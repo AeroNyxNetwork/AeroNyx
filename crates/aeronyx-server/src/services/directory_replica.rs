@@ -103,6 +103,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.14.0-DirectoryWitnessThreshold - Added configurable pinned-witness corroboration targets
 //! v0.13.0-DirectoryBoundedWitnessSelectionAudit - Bounded recurring selection verification without weakening startup audit
 //! v0.12.0-DirectoryMatureWitnessScheduling - Added audited mature unwitnessed checkpoint selection
 //! v0.11.0-DirectoryWitnessCapabilityNegotiation - Clarified peer-unavailable witness semantics for rolling upgrades
@@ -146,7 +147,10 @@ use aeronyx_core::protocol::discovery::{
 };
 use bincode::Options;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, params_from_iter, types::Value, Connection, OptionalExtension, Transaction,
+    TransactionBehavior,
+};
 use sha2::{Digest, Sha256};
 
 const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 6;
@@ -318,6 +322,22 @@ pub struct DirectoryObservationCheckpointAppendReport {
     pub producer_count: u16,
     /// Recomputable multi-source overlap root.
     pub observation_root: [u8; 32],
+}
+
+/// Audited mature checkpoint that has not reached its configured corroboration
+/// target among the current operator-pinned witnesses.
+///
+/// The retained witness identities are public node signing keys required only
+/// to avoid duplicate outbound requests. They must never be exposed by public
+/// status or interpreted as voting weight, consensus membership, or finality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryObservationWitnessTarget {
+    /// Canonical observer-signed checkpoint requiring more external evidence.
+    pub checkpoint: DirectoryObservationCheckpointV1,
+    /// Current pinned witnesses with an audited accepted receipt for this row.
+    pub witnessed_by: Vec<[u8; 32]>,
+    /// Required number of distinct pinned witness receipts.
+    pub minimum_witnesses: usize,
 }
 
 /// Result of independently evaluating an external observation checkpoint.
@@ -1165,6 +1185,12 @@ struct ObservationWitnessAudit {
     witnesses: u64,
     latest_sequence: u64,
     latest_witnesses: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct VerifiedObservationWitnessSet {
+    sequence: u64,
+    witness_node_ids: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Default)]
@@ -2069,18 +2095,76 @@ impl DirectoryReplicaStore {
         matured_before: u64,
         observed_at: u64,
     ) -> Result<Option<DirectoryObservationCheckpointV1>, DirectoryReplicaStoreError> {
+        self.audited_mature_observation_checkpoint_below_witness_threshold_internal(
+            matured_before,
+            observed_at,
+            1,
+            None,
+        )
+        .map(|target| target.map(|target| target.checkpoint))
+    }
+
+    /// Returns the next forward mature checkpoint below the configured
+    /// independent receipt target among current operator-pinned witnesses.
+    ///
+    /// Existing receipts from removed pins remain fully audited historical
+    /// evidence but do not satisfy the current operational threshold. The
+    /// returned witness identities let the coordinator skip duplicate requests.
+    /// This is corroboration evidence only, never consensus or finality.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the witness set is empty,
+    /// duplicated, larger than the protocol bound, the threshold is outside the
+    /// witness set, or any bounded selection evidence fails verification.
+    pub fn next_audited_mature_observation_checkpoint_below_witness_threshold(
+        &self,
+        matured_before: u64,
+        observed_at: u64,
+        minimum_witnesses: usize,
+        eligible_witnesses: &[[u8; 32]],
+    ) -> Result<Option<DirectoryObservationWitnessTarget>, DirectoryReplicaStoreError> {
+        self.audited_mature_observation_checkpoint_below_witness_threshold_internal(
+            matured_before,
+            observed_at,
+            minimum_witnesses,
+            Some(eligible_witnesses),
+        )
+    }
+
+    fn audited_mature_observation_checkpoint_below_witness_threshold_internal(
+        &self,
+        matured_before: u64,
+        observed_at: u64,
+        minimum_witnesses: usize,
+        eligible_witnesses: Option<&[[u8; 32]]>,
+    ) -> Result<Option<DirectoryObservationWitnessTarget>, DirectoryReplicaStoreError> {
         if matured_before == 0 || matured_before > observed_at {
             return Err(DirectoryReplicaStoreError::Request(
                 "observation witness maturity cutoff is invalid".to_string(),
             ));
         }
+        if minimum_witnesses == 0 || minimum_witnesses > MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1 {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation witness threshold is outside the protocol bound".to_string(),
+            ));
+        }
+        let eligible_witness_set = eligible_witnesses
+            .map(|witnesses| {
+                if minimum_witnesses > witnesses.len() {
+                    return Err(DirectoryReplicaStoreError::Request(
+                        "observation witness threshold exceeds its eligibility set".to_string(),
+                    ));
+                }
+                Self::validate_observation_witness_eligibility(witnesses)
+            })
+            .transpose()?;
         let connection = self.connection.lock();
         Self::validate_metadata(&connection, &self.local_node_id)?;
         let checkpoint_tip = Self::load_observation_checkpoint_tip(&connection)?;
         if checkpoint_tip.sequence == 0 {
             return Ok(None);
         }
-        let latest_witnessed_sequence = Self::latest_verified_observation_witness_sequence(
+        let latest_witness_set = Self::latest_verified_observation_witness_set(
             &connection,
             &self.local_node_id,
             observed_at,
@@ -2099,26 +2183,62 @@ impl DirectoryReplicaStore {
                 outcome_snapshot.last_checkpoint_sequence,
             )?;
         }
-        let minimum_sequence = latest_witnessed_sequence
+        let minimum_sequence = latest_witness_set
+            .sequence
             .max(outcome_snapshot.last_checkpoint_sequence)
             .max(1);
+        let mut query_parameters = vec![
+            Value::Integer(u64_to_i64(
+                matured_before,
+                "observation witness maturity cutoff",
+            )?),
+            Value::Integer(u64_to_i64(
+                minimum_sequence,
+                "observation witness sequence floor",
+            )?),
+        ];
+        let threshold_mode = eligible_witnesses.is_some();
+        let receipt_scope = if let Some(eligible_witnesses) = eligible_witnesses {
+            let placeholders = std::iter::repeat_n("?", eligible_witnesses.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            query_parameters.extend(
+                eligible_witnesses
+                    .iter()
+                    .map(|witness| Value::Blob(witness.to_vec())),
+            );
+            format!(" AND witness.witness_node_id IN ({placeholders})")
+        } else {
+            String::new()
+        };
+        query_parameters.push(Value::Integer(i64::try_from(minimum_witnesses).map_err(
+            |_| {
+                DirectoryReplicaStoreError::Request(
+                    "observation witness threshold exceeds i64".to_string(),
+                )
+            },
+        )?));
+        // Threshold collection finishes the current forward-floor checkpoint
+        // before advancing. The compatibility wrapper keeps the historical
+        // newest-unwitnessed behavior when no eligible pin set is supplied.
+        let candidate_order = if threshold_mode { "ASC" } else { "DESC" };
+        let checkpoint_query = format!(
+            "SELECT checkpoint.sequence
+             FROM directory_observation_checkpoints AS checkpoint
+             WHERE checkpoint.observed_at <= ?
+               AND checkpoint.sequence >= ?
+               AND (
+                   SELECT COUNT(*)
+                   FROM directory_observation_checkpoint_witnesses AS witness
+                   WHERE witness.checkpoint_sequence = checkpoint.sequence{receipt_scope}
+               ) < ?
+             ORDER BY checkpoint.sequence {candidate_order}
+             LIMIT 1"
+        );
         let checkpoint_sequence = connection
             .query_row(
-                "SELECT checkpoint.sequence
-                 FROM directory_observation_checkpoints AS checkpoint
-                 WHERE checkpoint.observed_at <= ?1
-                   AND checkpoint.sequence >= ?2
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM directory_observation_checkpoint_witnesses AS witness
-                       WHERE witness.checkpoint_sequence = checkpoint.sequence
-                   )
-                 ORDER BY checkpoint.sequence DESC
-                 LIMIT 1",
-                params![
-                    u64_to_i64(matured_before, "observation witness maturity cutoff")?,
-                    u64_to_i64(minimum_sequence, "observation witness sequence floor")?
-                ],
+                &checkpoint_query,
+                params_from_iter(query_parameters.iter()),
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
@@ -2134,16 +2254,91 @@ impl DirectoryReplicaStore {
                 )
             })
             .transpose()?;
+        let target = checkpoint.map(|checkpoint| {
+            let witnessed_by = if checkpoint.sequence == latest_witness_set.sequence {
+                latest_witness_set
+                    .witness_node_ids
+                    .iter()
+                    .copied()
+                    .filter(|witness| {
+                        eligible_witness_set
+                            .as_ref()
+                            .is_none_or(|eligible| eligible.contains(witness))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            DirectoryObservationWitnessTarget {
+                checkpoint,
+                witnessed_by,
+                minimum_witnesses,
+            }
+        });
         drop(connection);
-        if checkpoint
+        if target
             .as_ref()
-            .is_some_and(|candidate| candidate.observed_at > matured_before)
+            .is_some_and(|target| target.checkpoint.observed_at > matured_before)
         {
             return Err(DirectoryReplicaStoreError::Integrity(
                 "observation witness candidate violates maturity cutoff".to_string(),
             ));
         }
-        Ok(checkpoint)
+        if target
+            .as_ref()
+            .is_some_and(|target| target.witnessed_by.len() >= minimum_witnesses)
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation witness candidate already satisfies its threshold".to_string(),
+            ));
+        }
+        Ok(target)
+    }
+
+    /// Returns the number of current operator-pinned witnesses whose canonical
+    /// accepted receipts cover the specified latest checkpoint.
+    ///
+    /// Historical receipts from removed pins remain durable but are excluded.
+    /// The complete latest receipt set and its checkpoint are cryptographically
+    /// re-verified before the aggregate count is returned.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when pins are malformed or
+    /// duplicated, latest retained receipt evidence fails verification, or
+    /// `SQLite` cannot complete the bounded read.
+    pub fn verified_observation_witness_count_for_pins(
+        &self,
+        checkpoint_sequence: u64,
+        eligible_witnesses: &[[u8; 32]],
+        observed_at: u64,
+    ) -> Result<u64, DirectoryReplicaStoreError> {
+        if checkpoint_sequence == 0 || eligible_witnesses.is_empty() {
+            return Ok(0);
+        }
+        let eligible_witnesses =
+            Self::validate_observation_witness_eligibility(eligible_witnesses)?;
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let latest = Self::latest_verified_observation_witness_set(
+            &connection,
+            &self.local_node_id,
+            observed_at,
+        )?;
+        if latest.sequence != checkpoint_sequence {
+            return Ok(0);
+        }
+        u64::try_from(
+            latest
+                .witness_node_ids
+                .iter()
+                .filter(|witness| eligible_witnesses.contains(*witness))
+                .count(),
+        )
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "current pinned observation witness count exceeds u64".to_string(),
+            )
+        })
     }
 
     /// Independently evaluates an external observer checkpoint against this
@@ -4440,6 +4635,26 @@ impl DirectoryReplicaStore {
             .map_err(DirectoryReplicaStoreError::from)
     }
 
+    fn validate_observation_witness_eligibility(
+        witnesses: &[[u8; 32]],
+    ) -> Result<HashSet<[u8; 32]>, DirectoryReplicaStoreError> {
+        if witnesses.is_empty()
+            || witnesses.len() > MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1
+            || witnesses.iter().any(|witness| *witness == [0u8; 32])
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation witness eligibility set is invalid".to_string(),
+            ));
+        }
+        let unique = witnesses.iter().copied().collect::<HashSet<_>>();
+        if unique.len() != witnesses.len() {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation witness eligibility set contains duplicates".to_string(),
+            ));
+        }
+        Ok(unique)
+    }
+
     fn decode_canonical_observation_checkpoint_row(
         row: &StoredObservationCheckpointRow,
     ) -> Result<DirectoryObservationCheckpointV1, DirectoryReplicaStoreError> {
@@ -4541,11 +4756,11 @@ impl DirectoryReplicaStore {
         )
     }
 
-    fn latest_verified_observation_witness_sequence(
+    fn latest_verified_observation_witness_set(
         connection: &Connection,
         local_node_id: &[u8; 32],
         observed_at: u64,
-    ) -> Result<u64, DirectoryReplicaStoreError> {
+    ) -> Result<VerifiedObservationWitnessSet, DirectoryReplicaStoreError> {
         let latest_sequence: Option<i64> = connection.query_row(
             "SELECT MAX(checkpoint_sequence)
              FROM directory_observation_checkpoint_witnesses",
@@ -4553,7 +4768,7 @@ impl DirectoryReplicaStore {
             |row| row.get(0),
         )?;
         let Some(latest_sequence) = latest_sequence else {
-            return Ok(0);
+            return Ok(VerifiedObservationWitnessSet::default());
         };
         let latest_sequence = positive_i64_to_u64(
             latest_sequence,
@@ -4593,11 +4808,16 @@ impl DirectoryReplicaStore {
             },
         )?;
         let mut verified_rows = 0usize;
+        let mut witness_node_ids = Vec::with_capacity(MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1);
         for row in rows {
             let row = row?;
             let verified =
                 Self::verify_observation_witness_response(&row, local_node_id, observed_at)?;
             Self::verify_observation_witness_checkpoint(connection, &row, &verified)?;
+            witness_node_ids.push(bytes32(
+                &row.witness_node_id,
+                "latest observation witness node id",
+            )?);
             verified_rows = verified_rows.saturating_add(1);
         }
         drop(statement);
@@ -4612,7 +4832,10 @@ impl DirectoryReplicaStore {
             observed_at,
             latest_sequence,
         )?;
-        Ok(latest_sequence)
+        Ok(VerifiedObservationWitnessSet {
+            sequence: latest_sequence,
+            witness_node_ids,
+        })
     }
 
     fn audit_observation_checkpoints(
@@ -5846,6 +6069,38 @@ mod tests {
         .unwrap()
     }
 
+    fn accepted_observation_witness_response(
+        observer: &IdentityKeyPair,
+        witness: &IdentityKeyPair,
+        checkpoint: &DirectoryObservationCheckpointV1,
+        request_seed: u8,
+    ) -> DirectorySyncMessage {
+        let request_id = [request_seed; 16];
+        let checkpoint_hash = checkpoint.hash();
+        let responder = witness.public_key_bytes();
+        let signing_bytes = directory_observation_witness_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            checkpoint.sequence,
+            &checkpoint_hash,
+            &responder,
+            NOW + 22,
+            DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+        );
+        DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            observer: observer.public_key_bytes(),
+            checkpoint_sequence: checkpoint.sequence,
+            checkpoint_hash,
+            responder,
+            response_timestamp: NOW + 22,
+            outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+            signature: witness.sign(&signing_bytes),
+        }
+    }
+
     fn import_replica_block(
         store: &DirectoryReplicaStore,
         producer: &IdentityKeyPair,
@@ -6529,6 +6784,206 @@ mod tests {
     }
 
     #[test]
+    fn observation_witness_target_counts_only_current_pins_and_survives_restart() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let observer = IdentityKeyPair::from_bytes(&[0xc1; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0xc2; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0xc3; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0xc4; 32]).unwrap();
+        let witness_a = IdentityKeyPair::from_bytes(&[0xc5; 32]).unwrap();
+        let witness_b = IdentityKeyPair::from_bytes(&[0xc6; 32]).unwrap();
+        let retired_witness = IdentityKeyPair::from_bytes(&[0xc7; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let block_a = block(&producer_a, 1, [0u8; 32], &object);
+        let block_b = block(&producer_b, 1, [0u8; 32], &object);
+        let configured_producers = [producer_a.public_key_bytes(), producer_b.public_key_bytes()];
+        let eligible_witnesses = [witness_a.public_key_bytes(), witness_b.public_key_bytes()];
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 20).unwrap();
+        import_replica_block(&store, &producer_a, &object, &block_a, [0xc8; 16]);
+        import_replica_block(&store, &producer_b, &object, &block_b, [0xc9; 16]);
+        store
+            .append_observation_checkpoint(&configured_producers, &observer, NOW + 21)
+            .unwrap();
+        let checkpoint = store
+            .latest_audited_observation_checkpoint(NOW + 22)
+            .unwrap()
+            .unwrap();
+
+        let initial = store
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 21,
+                NOW + 22,
+                2,
+                &eligible_witnesses,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.checkpoint, checkpoint);
+        assert!(initial.witnessed_by.is_empty());
+        assert_eq!(initial.minimum_witnesses, 2);
+
+        let newer_object = descriptor(&subject, 2);
+        let newer_block_a = block(&producer_a, 2, block_a.hash(), &newer_object);
+        let newer_block_b = block(&producer_b, 2, block_b.hash(), &newer_object);
+        import_replica_block(
+            &store,
+            &producer_a,
+            &newer_object,
+            &newer_block_a,
+            [0xcd; 16],
+        );
+        import_replica_block(
+            &store,
+            &producer_b,
+            &newer_object,
+            &newer_block_b,
+            [0xce; 16],
+        );
+        let newer_checkpoint = store
+            .append_observation_checkpoint(&configured_producers, &observer, NOW + 23)
+            .unwrap();
+        assert!(newer_checkpoint.appended);
+        assert_eq!(newer_checkpoint.sequence, checkpoint.sequence + 1);
+
+        let retired_response =
+            accepted_observation_witness_response(&observer, &retired_witness, &checkpoint, 0xca);
+        assert!(store
+            .persist_observation_checkpoint_witness(&retired_response, NOW + 22)
+            .unwrap());
+        let after_retired = store
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 23,
+                NOW + 24,
+                2,
+                &eligible_witnesses,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_retired.checkpoint.sequence, checkpoint.sequence);
+        assert!(after_retired.witnessed_by.is_empty());
+        assert_eq!(
+            store
+                .verified_observation_witness_count_for_pins(
+                    checkpoint.sequence,
+                    &eligible_witnesses,
+                    NOW + 24,
+                )
+                .unwrap(),
+            0
+        );
+
+        let witness_a_response =
+            accepted_observation_witness_response(&observer, &witness_a, &checkpoint, 0xcb);
+        assert!(store
+            .persist_observation_checkpoint_witness(&witness_a_response, NOW + 22)
+            .unwrap());
+        let partial = store
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 23,
+                NOW + 24,
+                2,
+                &eligible_witnesses,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.checkpoint.sequence, checkpoint.sequence);
+        assert_eq!(partial.witnessed_by, vec![witness_a.public_key_bytes()]);
+        assert_eq!(
+            store
+                .verified_observation_witness_count_for_pins(
+                    checkpoint.sequence,
+                    &eligible_witnesses,
+                    NOW + 24,
+                )
+                .unwrap(),
+            1
+        );
+        assert!(store
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 21,
+                NOW + 23,
+                1,
+                &[witness_a.public_key_bytes()],
+            )
+            .unwrap()
+            .is_none());
+        let witness_b_response =
+            accepted_observation_witness_response(&observer, &witness_b, &checkpoint, 0xcc);
+        assert!(store
+            .persist_observation_checkpoint_witness(&witness_b_response, NOW + 22)
+            .unwrap());
+        assert!(store
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 21,
+                NOW + 24,
+                2,
+                &eligible_witnesses,
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .verified_observation_witness_count_for_pins(
+                    checkpoint.sequence,
+                    &eligible_witnesses,
+                    NOW + 24,
+                )
+                .unwrap(),
+            2
+        );
+        assert!(store
+            .verified_observation_witness_count_for_pins(
+                checkpoint.sequence,
+                &[witness_a.public_key_bytes(), witness_a.public_key_bytes()],
+                NOW + 24,
+            )
+            .is_err());
+        let next = store
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 23,
+                NOW + 24,
+                2,
+                &eligible_witnesses,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.checkpoint.sequence, newer_checkpoint.sequence);
+        assert!(next.witnessed_by.is_empty());
+        assert!(store
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 21,
+                NOW + 23,
+                0,
+                &eligible_witnesses,
+            )
+            .is_err());
+        assert!(store
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 21,
+                NOW + 23,
+                2,
+                &[witness_a.public_key_bytes(), witness_a.public_key_bytes()],
+            )
+            .is_err());
+        drop(store);
+
+        let (reopened, audit) =
+            DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 24).unwrap();
+        assert_eq!(audit.observation_checkpoint_witnesses, 3);
+        assert!(reopened
+            .next_audited_mature_observation_checkpoint_below_witness_threshold(
+                NOW + 21,
+                NOW + 24,
+                2,
+                &eligible_witnesses,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn witness_runtime_uses_bounded_mutually_exclusive_buckets() {
         let runtime = DirectoryReplicaSyncRuntime::default();
         let outcomes = [
@@ -6727,6 +7182,13 @@ mod tests {
         }
         assert!(store
             .latest_audited_mature_unwitnessed_observation_checkpoint(NOW + 21, NOW + 23)
+            .is_err());
+        assert!(store
+            .verified_observation_witness_count_for_pins(
+                checkpoint.sequence,
+                &[witness.public_key_bytes()],
+                NOW + 23,
+            )
             .is_err());
         drop(store);
         assert!(DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 23).is_err());

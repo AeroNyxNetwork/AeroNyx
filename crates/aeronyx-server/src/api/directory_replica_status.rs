@@ -74,6 +74,7 @@
 //!   audited compare-and-swap command boundary.
 //!
 //! ## Last Modified
+//! `v0.12.0-DirectoryWitnessThresholdStatus` - Added additive pinned-witness corroboration target status.
 //! `v0.11.0-DirectoryBoundedWitnessSelectionStatus` - Declared bounded recurring versus full startup audit semantics.
 //! `v0.10.0-DirectoryMatureWitnessStatus` - Declared mature forward-only witness scheduling semantics.
 //! `v0.9.0-DirectoryWitnessOutcomeStatus` - Added durable and process aggregate witness outcome diagnostics.
@@ -138,6 +139,7 @@ struct DirectoryReplicaStatusState {
     store: Option<Arc<DirectoryReplicaStore>>,
     runtime: Arc<DirectoryReplicaSyncRuntime>,
     configured_producers: Arc<HashSet<[u8; 32]>>,
+    witness_min_verified: usize,
     scope: DirectoryReplicaStatusScope,
 }
 
@@ -180,7 +182,13 @@ struct DirectoryReplicaObservationCheckpointStatus {
     external_witness_receipts: u64,
     latest_witnessed_sequence: u64,
     latest_sequence_witnesses: u64,
+    latest_checkpoint_current_pinned_witnesses: u64,
     latest_checkpoint_externally_witnessed: bool,
+    required_external_witnesses: u64,
+    latest_checkpoint_witnesses_remaining: Option<u64>,
+    latest_checkpoint_corroboration_status: &'static str,
+    latest_checkpoint_threshold_met: bool,
+    corroboration_policy: &'static str,
     evidence_basis: &'static str,
     security_model: &'static str,
 }
@@ -400,6 +408,7 @@ pub fn build_directory_replica_status_router(
     store: Option<Arc<DirectoryReplicaStore>>,
     runtime: Arc<DirectoryReplicaSyncRuntime>,
     configured_producers: Vec<[u8; 32]>,
+    witness_min_verified: usize,
     scope: DirectoryReplicaStatusScope,
 ) -> Router {
     runtime.register_producers(&configured_producers);
@@ -407,6 +416,7 @@ pub fn build_directory_replica_status_router(
         store,
         runtime,
         configured_producers: Arc::new(configured_producers.into_iter().collect()),
+        witness_min_verified,
         scope,
     };
     let router = Router::new().route(
@@ -646,11 +656,23 @@ async fn directory_replica_status_handler(
         .copied()
         .collect::<Vec<_>>();
     configured_producers.sort_unstable();
-    let (persisted, convergence) = if let Some(store) = state.store.clone() {
+    let (persisted, convergence, latest_current_pinned_witnesses) = if let Some(store) =
+        state.store.clone()
+    {
         match tokio::task::spawn_blocking(move || {
             let persisted = store.status_snapshot()?;
             let convergence = store.observation_convergence(&configured_producers)?;
-            Ok::<_, crate::services::DirectoryReplicaStoreError>((persisted, convergence))
+            let latest_current_pinned_witnesses = store
+                .verified_observation_witness_count_for_pins(
+                    persisted.observation_checkpoint_sequence,
+                    &configured_producers,
+                    generated_at,
+                )?;
+            Ok::<_, crate::services::DirectoryReplicaStoreError>((
+                persisted,
+                convergence,
+                latest_current_pinned_witnesses,
+            ))
         })
         .await
         {
@@ -699,6 +721,7 @@ async fn directory_replica_status_handler(
                 pending_producers: configured_count,
                 ..DirectoryReplicaObservationConvergenceSnapshot::default()
             },
+            0,
         )
     };
     let runtime = state.runtime.snapshot();
@@ -714,6 +737,8 @@ async fn directory_replica_status_handler(
         &convergence,
         &runtime_snapshots,
         &state.configured_producers,
+        state.witness_min_verified,
+        latest_current_pinned_witnesses,
         state.scope,
     ))
     .into_response()
@@ -875,7 +900,23 @@ fn build_observation_checkpoint_status(
     generated_at: u64,
     store_enabled: bool,
     persisted: &DirectoryReplicaStoreSnapshot,
+    witness_min_verified: usize,
+    latest_current_pinned_witnesses: u64,
 ) -> DirectoryReplicaObservationCheckpointStatus {
+    let required_external_witnesses = u64::try_from(witness_min_verified).unwrap_or(u64::MAX);
+    let latest_checkpoint_threshold_met = persisted.observation_checkpoint_sequence > 0
+        && latest_current_pinned_witnesses >= required_external_witnesses;
+    let latest_checkpoint_corroboration_status = if !store_enabled {
+        "disabled"
+    } else if persisted.observation_checkpoint_sequence == 0 {
+        "awaiting_checkpoint"
+    } else if latest_checkpoint_threshold_met {
+        "target_met"
+    } else if latest_current_pinned_witnesses > 0 {
+        "below_target"
+    } else {
+        "awaiting_external_receipt"
+    };
     DirectoryReplicaObservationCheckpointStatus {
         source_status: if !store_enabled {
             "disabled"
@@ -892,9 +933,18 @@ fn build_observation_checkpoint_status(
         external_witness_receipts: persisted.observation_checkpoint_witnesses,
         latest_witnessed_sequence: persisted.observation_checkpoint_witnessed_sequence,
         latest_sequence_witnesses: persisted.observation_checkpoint_latest_witnesses,
+        latest_checkpoint_current_pinned_witnesses: latest_current_pinned_witnesses,
         latest_checkpoint_externally_witnessed: persisted.observation_checkpoint_sequence > 0
             && persisted.observation_checkpoint_witnessed_sequence
                 == persisted.observation_checkpoint_sequence,
+        required_external_witnesses,
+        latest_checkpoint_witnesses_remaining: (persisted.observation_checkpoint_sequence > 0)
+            .then(|| {
+                required_external_witnesses.saturating_sub(latest_current_pinned_witnesses)
+            }),
+        latest_checkpoint_corroboration_status,
+        latest_checkpoint_threshold_met,
+        corroboration_policy: "distinct_current_operator_pinned_external_recomputations",
         evidence_basis:
             "local_node_signed_exact_producer_tips_plus_external_nodes_independently_recomputed_exact_prefixes_and_overlap_root",
         security_model:
@@ -921,7 +971,7 @@ fn build_observation_witness_outcome_status(
             "available"
         },
         durability: "audited_sqlite_aggregate_plus_process_runtime",
-        target_policy: "latest_mature_unwitnessed_checkpoint",
+        target_policy: "next_forward_mature_checkpoint_below_pinned_witness_target",
         maturity_policy: "one_configured_directory_sync_interval",
         monotonic_floor: "latest_authenticated_receipt_or_durable_outcome_sequence",
         selection_verification: "candidate_predecessor_latest_receipt_set_and_durable_outcome",
@@ -970,6 +1020,8 @@ fn build_directory_replica_status_response(
     convergence: &DirectoryReplicaObservationConvergenceSnapshot,
     runtime: &DirectoryReplicaRuntimeSnapshots<'_>,
     configured_producers: &HashSet<[u8; 32]>,
+    witness_min_verified: usize,
+    latest_current_pinned_witnesses: u64,
     scope: DirectoryReplicaStatusScope,
 ) -> DirectoryReplicaStatusResponse {
     let runtime_by_producer = runtime
@@ -1054,6 +1106,8 @@ fn build_directory_replica_status_response(
             generated_at,
             store_enabled,
             persisted,
+            witness_min_verified,
+            latest_current_pinned_witnesses,
         ),
         observation_witness_outcomes: build_observation_witness_outcome_status(
             generated_at,
@@ -1201,6 +1255,7 @@ mod tests {
             Some(store),
             runtime,
             vec![producer],
+            1,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         let response = router
@@ -1253,8 +1308,31 @@ mod tests {
             Some(0)
         );
         assert_eq!(
+            parsed["observation_checkpoint"]["latest_checkpoint_current_pinned_witnesses"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
             parsed["observation_checkpoint"]["latest_checkpoint_externally_witnessed"].as_bool(),
             Some(false)
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["required_external_witnesses"].as_u64(),
+            Some(1)
+        );
+        assert!(
+            parsed["observation_checkpoint"]["latest_checkpoint_witnesses_remaining"].is_null()
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["latest_checkpoint_corroboration_status"].as_str(),
+            Some("awaiting_checkpoint")
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["latest_checkpoint_threshold_met"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["observation_checkpoint"]["corroboration_policy"].as_str(),
+            Some("distinct_current_operator_pinned_external_recomputations")
         );
         assert_eq!(
             parsed["observation_checkpoint"]["security_model"].as_str(),
@@ -1276,7 +1354,7 @@ mod tests {
         );
         assert_eq!(
             parsed["observation_witness_outcomes"]["target_policy"].as_str(),
-            Some("latest_mature_unwitnessed_checkpoint")
+            Some("next_forward_mature_checkpoint_below_pinned_witness_target")
         );
         assert_eq!(
             parsed["observation_witness_outcomes"]["maturity_policy"].as_str(),
@@ -1303,6 +1381,39 @@ mod tests {
         assert!(parsed.get("producers").is_none());
         assert!(!body_text.contains(&hex::encode(producer)));
         Ok(())
+    }
+
+    #[test]
+    fn checkpoint_status_distinguishes_partial_and_satisfied_witness_targets() {
+        let persisted = DirectoryReplicaStoreSnapshot {
+            observation_checkpoints: 9,
+            observation_checkpoint_sequence: 9,
+            observation_checkpoint_observed_at: 90,
+            observation_checkpoint_witnessed_sequence: 9,
+            observation_checkpoint_latest_witnesses: 2,
+            ..DirectoryReplicaStoreSnapshot::default()
+        };
+
+        let partial = build_observation_checkpoint_status(100, true, &persisted, 2, 1);
+        assert_eq!(partial.latest_sequence_witnesses, 2);
+        assert_eq!(partial.latest_checkpoint_current_pinned_witnesses, 1);
+        assert_eq!(partial.required_external_witnesses, 2);
+        assert_eq!(partial.latest_checkpoint_witnesses_remaining, Some(1));
+        assert_eq!(
+            partial.latest_checkpoint_corroboration_status,
+            "below_target"
+        );
+        assert!(!partial.latest_checkpoint_threshold_met);
+        assert!(partial.latest_checkpoint_externally_witnessed);
+
+        let satisfied = build_observation_checkpoint_status(100, true, &persisted, 2, 2);
+        assert_eq!(satisfied.latest_checkpoint_current_pinned_witnesses, 2);
+        assert_eq!(satisfied.latest_checkpoint_witnesses_remaining, Some(0));
+        assert_eq!(
+            satisfied.latest_checkpoint_corroboration_status,
+            "target_met"
+        );
+        assert!(satisfied.latest_checkpoint_threshold_met);
     }
 
     #[test]
@@ -1356,6 +1467,7 @@ mod tests {
             Some(store),
             runtime,
             vec![producer],
+            1,
             DirectoryReplicaStatusScope::LocalOperator,
         );
         let response = router
@@ -1384,6 +1496,7 @@ mod tests {
             Some(Arc::clone(&store)),
             Arc::clone(&runtime),
             vec![producer],
+            1,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         for uri in [
@@ -1401,6 +1514,7 @@ mod tests {
             Some(store),
             runtime,
             vec![producer],
+            1,
             DirectoryReplicaStatusScope::LocalOperator,
         );
         let list_response = local_router
@@ -1497,6 +1611,7 @@ mod tests {
             Some(Arc::clone(&store)),
             Arc::clone(&runtime),
             vec![producer],
+            1,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         let public_response = public_router
@@ -1527,6 +1642,7 @@ mod tests {
             Some(store),
             runtime,
             vec![producer],
+            1,
             DirectoryReplicaStatusScope::LocalOperator,
         );
         let local_response = local_router

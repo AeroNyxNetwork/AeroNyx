@@ -293,6 +293,8 @@
 //     authenticated import must clear that state in the same SQLite transaction.
 //
 // Last Modified:
+//   v2.8.31-DirectoryWitnessThreshold - Wired the validated independent
+//     checkpoint receipt target into scheduling and privacy-tiered status
 //   v2.8.30-DurableDirectoryReplicaBackoff - Audit and restore producer retry state across restarts
 //   v2.8.29-DirectoryReplicaCoordinator - Extract bounded concurrent replica scheduling
 //   v2.8.28-DirectoryReplicaStatus - Privacy-tiered status and request-budgeted multi-page catch-up
@@ -2666,8 +2668,14 @@ impl Server {
             .config
             .discovery
             .directory_chain_sync_peer_node_id_bytes();
+        let directory_observation_witness_min_verified = self
+            .config
+            .discovery
+            .directory_observation_witness_min_verified;
         let public_directory_chain_store = directory_chain_store.clone();
         let public_directory_chain_sync_peer_ids = directory_chain_sync_peer_ids.clone();
+        let public_directory_observation_witness_min_verified =
+            directory_observation_witness_min_verified;
         let public_directory_replica_store = directory_replica_store.clone();
         let public_directory_replica_sync_runtime =
             Arc::clone(&directory_replica_sync_runtime);
@@ -2687,6 +2695,7 @@ impl Server {
                     public_directory_replica_store,
                     public_directory_replica_sync_runtime,
                     public_directory_chain_sync_peer_ids,
+                    public_directory_observation_witness_min_verified,
                     commitment_storage.clone(),
                     commitment_lease_authorized_coordinator,
                     public_commitment_sync_tip_notifier,
@@ -2788,6 +2797,7 @@ impl Server {
                     directory_replica_store.clone(),
                     directory_replica_sync_runtime,
                     directory_chain_sync_peer_ids.clone(),
+                    directory_observation_witness_min_verified,
                     DirectoryReplicaStatusScope::LocalOperator,
                 ));
             let app = if let Some(store) = directory_chain_store {
@@ -2898,6 +2908,7 @@ impl Server {
         directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
         directory_replica_sync_runtime: Arc<DirectoryReplicaSyncRuntime>,
         directory_chain_sync_peer_ids: Vec<[u8; 32]>,
+        directory_observation_witness_min_verified: usize,
         commitment_storage: Option<Arc<MemoryStorage>>,
         commitment_lease_authorized_coordinator: Option<[u8; 32]>,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
@@ -2923,6 +2934,7 @@ impl Server {
             directory_replica_store.clone(),
             directory_replica_sync_runtime,
             directory_chain_sync_peer_ids.clone(),
+            directory_observation_witness_min_verified,
             DirectoryReplicaStatusScope::PublicAggregate,
         ));
         let app = if let Some(store) = directory_chain_store {
@@ -4296,6 +4308,10 @@ impl Server {
             .config
             .discovery
             .directory_chain_sync_interval_secs;
+        let witness_min_verified = self
+            .config
+            .discovery
+            .directory_observation_witness_min_verified;
         let coordinator = match DirectoryReplicaSyncCoordinator::new(
             peers,
             interval_secs,
@@ -4303,6 +4319,7 @@ impl Server {
             runtime,
             peer_store,
             Arc::new(self.identity.clone()),
+            witness_min_verified,
         ) {
             Ok(coordinator) => coordinator,
             Err(reason) => {

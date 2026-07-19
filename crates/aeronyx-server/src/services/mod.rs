@@ -11,6 +11,8 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.12.0-DirectoryWitnessThreshold - Re-exported the audited checkpoint
+//     target used to retry only current pinned witnesses below threshold
 //   v0.11.0-DirectoryWitnessOutcomeTelemetry - Re-exported bounded durable and
 //     process-lifetime witness outcome telemetry types
 //   v0.10.0-DirectoryObservationCheckpoint - Re-exported the bounded append
@@ -57,7 +59,8 @@ pub(crate) use directory_replica::MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE;
 pub use directory_replica::{
     DirectoryObservationCheckpointAppendReport, DirectoryObservationWitnessDecision,
     DirectoryObservationWitnessOutcome, DirectoryObservationWitnessOutcomeCounters,
-    DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaAudit,
+    DirectoryObservationWitnessOutcomeSnapshot, DirectoryObservationWitnessTarget,
+    DirectoryReplicaAudit,
     DirectoryReplicaImportReport, DirectoryReplicaIncidentEvidence, DirectoryReplicaIncidentPage,
     DirectoryReplicaIncidentSummary, DirectoryReplicaObservationConvergenceSnapshot,
     DirectoryReplicaProducerSnapshot, DirectoryReplicaResolutionCommand,

@@ -29,6 +29,9 @@
 //!   descriptor sequence so rolling upgrades do not inflate transport faults.
 //! - Witnesses only checkpoints older than one complete synchronization
 //!   interval, preventing asymmetric schedulers from chasing a moving head.
+//! - Continues witnessing a mature checkpoint until the configured number of
+//!   current pinned peers have independently recomputed it, while skipping
+//!   pins whose canonical receipts are already durable.
 //! - Tries the producer directly first, then uses another pinned node as an
 //!   audited evidence carrier only for bounded availability/admission failures.
 //! - Requests up to eight contiguous blocks per page while the peer-side
@@ -52,10 +55,10 @@
 //! 7. Persist failures, and let a successful import atomically clear backoff.
 //! 8. If every producer reaches its signed tip, append an idempotent local
 //!    observation checkpoint from a blocking worker.
-//! 9. After one complete synchronization interval, ask pinned peers to
-//!    independently recompute the newest mature unwitnessed checkpoint;
-//!    persist only canonical accepted receipts, never trust an unavailable or
-//!    conflicting result.
+//! 9. After one complete synchronization interval, ask not-yet-recorded pinned
+//!    peers to independently recompute the next forward mature checkpoint
+//!    below its configured corroboration target; persist only canonical accepted
+//!    receipts, never trust an unavailable or conflicting result.
 //! 10. Treat an explicitly unsupported witness endpoint as peer unavailability
 //!     and retry only after that peer publishes a newer signed descriptor.
 //! 11. Persist bounded aggregate witness outcomes and mirror the current
@@ -80,6 +83,7 @@
 //!   signature, or descriptor-hash response; these are security failures.
 //!
 //! ## Last Modified
+//! `v0.11.0-DirectoryWitnessThreshold` - Added retryable pinned-witness corroboration targets.
 //! `v0.10.0-DirectoryMatureWitnessScheduling` - Added one-interval mature unwitnessed checkpoint targeting.
 //! `v0.9.0-DirectoryWitnessCapabilityNegotiation` - Added descriptor-sequence-scoped witness capability probing.
 //! `v0.8.0-DirectoryWitnessOutcomeTelemetry` - Added typed witness outcomes and audited aggregate diagnostics.
@@ -305,6 +309,7 @@ pub struct DirectoryReplicaSyncCoordinator {
     identity: Arc<IdentityKeyPair>,
     client: reqwest::Client,
     witness_capabilities: DirectoryWitnessCapabilityCache,
+    witness_min_verified: usize,
     restored_retry_states: usize,
 }
 
@@ -321,12 +326,16 @@ impl DirectoryReplicaSyncCoordinator {
         runtime: Arc<DirectoryReplicaSyncRuntime>,
         peer_store: Arc<PeerStore>,
         identity: Arc<IdentityKeyPair>,
+        witness_min_verified: usize,
     ) -> Result<Self, &'static str> {
         if peers.is_empty() {
             return Err("directory_sync_no_pinned_producers");
         }
         if interval_secs == 0 {
             return Err("directory_sync_interval_invalid");
+        }
+        if witness_min_verified == 0 || witness_min_verified > peers.len() {
+            return Err("directory_observation_witness_threshold_invalid");
         }
         runtime.register_producers(&peers);
         let retry_states = store
@@ -353,6 +362,7 @@ impl DirectoryReplicaSyncCoordinator {
             identity,
             client,
             witness_capabilities: DirectoryWitnessCapabilityCache::default(),
+            witness_min_verified,
             restored_retry_states,
         })
     }
@@ -519,6 +529,8 @@ impl DirectoryReplicaSyncCoordinator {
 
     async fn witness_mature_observation_checkpoint(&self) {
         let store = Arc::clone(&self.store);
+        let eligible_witnesses = Arc::clone(&self.peers);
+        let minimum_witnesses = self.witness_min_verified;
         let observed_at = unix_now_secs();
         let maturity_delay_secs = self
             .interval
@@ -528,15 +540,17 @@ impl DirectoryReplicaSyncCoordinator {
         if matured_before == 0 {
             return;
         }
-        let checkpoint = match tokio::task::spawn_blocking(move || {
-            store.latest_audited_mature_unwitnessed_observation_checkpoint(
+        let target = match tokio::task::spawn_blocking(move || {
+            store.next_audited_mature_observation_checkpoint_below_witness_threshold(
                 matured_before,
                 observed_at,
+                minimum_witnesses,
+                eligible_witnesses.as_ref(),
             )
         })
         .await
         {
-            Ok(Ok(Some(checkpoint))) => checkpoint,
+            Ok(Ok(Some(target))) => target,
             Ok(Ok(None)) => return,
             Ok(Err(_)) | Err(_) => {
                 warn!(
@@ -546,31 +560,39 @@ impl DirectoryReplicaSyncCoordinator {
                 return;
             }
         };
+        let checkpoint = target.checkpoint.clone();
         debug!(
             checkpoint_sequence = checkpoint.sequence,
             checkpoint_age_seconds = observed_at.saturating_sub(checkpoint.observed_at),
             maturity_delay_secs,
-            "[DIRECTORY_REPLICA] Mature unwitnessed checkpoint selected"
+            retained_pinned_witnesses = target.witnessed_by.len(),
+            minimum_witnesses = target.minimum_witnesses,
+            "[DIRECTORY_REPLICA] Mature checkpoint below witness target selected"
         );
-        let outcomes = stream::iter(self.peers.iter().copied())
-            .map(|witness| {
-                let checkpoint = checkpoint.clone();
-                async move {
-                    request_observation_checkpoint_witness(
-                        Arc::clone(&self.store),
-                        self.peer_store.as_ref(),
-                        self.identity.as_ref(),
-                        &witness,
-                        &self.client,
-                        &self.witness_capabilities,
-                        checkpoint,
-                    )
-                    .await
-                }
-            })
-            .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
-            .collect::<Vec<_>>()
-            .await;
+        let outcomes = stream::iter(
+            self.peers
+                .iter()
+                .copied()
+                .filter(|witness| !target.witnessed_by.contains(witness)),
+        )
+        .map(|witness| {
+            let checkpoint = checkpoint.clone();
+            async move {
+                request_observation_checkpoint_witness(
+                    Arc::clone(&self.store),
+                    self.peer_store.as_ref(),
+                    self.identity.as_ref(),
+                    &witness,
+                    &self.client,
+                    &self.witness_capabilities,
+                    checkpoint,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
+        .collect::<Vec<_>>()
+        .await;
         self.record_witness_outcome_round(checkpoint.sequence, outcomes)
             .await;
     }
@@ -632,7 +654,7 @@ impl DirectoryReplicaSyncCoordinator {
         );
         debug!(
             checkpoint_sequence,
-            configured_witnesses = outcomes.len(),
+            attempted_witnesses = outcomes.len(),
             accepted,
             evidence_unavailable,
             evidence_conflict,
@@ -1741,6 +1763,32 @@ mod tests {
         }
         let store = Arc::new(store);
         let runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
+        assert_eq!(
+            DirectoryReplicaSyncCoordinator::new(
+                vec![configured],
+                120,
+                Arc::clone(&store),
+                Arc::clone(&runtime),
+                Arc::new(PeerStore::new()),
+                Arc::clone(&local),
+                0,
+            )
+            .err(),
+            Some("directory_observation_witness_threshold_invalid")
+        );
+        assert_eq!(
+            DirectoryReplicaSyncCoordinator::new(
+                vec![configured],
+                120,
+                Arc::clone(&store),
+                Arc::clone(&runtime),
+                Arc::new(PeerStore::new()),
+                Arc::clone(&local),
+                2,
+            )
+            .err(),
+            Some("directory_observation_witness_threshold_invalid")
+        );
         let coordinator = DirectoryReplicaSyncCoordinator::new(
             vec![configured],
             120,
@@ -1748,6 +1796,7 @@ mod tests {
             Arc::clone(&runtime),
             Arc::new(PeerStore::new()),
             local,
+            1,
         )
         .unwrap();
 

@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.23.0 - Bounded recurring witness selection verification independently of retained checkpoint history.
+Modification Reason: v0.24.0 - Configurable pinned-witness corroboration targets with retryable receipt collection.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.23.0 - Kept recurring witness selection cost fixed while preserving complete startup and explicit operator audits.
+Last Modified: v0.24.0 - Distinguished independent multi-node corroboration from one-receipt evidence without claiming consensus.
+Previous: v0.23.0 - Kept recurring witness selection cost fixed while preserving complete startup and explicit operator audits.
 Previous: v0.22.0 - Prevented asymmetric replica schedules from perpetually witnessing a checkpoint that peers have not received yet.
 Previous: v0.21.0 - Prevented unsupported witness endpoints from being misreported as transport faults without changing the descriptor wire schema.
 Previous: v0.20.0 - Added durable/runtime witness outcome buckets without retaining peer identity or introducing reputation, quorum, consensus, or finality.
@@ -1082,8 +1083,7 @@ Implemented in Directory Sync V1 replica pull:
 
 Still pending before Directory Chain can be described as live:
 
-- Authenticated, audited, compare-and-swap quarantine resolution tooling.
-- Witness/co-signature policy and deterministic fork selection.
+- Portable co-signature certificate exchange and deterministic fork selection.
 - Independent implementation verification of the convergence root contract.
 
 Files likely changed:
@@ -1155,6 +1155,59 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-19 - Added Directory Witness Threshold V1.
+- Files changed:
+  - crates/aeronyx-server/src/config.rs
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/services/mod.rs
+  - deploy/node/server.example.toml
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Architecture:
+  - Added `discovery.directory_observation_witness_min_verified` with a
+    backward-compatible default of one and a hard range of 1-16.
+  - Configuration fails closed when the target exceeds the distinct pinned
+    Directory Sync peer set or is enabled without any pinned peers.
+  - The scheduler now finishes the next mature checkpoint at its forward floor
+    before advancing, instead of stopping after one receipt or perpetually
+    chasing a newer head while an earlier target remains incomplete.
+  - Already retained receipts from current pins are returned by the same
+    bounded audited selection transaction and excluded from duplicate network
+    requests. Receipts from removed pins remain historical evidence but no
+    longer satisfy the current operator target.
+  - Candidate selection remains history-bounded and verifies the candidate,
+    signed predecessor, latest receipt set, durable outcome, exact producer
+    tips, and recomputed overlap root before any request is sent.
+- Status contract:
+  - Additive public/operator fields report the configured target, remaining
+    receipts, all historical latest-sequence receipts, the current-pinned
+    subset, `awaiting_external_receipt` / `below_target` / `target_met` state,
+    and whether the latest checkpoint satisfies the target.
+  - Status re-verifies the bounded latest receipt set and computes threshold
+    state from current pins, preventing removed-pair evidence from producing a
+    false `target_met` result after operator pin rotation.
+  - Full witness identities remain private store/coordinator data used only to
+    prevent duplicate requests; public status exposes aggregate counts only.
+- Compatibility and security semantics:
+  - Existing configurations retain one-receipt behavior.
+  - Directory Sync frames, signed checkpoint format, SQLite schema, admission,
+    cadence, response limits, and privacy boundaries are unchanged.
+  - The threshold is independent recomputation corroboration, not voting
+    weight, quorum consensus, fork choice, financial-chain security, or
+    finality. Portable certificates and fork policy remain future work.
+- Verification:
+  - Threshold, current-pin rotation, retired-pin exclusion, forward-floor
+    scheduling, duplicate/invalid configuration, tampered receipt, and restart
+    persistence coverage passed.
+  - Directory Replica coverage passed: 50 tests across the library and binary
+    targets.
+  - Full `aeronyx-server` regression passed: 1,111 library tests, 2 binary
+    tests, and 1 documentation test passed with 9 intentionally ignored.
+  - `cargo check`, targeted `rustfmt --check`, Clippy correctness, and the
+    optimized release build passed.
+
 2026-07-19 - Added Bounded Witness Selection Audit V1.
 - Files changed:
   - crates/aeronyx-server/src/api/directory_replica_status.rs

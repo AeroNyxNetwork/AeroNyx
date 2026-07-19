@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - Document the bounded independent Directory checkpoint witness target. This
+#   is corroboration evidence only, not consensus, fork choice, or finality.
 # - Add an explicit opt-in ChatRelay blind relay capability block so operators
 #   understand why peer quorum remains below route-ready until relay service,
 #   public peer API, and self-advertisement are all intentionally enabled.
@@ -43,6 +45,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.6.0-node-deploy - Added Directory checkpoint witness threshold guidance.
 # v1.5.0-node-deploy - Added explicit ChatRelay capability opt-in defaults.
 # v1.4.0-node-deploy - Added discovery peer-store and onion-middle controls.
 # v1.3.0-node-deploy - Added VPN transport capability metadata defaults.
@@ -118,6 +121,12 @@ directory_chain_sync_peer_node_ids = []
 # Pulls at most one producer block per pinned peer each round. Keep this at 60
 # seconds or higher so descriptor-object hydration stays within peer rate limits.
 directory_chain_sync_interval_secs = 120
+# Number of distinct current Directory Sync pins that must independently
+# recompute the same mature local observation checkpoint. Valid range: 1-16,
+# and it cannot exceed directory_chain_sync_peer_node_ids. Existing nodes keep
+# one-receipt behavior. Use 2 or more only after compatible pins are deployed.
+# This is corroboration evidence; it is not a vote, consensus, or finality.
+directory_observation_witness_min_verified = 1
 peer_cache_write_interval_secs = 120
 # Optional external rollback witness for the signed verified-delivery cache.
 # Each pin is a 32-byte node Ed25519 identity in hexadecimal. Witnesses retain

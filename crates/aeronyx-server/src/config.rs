@@ -52,6 +52,7 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.14.0-DirectoryWitnessThreshold — Added a bounded independent checkpoint corroboration threshold
 //! v0.13.0-DirectorySyncPins — Added fail-closed Directory Sync peer admission pins
 //! v0.12.0-DirectoryChainStore — Added optional fail-closed local directory ledger path
 //! v0.11.0-VerifiedDeliveryWitnessAdmission — Added explicit witness requester pins
@@ -156,6 +157,14 @@ pub struct DiscoveryConfig {
     /// normal round remains below the peer API's per-minute request budget.
     #[serde(default = "DiscoveryConfig::default_directory_chain_sync_interval_secs")]
     pub directory_chain_sync_interval_secs: u64,
+    /// Minimum independent accepted receipts required for a local observation
+    /// checkpoint to satisfy the external corroboration target.
+    ///
+    /// This is an evidence threshold only. It does not assign voting weight,
+    /// select forks, establish consensus, or grant finality. The default of one
+    /// preserves the original witness behavior for existing configurations.
+    #[serde(default = "DiscoveryConfig::default_directory_observation_witness_min_verified")]
+    pub directory_observation_witness_min_verified: usize,
     /// Operator-pinned nodes that witness the signed delivery-cache generation.
     ///
     /// Witnesses receive only this node's identity, a monotonic generation,
@@ -280,6 +289,12 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_directory_chain_sync_interval_secs() -> u64 {
         120
+    }
+
+    /// Default independent Directory observation witness threshold.
+    #[must_use]
+    pub const fn default_directory_observation_witness_min_verified() -> usize {
+        1
     }
 
     /// Default external cache-anchor witness threshold.
@@ -424,6 +439,16 @@ impl DiscoveryConfig {
             }
         }
 
+        if self.directory_observation_witness_min_verified == 0
+            || self.directory_observation_witness_min_verified
+                > MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.directory_observation_witness_min_verified",
+                format!("must be between 1 and {MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS}"),
+            ));
+        }
+
         if !self.directory_chain_sync_peer_node_ids.is_empty() {
             if self.directory_chain_path.is_none() {
                 return Err(ServerError::config_invalid(
@@ -471,6 +496,19 @@ impl DiscoveryConfig {
                 }
                 validated.push(node_id);
             }
+            if self.directory_observation_witness_min_verified > validated.len() {
+                return Err(ServerError::config_invalid(
+                    "discovery.directory_observation_witness_min_verified",
+                    "must not exceed the number of pinned Directory Sync peers",
+                ));
+            }
+        } else if self.directory_observation_witness_min_verified
+            != Self::default_directory_observation_witness_min_verified()
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.directory_observation_witness_min_verified",
+                "requires at least one discovery.directory_chain_sync_peer_node_ids entry",
+            ));
         }
 
         if !(60..=86_400).contains(&self.directory_chain_sync_interval_secs) {
@@ -796,6 +834,8 @@ impl Default for DiscoveryConfig {
             directory_chain_path: None,
             directory_chain_sync_peer_node_ids: Vec::new(),
             directory_chain_sync_interval_secs: Self::default_directory_chain_sync_interval_secs(),
+            directory_observation_witness_min_verified:
+                Self::default_directory_observation_witness_min_verified(),
             verified_delivery_witness_node_ids: Vec::new(),
             verified_delivery_witness_requester_node_ids: Vec::new(),
             verified_delivery_witness_min_verified:
@@ -1045,6 +1085,10 @@ mod tests {
             config.discovery.directory_chain_sync_interval_secs,
             DiscoveryConfig::default_directory_chain_sync_interval_secs()
         );
+        assert_eq!(
+            config.discovery.directory_observation_witness_min_verified,
+            DiscoveryConfig::default_directory_observation_witness_min_verified()
+        );
         assert!(!config.discovery.gossip_enabled);
         assert_eq!(
             config.discovery.gossip_interval_secs,
@@ -1192,6 +1236,7 @@ directory_chain_sync_peer_node_ids = [
   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 ]
 directory_chain_sync_interval_secs = 180
+directory_observation_witness_min_verified = 1
 peer_cache_write_interval_secs = 120
 gossip_enabled = true
 gossip_interval_secs = 45
@@ -1243,6 +1288,10 @@ advertise_onion_middle = true
             vec![[0xcc; 32]]
         );
         assert_eq!(config.discovery.directory_chain_sync_interval_secs, 180);
+        assert_eq!(
+            config.discovery.directory_observation_witness_min_verified,
+            1
+        );
         assert_eq!(config.discovery.peer_cache_write_interval_secs, 120);
         assert!(config.discovery.gossip_enabled);
         assert_eq!(config.discovery.gossip_interval_secs, 45);
@@ -1462,6 +1511,36 @@ directory_chain_sync_peer_node_ids = [
 ]
 "#;
         assert!(ServerConfig::from_str(duplicate_pins).is_err());
+
+        let zero_witness_threshold = r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+directory_chain_sync_peer_node_ids = [
+  "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+]
+directory_observation_witness_min_verified = 0
+"#;
+        assert!(ServerConfig::from_str(zero_witness_threshold).is_err());
+
+        let witness_threshold_exceeds_pins = r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+directory_chain_sync_peer_node_ids = [
+  "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+]
+directory_observation_witness_min_verified = 2
+"#;
+        assert!(ServerConfig::from_str(witness_threshold_exceeds_pins).is_err());
+
+        let witness_threshold_without_pins = r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+directory_observation_witness_min_verified = 2
+"#;
+        assert!(ServerConfig::from_str(witness_threshold_without_pins).is_err());
     }
 
     #[test]
