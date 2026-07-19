@@ -1200,8 +1200,22 @@ Initial entry:
     documentation test passed with 9 documentation tests intentionally ignored.
   - `cargo clippy --all-targets -- -D clippy::correctness` and the release build
     passed.
-  - Live mature-pipeline status and two-current-pin receipt evidence remain the
-    rollout acceptance gate; they must not be claimed from unit tests alone.
+  - Commit `d575757` was deployed by rolling restart to US1, Korean1, and
+    Noway1 with zero active sessions. Every service returned `active/running`,
+    `NRestarts=0`, and successful startup health after the rollout.
+  - Korean1 recovered from approximately 900 missing blocks to zero lag under
+    the bounded catch-up policy without entering backoff or quarantine.
+  - Before raising policy, US1 checkpoint 297 received two distinct current-pin
+    signed receipts in one round. US1 was then validated and restarted with
+    `directory_observation_witness_min_verified = 2`.
+  - After restart, the threshold-2 runtime accepted two receipts for checkpoint
+    301 with zero evidence-unavailable, verification, or persistence failures.
+  - `observation_witness_pipeline` is a forward-work view: after one checkpoint
+    reaches its target, it may immediately expose the next newly mature
+    checkpoint awaiting the next bounded round. Health assessment therefore
+    combines monotonic checkpoint progress, `last_round_accepted`, and explicit
+    failure counters rather than requiring the queue to remain continuously
+    empty between normal rounds.
 
 2026-07-19 - Added Directory Witness Threshold V1.
 - Files changed:
