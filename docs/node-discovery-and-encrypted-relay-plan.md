@@ -1210,6 +1210,17 @@ Initial entry:
     `cargo fmt --all -- --check` remains blocked by pre-existing formatting
     differences in untouched files; the only new formatting finding was fixed
     before this verification record was written.
+- US1 rollout evidence:
+  - Code commit `54f3bbc` was deployed to US1 only after aggregate VPN health
+    reported zero active sessions. Korean1 and Noway1 were intentionally left
+    unchanged for this milestone.
+  - First startup migrated the replica namespace to schema v7 and appended
+    policy epoch 1 for two configured witnesses with threshold 2. The public
+    aggregate status reported `healthy`, policy `active`, and exact runtime
+    configuration match without exposing policy identities or digests.
+  - A second controlled zero-session restart reported `appended=false`; epoch
+    and row count remained 1, proving restart idempotency. The service remained
+    active with systemd `NRestarts=0`.
 
 2026-07-19 - Added Directory Witness Failure Drills V1.
 - Files changed:
