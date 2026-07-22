@@ -305,6 +305,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v1.0.0-BlindVaultService - Fail-closed initialization and bounded cleanup
+//     for the independent anonymous encrypted-object store
 //   v2.8.34-DirectoryPolicyHeadAnchor - Anchored opaque witness-policy heads at
 //     exact current pins with restart-audited monotonic evidence
 //   v2.8.33-DirectoryWitnessPolicyEpoch - Reconciled signed hash-linked local
@@ -527,9 +529,9 @@ use crate::services::peer_store::{
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
 use crate::services::{
-    spawn_dns_proxy, DirectoryChainAppendReport, DirectoryChainStore, DirectoryReplicaStore,
-    DirectoryReplicaSyncRuntime, HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore,
-    RoutingService, SessionManager,
+    spawn_dns_proxy, BlindVaultService, DirectoryChainAppendReport, DirectoryChainStore,
+    DirectoryReplicaStore, DirectoryReplicaSyncRuntime, HandshakeService, IpPoolService,
+    NodePolicyRuntime, PeerStore, RoutingService, SessionManager,
 };
 // v1.0.0-Membership
 use crate::services::deny_list::DenyList;
@@ -1466,6 +1468,25 @@ impl Server {
             }
             None
         };
+
+        // [BLIND-VAULT-SERVICE 2026-07-23 by Codex] This store is independent
+        // from identity-indexed MemChain and receiver-indexed ChatRelay state.
+        // Explicit enablement is fail-closed: a configured database error must
+        // stop startup rather than silently dropping encrypted recovery data.
+        let blind_vault = if self.config.blind_vault.enabled {
+            let service =
+                BlindVaultService::new(self.config.blind_vault.clone(), self.identity.clone())
+                    .map_err(|error| {
+                        ServerError::startup_failed(format!(
+                            "Blind Vault initialization failed: {error}"
+                        ))
+                    })?;
+            info!("[BLIND_VAULT] Anonymous encrypted-object store initialized");
+            Some(Arc::new(service))
+        } else {
+            info!("[BLIND_VAULT] Disabled");
+            None
+        };
         let chat_relay_runtime_ready = chat_relay.is_some();
 
         let peer_store = self.init_peer_store(chat_relay_runtime_ready).await;
@@ -1669,6 +1690,11 @@ impl Server {
                 }),
             ));
             info!("[CHAT_RELAY] Wallet route cleanup task started (ttl=300s, interval=60s)");
+        }
+
+        if let Some(ref vault) = blind_vault {
+            let cleanup_task = self.spawn_blind_vault_cleanup_task(Arc::clone(vault));
+            tasks.push(("blind-vault-cleanup", cleanup_task));
         }
 
         if let (Some(ref st), Some(ref vi), Some(ref mp), Some(ref aw)) =
@@ -8958,6 +8984,62 @@ impl Server {
                                 };
                                 relay.record_maintenance_worker_failure(reason);
                                 error!(reason, "[CHAT_RELAY] Durable TTL cleanup worker failed");
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Schedules bounded Blind Vault expiry cleanup on the blocking pool.
+    /// Logs contain aggregate counts only and never lease/object identifiers.
+    fn spawn_blind_vault_cleanup_task(&self, vault: Arc<BlindVaultService>) -> JoinHandle<()> {
+        let interval_secs = self.config.blind_vault.cleanup_interval_secs;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            info!(interval_secs, "[BLIND_VAULT] Bounded cleanup task started");
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = timer.tick() => {
+                        let cleanup_vault = Arc::clone(&vault);
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX);
+                        match tokio::task::spawn_blocking(move || {
+                            cleanup_vault.run_cleanup(now_ms)
+                        }).await {
+                            Ok(Ok(report)) => {
+                                if report.objects_removed > 0
+                                    || report.leases_removed > 0
+                                    || report.tombstones_removed > 0
+                                {
+                                    info!(
+                                        objects_removed = report.objects_removed,
+                                        leases_removed = report.leases_removed,
+                                        tombstones_removed = report.tombstones_removed,
+                                        "[BLIND_VAULT] Bounded cleanup completed"
+                                    );
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                warn!(reason = %error, "[BLIND_VAULT] Cleanup failed");
+                            }
+                            Err(join_error) => {
+                                let reason = if join_error.is_panic() {
+                                    "cleanup_worker_panicked"
+                                } else {
+                                    "cleanup_worker_cancelled"
+                                };
+                                error!(reason, "[BLIND_VAULT] Cleanup worker failed");
                             }
                         }
                     }
