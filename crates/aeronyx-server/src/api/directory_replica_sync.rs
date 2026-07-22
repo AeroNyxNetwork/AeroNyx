@@ -98,6 +98,9 @@
 //!   carrier while serving a recovery request.
 //!
 //! ## Last Modified
+//! `v0.15.2-MirrorRecoveryDeadline` - Allowed audited public carriers to
+//! complete within the bounded producer round.
+//! `v0.15.1-MirrorRecoveryDiagnostics` - Added privacy-safe carrier failure diagnostics.
 //! `v0.15.0-MirrorRecovery` - Added direct-first bounded public carrier recovery.
 //! `v0.14.0-FullNodeMirror` - Added bounded rotating non-authoritative mirror pulls.
 //! `v0.13.0-DirectoryPolicyHeadAnchor` - Added bounded external policy-head anchor rounds.
@@ -169,6 +172,12 @@ use crate::services::{
 pub(crate) const DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS: usize = 4;
 /// Hard wall-clock ceiling for one producer within a synchronization round.
 pub(crate) const DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS: u64 = 45;
+/// TCP establishment remains short so unreachable peers fail over promptly.
+const DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS: u64 = 3;
+/// A verified carrier may audit thousands of retained blocks before exporting
+/// one page. Keep the request bounded but leave enough time for that audit;
+/// the independent producer-round deadline still caps the complete operation.
+const DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// Maximum producer-local retry delay after repeated consecutive failures.
 pub(crate) const DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS: u64 =
     DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS;
@@ -476,8 +485,8 @@ impl DirectoryReplicaSyncCoordinator {
         runtime.restore_retry_states(&retry_states);
         let restored_retry_states = retry_states.len();
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
+            .connect_timeout(Duration::from_secs(DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
@@ -1538,7 +1547,13 @@ async fn pull_directory_chain_mirror_page_with_recovery(
                         return Ok((outcome, DirectoryMirrorPullSource::PublicCarrier));
                     }
                     Err(carrier_reason)
-                        if directory_mirror_failure_allows_recovery(&carrier_reason) => {}
+                        if directory_mirror_failure_allows_recovery(&carrier_reason) =>
+                    {
+                        debug!(
+                            reason = carrier_reason,
+                            "[DIRECTORY_REPLICA] Full-node Mirror recovery carrier unavailable"
+                        );
+                    }
                     Err(carrier_reason) => {
                         return Err(DirectoryMirrorPullFailure {
                             reason: carrier_reason,
@@ -2776,6 +2791,14 @@ mod tests {
     #[test]
     fn mirror_recovery_is_bounded_and_rejects_security_failures() {
         assert_eq!(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE, 2);
+        let recovery_carrier_count =
+            u64::try_from(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE)
+                .expect("bounded recovery carrier count fits u64");
+        assert!(
+            DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS
+                * (1 + recovery_carrier_count)
+                < DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS
+        );
         for reason in [
             "directory_range_transport_failed",
             "directory_objects_transport_failed",
