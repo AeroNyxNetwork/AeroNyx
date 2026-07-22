@@ -15,6 +15,7 @@
 //! - Encodes a fixed, allocation-bounded binary request/response contract.
 //! - Publishes authenticated, public-only key epochs for safe rotation.
 //! - Runs private RSA operations on Tokio's blocking pool.
+//! - Holds concurrency capacity until custody work ends, even after cancellation.
 //!
 //! ## Calling Relationships
 //! `main.rs` binds this router to loopback; `signer.rs` performs the private
@@ -26,10 +27,12 @@
 //!
 //! ## Next Developer Guide
 //! Keep authentication and pressure middleware outside the `Bytes` extractor.
-//! Never add wallet/account headers or request-body diagnostics.
+//! The in-flight guard must move into the blocking operation so client
+//! cancellation cannot release HSM capacity early. Never add wallet/account
+//! headers or request-body diagnostics.
 //!
-//! Last Modified: v0.2.0-BlindIssuerApi - Added bounded epoch snapshots and
-//! separated authorization from private-operation pressure controls.
+//! Last Modified: v0.2.1-BlindIssuerApi - Made private-operation concurrency
+//! permits cancellation-safe across the blocking custody boundary.
 //! ============================================
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,7 +51,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Extension, Router};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -207,10 +210,10 @@ async fn authorization_gate(
 
 async fn signing_pressure_gate(
     State(state): State<ApiState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(_guard) = InFlightGuard::try_acquire(&state.in_flight, state.max_in_flight) else {
+    let Some(guard) = InFlightGuard::try_acquire(&state.in_flight, state.max_in_flight) else {
         return empty_response(StatusCode::TOO_MANY_REQUESTS);
     };
     if !state
@@ -220,10 +223,19 @@ async fn signing_pressure_gate(
     {
         return empty_response(StatusCode::TOO_MANY_REQUESTS);
     }
+    // [BLIND-ISSUER-CANCEL 2026-07-23 by Codex] The handler clones this guard
+    // into `spawn_blocking`. Dropping a disconnected HTTP request therefore
+    // cannot advertise capacity while its non-cancellable HSM call still runs.
+    request.extensions_mut().insert(Arc::new(guard));
     next.run(request).await
 }
 
-async fn sign_handler(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn sign_handler(
+    State(state): State<ApiState>,
+    Extension(operation_guard): Extension<Arc<InFlightGuard>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     if headers.get(header::CONTENT_TYPE).map(HeaderValue::as_bytes)
         != Some(BLIND_ISSUER_CONTENT_TYPE.as_bytes())
     {
@@ -233,7 +245,12 @@ async fn sign_handler(State(state): State<ApiState>, headers: HeaderMap, body: B
         return empty_response(StatusCode::BAD_REQUEST);
     };
     let signer = Arc::clone(&state.signer);
-    let result = tokio::task::spawn_blocking(move || signer.sign(&request, now_millis())).await;
+    let result = tokio::task::spawn_blocking(move || {
+        let result = signer.sign(&request, now_millis());
+        drop(operation_guard);
+        result
+    })
+    .await;
     match result {
         Ok(Ok(response)) => binary_response(&response),
         Ok(Err(BlindSignError::InvalidRequest)) => empty_response(StatusCode::BAD_REQUEST),
@@ -562,6 +579,8 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::{Condvar, Mutex as StdMutex};
+    use std::time::Duration;
 
     use aeronyx_core::protocol::blind_vault::BlindVaultBlindAdmissionToken;
     use axum::body::to_bytes;
@@ -571,6 +590,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::{BlindIssuerConfig, BlindIssuerKeyConfig};
+    use crate::signer::{BlindSigningBackend, BlindSigningBackendError, BlindSigningKey};
 
     const BACKEND_TOKEN: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
 
@@ -583,6 +603,132 @@ mod tests {
             .expect("create secret");
         file.write_all(bytes).expect("write secret");
         file.sync_all().expect("sync secret");
+    }
+
+    struct BlockingBackend {
+        release: Arc<(StdMutex<bool>, Condvar)>,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        completed: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    impl BlindSigningBackend for BlockingBackend {
+        fn sign_blinded(
+            &self,
+            _blinded_message: &[u8],
+        ) -> Result<Vec<u8>, BlindSigningBackendError> {
+            self.started
+                .send(())
+                .map_err(|_| BlindSigningBackendError)?;
+            let (lock, wake) = self.release.as_ref();
+            let mut released = lock.lock().map_err(|_| BlindSigningBackendError)?;
+            while !*released {
+                released = wake.wait(released).map_err(|_| BlindSigningBackendError)?;
+            }
+            drop(released);
+            self.completed
+                .send(())
+                .map_err(|_| BlindSigningBackendError)?;
+            Ok(vec![0; MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES])
+        }
+    }
+
+    fn authorized_sign_http_request(body: Vec<u8>, authorization: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/internal/v1/blind-sign")
+            .header(header::AUTHORIZATION, authorization)
+            .header(header::CONTENT_TYPE, BLIND_ISSUER_CONTENT_TYPE)
+            .body(Body::from(body))
+            .expect("authorized signing request")
+    }
+
+    #[tokio::test]
+    async fn cancelled_requests_hold_capacity_until_backend_completion() {
+        let now_ms = now_millis();
+        let key_pair =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("RSA key pair");
+        let public_epoch = BlindVaultBlindIssuerEpoch::new(
+            key_pair.pk.to_der().expect("public DER"),
+            now_ms - 60_000,
+            now_ms + 24 * 60 * 60 * 1_000,
+            7 * 24 * 60 * 60 * 1_000,
+        );
+        let issuer_key_id = public_epoch.issuer_key_id;
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let signer = Arc::new(
+            BlindSigner::from_signing_keys(vec![BlindSigningKey::new(
+                public_epoch,
+                Box::new(BlockingBackend {
+                    release: Arc::clone(&release),
+                    started: started_tx,
+                    completed: completed_tx,
+                }),
+            )
+            .expect("blocking signing key")])
+            .expect("blocking signer"),
+        );
+        let router = build_router(signer, Zeroizing::new(BACKEND_TOKEN.to_vec()), 128, 1);
+        let request = BlindSignRequest {
+            version: BLIND_VAULT_BLIND_ADMISSION_VERSION,
+            issuer_key_id,
+            blinded_message: vec![3; MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES],
+        };
+        let body = encode_sign_request(&request).expect("encode request");
+        let authorization = format!(
+            "Bearer {}",
+            std::str::from_utf8(BACKEND_TOKEN).expect("ASCII backend token")
+        );
+
+        let first_router = router.clone();
+        let first_body = body.clone();
+        let first_authorization = authorization.clone();
+        let first = tokio::spawn(async move {
+            first_router
+                .oneshot(authorized_sign_http_request(
+                    first_body,
+                    &first_authorization,
+                ))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .expect("backend start should not time out")
+            .expect("backend operation started");
+        first.abort();
+        assert!(first
+            .await
+            .expect_err("request should be cancelled")
+            .is_cancelled());
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            router
+                .clone()
+                .oneshot(authorized_sign_http_request(body.clone(), &authorization)),
+        )
+        .await;
+
+        let (lock, wake) = release.as_ref();
+        *lock.lock().expect("release lock") = true;
+        wake.notify_all();
+        tokio::time::timeout(Duration::from_secs(2), completed_rx.recv())
+            .await
+            .expect("backend completion should not time out")
+            .expect("backend operation completed");
+
+        let second_status = second
+            .expect("capacity rejection should not block")
+            .expect("capacity response")
+            .status();
+        assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
+
+        let recovered = router
+            .oneshot(authorized_sign_http_request(body, &authorization))
+            .await
+            .expect("recovered response");
+        assert_eq!(recovered.status(), StatusCode::OK);
     }
 
     #[tokio::test]
