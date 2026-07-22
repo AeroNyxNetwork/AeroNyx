@@ -46,7 +46,8 @@
 //!   candidate, its predecessor, the latest receipt set, and durable outcome;
 //!   startup and explicit audits still verify the complete retained history.
 //! - Exports bounded producer blocks and descriptors only after a complete
-//!   audit inside the same `SQLite` read transaction for signed carrier use.
+//!   producer-scoped audit inside the same `SQLite` read transaction for
+//!   signed carrier use, without rescanning unrelated producer histories.
 //! - Retains a bounded, durable registry for permissionless full-node mirrors
 //!   without granting those producers checkpoint, witness, or policy authority.
 //! - Gates public carrier recovery reads on that durable mirror registry while
@@ -88,7 +89,8 @@
 //! 13. Admit dynamically discovered mirrors into a capacity-bounded registry;
 //!     promote them out of mirror status atomically if later operator-pinned.
 //! 14. Permit public recovery reads only for producers still present in that
-//!     registry, while preserving the general reader for pinned authority use.
+//!     registry, while preserving the general reader for pinned authority use;
+//!     re-audit the complete requested producer namespace transactionally.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -123,6 +125,9 @@
 //!   this store. The receiver must still verify producer and carrier signatures.
 //! - Public carrier reads must call `audited_mirror_evidence_*`; never use the
 //!   general authority reader to bypass durable mirror membership.
+//! - Producer-scoped export audits may skip unrelated chain histories, but must
+//!   still verify metadata, mirror admission when required, and every block,
+//!   commitment, object, signature, linkage, index, and tip for the target.
 //! - Incident evidence export is read-only. Quarantine resolution requires a
 //!   separately authenticated, audited compare-and-swap command boundary.
 //! - Never expose [`DirectoryReplicaStore::resolve_quarantine`] through the
@@ -130,6 +135,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.19.1-ProducerScopedExportAudit - Isolated transactional carrier audits
+//! by producer without weakening target-chain verification
 //! v0.19.0-MirrorRecovery - Added registry-gated public recovery reads and carrier import tests
 //! v0.18.0-FullNodeMirror - Added schema v9 bounded non-authoritative mirror registry
 //! v0.17.0-DirectoryPolicyHeadAnchor - Added schema v8 opaque external policy-head anchors and signed receipts
@@ -2216,8 +2223,8 @@ impl DirectoryReplicaStore {
         Ok(promoted)
     }
 
-    /// Audits the complete replica namespace, then exports one bounded producer
-    /// page from the same read transaction.
+    /// Audits the complete requested producer namespace, then exports one
+    /// bounded page from the same read transaction.
     ///
     /// # Errors
     /// Returns [`DirectoryReplicaStoreError`] for invalid bounds, a missing or
@@ -2259,9 +2266,16 @@ impl DirectoryReplicaStore {
         }
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        Self::audit_connection(&transaction, &self.local_node_id, observed_at)?;
-        Self::require_evidence_scope(&transaction, producer, scope)?;
-        let tip = Self::load_tip(&transaction, producer)?;
+        // [DIRECTORY-PRODUCER-AUDIT 2026-07-22 by Codex] Keep export
+        // verification fail-closed for the target without coupling availability
+        // to unrelated producer, checkpoint, witness, or retry histories.
+        let tip = Self::audit_evidence_producer(
+            &transaction,
+            &self.local_node_id,
+            producer,
+            observed_at,
+            scope,
+        )?;
         if tip.quarantined {
             return Err(DirectoryReplicaStoreError::Quarantined(
                 tip.quarantine_kind
@@ -2329,8 +2343,9 @@ impl DirectoryReplicaStore {
         )
     }
 
-    /// Audits the complete replica namespace, then loads exact producer-bound
-    /// descriptor objects from the same read transaction and in request order.
+    /// Audits the complete requested producer namespace, then loads exact
+    /// producer-bound descriptor objects from the same read transaction and in
+    /// request order.
     ///
     /// `Ok(None)` means at least one requested object is not retained for this
     /// producer. Partial responses are never returned.
@@ -2375,9 +2390,15 @@ impl DirectoryReplicaStore {
         }
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        Self::audit_connection(&transaction, &self.local_node_id, observed_at)?;
-        Self::require_evidence_scope(&transaction, producer, scope)?;
-        let tip = Self::load_tip(&transaction, producer)?;
+        // [DIRECTORY-PRODUCER-AUDIT 2026-07-22 by Codex] Object hydration uses
+        // the identical producer-scoped audit boundary as block export.
+        let tip = Self::audit_evidence_producer(
+            &transaction,
+            &self.local_node_id,
+            producer,
+            observed_at,
+            scope,
+        )?;
         if tip.quarantined {
             return Err(DirectoryReplicaStoreError::Quarantined(
                 tip.quarantine_kind
@@ -2434,6 +2455,32 @@ impl DirectoryReplicaStore {
             observed_at,
             DirectoryReplicaEvidenceScope::RetainedMirror,
         )
+    }
+
+    /// Re-verifies one complete producer namespace for a transactional export.
+    ///
+    /// [DIRECTORY-PRODUCER-AUDIT 2026-07-22 by Codex] A carrier must remain a
+    /// blind transport for independently signed public evidence. This helper
+    /// deliberately avoids a cache or database-supplied watermark: metadata and
+    /// public mirror admission are checked first, then every target block,
+    /// commitment, descriptor object, signature, hash link, index, and tip is
+    /// verified before any evidence is read from the same transaction.
+    fn audit_evidence_producer(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        producer: &[u8; 32],
+        observed_at: u64,
+        scope: DirectoryReplicaEvidenceScope,
+    ) -> Result<DirectoryReplicaTip, DirectoryReplicaStoreError> {
+        Self::validate_metadata(connection, local_node_id)?;
+        if scope == DirectoryReplicaEvidenceScope::RetainedMirror {
+            Self::audit_mirror_registry(connection, local_node_id)?;
+        }
+        Self::require_evidence_scope(connection, producer, scope)?;
+        let tip = Self::load_tip(connection, producer)?;
+        let mut report = DirectoryReplicaAudit::default();
+        Self::audit_producer(connection, &tip, observed_at, &mut report)?;
+        Ok(tip)
     }
 
     fn require_evidence_scope(
@@ -8463,6 +8510,122 @@ mod tests {
                 NOW + 20,
             ),
             Err(DirectoryReplicaStoreError::Request(_))
+        ));
+    }
+
+    #[test]
+    fn producer_scoped_export_fails_closed_without_cross_producer_coupling() {
+        // [DIRECTORY-PRODUCER-AUDIT 2026-07-22 by Codex] Prove that public
+        // export re-verifies every target object while an unrelated namespace
+        // cannot turn one producer's availability into a global failure.
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x21; 32]).unwrap();
+        let target = IdentityKeyPair::from_bytes(&[0x22; 32]).unwrap();
+        let unrelated = IdentityKeyPair::from_bytes(&[0x23; 32]).unwrap();
+        let target_subject = IdentityKeyPair::from_bytes(&[0x24; 32]).unwrap();
+        let unrelated_subject = IdentityKeyPair::from_bytes(&[0x25; 32]).unwrap();
+        let target_object = descriptor(&target_subject, 1);
+        let unrelated_object = descriptor(&unrelated_subject, 1);
+        let target_block = block(&target, 1, [0u8; 32], &target_object);
+        let unrelated_block = block(&unrelated, 1, [0u8; 32], &unrelated_object);
+        let target_frame = response_frame(
+            &target,
+            vec![target_block.clone()],
+            false,
+            1,
+            target_block.hash(),
+            [0x26; 16],
+        );
+        let unrelated_frame = response_frame(
+            &unrelated,
+            vec![unrelated_block.clone()],
+            false,
+            1,
+            unrelated_block.hash(),
+            [0x27; 16],
+        );
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        store
+            .import_verified_mirror_page(
+                target.public_key_bytes(),
+                11,
+                4,
+                std::slice::from_ref(&target_block),
+                std::slice::from_ref(&target_object),
+                1,
+                target_block.hash(),
+                &target_frame,
+                NOW + 20,
+            )
+            .unwrap();
+        store
+            .import_verified_mirror_page(
+                unrelated.public_key_bytes(),
+                12,
+                4,
+                std::slice::from_ref(&unrelated_block),
+                std::slice::from_ref(&unrelated_object),
+                1,
+                unrelated_block.hash(),
+                &unrelated_frame,
+                NOW + 20,
+            )
+            .unwrap();
+
+        let external = Connection::open(&path).unwrap();
+        external
+            .execute(
+                "UPDATE directory_replica_blocks SET block_hash = ?2
+                 WHERE producer = ?1 AND height = 1",
+                params![
+                    unrelated.public_key_bytes().as_slice(),
+                    [0xff_u8; 32].as_slice()
+                ],
+            )
+            .unwrap();
+        let page = store
+            .audited_mirror_evidence_page(&target.public_key_bytes(), 1, 1, NOW + 21)
+            .unwrap();
+        assert_eq!(page.blocks, vec![target_block.clone()]);
+        assert!(matches!(
+            store.audit(NOW + 21),
+            Err(DirectoryReplicaStoreError::Integrity(_))
+        ));
+
+        external
+            .execute(
+                "UPDATE directory_replica_blocks SET block_hash = ?2
+                 WHERE producer = ?1 AND height = 1",
+                params![
+                    unrelated.public_key_bytes().as_slice(),
+                    unrelated_block.hash().as_slice()
+                ],
+            )
+            .unwrap();
+        assert!(store.audit(NOW + 21).is_ok());
+        external
+            .execute(
+                "UPDATE directory_replica_blocks SET block_hash = ?2
+                 WHERE producer = ?1 AND height = 1",
+                params![
+                    target.public_key_bytes().as_slice(),
+                    [0xee_u8; 32].as_slice()
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.audited_mirror_evidence_page(&target.public_key_bytes(), 1, 1, NOW + 21),
+            Err(DirectoryReplicaStoreError::Integrity(_))
+        ));
+        assert!(matches!(
+            store.audited_mirror_evidence_descriptor_objects(
+                &target.public_key_bytes(),
+                &[target_block.commitments[0].descriptor_hash],
+                NOW + 21,
+            ),
+            Err(DirectoryReplicaStoreError::Integrity(_))
         ));
     }
 
