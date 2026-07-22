@@ -13,6 +13,7 @@
 //! - Rejects non-loopback listeners and unbounded key epochs.
 //! - Reads secrets with `O_NOFOLLOW`, bounded allocation, and owner-only mode.
 //! - Keeps secret bytes in zeroizing buffers until cryptographic parsing.
+//! - Bounds how long HTTP callers wait for non-cancellable custody operations.
 //!
 //! ## Calling Relationships
 //! `main.rs` loads this policy; `signer.rs` consumes key files; `api.rs`
@@ -26,7 +27,7 @@
 //! Do not add inline private keys or bearer tokens to TOML/environment values.
 //! Secret-manager integration should implement a separate custody backend.
 //!
-//! Last Modified: v0.1.1-BlindIssuerConfig - Enforce absolute, same-owner secrets.
+//! Last Modified: v0.2.0-BlindIssuerConfig - Added bounded signing timeout.
 //! ============================================
 
 use std::collections::HashSet;
@@ -34,6 +35,7 @@ use std::fs::File;
 use std::io::{Read, Take};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use aeronyx_core::protocol::blind_vault::{
     MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS, MAX_BLIND_VAULT_BLIND_ISSUER_EPOCH_MS,
@@ -48,6 +50,11 @@ const MAX_AUTH_TOKEN_BYTES: u64 = 256;
 const MIN_AUTH_TOKEN_BYTES: usize = 32;
 const MAX_AUTH_TOKEN_LENGTH: usize = 128;
 const MAX_LEASE_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+const MIN_SIGNING_TIMEOUT_MS: u64 = 100;
+const MAX_SIGNING_TIMEOUT_MS: u64 = 120_000;
+
+/// Default caller wait bound for one private custody operation.
+pub const DEFAULT_SIGNING_TIMEOUT_MS: u64 = 10_000;
 
 /// Fail-closed issuer startup/configuration failures.
 #[derive(Debug, Error)]
@@ -109,6 +116,10 @@ pub struct BlindIssuerConfig {
     /// Maximum concurrent private-key operations.
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
+    /// Caller wait bound for one private operation; the operation retains its
+    /// capacity permit if the HTTP response times out before an HSM returns.
+    #[serde(default = "default_signing_timeout_ms")]
+    pub signing_timeout_ms: u64,
     /// Rotating private-key epochs. Overlap is allowed for safe rollout.
     pub keys: Vec<BlindIssuerKeyConfig>,
 }
@@ -150,6 +161,11 @@ impl BlindIssuerConfig {
         if self.max_in_flight == 0 || self.max_in_flight > 64 {
             return Err(ConfigError::InvalidPolicy(
                 "max_in_flight must be between 1 and 64",
+            ));
+        }
+        if !(MIN_SIGNING_TIMEOUT_MS..=MAX_SIGNING_TIMEOUT_MS).contains(&self.signing_timeout_ms) {
+            return Err(ConfigError::InvalidPolicy(
+                "signing_timeout_ms must be between 100 and 120000",
             ));
         }
         if self.keys.is_empty() || self.keys.len() > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS {
@@ -219,6 +235,12 @@ impl BlindIssuerConfig {
         }
         Ok(token)
     }
+
+    /// Returns the validated caller wait bound for one signing operation.
+    #[must_use]
+    pub const fn signing_timeout(&self) -> Duration {
+        Duration::from_millis(self.signing_timeout_ms)
+    }
 }
 
 pub(crate) fn read_private_key_der(path: &Path) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
@@ -231,6 +253,10 @@ const fn default_max_requests_per_second() -> u64 {
 
 const fn default_max_in_flight() -> usize {
     8
+}
+
+const fn default_signing_timeout_ms() -> u64 {
+    DEFAULT_SIGNING_TIMEOUT_MS
 }
 
 fn read_bounded_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, ConfigError> {
@@ -312,6 +338,7 @@ mod tests {
             auth_token_file: token_path.clone(),
             max_requests_per_second: 128,
             max_in_flight: 8,
+            signing_timeout_ms: DEFAULT_SIGNING_TIMEOUT_MS,
             keys: vec![BlindIssuerKeyConfig {
                 private_key_der_file: directory.path().join("issuer.der"),
                 not_before_unix_secs: 1_800_000_000,
@@ -335,6 +362,7 @@ mod tests {
             auth_token_file: PathBuf::from("/var/lib/aeronyx/backend.token"),
             max_requests_per_second: 128,
             max_in_flight: 8,
+            signing_timeout_ms: DEFAULT_SIGNING_TIMEOUT_MS,
             keys: vec![BlindIssuerKeyConfig {
                 private_key_der_file: PathBuf::from("/var/lib/aeronyx/issuer.der"),
                 not_before_unix_secs: 1,
@@ -362,6 +390,7 @@ mod tests {
             auth_token_file: PathBuf::from("backend.token"),
             max_requests_per_second: 128,
             max_in_flight: 8,
+            signing_timeout_ms: DEFAULT_SIGNING_TIMEOUT_MS,
             keys: vec![BlindIssuerKeyConfig {
                 private_key_der_file: PathBuf::from("/var/lib/aeronyx/issuer.der"),
                 not_before_unix_secs: 1,
@@ -373,6 +402,34 @@ mod tests {
 
         config.auth_token_file = PathBuf::from("/var/lib/aeronyx/backend.token");
         config.keys[0].private_key_der_file = PathBuf::from("issuer.der");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn signing_timeout_is_bounded_and_defaults_for_old_configs() {
+        let legacy_toml = r#"
+listen_addr = "127.0.0.1:9191"
+auth_token_file = "/var/lib/aeronyx/backend.token"
+max_requests_per_second = 128
+max_in_flight = 8
+
+[[keys]]
+private_key_der_file = "/var/lib/aeronyx/issuer.der"
+not_before_unix_secs = 1
+expires_at_unix_secs = 2
+max_lease_ttl_secs = 1
+"#;
+        let mut config: BlindIssuerConfig = toml::from_str(legacy_toml).expect("legacy config");
+        assert_eq!(config.signing_timeout_ms, DEFAULT_SIGNING_TIMEOUT_MS);
+        assert_eq!(
+            config.signing_timeout(),
+            Duration::from_millis(DEFAULT_SIGNING_TIMEOUT_MS)
+        );
+        assert!(config.validate().is_ok());
+
+        config.signing_timeout_ms = MIN_SIGNING_TIMEOUT_MS - 1;
+        assert!(config.validate().is_err());
+        config.signing_timeout_ms = MAX_SIGNING_TIMEOUT_MS + 1;
         assert!(config.validate().is_err());
     }
 }

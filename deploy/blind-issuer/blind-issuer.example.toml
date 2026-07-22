@@ -11,7 +11,7 @@
 # Main Functionality:
 # - Pins a loopback-only backend API.
 # - References owner-only token and private-key files by absolute path.
-# - Bounds private operations and key epoch policy.
+# - Bounds private operations, caller wait time, and key epoch policy.
 #
 # Dependencies:
 # - crates/aeronyx-blind-issuer/src/config.rs
@@ -23,13 +23,16 @@
 # - Never inline token/key bytes or copy this file to a decentralized node.
 # - Epoch duration must not exceed 31 days.
 #
-# Last Modified: v1.0.0-BlindIssuerDeploy - Initial fail-closed template.
+# Last Modified: v1.1.0-BlindIssuerDeploy - Added bounded signing timeout.
 # ============================================
 
 listen_addr = "127.0.0.1:9191"
 auth_token_file = "/var/lib/aeronyx-blind-issuer/backend.token"
 max_requests_per_second = 128
 max_in_flight = 8
+# Ends the HTTP wait after 10 seconds. A timed-out HSM operation keeps its
+# max_in_flight permit until the device actually returns.
+signing_timeout_ms = 10000
 
 # Replace this path and both timestamps before enabling the service. Keep the
 # old and new [[keys]] entries together during a bounded rotation overlap.

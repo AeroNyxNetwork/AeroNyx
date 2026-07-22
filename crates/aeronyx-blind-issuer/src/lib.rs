@@ -35,7 +35,7 @@
 //! - Production key custody should migrate behind a KMS/HSM implementation of
 //!   the signer boundary without changing the internal wire contract.
 //!
-//! Last Modified: v0.2.0-BlindIssuer - Added replaceable custody backend API.
+//! Last Modified: v0.3.0-BlindIssuer - Added bounded custody response deadlines.
 //! ============================================
 
 pub mod api;
@@ -43,11 +43,13 @@ pub mod config;
 pub mod signer;
 
 pub use api::{
-    build_router, decode_epoch_snapshot, decode_sign_response, encode_epoch_snapshot,
-    encode_sign_request, BlindIssuerEpochSnapshot, BLIND_ISSUER_CONTENT_TYPE,
-    BLIND_ISSUER_EPOCH_CONTENT_TYPE,
+    build_router, build_router_with_timeout, decode_epoch_snapshot, decode_sign_response,
+    encode_epoch_snapshot, encode_sign_request, BlindIssuerEpochSnapshot,
+    BLIND_ISSUER_CONTENT_TYPE, BLIND_ISSUER_EPOCH_CONTENT_TYPE,
 };
-pub use config::{BlindIssuerConfig, BlindIssuerKeyConfig, ConfigError};
+pub use config::{
+    BlindIssuerConfig, BlindIssuerKeyConfig, ConfigError, DEFAULT_SIGNING_TIMEOUT_MS,
+};
 pub use signer::{
     BlindSignError, BlindSignRequest, BlindSignResponse, BlindSigner, BlindSignerBuildError,
     BlindSigningBackend, BlindSigningBackendError, BlindSigningKey,

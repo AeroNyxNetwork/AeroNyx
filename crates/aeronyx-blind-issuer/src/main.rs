@@ -10,6 +10,7 @@
 //!
 //! ## Main Functionality
 //! - Serves the loopback-only authenticated blind-signing API.
+//! - Applies a bounded caller deadline without cancelling custody operations.
 //! - Generates owner-only RSA private-key files and public registration data.
 //! - Generates owner-only random backend bearer-token files.
 //!
@@ -21,7 +22,7 @@
 //! Keep key generation explicit and `create_new`; never overwrite custody
 //! material. Add systemd hardening in deployment packaging, not runtime code.
 //!
-//! Last Modified: v0.1.1-BlindIssuerBinary - Graceful SIGTERM shutdown.
+//! Last Modified: v0.2.0-BlindIssuerBinary - Added configured signing deadline.
 //! ============================================
 
 use std::error::Error;
@@ -38,7 +39,7 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 use zeroize::Zeroizing;
 
-use aeronyx_blind_issuer::{build_router, BlindIssuerConfig, BlindSigner};
+use aeronyx_blind_issuer::{build_router_with_timeout, BlindIssuerConfig, BlindSigner};
 
 #[derive(Debug, Parser)]
 #[command(name = "aeronyx-blind-issuer")]
@@ -97,14 +98,21 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
     let auth_token = config.load_auth_token()?;
     let signer = Arc::new(BlindSigner::from_config(&config)?);
     let key_count = signer.key_count();
-    let router = build_router(
+    let signing_timeout = config.signing_timeout();
+    let router = build_router_with_timeout(
         signer,
         auth_token,
         config.max_requests_per_second,
         config.max_in_flight,
+        signing_timeout,
     );
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    info!(%listen_addr, key_count, "blind issuer ready");
+    info!(
+        %listen_addr,
+        key_count,
+        signing_timeout_ms = config.signing_timeout_ms,
+        "blind issuer ready"
+    );
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

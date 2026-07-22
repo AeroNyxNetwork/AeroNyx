@@ -31,13 +31,13 @@
 //! cancellation cannot release HSM capacity early. Never add wallet/account
 //! headers or request-body diagnostics.
 //!
-//! Last Modified: v0.2.1-BlindIssuerApi - Made private-operation concurrency
-//! permits cancellation-safe across the blocking custody boundary.
+//! Last Modified: v0.3.0-BlindIssuerApi - Added cancellation-safe custody
+//! response deadlines while preserving the original router entry point.
 //! ============================================
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::blind_vault::{
     BlindVaultBlindIssuerEpoch, BLIND_VAULT_BLIND_ADMISSION_VERSION,
@@ -58,6 +58,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::config::DEFAULT_SIGNING_TIMEOUT_MS;
 use crate::signer::{BlindSignError, BlindSignRequest, BlindSignResponse, BlindSigner};
 
 const REQUEST_MAGIC: [u8; 4] = *b"ANBI";
@@ -107,6 +108,7 @@ struct ApiState {
     max_in_flight: usize,
     rate: Arc<Mutex<RateWindow>>,
     max_requests_per_second: u64,
+    signing_timeout: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -170,6 +172,26 @@ pub fn build_router(
     max_requests_per_second: u64,
     max_in_flight: usize,
 ) -> Router {
+    build_router_with_timeout(
+        signer,
+        auth_token,
+        max_requests_per_second,
+        max_in_flight,
+        Duration::from_millis(DEFAULT_SIGNING_TIMEOUT_MS),
+    )
+}
+
+/// Builds the local signer router with an explicit custody response deadline.
+///
+/// A timeout ends only the HTTP wait. The private operation keeps its in-flight
+/// permit until the software/HSM/KMS backend actually returns.
+pub fn build_router_with_timeout(
+    signer: Arc<BlindSigner>,
+    auth_token: Zeroizing<Vec<u8>>,
+    max_requests_per_second: u64,
+    max_in_flight: usize,
+    signing_timeout: Duration,
+) -> Router {
     let state = ApiState {
         signer,
         auth_token: Arc::new(auth_token),
@@ -177,6 +199,7 @@ pub fn build_router(
         max_in_flight,
         rate: Arc::new(Mutex::new(RateWindow::default())),
         max_requests_per_second,
+        signing_timeout,
     };
     let signing = Router::new()
         .route("/internal/v1/blind-sign", post(sign_handler))
@@ -245,21 +268,21 @@ async fn sign_handler(
         return empty_response(StatusCode::BAD_REQUEST);
     };
     let signer = Arc::clone(&state.signer);
-    let result = tokio::task::spawn_blocking(move || {
+    let operation = tokio::task::spawn_blocking(move || {
         let result = signer.sign(&request, now_millis());
         drop(operation_guard);
         result
-    })
-    .await;
-    match result {
-        Ok(Ok(response)) => binary_response(&response),
-        Ok(Err(BlindSignError::InvalidRequest)) => empty_response(StatusCode::BAD_REQUEST),
-        Ok(Err(BlindSignError::UnknownIssuer | BlindSignError::InactiveIssuer)) => {
+    });
+    match tokio::time::timeout(state.signing_timeout, operation).await {
+        Ok(Ok(Ok(response))) => binary_response(&response),
+        Ok(Ok(Err(BlindSignError::InvalidRequest))) => empty_response(StatusCode::BAD_REQUEST),
+        Ok(Ok(Err(BlindSignError::UnknownIssuer | BlindSignError::InactiveIssuer))) => {
             empty_response(StatusCode::FORBIDDEN)
         }
-        Ok(Err(BlindSignError::SigningFailed)) | Err(_) => {
+        Ok(Ok(Err(BlindSignError::SigningFailed)) | Err(_)) => {
             empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
+        Err(_) => empty_response(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 
@@ -642,48 +665,93 @@ mod tests {
             .expect("authorized signing request")
     }
 
+    struct BlockingFixture {
+        router: Router,
+        body: Vec<u8>,
+        authorization: String,
+        release: Arc<(StdMutex<bool>, Condvar)>,
+        started: tokio::sync::mpsc::UnboundedReceiver<()>,
+        completed: tokio::sync::mpsc::UnboundedReceiver<()>,
+    }
+
+    impl BlockingFixture {
+        fn new(signing_timeout: Duration) -> Self {
+            let now_ms = now_millis();
+            let key_pair =
+                KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("RSA key pair");
+            let public_epoch = BlindVaultBlindIssuerEpoch::new(
+                key_pair.pk.to_der().expect("public DER"),
+                now_ms - 60_000,
+                now_ms + 24 * 60 * 60 * 1_000,
+                7 * 24 * 60 * 60 * 1_000,
+            );
+            let issuer_key_id = public_epoch.issuer_key_id;
+            let release = Arc::new((StdMutex::new(false), Condvar::new()));
+            let (started_tx, started) = tokio::sync::mpsc::unbounded_channel();
+            let (completed_tx, completed) = tokio::sync::mpsc::unbounded_channel();
+            let signer = Arc::new(
+                BlindSigner::from_signing_keys(vec![BlindSigningKey::new(
+                    public_epoch,
+                    Box::new(BlockingBackend {
+                        release: Arc::clone(&release),
+                        started: started_tx,
+                        completed: completed_tx,
+                    }),
+                )
+                .expect("blocking signing key")])
+                .expect("blocking signer"),
+            );
+            let router = build_router_with_timeout(
+                signer,
+                Zeroizing::new(BACKEND_TOKEN.to_vec()),
+                128,
+                1,
+                signing_timeout,
+            );
+            let request = BlindSignRequest {
+                version: BLIND_VAULT_BLIND_ADMISSION_VERSION,
+                issuer_key_id,
+                blinded_message: vec![3; MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES],
+            };
+            let authorization = format!(
+                "Bearer {}",
+                std::str::from_utf8(BACKEND_TOKEN).expect("ASCII backend token")
+            );
+            Self {
+                router,
+                body: encode_sign_request(&request).expect("encode request"),
+                authorization,
+                release,
+                started,
+                completed,
+            }
+        }
+
+        async fn wait_started(&mut self) {
+            tokio::time::timeout(Duration::from_secs(2), self.started.recv())
+                .await
+                .expect("backend start should not time out")
+                .expect("backend operation started");
+        }
+
+        async fn release_and_wait(&mut self) {
+            let (lock, wake) = self.release.as_ref();
+            *lock.lock().expect("release lock") = true;
+            wake.notify_all();
+            tokio::time::timeout(Duration::from_secs(2), self.completed.recv())
+                .await
+                .expect("backend completion should not time out")
+                .expect("backend operation completed");
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_requests_hold_capacity_until_backend_completion() {
-        let now_ms = now_millis();
-        let key_pair =
-            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("RSA key pair");
-        let public_epoch = BlindVaultBlindIssuerEpoch::new(
-            key_pair.pk.to_der().expect("public DER"),
-            now_ms - 60_000,
-            now_ms + 24 * 60 * 60 * 1_000,
-            7 * 24 * 60 * 60 * 1_000,
-        );
-        let issuer_key_id = public_epoch.issuer_key_id;
-        let release = Arc::new((StdMutex::new(false), Condvar::new()));
-        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
-        let signer = Arc::new(
-            BlindSigner::from_signing_keys(vec![BlindSigningKey::new(
-                public_epoch,
-                Box::new(BlockingBackend {
-                    release: Arc::clone(&release),
-                    started: started_tx,
-                    completed: completed_tx,
-                }),
-            )
-            .expect("blocking signing key")])
-            .expect("blocking signer"),
-        );
-        let router = build_router(signer, Zeroizing::new(BACKEND_TOKEN.to_vec()), 128, 1);
-        let request = BlindSignRequest {
-            version: BLIND_VAULT_BLIND_ADMISSION_VERSION,
-            issuer_key_id,
-            blinded_message: vec![3; MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES],
-        };
-        let body = encode_sign_request(&request).expect("encode request");
-        let authorization = format!(
-            "Bearer {}",
-            std::str::from_utf8(BACKEND_TOKEN).expect("ASCII backend token")
-        );
+        let mut fixture = BlockingFixture::new(Duration::from_secs(10));
 
-        let first_router = router.clone();
-        let first_body = body.clone();
-        let first_authorization = authorization.clone();
+        let first_router = fixture.router.clone();
+        let first_body = fixture.body.clone();
+        let first_authorization = fixture.authorization.clone();
         let first = tokio::spawn(async move {
             first_router
                 .oneshot(authorized_sign_http_request(
@@ -692,10 +760,7 @@ mod tests {
                 ))
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
-            .await
-            .expect("backend start should not time out")
-            .expect("backend operation started");
+        fixture.wait_started().await;
         first.abort();
         assert!(first
             .await
@@ -704,19 +769,14 @@ mod tests {
 
         let second = tokio::time::timeout(
             Duration::from_secs(2),
-            router
-                .clone()
-                .oneshot(authorized_sign_http_request(body.clone(), &authorization)),
+            fixture.router.clone().oneshot(authorized_sign_http_request(
+                fixture.body.clone(),
+                &fixture.authorization,
+            )),
         )
         .await;
 
-        let (lock, wake) = release.as_ref();
-        *lock.lock().expect("release lock") = true;
-        wake.notify_all();
-        tokio::time::timeout(Duration::from_secs(2), completed_rx.recv())
-            .await
-            .expect("backend completion should not time out")
-            .expect("backend operation completed");
+        fixture.release_and_wait().await;
 
         let second_status = second
             .expect("capacity rejection should not block")
@@ -724,8 +784,58 @@ mod tests {
             .status();
         assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
 
-        let recovered = router
-            .oneshot(authorized_sign_http_request(body, &authorization))
+        let recovered = fixture
+            .router
+            .oneshot(authorized_sign_http_request(
+                fixture.body,
+                &fixture.authorization,
+            ))
+            .await
+            .expect("recovered response");
+        assert_eq!(recovered.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn signing_timeout_is_retryable_without_releasing_capacity() {
+        let mut fixture = BlockingFixture::new(Duration::from_millis(50));
+        let first_router = fixture.router.clone();
+        let first_body = fixture.body.clone();
+        let first_authorization = fixture.authorization.clone();
+        let first = tokio::spawn(async move {
+            first_router
+                .oneshot(authorized_sign_http_request(
+                    first_body,
+                    &first_authorization,
+                ))
+                .await
+        });
+        fixture.wait_started().await;
+        let timed_out = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("HTTP timeout response")
+            .expect("request task")
+            .expect("timeout response");
+        assert_eq!(timed_out.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(timed_out.headers()[header::CACHE_CONTROL], "no-store");
+
+        let saturated = fixture
+            .router
+            .clone()
+            .oneshot(authorized_sign_http_request(
+                fixture.body.clone(),
+                &fixture.authorization,
+            ))
+            .await
+            .expect("saturated response");
+        assert_eq!(saturated.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        fixture.release_and_wait().await;
+        let recovered = fixture
+            .router
+            .oneshot(authorized_sign_http_request(
+                fixture.body,
+                &fixture.authorization,
+            ))
             .await
             .expect("recovered response");
         assert_eq!(recovered.status(), StatusCode::OK);
@@ -747,6 +857,7 @@ mod tests {
             auth_token_file: directory.path().join("backend.token"),
             max_requests_per_second: 128,
             max_in_flight: 8,
+            signing_timeout_ms: DEFAULT_SIGNING_TIMEOUT_MS,
             keys: vec![BlindIssuerKeyConfig {
                 private_key_der_file: private_path,
                 not_before_unix_secs: now_ms / 1_000 - 60,

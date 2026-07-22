@@ -14,6 +14,7 @@ Main Functionality:
 - Builds and installs the isolated Rust signer.
 - Provisions an unprivileged custody account and owner-only secret files.
 - Documents authenticated backend frames and safe key rotation.
+- Documents bounded HSM/KMS response deadlines and retry semantics.
 - Keeps all private issuer material away from decentralized storage nodes.
 
 Dependencies:
@@ -37,7 +38,7 @@ Important Note for Next Developer:
 - Production private keys should ultimately move behind the existing signer
   boundary into an HSM/KMS without changing the wire contract.
 
-Last Modified: v1.0.0-BlindIssuerDeploy - Initial production runbook.
+Last Modified: v1.1.0-BlindIssuerDeploy - Added custody timeout operations.
 ============================================
 -->
 
@@ -113,6 +114,14 @@ sudo systemctl status aeronyx-blind-issuer.service
 The service binds only to `127.0.0.1`, and systemd independently denies all
 non-local network traffic. It has no capabilities, devices, writable paths,
 home access, or access to AeroNyx node databases.
+
+`signing_timeout_ms` controls how long the backend waits for an HTTP response
+(default 10,000ms; allowed 100–120,000ms). A timeout returns `503`, but it does
+not cancel a native software/HSM/KMS operation. That operation retains its
+`max_in_flight` permit until completion, so disconnected or retrying callers
+cannot exceed the configured custody capacity. Upstream retries must use
+bounded exponential backoff; blind signing is deterministic for the same
+validated request, so a retry does not create a linkable redemption identity.
 
 ## Internal API
 
