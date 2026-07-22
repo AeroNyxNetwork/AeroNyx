@@ -41,8 +41,8 @@
 //! commitments, keys, paths selected by clients, or per-lease usage.
 //!
 //! ## Important Note For The Next Developer
-//! - `provision_lease` remains internal/test-only. Public routes must call
-//!   `provision_lease_with_admission`; never bypass the one-time spend table.
+//! - Every lease, including tests, must enter through V1 or V2 admission and
+//!   the one-time spend table. Do not restore a direct provisioning bypass.
 //! - V1 tickets remain linkable bearer credentials for compatibility. Prefer
 //!   V2 blind admission for new integrations and never reuse issuance logs as
 //!   storage-node policy input.
@@ -52,7 +52,9 @@
 //! - Pull cursors must remain lease-bound AEAD ciphertext; never expose the
 //!   internal SQLite sequence or accept a caller-provided raw sequence.
 //!
-//! Last Modified: v1.4.0-BlindVaultIssuerDirectory - Added deterministic
+//! Last Modified: v1.5.0-BlindVaultAdmissionOnly - Removed the unused direct
+//! lease-provisioning bypass and moved tests onto the production admission path.
+//! v1.4.0-BlindVaultIssuerDirectory - Added deterministic
 //! active/future issuer snapshots for authenticated key discovery.
 //! v1.3.0-BlindVaultBlindAdmission - Added RFC 9474 V2
 //! verification with key-bound policy and scheme-separated replay markers.
@@ -322,31 +324,6 @@ impl BlindVaultService {
             admission_issuers,
             blind_admission_issuers,
         })
-    }
-
-    /// Inserts one exact anonymous lease or accepts an idempotent retry.
-    ///
-    /// A caller must perform external anonymous admission before invoking this
-    /// method from a public route.
-    pub fn provision_lease(
-        &self,
-        request: &BlindVaultLeaseCreateRequest,
-        now_ms: u64,
-    ) -> Result<BlindVaultLeaseProvisionOutcome, BlindVaultServiceError> {
-        request.validate_and_verify(now_ms, self.config.max_lease_ttl_ms())?;
-        let now = sqlite_i64(now_ms)?;
-        let expires_at = sqlite_i64(request.expires_at_ms)?;
-        let read_tag = self.read_capability_tag(&request.lease_id, &request.read_capability_hash);
-
-        let mut connection = self.connection.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(outcome) = existing_lease_outcome(&transaction, request, &read_tag)? {
-            return Ok(outcome);
-        }
-        ensure_lease_request_available(&transaction, &request.request_id)?;
-        insert_lease_row(&transaction, request, &read_tag, now, expires_at)?;
-        transaction.commit()?;
-        Ok(BlindVaultLeaseProvisionOutcome::Created)
     }
 
     /// Returns deterministic, public, non-expired V2 issuer epochs.
@@ -1358,14 +1335,18 @@ mod tests {
         write_key: IdentityKeyPair,
         admin_key: IdentityKeyPair,
         read_capability: [u8; 32],
+        admission: BlindVaultAdmissionTicket,
         lease: BlindVaultLeaseCreateRequest,
     }
 
     impl Fixture {
         fn new(max_objects: u64, max_bytes: u64) -> Self {
             let directory = tempfile::tempdir().expect("temp directory");
+            let issuer_key = IdentityKeyPair::from_bytes(&[6; 32]).expect("issuer key");
             let config = BlindVaultConfig {
                 enabled: true,
+                public_api_enabled: true,
+                admission_issuer_public_keys: vec![hex::encode(issuer_key.public_key_bytes())],
                 db_path: directory.path().join("vault.db").display().to_string(),
                 max_objects_per_lease: max_objects,
                 max_bytes_per_lease: max_bytes,
@@ -1383,6 +1364,14 @@ mod tests {
                 NOW_MS + 7 * 24 * 60 * 60 * 1_000,
             );
             lease.sign(&admin_key).expect("sign lease");
+            let mut admission = BlindVaultAdmissionTicket::new(
+                [6; 32],
+                issuer_key.public_key_bytes(),
+                NOW_MS - 1_000,
+                NOW_MS + 60 * 60 * 1_000,
+                14 * 24 * 60 * 60 * 1_000,
+            );
+            admission.sign(&issuer_key).expect("sign admission");
             let node_key = IdentityKeyPair::from_bytes(&[10; 32]).expect("node key");
             let service = BlindVaultService::new(config, node_key).expect("service");
             Self {
@@ -1391,6 +1380,7 @@ mod tests {
                 write_key,
                 admin_key,
                 read_capability,
+                admission,
                 lease,
             }
         }
@@ -1398,10 +1388,23 @@ mod tests {
         fn provision(&self) {
             assert_eq!(
                 self.service
-                    .provision_lease(&self.lease, NOW_MS)
+                    .provision_lease_with_admission(
+                        &self.admission_request(self.lease.clone()),
+                        NOW_MS
+                    )
                     .expect("provision lease"),
                 BlindVaultLeaseProvisionOutcome::Created
             );
+        }
+
+        fn admission_request(
+            &self,
+            lease: BlindVaultLeaseCreateRequest,
+        ) -> BlindVaultLeaseAdmissionRequest {
+            BlindVaultLeaseAdmissionRequest {
+                admission: self.admission.clone(),
+                lease,
+            }
         }
 
         fn put(&self, object_byte: u8, request_byte: u8) -> BlindVaultPutRequest {
@@ -1424,7 +1427,10 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .provision_lease(&fixture.lease, NOW_MS)
+                .provision_lease_with_admission(
+                    &fixture.admission_request(fixture.lease.clone()),
+                    NOW_MS,
+                )
                 .expect("idempotent lease"),
             BlindVaultLeaseProvisionOutcome::Existing
         );
@@ -1433,7 +1439,9 @@ mod tests {
         conflict.expires_at_ms += 1;
         conflict.sign(&fixture.admin_key).expect("sign conflict");
         assert!(matches!(
-            fixture.service.provision_lease(&conflict, NOW_MS),
+            fixture
+                .service
+                .provision_lease_with_admission(&fixture.admission_request(conflict), NOW_MS,),
             Err(BlindVaultServiceError::LeaseConflict)
         ));
     }
