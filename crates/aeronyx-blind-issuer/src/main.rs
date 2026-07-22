@@ -12,6 +12,7 @@
 //! - Serves the loopback-only authenticated blind-signing API.
 //! - Applies a bounded caller deadline without cancelling custody operations.
 //! - Applies fail-closed circuit-breaker policy for unhealthy custody backends.
+//! - Atomically reloads validated rotating key epochs on Unix SIGHUP.
 //! - Generates owner-only RSA private-key files and public registration data.
 //! - Generates owner-only random backend bearer-token files.
 //!
@@ -23,7 +24,7 @@
 //! Keep key generation explicit and `create_new`; never overwrite custody
 //! material. Add systemd hardening in deployment packaging, not runtime code.
 //!
-//! Last Modified: v0.3.0-BlindIssuerBinary - Added composed API/breaker policy.
+//! Last Modified: v0.4.0-BlindIssuerBinary - Added fail-closed SIGHUP key reload.
 //! ============================================
 
 use std::error::Error;
@@ -31,6 +32,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use blind_rsa_signatures::{DefaultRng, KeyPairSha384PSSRandomized};
@@ -38,10 +41,15 @@ use clap::{Parser, Subcommand};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
 use zeroize::Zeroizing;
 
+#[cfg(unix)]
+use aeronyx_blind_issuer::ConfigError;
 use aeronyx_blind_issuer::{
-    build_router_with_policy, BlindIssuerApiPolicy, BlindIssuerConfig, BlindSigner,
+    build_router_with_runtime, BlindIssuerApiPolicy, BlindIssuerConfig, BlindIssuerRuntime,
+    BlindSigner,
 };
 
 #[derive(Debug, Parser)]
@@ -101,10 +109,11 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
     let auth_token = config.load_auth_token()?;
     let signer = Arc::new(BlindSigner::from_config(&config)?);
     let key_count = signer.key_count();
+    let runtime = BlindIssuerRuntime::new(signer);
     let policy = BlindIssuerApiPolicy::new(config.max_requests_per_second, config.max_in_flight)
         .with_signing_timeout(config.signing_timeout())
         .with_circuit_breaker(config.circuit_failure_threshold, config.circuit_cooldown());
-    let router = build_router_with_policy(signer, auth_token, policy);
+    let router = build_router_with_runtime(runtime.clone(), auth_token, policy);
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     info!(
         %listen_addr,
@@ -114,10 +123,68 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
         circuit_cooldown_ms = config.circuit_cooldown_ms,
         "blind issuer ready"
     );
-    axum::serve(listener, router)
+    #[cfg(unix)]
+    let reload_task = tokio::spawn(reload_on_hangup(path.to_path_buf(), config, runtime));
+    let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    #[cfg(unix)]
+    {
+        reload_task.abort();
+        let _ = reload_task.await;
+    }
+    serve_result?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn reload_on_hangup(
+    path: PathBuf,
+    startup_config: BlindIssuerConfig,
+    runtime: BlindIssuerRuntime,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let Ok(mut hangup) = signal(SignalKind::hangup()) else {
+        warn!("blind issuer key reload signal unavailable");
+        return;
+    };
+    while hangup.recv().await.is_some() {
+        let reload_path = path.clone();
+        let baseline = startup_config.clone();
+        let candidate =
+            tokio::task::spawn_blocking(move || load_reload_candidate(&reload_path, &baseline))
+                .await;
+        let Ok(Ok(signer)) = candidate else {
+            // [BLIND-ISSUER-RELOAD 2026-07-23 by Codex] Do not log provider,
+            // path, key, or parsing details from the custody boundary.
+            warn!("blind issuer key reload rejected");
+            continue;
+        };
+        let key_count = signer.key_count();
+        if let Ok(signer_generation) = runtime.replace_signer(signer, now_millis()) {
+            info!(
+                signer_generation,
+                key_count, "blind issuer key reload applied"
+            );
+        } else {
+            warn!("blind issuer key reload rejected");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn load_reload_candidate(
+    path: &Path,
+    startup_config: &BlindIssuerConfig,
+) -> Result<Arc<BlindSigner>, ConfigError> {
+    let candidate_config = BlindIssuerConfig::load(path)?;
+    if !startup_config.key_reload_compatible_with(&candidate_config) {
+        return Err(ConfigError::InvalidPolicy(
+            "non-key configuration changes require restart",
+        ));
+    }
+    BlindSigner::from_config(&candidate_config).map(Arc::new)
 }
 
 #[cfg(unix)]
@@ -145,6 +212,16 @@ async fn wait_for_ctrl_c() {
     if tokio::signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
     }
+}
+
+#[cfg(unix)]
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn generate_key(path: &Path, bits: usize) -> Result<(), Box<dyn Error>> {

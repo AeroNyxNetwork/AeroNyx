@@ -16,6 +16,7 @@
 //! - Exposes a loopback-only, backend-authenticated HTTP interface.
 //! - Provides public epoch material without account or issuance metadata.
 //! - Publishes authenticated aggregate health and isolates backend failures.
+//! - Atomically rotates validated signer epochs without interrupting requests.
 //!
 //! ## Dependencies
 //! - `config`: fail-closed listener, key epoch, and secret-file policy.
@@ -36,7 +37,7 @@
 //! - Production key custody should migrate behind a KMS/HSM implementation of
 //!   the signer boundary without changing the internal wire contract.
 //!
-//! Last Modified: v0.4.0-BlindIssuer - Added operational policy and breaker state.
+//! Last Modified: v0.5.0-BlindIssuer - Added continuity-safe live key rotation.
 //! ============================================
 
 pub mod api;
@@ -44,9 +45,10 @@ pub mod config;
 pub mod signer;
 
 pub use api::{
-    build_router, build_router_with_policy, build_router_with_timeout, decode_epoch_snapshot,
-    decode_sign_response, encode_epoch_snapshot, encode_sign_request, BlindIssuerApiPolicy,
-    BlindIssuerEpochSnapshot, BlindIssuerOperationalSnapshot, BLIND_ISSUER_CONTENT_TYPE,
+    build_router, build_router_with_policy, build_router_with_runtime, build_router_with_timeout,
+    decode_epoch_snapshot, decode_sign_response, encode_epoch_snapshot, encode_sign_request,
+    BlindIssuerApiPolicy, BlindIssuerEpochSnapshot, BlindIssuerOperationalSnapshot,
+    BlindIssuerReloadError, BlindIssuerRuntime, BLIND_ISSUER_CONTENT_TYPE,
     BLIND_ISSUER_EPOCH_CONTENT_TYPE,
 };
 pub use config::{

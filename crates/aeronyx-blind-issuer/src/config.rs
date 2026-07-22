@@ -28,7 +28,7 @@
 //! Do not add inline private keys or bearer tokens to TOML/environment values.
 //! Secret-manager integration should implement a separate custody backend.
 //!
-//! Last Modified: v0.3.0-BlindIssuerConfig - Added bounded circuit-breaker policy.
+//! Last Modified: v0.4.0-BlindIssuerConfig - Defined key-only hot-reload policy.
 //! ============================================
 
 use std::collections::HashSet;
@@ -274,6 +274,23 @@ impl BlindIssuerConfig {
     pub const fn circuit_cooldown(&self) -> Duration {
         Duration::from_millis(self.circuit_cooldown_ms)
     }
+
+    /// Returns whether `candidate` changes only rotating key epochs.
+    ///
+    /// [BLIND-ISSUER-RELOAD 2026-07-23 by Codex] Listener, authentication,
+    /// pressure, timeout, and circuit policy remain startup-only. Silently
+    /// applying only part of a changed configuration would leave operators
+    /// believing limits or credentials had rotated when they had not.
+    #[must_use]
+    pub fn key_reload_compatible_with(&self, candidate: &Self) -> bool {
+        self.listen_addr == candidate.listen_addr
+            && self.auth_token_file == candidate.auth_token_file
+            && self.max_requests_per_second == candidate.max_requests_per_second
+            && self.max_in_flight == candidate.max_in_flight
+            && self.signing_timeout_ms == candidate.signing_timeout_ms
+            && self.circuit_failure_threshold == candidate.circuit_failure_threshold
+            && self.circuit_cooldown_ms == candidate.circuit_cooldown_ms
+    }
 }
 
 pub(crate) fn read_private_key_der(path: &Path) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
@@ -507,6 +524,12 @@ max_lease_ttl_secs = 1
             config.circuit_cooldown(),
             Duration::from_millis(DEFAULT_CIRCUIT_COOLDOWN_MS)
         );
+
+        let mut key_only_reload = config.clone();
+        key_only_reload.keys[0].not_before_unix_secs += 1;
+        assert!(config.key_reload_compatible_with(&key_only_reload));
+        key_only_reload.max_in_flight += 1;
+        assert!(!config.key_reload_compatible_with(&key_only_reload));
 
         config.circuit_failure_threshold = 0;
         assert!(config.validate().is_err());

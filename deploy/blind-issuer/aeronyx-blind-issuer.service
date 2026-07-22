@@ -12,7 +12,7 @@
 # Main Functionality:
 # - Runs as a static unprivileged account with no Linux capabilities.
 # - Restricts network access to localhost and filesystems to read-only views.
-# - Drains in-flight requests on SIGTERM and restarts only after failures.
+# - Drains in-flight requests on SIGTERM and reloads key epochs on SIGHUP.
 #
 # Dependencies:
 # - /usr/local/bin/aeronyx-blind-issuer
@@ -23,7 +23,7 @@
 # 1. systemd verifies required paths and applies the sandbox.
 # 2. The Rust process independently revalidates listener and secret policy.
 # 3. The backend connects only over the configured loopback address.
-# 4. SIGTERM triggers Axum graceful shutdown before the timeout.
+# 4. SIGHUP atomically reloads validated key epochs; SIGTERM drains shutdown.
 #
 # Important Note for Next Developer:
 # - Never add CAP_NET_ADMIN, public listen addresses, node databases, or
@@ -31,7 +31,7 @@
 # - Keep User/Group stable; secret ownership is checked against the process UID.
 # - Do not use DynamicUser unless custody files move to an HSM/KMS backend.
 #
-# Last Modified: v1.0.0-BlindIssuerDeploy - Initial hardened unit.
+# Last Modified: v1.1.0-BlindIssuerDeploy - Added explicit key reload command.
 # ============================================
 
 [Unit]
@@ -49,6 +49,7 @@ Group=aeronyx-issuer
 WorkingDirectory=/
 Environment=RUST_LOG=aeronyx_blind_issuer=info
 ExecStart=/usr/local/bin/aeronyx-blind-issuer serve --config /etc/aeronyx/blind-issuer.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM

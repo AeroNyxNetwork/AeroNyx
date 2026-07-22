@@ -39,7 +39,7 @@ Important Note for Next Developer:
 - Production private keys should ultimately move behind the existing signer
   boundary into an HSM/KMS without changing the wire contract.
 
-Last Modified: v1.3.0-BlindIssuerDeploy - Added single-probe half-open recovery.
+Last Modified: v1.4.0-BlindIssuerDeploy - Added continuity-safe live key reload.
 ============================================
 -->
 
@@ -153,25 +153,32 @@ exports `encode_sign_request`, `decode_sign_response`, and
 `decode_epoch_snapshot` as the canonical backend-side codec reference.
 
 The JSON status snapshot contains only process-wide counts: active/key count,
-in-flight capacity, breaker state (`circuit_open` and `circuit_half_open`),
-successes, backend failures, timeouts, and rejections. It never includes blinded
-bytes, key IDs, wallet/account/device identifiers, IP addresses, request IDs,
-timestamps per request, or issuance history. Treat the endpoint as operator
-telemetry and keep bearer authentication enabled even on loopback.
+signer generation, in-flight capacity, breaker state (`circuit_open` and
+`circuit_half_open`), successes, backend failures, timeouts, and rejections. It
+never includes blinded bytes, key IDs, wallet/account/device identifiers, IP
+addresses, request IDs, timestamps per request, or issuance history. Treat the
+endpoint as operator telemetry and keep bearer authentication enabled even on
+loopback.
 
 ## Safe Rotation
 
 1. Generate a new private key as `aeronyx-issuer`; never copy it to nodes.
 2. Add a future `[[keys]]` epoch while retaining the currently active epoch.
-3. Restart the issuer and require `/internal/v1/health` to return `204`.
-4. Fetch `/internal/v1/issuer-epochs` through the authenticated backend path.
-5. Publish the new **public** DER epoch to storage-node configuration before
+3. Atomically install the updated config, then run
+   `sudo systemctl reload aeronyx-blind-issuer.service`.
+4. Require `signer_generation` to increase and `/internal/v1/health` to remain
+   `204`; a rejected reload leaves the previous generation serving unchanged.
+5. Fetch `/internal/v1/issuer-epochs` through the authenticated backend path.
+6. Publish the new **public** DER epoch to storage-node configuration before
    its activation time; nodes then expose signed public issuer directories.
-6. Activate client selection only after audited nodes advertise the same key ID.
-7. Keep the old public epoch on nodes until it expires. Remove its private key
+7. Activate client selection only after audited nodes advertise the same key ID.
+8. Keep the old public epoch on nodes until it expires. Remove its private key
    from online custody only after issuance has stopped and the rollback window
    has closed.
 
 Rotation overlap is for public-key propagation and clock tolerance. It must not
 be used to add account tiers, application IDs, or redemption callbacks to the
-signer.
+signer. SIGHUP reloads only `[[keys]]`; listener, token path, capacity, timeout,
+and circuit-policy changes are rejected and require a controlled restart. Every
+reload candidate must contain an active key and preserve every unexpired epoch
+byte-for-byte, so already issued clients cannot lose their signing epoch.
