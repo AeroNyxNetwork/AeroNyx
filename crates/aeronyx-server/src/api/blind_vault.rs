@@ -8,7 +8,8 @@
 //! wallet, sender, receiver, conversation, namespace, or search metadata.
 //!
 //! ## Main Functionality
-//! - `POST /api/vault/v1/lease`: atomically redeems one admission ticket.
+//! - `POST /api/vault/v1/lease`: atomically redeems a V1 bearer ticket or V2
+//!   RFC 9474 blind-issued credential without changing the route.
 //! - `POST /api/vault/v1/put`: stores one immutable padded ciphertext.
 //! - `POST /api/vault/v1/pull`: returns a node-signed stable recovery page.
 //! - `POST /api/vault/v1/delete`: administration-key deletion and receipt.
@@ -37,7 +38,9 @@
 //!   handler; that would apply backpressure after attacker-controlled buffering.
 //! - V1 admission is a signed one-time bearer credential, not blind issuance.
 //!
-//! Last Modified: v1.0.0-BlindVaultApi - Initial bounded binary API.
+//! Last Modified: v1.1.0-BlindVaultBlindAdmission - Added additive V2
+//! redemption on the existing bounded lease route.
+//! v1.0.0-BlindVaultApi - Initial bounded binary API.
 //! ============================================
 
 use std::sync::{atomic::AtomicUsize, Arc};
@@ -240,16 +243,27 @@ async fn lease_handler(
     State(state): State<BlindVaultApiState>,
     body: Bytes,
 ) -> Result<Response, ApiFailure> {
-    let BlindVaultFrame::LeaseAdmission(request) = decode_frame(&body)? else {
-        return Err(ApiFailure::invalid_frame());
+    let outcome = match decode_frame(&body)? {
+        BlindVaultFrame::LeaseAdmission(request) => {
+            let service = Arc::clone(&state.service);
+            tokio::task::spawn_blocking(move || {
+                service.provision_lease_with_admission(&request, now_millis())
+            })
+            .await
+            .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+            .map_err(map_service_error)?
+        }
+        BlindVaultFrame::BlindLeaseAdmission(request) => {
+            let service = Arc::clone(&state.service);
+            tokio::task::spawn_blocking(move || {
+                service.provision_lease_with_blind_admission(&request, now_millis())
+            })
+            .await
+            .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+            .map_err(map_service_error)?
+        }
+        _ => return Err(ApiFailure::invalid_frame()),
     };
-    let service = Arc::clone(&state.service);
-    let outcome = tokio::task::spawn_blocking(move || {
-        service.provision_lease_with_admission(&request, now_millis())
-    })
-    .await
-    .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
-    .map_err(map_service_error)?;
     Ok((
         StatusCode::OK,
         Json(LeaseAdmissionBody {
@@ -363,6 +377,7 @@ fn map_service_error(error: BlindVaultServiceError) -> ApiFailure {
             ApiFailure::new(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
         }
         BlindVaultServiceError::AdmissionIssuerRejected
+        | BlindVaultServiceError::AdmissionProofRejected
         | BlindVaultServiceError::AdmissionSpent => {
             ApiFailure::new(StatusCode::FORBIDDEN, "admission_rejected")
         }
@@ -416,7 +431,8 @@ fn now_millis() -> u64 {
 mod tests {
     use super::*;
     use aeronyx_core::protocol::blind_vault::{
-        BlindVaultAdmissionTicket, BlindVaultLeaseAdmissionRequest,
+        BlindVaultAdmissionTicket, BlindVaultBlindAdmissionToken,
+        BlindVaultBlindLeaseAdmissionRequest, BlindVaultLeaseAdmissionRequest,
         BlindVaultLeaseCreateRequest, BlindVaultPullRequest, BlindVaultPutRequest,
         BLIND_VAULT_PROTOCOL_VERSION,
     };
@@ -424,11 +440,13 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use blind_rsa_signatures::{DefaultRng, KeyPairSha384PSSRandomized};
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    use crate::config_blind_vault::BlindVaultConfig;
+    use crate::config_blind_vault::{BlindVaultBlindAdmissionIssuerConfig, BlindVaultConfig};
 
     struct ApiFixture {
         _directory: TempDir,
@@ -451,9 +469,7 @@ mod tests {
             let config = BlindVaultConfig {
                 enabled: true,
                 public_api_enabled: true,
-                admission_issuer_public_keys: vec![hex::encode(
-                    issuer_key.public_key_bytes(),
-                )],
+                admission_issuer_public_keys: vec![hex::encode(issuer_key.public_key_bytes())],
                 db_path: directory.path().join("vault.db").display().to_string(),
                 ..BlindVaultConfig::default()
             };
@@ -489,9 +505,7 @@ mod tests {
                 now_ms + 60 * 1_000,
                 2 * 60 * 60 * 1_000,
             );
-            admission
-                .sign(&self.issuer_key)
-                .expect("sign admission");
+            admission.sign(&self.issuer_key).expect("sign admission");
             BlindVaultLeaseAdmissionRequest { admission, lease }
         }
 
@@ -572,10 +586,7 @@ mod tests {
         );
         put.sign(&fixture.write_key);
         let put_response = fixture
-            .post_frame(
-                "/api/vault/v1/put",
-                BlindVaultFrame::Put(put.clone()),
-            )
+            .post_frame("/api/vault/v1/put", BlindVaultFrame::Put(put.clone()))
             .await;
         assert_eq!(put_response.status(), StatusCode::CREATED);
         assert_eq!(
@@ -603,10 +614,7 @@ mod tests {
             limit: 4,
         };
         let pull_response = fixture
-            .post_frame(
-                "/api/vault/v1/pull",
-                BlindVaultFrame::PullRequest(pull),
-            )
+            .post_frame("/api/vault/v1/pull", BlindVaultFrame::PullRequest(pull))
             .await;
         assert_eq!(pull_response.status(), StatusCode::OK);
         let pull_body = to_bytes(pull_response.into_body(), 32 * 1_024)
@@ -623,11 +631,124 @@ mod tests {
             .expect("valid signed recovery page");
     }
 
+    // [BLIND-VAULT-RFC9474-HTTP 2026-07-23 by Codex] Cross the actual Axum
+    // boundary with a finalized blind signature. This proves the public lease
+    // endpoint accepts V2 without exposing the issuer-side blinding transcript.
+    #[tokio::test]
+    async fn http_contract_redeems_rfc9474_blind_admission() {
+        let now_ms = now_millis();
+        let key_pair =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("RSA key pair");
+        let public_der = key_pair.pk.to_der().expect("public key DER");
+        let issuer_key_id: [u8; 32] = Sha256::digest(&public_der).into();
+        let directory = tempfile::tempdir().expect("temp directory");
+        let node_key = IdentityKeyPair::from_bytes(&[61; 32]).expect("node key");
+        let config = BlindVaultConfig {
+            enabled: true,
+            public_api_enabled: true,
+            blind_admission_issuers: vec![BlindVaultBlindAdmissionIssuerConfig {
+                public_key_der_base64: BASE64.encode(&public_der),
+                not_before_unix_secs: now_ms / 1_000 - 60,
+                expires_at_unix_secs: now_ms / 1_000 + 24 * 60 * 60,
+                max_lease_ttl_secs: 14 * 24 * 60 * 60,
+            }],
+            db_path: directory.path().join("vault.db").display().to_string(),
+            ..BlindVaultConfig::default()
+        };
+        let service = Arc::new(
+            BlindVaultService::new(config, node_key.clone()).expect("blind vault service"),
+        );
+        let router = build_blind_vault_router(service, Arc::new(node_key));
+
+        let write_key = IdentityKeyPair::from_bytes(&[62; 32]).expect("write key");
+        let admin_key = IdentityKeyPair::from_bytes(&[63; 32]).expect("admin key");
+        let mut lease = BlindVaultLeaseCreateRequest::new(
+            [64; 32],
+            [65; 16],
+            write_key.public_key_bytes(),
+            admin_key.public_key_bytes(),
+            Sha256::digest([66; 32]).into(),
+            now_ms + 7 * 24 * 60 * 60 * 1_000,
+        );
+        lease.sign(&admin_key).expect("sign lease");
+
+        let unsigned =
+            BlindVaultBlindAdmissionToken::new(issuer_key_id, [67; 32], [0; 32], vec![0; 256]);
+        let message = unsigned.message_bytes();
+        let blinding = key_pair
+            .pk
+            .blind(&mut DefaultRng, &message)
+            .expect("blind admission message");
+        let blind_signature = key_pair
+            .sk
+            .blind_sign(&blinding.blind_message)
+            .expect("blind sign admission");
+        let signature = key_pair
+            .pk
+            .finalize(&blind_signature, &blinding, &message)
+            .expect("finalize admission");
+        let randomizer = blinding.msg_randomizer.expect("randomized-message mode").0;
+        let frame = BlindVaultFrame::BlindLeaseAdmission(BlindVaultBlindLeaseAdmissionRequest {
+            admission: BlindVaultBlindAdmissionToken::new(
+                issuer_key_id,
+                [67; 32],
+                randomizer,
+                signature.0,
+            ),
+            lease,
+        });
+        let body = encode_blind_vault_frame(&frame).expect("encode blind admission");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/vault/v1/lease")
+                    .header(header::CONTENT_TYPE, BINARY_CONTENT_TYPE)
+                    .body(Body::from(body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("response body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response_body).expect("response json"),
+            serde_json::json!({"success": true, "existing": false})
+        );
+
+        let retry = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/vault/v1/lease")
+                    .header(header::CONTENT_TYPE, BINARY_CONTENT_TYPE)
+                    .body(Body::from(body))
+                    .expect("retry request"),
+            )
+            .await
+            .expect("retry response");
+        assert_eq!(retry.status(), StatusCode::OK);
+        let retry_body = to_bytes(retry.into_body(), 1_024)
+            .await
+            .expect("retry body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&retry_body).expect("retry json"),
+            serde_json::json!({"success": true, "existing": true})
+        );
+    }
+
     #[tokio::test]
     async fn http_contract_bounds_bodies_and_collapses_private_failures() {
         let fixture = ApiFixture::new();
         let malformed = fixture
-            .post_body("/api/vault/v1/lease", b"private-capability-material".to_vec())
+            .post_body(
+                "/api/vault/v1/lease",
+                b"private-capability-material".to_vec(),
+            )
             .await;
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
         let malformed_body = to_bytes(malformed.into_body(), 1_024)

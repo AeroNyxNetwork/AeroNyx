@@ -11,8 +11,8 @@
 //! - Keeps the service disabled by default for backward compatibility.
 //! - Bounds lease lifetime, object lifetime, per-lease count/bytes, page size,
 //!   admission lifetime, deletion tombstones, and maintenance work.
-//! - Keeps public routes fail-closed unless at least one Ed25519 admission
-//!   issuer is explicitly pinned by the node operator.
+//! - Keeps public routes fail-closed unless at least one V1 Ed25519 issuer or
+//!   V2 RFC 9474 RSA epoch key is explicitly pinned by the node operator.
 //! - Validates that one corrupted or malicious lease cannot consume unbounded
 //!   storage or request work.
 //!
@@ -32,7 +32,9 @@
 //!   replace them with account, wallet, device, or application allowlists.
 //! - Keep byte/count limits finite even on official nodes.
 //!
-//! Last Modified: v1.1.0-BlindVaultAdmission - Added default-off public API and
+//! Last Modified: v1.2.0-BlindVaultBlindAdmission - Added bounded RSA epoch
+//! policies for unlinkable V2 admission.
+//! v1.1.0-BlindVaultAdmission - Added default-off public API and
 //! pinned anonymous admission issuer policy.
 //! v1.0.0-BlindVaultService - Initial bounded configuration.
 //! ============================================
@@ -40,7 +42,10 @@
 use std::collections::HashSet;
 
 use aeronyx_core::crypto::keys::IdentityPublicKey;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use blind_rsa_signatures::PublicKeySha384PSSRandomized;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Result, ServerError};
 
@@ -51,6 +56,30 @@ const MAX_PULL_OBJECTS_HARD: usize = 256;
 const LARGEST_PROTOCOL_OBJECT_BYTES: u64 = 256 * 1024;
 const MAX_ADMISSION_ISSUERS: usize = 16;
 const MAX_ADMISSION_TICKET_TTL_SECS_HARD: u64 = 7 * 24 * 60 * 60;
+const MAX_BLIND_ISSUER_EPOCH_SECS_HARD: u64 = 31 * 24 * 60 * 60;
+const MAX_BLIND_ISSUER_DER_BYTES: usize = 1_024;
+
+/// Operator-pinned public policy for one rotating RFC 9474 issuer key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlindVaultBlindAdmissionIssuerConfig {
+    /// Canonical RSA public key DER encoded with standard Base64.
+    pub public_key_der_base64: String,
+    /// Inclusive key activation time as Unix seconds.
+    pub not_before_unix_secs: u64,
+    /// Exclusive key expiry time as Unix seconds.
+    pub expires_at_unix_secs: u64,
+    /// Maximum lease lifetime authorized by this issuer epoch.
+    pub max_lease_ttl_secs: u64,
+}
+
+/// Parsed non-secret issuer material consumed by the storage service.
+pub(crate) struct BlindVaultBlindAdmissionIssuerMaterial {
+    pub(crate) key_id: [u8; 32],
+    pub(crate) public_key_der: Vec<u8>,
+    pub(crate) not_before_ms: u64,
+    pub(crate) expires_at_ms: u64,
+    pub(crate) max_lease_ttl_ms: u64,
+}
 
 /// Bounded, opt-in node policy for anonymous encrypted object storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +95,10 @@ pub struct BlindVaultConfig {
     /// Tickets carry no account or application identity.
     #[serde(default)]
     pub admission_issuer_public_keys: Vec<String>,
+    /// Rotating RFC 9474 public issuer keys for unlinkable V2 credentials.
+    /// Private signing keys must never be placed on a storage node.
+    #[serde(default)]
+    pub blind_admission_issuers: Vec<BlindVaultBlindAdmissionIssuerConfig>,
     /// Maximum validity window accepted for one bearer admission ticket.
     #[serde(default = "BlindVaultConfig::default_max_admission_ticket_ttl_secs")]
     pub max_admission_ticket_ttl_secs: u64,
@@ -203,10 +236,11 @@ impl BlindVaultConfig {
             ));
         }
         let issuer_keys = self.admission_issuer_key_bytes()?;
-        if self.public_api_enabled && issuer_keys.is_empty() {
+        let blind_issuers = self.blind_admission_issuer_materials()?;
+        if self.public_api_enabled && issuer_keys.is_empty() && blind_issuers.is_empty() {
             return Err(invalid(
                 "admission_issuer_public_keys",
-                "must pin at least one issuer when the public API is enabled",
+                "must pin at least one V1 or V2 issuer when the public API is enabled",
             ));
         }
         Ok(())
@@ -247,6 +281,96 @@ impl BlindVaultConfig {
         Ok(parsed)
     }
 
+    /// Parses bounded V2 RSA issuer epochs and derives canonical key IDs.
+    pub(crate) fn blind_admission_issuer_materials(
+        &self,
+    ) -> Result<Vec<BlindVaultBlindAdmissionIssuerMaterial>> {
+        if self.blind_admission_issuers.len() > MAX_ADMISSION_ISSUERS {
+            return Err(invalid(
+                "blind_admission_issuers",
+                "must contain no more than 16 keys",
+            ));
+        }
+        let mut unique = HashSet::with_capacity(self.blind_admission_issuers.len());
+        let mut parsed = Vec::with_capacity(self.blind_admission_issuers.len());
+        for issuer in &self.blind_admission_issuers {
+            let der = BASE64
+                .decode(issuer.public_key_der_base64.trim())
+                .map_err(|_| {
+                    invalid(
+                        "blind_admission_issuers",
+                        "public_key_der_base64 must contain valid standard Base64",
+                    )
+                })?;
+            if der.is_empty() || der.len() > MAX_BLIND_ISSUER_DER_BYTES {
+                return Err(invalid(
+                    "blind_admission_issuers",
+                    "RSA public key DER must be between 1 and 1024 bytes",
+                ));
+            }
+            let public_key = PublicKeySha384PSSRandomized::from_der(&der).map_err(|_| {
+                invalid(
+                    "blind_admission_issuers",
+                    "contains an invalid RSA public key DER",
+                )
+            })?;
+            // [BLIND-VAULT-BLIND-ISSUER 2026-07-23 by Codex] Normalize both
+            // accepted PKCS#1 and SPKI inputs before deriving the protocol key
+            // ID. The same RSA key must never acquire two IDs by re-encoding.
+            let canonical_der = public_key.to_der().map_err(|_| {
+                invalid(
+                    "blind_admission_issuers",
+                    "RSA public key could not be canonicalized",
+                )
+            })?;
+            let key_id: [u8; 32] = Sha256::digest(&canonical_der).into();
+            if !unique.insert(key_id) {
+                return Err(invalid(
+                    "blind_admission_issuers",
+                    "must not contain duplicate RSA keys",
+                ));
+            }
+            let epoch_secs = issuer
+                .expires_at_unix_secs
+                .checked_sub(issuer.not_before_unix_secs)
+                .ok_or_else(|| {
+                    invalid(
+                        "blind_admission_issuers",
+                        "expires_at_unix_secs must be after not_before_unix_secs",
+                    )
+                })?;
+            if epoch_secs == 0 || epoch_secs > MAX_BLIND_ISSUER_EPOCH_SECS_HARD {
+                return Err(invalid(
+                    "blind_admission_issuers",
+                    "issuer epoch must be between 1 second and 31 days",
+                ));
+            }
+            if issuer.max_lease_ttl_secs == 0 || issuer.max_lease_ttl_secs > self.max_lease_ttl_secs
+            {
+                return Err(invalid(
+                    "blind_admission_issuers",
+                    "max_lease_ttl_secs must be non-zero and no greater than node policy",
+                ));
+            }
+            let not_before_ms = issuer
+                .not_before_unix_secs
+                .checked_mul(1_000)
+                .ok_or_else(|| invalid("blind_admission_issuers", "timestamp is too large"))?;
+            let expires_at_ms = issuer
+                .expires_at_unix_secs
+                .checked_mul(1_000)
+                .ok_or_else(|| invalid("blind_admission_issuers", "timestamp is too large"))?;
+            parsed.push(BlindVaultBlindAdmissionIssuerMaterial {
+                key_id,
+                public_key_der: canonical_der,
+                not_before_ms,
+                expires_at_ms,
+                max_lease_ttl_ms: issuer.max_lease_ttl_secs.saturating_mul(1_000),
+            });
+        }
+        Ok(parsed)
+    }
+
     /// Maximum lease lifetime in milliseconds.
     #[must_use]
     pub const fn max_lease_ttl_ms(&self) -> u64 {
@@ -278,6 +402,7 @@ impl Default for BlindVaultConfig {
             enabled: false,
             public_api_enabled: false,
             admission_issuer_public_keys: Vec::new(),
+            blind_admission_issuers: Vec::new(),
             max_admission_ticket_ttl_secs: Self::default_max_admission_ticket_ttl_secs(),
             db_path: Self::default_db_path(),
             max_lease_ttl_secs: Self::default_max_lease_ttl_secs(),
@@ -299,6 +424,7 @@ fn invalid(field: &'static str, message: &'static str) -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blind_rsa_signatures::{DefaultRng, KeyPairSha384PSSRandomized};
 
     #[test]
     fn default_is_disabled_and_bounded() {
@@ -352,6 +478,43 @@ mod tests {
                 hex::encode(issuer.public_key_bytes()),
             ],
             ..valid
+        };
+        assert!(duplicate.validate().is_err());
+    }
+
+    // [BLIND-VAULT-BLIND-ISSUER 2026-07-23 by Codex] A rotating RSA key can
+    // independently satisfy fail-closed public admission without weakening the
+    // existing V1 Ed25519 path.
+    #[test]
+    fn public_api_accepts_one_bounded_blind_issuer_epoch() {
+        let key_pair =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("RSA key pair");
+        let der = key_pair.pk.to_der().expect("public key DER");
+        let config = BlindVaultConfig {
+            enabled: true,
+            public_api_enabled: true,
+            blind_admission_issuers: vec![BlindVaultBlindAdmissionIssuerConfig {
+                public_key_der_base64: BASE64.encode(&der),
+                not_before_unix_secs: 1_800_000_000,
+                expires_at_unix_secs: 1_800_000_000 + 24 * 60 * 60,
+                max_lease_ttl_secs: 7 * 24 * 60 * 60,
+            }],
+            ..BlindVaultConfig::default()
+        };
+        config.validate().expect("valid blind issuer policy");
+        let material = config
+            .blind_admission_issuer_materials()
+            .expect("parsed blind issuer");
+        assert_eq!(material.len(), 1);
+        let expected_key_id: [u8; 32] = Sha256::digest(&der).into();
+        assert_eq!(material[0].key_id, expected_key_id);
+
+        let duplicate = BlindVaultConfig {
+            blind_admission_issuers: vec![
+                config.blind_admission_issuers[0].clone(),
+                config.blind_admission_issuers[0].clone(),
+            ],
+            ..config
         };
         assert!(duplicate.validate().is_err());
     }

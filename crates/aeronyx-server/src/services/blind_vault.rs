@@ -11,6 +11,7 @@
 //! ## Main Functionality
 //! - Self-authenticating anonymous lease provisioning.
 //! - Atomic one-time bearer admission spend + lease creation.
+//! - RFC 9474 blind-admission verification under rotating public epoch keys.
 //! - Immutable, idempotent ciphertext object persistence.
 //! - Capability-gated bounded recovery pages with encrypted snapshot cursors.
 //! - Administration-key object deletion with signed node receipts.
@@ -41,15 +42,18 @@
 //! ## Important Note For The Next Developer
 //! - `provision_lease` remains internal/test-only. Public routes must call
 //!   `provision_lease_with_admission`; never bypass the one-time spend table.
-//! - V1 tickets are signed bearer credentials, not blind signatures. Do not
-//!   claim unlinkable issuance until a separately audited issuer is deployed.
+//! - V1 tickets remain linkable bearer credentials for compatibility. Prefer
+//!   V2 blind admission for new integrations and never reuse issuance logs as
+//!   storage-node policy input.
 //! - Never accept mutable replacement under an existing object ID.
 //! - Never publish object commitments or receipts into the Directory Chain.
 //! - API handlers must run synchronous SQLite methods in `spawn_blocking`.
 //! - Pull cursors must remain lease-bound AEAD ciphertext; never expose the
 //!   internal SQLite sequence or accept a caller-provided raw sequence.
 //!
-//! Last Modified: v1.2.0-BlindVaultAdmission - Added pinned issuer validation,
+//! Last Modified: v1.3.0-BlindVaultBlindAdmission - Added RFC 9474 V2
+//! verification with key-bound policy and scheme-separated replay markers.
+//! v1.2.0-BlindVaultAdmission - Added pinned issuer validation,
 //! atomic one-time redemption, and bounded spend-marker cleanup.
 //! v1.1.0-BlindVaultSnapshotCursor - Added lease-bound encrypted
 //! snapshot cursors for stable recovery pagination.
@@ -64,10 +68,11 @@ use std::time::Duration;
 
 use aeronyx_core::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::blind_vault::{
-    BlindVaultDeleteRequest, BlindVaultDeletedReceipt, BlindVaultError,
-    BlindVaultLeaseAdmissionRequest, BlindVaultLeaseCreateRequest, BlindVaultPutRequest,
-    BlindVaultStoredReceipt,
+    BlindVaultBlindLeaseAdmissionRequest, BlindVaultDeleteRequest, BlindVaultDeletedReceipt,
+    BlindVaultError, BlindVaultLeaseAdmissionRequest, BlindVaultLeaseCreateRequest,
+    BlindVaultPutRequest, BlindVaultStoredReceipt,
 };
+use blind_rsa_signatures::{MessageRandomizer, PublicKeySha384PSSRandomized, Signature};
 use chacha20poly1305::{
     aead::{Aead, NewAead, Payload},
     Key, XChaCha20Poly1305, XNonce,
@@ -97,6 +102,13 @@ const CLEANUP_OBJECT_BATCH: usize = 512;
 const CLEANUP_LEASE_BATCH: usize = 128;
 const CLEANUP_TOMBSTONE_BATCH: usize = 512;
 const CLEANUP_ADMISSION_SPEND_BATCH: usize = 512;
+
+struct BlindAdmissionIssuer {
+    public_key: PublicKeySha384PSSRandomized,
+    not_before_ms: u64,
+    expires_at_ms: u64,
+    max_lease_ttl_ms: u64,
+}
 
 /// Result of idempotent anonymous lease provisioning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +223,9 @@ pub enum BlindVaultServiceError {
     /// Admission issuer is not pinned by this node operator.
     #[error("blind vault admission issuer rejected")]
     AdmissionIssuerRejected,
+    /// Blind admission proof did not verify under its pinned epoch key.
+    #[error("blind vault admission proof rejected")]
+    AdmissionProofRejected,
     /// Admission ticket was already consumed by another lease.
     #[error("blind vault admission ticket already spent")]
     AdmissionSpent,
@@ -236,6 +251,7 @@ pub struct BlindVaultService {
     read_auth_key: Zeroizing<[u8; 32]>,
     pull_cursor_key: Zeroizing<[u8; 32]>,
     admission_issuers: HashMap<[u8; 32], IdentityPublicKey>,
+    blind_admission_issuers: HashMap<[u8; 32], BlindAdmissionIssuer>,
 }
 
 impl BlindVaultService {
@@ -273,6 +289,26 @@ impl BlindVaultService {
                     .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
+        let blind_admission_issuers = config
+            .blind_admission_issuer_materials()
+            .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?
+            .into_iter()
+            .map(|material| {
+                PublicKeySha384PSSRandomized::from_der(&material.public_key_der)
+                    .map(|public_key| {
+                        (
+                            material.key_id,
+                            BlindAdmissionIssuer {
+                                public_key,
+                                not_before_ms: material.not_before_ms,
+                                expires_at_ms: material.expires_at_ms,
+                                max_lease_ttl_ms: material.max_lease_ttl_ms,
+                            },
+                        )
+                    })
+                    .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
 
         Ok(Self {
             config,
@@ -281,6 +317,7 @@ impl BlindVaultService {
             read_auth_key,
             pull_cursor_key,
             admission_issuers,
+            blind_admission_issuers,
         })
     }
 
@@ -331,10 +368,64 @@ impl BlindVaultService {
             issuer_key,
         )?;
 
-        let lease = &request.lease;
+        self.provision_validated_admission(
+            &request.lease,
+            &request.admission.token_id,
+            request.admission.expires_at_ms,
+            now_ms,
+        )
+    }
+
+    /// Verifies and atomically spends an unlinkable RFC 9474 credential.
+    pub fn provision_lease_with_blind_admission(
+        &self,
+        request: &BlindVaultBlindLeaseAdmissionRequest,
+        now_ms: u64,
+    ) -> Result<BlindVaultLeaseProvisionOutcome, BlindVaultServiceError> {
+        if !self.config.public_api_enabled {
+            return Err(BlindVaultServiceError::AdmissionUnavailable);
+        }
+        request.admission.validate_shape()?;
+        let issuer = self
+            .blind_admission_issuers
+            .get(&request.admission.issuer_key_id)
+            .ok_or(BlindVaultServiceError::AdmissionIssuerRejected)?;
+        if now_ms < issuer.not_before_ms || now_ms >= issuer.expires_at_ms {
+            return Err(BlindVaultServiceError::AdmissionIssuerRejected);
+        }
+        let signature = Signature::new(request.admission.signature.clone());
+        let randomizer = MessageRandomizer::new(request.admission.message_randomizer);
+        issuer
+            .public_key
+            .verify(
+                &signature,
+                Some(randomizer),
+                &request.admission.message_bytes(),
+            )
+            .map_err(|_| BlindVaultServiceError::AdmissionProofRejected)?;
+        request.lease.validate_and_verify(
+            now_ms,
+            self.config.max_lease_ttl_ms().min(issuer.max_lease_ttl_ms),
+        )?;
+
+        self.provision_validated_admission(
+            &request.lease,
+            &request.admission.spend_id(),
+            issuer.expires_at_ms,
+            now_ms,
+        )
+    }
+
+    fn provision_validated_admission(
+        &self,
+        lease: &BlindVaultLeaseCreateRequest,
+        spend_id: &[u8; 32],
+        spend_expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<BlindVaultLeaseProvisionOutcome, BlindVaultServiceError> {
         let now = sqlite_i64(now_ms)?;
         let lease_expires_at = sqlite_i64(lease.expires_at_ms)?;
-        let ticket_expires_at = sqlite_i64(request.admission.expires_at_ms)?;
+        let spend_expires_at = sqlite_i64(spend_expires_at_ms)?;
         let read_tag = self.read_capability_tag(&lease.lease_id, &lease.read_capability_hash);
 
         let mut connection = self.connection.lock();
@@ -346,7 +437,7 @@ impl BlindVaultService {
             "SELECT EXISTS(
                 SELECT 1 FROM blind_vault_admission_spends WHERE token_id = ?1
              )",
-            params![&request.admission.token_id[..]],
+            params![&spend_id[..]],
             |row| row.get(0),
         )?;
         if spent {
@@ -354,13 +445,13 @@ impl BlindVaultService {
         }
         ensure_lease_request_available(&transaction, &lease.request_id)?;
 
-        // [BLIND-VAULT-ADMISSION 2026-07-23 by Codex] Spend and lease creation
-        // share one IMMEDIATE transaction. A crash can commit both or neither,
-        // never a reusable token without its corresponding anonymous lease.
+        // [BLIND-VAULT-ADMISSION 2026-07-23 by Codex] V1 raw token IDs and
+        // V2 domain-separated spend IDs share one transaction and replay table.
+        // A crash commits both spend and lease or neither.
         transaction.execute(
             "INSERT INTO blind_vault_admission_spends
              (token_id, consumed_at_ms, expires_at_ms) VALUES (?1, ?2, ?3)",
-            params![&request.admission.token_id[..], now, ticket_expires_at],
+            params![&spend_id[..], now, spend_expires_at],
         )?;
         insert_lease_row(&transaction, lease, &read_tag, now, lease_expires_at)?;
         transaction.commit()?;
@@ -1207,8 +1298,15 @@ pub type SharedBlindVaultService = Arc<BlindVaultService>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aeronyx_core::protocol::blind_vault::BlindVaultAdmissionTicket;
+    use aeronyx_core::protocol::blind_vault::{
+        BlindVaultAdmissionTicket, BlindVaultBlindAdmissionToken,
+        BlindVaultBlindLeaseAdmissionRequest,
+    };
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use blind_rsa_signatures::{DefaultRng, KeyPairSha384PSSRandomized};
     use tempfile::TempDir;
+
+    use crate::config_blind_vault::BlindVaultBlindAdmissionIssuerConfig;
 
     const NOW_MS: u64 = 1_800_000_000_000;
 
@@ -1370,6 +1468,98 @@ mod tests {
             .run_cleanup(NOW_MS + 60 * 60 * 1_000 + 1)
             .expect("cleanup spent ticket");
         assert_eq!(cleanup.admission_spends_removed, 1);
+    }
+
+    // [BLIND-VAULT-BLIND-REDEMPTION 2026-07-23 by Codex] Simulate the full
+    // RFC 9474 lifecycle. The storage service receives only the finalized
+    // token and cannot recover or correlate the issuer's blind transcript.
+    #[test]
+    fn blind_admission_is_unlinkable_one_time_and_policy_bounded() {
+        let key_pair =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("RSA key pair");
+        let public_der = key_pair.pk.to_der().expect("public key DER");
+        let issuer_key_id: [u8; 32] = Sha256::digest(&public_der).into();
+        let directory = tempfile::tempdir().expect("temp directory");
+        let config = BlindVaultConfig {
+            enabled: true,
+            public_api_enabled: true,
+            blind_admission_issuers: vec![BlindVaultBlindAdmissionIssuerConfig {
+                public_key_der_base64: BASE64.encode(&public_der),
+                not_before_unix_secs: NOW_MS / 1_000 - 60,
+                expires_at_unix_secs: NOW_MS / 1_000 + 24 * 60 * 60,
+                max_lease_ttl_secs: 14 * 24 * 60 * 60,
+            }],
+            db_path: directory.path().join("vault.db").display().to_string(),
+            ..BlindVaultConfig::default()
+        };
+        let node_key = IdentityKeyPair::from_bytes(&[51; 32]).expect("node key");
+        let service = BlindVaultService::new(config, node_key).expect("service");
+
+        let write_key = IdentityKeyPair::from_bytes(&[52; 32]).expect("write key");
+        let admin_key = IdentityKeyPair::from_bytes(&[53; 32]).expect("admin key");
+        let mut lease = BlindVaultLeaseCreateRequest::new(
+            [54; 32],
+            [55; 16],
+            write_key.public_key_bytes(),
+            admin_key.public_key_bytes(),
+            Sha256::digest([56; 32]).into(),
+            NOW_MS + 7 * 24 * 60 * 60 * 1_000,
+        );
+        lease.sign(&admin_key).expect("sign lease");
+
+        let token_id = [57; 32];
+        let unsigned =
+            BlindVaultBlindAdmissionToken::new(issuer_key_id, token_id, [1; 32], vec![0; 256]);
+        let message = unsigned.message_bytes();
+        let blinding = key_pair
+            .pk
+            .blind(&mut DefaultRng, &message)
+            .expect("blind admission message");
+        let blind_signature = key_pair
+            .sk
+            .blind_sign(&blinding.blind_message)
+            .expect("blind sign admission");
+        let signature = key_pair
+            .pk
+            .finalize(&blind_signature, &blinding, &message)
+            .expect("finalize admission");
+        let randomizer = blinding.msg_randomizer.expect("randomized-message mode").0;
+        let admission =
+            BlindVaultBlindAdmissionToken::new(issuer_key_id, token_id, randomizer, signature.0);
+        let request = BlindVaultBlindLeaseAdmissionRequest { admission, lease };
+
+        assert_eq!(
+            service
+                .provision_lease_with_blind_admission(&request, NOW_MS)
+                .expect("first blind redemption"),
+            BlindVaultLeaseProvisionOutcome::Created
+        );
+        assert_eq!(
+            service
+                .provision_lease_with_blind_admission(&request, NOW_MS + 1)
+                .expect("idempotent blind retry"),
+            BlindVaultLeaseProvisionOutcome::Existing
+        );
+
+        let mut second_lease = request.lease.clone();
+        second_lease.lease_id = [58; 32];
+        second_lease.request_id = [59; 16];
+        second_lease.sign(&admin_key).expect("sign second lease");
+        let replay = BlindVaultBlindLeaseAdmissionRequest {
+            admission: request.admission.clone(),
+            lease: second_lease,
+        };
+        assert!(matches!(
+            service.provision_lease_with_blind_admission(&replay, NOW_MS + 2),
+            Err(BlindVaultServiceError::AdmissionSpent)
+        ));
+
+        let mut forged = request.clone();
+        forged.admission.token_id[0] ^= 1;
+        assert!(matches!(
+            service.provision_lease_with_blind_admission(&forged, NOW_MS + 3),
+            Err(BlindVaultServiceError::AdmissionProofRejected)
+        ));
     }
 
     #[test]

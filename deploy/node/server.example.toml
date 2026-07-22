@@ -174,15 +174,13 @@ advertise_onion_middle = false
 # [BLIND-VAULT-CONFIG 2026-07-23 by Codex] Independent node-blind storage for
 # opaque contact-vault and optional message-archive objects. The schema does
 # not contain account, wallet, sender, receiver, namespace, social-graph, or
-# search-vector fields. Keep this disabled until the anonymous one-time lease
-# admission and public API milestone is released; enabling it today only starts
-# the local storage/cleanup foundation and does not advertise a network
-# capability.
+# search-vector fields. Keep it disabled until the operator has provisioned a
+# dedicated database and pinned at least one admission issuer.
 [blind_vault]
 enabled = false
 # Public client routes additionally require this explicit gate and at least one
-# pinned issuer key. V1 uses one-time signed bearer tickets; do not describe it
-# as unlinkable blind issuance until that separate issuer milestone ships.
+# pinned issuer key. V1 Ed25519 bearer tickets remain compatible; new
+# deployments should pin a rotating V2 RFC 9474 RSA issuer below.
 public_api_enabled = false
 admission_issuer_public_keys = []
 max_admission_ticket_ttl_secs = 86400
@@ -195,6 +193,17 @@ max_pull_objects = 64
 tombstone_ttl_secs = 604800
 mutation_clock_skew_secs = 300
 cleanup_interval_secs = 300
+
+# [BLIND-VAULT-BLIND-ISSUER 2026-07-23 by Codex] Each V2 issuer epoch carries
+# only a public RSA key and fixed coarse policy. Never copy the issuer private
+# key onto a storage node. The key fingerprint is derived from canonical DER;
+# clients include that fingerprint in the blinded, domain-separated message.
+# Keep epochs at 31 days or less and overlap rotations only for clock/grace.
+# [[blind_vault.blind_admission_issuers]]
+# public_key_der_base64 = "BASE64_RSA_PUBLIC_KEY_DER"
+# not_before_unix_secs = 1800000000
+# expires_at_unix_secs = 1800086400
+# max_lease_ttl_secs = 604800
 
 # Commercial VPN nodes should start with MemChain disabled unless the operator
 # explicitly wants local memory-chain services on the same machine.
