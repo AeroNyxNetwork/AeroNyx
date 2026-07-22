@@ -415,6 +415,106 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeronyx_core::protocol::blind_vault::{
+        BlindVaultAdmissionTicket, BlindVaultLeaseAdmissionRequest,
+        BlindVaultLeaseCreateRequest, BlindVaultPullRequest, BlindVaultPutRequest,
+        BLIND_VAULT_PROTOCOL_VERSION,
+    };
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    use crate::config_blind_vault::BlindVaultConfig;
+
+    struct ApiFixture {
+        _directory: TempDir,
+        router: Router,
+        issuer_key: IdentityKeyPair,
+        node_key: IdentityKeyPair,
+        write_key: IdentityKeyPair,
+        admin_key: IdentityKeyPair,
+        read_capability: [u8; 32],
+        lease_id: [u8; 32],
+    }
+
+    impl ApiFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("temp directory");
+            let issuer_key = IdentityKeyPair::from_bytes(&[31; 32]).expect("issuer key");
+            let node_key = IdentityKeyPair::from_bytes(&[32; 32]).expect("node key");
+            let write_key = IdentityKeyPair::from_bytes(&[33; 32]).expect("write key");
+            let admin_key = IdentityKeyPair::from_bytes(&[34; 32]).expect("admin key");
+            let config = BlindVaultConfig {
+                enabled: true,
+                public_api_enabled: true,
+                admission_issuer_public_keys: vec![hex::encode(
+                    issuer_key.public_key_bytes(),
+                )],
+                db_path: directory.path().join("vault.db").display().to_string(),
+                ..BlindVaultConfig::default()
+            };
+            let service = Arc::new(
+                BlindVaultService::new(config, node_key.clone()).expect("blind vault service"),
+            );
+            Self {
+                _directory: directory,
+                router: build_blind_vault_router(service, Arc::new(node_key.clone())),
+                issuer_key,
+                node_key,
+                write_key,
+                admin_key,
+                read_capability: [35; 32],
+                lease_id: [36; 32],
+            }
+        }
+
+        fn admission(&self, now_ms: u64) -> BlindVaultLeaseAdmissionRequest {
+            let mut lease = BlindVaultLeaseCreateRequest::new(
+                self.lease_id,
+                [37; 16],
+                self.write_key.public_key_bytes(),
+                self.admin_key.public_key_bytes(),
+                Sha256::digest(self.read_capability).into(),
+                now_ms + 60 * 60 * 1_000,
+            );
+            lease.sign(&self.admin_key).expect("sign lease");
+            let mut admission = BlindVaultAdmissionTicket::new(
+                [38; 32],
+                self.issuer_key.public_key_bytes(),
+                now_ms.saturating_sub(1_000),
+                now_ms + 60 * 1_000,
+                2 * 60 * 60 * 1_000,
+            );
+            admission
+                .sign(&self.issuer_key)
+                .expect("sign admission");
+            BlindVaultLeaseAdmissionRequest { admission, lease }
+        }
+
+        async fn post_frame(&self, path: &str, frame: BlindVaultFrame) -> Response {
+            let body = encode_blind_vault_frame(&frame).expect("encode request");
+            self.post_body(path, body).await
+        }
+
+        async fn post_body(&self, path: &str, body: Vec<u8>) -> Response {
+            self.router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, BINARY_CONTENT_TYPE)
+                        .body(Body::from(body))
+                        .expect("request"),
+                )
+                .await
+                .expect("route response")
+        }
+    }
 
     #[test]
     fn identity_free_rate_window_resets_and_bounds() {
@@ -438,5 +538,115 @@ mod tests {
         let issuer = map_service_error(BlindVaultServiceError::AdmissionIssuerRejected);
         assert_eq!(spent.reason, "admission_rejected");
         assert_eq!(issuer.reason, spent.reason);
+    }
+
+    // [BLIND-VAULT-HTTP-CONTRACT 2026-07-23 by Codex] Exercise the same
+    // encoded frames used by external clients so router composition, body
+    // extraction, service calls, and node-signed responses cannot drift apart.
+    #[tokio::test]
+    async fn http_contract_admits_stores_and_recovers_signed_ciphertext() {
+        let fixture = ApiFixture::new();
+        let now_ms = now_millis();
+
+        let admission_response = fixture
+            .post_frame(
+                "/api/vault/v1/lease",
+                BlindVaultFrame::LeaseAdmission(fixture.admission(now_ms)),
+            )
+            .await;
+        assert_eq!(admission_response.status(), StatusCode::OK);
+        let admission_body = to_bytes(admission_response.into_body(), 1_024)
+            .await
+            .expect("admission body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&admission_body).expect("admission json"),
+            serde_json::json!({"success": true, "existing": false})
+        );
+
+        let mut put = BlindVaultPutRequest::new(
+            fixture.lease_id,
+            [39; 32],
+            [40; 16],
+            vec![0xa5; 4 * 1_024],
+            now_ms + 30 * 60 * 1_000,
+        );
+        put.sign(&fixture.write_key);
+        let put_response = fixture
+            .post_frame(
+                "/api/vault/v1/put",
+                BlindVaultFrame::Put(put.clone()),
+            )
+            .await;
+        assert_eq!(put_response.status(), StatusCode::CREATED);
+        assert_eq!(
+            put_response.headers()[header::CONTENT_TYPE],
+            BINARY_CONTENT_TYPE
+        );
+        let put_body = to_bytes(put_response.into_body(), 16 * 1_024)
+            .await
+            .expect("put body");
+        let BlindVaultFrame::StoredReceipt(receipt) =
+            decode_blind_vault_frame(&put_body).expect("stored receipt")
+        else {
+            panic!("put returned wrong frame kind");
+        };
+        assert!(receipt.matches_put(&put));
+        receipt
+            .validate_and_verify(&fixture.node_key.public_key())
+            .expect("valid node receipt");
+
+        let pull = BlindVaultPullRequest {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            lease_id: fixture.lease_id,
+            read_capability: fixture.read_capability,
+            continuation_cursor: Vec::new(),
+            limit: 4,
+        };
+        let pull_response = fixture
+            .post_frame(
+                "/api/vault/v1/pull",
+                BlindVaultFrame::PullRequest(pull),
+            )
+            .await;
+        assert_eq!(pull_response.status(), StatusCode::OK);
+        let pull_body = to_bytes(pull_response.into_body(), 32 * 1_024)
+            .await
+            .expect("pull body");
+        let BlindVaultFrame::PullResponse(page) =
+            decode_blind_vault_frame(&pull_body).expect("pull response")
+        else {
+            panic!("pull returned wrong frame kind");
+        };
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].ciphertext, put.ciphertext);
+        page.validate_and_verify(&fixture.node_key.public_key())
+            .expect("valid signed recovery page");
+    }
+
+    #[tokio::test]
+    async fn http_contract_bounds_bodies_and_collapses_private_failures() {
+        let fixture = ApiFixture::new();
+        let malformed = fixture
+            .post_body("/api/vault/v1/lease", b"private-capability-material".to_vec())
+            .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        let malformed_body = to_bytes(malformed.into_body(), 1_024)
+            .await
+            .expect("malformed body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&malformed_body).expect("error json"),
+            serde_json::json!({"success": false, "error": "invalid_frame"})
+        );
+        assert!(!malformed_body
+            .windows(b"private-capability-material".len())
+            .any(|window| window == b"private-capability-material"));
+
+        let oversized = fixture
+            .post_body(
+                "/api/vault/v1/lease",
+                vec![0; SMALL_REQUEST_BODY_MAX_BYTES + 1],
+            )
+            .await;
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
