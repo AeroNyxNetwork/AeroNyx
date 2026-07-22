@@ -10,7 +10,9 @@
 //! ## Main Functionality
 //! - Keeps the service disabled by default for backward compatibility.
 //! - Bounds lease lifetime, object lifetime, per-lease count/bytes, page size,
-//!   deletion tombstones, and maintenance work.
+//!   admission lifetime, deletion tombstones, and maintenance work.
+//! - Keeps public routes fail-closed unless at least one Ed25519 admission
+//!   issuer is explicitly pinned by the node operator.
 //! - Validates that one corrupted or malicious lease cannot consume unbounded
 //!   storage or request work.
 //!
@@ -26,13 +28,18 @@
 //!
 //! ## Important Note For The Next Developer
 //! - Enabling storage must not automatically advertise a public capability.
-//! - Lease admission remains a separate protocol policy; do not add account or
-//!   wallet allowlists to this configuration.
+//! - Admission issuer keys authorize anonymous bearer credentials only. Never
+//!   replace them with account, wallet, device, or application allowlists.
 //! - Keep byte/count limits finite even on official nodes.
 //!
-//! Last Modified: v1.0.0-BlindVaultService - Initial bounded configuration.
+//! Last Modified: v1.1.0-BlindVaultAdmission - Added default-off public API and
+//! pinned anonymous admission issuer policy.
+//! v1.0.0-BlindVaultService - Initial bounded configuration.
 //! ============================================
 
+use std::collections::HashSet;
+
+use aeronyx_core::crypto::keys::IdentityPublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, ServerError};
@@ -42,6 +49,8 @@ const MAX_OBJECTS_PER_LEASE_HARD: u64 = 1_000_000;
 const MAX_BYTES_PER_LEASE_HARD: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_PULL_OBJECTS_HARD: usize = 256;
 const LARGEST_PROTOCOL_OBJECT_BYTES: u64 = 256 * 1024;
+const MAX_ADMISSION_ISSUERS: usize = 16;
+const MAX_ADMISSION_TICKET_TTL_SECS_HARD: u64 = 7 * 24 * 60 * 60;
 
 /// Bounded, opt-in node policy for anonymous encrypted object storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +58,17 @@ pub struct BlindVaultConfig {
     /// Enables local Blind Vault persistence and client routes.
     #[serde(default)]
     pub enabled: bool,
+    /// Exposes client routes only when storage and admission issuer policy are
+    /// both explicitly configured. Storage initialization alone remains local.
+    #[serde(default)]
+    pub public_api_enabled: bool,
+    /// Operator-pinned Ed25519 issuer public keys, encoded as 64 hex digits.
+    /// Tickets carry no account or application identity.
+    #[serde(default)]
+    pub admission_issuer_public_keys: Vec<String>,
+    /// Maximum validity window accepted for one bearer admission ticket.
+    #[serde(default = "BlindVaultConfig::default_max_admission_ticket_ttl_secs")]
+    pub max_admission_ticket_ttl_secs: u64,
     /// Dedicated SQLite path. It must not reuse MemChain, ChatRelay, or
     /// Directory Chain databases.
     #[serde(default = "BlindVaultConfig::default_db_path")]
@@ -88,6 +108,10 @@ impl BlindVaultConfig {
         90 * 24 * 60 * 60
     }
 
+    const fn default_max_admission_ticket_ttl_secs() -> u64 {
+        24 * 60 * 60
+    }
+
     const fn default_max_object_ttl_secs() -> u64 {
         30 * 24 * 60 * 60
     }
@@ -118,6 +142,12 @@ impl BlindVaultConfig {
 
     /// Validates finite service limits when the subsystem is enabled.
     pub fn validate(&self) -> Result<()> {
+        if self.public_api_enabled && !self.enabled {
+            return Err(invalid(
+                "public_api_enabled",
+                "requires blind_vault.enabled=true",
+            ));
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -164,7 +194,57 @@ impl BlindVaultConfig {
         if self.cleanup_interval_secs == 0 {
             return Err(invalid("cleanup_interval_secs", "must be non-zero"));
         }
+        if self.max_admission_ticket_ttl_secs == 0
+            || self.max_admission_ticket_ttl_secs > MAX_ADMISSION_TICKET_TTL_SECS_HARD
+        {
+            return Err(invalid(
+                "max_admission_ticket_ttl_secs",
+                "must be between 1 second and 7 days",
+            ));
+        }
+        let issuer_keys = self.admission_issuer_key_bytes()?;
+        if self.public_api_enabled && issuer_keys.is_empty() {
+            return Err(invalid(
+                "admission_issuer_public_keys",
+                "must pin at least one issuer when the public API is enabled",
+            ));
+        }
         Ok(())
+    }
+
+    /// Parses and validates the bounded issuer allowlist.
+    pub fn admission_issuer_key_bytes(&self) -> Result<Vec<[u8; 32]>> {
+        if self.admission_issuer_public_keys.len() > MAX_ADMISSION_ISSUERS {
+            return Err(invalid(
+                "admission_issuer_public_keys",
+                "must contain no more than 16 keys",
+            ));
+        }
+        let mut unique = HashSet::with_capacity(self.admission_issuer_public_keys.len());
+        let mut parsed = Vec::with_capacity(self.admission_issuer_public_keys.len());
+        for encoded in &self.admission_issuer_public_keys {
+            let mut bytes = [0_u8; 32];
+            hex::decode_to_slice(encoded.trim(), &mut bytes).map_err(|_| {
+                invalid(
+                    "admission_issuer_public_keys",
+                    "each key must be exactly 32 bytes of hexadecimal",
+                )
+            })?;
+            IdentityPublicKey::from_bytes(&bytes).map_err(|_| {
+                invalid(
+                    "admission_issuer_public_keys",
+                    "contains an invalid Ed25519 public key",
+                )
+            })?;
+            if !unique.insert(bytes) {
+                return Err(invalid(
+                    "admission_issuer_public_keys",
+                    "must not contain duplicate keys",
+                ));
+            }
+            parsed.push(bytes);
+        }
+        Ok(parsed)
     }
 
     /// Maximum lease lifetime in milliseconds.
@@ -184,12 +264,21 @@ impl BlindVaultConfig {
     pub const fn mutation_clock_skew_ms(&self) -> u64 {
         self.mutation_clock_skew_secs.saturating_mul(1_000)
     }
+
+    /// Maximum admission-ticket validity window in milliseconds.
+    #[must_use]
+    pub const fn max_admission_ticket_ttl_ms(&self) -> u64 {
+        self.max_admission_ticket_ttl_secs.saturating_mul(1_000)
+    }
 }
 
 impl Default for BlindVaultConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            public_api_enabled: false,
+            admission_issuer_public_keys: Vec::new(),
+            max_admission_ticket_ttl_secs: Self::default_max_admission_ticket_ttl_secs(),
             db_path: Self::default_db_path(),
             max_lease_ttl_secs: Self::default_max_lease_ttl_secs(),
             max_object_ttl_secs: Self::default_max_object_ttl_secs(),
@@ -239,5 +328,31 @@ mod tests {
             config.mutation_clock_skew_ms(),
             config.mutation_clock_skew_secs * 1_000
         );
+        assert_eq!(
+            config.max_admission_ticket_ttl_ms(),
+            config.max_admission_ticket_ttl_secs * 1_000
+        );
+    }
+
+    #[test]
+    fn public_api_requires_a_valid_unique_issuer_key() {
+        let issuer =
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[19; 32]).expect("issuer key");
+        let valid = BlindVaultConfig {
+            enabled: true,
+            public_api_enabled: true,
+            admission_issuer_public_keys: vec![hex::encode(issuer.public_key_bytes())],
+            ..BlindVaultConfig::default()
+        };
+        valid.validate().expect("valid public API policy");
+
+        let duplicate = BlindVaultConfig {
+            admission_issuer_public_keys: vec![
+                hex::encode(issuer.public_key_bytes()),
+                hex::encode(issuer.public_key_bytes()),
+            ],
+            ..valid
+        };
+        assert!(duplicate.validate().is_err());
     }
 }

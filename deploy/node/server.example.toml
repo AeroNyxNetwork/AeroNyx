@@ -180,6 +180,12 @@ advertise_onion_middle = false
 # capability.
 [blind_vault]
 enabled = false
+# Public client routes additionally require this explicit gate and at least one
+# pinned issuer key. V1 uses one-time signed bearer tickets; do not describe it
+# as unlinkable blind issuance until that separate issuer milestone ships.
+public_api_enabled = false
+admission_issuer_public_keys = []
+max_admission_ticket_ttl_secs = 86400
 db_path = "/var/lib/aeronyx/blind-vault.db"
 max_lease_ttl_secs = 7776000
 max_object_ttl_secs = 2592000
