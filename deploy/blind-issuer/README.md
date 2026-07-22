@@ -39,8 +39,8 @@ Important Note for Next Developer:
 - Production private keys should ultimately move behind the existing signer
   boundary into an HSM/KMS without changing the wire contract.
 
-Last Modified: v1.7.0-BlindIssuerDeploy - Documented strict single-value
-authorization parsing ahead of request-body extraction.
+Last Modified: v1.8.0-BlindIssuerDeploy - Added complete offline configuration
+and custody-material preflight before service activation.
 ============================================
 -->
 
@@ -105,6 +105,8 @@ sudo install -d -o root -g aeronyx-issuer -m 0750 /etc/aeronyx
 sudo install -o root -g aeronyx-issuer -m 0640 \
   deploy/blind-issuer/blind-issuer.example.toml \
   /etc/aeronyx/blind-issuer.toml
+sudo -u aeronyx-issuer /usr/local/bin/aeronyx-blind-issuer \
+  check-config --config /etc/aeronyx/blind-issuer.toml
 sudo install -o root -g root -m 0644 \
   deploy/blind-issuer/aeronyx-blind-issuer.service \
   /etc/systemd/system/aeronyx-blind-issuer.service
@@ -112,6 +114,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now aeronyx-blind-issuer.service
 sudo systemctl status aeronyx-blind-issuer.service
 ```
+
+`check-config` uses the exact same startup-material loader as `serve`. It
+validates TOML policy, loopback binding, token ownership/permissions, every
+private-key file, canonical public-key derivation, epoch time bounds, and
+active-key availability without binding a socket. Successful output contains
+only the loopback address and aggregate key count; it never prints token bytes,
+key IDs, paths, or private material. Both `check-config` and `serve` fail closed
+unless at least one configured issuer epoch is active at the current time.
 
 The service binds only to `127.0.0.1`, and systemd independently denies all
 non-local network traffic. It has no capabilities, devices, writable paths,
