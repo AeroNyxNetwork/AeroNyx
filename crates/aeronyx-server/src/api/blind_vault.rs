@@ -8,6 +8,7 @@
 //! wallet, sender, receiver, conversation, namespace, or search metadata.
 //!
 //! ## Main Functionality
+//! - `GET /api/vault/v1/issuers`: returns node-signed V2 issuer epochs.
 //! - `POST /api/vault/v1/lease`: atomically redeems a V1 bearer ticket or V2
 //!   RFC 9474 blind-issued credential without changing the route.
 //! - `POST /api/vault/v1/put`: stores one immutable padded ciphertext.
@@ -18,13 +19,13 @@
 //!
 //! ## Dependencies
 //! - `aeronyx_core::protocol::blind_vault`: stable binary frames and signatures.
-//! - `services/blind_vault.rs`: synchronous transactional SQLite service.
+//! - `services/blind_vault.rs`: synchronous transactional `SQLite` service.
 //! - `server.rs`: mounts this router only after explicit public API enablement.
 //!
 //! ## Main Logical Flow
 //! 1. Middleware rejects pressure before Axum buffers the body.
 //! 2. The handler decodes one expected bounded frame kind.
-//! 3. SQLite work runs on Tokio's blocking pool.
+//! 3. `SQLite` work runs on Tokio's blocking pool.
 //! 4. Success returns a binary protocol frame; failure returns only a stable
 //!    privacy-safe reason bucket.
 //!
@@ -38,7 +39,9 @@
 //!   handler; that would apply backpressure after attacker-controlled buffering.
 //! - V1 admission is a signed one-time bearer credential, not blind issuance.
 //!
-//! Last Modified: v1.1.0-BlindVaultBlindAdmission - Added additive V2
+//! Last Modified: v1.2.0-BlindVaultIssuerDirectory - Added bounded,
+//! node-signed public key discovery for V2 issuer rotation.
+//! v1.1.0-BlindVaultBlindAdmission - Added additive V2
 //! redemption on the existing bounded lease route.
 //! v1.0.0-BlindVaultApi - Initial bounded binary API.
 //! ============================================
@@ -48,16 +51,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::crypto::keys::IdentityKeyPair;
 use aeronyx_core::protocol::blind_vault::{
-    decode_blind_vault_frame, encode_blind_vault_frame, BlindVaultFrame, BlindVaultPullResponse,
-    BlindVaultRecoveredObject, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES,
+    decode_blind_vault_frame, encode_blind_vault_frame, BlindVaultBlindIssuerDirectory,
+    BlindVaultFrame, BlindVaultPullResponse, BlindVaultRecoveredObject,
+    MAX_BLIND_VAULT_MUTATION_FRAME_BYTES,
 };
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use parking_lot::Mutex;
@@ -73,6 +77,7 @@ const MAX_IN_FLIGHT_PULLS: usize = 16;
 const MAX_MUTATIONS_PER_SECOND: u64 = 256;
 const MAX_PULLS_PER_SECOND: u64 = 64;
 const BINARY_CONTENT_TYPE: &str = "application/vnd.aeronyx.blind-vault-v1";
+const ISSUER_DIRECTORY_CACHE_CONTROL: &str = "public, max-age=60, must-revalidate";
 
 #[derive(Clone)]
 struct BlindVaultApiState {
@@ -191,11 +196,19 @@ pub fn build_blind_vault_router(
             pull_request_gate,
         ))
         .layer(DefaultBodyLimit::max(SMALL_REQUEST_BODY_MAX_BYTES));
+    let issuer_router = Router::new()
+        .route("/api/vault/v1/issuers", get(issuer_directory_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            pull_request_gate,
+        ))
+        .layer(DefaultBodyLimit::max(0));
 
     lease_router
         .merge(put_router)
         .merge(delete_router)
         .merge(pull_router)
+        .merge(issuer_router)
         .with_state(state)
 }
 
@@ -272,6 +285,37 @@ async fn lease_handler(
         }),
     )
         .into_response())
+}
+
+async fn issuer_directory_handler(
+    State(state): State<BlindVaultApiState>,
+) -> Result<Response, ApiFailure> {
+    let generated_at_ms = now_millis();
+    let service = Arc::clone(&state.service);
+    let epochs =
+        tokio::task::spawn_blocking(move || service.blind_admission_issuer_epochs(generated_at_ms))
+            .await
+            .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?
+            .map_err(map_service_error)?;
+    let mut directory = BlindVaultBlindIssuerDirectory::new(
+        generated_at_ms,
+        state.node_identity.public_key_bytes(),
+        epochs,
+    );
+    directory
+        .sign(&state.node_identity)
+        .map_err(|_| ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+    let mut response = binary_response(
+        StatusCode::OK,
+        BlindVaultFrame::BlindIssuerDirectory(directory),
+    )?;
+    // [BLIND-VAULT-ISSUER-DIRECTORY 2026-07-23 by Codex] A short cache lowers
+    // probe pressure while signed freshness keeps rotation fail-closed.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(ISSUER_DIRECTORY_CACHE_CONTROL),
+    );
+    Ok(response)
 }
 
 async fn put_handler(
@@ -658,7 +702,42 @@ mod tests {
         let service = Arc::new(
             BlindVaultService::new(config, node_key.clone()).expect("blind vault service"),
         );
-        let router = build_blind_vault_router(service, Arc::new(node_key));
+        let router = build_blind_vault_router(service, Arc::new(node_key.clone()));
+
+        let directory_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/vault/v1/issuers")
+                    .body(Body::empty())
+                    .expect("issuer request"),
+            )
+            .await
+            .expect("issuer response");
+        assert_eq!(directory_response.status(), StatusCode::OK);
+        assert_eq!(
+            directory_response.headers()[header::CONTENT_TYPE],
+            BINARY_CONTENT_TYPE
+        );
+        assert_eq!(
+            directory_response.headers()[header::CACHE_CONTROL],
+            ISSUER_DIRECTORY_CACHE_CONTROL
+        );
+        let directory_body = to_bytes(directory_response.into_body(), 16 * 1_024)
+            .await
+            .expect("issuer directory body");
+        let BlindVaultFrame::BlindIssuerDirectory(issuer_directory) =
+            decode_blind_vault_frame(&directory_body).expect("issuer directory frame")
+        else {
+            panic!("issuer route returned wrong frame kind");
+        };
+        issuer_directory
+            .validate_and_verify(now_millis(), 60_000, 5_000, &node_key.public_key())
+            .expect("valid node-signed issuer directory");
+        assert_eq!(issuer_directory.epochs.len(), 1);
+        assert_eq!(issuer_directory.epochs[0].issuer_key_id, issuer_key_id);
+        assert_eq!(issuer_directory.epochs[0].public_key_der, public_der);
 
         let write_key = IdentityKeyPair::from_bytes(&[62; 32]).expect("write key");
         let admin_key = IdentityKeyPair::from_bytes(&[63; 32]).expect("admin key");

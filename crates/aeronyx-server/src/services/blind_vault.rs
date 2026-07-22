@@ -12,6 +12,7 @@
 //! - Self-authenticating anonymous lease provisioning.
 //! - Atomic one-time bearer admission spend + lease creation.
 //! - RFC 9474 blind-admission verification under rotating public epoch keys.
+//! - Deterministic public issuer-epoch snapshots for node-signed discovery.
 //! - Immutable, idempotent ciphertext object persistence.
 //! - Capability-gated bounded recovery pages with encrypted snapshot cursors.
 //! - Administration-key object deletion with signed node receipts.
@@ -51,7 +52,9 @@
 //! - Pull cursors must remain lease-bound AEAD ciphertext; never expose the
 //!   internal SQLite sequence or accept a caller-provided raw sequence.
 //!
-//! Last Modified: v1.3.0-BlindVaultBlindAdmission - Added RFC 9474 V2
+//! Last Modified: v1.4.0-BlindVaultIssuerDirectory - Added deterministic
+//! active/future issuer snapshots for authenticated key discovery.
+//! v1.3.0-BlindVaultBlindAdmission - Added RFC 9474 V2
 //! verification with key-bound policy and scheme-separated replay markers.
 //! v1.2.0-BlindVaultAdmission - Added pinned issuer validation,
 //! atomic one-time redemption, and bounded spend-marker cleanup.
@@ -68,9 +71,9 @@ use std::time::Duration;
 
 use aeronyx_core::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::blind_vault::{
-    BlindVaultBlindLeaseAdmissionRequest, BlindVaultDeleteRequest, BlindVaultDeletedReceipt,
-    BlindVaultError, BlindVaultLeaseAdmissionRequest, BlindVaultLeaseCreateRequest,
-    BlindVaultPutRequest, BlindVaultStoredReceipt,
+    BlindVaultBlindIssuerEpoch, BlindVaultBlindLeaseAdmissionRequest, BlindVaultDeleteRequest,
+    BlindVaultDeletedReceipt, BlindVaultError, BlindVaultLeaseAdmissionRequest,
+    BlindVaultLeaseCreateRequest, BlindVaultPutRequest, BlindVaultStoredReceipt,
 };
 use blind_rsa_signatures::{MessageRandomizer, PublicKeySha384PSSRandomized, Signature};
 use chacha20poly1305::{
@@ -346,6 +349,45 @@ impl BlindVaultService {
         Ok(BlindVaultLeaseProvisionOutcome::Created)
     }
 
+    /// Returns deterministic, public, non-expired V2 issuer epochs.
+    ///
+    /// Future keys are intentionally included so clients can prefetch rotation
+    /// material. Expired keys and all issuer-private state are omitted.
+    ///
+    /// # Errors
+    /// Returns `AdmissionConfigurationInvalid` if canonical key material no
+    /// longer matches the validated configuration snapshot.
+    pub fn blind_admission_issuer_epochs(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<BlindVaultBlindIssuerEpoch>, BlindVaultServiceError> {
+        let mut epochs = self
+            .blind_admission_issuers
+            .iter()
+            .filter(|(_, issuer)| issuer.expires_at_ms > now_ms)
+            .map(|(configured_key_id, issuer)| {
+                let public_key_der = issuer
+                    .public_key
+                    .to_der()
+                    .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?;
+                let epoch = BlindVaultBlindIssuerEpoch::new(
+                    public_key_der,
+                    issuer.not_before_ms,
+                    issuer.expires_at_ms,
+                    issuer.max_lease_ttl_ms,
+                );
+                if &epoch.issuer_key_id != configured_key_id {
+                    return Err(BlindVaultServiceError::AdmissionConfigurationInvalid);
+                }
+                Ok(epoch)
+            })
+            .collect::<Result<Vec<_>, BlindVaultServiceError>>()?;
+        // [BLIND-VAULT-ISSUER-DIRECTORY 2026-07-23 by Codex] HashMap order is
+        // process-randomized; canonical sorting keeps signatures reproducible.
+        epochs.sort_by_key(|epoch| epoch.issuer_key_id);
+        Ok(epochs)
+    }
+
     /// Atomically consumes one operator-approved anonymous bearer ticket and
     /// provisions its self-authenticating lease. Exact retries remain
     /// idempotent; the same ticket cannot create a second lease.
@@ -400,7 +442,7 @@ impl BlindVaultService {
             .verify(
                 &signature,
                 Some(randomizer),
-                &request.admission.message_bytes(),
+                request.admission.message_bytes(),
             )
             .map_err(|_| BlindVaultServiceError::AdmissionProofRejected)?;
         request.lease.validate_and_verify(
@@ -1494,6 +1536,16 @@ mod tests {
         };
         let node_key = IdentityKeyPair::from_bytes(&[51; 32]).expect("node key");
         let service = BlindVaultService::new(config, node_key).expect("service");
+        let advertised_epochs = service
+            .blind_admission_issuer_epochs(NOW_MS)
+            .expect("issuer epochs");
+        assert_eq!(advertised_epochs.len(), 1);
+        assert_eq!(advertised_epochs[0].issuer_key_id, issuer_key_id);
+        assert_eq!(advertised_epochs[0].public_key_der, public_der);
+        assert!(service
+            .blind_admission_issuer_epochs(NOW_MS + 24 * 60 * 60 * 1_000)
+            .expect("expired issuer filter")
+            .is_empty());
 
         let write_key = IdentityKeyPair::from_bytes(&[52; 32]).expect("write key");
         let admin_key = IdentityKeyPair::from_bytes(&[53; 32]).expect("admin key");

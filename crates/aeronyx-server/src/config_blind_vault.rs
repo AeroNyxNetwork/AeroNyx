@@ -42,6 +42,10 @@
 use std::collections::HashSet;
 
 use aeronyx_core::crypto::keys::IdentityPublicKey;
+use aeronyx_core::protocol::blind_vault::{
+    MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES, MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS,
+    MAX_BLIND_VAULT_BLIND_ISSUER_EPOCH_MS,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use blind_rsa_signatures::PublicKeySha384PSSRandomized;
 use serde::{Deserialize, Serialize};
@@ -56,8 +60,6 @@ const MAX_PULL_OBJECTS_HARD: usize = 256;
 const LARGEST_PROTOCOL_OBJECT_BYTES: u64 = 256 * 1024;
 const MAX_ADMISSION_ISSUERS: usize = 16;
 const MAX_ADMISSION_TICKET_TTL_SECS_HARD: u64 = 7 * 24 * 60 * 60;
-const MAX_BLIND_ISSUER_EPOCH_SECS_HARD: u64 = 31 * 24 * 60 * 60;
-const MAX_BLIND_ISSUER_DER_BYTES: usize = 1_024;
 
 /// Operator-pinned public policy for one rotating RFC 9474 issuer key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,7 +287,7 @@ impl BlindVaultConfig {
     pub(crate) fn blind_admission_issuer_materials(
         &self,
     ) -> Result<Vec<BlindVaultBlindAdmissionIssuerMaterial>> {
-        if self.blind_admission_issuers.len() > MAX_ADMISSION_ISSUERS {
+        if self.blind_admission_issuers.len() > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS {
             return Err(invalid(
                 "blind_admission_issuers",
                 "must contain no more than 16 keys",
@@ -302,7 +304,7 @@ impl BlindVaultConfig {
                         "public_key_der_base64 must contain valid standard Base64",
                     )
                 })?;
-            if der.is_empty() || der.len() > MAX_BLIND_ISSUER_DER_BYTES {
+            if der.is_empty() || der.len() > MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES {
                 return Err(invalid(
                     "blind_admission_issuers",
                     "RSA public key DER must be between 1 and 1024 bytes",
@@ -339,7 +341,7 @@ impl BlindVaultConfig {
                         "expires_at_unix_secs must be after not_before_unix_secs",
                     )
                 })?;
-            if epoch_secs == 0 || epoch_secs > MAX_BLIND_ISSUER_EPOCH_SECS_HARD {
+            if epoch_secs == 0 || epoch_secs > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCH_MS / 1_000 {
                 return Err(invalid(
                     "blind_admission_issuers",
                     "issuer epoch must be between 1 second and 31 days",

@@ -16,6 +16,8 @@
 //!   binding a storage lease to an account identity.
 //! - Defines an additive RFC 9474 blind-issued admission credential whose
 //!   redemption cannot be linked to its issuance transcript.
+//! - Defines a node-signed issuer-epoch directory for authenticated key
+//!   discovery and overlap-safe rotation.
 //! - Defines bounded recovery request/page frames with node-signed ciphertext
 //!   commitments and opaque continuation cursors.
 //! - Provides deterministic signing bytes and bounded binary wire framing.
@@ -56,7 +58,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.4.0-BlindVaultBlindAdmission - Added an unlinkable
+//! Last Modified: v1.5.0-BlindVaultIssuerDirectory - Added signed public
+//! issuer-epoch discovery for safe blind-signing key rotation.
+//! v1.4.0-BlindVaultBlindAdmission - Added an unlinkable
 //! RFC 9474 redemption contract while preserving the V1 bearer frame.
 //! v1.3.0-BlindVaultPull - Added bounded signed recovery pages
 //! and per-frame allocation ceilings.
@@ -83,6 +87,7 @@ const LEASE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Lease-v1";
 const ADMISSION_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Admission-v1";
 const BLIND_ADMISSION_MESSAGE_DOMAIN: &[u8] = b"AeroNyx-BlindVault-BlindAdmission-v2";
 const BLIND_ADMISSION_SPEND_DOMAIN: &[u8] = b"AeroNyx-BlindVault-BlindSpend-v2";
+const BLIND_ISSUER_DIRECTORY_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-IssuerDirectory-v1";
 const PULL_RESPONSE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullResponse-v1";
 const DELETE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Delete-v1";
 const DELETE_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-DeletedReceipt-v1";
@@ -97,6 +102,7 @@ const FRAME_KIND_LEASE_ADMISSION: u8 = 6;
 const FRAME_KIND_PULL_REQUEST: u8 = 7;
 const FRAME_KIND_PULL_RESPONSE: u8 = 8;
 const FRAME_KIND_BLIND_LEASE_ADMISSION: u8 = 9;
+const FRAME_KIND_BLIND_ISSUER_DIRECTORY: u8 = 10;
 
 /// Initial blind-vault wire version. This version is independent of the VPN
 /// transport and legacy chat-envelope versions.
@@ -110,6 +116,15 @@ pub const MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES: usize = 256;
 
 /// Upper RSA signature bound prevents attacker-controlled allocation growth.
 pub const MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES: usize = 512;
+
+/// Maximum rotating blind-admission keys advertised by one storage node.
+pub const MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS: usize = 16;
+
+/// Maximum canonical RSA public-key DER accepted in an issuer directory.
+pub const MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES: usize = 800;
+
+/// Maximum lifetime of one advertised issuer epoch.
+pub const MAX_BLIND_VAULT_BLIND_ISSUER_EPOCH_MS: u64 = 31 * 24 * 60 * 60 * 1_000;
 
 /// Maximum mutation/request frame. The largest v1 ciphertext class is 256 KiB;
 /// the remaining space covers fixed metadata and framing.
@@ -157,6 +172,8 @@ pub enum BlindVaultFrame {
     PullResponse(BlindVaultPullResponse),
     /// RFC 9474 blind-issued one-time credential plus anonymous lease.
     BlindLeaseAdmission(BlindVaultBlindLeaseAdmissionRequest),
+    /// Node-signed public blind-admission key epochs and coarse policy.
+    BlindIssuerDirectory(BlindVaultBlindIssuerDirectory),
 }
 
 /// Anonymous lease metadata signed by its independent administration key.
@@ -485,6 +502,201 @@ pub struct BlindVaultBlindLeaseAdmissionRequest {
     pub admission: BlindVaultBlindAdmissionToken,
     /// Self-authenticating random replica lease requested by the bearer.
     pub lease: BlindVaultLeaseCreateRequest,
+}
+
+/// One public RFC 9474 issuer key and its node-enforced coarse policy.
+///
+/// The key is public by design. No issuer URL, account scope, product tier, or
+/// issuance transcript belongs in this storage-node directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultBlindIssuerEpoch {
+    /// Blind-admission scheme version accepted under this key.
+    pub admission_version: u16,
+    /// SHA-256 fingerprint of `public_key_der`.
+    pub issuer_key_id: [u8; 32],
+    /// Canonical SPKI DER for the RSA public key.
+    pub public_key_der: Vec<u8>,
+    /// Inclusive activation time in Unix milliseconds.
+    pub not_before_ms: u64,
+    /// Exclusive expiry time in Unix milliseconds.
+    pub expires_at_ms: u64,
+    /// Maximum anonymous lease lifetime authorized by this key epoch.
+    pub max_lease_ttl_ms: u64,
+}
+
+impl BlindVaultBlindIssuerEpoch {
+    /// Builds an epoch and derives its stable key fingerprint.
+    #[must_use]
+    pub fn new(
+        public_key_der: Vec<u8>,
+        not_before_ms: u64,
+        expires_at_ms: u64,
+        max_lease_ttl_ms: u64,
+    ) -> Self {
+        let issuer_key_id = sha256(&public_key_der);
+        Self {
+            admission_version: BLIND_VAULT_BLIND_ADMISSION_VERSION,
+            issuer_key_id,
+            public_key_der,
+            not_before_ms,
+            expires_at_ms,
+            max_lease_ttl_ms,
+        }
+    }
+
+    fn validate_at(&self, generated_at_ms: u64) -> Result<(), BlindVaultError> {
+        if self.admission_version != BLIND_VAULT_BLIND_ADMISSION_VERSION {
+            return Err(BlindVaultError::UnsupportedBlindAdmissionVersion(
+                self.admission_version,
+            ));
+        }
+        require_non_zero("blind_issuer_key_id", &self.issuer_key_id)?;
+        if self.public_key_der.is_empty()
+            || self.public_key_der.len() > MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES
+        {
+            return Err(BlindVaultError::InvalidBlindIssuerKeyLength {
+                actual: self.public_key_der.len(),
+            });
+        }
+        if sha256(&self.public_key_der) != self.issuer_key_id {
+            return Err(BlindVaultError::BlindIssuerKeyIdMismatch);
+        }
+        let epoch_lifetime_ms = self
+            .expires_at_ms
+            .checked_sub(self.not_before_ms)
+            .ok_or(BlindVaultError::InvalidBlindIssuerEpochPolicy)?;
+        if epoch_lifetime_ms == 0
+            || epoch_lifetime_ms > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCH_MS
+            || self.max_lease_ttl_ms == 0
+            || self.expires_at_ms <= generated_at_ms
+        {
+            return Err(BlindVaultError::InvalidBlindIssuerEpochPolicy);
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated discovery response for blind-admission key rotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultBlindIssuerDirectory {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Response creation time in Unix milliseconds.
+    pub generated_at_ms: u64,
+    /// Descriptor identity of the responding storage node.
+    pub node_id: [u8; 32],
+    /// Strictly key-ID-sorted active and pre-announced future epochs.
+    pub epochs: Vec<BlindVaultBlindIssuerEpoch>,
+    /// Ed25519 signature by `node_id` over all directory fields.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultBlindIssuerDirectory {
+    /// Builds an unsigned issuer directory.
+    #[must_use]
+    pub const fn new(
+        generated_at_ms: u64,
+        node_id: [u8; 32],
+        epochs: Vec<BlindVaultBlindIssuerEpoch>,
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            generated_at_ms,
+            node_id,
+            epochs,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical key-directory signing input.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let epoch_bytes = self
+            .epochs
+            .iter()
+            .map(|epoch| 90usize.saturating_add(epoch.public_key_der.len()))
+            .sum::<usize>();
+        let mut bytes =
+            Vec::with_capacity(BLIND_ISSUER_DIRECTORY_SIGNING_DOMAIN.len() + 44 + epoch_bytes);
+        bytes.extend_from_slice(BLIND_ISSUER_DIRECTORY_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.generated_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.node_id);
+        let epoch_count = u16::try_from(self.epochs.len()).unwrap_or(u16::MAX);
+        bytes.extend_from_slice(&epoch_count.to_be_bytes());
+        for epoch in &self.epochs {
+            bytes.extend_from_slice(&epoch.admission_version.to_be_bytes());
+            bytes.extend_from_slice(&epoch.issuer_key_id);
+            let der_length = u16::try_from(epoch.public_key_der.len()).unwrap_or(u16::MAX);
+            bytes.extend_from_slice(&der_length.to_be_bytes());
+            bytes.extend_from_slice(&epoch.public_key_der);
+            bytes.extend_from_slice(&epoch.not_before_ms.to_be_bytes());
+            bytes.extend_from_slice(&epoch.expires_at_ms.to_be_bytes());
+            bytes.extend_from_slice(&epoch.max_lease_ttl_ms.to_be_bytes());
+        }
+        bytes
+    }
+
+    /// Validates and signs the directory with the node descriptor identity.
+    ///
+    /// # Errors
+    /// Returns an invariant error for malformed epochs or a node-identity
+    /// mismatch.
+    pub fn sign(&mut self, node_key: &IdentityKeyPair) -> Result<(), BlindVaultError> {
+        self.validate_fields()?;
+        if self.node_id != node_key.public_key_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        self.signature = node_key.sign(&self.signing_bytes());
+        Ok(())
+    }
+
+    /// Verifies bounds, freshness, expected node identity, and signature.
+    ///
+    /// # Errors
+    /// Returns an invariant, freshness, identity, or signature error when the
+    /// directory cannot be trusted.
+    pub fn validate_and_verify(
+        &self,
+        now_ms: u64,
+        maximum_age_ms: u64,
+        maximum_clock_skew_ms: u64,
+        node_key: &IdentityPublicKey,
+    ) -> Result<(), BlindVaultError> {
+        self.validate_fields()?;
+        if maximum_age_ms == 0
+            || self.generated_at_ms > now_ms.saturating_add(maximum_clock_skew_ms)
+            || now_ms.saturating_sub(self.generated_at_ms) > maximum_age_ms
+        {
+            return Err(BlindVaultError::IssuerDirectoryTimestampOutsideWindow);
+        }
+        if self.node_id != node_key.to_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        node_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+
+    fn validate_fields(&self) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("blind_issuer_directory_node_id", &self.node_id)?;
+        if self.epochs.len() > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS {
+            return Err(BlindVaultError::TooManyBlindIssuerEpochs);
+        }
+        for epoch in &self.epochs {
+            epoch.validate_at(self.generated_at_ms)?;
+        }
+        if self
+            .epochs
+            .windows(2)
+            .any(|pair| pair[0].issuer_key_id >= pair[1].issuer_key_id)
+        {
+            return Err(BlindVaultError::BlindIssuerEpochOrderInvalid);
+        }
+        Ok(())
+    }
 }
 
 /// Capability-authenticated request for one stable recovery snapshot page.
@@ -1081,6 +1293,10 @@ pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, Blin
             FRAME_KIND_BLIND_LEASE_ADMISSION,
             serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
         ),
+        BlindVaultFrame::BlindIssuerDirectory(value) => (
+            FRAME_KIND_BLIND_ISSUER_DIRECTORY,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
     };
 
     let total = FRAME_HEADER_BYTES
@@ -1151,6 +1367,9 @@ pub fn decode_blind_vault_frame(bytes: &[u8]) -> Result<BlindVaultFrame, BlindVa
         FRAME_KIND_BLIND_LEASE_ADMISSION => Ok(BlindVaultFrame::BlindLeaseAdmission(
             deserialize_body(body, frame_limit)?,
         )),
+        FRAME_KIND_BLIND_ISSUER_DIRECTORY => Ok(BlindVaultFrame::BlindIssuerDirectory(
+            deserialize_body(body, frame_limit)?,
+        )),
         kind => Err(BlindVaultError::UnknownFrameKind(kind)),
     }
 }
@@ -1215,6 +1434,27 @@ pub enum BlindVaultError {
         /// Received finalized signature length in bytes.
         actual: usize,
     },
+    /// An advertised RSA public key exceeded the issuer-directory bound.
+    #[error("blind issuer public-key DER length {actual} is invalid")]
+    InvalidBlindIssuerKeyLength {
+        /// Received canonical DER length in bytes.
+        actual: usize,
+    },
+    /// Advertised RSA key bytes did not match their signed key fingerprint.
+    #[error("blind issuer key fingerprint does not match public-key DER")]
+    BlindIssuerKeyIdMismatch,
+    /// An issuer epoch had an empty, expired, reversed, or overlong policy.
+    #[error("blind issuer epoch policy is invalid")]
+    InvalidBlindIssuerEpochPolicy,
+    /// A signed directory exceeded the protocol-wide epoch count ceiling.
+    #[error("blind issuer directory contains too many epochs")]
+    TooManyBlindIssuerEpochs,
+    /// Epochs were duplicated or not in canonical key-ID order.
+    #[error("blind issuer epochs are not in strict key-ID order")]
+    BlindIssuerEpochOrderInvalid,
+    /// Signed issuer discovery data was stale or implausibly far in the future.
+    #[error("blind issuer directory timestamp is outside the accepted window")]
+    IssuerDirectoryTimestampOutsideWindow,
     /// Pull page size was zero or exceeded the protocol-wide ceiling.
     #[error("blind-vault pull limit is invalid")]
     InvalidPullLimit,
@@ -1287,7 +1527,8 @@ fn frame_limit_for_kind(kind: u8) -> Result<u64, BlindVaultError> {
         | FRAME_KIND_DELETED_RECEIPT
         | FRAME_KIND_LEASE_ADMISSION
         | FRAME_KIND_PULL_REQUEST
-        | FRAME_KIND_BLIND_LEASE_ADMISSION => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
+        | FRAME_KIND_BLIND_LEASE_ADMISSION
+        | FRAME_KIND_BLIND_ISSUER_DIRECTORY => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
         FRAME_KIND_PULL_RESPONSE => Ok(MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES),
         unknown => Err(BlindVaultError::UnknownFrameKind(unknown)),
     }
@@ -1422,6 +1663,29 @@ mod tests {
         response
     }
 
+    fn signed_blind_issuer_directory() -> BlindVaultBlindIssuerDirectory {
+        let mut epochs = vec![
+            BlindVaultBlindIssuerEpoch::new(
+                vec![0x31; 64],
+                NOW_MS - 60_000,
+                NOW_MS + 24 * 60 * 60 * 1_000,
+                7 * 24 * 60 * 60 * 1_000,
+            ),
+            BlindVaultBlindIssuerEpoch::new(
+                vec![0x32; 72],
+                NOW_MS + 12 * 60 * 60 * 1_000,
+                NOW_MS + 2 * 24 * 60 * 60 * 1_000,
+                7 * 24 * 60 * 60 * 1_000,
+            ),
+        ];
+        epochs.sort_by_key(|epoch| epoch.issuer_key_id);
+        let node = node_key();
+        let mut directory =
+            BlindVaultBlindIssuerDirectory::new(NOW_MS, node.public_key_bytes(), epochs);
+        directory.sign(&node).expect("sign issuer directory");
+        directory
+    }
+
     #[test]
     fn signed_put_validates_and_round_trips() {
         let put = signed_put();
@@ -1529,6 +1793,49 @@ mod tests {
             Err(BlindVaultError::InvalidBlindAdmissionSignatureLength {
                 actual: MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES + 1,
             })
+        );
+    }
+
+    // [BLIND-VAULT-ISSUER-DIRECTORY 2026-07-23 by Codex] Clients authenticate
+    // key rotation against the node descriptor identity before creating a
+    // blinded token; the directory carries public policy only.
+    #[test]
+    fn signed_issuer_directory_is_fresh_canonical_and_round_trips() {
+        let directory = signed_blind_issuer_directory();
+        directory
+            .validate_and_verify(NOW_MS + 1_000, 60_000, 5_000, &node_key().public_key())
+            .expect("valid issuer directory");
+
+        let encoded =
+            encode_blind_vault_frame(&BlindVaultFrame::BlindIssuerDirectory(directory.clone()))
+                .expect("encode issuer directory");
+        assert_eq!(encoded[6], FRAME_KIND_BLIND_ISSUER_DIRECTORY);
+        assert_eq!(
+            decode_blind_vault_frame(&encoded).expect("decode issuer directory"),
+            BlindVaultFrame::BlindIssuerDirectory(directory)
+        );
+    }
+
+    #[test]
+    fn issuer_directory_rejects_key_tampering_order_drift_and_staleness() {
+        let mut key_tampered = signed_blind_issuer_directory();
+        key_tampered.epochs[0].public_key_der[0] ^= 1;
+        assert_eq!(
+            key_tampered.validate_and_verify(NOW_MS, 60_000, 5_000, &node_key().public_key(),),
+            Err(BlindVaultError::BlindIssuerKeyIdMismatch)
+        );
+
+        let mut reordered = signed_blind_issuer_directory();
+        reordered.epochs.reverse();
+        assert_eq!(
+            reordered.validate_and_verify(NOW_MS, 60_000, 5_000, &node_key().public_key(),),
+            Err(BlindVaultError::BlindIssuerEpochOrderInvalid)
+        );
+
+        let stale = signed_blind_issuer_directory();
+        assert_eq!(
+            stale.validate_and_verify(NOW_MS + 60_001, 60_000, 5_000, &node_key().public_key(),),
+            Err(BlindVaultError::IssuerDirectoryTimestampOutsideWindow)
         );
     }
 
