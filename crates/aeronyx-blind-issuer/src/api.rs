@@ -19,6 +19,7 @@
 //! - Exposes authenticated aggregate health without request/user identifiers.
 //! - Opens a monotonic circuit breaker after repeated custody failures.
 //! - Audits live-reload outcomes as coarse process-wide counters.
+//! - Uses a monotonic bounded token bucket for signing admission.
 //!
 //! ## Calling Relationships
 //! `main.rs` binds this router to loopback; `signer.rs` performs the private
@@ -34,8 +35,8 @@
 //! cancellation cannot release HSM capacity early. Never add wallet/account
 //! headers or request-body diagnostics.
 //!
-//! Last Modified: v0.7.0-BlindIssuerApi - Added atomic reload audit snapshots
-//! and fail-closed signer-generation overflow handling.
+//! Last Modified: v0.8.0-BlindIssuerApi - Replaced wall-clock fixed-window
+//! admission with a monotonic constant-memory token bucket.
 //! ============================================
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -80,6 +81,7 @@ const MAX_EPOCH_RESPONSE_BYTES: usize = EPOCH_RESPONSE_HEADER_BYTES
         * (EPOCH_ENTRY_FIXED_BYTES + MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES);
 const AUTHORIZATION_PREFIX: &[u8] = b"Bearer ";
 const CACHE_CONTROL_NO_STORE: &str = "no-store";
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// Content type for the local blind-issuer binary contract.
 pub const BLIND_ISSUER_CONTENT_TYPE: &str = "application/vnd.aeronyx.blind-issuer-v1";
@@ -361,7 +363,7 @@ struct ApiState {
     runtime: BlindIssuerRuntime,
     auth_token: Arc<Zeroizing<Vec<u8>>>,
     in_flight: Arc<AtomicUsize>,
-    rate: Arc<Mutex<RateWindow>>,
+    rate: Arc<Mutex<TokenBucket>>,
     policy: BlindIssuerApiPolicy,
     breaker: Arc<CircuitBreaker>,
     metrics: Arc<RuntimeMetrics>,
@@ -524,23 +526,56 @@ impl Drop for CircuitPermit {
     }
 }
 
-#[derive(Debug, Default)]
-struct RateWindow {
-    epoch_second: u64,
-    accepted: u64,
+// [BLIND-ISSUER-RATE 2026-07-23 by Codex] Wall time can jump during NTP
+// correction. Keep admission on `Instant` and retain constant memory even when
+// callers configure the public router constructor directly.
+#[derive(Debug)]
+struct TokenBucket {
+    capacity: u64,
+    available: u64,
+    last_refill: Instant,
+    refill_remainder_nanos: u128,
 }
 
-impl RateWindow {
-    fn try_take(&mut self, epoch_second: u64, limit: u64) -> bool {
-        if self.epoch_second != epoch_second {
-            self.epoch_second = epoch_second;
-            self.accepted = 0;
+impl TokenBucket {
+    const fn new(capacity: u64, now: Instant) -> Self {
+        Self {
+            capacity,
+            available: capacity,
+            last_refill: now,
+            refill_remainder_nanos: 0,
         }
-        if self.accepted >= limit {
+    }
+
+    fn try_take(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        if self.available == 0 {
             return false;
         }
-        self.accepted += 1;
+        self.available -= 1;
         true
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let Some(elapsed) = now.checked_duration_since(self.last_refill) else {
+            return;
+        };
+        self.last_refill = now;
+        if self.capacity == 0 {
+            self.refill_remainder_nanos = 0;
+            return;
+        }
+        let generated_numerator = elapsed
+            .as_nanos()
+            .saturating_mul(u128::from(self.capacity))
+            .saturating_add(self.refill_remainder_nanos);
+        let generated = u64::try_from(generated_numerator / NANOS_PER_SECOND).unwrap_or(u64::MAX);
+        self.available = self.capacity.min(self.available.saturating_add(generated));
+        self.refill_remainder_nanos = if self.available == self.capacity {
+            0
+        } else {
+            generated_numerator % NANOS_PER_SECOND
+        };
     }
 }
 
@@ -636,7 +671,10 @@ pub fn build_router_with_runtime(
         runtime,
         auth_token: Arc::new(auth_token),
         in_flight: Arc::new(AtomicUsize::new(0)),
-        rate: Arc::new(Mutex::new(RateWindow::default())),
+        rate: Arc::new(Mutex::new(TokenBucket::new(
+            policy.max_requests_per_second,
+            Instant::now(),
+        ))),
         policy,
         breaker,
         metrics: Arc::new(RuntimeMetrics::default()),
@@ -699,11 +737,7 @@ async fn signing_pressure_gate(
             .fetch_add(1, Ordering::Relaxed);
         return empty_response(StatusCode::TOO_MANY_REQUESTS);
     };
-    if !state
-        .rate
-        .lock()
-        .try_take(now_seconds(), state.policy.max_requests_per_second)
-    {
+    if !state.rate.lock().try_take(Instant::now()) {
         state.metrics.rate_rejected.fetch_add(1, Ordering::Relaxed);
         return empty_response(StatusCode::TOO_MANY_REQUESTS);
     }
@@ -1105,13 +1139,6 @@ fn empty_response(status: StatusCode) -> Response {
         .into_response()
 }
 
-fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1344,6 +1371,29 @@ mod tests {
                 .expect("backend completion should not time out")
                 .expect("backend operation completed");
         }
+    }
+
+    #[test]
+    fn token_bucket_refills_monotonically_and_caps_idle_burst() {
+        let started_at = Instant::now();
+        let mut bucket = TokenBucket::new(2, started_at);
+
+        assert!(bucket.try_take(started_at));
+        assert!(bucket.try_take(started_at));
+        assert!(!bucket.try_take(started_at));
+        assert!(!bucket.try_take(started_at + Duration::from_millis(499)));
+        assert!(bucket.try_take(started_at + Duration::from_millis(500)));
+        assert!(!bucket.try_take(started_at + Duration::from_millis(500)));
+        assert!(bucket.try_take(started_at + Duration::from_secs(1)));
+        assert!(!bucket.try_take(started_at + Duration::from_secs(1)));
+
+        let after_idle = started_at + Duration::from_secs(10);
+        assert!(bucket.try_take(after_idle));
+        assert!(bucket.try_take(after_idle));
+        assert!(!bucket.try_take(after_idle));
+
+        let mut closed = TokenBucket::new(0, started_at);
+        assert!(!closed.try_take(started_at + Duration::from_secs(1)));
     }
 
     #[tokio::test]

@@ -39,8 +39,8 @@ Important Note for Next Developer:
 - Production private keys should ultimately move behind the existing signer
   boundary into an HSM/KMS without changing the wire contract.
 
-Last Modified: v1.5.0-BlindIssuerDeploy - Added machine-checkable aggregate
-reload audit state and fail-closed generation handling.
+Last Modified: v1.6.0-BlindIssuerDeploy - Documented monotonic token-bucket
+admission and its bounded burst behavior.
 ============================================
 -->
 
@@ -116,6 +116,12 @@ sudo systemctl status aeronyx-blind-issuer.service
 The service binds only to `127.0.0.1`, and systemd independently denies all
 non-local network traffic. It has no capabilities, devices, writable paths,
 home access, or access to AeroNyx node databases.
+
+`max_requests_per_second` is enforced by a monotonic, constant-memory token
+bucket before request-body extraction. Its burst capacity is exactly one second
+of the configured rate, and capacity refills continuously at that rate. Wall
+clock/NTP corrections cannot reset or bypass the limiter. `max_in_flight`
+remains the separate hard ceiling for concurrent private-key operations.
 
 `signing_timeout_ms` controls how long the backend waits for an HTTP response
 (default 10,000ms; allowed 100–120,000ms). A timeout returns `503`, but it does
