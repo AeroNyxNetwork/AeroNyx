@@ -12,6 +12,8 @@
 //! - Defines the immutable encrypted object accepted by a blind vault node.
 //! - Defines a node-signed storage receipt suitable for independent replicas.
 //! - Defines anonymous lease authority and signed object deletion contracts.
+//! - Defines issuer-signed, short-lived bearer admission tickets without
+//!   binding a storage lease to an account identity.
 //! - Provides deterministic signing bytes and bounded binary wire framing.
 //! - Enforces coarse ciphertext size classes to reduce content-size leakage.
 //! - Keeps application domain separation inside client ciphertext and keys.
@@ -44,11 +46,16 @@
 //!   metadata by design and serves a different retrieval model.
 //! - Do not put vault object IDs, commitments, or receipts in the public
 //!   directory chain. Public commitments would create durable activity links.
+//! - A v1 admission ticket is a signed bearer credential, not a blind
+//!   signature. Issuers must not embed identity, account, or application data;
+//!   a future blind-issued proof can use a new frame kind/version.
 //! - Do not change existing field order. Add a new frame version/kind instead.
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.1.0-BlindVaultLease - Added anonymous lease authority,
+//! Last Modified: v1.2.0-BlindVaultAdmission - Added bounded issuer-signed
+//! one-time bearer admission contracts.
+//! v1.1.0-BlindVaultLease - Added anonymous lease authority,
 //! administration-key deletion, and signed deletion receipts.
 //! v1.0.0-BlindVaultWire - Initial durable object and signed receipt contract.
 //! ============================================
@@ -66,6 +73,7 @@ use crate::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 const PUT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Put-v1";
 const RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-StoredReceipt-v1";
 const LEASE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Lease-v1";
+const ADMISSION_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Admission-v1";
 const DELETE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Delete-v1";
 const DELETE_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-DeletedReceipt-v1";
 const FRAME_MAGIC: [u8; 4] = *b"ANBV";
@@ -75,6 +83,7 @@ const FRAME_KIND_STORED_RECEIPT: u8 = 2;
 const FRAME_KIND_LEASE_CREATE: u8 = 3;
 const FRAME_KIND_DELETE: u8 = 4;
 const FRAME_KIND_DELETED_RECEIPT: u8 = 5;
+const FRAME_KIND_LEASE_ADMISSION: u8 = 6;
 
 /// Initial blind-vault wire version. This version is independent of the VPN
 /// transport and legacy chat-envelope versions.
@@ -104,6 +113,8 @@ pub enum BlindVaultFrame {
     Delete(BlindVaultDeleteRequest),
     /// Node proof that an exact object was removed or already absent.
     DeletedReceipt(BlindVaultDeletedReceipt),
+    /// One-time bearer admission ticket plus a self-authenticating lease.
+    LeaseAdmission(BlindVaultLeaseAdmissionRequest),
 }
 
 /// Anonymous lease metadata signed by its independent administration key.
@@ -203,6 +214,138 @@ impl BlindVaultLeaseCreateRequest {
         admin_key
             .verify(&self.signing_bytes(), &self.signature)
             .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+}
+
+/// Short-lived bearer credential authorising one anonymous lease admission.
+///
+/// The issuer signs only random token material and coarse resource policy. It
+/// must not attach an account, wallet, device, application namespace, or lease
+/// identifier. Storage nodes persist only the spent `token_id` until expiry.
+/// Version 1 is deliberately named a bearer ticket rather than a blind token:
+/// unlinkable issuance requires a separately audited blind-signature or VOPRF
+/// issuer and will use an additive protocol version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultAdmissionTicket {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Cryptographically random one-time bearer identifier.
+    pub token_id: [u8; 32],
+    /// Ed25519 identity of the operator-approved admission issuer.
+    pub issuer_id: [u8; 32],
+    /// Earliest Unix millisecond at which redemption is valid.
+    pub not_before_ms: u64,
+    /// Unix millisecond after which redemption and spent-state retention end.
+    pub expires_at_ms: u64,
+    /// Maximum lease lifetime this credential permits.
+    pub maximum_lease_ttl_ms: u64,
+    /// Ed25519 signature by `issuer_id` over all preceding fields.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultAdmissionTicket {
+    /// Builds an unsigned admission ticket from random bearer material.
+    #[must_use]
+    pub fn new(
+        token_id: [u8; 32],
+        issuer_id: [u8; 32],
+        not_before_ms: u64,
+        expires_at_ms: u64,
+        maximum_lease_ttl_ms: u64,
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            token_id,
+            issuer_id,
+            not_before_ms,
+            expires_at_ms,
+            maximum_lease_ttl_ms,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical issuer-signing input.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(ADMISSION_SIGNING_DOMAIN.len() + 90);
+        bytes.extend_from_slice(ADMISSION_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.token_id);
+        bytes.extend_from_slice(&self.issuer_id);
+        bytes.extend_from_slice(&self.not_before_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.expires_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.maximum_lease_ttl_ms.to_be_bytes());
+        bytes
+    }
+
+    /// Signs this bearer ticket with its declared issuer identity.
+    pub fn sign(&mut self, issuer_key: &IdentityKeyPair) -> Result<(), BlindVaultError> {
+        if self.issuer_id != issuer_key.public_key_bytes() {
+            return Err(BlindVaultError::AdmissionIssuerMismatch);
+        }
+        self.signature = issuer_key.sign(&self.signing_bytes());
+        Ok(())
+    }
+
+    /// Validates bounded lifetime, resource policy, issuer binding, and
+    /// signature. Operator issuer allowlisting remains server policy.
+    pub fn validate_and_verify(
+        &self,
+        now_ms: u64,
+        maximum_ticket_lifetime_ms: u64,
+        issuer_key: &IdentityPublicKey,
+    ) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("admission_token_id", &self.token_id)?;
+        if self.issuer_id != issuer_key.to_bytes() {
+            return Err(BlindVaultError::AdmissionIssuerMismatch);
+        }
+        if self.not_before_ms > now_ms {
+            return Err(BlindVaultError::AdmissionNotYetValid);
+        }
+        let validity_window = self
+            .expires_at_ms
+            .checked_sub(self.not_before_ms)
+            .ok_or(BlindVaultError::InvalidAdmissionPolicy)?;
+        if validity_window == 0
+            || validity_window > maximum_ticket_lifetime_ms
+            || self.maximum_lease_ttl_ms == 0
+        {
+            return Err(BlindVaultError::InvalidAdmissionPolicy);
+        }
+        validate_future_deadline(now_ms, self.expires_at_ms, maximum_ticket_lifetime_ms)?;
+        issuer_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+}
+
+/// Atomic wire request pairing one bearer admission with one anonymous lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultLeaseAdmissionRequest {
+    /// Short-lived issuer-signed one-time credential.
+    pub admission: BlindVaultAdmissionTicket,
+    /// Self-authenticating random replica lease requested by the bearer.
+    pub lease: BlindVaultLeaseCreateRequest,
+}
+
+impl BlindVaultLeaseAdmissionRequest {
+    /// Validates both signatures and applies the narrower node/ticket lease
+    /// lifetime without binding the two random identifiers in durable state.
+    pub fn validate_and_verify(
+        &self,
+        now_ms: u64,
+        node_maximum_lease_ttl_ms: u64,
+        maximum_ticket_lifetime_ms: u64,
+        issuer_key: &IdentityPublicKey,
+    ) -> Result<(), BlindVaultError> {
+        self.admission
+            .validate_and_verify(now_ms, maximum_ticket_lifetime_ms, issuer_key)?;
+        self.lease.validate_and_verify(
+            now_ms,
+            node_maximum_lease_ttl_ms.min(self.admission.maximum_lease_ttl_ms),
+        )
     }
 }
 
@@ -604,6 +747,9 @@ pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, Blin
         BlindVaultFrame::DeletedReceipt(value) => {
             (FRAME_KIND_DELETED_RECEIPT, serialize_body(value)?)
         }
+        BlindVaultFrame::LeaseAdmission(value) => {
+            (FRAME_KIND_LEASE_ADMISSION, serialize_body(value)?)
+        }
     };
 
     let total = FRAME_HEADER_BYTES
@@ -642,6 +788,7 @@ pub fn decode_blind_vault_frame(bytes: &[u8]) -> Result<BlindVaultFrame, BlindVa
         FRAME_KIND_LEASE_CREATE => Ok(BlindVaultFrame::LeaseCreate(deserialize_body(body)?)),
         FRAME_KIND_DELETE => Ok(BlindVaultFrame::Delete(deserialize_body(body)?)),
         FRAME_KIND_DELETED_RECEIPT => Ok(BlindVaultFrame::DeletedReceipt(deserialize_body(body)?)),
+        FRAME_KIND_LEASE_ADMISSION => Ok(BlindVaultFrame::LeaseAdmission(deserialize_body(body)?)),
         kind => Err(BlindVaultError::UnknownFrameKind(kind)),
     }
 }
@@ -688,6 +835,15 @@ pub enum BlindVaultError {
     /// Receipt signer did not match the declared descriptor identity.
     #[error("receipt node identity does not match its signing key")]
     NodeIdentityMismatch,
+    /// Admission ticket signer did not match its declared issuer identity.
+    #[error("admission issuer identity does not match its signing key")]
+    AdmissionIssuerMismatch,
+    /// Admission ticket cannot be redeemed before its validity window.
+    #[error("admission ticket is not yet valid")]
+    AdmissionNotYetValid,
+    /// Admission ticket carried an invalid time or lease policy.
+    #[error("admission ticket policy is invalid")]
+    InvalidAdmissionPolicy,
     /// Receipt promised no positive retention interval.
     #[error("receipt storage window is invalid")]
     InvalidReceiptWindow,
@@ -791,6 +947,7 @@ mod tests {
 
     const NOW_MS: u64 = 1_800_000_000_000;
     const MAX_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+    const MAX_TICKET_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 
     fn lease_key() -> IdentityKeyPair {
         IdentityKeyPair::from_bytes(&[7; 32]).expect("valid deterministic lease key")
@@ -802,6 +959,10 @@ mod tests {
 
     fn admin_key() -> IdentityKeyPair {
         IdentityKeyPair::from_bytes(&[11; 32]).expect("valid deterministic admin key")
+    }
+
+    fn admission_issuer_key() -> IdentityKeyPair {
+        IdentityKeyPair::from_bytes(&[15; 32]).expect("valid deterministic admission issuer key")
     }
 
     fn signed_lease() -> BlindVaultLeaseCreateRequest {
@@ -829,6 +990,19 @@ mod tests {
         put
     }
 
+    fn signed_admission() -> BlindVaultAdmissionTicket {
+        let issuer = admission_issuer_key();
+        let mut ticket = BlindVaultAdmissionTicket::new(
+            [17; 32],
+            issuer.public_key_bytes(),
+            NOW_MS - 1_000,
+            NOW_MS + 60 * 60 * 1_000,
+            14 * 24 * 60 * 60 * 1_000,
+        );
+        ticket.sign(&issuer).expect("matching admission issuer");
+        ticket
+    }
+
     #[test]
     fn signed_put_validates_and_round_trips() {
         let put = signed_put();
@@ -853,6 +1027,58 @@ mod tests {
         assert_eq!(
             decode_blind_vault_frame(&encoded).expect("decode lease"),
             BlindVaultFrame::LeaseCreate(lease)
+        );
+    }
+
+    #[test]
+    fn bearer_admission_validates_and_round_trips_without_identity_metadata() {
+        let request = BlindVaultLeaseAdmissionRequest {
+            admission: signed_admission(),
+            lease: signed_lease(),
+        };
+        request
+            .validate_and_verify(
+                NOW_MS,
+                MAX_TTL_MS,
+                MAX_TICKET_TTL_MS,
+                &admission_issuer_key().public_key(),
+            )
+            .expect("valid admission and lease");
+
+        let encoded = encode_blind_vault_frame(&BlindVaultFrame::LeaseAdmission(request.clone()))
+            .expect("encode admission");
+        assert_eq!(
+            decode_blind_vault_frame(&encoded).expect("decode admission"),
+            BlindVaultFrame::LeaseAdmission(request)
+        );
+    }
+
+    #[test]
+    fn admission_rejects_future_window_and_overlong_lease() {
+        let issuer = admission_issuer_key();
+        let mut future = signed_admission();
+        future.not_before_ms = NOW_MS + 1;
+        future.sign(&issuer).expect("sign future ticket");
+        assert_eq!(
+            future.validate_and_verify(NOW_MS, MAX_TICKET_TTL_MS, &issuer.public_key()),
+            Err(BlindVaultError::AdmissionNotYetValid)
+        );
+
+        let mut narrow = signed_admission();
+        narrow.maximum_lease_ttl_ms = 60 * 60 * 1_000;
+        narrow.sign(&issuer).expect("sign narrow ticket");
+        let request = BlindVaultLeaseAdmissionRequest {
+            admission: narrow,
+            lease: signed_lease(),
+        };
+        assert_eq!(
+            request.validate_and_verify(
+                NOW_MS,
+                MAX_TTL_MS,
+                MAX_TICKET_TTL_MS,
+                &issuer.public_key(),
+            ),
+            Err(BlindVaultError::LifetimeTooLong)
         );
     }
 
