@@ -24,7 +24,8 @@
 //! Keep key generation explicit and `create_new`; never overwrite custody
 //! material. Add systemd hardening in deployment packaging, not runtime code.
 //!
-//! Last Modified: v0.4.0-BlindIssuerBinary - Added fail-closed SIGHUP key reload.
+//! Last Modified: v0.5.0-BlindIssuerBinary - Audited every SIGHUP reload outcome
+//! without exposing custody configuration or key details.
 //! ============================================
 
 use std::error::Error;
@@ -158,6 +159,7 @@ async fn reload_on_hangup(
         let Ok(Ok(signer)) = candidate else {
             // [BLIND-ISSUER-RELOAD 2026-07-23 by Codex] Do not log provider,
             // path, key, or parsing details from the custody boundary.
+            runtime.record_reload_rejection(now_millis());
             warn!("blind issuer key reload rejected");
             continue;
         };

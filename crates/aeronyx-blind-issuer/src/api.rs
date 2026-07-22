@@ -18,6 +18,7 @@
 //! - Holds concurrency capacity until custody work ends, even after cancellation.
 //! - Exposes authenticated aggregate health without request/user identifiers.
 //! - Opens a monotonic circuit breaker after repeated custody failures.
+//! - Audits live-reload outcomes as coarse process-wide counters.
 //!
 //! ## Calling Relationships
 //! `main.rs` binds this router to loopback; `signer.rs` performs the private
@@ -33,8 +34,8 @@
 //! cancellation cannot release HSM capacity early. Never add wallet/account
 //! headers or request-body diagnostics.
 //!
-//! Last Modified: v0.6.0-BlindIssuerApi - Added validated atomic signer reloads
-//! while preserving in-flight custody operations and public API compatibility.
+//! Last Modified: v0.7.0-BlindIssuerApi - Added atomic reload audit snapshots
+//! and fail-closed signer-generation overflow handling.
 //! ============================================
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -145,6 +146,21 @@ pub struct BlindIssuerOperationalSnapshot {
     /// Monotonic in-process signer snapshot generation, starting at one.
     #[serde(default)]
     pub signer_generation: u64,
+    /// Key reload candidates evaluated since process startup.
+    #[serde(default)]
+    pub reload_attempted: u64,
+    /// Key reloads atomically installed since process startup.
+    #[serde(default)]
+    pub reload_succeeded: u64,
+    /// Key reloads rejected before changing the active signer.
+    #[serde(default)]
+    pub reload_rejected: u64,
+    /// Unix time of the last evaluated reload, or zero before the first attempt.
+    #[serde(default)]
+    pub last_reload_attempt_at_ms: u64,
+    /// Unix time of the last installed reload, or zero before the first success.
+    #[serde(default)]
+    pub last_reload_success_at_ms: u64,
     /// Private operations that have not yet returned from custody.
     pub in_flight: usize,
     /// Configured private-operation concurrency ceiling.
@@ -203,6 +219,9 @@ pub enum BlindIssuerReloadError {
     /// The candidate removed or changed a still-valid published epoch.
     #[error("blind issuer reload breaks epoch continuity")]
     EpochContinuity,
+    /// The process exhausted its monotonic signer-generation space.
+    #[error("blind issuer signer generation exhausted")]
+    GenerationExhausted,
 }
 
 struct BlindIssuerRuntimeInner {
@@ -212,6 +231,39 @@ struct BlindIssuerRuntimeInner {
 struct BlindIssuerRuntimeState {
     signer: Arc<BlindSigner>,
     generation: u64,
+    reload_attempted: u64,
+    reload_succeeded: u64,
+    reload_rejected: u64,
+    last_reload_attempt_at_ms: u64,
+    last_reload_success_at_ms: u64,
+}
+
+// [BLIND-ISSUER-RELOAD-AUDIT 2026-07-23 by Codex] Return one coherent
+// signer/audit view instead of extending an increasingly fragile tuple.
+struct BlindIssuerRuntimeSnapshot {
+    signer: Arc<BlindSigner>,
+    signer_generation: u64,
+    reload_attempted: u64,
+    reload_succeeded: u64,
+    reload_rejected: u64,
+    last_reload_attempt_at_ms: u64,
+    last_reload_success_at_ms: u64,
+}
+
+impl BlindIssuerRuntimeState {
+    fn record_reload_attempt(&mut self, now_ms: u64) {
+        self.reload_attempted = self.reload_attempted.saturating_add(1);
+        self.last_reload_attempt_at_ms = now_ms;
+    }
+
+    fn record_reload_rejection(&mut self) {
+        self.reload_rejected = self.reload_rejected.saturating_add(1);
+    }
+
+    fn record_reload_success(&mut self, now_ms: u64) {
+        self.reload_succeeded = self.reload_succeeded.saturating_add(1);
+        self.last_reload_success_at_ms = now_ms;
+    }
 }
 
 /// Reloadable signer handle shared by HTTP state and the process signal loop.
@@ -233,6 +285,11 @@ impl BlindIssuerRuntime {
                 state: RwLock::new(BlindIssuerRuntimeState {
                     signer,
                     generation: 1,
+                    reload_attempted: 0,
+                    reload_succeeded: 0,
+                    reload_rejected: 0,
+                    last_reload_attempt_at_ms: 0,
+                    last_reload_success_at_ms: 0,
                 }),
             }),
         }
@@ -248,29 +305,54 @@ impl BlindIssuerRuntime {
         candidate: Arc<BlindSigner>,
         now_ms: u64,
     ) -> Result<u64, BlindIssuerReloadError> {
-        if !candidate.has_active_key(now_ms) {
-            return Err(BlindIssuerReloadError::NoActiveIssuer);
-        }
+        let candidate_has_active_key = candidate.has_active_key(now_ms);
         let candidate_epochs = candidate.public_epochs(now_ms);
         let mut state = self.inner.state.write();
+        state.record_reload_attempt(now_ms);
+        if !candidate_has_active_key {
+            state.record_reload_rejection();
+            return Err(BlindIssuerReloadError::NoActiveIssuer);
+        }
         if state
             .signer
             .public_epochs(now_ms)
             .iter()
             .any(|epoch| !candidate_epochs.contains(epoch))
         {
+            state.record_reload_rejection();
             return Err(BlindIssuerReloadError::EpochContinuity);
         }
+        let Some(next_generation) = state.generation.checked_add(1) else {
+            state.record_reload_rejection();
+            return Err(BlindIssuerReloadError::GenerationExhausted);
+        };
         state.signer = candidate;
-        state.generation = state.generation.saturating_add(1);
-        let generation = state.generation;
+        state.generation = next_generation;
+        state.record_reload_success(now_ms);
         drop(state);
-        Ok(generation)
+        Ok(next_generation)
     }
 
-    fn snapshot(&self) -> (Arc<BlindSigner>, u64) {
+    /// Records a candidate that failed before a signer could be constructed.
+    ///
+    /// This deliberately stores no failure reason, path, provider, or key ID.
+    pub fn record_reload_rejection(&self, now_ms: u64) {
+        let mut state = self.inner.state.write();
+        state.record_reload_attempt(now_ms);
+        state.record_reload_rejection();
+    }
+
+    fn snapshot(&self) -> BlindIssuerRuntimeSnapshot {
         let state = self.inner.state.read();
-        (Arc::clone(&state.signer), state.generation)
+        BlindIssuerRuntimeSnapshot {
+            signer: Arc::clone(&state.signer),
+            signer_generation: state.generation,
+            reload_attempted: state.reload_attempted,
+            reload_succeeded: state.reload_succeeded,
+            reload_rejected: state.reload_rejected,
+            last_reload_attempt_at_ms: state.last_reload_attempt_at_ms,
+            last_reload_success_at_ms: state.last_reload_success_at_ms,
+        }
     }
 }
 
@@ -648,7 +730,8 @@ async fn sign_handler(
     let Ok(request) = decode_sign_request(&body) else {
         return empty_response(StatusCode::BAD_REQUEST);
     };
-    let (signer, _) = state.runtime.snapshot();
+    let runtime = state.runtime.snapshot();
+    let signer = runtime.signer;
     let backend_circuit_permit = Arc::clone(&circuit_permit);
     let operation = tokio::task::spawn_blocking(move || {
         let result = signer.sign(&request, now_millis());
@@ -695,8 +778,8 @@ async fn sign_handler(
 }
 
 async fn health_handler(State(state): State<ApiState>) -> Response {
-    let (signer, _) = state.runtime.snapshot();
-    if signer.has_active_key(now_millis()) && state.breaker.is_healthy() {
+    let runtime = state.runtime.snapshot();
+    if runtime.signer.has_active_key(now_millis()) && state.breaker.is_healthy() {
         empty_response(StatusCode::NO_CONTENT)
     } else {
         empty_response(StatusCode::SERVICE_UNAVAILABLE)
@@ -705,14 +788,19 @@ async fn health_handler(State(state): State<ApiState>) -> Response {
 
 async fn status_handler(State(state): State<ApiState>) -> Response {
     let generated_at_ms = now_millis();
-    let (signer, signer_generation) = state.runtime.snapshot();
+    let runtime = state.runtime.snapshot();
     let (circuit_open, circuit_half_open, circuit_open_until_ms, consecutive_backend_failures) =
         state.breaker.snapshot();
     let snapshot = BlindIssuerOperationalSnapshot {
         generated_at_ms,
-        active_key: signer.has_active_key(generated_at_ms),
-        key_count: signer.key_count(),
-        signer_generation,
+        active_key: runtime.signer.has_active_key(generated_at_ms),
+        key_count: runtime.signer.key_count(),
+        signer_generation: runtime.signer_generation,
+        reload_attempted: runtime.reload_attempted,
+        reload_succeeded: runtime.reload_succeeded,
+        reload_rejected: runtime.reload_rejected,
+        last_reload_attempt_at_ms: runtime.last_reload_attempt_at_ms,
+        last_reload_success_at_ms: runtime.last_reload_success_at_ms,
         in_flight: state.in_flight.load(Ordering::Acquire),
         max_in_flight: state.policy.max_in_flight,
         circuit_open,
@@ -736,10 +824,10 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
 
 async fn epoch_handler(State(state): State<ApiState>) -> Response {
     let generated_at_ms = now_millis();
-    let (signer, _) = state.runtime.snapshot();
+    let runtime = state.runtime.snapshot();
     let snapshot = BlindIssuerEpochSnapshot {
         generated_at_ms,
-        epochs: signer.public_epochs(generated_at_ms),
+        epochs: runtime.signer.public_epochs(generated_at_ms),
     };
     encode_epoch_snapshot(&snapshot).map_or_else(
         |_| empty_response(StatusCode::INTERNAL_SERVER_ERROR),
@@ -1423,6 +1511,11 @@ mod tests {
         assert!(open.active_key);
         assert_eq!(open.key_count, 1);
         assert_eq!(open.signer_generation, 1);
+        assert_eq!(open.reload_attempted, 0);
+        assert_eq!(open.reload_succeeded, 0);
+        assert_eq!(open.reload_rejected, 0);
+        assert_eq!(open.last_reload_attempt_at_ms, 0);
+        assert_eq!(open.last_reload_success_at_ms, 0);
         assert_eq!(open.in_flight, 0);
         assert_eq!(open.max_in_flight, 1);
         assert!(open.circuit_open);
@@ -1496,8 +1589,8 @@ mod tests {
         assert!(breaker.try_admit().is_some());
     }
 
-    #[test]
-    fn signer_reload_is_atomic_active_and_continuity_safe() {
+    #[tokio::test]
+    async fn signer_reload_is_atomic_active_and_continuity_safe() {
         let now_ms = now_millis();
         let old_pair =
             KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("old RSA key");
@@ -1521,15 +1614,17 @@ mod tests {
             ..new_epoch.clone()
         };
         let runtime = BlindIssuerRuntime::new(signer_from_epochs(vec![old_epoch.clone()]));
-        let (held_signer, generation) = runtime.snapshot();
-        assert_eq!(generation, 1);
+        let held = runtime.snapshot();
+        assert_eq!(held.signer_generation, 1);
+
+        runtime.record_reload_rejection(now_ms - 3);
 
         assert_eq!(
-            runtime.replace_signer(signer_from_epochs(vec![future_epoch]), now_ms),
+            runtime.replace_signer(signer_from_epochs(vec![future_epoch]), now_ms - 2),
             Err(BlindIssuerReloadError::NoActiveIssuer)
         );
         assert_eq!(
-            runtime.replace_signer(signer_from_epochs(vec![new_epoch.clone()]), now_ms),
+            runtime.replace_signer(signer_from_epochs(vec![new_epoch.clone()]), now_ms - 1),
             Err(BlindIssuerReloadError::EpochContinuity)
         );
         assert_eq!(
@@ -1537,10 +1632,43 @@ mod tests {
             Ok(2)
         );
 
-        let (current_signer, generation) = runtime.snapshot();
-        assert_eq!(generation, 2);
-        assert_eq!(current_signer.key_count(), 2);
-        assert_eq!(held_signer.key_count(), 1, "in-flight snapshot stays alive");
+        let current = runtime.snapshot();
+        assert_eq!(current.signer_generation, 2);
+        assert_eq!(current.signer.key_count(), 2);
+        assert_eq!(current.reload_attempted, 4);
+        assert_eq!(current.reload_succeeded, 1);
+        assert_eq!(current.reload_rejected, 3);
+        assert_eq!(current.last_reload_attempt_at_ms, now_ms);
+        assert_eq!(current.last_reload_success_at_ms, now_ms);
+        assert_eq!(held.signer.key_count(), 1, "in-flight snapshot stays alive");
+
+        let router = build_router_with_runtime(
+            runtime.clone(),
+            Zeroizing::new(BACKEND_TOKEN.to_vec()),
+            BlindIssuerApiPolicy::new(128, 1),
+        );
+        let authorization = format!(
+            "Bearer {}",
+            std::str::from_utf8(BACKEND_TOKEN).expect("ASCII backend token")
+        );
+        let reported = operational_snapshot(&router, &authorization).await;
+        assert_eq!(reported.signer_generation, 2);
+        assert_eq!(reported.reload_attempted, 4);
+        assert_eq!(reported.reload_succeeded, 1);
+        assert_eq!(reported.reload_rejected, 3);
+        assert_eq!(reported.last_reload_attempt_at_ms, now_ms);
+        assert_eq!(reported.last_reload_success_at_ms, now_ms);
+
+        runtime.inner.state.write().generation = u64::MAX;
+        assert_eq!(
+            runtime.replace_signer(Arc::clone(&current.signer), now_ms + 1),
+            Err(BlindIssuerReloadError::GenerationExhausted)
+        );
+        let exhausted = runtime.snapshot();
+        assert_eq!(exhausted.signer_generation, u64::MAX);
+        assert_eq!(exhausted.reload_attempted, 5);
+        assert_eq!(exhausted.reload_succeeded, 1);
+        assert_eq!(exhausted.reload_rejected, 4);
     }
 
     #[tokio::test]

@@ -39,7 +39,8 @@ Important Note for Next Developer:
 - Production private keys should ultimately move behind the existing signer
   boundary into an HSM/KMS without changing the wire contract.
 
-Last Modified: v1.4.0-BlindIssuerDeploy - Added continuity-safe live key reload.
+Last Modified: v1.5.0-BlindIssuerDeploy - Added machine-checkable aggregate
+reload audit state and fail-closed generation handling.
 ============================================
 -->
 
@@ -153,10 +154,12 @@ exports `encode_sign_request`, `decode_sign_response`, and
 `decode_epoch_snapshot` as the canonical backend-side codec reference.
 
 The JSON status snapshot contains only process-wide counts: active/key count,
-signer generation, in-flight capacity, breaker state (`circuit_open` and
-`circuit_half_open`), successes, backend failures, timeouts, and rejections. It
-never includes blinded bytes, key IDs, wallet/account/device identifiers, IP
-addresses, request IDs, timestamps per request, or issuance history. Treat the
+signer generation, reload attempts/successes/rejections, last aggregate reload
+attempt/success time, in-flight capacity, breaker state (`circuit_open` and
+`circuit_half_open`), signing successes, backend failures, timeouts, and
+rejections. It never includes blinded bytes, key IDs, wallet/account/device
+identifiers, IP addresses, request IDs, timestamps per request, issuance
+history, key paths, custody providers, or reload error details. Treat the
 endpoint as operator telemetry and keep bearer authentication enabled even on
 loopback.
 
@@ -166,8 +169,11 @@ loopback.
 2. Add a future `[[keys]]` epoch while retaining the currently active epoch.
 3. Atomically install the updated config, then run
    `sudo systemctl reload aeronyx-blind-issuer.service`.
-4. Require `signer_generation` to increase and `/internal/v1/health` to remain
-   `204`; a rejected reload leaves the previous generation serving unchanged.
+4. Require `reload_attempted` to increase by one, `reload_succeeded` to increase
+   by one, `reload_rejected` to remain unchanged, `signer_generation` to
+   increase, and `/internal/v1/health` to remain `204`. A rejected reload
+   increments only the attempt/rejection audit counters and leaves the previous
+   generation serving unchanged.
 5. Fetch `/internal/v1/issuer-epochs` through the authenticated backend path.
 6. Publish the new **public** DER epoch to storage-node configuration before
    its activation time; nodes then expose signed public issuer directories.
