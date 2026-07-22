@@ -30,6 +30,7 @@ blind-rsa-signatures = "0.17.2"
 clap = { workspace = true }
 hex = { workspace = true }
 libc = "0.2"
+nix = { workspace = true, features = ["user"] }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }

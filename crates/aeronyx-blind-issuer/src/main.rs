@@ -21,7 +21,7 @@
 //! Keep key generation explicit and `create_new`; never overwrite custody
 //! material. Add systemd hardening in deployment packaging, not runtime code.
 //!
-//! Last Modified: v0.1.0-BlindIssuerBinary - Initial process entry point.
+//! Last Modified: v0.1.1-BlindIssuerBinary - Graceful SIGTERM shutdown.
 //! ============================================
 
 use std::error::Error;
@@ -111,7 +111,28 @@ async fn serve(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // [BLIND-ISSUER-HARDENING 2026-07-23 by Codex] systemd sends SIGTERM;
+    // waiting only for Ctrl-C would skip Axum's graceful-drain path in service.
+    let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+        wait_for_ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        () = wait_for_ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    wait_for_ctrl_c().await;
+}
+
+async fn wait_for_ctrl_c() {
     if tokio::signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
     }
@@ -152,6 +173,7 @@ fn write_secure_new(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .mode(0o600)
         .open(path)?;
     file.write_all(bytes)?;

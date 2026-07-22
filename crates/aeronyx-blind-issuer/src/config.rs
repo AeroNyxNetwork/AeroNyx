@@ -26,7 +26,7 @@
 //! Do not add inline private keys or bearer tokens to TOML/environment values.
 //! Secret-manager integration should implement a separate custody backend.
 //!
-//! Last Modified: v0.1.0-BlindIssuerConfig - Initial fail-closed policy.
+//! Last Modified: v0.1.1-BlindIssuerConfig - Enforce absolute, same-owner secrets.
 //! ============================================
 
 use std::collections::HashSet;
@@ -137,9 +137,9 @@ impl BlindIssuerConfig {
                 "listen_addr must use a loopback IP",
             ));
         }
-        if self.auth_token_file.as_os_str().is_empty() {
+        if !self.auth_token_file.is_absolute() {
             return Err(ConfigError::InvalidPolicy(
-                "auth_token_file must not be empty",
+                "auth_token_file must be an absolute path",
             ));
         }
         if self.max_requests_per_second == 0 || self.max_requests_per_second > 10_000 {
@@ -160,11 +160,11 @@ impl BlindIssuerConfig {
 
         let mut unique_paths = HashSet::with_capacity(self.keys.len());
         for key in &self.keys {
-            if key.private_key_der_file.as_os_str().is_empty()
+            if !key.private_key_der_file.is_absolute()
                 || !unique_paths.insert(key.private_key_der_file.clone())
             {
                 return Err(ConfigError::InvalidPolicy(
-                    "private key paths must be non-empty and unique",
+                    "private key paths must be absolute and unique",
                 ));
             }
             let epoch_secs = key
@@ -235,6 +235,15 @@ const fn default_max_in_flight() -> usize {
 
 fn read_bounded_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, ConfigError> {
     let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(ConfigError::InvalidPolicy(
+            "configuration path must be a regular file",
+        ));
+    }
+    if metadata.len() > maximum_bytes {
+        return Err(ConfigError::FileTooLarge);
+    }
     read_bounded_reader(file.take(maximum_bytes + 1), maximum_bytes)
 }
 
@@ -259,8 +268,17 @@ fn read_secure_file(path: &Path, maximum_bytes: u64) -> Result<Zeroizing<Vec<u8>
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+    // [BLIND-ISSUER-HARDENING 2026-07-23 by Codex] Mode 0600 is not enough
+    // when a privileged process can read a file owned by another account.
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.nlink() != 1
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+    {
         return Err(ConfigError::InsecureSecretFile);
+    }
+    if metadata.len() > maximum_bytes {
+        return Err(ConfigError::FileTooLarge);
     }
     Ok(Zeroizing::new(read_bounded_reader(
         file.take(maximum_bytes + 1),
@@ -314,11 +332,11 @@ mod tests {
     fn configuration_rejects_public_listener_and_long_epoch() {
         let config = BlindIssuerConfig {
             listen_addr: "0.0.0.0:9191".to_owned(),
-            auth_token_file: PathBuf::from("backend.token"),
+            auth_token_file: PathBuf::from("/var/lib/aeronyx/backend.token"),
             max_requests_per_second: 128,
             max_in_flight: 8,
             keys: vec![BlindIssuerKeyConfig {
-                private_key_der_file: PathBuf::from("issuer.der"),
+                private_key_der_file: PathBuf::from("/var/lib/aeronyx/issuer.der"),
                 not_before_unix_secs: 1,
                 expires_at_unix_secs: 2,
                 max_lease_ttl_secs: 1,
@@ -335,5 +353,26 @@ mod tests {
             ..config
         };
         assert!(long_epoch.validate().is_err());
+    }
+
+    #[test]
+    fn configuration_requires_absolute_secret_paths() {
+        let mut config = BlindIssuerConfig {
+            listen_addr: "127.0.0.1:9191".to_owned(),
+            auth_token_file: PathBuf::from("backend.token"),
+            max_requests_per_second: 128,
+            max_in_flight: 8,
+            keys: vec![BlindIssuerKeyConfig {
+                private_key_der_file: PathBuf::from("/var/lib/aeronyx/issuer.der"),
+                not_before_unix_secs: 1,
+                expires_at_unix_secs: 2,
+                max_lease_ttl_secs: 1,
+            }],
+        };
+        assert!(config.validate().is_err());
+
+        config.auth_token_file = PathBuf::from("/var/lib/aeronyx/backend.token");
+        config.keys[0].private_key_der_file = PathBuf::from("issuer.der");
+        assert!(config.validate().is_err());
     }
 }
