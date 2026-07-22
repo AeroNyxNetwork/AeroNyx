@@ -88,6 +88,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_QUERY_NAME: &str = "api.aeronyx.network";
 const EGRESS_CHECK_ADDR: &str = "1.1.1.1:443";
 const VPN_SERVICE_NAME: &str = "aeronyx-server";
+const VPN_SERVICE_UNIT_NAME: &str = "aeronyx-server.service";
 const VPN_SERVICE_NAME_ENV: &str = "AERONYX_SYSTEMD_SERVICE";
 const PROC_SELF_CGROUP_PATH: &str = "/proc/self/cgroup";
 const UPGRADE_STATUS_FILE: &str = "/var/lib/aeronyx/upgrade-status.json";
@@ -1760,10 +1761,15 @@ fn resolve_vpn_service_name_from(
     operator_override: Option<&str>,
     process_cgroup: Option<&str>,
 ) -> String {
-    operator_override
+    let resolved = operator_override
         .and_then(validated_systemd_service_name)
         .or_else(|| process_cgroup.and_then(systemd_service_name_from_cgroup))
-        .unwrap_or_else(|| VPN_SERVICE_NAME.to_string())
+        .unwrap_or_else(|| VPN_SERVICE_NAME.to_string());
+    if resolved == VPN_SERVICE_UNIT_NAME {
+        VPN_SERVICE_NAME.to_string()
+    } else {
+        resolved
+    }
 }
 
 fn systemd_service_name_from_cgroup(cgroup: &str) -> Option<String> {
@@ -2913,6 +2919,10 @@ mod tests {
         );
 
         assert_eq!(resolved, "aeronyx-server-jp1.service");
+        assert_eq!(
+            resolve_vpn_service_name_from(None, Some("0::/system.slice/aeronyx-server.service\n"),),
+            VPN_SERVICE_NAME
+        );
     }
 
     #[test]
