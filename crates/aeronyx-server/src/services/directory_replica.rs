@@ -49,13 +49,16 @@
 //!   audit inside the same `SQLite` read transaction for signed carrier use.
 //! - Retains a bounded, durable registry for permissionless full-node mirrors
 //!   without granting those producers checkpoint, witness, or policy authority.
+//! - Gates public carrier recovery reads on that durable mirror registry while
+//!   preserving exact producer signatures, object hashes, and quarantine state.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
 //! - `api/directory_replica_sync.rs` verifies and downloads bounded peer pages,
 //!   then calls `import_verified_page` from a blocking worker.
 //! - `api/directory_replica_status.rs` reads only low-cost audited snapshots.
-//! - The local producer store remains the only source served by peer routes.
+//! - `api/directory_chain_peer.rs` serves local history plus audited, registry-
+//!   gated replica recovery evidence; witness and policy routes remain pinned.
 //!
 //! ## Main Logical Flow
 //! 1. Open the existing Directory Chain `SQLite` file and initialize only the
@@ -84,6 +87,8 @@
 //!     reject rollback, same-epoch conflict, and non-contiguous progression.
 //! 13. Admit dynamically discovered mirrors into a capacity-bounded registry;
 //!     promote them out of mirror status atomically if later operator-pinned.
+//! 14. Permit public recovery reads only for producers still present in that
+//!     registry, while preserving the general reader for pinned authority use.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -116,6 +121,8 @@
 //!   finality, and public status must never expose their full member identities.
 //! - A carrier may export only non-quarantined producer evidence retained in
 //!   this store. The receiver must still verify producer and carrier signatures.
+//! - Public carrier reads must call `audited_mirror_evidence_*`; never use the
+//!   general authority reader to bypass durable mirror membership.
 //! - Incident evidence export is read-only. Quarantine resolution requires a
 //!   separately authenticated, audited compare-and-swap command boundary.
 //! - Never expose [`DirectoryReplicaStore::resolve_quarantine`] through the
@@ -123,6 +130,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.19.0-MirrorRecovery - Added registry-gated public recovery reads and carrier import tests
 //! v0.18.0-FullNodeMirror - Added schema v9 bounded non-authoritative mirror registry
 //! v0.17.0-DirectoryPolicyHeadAnchor - Added schema v8 opaque external policy-head anchors and signed receipts
 //! v0.16.0-DirectoryWitnessPolicyEpoch - Added schema v7 signed hash-linked local witness policy history, metadata-head partial-deletion protection, startup reconciliation, and tamper tests
@@ -222,6 +230,12 @@ enum DirectoryReplicaImportMode {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryReplicaEvidenceScope {
+    AnyAudited,
+    RetainedMirror,
+}
+
 /// Failures returned by the producer-isolated replica store.
 #[derive(Debug, thiserror::Error)]
 pub enum DirectoryReplicaStoreError {
@@ -252,6 +266,9 @@ pub enum DirectoryReplicaStoreError {
     /// The configured durable permissionless mirror namespace ceiling is full.
     #[error("directory full-node mirror capacity reached")]
     MirrorCapacity,
+    /// A public recovery read requested a namespace not retained as a mirror.
+    #[error("directory full-node mirror namespace is not retained")]
+    MirrorNotRetained,
 }
 
 /// Aggregate result of a complete replica startup audit.
@@ -974,12 +991,24 @@ pub struct DirectoryFullNodeMirrorRuntimeSnapshot {
     pub pages_succeeded: u64,
     /// Failed bounded mirror attempts during this process lifetime.
     pub attempts_failed: u64,
+    /// Direct-page failures that entered bounded carrier recovery.
+    pub recovery_attempts: u64,
+    /// Mirror pages recovered through an independently authenticated carrier.
+    pub recovery_succeeded: u64,
+    /// Bounded carrier recovery attempts that exhausted or failed closed.
+    pub recovery_failed: u64,
     /// Timestamp of the latest completed mirror round.
     pub last_round_at: Option<u64>,
     /// Timestamp of the latest authenticated mirror import.
     pub last_success_at: Option<u64>,
     /// Timestamp of the latest failed mirror attempt.
     pub last_failure_at: Option<u64>,
+    /// Timestamp of the latest bounded carrier recovery attempt.
+    pub last_recovery_attempt_at: Option<u64>,
+    /// Timestamp of the latest successful carrier recovery.
+    pub last_recovery_success_at: Option<u64>,
+    /// Timestamp of the latest failed or exhausted carrier recovery.
+    pub last_recovery_failure_at: Option<u64>,
 }
 
 impl DirectoryReplicaSyncObservation {
@@ -1217,6 +1246,26 @@ impl DirectoryReplicaSyncRuntime {
         }
         if failed > 0 {
             snapshot.last_failure_at = Some(completed_at);
+        }
+    }
+
+    /// Records one privacy-safe carrier recovery outcome.
+    ///
+    /// Carrier identities, endpoints, routes, producer identities, response
+    /// bodies, and failure strings are intentionally excluded.
+    pub fn record_full_node_mirror_recovery(&self, succeeded: bool, completed_at: u64) {
+        if completed_at == 0 {
+            return;
+        }
+        let mut snapshot = self.full_node_mirror.lock();
+        snapshot.recovery_attempts = snapshot.recovery_attempts.saturating_add(1);
+        snapshot.last_recovery_attempt_at = Some(completed_at);
+        if succeeded {
+            snapshot.recovery_succeeded = snapshot.recovery_succeeded.saturating_add(1);
+            snapshot.last_recovery_success_at = Some(completed_at);
+        } else {
+            snapshot.recovery_failed = snapshot.recovery_failed.saturating_add(1);
+            snapshot.last_recovery_failure_at = Some(completed_at);
         }
     }
 
@@ -2180,6 +2229,23 @@ impl DirectoryReplicaStore {
         limit: u16,
         observed_at: u64,
     ) -> Result<DirectoryReplicaEvidencePage, DirectoryReplicaStoreError> {
+        self.audited_evidence_page_with_scope(
+            producer,
+            from_height,
+            limit,
+            observed_at,
+            DirectoryReplicaEvidenceScope::AnyAudited,
+        )
+    }
+
+    fn audited_evidence_page_with_scope(
+        &self,
+        producer: &[u8; 32],
+        from_height: u64,
+        limit: u16,
+        observed_at: u64,
+        scope: DirectoryReplicaEvidenceScope,
+    ) -> Result<DirectoryReplicaEvidencePage, DirectoryReplicaStoreError> {
         if *producer == [0u8; 32]
             || *producer == self.local_node_id
             || from_height == 0
@@ -2194,6 +2260,7 @@ impl DirectoryReplicaStore {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         Self::audit_connection(&transaction, &self.local_node_id, observed_at)?;
+        Self::require_evidence_scope(&transaction, producer, scope)?;
         let tip = Self::load_tip(&transaction, producer)?;
         if tip.quarantined {
             return Err(DirectoryReplicaStoreError::Quarantined(
@@ -2234,6 +2301,34 @@ impl DirectoryReplicaStore {
         })
     }
 
+    /// Exports one audited page only when the producer remains in the durable
+    /// non-authoritative mirror registry.
+    ///
+    /// Public recovery admission must use this method instead of the general
+    /// authority evidence reader. Registry membership grants read eligibility
+    /// only; it never grants checkpoint, witness, policy, voting, fork-choice,
+    /// consensus, or finality authority.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError::MirrorNotRetained`] when this node
+    /// does not retain the requested producer as a permissionless mirror, plus
+    /// the ordinary audited evidence-page errors.
+    pub(crate) fn audited_mirror_evidence_page(
+        &self,
+        producer: &[u8; 32],
+        from_height: u64,
+        limit: u16,
+        observed_at: u64,
+    ) -> Result<DirectoryReplicaEvidencePage, DirectoryReplicaStoreError> {
+        self.audited_evidence_page_with_scope(
+            producer,
+            from_height,
+            limit,
+            observed_at,
+            DirectoryReplicaEvidenceScope::RetainedMirror,
+        )
+    }
+
     /// Audits the complete replica namespace, then loads exact producer-bound
     /// descriptor objects from the same read transaction and in request order.
     ///
@@ -2248,6 +2343,21 @@ impl DirectoryReplicaStore {
         producer: &[u8; 32],
         descriptor_hashes: &[[u8; 32]],
         observed_at: u64,
+    ) -> Result<Option<Vec<SignedNodeDescriptor>>, DirectoryReplicaStoreError> {
+        self.audited_evidence_descriptor_objects_with_scope(
+            producer,
+            descriptor_hashes,
+            observed_at,
+            DirectoryReplicaEvidenceScope::AnyAudited,
+        )
+    }
+
+    fn audited_evidence_descriptor_objects_with_scope(
+        &self,
+        producer: &[u8; 32],
+        descriptor_hashes: &[[u8; 32]],
+        observed_at: u64,
+        scope: DirectoryReplicaEvidenceScope,
     ) -> Result<Option<Vec<SignedNodeDescriptor>>, DirectoryReplicaStoreError> {
         let unique = descriptor_hashes.iter().copied().collect::<HashSet<_>>();
         if *producer == [0u8; 32]
@@ -2266,6 +2376,7 @@ impl DirectoryReplicaStore {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         Self::audit_connection(&transaction, &self.local_node_id, observed_at)?;
+        Self::require_evidence_scope(&transaction, producer, scope)?;
         let tip = Self::load_tip(&transaction, producer)?;
         if tip.quarantined {
             return Err(DirectoryReplicaStoreError::Quarantined(
@@ -2303,6 +2414,48 @@ impl DirectoryReplicaStore {
         drop(statement);
         transaction.commit()?;
         Ok(Some(objects))
+    }
+
+    /// Loads exact audited descriptor objects only for a producer retained in
+    /// the durable non-authoritative mirror registry.
+    ///
+    /// This is the object-hydration companion to
+    /// [`Self::audited_mirror_evidence_page`]. It deliberately preserves exact
+    /// producer binding and refuses partial responses.
+    pub(crate) fn audited_mirror_evidence_descriptor_objects(
+        &self,
+        producer: &[u8; 32],
+        descriptor_hashes: &[[u8; 32]],
+        observed_at: u64,
+    ) -> Result<Option<Vec<SignedNodeDescriptor>>, DirectoryReplicaStoreError> {
+        self.audited_evidence_descriptor_objects_with_scope(
+            producer,
+            descriptor_hashes,
+            observed_at,
+            DirectoryReplicaEvidenceScope::RetainedMirror,
+        )
+    }
+
+    fn require_evidence_scope(
+        connection: &Connection,
+        producer: &[u8; 32],
+        scope: DirectoryReplicaEvidenceScope,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if scope == DirectoryReplicaEvidenceScope::AnyAudited {
+            return Ok(());
+        }
+        let retained = connection
+            .query_row(
+                "SELECT 1 FROM directory_replica_mirror_producers WHERE producer = ?1",
+                params![producer.as_slice()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !retained {
+            return Err(DirectoryReplicaStoreError::MirrorNotRetained);
+        }
+        Ok(())
     }
 
     /// Returns a low-cost aggregate snapshot of persisted, already-audited
@@ -8164,6 +8317,25 @@ mod tests {
     }
 
     #[test]
+    fn full_node_mirror_runtime_tracks_only_aggregate_recovery_outcomes() {
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        runtime.record_full_node_mirror_round(5, 2, 1, NOW + 1);
+        runtime.record_full_node_mirror_recovery(true, NOW + 2);
+        runtime.record_full_node_mirror_recovery(false, NOW + 3);
+
+        let snapshot = runtime.full_node_mirror_snapshot();
+        assert_eq!(snapshot.rounds, 1);
+        assert_eq!(snapshot.pages_succeeded, 1);
+        assert_eq!(snapshot.attempts_failed, 1);
+        assert_eq!(snapshot.recovery_attempts, 2);
+        assert_eq!(snapshot.recovery_succeeded, 1);
+        assert_eq!(snapshot.recovery_failed, 1);
+        assert_eq!(snapshot.last_recovery_attempt_at, Some(NOW + 3));
+        assert_eq!(snapshot.last_recovery_success_at, Some(NOW + 2));
+        assert_eq!(snapshot.last_recovery_failure_at, Some(NOW + 3));
+    }
+
+    #[test]
     fn full_node_mirror_registry_is_bounded_and_promotes_only_by_operator_pin() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("directory.db");
@@ -8242,6 +8414,22 @@ mod tests {
         ));
         store.ensure_mirror_capacity(2).unwrap();
 
+        let public_page = store
+            .audited_mirror_evidence_page(&mirror_a.public_key_bytes(), 1, 1, NOW + 21)
+            .unwrap();
+        assert_eq!(public_page.blocks, vec![block_a.clone()]);
+        let object_hash = block_a.commitments[0].descriptor_hash;
+        assert_eq!(
+            store
+                .audited_mirror_evidence_descriptor_objects(
+                    &mirror_a.public_key_bytes(),
+                    &[object_hash],
+                    NOW + 21,
+                )
+                .unwrap(),
+            Some(vec![object.clone()])
+        );
+
         assert_eq!(
             store
                 .promote_pinned_producers(&[
@@ -8253,6 +8441,15 @@ mod tests {
         );
         assert!(store.mirror_producer_ids().unwrap().is_empty());
         assert_eq!(store.audit(NOW + 21).unwrap().mirror_producers, 0);
+        assert!(matches!(
+            store.audited_mirror_evidence_page(
+                &mirror_a.public_key_bytes(),
+                1,
+                1,
+                NOW + 21,
+            ),
+            Err(DirectoryReplicaStoreError::MirrorNotRetained)
+        ));
         assert!(matches!(
             store.import_verified_mirror_page(
                 mirror_a.public_key_bytes(),
@@ -8371,6 +8568,8 @@ mod tests {
     fn audited_carrier_export_is_bounded_exact_and_importable() {
         let source_temp = TempDir::new().unwrap();
         let receiver_temp = TempDir::new().unwrap();
+        let mirror_receiver_temp = TempDir::new().unwrap();
+        let invalid_receiver_temp = TempDir::new().unwrap();
         let carrier = IdentityKeyPair::from_bytes(&[0x12; 32]).unwrap();
         let receiver = IdentityKeyPair::from_bytes(&[0x13; 32]).unwrap();
         let producer = IdentityKeyPair::from_bytes(&[0x14; 32]).unwrap();
@@ -8430,7 +8629,7 @@ mod tests {
             .import_verified_page(
                 producer.public_key_bytes(),
                 &page.blocks,
-                &[object],
+                std::slice::from_ref(&object),
                 page.tip_height,
                 page.tip_hash,
                 &frame,
@@ -8438,6 +8637,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported.blocks_inserted, 1);
+
+        let (mirror_destination, _) = DirectoryReplicaStore::open(
+            mirror_receiver_temp.path().join("directory.db"),
+            receiver.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        let mirror_imported = mirror_destination
+            .import_verified_mirror_page(
+                producer.public_key_bytes(),
+                1,
+                4,
+                &page.blocks,
+                std::slice::from_ref(&object),
+                page.tip_height,
+                page.tip_hash,
+                &frame,
+                NOW + 20,
+            )
+            .unwrap();
+        assert_eq!(mirror_imported.blocks_inserted, 1);
+        assert_eq!(
+            mirror_destination.mirror_producer_ids().unwrap(),
+            vec![producer.public_key_bytes()]
+        );
+
+        let mut producer_tampered_block = replica_block.clone();
+        producer_tampered_block.header.timestamp =
+            producer_tampered_block.header.timestamp.saturating_add(1);
+        let producer_tampered_hash = producer_tampered_block.hash();
+        let producer_tampered_frame = carrier_response_frame(
+            &producer,
+            &carrier,
+            vec![producer_tampered_block.clone()],
+            false,
+            1,
+            producer_tampered_hash,
+            [0x19; 16],
+        );
+        let (invalid_destination, _) = DirectoryReplicaStore::open(
+            invalid_receiver_temp.path().join("directory.db"),
+            receiver.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        assert!(matches!(
+            invalid_destination.import_verified_mirror_page(
+                producer.public_key_bytes(),
+                1,
+                4,
+                &[producer_tampered_block],
+                std::slice::from_ref(&object),
+                1,
+                producer_tampered_hash,
+                &producer_tampered_frame,
+                NOW + 20,
+            ),
+            Err(DirectoryReplicaStoreError::Block(_))
+        ));
 
         let mut tampered = frame;
         let last = tampered.len() - 1;

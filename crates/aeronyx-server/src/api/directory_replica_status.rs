@@ -37,6 +37,8 @@
 //!   strictly outside every HTTP listener.
 //! - Reports aggregate Full-node Mirror capacity and bounded round health while
 //!   keeping mirror identities/endpoints out of every public response.
+//! - Reports aggregate direct-first carrier recovery attempts and outcomes
+//!   without exposing producers, carriers, endpoints, or selected paths.
 //!
 //! ## Calling Relationships
 //! - `server.rs` mounts this router separately for public and operator scopes.
@@ -56,7 +58,8 @@
 //!    aggregate pins and threshold without returning policy membership.
 //! 9. Serialize aggregate-only or fingerprint-only detail by listener scope.
 //! 10. Re-verify canonical incident evidence before an operator-only export.
-//! 11. Report mirror transport separately from pinned authority observations.
+//! 11. Report mirror transport and bounded recovery separately from pinned
+//!     authority observations.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -83,8 +86,10 @@
 //!   audited compare-and-swap command boundary.
 //! - Mirror health must never be folded into checkpoint, witness, policy, vote,
 //!   fork-choice, consensus, or finality labels.
+//! - Recovery telemetry is aggregate transport health, never carrier reputation.
 //!
 //! ## Last Modified
+//! `v0.17.0-MirrorRecoveryStatus` - Added aggregate direct-first carrier recovery outcomes.
 //! `v0.16.0-FullNodeMirrorStatus` - Added aggregate bounded non-authoritative mirror health.
 //! `v0.15.0-DirectoryWitnessPolicyEpochStatus` - Added aggregate signed policy epoch, change count, pin count, threshold, and runtime-match state while keeping identities and digests host-local.
 //! `v0.14.0-DirectoryWitnessFailureDrillStatus` - Added current-pin completion evidence for the latest witnessed checkpoint so retired receipts cannot be mistaken for live threshold satisfaction.
@@ -310,9 +315,15 @@ struct DirectoryFullNodeMirrorStatus {
     last_round_failed: u64,
     pages_succeeded: u64,
     attempts_failed: u64,
+    recovery_attempts: u64,
+    recovery_succeeded: u64,
+    recovery_failed: u64,
     last_round_age_seconds: Option<u64>,
     last_success_age_seconds: Option<u64>,
     last_failure_age_seconds: Option<u64>,
+    last_recovery_attempt_age_seconds: Option<u64>,
+    last_recovery_success_age_seconds: Option<u64>,
+    last_recovery_failure_age_seconds: Option<u64>,
     selection_policy: &'static str,
     transport_policy: &'static str,
     authority_boundary: &'static str,
@@ -1348,6 +1359,9 @@ fn build_full_node_mirror_status(
         last_round_failed: runtime.last_round_failed,
         pages_succeeded: runtime.pages_succeeded,
         attempts_failed: runtime.attempts_failed,
+        recovery_attempts: runtime.recovery_attempts,
+        recovery_succeeded: runtime.recovery_succeeded,
+        recovery_failed: runtime.recovery_failed,
         last_round_age_seconds: runtime
             .last_round_at
             .map(|timestamp| generated_at.saturating_sub(timestamp)),
@@ -1357,9 +1371,19 @@ fn build_full_node_mirror_status(
         last_failure_age_seconds: runtime
             .last_failure_at
             .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_recovery_attempt_age_seconds: runtime
+            .last_recovery_attempt_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_recovery_success_age_seconds: runtime
+            .last_recovery_success_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_recovery_failure_age_seconds: runtime
+            .last_recovery_failure_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
         selection_policy:
             "valid_public_signed_descriptors_excluding_self_and_operator_pins_rotating_bounded_window",
-        transport_policy: "direct_signed_directory_pages_only_no_carrier_fallback",
+        transport_policy:
+            "direct_first_then_at_most_two_verified_public_carriers_for_availability_failures_only",
         authority_boundary:
             "operator_pins_only_for_checkpoints_witnesses_and_policy_anchors",
         privacy_boundary:

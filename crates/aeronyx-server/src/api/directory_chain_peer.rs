@@ -18,8 +18,8 @@
 //! - `POST /api/discovery/peer/directory/observation-checkpoint-witness`
 //! - `POST /api/discovery/peer/directory/observation-policy-anchor`
 //! - Tiered admission: verified public peers may mirror this node's own signed
-//!   producer history, while replica carrier, witness, and policy-anchor routes
-//!   remain restricted to operator-pinned peers.
+//!   producer history and recover retained non-authoritative mirror evidence;
+//!   witness and policy-anchor routes remain restricted to operator-pinned peers.
 //! - Ed25519 request/response authentication, timestamp freshness, replay
 //!   rejection, per-peer rate limits, body limits, and audit-gated reads.
 //! - Exact content-addressed descriptor batches; no partial object response.
@@ -45,8 +45,9 @@
 //!    returned block identities, and the audited tip.
 //! 6. A witness response is accepted only after the local replica store
 //!    independently reproduces every exact prefix and observation root.
-//! 7. Carrier routes audit and read one producer namespace in the same SQLite
-//!    transaction; the carrier signs transport but never producer history.
+//! 7. Carrier routes audit one producer namespace before reading it. Public
+//!    recovery can export configured producer history or a durable mirror
+//!    namespace. The carrier signs transport but never producer history.
 //! 8. Policy-anchor requests disclose only an observer epoch and opaque digest;
 //!    rollback, same-epoch conflict, and non-contiguous progression fail closed.
 //!
@@ -57,19 +58,21 @@
 //! records, DNS contents, destinations, private keys, or wallet traffic.
 //!
 //! ## Important Note for Next Developer
-//! - Permissionless admission applies only to the local producer tip, range,
-//!   and descriptor-object routes. Replica carrier, witness, and policy-anchor
-//!   routes always require both a configured pin and a live descriptor.
+//! - Permissionless carrier admission applies only when public mirror reads are
+//!   enabled and only to configured producers or namespaces in the durable
+//!   mirror registry. Witness and policy-anchor routes always require a pin.
 //! - Never return a descriptor not committed by the audited local chain.
 //! - Keep request/response limits synchronized with `aeronyx-core` constants.
 //! - Replica import, fork quarantine, and fork choice are separate layers. A
 //!   valid response proves what one producer signed; it is not consensus.
 //! - Never sign an accepted witness response from the observer signature alone.
 //!   Missing local prefixes must remain unavailable, never trusted by fallback.
-//! - Never export a replica for an unpinned or quarantined producer. A carrier
-//!   signature does not replace any producer block or descriptor signature.
+//! - Never export a non-configured replica unless it remains in the audited
+//!   mirror registry. A carrier signature does not replace any producer block or
+//!   descriptor signature and grants no authority.
 //!
 //! ## Last Modified
+//! v0.9.0-MirrorRecovery - Added bounded verified-public recovery for audited mirror namespaces.
 //! v0.8.0-FullNodeMirror - Added verified-public read admission with pinned authority routes.
 //! v0.7.0-DirectoryPolicyHeadAnchor - Added durable opaque policy-head anchor route.
 //! v0.6.1-DirectoryBoundedMultiBlockCatchUp - Added commitment-bounded multi-block pages.
@@ -111,13 +114,15 @@ use aeronyx_core::protocol::discovery::{
     directory_replica_descriptor_objects_response_signing_bytes,
     directory_tip_request_signing_bytes, directory_tip_response_signing_bytes,
     encode_directory_sync_message, DirectoryCommitmentBlockV1, DirectoryObservationCheckpointV1,
-    DirectorySyncMessage, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+    DirectorySyncMessage, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
     DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
     DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
     MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 
-use crate::services::directory_replica::DirectoryObservationWitnessPolicyAnchorDecision;
+use crate::services::directory_replica::{
+    DirectoryObservationWitnessPolicyAnchorDecision, DirectoryReplicaEvidencePage,
+};
 use crate::services::{
     DirectoryChainStore, DirectoryChainStoreError, DirectoryObservationWitnessDecision,
     DirectoryReplicaStore, DirectoryReplicaStoreError, PeerStore,
@@ -191,6 +196,8 @@ impl DirectoryPeerRequestGuard {
 enum DirectoryPeerAdmission {
     /// Read-only mirroring of this node's own public signed producer history.
     VerifiedPublicMirror,
+    /// Read-only recovery of another producer's retained public signed history.
+    VerifiedPublicRecovery,
     /// Authority-sensitive carrier, witness, and policy-anchor operations.
     PinnedAuthority,
 }
@@ -286,9 +293,15 @@ async fn authenticate_request(
     {
         return Err(protocol_error(StatusCode::FORBIDDEN, "peer_not_pinned"));
     }
-    if admission == DirectoryPeerAdmission::VerifiedPublicMirror
+    let requester_is_pinned = state.pinned_peers.contains(&requester);
+    let permissionless_read = matches!(
+        admission,
+        DirectoryPeerAdmission::VerifiedPublicMirror
+            | DirectoryPeerAdmission::VerifiedPublicRecovery
+    );
+    if permissionless_read
         && !state.allow_public_mirror_reads
-        && !state.pinned_peers.contains(&requester)
+        && !requester_is_pinned
     {
         return Err(protocol_error(
             StatusCode::FORBIDDEN,
@@ -298,7 +311,9 @@ async fn authenticate_request(
     let Some(descriptor) = state.peer_store.get_valid(&requester, now) else {
         return Err(protocol_error(StatusCode::FORBIDDEN, "unknown_peer"));
     };
-    if admission == DirectoryPeerAdmission::VerifiedPublicMirror
+    let public_descriptor_required = admission == DirectoryPeerAdmission::VerifiedPublicMirror
+        || (admission == DirectoryPeerAdmission::VerifiedPublicRecovery && !requester_is_pinned);
+    if public_descriptor_required
         && !descriptor.descriptor.policy.public_discovery
     {
         return Err(protocol_error(
@@ -615,6 +630,94 @@ async fn descriptor_objects_handler(
     })
 }
 
+async fn audited_replica_page_for_request(
+    state: &DirectoryChainPeerState,
+    producer: [u8; 32],
+    from_height: u64,
+    limit: u16,
+    observed_at: u64,
+) -> Result<DirectoryReplicaEvidencePage, Response> {
+    let producer_is_pinned = state.pinned_peers.contains(&producer);
+    if !producer_is_pinned && !state.allow_public_mirror_reads {
+        return Err(protocol_error(
+            StatusCode::FORBIDDEN,
+            "public_mirror_disabled",
+        ));
+    }
+    let Some(store) = state.replica_store.as_ref().map(Arc::clone) else {
+        return Err(protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "replica_store_disabled",
+        ));
+    };
+    match tokio::task::spawn_blocking(move || {
+        if producer_is_pinned {
+            store.audited_evidence_page(&producer, from_height, limit, observed_at)
+        } else {
+            store.audited_mirror_evidence_page(&producer, from_height, limit, observed_at)
+        }
+    })
+    .await
+    {
+        Ok(Ok(page)) if page.tip_height > 0 => Ok(page),
+        Ok(Ok(_)) => Err(protocol_error(StatusCode::NOT_FOUND, "replica_not_found")),
+        Ok(Err(error)) => Err(replica_store_error_response(&error)),
+        Err(_) => Err(protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_task_failed",
+        )),
+    }
+}
+
+async fn audited_replica_objects_for_request(
+    state: &DirectoryChainPeerState,
+    producer: [u8; 32],
+    descriptor_hashes: Vec<[u8; 32]>,
+    observed_at: u64,
+) -> Result<Vec<SignedNodeDescriptor>, Response> {
+    let producer_is_pinned = state.pinned_peers.contains(&producer);
+    if !producer_is_pinned && !state.allow_public_mirror_reads {
+        return Err(protocol_error(
+            StatusCode::FORBIDDEN,
+            "public_mirror_disabled",
+        ));
+    }
+    let Some(store) = state.replica_store.as_ref().map(Arc::clone) else {
+        return Err(protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "replica_store_disabled",
+        ));
+    };
+    match tokio::task::spawn_blocking(move || {
+        if producer_is_pinned {
+            store.audited_evidence_descriptor_objects(
+                &producer,
+                &descriptor_hashes,
+                observed_at,
+            )
+        } else {
+            store.audited_mirror_evidence_descriptor_objects(
+                &producer,
+                &descriptor_hashes,
+                observed_at,
+            )
+        }
+    })
+    .await
+    {
+        Ok(Ok(Some(objects))) => Ok(objects),
+        Ok(Ok(None)) => Err(protocol_error(
+            StatusCode::NOT_FOUND,
+            "replica_object_not_found",
+        )),
+        Ok(Err(error)) => Err(replica_store_error_response(&error)),
+        Err(_) => Err(protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_task_failed",
+        )),
+    }
+}
+
 async fn replica_block_range_handler(
     State(state): State<DirectoryChainPeerState>,
     body: Bytes,
@@ -657,7 +760,7 @@ async fn replica_block_range_handler(
     );
     if let Err(response) = authenticate_request(
         &state,
-        DirectoryPeerAdmission::PinnedAuthority,
+        DirectoryPeerAdmission::VerifiedPublicRecovery,
         requester,
         request_id,
         request_timestamp,
@@ -669,21 +772,17 @@ async fn replica_block_range_handler(
     {
         return response;
     }
-    if !state.pinned_peers.contains(&producer) {
-        return protocol_error(StatusCode::FORBIDDEN, "producer_not_pinned");
-    }
-    let Some(store) = state.replica_store.as_ref().map(Arc::clone) else {
-        return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_store_disabled");
-    };
-    let page = match tokio::task::spawn_blocking(move || {
-        store.audited_evidence_page(&producer, from_height, limit, now)
-    })
+    let page = match audited_replica_page_for_request(
+        &state,
+        producer,
+        from_height,
+        limit,
+        now,
+    )
     .await
     {
-        Ok(Ok(page)) if page.tip_height > 0 => page,
-        Ok(Ok(_)) => return protocol_error(StatusCode::NOT_FOUND, "replica_not_found"),
-        Ok(Err(error)) => return replica_store_error_response(&error),
-        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
+        Ok(page) => page,
+        Err(response) => return response,
     };
     let blocks = bounded_directory_transport_blocks(page.blocks);
     let has_more = blocks
@@ -764,7 +863,7 @@ async fn replica_descriptor_objects_handler(
     );
     if let Err(response) = authenticate_request(
         &state,
-        DirectoryPeerAdmission::PinnedAuthority,
+        DirectoryPeerAdmission::VerifiedPublicRecovery,
         requester,
         request_id,
         request_timestamp,
@@ -776,22 +875,16 @@ async fn replica_descriptor_objects_handler(
     {
         return response;
     }
-    if !state.pinned_peers.contains(&producer) {
-        return protocol_error(StatusCode::FORBIDDEN, "producer_not_pinned");
-    }
-    let Some(store) = state.replica_store.as_ref().map(Arc::clone) else {
-        return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_store_disabled");
-    };
-    let requested_hashes = descriptor_hashes.clone();
-    let objects = match tokio::task::spawn_blocking(move || {
-        store.audited_evidence_descriptor_objects(&producer, &requested_hashes, now)
-    })
+    let objects = match audited_replica_objects_for_request(
+        &state,
+        producer,
+        descriptor_hashes.clone(),
+        now,
+    )
     .await
     {
-        Ok(Ok(Some(objects))) => objects,
-        Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "replica_object_not_found"),
-        Ok(Err(error)) => return replica_store_error_response(&error),
-        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
+        Ok(objects) => objects,
+        Err(response) => return response,
     };
     let carrier = state.identity.public_key_bytes();
     let response_timestamp = now_secs();
@@ -1100,6 +1193,9 @@ fn replica_store_error_response(error: &DirectoryReplicaStoreError) -> Response 
         DirectoryReplicaStoreError::Quarantined(_) => {
             protocol_error(StatusCode::CONFLICT, "producer_quarantined")
         }
+        DirectoryReplicaStoreError::MirrorNotRetained => {
+            protocol_error(StatusCode::NOT_FOUND, "mirror_replica_not_retained")
+        }
         _ => {
             warn!(error = %error, "[DIRECTORY_CHAIN] Refused unaudited replica export");
             protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_not_verified")
@@ -1227,6 +1323,35 @@ mod tests {
         .unwrap()
     }
 
+    fn replica_range_request(
+        requester: &IdentityKeyPair,
+        producer: &[u8; 32],
+        request_id: [u8; 16],
+    ) -> Vec<u8> {
+        let timestamp = now_secs();
+        let requester_id = requester.public_key_bytes();
+        let signing_bytes = directory_replica_block_range_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer,
+            1,
+            1,
+            &request_id,
+            &requester_id,
+            timestamp,
+        );
+        encode_directory_sync_message(&DirectorySyncMessage::ReplicaBlockRangeRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer: *producer,
+            from_height: 1,
+            limit: 1,
+            request_id,
+            requester: requester_id,
+            request_timestamp: timestamp,
+            signature: requester.sign(&signing_bytes),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn request_guard_enforces_global_permissionless_budget() {
         let mut guard = DirectoryPeerRequestGuard::default();
@@ -1283,13 +1408,29 @@ mod tests {
         )
     }
 
-    fn carrier_test_router() -> (
+    #[derive(Clone, Copy)]
+    enum CarrierTestPolicy {
+        PinnedAuthority,
+        PublicMirror,
+        PublicWithoutMirror,
+        PublicMirrorDisabled,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn carrier_test_router_with_access(policy: CarrierTestPolicy) -> (
         Router,
         Arc<IdentityKeyPair>,
         IdentityKeyPair,
         IdentityKeyPair,
         SignedNodeDescriptor,
     ) {
+        let (mirror_namespace, requester_pinned, producer_pinned, allow_public_mirror_reads) =
+            match policy {
+                CarrierTestPolicy::PinnedAuthority => (false, true, true, false),
+                CarrierTestPolicy::PublicMirror => (true, false, false, true),
+                CarrierTestPolicy::PublicWithoutMirror => (false, false, false, true),
+                CarrierTestPolicy::PublicMirrorDisabled => (true, false, false, false),
+            };
         let now = now_secs();
         let carrier = Arc::new(IdentityKeyPair::from_bytes(&[0xd1; 32]).unwrap());
         let requester = IdentityKeyPair::from_bytes(&[0xd2; 32]).unwrap();
@@ -1324,15 +1465,24 @@ mod tests {
             })
             .unwrap();
         let peer_store = Arc::new(PeerStore::new());
-        for identity in [&requester, &producer] {
-            peer_store
-                .upsert_verified_from_source(
-                    signed_descriptor(identity, now),
-                    now,
-                    "directory_carrier_test",
-                )
-                .unwrap();
-        }
+        let mut requester_descriptor = signed_descriptor(&requester, now);
+        requester_descriptor.descriptor.policy.public_discovery = true;
+        requester_descriptor =
+            SignedNodeDescriptor::sign(requester_descriptor.descriptor, &requester).unwrap();
+        peer_store
+            .upsert_verified_from_source(
+                requester_descriptor,
+                now,
+                "directory_carrier_test",
+            )
+            .unwrap();
+        peer_store
+            .upsert_verified_from_source(
+                signed_descriptor(&producer, now),
+                now,
+                "directory_carrier_test",
+            )
+            .unwrap();
         let temp = TempDir::new().unwrap();
         let root = temp.keep();
         let path = root.join("directory.db");
@@ -1340,31 +1490,64 @@ mod tests {
             DirectoryChainStore::open(&path, carrier.public_key_bytes(), now).unwrap();
         let (replica_store, _) =
             DirectoryReplicaStore::open(&path, carrier.public_key_bytes(), now).unwrap();
-        replica_store
-            .import_verified_page(
-                producer.public_key_bytes(),
-                std::slice::from_ref(&block),
-                std::slice::from_ref(&object),
-                1,
-                block.hash(),
-                &response_frame,
-                now,
-            )
-            .unwrap();
+        if mirror_namespace {
+            replica_store
+                .import_verified_mirror_page(
+                    producer.public_key_bytes(),
+                    1,
+                    4,
+                    std::slice::from_ref(&block),
+                    std::slice::from_ref(&object),
+                    1,
+                    block.hash(),
+                    &response_frame,
+                    now,
+                )
+                .unwrap();
+        } else {
+            replica_store
+                .import_verified_page(
+                    producer.public_key_bytes(),
+                    std::slice::from_ref(&block),
+                    std::slice::from_ref(&object),
+                    1,
+                    block.hash(),
+                    &response_frame,
+                    now,
+                )
+                .unwrap();
+        }
+        let mut pins = Vec::new();
+        if requester_pinned {
+            pins.push(requester.public_key_bytes());
+        }
+        if producer_pinned {
+            pins.push(producer.public_key_bytes());
+        }
         (
             build_directory_chain_peer_router_with_replica(
                 Arc::new(chain_store),
                 Some(Arc::new(replica_store)),
                 peer_store,
                 Arc::clone(&carrier),
-                vec![requester.public_key_bytes(), producer.public_key_bytes()],
-                false,
+                pins,
+                allow_public_mirror_reads,
             ),
             carrier,
             requester,
             producer,
             object,
         )
+    }
+
+    fn carrier_test_router() -> (
+        Router,
+        Arc<IdentityKeyPair>,
+        IdentityKeyPair,
+        IdentityKeyPair,
+        SignedNodeDescriptor,
+    ) {
+        carrier_test_router_with_access(CarrierTestPolicy::PinnedAuthority)
     }
 
     #[tokio::test]
@@ -1585,6 +1768,120 @@ mod tests {
         };
         assert_eq!(descriptor_hashes, vec![descriptor_hash]);
         assert_eq!(objects, vec![expected_descriptor]);
+    }
+
+    #[tokio::test]
+    async fn verified_public_peer_can_recover_only_registered_mirror_evidence() {
+        let (router, carrier, requester, producer, expected_object) =
+            carrier_test_router_with_access(CarrierTestPolicy::PublicMirror);
+        let request_id = [0xce; 16];
+        let producer_id = producer.public_key_bytes();
+        let request = replica_range_request(&requester, &producer_id, request_id);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-block-range")
+                    .body(Body::from(request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let (blocks, has_more, tip_height, _) = verify_replica_block_range_response(
+            &body,
+            &request_id,
+            &producer_id,
+            &carrier.public_key_bytes(),
+            1,
+            now_secs(),
+        )
+        .unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert!(!has_more);
+        assert_eq!(tip_height, 1);
+        let descriptor_hash = blocks[0].commitments[0].descriptor_hash;
+        let object_id = [0xcd; 16];
+        let object_timestamp = now_secs();
+        let requester_id = requester.public_key_bytes();
+        let object_signing = directory_replica_descriptor_objects_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &producer_id,
+            &[descriptor_hash],
+            &object_id,
+            &requester_id,
+            object_timestamp,
+        );
+        let object_request = encode_directory_sync_message(
+            &DirectorySyncMessage::ReplicaDescriptorObjectsRequestV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                producer: producer_id,
+                descriptor_hashes: vec![descriptor_hash],
+                request_id: object_id,
+                requester: requester_id,
+                request_timestamp: object_timestamp,
+                signature: requester.sign(&object_signing),
+            },
+        )
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-descriptor-objects")
+                    .body(Body::from(object_request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        assert_eq!(
+            verify_replica_descriptor_objects_response(
+                &body,
+                &object_id,
+                &producer_id,
+                &carrier.public_key_bytes(),
+                &[descriptor_hash],
+                object_timestamp,
+            )
+            .unwrap(),
+            vec![expected_object]
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_public_recovery_refuses_unregistered_or_disabled_namespaces() {
+        let (unregistered_router, _, requester, producer, _) =
+            carrier_test_router_with_access(CarrierTestPolicy::PublicWithoutMirror);
+        let producer_id = producer.public_key_bytes();
+        let response = unregistered_router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-block-range")
+                    .body(Body::from(replica_range_request(
+                        &requester,
+                        &producer_id,
+                        [0xcf; 16],
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let (disabled_router, _, requester, producer, _) =
+            carrier_test_router_with_access(CarrierTestPolicy::PublicMirrorDisabled);
+        let response = disabled_router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-block-range")
+                    .body(Body::from(replica_range_request(
+                        &requester,
+                        &producer.public_key_bytes(),
+                        [0xd0; 16],
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -39,8 +39,9 @@
 //! - Requests up to eight contiguous blocks per page while the peer-side
 //!   commitment cap preserves the original hydration/body budget.
 //! - Cancels an in-flight round when server shutdown is requested.
-//! - Optionally mirrors one direct page from a rotating, bounded set of valid
-//!   public discovery peers without adding them to authority checkpoints.
+//! - Optionally mirrors one page from a rotating, bounded set of valid public
+//!   discovery peers, using direct-first bounded carrier recovery without
+//!   adding any mirror or carrier to authority checkpoints.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -71,7 +72,9 @@
 //! 13. Ask missing current pins to retain the opaque current policy head and
 //!     persist only exact accepted signed receipts.
 //! 14. Select verified public mirror candidates, exclude self and authority
-//!     pins, rotate a bounded attempt window, and import only direct signed data.
+//!     pins, and try the producer directly before at most two public carriers.
+//!     Every imported block remains signed by the original producer; a carrier
+//!     signs only the response envelope and never gains authority.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -91,8 +94,11 @@
 //!   signature, or descriptor-hash response; these are security failures.
 //! - Never feed permissionless mirror membership into checkpoints, witnesses,
 //!   policy anchors, fork choice, consensus, voting, or finality.
+//! - Mirror carrier recovery is one level only. Never recursively fetch from a
+//!   carrier while serving a recovery request.
 //!
 //! ## Last Modified
+//! `v0.15.0-MirrorRecovery` - Added direct-first bounded public carrier recovery.
 //! `v0.14.0-FullNodeMirror` - Added bounded rotating non-authoritative mirror pulls.
 //! `v0.13.0-DirectoryPolicyHeadAnchor` - Added bounded external policy-head anchor rounds.
 //! `v0.12.0-DirectoryBoundedColdCatchUp` - Raised the sparse-page cold catch-up cap while preserving the per-peer request budget.
@@ -198,6 +204,22 @@ pub(crate) const DIRECTORY_SYNC_MAX_PAGES_PER_ROUND: u32 = 8;
 pub(crate) const DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND: u32 = 30;
 /// Permissionless mirror work is intentionally below authority fan-out limits.
 const DIRECTORY_MIRROR_MAX_ATTEMPTS_PER_ROUND: usize = 8;
+/// One direct mirror failure may try at most two independent public carriers.
+const DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE: usize = 2;
+/// Keep carrier choice stable within a round while avoiding permanent affinity.
+const DIRECTORY_MIRROR_RECOVERY_ROTATION_SECS: u64 = 5 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryMirrorPullSource {
+    DirectProducer,
+    PublicCarrier,
+}
+
+#[derive(Debug)]
+struct DirectoryMirrorPullFailure {
+    reason: String,
+    recovery_attempted: bool,
+}
 
 /// Result of one authenticated outbound replica synchronization page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,7 +657,7 @@ impl DirectoryReplicaSyncCoordinator {
     ) -> bool {
         let result = tokio::time::timeout(
             Duration::from_secs(DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS),
-            pull_directory_chain_mirror_page(
+            pull_directory_chain_mirror_page_with_recovery(
                 Arc::clone(&self.store),
                 self.peer_store.as_ref(),
                 self.identity.as_ref(),
@@ -646,7 +668,27 @@ impl DirectoryReplicaSyncCoordinator {
             ),
         )
         .await;
-        matches!(result, Ok(Ok(_)))
+        match result {
+            Ok(Ok((_, DirectoryMirrorPullSource::DirectProducer))) => true,
+            Ok(Ok((_, DirectoryMirrorPullSource::PublicCarrier))) => {
+                self.runtime
+                    .record_full_node_mirror_recovery(true, unix_now_secs());
+                true
+            }
+            Ok(Err(failure)) => {
+                if failure.recovery_attempted {
+                    self.runtime
+                        .record_full_node_mirror_recovery(false, unix_now_secs());
+                }
+                debug!(
+                    reason = failure.reason,
+                    recovery_attempted = failure.recovery_attempted,
+                    "[DIRECTORY_REPLICA] Full-node Mirror pull rejected"
+                );
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     async fn synchronize_producer(&self, producer: [u8; 32]) -> bool {
@@ -1443,11 +1485,85 @@ pub async fn pull_directory_chain_page(
     import_directory_range_page(replica_store, *producer, page, objects, requests_made).await
 }
 
+/// Pulls one signed page into the bounded non-authoritative mirror set.
+///
+/// The producer is always tried first. Only availability/admission failures may
+/// enter the bounded carrier path; canonical, signature, producer-binding,
+/// descriptor, hash-chain, and durable integrity failures stop immediately.
+async fn pull_directory_chain_mirror_page_with_recovery(
+    replica_store: Arc<DirectoryReplicaStore>,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    producer: &[u8; 32],
+    descriptor_sequence: u64,
+    max_mirror_producers: usize,
+    client: &reqwest::Client,
+) -> Result<(DirectorySyncPullOutcome, DirectoryMirrorPullSource), DirectoryMirrorPullFailure> {
+    match pull_directory_chain_mirror_page(
+        Arc::clone(&replica_store),
+        peer_store,
+        identity,
+        producer,
+        descriptor_sequence,
+        max_mirror_producers,
+        client,
+    )
+    .await
+    {
+        Ok(outcome) => Ok((outcome, DirectoryMirrorPullSource::DirectProducer)),
+        Err(reason) if directory_mirror_failure_allows_recovery(&reason) => {
+            let carriers = directory_mirror_recovery_carriers(
+                peer_store,
+                producer,
+                &identity.public_key_bytes(),
+                unix_now_secs(),
+            );
+            for carrier in carriers {
+                match pull_directory_chain_mirror_page_via_carrier(
+                    Arc::clone(&replica_store),
+                    peer_store,
+                    identity,
+                    producer,
+                    descriptor_sequence,
+                    max_mirror_producers,
+                    &carrier,
+                    client,
+                )
+                .await
+                {
+                    Ok(mut outcome) => {
+                        // Conservatively account for the failed direct range
+                        // request without retaining the selected carrier.
+                        outcome.requests_made = outcome.requests_made.saturating_add(1);
+                        return Ok((outcome, DirectoryMirrorPullSource::PublicCarrier));
+                    }
+                    Err(carrier_reason)
+                        if directory_mirror_failure_allows_recovery(&carrier_reason) => {}
+                    Err(carrier_reason) => {
+                        return Err(DirectoryMirrorPullFailure {
+                            reason: carrier_reason,
+                            recovery_attempted: true,
+                        });
+                    }
+                }
+            }
+            Err(DirectoryMirrorPullFailure {
+                reason: "directory_mirror_recovery_exhausted".to_string(),
+                recovery_attempted: true,
+            })
+        }
+        Err(reason) => Err(DirectoryMirrorPullFailure {
+            reason,
+            recovery_attempted: false,
+        }),
+    }
+}
+
 /// Pulls one direct signed page into the bounded non-authoritative mirror set.
 ///
 /// The exact discovery descriptor sequence selected for this attempt must still
-/// be current and public when URLs are derived. Mirror pulls never use carrier
-/// fallback and never alter configured checkpoint/witness authority membership.
+/// be current and public when URLs are derived. This function performs no
+/// fallback and never alters configured checkpoint/witness authority membership.
 async fn pull_directory_chain_mirror_page(
     replica_store: Arc<DirectoryReplicaStore>,
     peer_store: &PeerStore,
@@ -1487,6 +1603,66 @@ async fn pull_directory_chain_mirror_page(
     let (objects, requests_made) = hydrate_directory_descriptor_objects(
         identity,
         producer,
+        client,
+        object_url,
+        &requester,
+        &page.blocks,
+    )
+    .await?;
+    import_directory_mirror_range_page(
+        replica_store,
+        *producer,
+        descriptor_sequence,
+        max_mirror_producers,
+        page,
+        objects,
+        requests_made,
+    )
+    .await
+}
+
+// Each argument is a distinct authenticated protocol boundary. Grouping them
+// into an opaque context would make producer/carrier confusion easier during
+// security review, so keep the identities and bounded retention policy explicit.
+#[allow(clippy::too_many_arguments)]
+async fn pull_directory_chain_mirror_page_via_carrier(
+    replica_store: Arc<DirectoryReplicaStore>,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    producer: &[u8; 32],
+    descriptor_sequence: u64,
+    max_mirror_producers: usize,
+    carrier: &[u8; 32],
+    client: &reqwest::Client,
+) -> Result<DirectorySyncPullOutcome, String> {
+    let request_timestamp = unix_now_secs();
+    let local_tip = replica_store
+        .producer_tip(producer)
+        .map_err(|_| "directory_mirror_tip_unavailable".to_string())?;
+    if local_tip.quarantined {
+        return Err("directory_mirror_producer_quarantined".to_string());
+    }
+    let (range_url, object_url) =
+        directory_mirror_recovery_carrier_urls(peer_store, carrier, request_timestamp)?;
+    let from_height = local_tip
+        .tip_height
+        .checked_add(1)
+        .ok_or_else(|| "directory_mirror_height_exhausted".to_string())?;
+    let requester = identity.public_key_bytes();
+    let page = request_directory_replica_block_page(
+        identity,
+        producer,
+        carrier,
+        client,
+        range_url,
+        from_height,
+        request_timestamp,
+    )
+    .await?;
+    let (objects, requests_made) = hydrate_directory_replica_descriptor_objects(
+        identity,
+        producer,
+        carrier,
         client,
         object_url,
         &requester,
@@ -1583,6 +1759,74 @@ fn directory_sync_failure_allows_carrier_fallback(reason: &str) -> bool {
         return matches!(status, 403 | 404 | 408 | 429) || status >= 500;
     }
     false
+}
+
+fn directory_mirror_failure_allows_recovery(reason: &str) -> bool {
+    if matches!(
+        reason,
+        "directory_range_transport_failed"
+            | "directory_objects_transport_failed"
+            | "directory_replica_range_transport_failed"
+            | "directory_replica_objects_transport_failed"
+            | "directory_mirror_recovery_carrier_unavailable"
+            | "directory_mirror_recovery_carrier_not_public"
+            | "directory_mirror_recovery_carrier_missing_endpoint"
+            | "directory_mirror_recovery_carrier_unsafe_endpoint"
+            | "directory_mirror_recovery_carrier_invalid_endpoint"
+    ) {
+        return true;
+    }
+    for prefix in [
+        "directory_range_http_status_",
+        "directory_objects_http_status_",
+        "directory_replica_range_http_status_",
+        "directory_replica_objects_http_status_",
+    ] {
+        let Some(status) = reason
+            .strip_prefix(prefix)
+            .and_then(|value| value.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        return matches!(status, 403 | 404 | 408 | 429) || status >= 500;
+    }
+    false
+}
+
+fn directory_mirror_recovery_carriers(
+    peer_store: &PeerStore,
+    producer: &[u8; 32],
+    requester: &[u8; 32],
+    now: u64,
+) -> Vec<[u8; 32]> {
+    let mut carriers = peer_store
+        .valid_public_descriptors(now, usize::MAX)
+        .into_iter()
+        .filter(|descriptor| {
+            let node_id = descriptor.node_id();
+            node_id != *producer
+                && node_id != *requester
+                && descriptor.descriptor.policy.public_discovery
+                && descriptor
+                    .descriptor
+                    .public_endpoint
+                    .as_deref()
+                    .is_some_and(commitment_peer_endpoint_is_public)
+        })
+        .map(|descriptor| descriptor.node_id())
+        .collect::<Vec<_>>();
+    carriers.sort_unstable();
+    carriers.dedup();
+    if !carriers.is_empty() {
+        let producer_seed = u64::from_be_bytes(producer[..8].try_into().unwrap_or([0u8; 8]));
+        let requester_seed = u64::from_be_bytes(requester[..8].try_into().unwrap_or([0u8; 8]));
+        let epoch_seed = now / DIRECTORY_MIRROR_RECOVERY_ROTATION_SECS;
+        let cursor = usize::try_from(producer_seed ^ requester_seed ^ epoch_seed).unwrap_or(0)
+            % carriers.len();
+        carriers.rotate_left(cursor);
+        carriers.truncate(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE);
+    }
+    carriers
 }
 
 async fn pull_directory_chain_page_via_carrier(
@@ -1710,6 +1954,38 @@ fn directory_replica_carrier_urls(
         "/api/discovery/peer/directory/replica-descriptor-objects",
     )
     .map_err(|_| "pinned_directory_peer_invalid_endpoint".to_string())?;
+    Ok((range_url, object_url))
+}
+
+fn directory_mirror_recovery_carrier_urls(
+    peer_store: &PeerStore,
+    carrier: &[u8; 32],
+    request_timestamp: u64,
+) -> Result<(reqwest::Url, reqwest::Url), String> {
+    let descriptor = peer_store
+        .get_valid(carrier, request_timestamp)
+        .ok_or_else(|| "directory_mirror_recovery_carrier_unavailable".to_string())?;
+    if !descriptor.descriptor.policy.public_discovery {
+        return Err("directory_mirror_recovery_carrier_not_public".to_string());
+    }
+    let endpoint = descriptor
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "directory_mirror_recovery_carrier_missing_endpoint".to_string())?;
+    if !commitment_peer_endpoint_is_public(endpoint) {
+        return Err("directory_mirror_recovery_carrier_unsafe_endpoint".to_string());
+    }
+    let range_url = commitment_peer_url(
+        endpoint,
+        "/api/discovery/peer/directory/replica-block-range",
+    )
+    .map_err(|_| "directory_mirror_recovery_carrier_invalid_endpoint".to_string())?;
+    let object_url = commitment_peer_url(
+        endpoint,
+        "/api/discovery/peer/directory/replica-descriptor-objects",
+    )
+    .map_err(|_| "directory_mirror_recovery_carrier_invalid_endpoint".to_string())?;
     Ok((range_url, object_url))
 }
 
@@ -2495,6 +2771,86 @@ mod tests {
         ] {
             assert!(!directory_sync_failure_allows_carrier_fallback(reason));
         }
+    }
+
+    #[test]
+    fn mirror_recovery_is_bounded_and_rejects_security_failures() {
+        assert_eq!(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE, 2);
+        for reason in [
+            "directory_range_transport_failed",
+            "directory_objects_transport_failed",
+            "directory_range_http_status_404",
+            "directory_replica_range_http_status_429",
+            "directory_replica_objects_http_status_503",
+            "directory_mirror_recovery_carrier_unavailable",
+        ] {
+            assert!(directory_mirror_failure_allows_recovery(reason));
+        }
+        for reason in [
+            "directory_mirror_descriptor_changed",
+            "directory_range_response_noncanonical",
+            "directory_range_response_invalid_signature",
+            "directory_replica_range_response_contract_mismatch",
+            "directory_replica_range_response_invalid_signature",
+            "directory_replica_object_response_hash_mismatch",
+            "directory_mirror_import_rejected",
+            "directory_range_http_status_400",
+            "directory_range_http_status_401",
+            "directory_range_http_status_409",
+        ] {
+            assert!(!directory_mirror_failure_allows_recovery(reason));
+        }
+    }
+
+    #[test]
+    fn mirror_recovery_carrier_selection_excludes_participants_and_is_deterministic() {
+        let now = unix_now_secs();
+        let producer = IdentityKeyPair::from_bytes(&[0xe1; 32]).unwrap();
+        let requester = IdentityKeyPair::from_bytes(&[0xe2; 32]).unwrap();
+        let store = PeerStore::new();
+        let mut expected_excluded = HashSet::new();
+        expected_excluded.insert(producer.public_key_bytes());
+        expected_excluded.insert(requester.public_key_bytes());
+
+        for seed in [0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7] {
+            let identity = IdentityKeyPair::from_bytes(&[seed; 32]).unwrap();
+            let mut descriptor = aeronyx_core::protocol::discovery::NodeDescriptor::new(
+                identity.public_key_bytes(),
+                1,
+                now.saturating_sub(1),
+                now + 600,
+                "mirror-recovery-test",
+            );
+            descriptor.policy.public_discovery = true;
+            descriptor.public_endpoint = Some(format!("http://8.8.8.{seed}:8422"));
+            store
+                .upsert_verified_from_source(
+                    SignedNodeDescriptor::sign(descriptor, &identity).unwrap(),
+                    now,
+                    "directory_mirror_recovery_test",
+                )
+                .unwrap();
+        }
+
+        let selected = directory_mirror_recovery_carriers(
+            &store,
+            &producer.public_key_bytes(),
+            &requester.public_key_bytes(),
+            now,
+        );
+        assert_eq!(selected.len(), DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE);
+        assert!(selected
+            .iter()
+            .all(|candidate| !expected_excluded.contains(candidate)));
+        assert_eq!(
+            selected,
+            directory_mirror_recovery_carriers(
+                &store,
+                &producer.public_key_bytes(),
+                &requester.public_key_bytes(),
+                now,
+            )
+        );
     }
 
     #[test]
