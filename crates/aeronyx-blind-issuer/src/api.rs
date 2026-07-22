@@ -33,11 +33,11 @@
 //! cancellation cannot release HSM capacity early. Never add wallet/account
 //! headers or request-body diagnostics.
 //!
-//! Last Modified: v0.4.0-BlindIssuerApi - Added policy composition,
-//! privacy-safe operational snapshots, and custody circuit breaking.
+//! Last Modified: v0.5.0-BlindIssuerApi - Added cancellation-safe single-probe
+//! half-open recovery without false-green health transitions.
 //! ============================================
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -146,9 +146,12 @@ pub struct BlindIssuerOperationalSnapshot {
     pub in_flight: usize,
     /// Configured private-operation concurrency ceiling.
     pub max_in_flight: usize,
-    /// Whether the monotonic circuit is currently rejecting signing calls.
+    /// Whether custody remains unverified after the circuit opened.
     pub circuit_open: bool,
-    /// Approximate Unix millisecond recovery time, or zero while closed.
+    /// Whether the one allowed post-cooldown recovery probe is in flight.
+    #[serde(default)]
+    pub circuit_half_open: bool,
+    /// Approximate Unix recovery time, or zero when closed/probe-eligible.
     pub circuit_open_until_ms: u64,
     /// Consecutive backend failures/timeouts since the last success.
     pub consecutive_backend_failures: u64,
@@ -215,6 +218,8 @@ struct CircuitState {
     consecutive_failures: u64,
     open_until: Option<Instant>,
     open_until_ms: u64,
+    probe_in_flight: bool,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -227,46 +232,130 @@ struct CircuitBreaker {
 impl CircuitBreaker {
     fn new(failure_threshold: u64, cooldown: Duration) -> Self {
         Self {
-            failure_threshold,
+            failure_threshold: failure_threshold.max(1),
             cooldown,
             state: Mutex::new(CircuitState::default()),
         }
     }
 
-    fn is_open(&self) -> bool {
-        self.state
-            .lock()
-            .open_until
-            .is_some_and(|deadline| Instant::now() < deadline)
+    fn try_admit(self: &Arc<Self>) -> Option<Arc<CircuitPermit>> {
+        let mut state = self.state.lock();
+        let is_probe = match state.open_until {
+            None => false,
+            Some(deadline) if Instant::now() < deadline || state.probe_in_flight => return None,
+            Some(_) => {
+                state.probe_in_flight = true;
+                true
+            }
+        };
+        Some(Arc::new(CircuitPermit {
+            breaker: Arc::clone(self),
+            generation: state.generation,
+            is_probe,
+            resolved: AtomicBool::new(false),
+        }))
     }
 
-    fn record_success(&self) {
+    fn is_healthy(&self) -> bool {
+        self.state.lock().open_until.is_none()
+    }
+
+    fn record_success(&self, generation: u64) {
         let mut state = self.state.lock();
+        if state.generation != generation {
+            return;
+        }
+        let recovered_from_open = state.open_until.is_some();
         state.consecutive_failures = 0;
         state.open_until = None;
         state.open_until_ms = 0;
-    }
-
-    fn record_failure(&self, now_ms: u64) {
-        let mut state = self.state.lock();
-        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-        if state.consecutive_failures >= self.failure_threshold {
-            state.open_until = Instant::now().checked_add(self.cooldown);
-            state.open_until_ms =
-                now_ms.saturating_add(self.cooldown.as_millis().try_into().unwrap_or(u64::MAX));
+        state.probe_in_flight = false;
+        if recovered_from_open {
+            state.generation = state.generation.saturating_add(1);
         }
     }
 
-    fn snapshot(&self) -> (bool, u64, u64) {
+    fn record_failure(&self, generation: u64, now_ms: u64) {
+        let mut state = self.state.lock();
+        if state.generation != generation {
+            return;
+        }
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.probe_in_flight || state.consecutive_failures >= self.failure_threshold {
+            state.open_until = Instant::now().checked_add(self.cooldown);
+            state.open_until_ms =
+                now_ms.saturating_add(self.cooldown.as_millis().try_into().unwrap_or(u64::MAX));
+            state.probe_in_flight = false;
+            state.generation = state.generation.saturating_add(1);
+        }
+    }
+
+    fn record_neutral(&self, generation: u64, is_probe: bool) {
+        if !is_probe {
+            return;
+        }
+        let mut state = self.state.lock();
+        if state.generation == generation {
+            state.probe_in_flight = false;
+        }
+    }
+
+    fn snapshot(&self) -> (bool, bool, u64, u64) {
         let state = self.state.lock();
-        let circuit_open = state
-            .open_until
-            .is_some_and(|deadline| Instant::now() < deadline);
+        let now = Instant::now();
+        let circuit_open = state.open_until.is_some();
         (
             circuit_open,
-            if circuit_open { state.open_until_ms } else { 0 },
+            state.probe_in_flight,
+            if state.open_until.is_some_and(|deadline| now < deadline) {
+                state.open_until_ms
+            } else {
+                0
+            },
             state.consecutive_failures,
         )
+    }
+}
+
+/// One admission decision whose first terminal outcome updates the breaker.
+///
+/// [BLIND-ISSUER-HALF-OPEN 2026-07-23 by Codex] The permit is shared with the
+/// blocking custody call. HTTP cancellation therefore cannot release a probe
+/// while its private operation is still executing, and timeout/completion races
+/// can update the circuit at most once.
+#[derive(Debug)]
+struct CircuitPermit {
+    breaker: Arc<CircuitBreaker>,
+    generation: u64,
+    is_probe: bool,
+    resolved: AtomicBool,
+}
+
+impl CircuitPermit {
+    fn resolve_success(&self) {
+        if !self.resolved.swap(true, Ordering::AcqRel) {
+            self.breaker.record_success(self.generation);
+        }
+    }
+
+    fn resolve_failure(&self, now_ms: u64) {
+        if !self.resolved.swap(true, Ordering::AcqRel) {
+            self.breaker.record_failure(self.generation, now_ms);
+        }
+    }
+
+    fn resolve_neutral(&self) {
+        if !self.resolved.swap(true, Ordering::AcqRel) {
+            self.breaker.record_neutral(self.generation, self.is_probe);
+        }
+    }
+}
+
+impl Drop for CircuitPermit {
+    fn drop(&mut self) {
+        if !self.resolved.swap(true, Ordering::AcqRel) {
+            self.breaker.record_neutral(self.generation, self.is_probe);
+        }
     }
 }
 
@@ -421,13 +510,13 @@ async fn signing_pressure_gate(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if state.breaker.is_open() {
+    let Some(circuit_permit) = state.breaker.try_admit() else {
         state
             .metrics
             .circuit_rejected
             .fetch_add(1, Ordering::Relaxed);
         return empty_response(StatusCode::SERVICE_UNAVAILABLE);
-    }
+    };
     let Some(guard) = InFlightGuard::try_acquire(&state.in_flight, state.policy.max_in_flight)
     else {
         state
@@ -448,12 +537,14 @@ async fn signing_pressure_gate(
     // into `spawn_blocking`. Dropping a disconnected HTTP request therefore
     // cannot advertise capacity while its non-cancellable HSM call still runs.
     request.extensions_mut().insert(Arc::new(guard));
+    request.extensions_mut().insert(circuit_permit);
     next.run(request).await
 }
 
 async fn sign_handler(
     State(state): State<ApiState>,
     Extension(operation_guard): Extension<Arc<InFlightGuard>>,
+    Extension(circuit_permit): Extension<Arc<CircuitPermit>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -466,14 +557,25 @@ async fn sign_handler(
         return empty_response(StatusCode::BAD_REQUEST);
     };
     let signer = Arc::clone(&state.signer);
+    let backend_circuit_permit = Arc::clone(&circuit_permit);
     let operation = tokio::task::spawn_blocking(move || {
         let result = signer.sign(&request, now_millis());
+        match &result {
+            Ok(_) => backend_circuit_permit.resolve_success(),
+            Err(BlindSignError::SigningFailed) => {
+                backend_circuit_permit.resolve_failure(now_millis());
+            }
+            Err(
+                BlindSignError::InvalidRequest
+                | BlindSignError::UnknownIssuer
+                | BlindSignError::InactiveIssuer,
+            ) => backend_circuit_permit.resolve_neutral(),
+        }
         drop(operation_guard);
         result
     });
     match tokio::time::timeout(state.policy.signing_timeout, operation).await {
         Ok(Ok(Ok(response))) => {
-            state.breaker.record_success();
             state
                 .metrics
                 .signing_succeeded
@@ -485,12 +587,12 @@ async fn sign_handler(
             empty_response(StatusCode::FORBIDDEN)
         }
         Ok(Ok(Err(BlindSignError::SigningFailed)) | Err(_)) => {
-            state.breaker.record_failure(now_millis());
+            circuit_permit.resolve_failure(now_millis());
             state.metrics.backend_failed.fetch_add(1, Ordering::Relaxed);
             empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Err(_) => {
-            state.breaker.record_failure(now_millis());
+            circuit_permit.resolve_failure(now_millis());
             state
                 .metrics
                 .signing_timed_out
@@ -501,7 +603,7 @@ async fn sign_handler(
 }
 
 async fn health_handler(State(state): State<ApiState>) -> Response {
-    if state.signer.has_active_key(now_millis()) && !state.breaker.is_open() {
+    if state.signer.has_active_key(now_millis()) && state.breaker.is_healthy() {
         empty_response(StatusCode::NO_CONTENT)
     } else {
         empty_response(StatusCode::SERVICE_UNAVAILABLE)
@@ -510,7 +612,7 @@ async fn health_handler(State(state): State<ApiState>) -> Response {
 
 async fn status_handler(State(state): State<ApiState>) -> Response {
     let generated_at_ms = now_millis();
-    let (circuit_open, circuit_open_until_ms, consecutive_backend_failures) =
+    let (circuit_open, circuit_half_open, circuit_open_until_ms, consecutive_backend_failures) =
         state.breaker.snapshot();
     let snapshot = BlindIssuerOperationalSnapshot {
         generated_at_ms,
@@ -519,6 +621,7 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
         in_flight: state.in_flight.load(Ordering::Acquire),
         max_in_flight: state.policy.max_in_flight,
         circuit_open,
+        circuit_half_open,
         circuit_open_until_ms,
         consecutive_backend_failures,
         signing_succeeded: state.metrics.signing_succeeded.load(Ordering::Relaxed),
@@ -844,7 +947,6 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::atomic::AtomicBool;
     use std::sync::{Condvar, Mutex as StdMutex};
     use std::time::Duration;
 
@@ -948,6 +1050,20 @@ mod tests {
             .await
             .expect("status body");
         serde_json::from_slice(&bytes).expect("status snapshot")
+    }
+
+    async fn health_status(router: &Router) -> StatusCode {
+        router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/internal/v1/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response")
+            .status()
     }
 
     struct BlockingFixture {
@@ -1186,17 +1302,10 @@ mod tests {
             .expect("open circuit response");
         assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        let unhealthy = router
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/internal/v1/health")
-                    .body(Body::empty())
-                    .expect("health request"),
-            )
-            .await
-            .expect("health response");
-        assert_eq!(unhealthy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            health_status(&router).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
 
         let open = operational_snapshot(&router, &authorization).await;
         assert!(open.active_key);
@@ -1204,6 +1313,7 @@ mod tests {
         assert_eq!(open.in_flight, 0);
         assert_eq!(open.max_in_flight, 1);
         assert!(open.circuit_open);
+        assert!(!open.circuit_half_open);
         assert!(open.circuit_open_until_ms >= open.generated_at_ms);
         assert_eq!(open.consecutive_backend_failures, 2);
         assert_eq!(open.backend_failed, 2);
@@ -1213,6 +1323,11 @@ mod tests {
 
         failing.store(false, Ordering::Release);
         tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            health_status(&router).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cooldown alone must not restore custody health"
+        );
         let recovered = router
             .clone()
             .oneshot(authorized_sign_http_request(body, &authorization))
@@ -1221,9 +1336,51 @@ mod tests {
         assert_eq!(recovered.status(), StatusCode::OK);
         let closed = operational_snapshot(&router, &authorization).await;
         assert!(!closed.circuit_open);
+        assert!(!closed.circuit_half_open);
         assert_eq!(closed.circuit_open_until_ms, 0);
         assert_eq!(closed.consecutive_backend_failures, 0);
         assert_eq!(closed.signing_succeeded, 1);
+    }
+
+    #[tokio::test]
+    async fn half_open_allows_one_probe_and_ignores_stale_success() {
+        let breaker = Arc::new(CircuitBreaker::new(1, Duration::from_millis(20)));
+        let failing = breaker.try_admit().expect("initial admission");
+        let stale_success = breaker.try_admit().expect("concurrent admission");
+
+        failing.resolve_failure(now_millis());
+        stale_success.resolve_success();
+        assert!(
+            !breaker.is_healthy(),
+            "stale success must not close circuit"
+        );
+        assert!(breaker.try_admit().is_none());
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!breaker.is_healthy());
+        let abandoned_probe = breaker.try_admit().expect("half-open probe");
+        assert!(breaker.try_admit().is_none(), "only one probe may run");
+        let snapshot = breaker.snapshot();
+        assert!(snapshot.0);
+        assert!(snapshot.1);
+        assert_eq!(snapshot.2, 0);
+        drop(abandoned_probe);
+
+        let request_probe = breaker.try_admit().expect("replacement probe");
+        let backend_probe = Arc::clone(&request_probe);
+        drop(request_probe);
+        assert!(
+            breaker.try_admit().is_none(),
+            "request cancellation must not release a running backend probe"
+        );
+        backend_probe.resolve_failure(now_millis());
+        assert!(breaker.try_admit().is_none());
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let successful_probe = breaker.try_admit().expect("recovery probe");
+        successful_probe.resolve_success();
+        assert!(breaker.is_healthy());
+        assert!(breaker.try_admit().is_some());
     }
 
     #[tokio::test]

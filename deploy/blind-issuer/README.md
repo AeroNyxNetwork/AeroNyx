@@ -39,7 +39,7 @@ Important Note for Next Developer:
 - Production private keys should ultimately move behind the existing signer
   boundary into an HSM/KMS without changing the wire contract.
 
-Last Modified: v1.2.0-BlindIssuerDeploy - Added aggregate status and breaker.
+Last Modified: v1.3.0-BlindIssuerDeploy - Added single-probe half-open recovery.
 ============================================
 -->
 
@@ -128,8 +128,12 @@ validated request, so a retry does not create a linkable redemption identity.
 custody circuit after consecutive backend failures or caller timeouts.
 `circuit_cooldown_ms` (default 30,000ms; allowed 1,000–300,000ms) uses a
 monotonic clock for enforcement. While open, signing returns `503` before body
-extraction. A successful post-cooldown operation closes the circuit and resets
-the consecutive-failure count.
+extraction. Cooldown expiry does not declare the signer healthy: it admits one
+half-open signing probe while concurrent requests continue to receive `503`.
+Only a successful custody operation closes the circuit and resets the
+consecutive-failure count. A failed or timed-out probe opens a fresh cooldown;
+a malformed/policy-rejected request releases the probe without claiming that
+the private-key backend recovered.
 
 ## Internal API
 
@@ -138,7 +142,7 @@ is installed.
 
 | Endpoint | Authentication | Result |
 |---|---|---|
-| `GET /internal/v1/health` | none, loopback only | `204` with an active key; otherwise `503` |
+| `GET /internal/v1/health` | none, loopback only | `204` with an active key and verified closed circuit; otherwise `503` |
 | `GET /internal/v1/issuer-epochs` | Bearer token | bounded `ANBE` public epoch snapshot |
 | `GET /internal/v1/status` | Bearer token | aggregate health/capacity counters; no request dimensions |
 | `POST /internal/v1/blind-sign` | Bearer token | bounded `ANBS` blind signature |
@@ -149,11 +153,11 @@ exports `encode_sign_request`, `decode_sign_response`, and
 `decode_epoch_snapshot` as the canonical backend-side codec reference.
 
 The JSON status snapshot contains only process-wide counts: active/key count,
-in-flight capacity, breaker state, successes, backend failures, timeouts, and
-rejections. It never includes blinded bytes, key IDs, wallet/account/device
-identifiers, IP addresses, request IDs, timestamps per request, or issuance
-history. Treat the endpoint as operator telemetry and keep bearer authentication
-enabled even on loopback.
+in-flight capacity, breaker state (`circuit_open` and `circuit_half_open`),
+successes, backend failures, timeouts, and rejections. It never includes blinded
+bytes, key IDs, wallet/account/device identifiers, IP addresses, request IDs,
+timestamps per request, or issuance history. Treat the endpoint as operator
+telemetry and keep bearer authentication enabled even on loopback.
 
 ## Safe Rotation
 
