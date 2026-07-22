@@ -39,8 +39,8 @@ Important Note for Next Developer:
 - Production private keys should ultimately move behind the existing signer
   boundary into an HSM/KMS without changing the wire contract.
 
-Last Modified: v1.6.0-BlindIssuerDeploy - Documented monotonic token-bucket
-admission and its bounded burst behavior.
+Last Modified: v1.7.0-BlindIssuerDeploy - Documented strict single-value
+authorization parsing ahead of request-body extraction.
 ============================================
 -->
 
@@ -145,7 +145,9 @@ the private-key backend recovered.
 ## Internal API
 
 All responses use `Cache-Control: no-store`. No request-body tracing middleware
-is installed.
+is installed. Authenticated endpoints require exactly one canonical
+`Authorization: Bearer <token>` header; missing, malformed, or repeated values
+return `401` before body extraction or signing-capacity admission.
 
 | Endpoint | Authentication | Result |
 |---|---|---|

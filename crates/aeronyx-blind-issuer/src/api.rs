@@ -20,6 +20,7 @@
 //! - Opens a monotonic circuit breaker after repeated custody failures.
 //! - Audits live-reload outcomes as coarse process-wide counters.
 //! - Uses a monotonic bounded token bucket for signing admission.
+//! - Rejects ambiguous multi-value authorization headers.
 //!
 //! ## Calling Relationships
 //! `main.rs` binds this router to loopback; `signer.rs` performs the private
@@ -35,8 +36,8 @@
 //! cancellation cannot release HSM capacity early. Never add wallet/account
 //! headers or request-body diagnostics.
 //!
-//! Last Modified: v0.8.0-BlindIssuerApi - Replaced wall-clock fixed-window
-//! admission with a monotonic constant-memory token bucket.
+//! Last Modified: v0.9.0-BlindIssuerApi - Enforced one canonical authorization
+//! header before all body extraction and pressure work.
 //! ============================================
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -880,9 +881,15 @@ async fn epoch_handler(State(state): State<ApiState>) -> Response {
 }
 
 fn is_authorized(headers: &HeaderMap, expected: &[u8]) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION) else {
+    // [BLIND-ISSUER-AUTH 2026-07-23 by Codex] Reject duplicates instead of
+    // trusting whichever value a proxy or `HeaderMap::get` selects first.
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
         return false;
     };
+    if values.next().is_some() {
+        return false;
+    }
     let bytes = value.as_bytes();
     let Some(candidate) = bytes.strip_prefix(AUTHORIZATION_PREFIX) else {
         return false;
@@ -1396,6 +1403,30 @@ mod tests {
         assert!(!closed.try_take(started_at + Duration::from_secs(1)));
     }
 
+    #[test]
+    fn authorization_requires_one_canonical_header_value() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_authorized(&headers, BACKEND_TOKEN));
+
+        let canonical = format!(
+            "Bearer {}",
+            std::str::from_utf8(BACKEND_TOKEN).expect("ASCII backend token")
+        );
+        let canonical = HeaderValue::from_bytes(canonical.as_bytes()).expect("authorization");
+        headers.insert(header::AUTHORIZATION, canonical.clone());
+        assert!(is_authorized(&headers, BACKEND_TOKEN));
+
+        headers.append(header::AUTHORIZATION, canonical);
+        assert!(!is_authorized(&headers, BACKEND_TOKEN));
+
+        headers.remove(header::AUTHORIZATION);
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer 0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"),
+        );
+        assert!(!is_authorized(&headers, BACKEND_TOKEN));
+    }
+
     #[tokio::test]
     async fn cancelled_requests_hold_capacity_until_backend_completion() {
         let mut fixture = BlockingFixture::new(Duration::from_secs(10));
@@ -1776,12 +1807,13 @@ mod tests {
                     .method("POST")
                     .uri("/internal/v1/blind-sign")
                     .header(header::CONTENT_TYPE, BLIND_ISSUER_CONTENT_TYPE)
-                    .body(Body::from(body.clone()))
+                    .body(Body::from(vec![0; MAX_SIGN_REQUEST_BYTES + 1]))
                     .expect("unauthorized request"),
             )
             .await
             .expect("unauthorized response");
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(unauthorized.headers()[header::CONTENT_LENGTH], "0");
 
         let authorization = format!(
             "Bearer {}",
