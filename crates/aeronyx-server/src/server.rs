@@ -1698,6 +1698,11 @@ impl Server {
             tasks.push(("blind-vault-cleanup", cleanup_task));
         }
 
+        // [NODE-API-LIFECYCLE 2026-07-23 by Codex] The protocol node API is
+        // infrastructure, not a MemChain side effect. Track whether the rich
+        // MemChain branch started it and fall back to the same router without
+        // MPI routes when memory services are disabled.
+        let mut node_api_started = false;
         if let (Some(ref st), Some(ref vi), Some(ref mp), Some(ref aw)) =
             (&storage, &vector_index, &mempool, &aof_writer)
         {
@@ -1857,12 +1862,9 @@ impl Server {
 
             let api_task = self.start_combined_api(
                 self.config.memchain.api_listen_addr,
-                Arc::clone(&mpi_state),
-                Arc::clone(mp),
-                Arc::clone(aw),
+                Some(Arc::clone(&mpi_state)),
                 Arc::clone(&ip_pool),
                 Arc::clone(&sessions),
-                Arc::clone(&udp),
                 Arc::clone(&node_policy),
                 Arc::clone(&voucher_verifier),
                 Arc::clone(&encrypted_message_counter),
@@ -1876,7 +1878,8 @@ impl Server {
                 Arc::clone(&udp),
                 commitment_sync_tip_notifier,
             );
-            tasks.push(("memchain-api", api_task));
+            tasks.push(("node-api", api_task));
+            node_api_started = true;
 
             if let Some(sync_task) = self.spawn_memchain_commitment_sync_task(
                 Arc::clone(st),
@@ -2061,6 +2064,28 @@ impl Server {
             } else {
                 info!("[MINER] Disabled (interval=0)");
             }
+        }
+
+        if !node_api_started {
+            let api_task = self.start_combined_api(
+                self.config.memchain.api_listen_addr,
+                None,
+                Arc::clone(&ip_pool),
+                Arc::clone(&sessions),
+                Arc::clone(&node_policy),
+                Arc::clone(&voucher_verifier),
+                Arc::clone(&encrypted_message_counter),
+                Arc::clone(&packet_handler),
+                Arc::clone(&peer_store),
+                directory_chain_store.clone(),
+                directory_replica_store.clone(),
+                Arc::clone(&directory_replica_sync_runtime),
+                chat_relay.clone(),
+                blind_vault.clone(),
+                Arc::clone(&udp),
+                None,
+            );
+            tasks.push(("node-api", api_task));
         }
 
         info!("Server started successfully");
@@ -2665,12 +2690,9 @@ impl Server {
     fn start_combined_api(
         &self,
         listen_addr: std::net::SocketAddr,
-        mpi_state: Arc<MpiState>,
-        _mempool: Arc<MemPool>,
-        _aof_writer: Arc<TokioMutex<AofWriter>>,
+        mpi_state: Option<Arc<MpiState>>,
         ip_pool: Arc<IpPoolService>,
         sessions: Arc<SessionManager>,
-        _udp: Arc<UdpTransport>,
         node_policy: Arc<NodePolicyRuntime>,
         voucher_verifier: Arc<VoucherVerifier>,
         encrypted_message_counter: Arc<AtomicU64>,
@@ -2709,7 +2731,9 @@ impl Server {
         let smoke_node_identity = Arc::clone(&node_identity);
         let smoke_peer_http_client = Arc::clone(&peer_http_client);
         let smoke_local_capability_status = local_capability_status.clone();
-        let commitment_storage = mpi_state.storage.clone();
+        let commitment_storage = mpi_state
+            .as_ref()
+            .and_then(|state| state.storage.clone());
         let commitment_lease_authorized_coordinator =
             self.config.memchain.commitment_sync_coordinator_node_id();
         let public_commitment_sync_tip_notifier = commitment_sync_tip_notifier.clone();
@@ -2799,7 +2823,7 @@ impl Server {
                 ),
                 _ => axum::Router::new(),
             };
-            let app = build_mpi_router(mpi_state)
+            let app = axum::Router::new()
                 .merge(build_voice_router(Arc::clone(&sessions)))
                 .merge(chat_blob_router)
                 .merge(blind_vault_router)
@@ -2890,6 +2914,11 @@ impl Server {
                     directory_full_node_mirror_max_producers,
                     DirectoryReplicaStatusScope::LocalOperator,
                 ));
+            let app = if let Some(mpi_state) = mpi_state {
+                app.merge(build_mpi_router(mpi_state))
+            } else {
+                app
+            };
             let app = if let Some(store) = directory_chain_store {
                 app.merge(build_directory_chain_peer_router_with_replica(
                     store,
@@ -2916,7 +2945,7 @@ impl Server {
 
             let listener = match tokio::net::TcpListener::bind(listen_addr).await {
                 Ok(l) => {
-                    info!("[API] MemChain API on http://{}", listen_addr);
+                    info!("[API] Node API on http://{}", listen_addr);
                     l
                 }
                 Err(e) => {
