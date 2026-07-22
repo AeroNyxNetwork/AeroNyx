@@ -9021,11 +9021,13 @@ impl Server {
                                 if report.objects_removed > 0
                                     || report.leases_removed > 0
                                     || report.tombstones_removed > 0
+                                    || report.admission_spends_removed > 0
                                 {
                                     info!(
                                         objects_removed = report.objects_removed,
                                         leases_removed = report.leases_removed,
                                         tombstones_removed = report.tombstones_removed,
+                                        admission_spends_removed = report.admission_spends_removed,
                                         "[BLIND_VAULT] Bounded cleanup completed"
                                     );
                                 }
