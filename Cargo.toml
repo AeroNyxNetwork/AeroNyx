@@ -16,8 +16,11 @@
 # Solution: Server must use the same versions to ensure crypto compatibility
 #
 # Architecture Overview:
+# [BLIND-ISSUER 2026-07-23 by Codex] Private RSA custody lives in a dedicated
+# process that deliberately has no dependency on aeronyx-server node state.
 # ┌─────────────────────────────────────────────────────────────┐
 # │  aeronyx-server    - Main server binary & orchestration     │
+# │  aeronyx-blind-issuer - Isolated RFC 9474 signing process   │
 # │  aeronyx-core      - Protocol definitions & cryptography    │
 # │  aeronyx-transport - Network I/O & TUN device abstraction   │
 # │  aeronyx-common    - Shared utilities & types               │
@@ -29,12 +32,14 @@
 # - Use workspace inheritance for common dependencies
 # - All crates should use the same async runtime (tokio)
 #
-# Last Modified: Version alignment fix for client compatibility
+# Last Modified: v0.2.0-BlindIssuer - Added an isolated blind-signing process.
+# Version alignment fix for client compatibility
 # ============================================
 
 [workspace]
 resolver = "2"
 members = [
+    "crates/aeronyx-blind-issuer",
     "crates/aeronyx-core",
     "crates/aeronyx-transport",
     "crates/aeronyx-server",

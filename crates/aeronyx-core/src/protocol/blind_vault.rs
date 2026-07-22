@@ -1063,6 +1063,11 @@ impl BlindVaultStoredReceipt {
     }
 
     /// Confirms that this receipt is for the exact submitted request.
+    // [BLIND-VAULT 2026-07-23 by Codex] This intentionally compares the node's
+    // retention promise with the client-requested expiry. It is not a repeated
+    // struct-field comparison; accepting a longer promise would change the
+    // opaque request's retention semantics.
+    #[allow(clippy::suspicious_operation_groupings)]
     #[must_use]
     pub fn matches_put(&self, put: &BlindVaultPutRequest) -> bool {
         self.version == put.version
