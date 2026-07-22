@@ -14,6 +14,8 @@
 //! - Defines anonymous lease authority and signed object deletion contracts.
 //! - Defines issuer-signed, short-lived bearer admission tickets without
 //!   binding a storage lease to an account identity.
+//! - Defines an additive RFC 9474 blind-issued admission credential whose
+//!   redemption cannot be linked to its issuance transcript.
 //! - Defines bounded recovery request/page frames with node-signed ciphertext
 //!   commitments and opaque continuation cursors.
 //! - Provides deterministic signing bytes and bounded binary wire framing.
@@ -48,14 +50,15 @@
 //!   metadata by design and serves a different retrieval model.
 //! - Do not put vault object IDs, commitments, or receipts in the public
 //!   directory chain. Public commitments would create durable activity links.
-//! - A v1 admission ticket is a signed bearer credential, not a blind
-//!   signature. Issuers must not embed identity, account, or application data;
-//!   a future blind-issued proof can use a new frame kind/version.
+//! - A v1 admission ticket remains a signed bearer credential. New clients
+//!   should use the additive V2 blind-issued frame; never mutate kind 6.
 //! - Do not change existing field order. Add a new frame version/kind instead.
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.3.0-BlindVaultPull - Added bounded signed recovery pages
+//! Last Modified: v1.4.0-BlindVaultBlindAdmission - Added an unlinkable
+//! RFC 9474 redemption contract while preserving the V1 bearer frame.
+//! v1.3.0-BlindVaultPull - Added bounded signed recovery pages
 //! and per-frame allocation ceilings.
 //! v1.2.0-BlindVaultAdmission - Added bounded issuer-signed
 //! one-time bearer admission contracts.
@@ -78,6 +81,8 @@ const PUT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Put-v1";
 const RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-StoredReceipt-v1";
 const LEASE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Lease-v1";
 const ADMISSION_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Admission-v1";
+const BLIND_ADMISSION_MESSAGE_DOMAIN: &[u8] = b"AeroNyx-BlindVault-BlindAdmission-v2";
+const BLIND_ADMISSION_SPEND_DOMAIN: &[u8] = b"AeroNyx-BlindVault-BlindSpend-v2";
 const PULL_RESPONSE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullResponse-v1";
 const DELETE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Delete-v1";
 const DELETE_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-DeletedReceipt-v1";
@@ -91,10 +96,20 @@ const FRAME_KIND_DELETED_RECEIPT: u8 = 5;
 const FRAME_KIND_LEASE_ADMISSION: u8 = 6;
 const FRAME_KIND_PULL_REQUEST: u8 = 7;
 const FRAME_KIND_PULL_RESPONSE: u8 = 8;
+const FRAME_KIND_BLIND_LEASE_ADMISSION: u8 = 9;
 
 /// Initial blind-vault wire version. This version is independent of the VPN
 /// transport and legacy chat-envelope versions.
 pub const BLIND_VAULT_PROTOCOL_VERSION: u16 = 1;
+
+/// Unlinkable blind-admission credential version carried inside frame kind 9.
+pub const BLIND_VAULT_BLIND_ADMISSION_VERSION: u16 = 2;
+
+/// RSA-2048 through RSA-4096 signatures are accepted by the wire contract.
+pub const MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES: usize = 256;
+
+/// Upper RSA signature bound prevents attacker-controlled allocation growth.
+pub const MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES: usize = 512;
 
 /// Maximum mutation/request frame. The largest v1 ciphertext class is 256 KiB;
 /// the remaining space covers fixed metadata and framing.
@@ -140,6 +155,8 @@ pub enum BlindVaultFrame {
     PullRequest(BlindVaultPullRequest),
     /// Node-signed stable encrypted-object page.
     PullResponse(BlindVaultPullResponse),
+    /// RFC 9474 blind-issued one-time credential plus anonymous lease.
+    BlindLeaseAdmission(BlindVaultBlindLeaseAdmissionRequest),
 }
 
 /// Anonymous lease metadata signed by its independent administration key.
@@ -372,6 +389,102 @@ impl BlindVaultLeaseAdmissionRequest {
             node_maximum_lease_ttl_ms.min(self.admission.maximum_lease_ttl_ms),
         )
     }
+}
+
+/// Unlinkable one-time admission credential finalized by an RFC 9474 client.
+///
+/// The issuer sees only a blinded message during issuance. The storage node
+/// later receives these fields, verifies them against an operator-pinned RSA
+/// epoch key, and cannot correlate redemption with the issuance transcript.
+/// Resource limits and validity are intentionally absent: they are fixed by
+/// the pinned issuer-key policy so a blind client cannot choose its own quota.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultBlindAdmissionToken {
+    /// Blind-admission credential version; independent of the outer frame.
+    pub version: u16,
+    /// SHA-256 fingerprint of the issuer's canonical RSA public-key DER.
+    pub issuer_key_id: [u8; 32],
+    /// Cryptographically random one-time token chosen before blinding.
+    pub token_id: [u8; 32],
+    /// RFC 9474 randomized-message value retained by the client.
+    pub message_randomizer: [u8; 32],
+    /// Finalized RSA-PSS signature over `message_bytes()`.
+    pub signature: Vec<u8>,
+}
+
+impl BlindVaultBlindAdmissionToken {
+    /// Builds a finalized token from client-owned blind-signature output.
+    #[must_use]
+    pub fn new(
+        issuer_key_id: [u8; 32],
+        token_id: [u8; 32],
+        message_randomizer: [u8; 32],
+        signature: Vec<u8>,
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_BLIND_ADMISSION_VERSION,
+            issuer_key_id,
+            token_id,
+            message_randomizer,
+            signature,
+        }
+    }
+
+    /// Domain-separated message blinded and signed by the external issuer.
+    #[must_use]
+    pub fn message_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(BLIND_ADMISSION_MESSAGE_DOMAIN.len() + 66);
+        bytes.extend_from_slice(BLIND_ADMISSION_MESSAGE_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.issuer_key_id);
+        bytes.extend_from_slice(&self.token_id);
+        bytes
+    }
+
+    /// Opaque replay marker stored by a node until the issuer epoch expires.
+    ///
+    /// Hashing a domain, key fingerprint, and token avoids cross-scheme spend
+    /// collisions without adding account or lease identifiers to durable state.
+    #[must_use]
+    pub fn spend_id(&self) -> [u8; 32] {
+        let mut bytes = Vec::with_capacity(BLIND_ADMISSION_SPEND_DOMAIN.len() + 64);
+        bytes.extend_from_slice(BLIND_ADMISSION_SPEND_DOMAIN);
+        bytes.extend_from_slice(&self.issuer_key_id);
+        bytes.extend_from_slice(&self.token_id);
+        sha256(&bytes)
+    }
+
+    /// Validates allocation bounds and random identifiers before RSA work.
+    pub fn validate_shape(&self) -> Result<(), BlindVaultError> {
+        if self.version != BLIND_VAULT_BLIND_ADMISSION_VERSION {
+            return Err(BlindVaultError::UnsupportedBlindAdmissionVersion(
+                self.version,
+            ));
+        }
+        require_non_zero("blind_admission_issuer_key_id", &self.issuer_key_id)?;
+        require_non_zero("blind_admission_token_id", &self.token_id)?;
+        require_non_zero(
+            "blind_admission_message_randomizer",
+            &self.message_randomizer,
+        )?;
+        if !(MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES..=MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES)
+            .contains(&self.signature.len())
+        {
+            return Err(BlindVaultError::InvalidBlindAdmissionSignatureLength {
+                actual: self.signature.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Atomic V2 redemption pairing one unlinkable token with one random lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultBlindLeaseAdmissionRequest {
+    /// RFC 9474 finalized one-time credential.
+    pub admission: BlindVaultBlindAdmissionToken,
+    /// Self-authenticating random replica lease requested by the bearer.
+    pub lease: BlindVaultLeaseCreateRequest,
 }
 
 /// Capability-authenticated request for one stable recovery snapshot page.
@@ -964,6 +1077,10 @@ pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, Blin
             FRAME_KIND_PULL_RESPONSE,
             serialize_body(value, MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES)?,
         ),
+        BlindVaultFrame::BlindLeaseAdmission(value) => (
+            FRAME_KIND_BLIND_LEASE_ADMISSION,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
     };
 
     let total = FRAME_HEADER_BYTES
@@ -1031,6 +1148,9 @@ pub fn decode_blind_vault_frame(bytes: &[u8]) -> Result<BlindVaultFrame, BlindVa
             body,
             frame_limit,
         )?)),
+        FRAME_KIND_BLIND_LEASE_ADMISSION => Ok(BlindVaultFrame::BlindLeaseAdmission(
+            deserialize_body(body, frame_limit)?,
+        )),
         kind => Err(BlindVaultError::UnknownFrameKind(kind)),
     }
 }
@@ -1086,6 +1206,15 @@ pub enum BlindVaultError {
     /// Admission ticket carried an invalid time or lease policy.
     #[error("admission ticket policy is invalid")]
     InvalidAdmissionPolicy,
+    /// Blind-admission credential version is unsupported.
+    #[error("unsupported blind-admission credential version {0}")]
+    UnsupportedBlindAdmissionVersion(u16),
+    /// Finalized RSA signature did not fit the RSA-2048 through RSA-4096 bound.
+    #[error("blind-admission signature length {actual} is invalid")]
+    InvalidBlindAdmissionSignatureLength {
+        /// Received finalized signature length in bytes.
+        actual: usize,
+    },
     /// Pull page size was zero or exceeded the protocol-wide ceiling.
     #[error("blind-vault pull limit is invalid")]
     InvalidPullLimit,
@@ -1157,7 +1286,8 @@ fn frame_limit_for_kind(kind: u8) -> Result<u64, BlindVaultError> {
         | FRAME_KIND_DELETE
         | FRAME_KIND_DELETED_RECEIPT
         | FRAME_KIND_LEASE_ADMISSION
-        | FRAME_KIND_PULL_REQUEST => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
+        | FRAME_KIND_PULL_REQUEST
+        | FRAME_KIND_BLIND_LEASE_ADMISSION => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
         FRAME_KIND_PULL_RESPONSE => Ok(MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES),
         unknown => Err(BlindVaultError::UnknownFrameKind(unknown)),
     }
@@ -1339,6 +1469,66 @@ mod tests {
         assert_eq!(
             decode_blind_vault_frame(&encoded).expect("decode admission"),
             BlindVaultFrame::LeaseAdmission(request)
+        );
+    }
+
+    // [BLIND-VAULT-BLIND-ADMISSION 2026-07-23 by Codex] Core validates only
+    // bounded wire shape; the server crate performs RFC 9474 verification with
+    // an operator-pinned RSA epoch key.
+    #[test]
+    fn blind_admission_shape_is_domain_separated_and_round_trips_additively() {
+        let admission = BlindVaultBlindAdmissionToken::new(
+            [41; 32],
+            [42; 32],
+            [43; 32],
+            vec![44; MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES],
+        );
+        admission.validate_shape().expect("bounded blind token");
+        assert!(admission
+            .message_bytes()
+            .starts_with(BLIND_ADMISSION_MESSAGE_DOMAIN));
+        assert_ne!(admission.spend_id(), admission.token_id);
+
+        let request = BlindVaultBlindLeaseAdmissionRequest {
+            admission,
+            lease: signed_lease(),
+        };
+        let encoded =
+            encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseAdmission(request.clone()))
+                .expect("encode blind admission");
+        assert_eq!(encoded[6], FRAME_KIND_BLIND_LEASE_ADMISSION);
+        assert_eq!(
+            decode_blind_vault_frame(&encoded).expect("decode blind admission"),
+            BlindVaultFrame::BlindLeaseAdmission(request)
+        );
+    }
+
+    #[test]
+    fn blind_admission_rejects_zero_randomizer_and_unbounded_signature() {
+        let zero_randomizer = BlindVaultBlindAdmissionToken::new(
+            [45; 32],
+            [46; 32],
+            [0; 32],
+            vec![47; MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES],
+        );
+        assert!(matches!(
+            zero_randomizer.validate_shape(),
+            Err(BlindVaultError::ZeroIdentifier(
+                "blind_admission_message_randomizer"
+            ))
+        ));
+
+        let oversized = BlindVaultBlindAdmissionToken::new(
+            [45; 32],
+            [46; 32],
+            [48; 32],
+            vec![49; MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES + 1],
+        );
+        assert_eq!(
+            oversized.validate_shape(),
+            Err(BlindVaultError::InvalidBlindAdmissionSignatureLength {
+                actual: MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES + 1,
+            })
         );
     }
 
