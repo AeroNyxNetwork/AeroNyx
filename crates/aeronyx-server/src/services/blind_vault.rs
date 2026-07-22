@@ -11,7 +11,7 @@
 //! ## Main Functionality
 //! - Self-authenticating anonymous lease provisioning.
 //! - Immutable, idempotent ciphertext object persistence.
-//! - Capability-gated bounded recovery pages.
+//! - Capability-gated bounded recovery pages with encrypted snapshot cursors.
 //! - Administration-key object deletion with signed node receipts.
 //! - Transactional per-lease count/byte quotas and bounded expiry cleanup.
 //!
@@ -42,10 +42,12 @@
 //! - Never accept mutable replacement under an existing object ID.
 //! - Never publish object commitments or receipts into the Directory Chain.
 //! - API handlers must run synchronous SQLite methods in `spawn_blocking`.
-//! - Pull continuation sequence is node-internal and must be authenticated or
-//!   encrypted before it becomes a client cursor.
+//! - Pull cursors must remain lease-bound AEAD ciphertext; never expose the
+//!   internal SQLite sequence or accept a caller-provided raw sequence.
 //!
-//! Last Modified: v1.0.0-BlindVaultService - Initial transactional service.
+//! Last Modified: v1.1.0-BlindVaultSnapshotCursor - Added lease-bound encrypted
+//! snapshot cursors for stable recovery pagination.
+//! v1.0.0-BlindVaultService - Initial transactional service.
 //! ============================================
 
 use std::fs;
@@ -58,8 +60,13 @@ use aeronyx_core::protocol::blind_vault::{
     BlindVaultDeleteRequest, BlindVaultDeletedReceipt, BlindVaultError,
     BlindVaultLeaseCreateRequest, BlindVaultPutRequest, BlindVaultStoredReceipt,
 };
+use chacha20poly1305::{
+    aead::{Aead, NewAead, Payload},
+    Key, XChaCha20Poly1305, XNonce,
+};
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
+use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -70,6 +77,14 @@ type HmacSha256 = Hmac<Sha256>;
 
 const READ_AUTH_KEY_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReadAuth-Key-v1";
 const READ_AUTH_TAG_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReadAuth-Tag-v1";
+const PULL_CURSOR_KEY_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullCursor-Key-v1";
+const PULL_CURSOR_AAD_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullCursor-AAD-v1";
+const PULL_CURSOR_VERSION: u8 = 1;
+const PULL_CURSOR_NONCE_BYTES: usize = 24;
+const PULL_CURSOR_PLAINTEXT_BYTES: usize = 16;
+const PULL_CURSOR_TAG_BYTES: usize = 16;
+const PULL_CURSOR_BYTES: usize =
+    1 + PULL_CURSOR_NONCE_BYTES + PULL_CURSOR_PLAINTEXT_BYTES + PULL_CURSOR_TAG_BYTES;
 const CLEANUP_OBJECT_BATCH: usize = 512;
 const CLEANUP_LEASE_BATCH: usize = 128;
 const CLEANUP_TOMBSTONE_BATCH: usize = 512;
@@ -101,8 +116,8 @@ pub struct BlindVaultStoredObject {
 pub struct BlindVaultPullPage {
     /// Still-live opaque objects in insertion order.
     pub objects: Vec<BlindVaultStoredObject>,
-    /// Internal continuation sequence; API layers must protect it before use.
-    pub continuation_sequence: Option<u64>,
+    /// Lease-bound encrypted cursor for the same stable recovery snapshot.
+    pub continuation_cursor: Option<Vec<u8>>,
 }
 
 /// Aggregate-only bounded maintenance result.
@@ -171,6 +186,12 @@ pub enum BlindVaultServiceError {
     /// Read capability did not authorise this lease.
     #[error("blind vault read capability rejected")]
     ReadUnauthorized,
+    /// Pull cursor could not be authenticated for this lease.
+    #[error("blind vault pull cursor rejected")]
+    InvalidPullCursor,
+    /// Pull cursor could not be encrypted.
+    #[error("blind vault pull cursor encryption failed")]
+    PullCursorEncryptionFailed,
     /// Requested object is absent and has no retained tombstone.
     #[error("blind vault object not found")]
     ObjectNotFound,
@@ -188,6 +209,7 @@ pub struct BlindVaultService {
     connection: Mutex<Connection>,
     node_identity: IdentityKeyPair,
     read_auth_key: Zeroizing<[u8; 32]>,
+    pull_cursor_key: Zeroizing<[u8; 32]>,
 }
 
 impl BlindVaultService {
@@ -213,16 +235,15 @@ impl BlindVaultService {
         init_schema(&connection)?;
 
         let seed = Zeroizing::new(node_identity.to_bytes());
-        let mut key_deriver = HmacSha256::new_from_slice(seed.as_ref())
-            .map_err(|_| BlindVaultServiceError::CorruptState)?;
-        key_deriver.update(READ_AUTH_KEY_DOMAIN);
-        let read_auth_key = Zeroizing::new(key_deriver.finalize().into_bytes().into());
+        let read_auth_key = derive_node_key(seed.as_ref(), READ_AUTH_KEY_DOMAIN)?;
+        let pull_cursor_key = derive_node_key(seed.as_ref(), PULL_CURSOR_KEY_DOMAIN)?;
 
         Ok(Self {
             config,
             connection: Mutex::new(connection),
             node_identity,
             read_auth_key,
+            pull_cursor_key,
         })
     }
 
@@ -395,7 +416,7 @@ impl BlindVaultService {
         &self,
         lease_id: &[u8; 32],
         read_capability: &[u8; 32],
-        after_sequence: Option<u64>,
+        continuation_cursor: Option<&[u8]>,
         requested_limit: usize,
         now_ms: u64,
     ) -> Result<BlindVaultPullPage, BlindVaultServiceError> {
@@ -403,7 +424,6 @@ impl BlindVaultService {
             return Err(BlindVaultServiceError::ReadUnauthorized);
         }
         let now = sqlite_i64(now_ms)?;
-        let after = sqlite_i64(after_sequence.unwrap_or(0))?;
         let limit = requested_limit.min(self.config.max_pull_objects);
         let query_limit = i64::try_from(limit.saturating_add(1))
             .map_err(|_| BlindVaultServiceError::CorruptState)?;
@@ -423,21 +443,46 @@ impl BlindVaultService {
         }
         self.verify_read_capability(lease_id, read_capability, &read_tag)?;
 
+        // [BLIND-VAULT-CURSOR 2026-07-23 by Codex] The first page freezes a
+        // sequence ceiling. Subsequent pages can neither reveal raw SQLite
+        // positions nor drift into objects written after recovery began.
+        let (after_sequence, ceiling_sequence) = if let Some(cursor) = continuation_cursor {
+            self.decode_pull_cursor(lease_id, cursor)?
+        } else {
+            let ceiling: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(sequence), 0)
+                 FROM blind_vault_objects
+                 WHERE lease_id = ?1 AND expires_at_ms > ?2",
+                params![&lease_id[..], now],
+                |row| row.get(0),
+            )?;
+            (
+                0,
+                u64::try_from(ceiling).map_err(|_| BlindVaultServiceError::CorruptState)?,
+            )
+        };
+        let after = sqlite_i64(after_sequence)?;
+        let ceiling = sqlite_i64(ceiling_sequence)?;
+
         let mut statement = connection.prepare(
             "SELECT sequence, object_id, ciphertext, ciphertext_commitment, expires_at_ms
              FROM blind_vault_objects
-             WHERE lease_id = ?1 AND sequence > ?2 AND expires_at_ms > ?3
-             ORDER BY sequence ASC LIMIT ?4",
+             WHERE lease_id = ?1 AND sequence > ?2 AND sequence <= ?3
+               AND expires_at_ms > ?4
+             ORDER BY sequence ASC LIMIT ?5",
         )?;
-        let rows = statement.query_map(params![&lease_id[..], after, now, query_limit], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
+        let rows = statement.query_map(
+            params![&lease_id[..], after, ceiling, now, query_limit],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
 
         let mut decoded = Vec::new();
         for row in rows {
@@ -457,12 +502,18 @@ impl BlindVaultService {
         if has_more {
             decoded.truncate(limit);
         }
-        let continuation_sequence = has_more
-            .then(|| decoded.last().map(|(sequence, _)| *sequence))
-            .flatten();
+        let continuation_cursor = if has_more {
+            let position = decoded
+                .last()
+                .map(|(sequence, _)| *sequence)
+                .ok_or(BlindVaultServiceError::CorruptState)?;
+            Some(self.encode_pull_cursor(lease_id, position, ceiling_sequence)?)
+        } else {
+            None
+        };
         Ok(BlindVaultPullPage {
             objects: decoded.into_iter().map(|(_, object)| object).collect(),
-            continuation_sequence,
+            continuation_cursor,
         })
     }
 
@@ -691,6 +742,97 @@ impl BlindVaultService {
         mac.verify_slice(stored_tag)
             .map_err(|_| BlindVaultServiceError::ReadUnauthorized)
     }
+
+    fn pull_cursor_aad(lease_id: &[u8; 32]) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(PULL_CURSOR_AAD_DOMAIN.len() + lease_id.len());
+        aad.extend_from_slice(PULL_CURSOR_AAD_DOMAIN);
+        aad.extend_from_slice(lease_id);
+        aad
+    }
+
+    fn encode_pull_cursor(
+        &self,
+        lease_id: &[u8; 32],
+        position: u64,
+        ceiling: u64,
+    ) -> Result<Vec<u8>, BlindVaultServiceError> {
+        if position > ceiling || ceiling > i64::MAX as u64 {
+            return Err(BlindVaultServiceError::PullCursorEncryptionFailed);
+        }
+        let mut plaintext = [0_u8; PULL_CURSOR_PLAINTEXT_BYTES];
+        plaintext[..8].copy_from_slice(&position.to_le_bytes());
+        plaintext[8..].copy_from_slice(&ceiling.to_le_bytes());
+
+        let mut nonce = [0_u8; PULL_CURSOR_NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(self.pull_cursor_key.as_ref()));
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &Self::pull_cursor_aad(lease_id),
+                },
+            )
+            .map_err(|_| BlindVaultServiceError::PullCursorEncryptionFailed)?;
+        if ciphertext.len() != PULL_CURSOR_PLAINTEXT_BYTES + PULL_CURSOR_TAG_BYTES {
+            return Err(BlindVaultServiceError::PullCursorEncryptionFailed);
+        }
+
+        let mut encoded = Vec::with_capacity(PULL_CURSOR_BYTES);
+        encoded.push(PULL_CURSOR_VERSION);
+        encoded.extend_from_slice(&nonce);
+        encoded.extend_from_slice(&ciphertext);
+        Ok(encoded)
+    }
+
+    fn decode_pull_cursor(
+        &self,
+        lease_id: &[u8; 32],
+        encoded: &[u8],
+    ) -> Result<(u64, u64), BlindVaultServiceError> {
+        if encoded.len() != PULL_CURSOR_BYTES
+            || encoded.first().copied() != Some(PULL_CURSOR_VERSION)
+        {
+            return Err(BlindVaultServiceError::InvalidPullCursor);
+        }
+        let nonce_start = 1;
+        let ciphertext_start = nonce_start + PULL_CURSOR_NONCE_BYTES;
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(self.pull_cursor_key.as_ref()));
+        let plaintext = cipher
+            .decrypt(
+                XNonce::from_slice(&encoded[nonce_start..ciphertext_start]),
+                Payload {
+                    msg: &encoded[ciphertext_start..],
+                    aad: &Self::pull_cursor_aad(lease_id),
+                },
+            )
+            .map_err(|_| BlindVaultServiceError::InvalidPullCursor)?;
+        if plaintext.len() != PULL_CURSOR_PLAINTEXT_BYTES {
+            return Err(BlindVaultServiceError::InvalidPullCursor);
+        }
+
+        let mut position = [0_u8; 8];
+        position.copy_from_slice(&plaintext[..8]);
+        let mut ceiling = [0_u8; 8];
+        ceiling.copy_from_slice(&plaintext[8..]);
+        let position = u64::from_le_bytes(position);
+        let ceiling = u64::from_le_bytes(ceiling);
+        if position > ceiling || ceiling > i64::MAX as u64 {
+            return Err(BlindVaultServiceError::InvalidPullCursor);
+        }
+        Ok((position, ceiling))
+    }
+}
+
+fn derive_node_key(
+    seed: &[u8],
+    domain: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, BlindVaultServiceError> {
+    let mut key_deriver =
+        HmacSha256::new_from_slice(seed).map_err(|_| BlindVaultServiceError::CorruptState)?;
+    key_deriver.update(domain);
+    Ok(Zeroizing::new(key_deriver.finalize().into_bytes().into()))
 }
 
 #[derive(Debug)]
@@ -1029,7 +1171,7 @@ mod tests {
             page.objects[0].ciphertext_commitment,
             put.ciphertext_commitment
         );
-        assert!(page.continuation_sequence.is_none());
+        assert!(page.continuation_cursor.is_none());
 
         assert!(matches!(
             fixture
@@ -1099,24 +1241,44 @@ mod tests {
             .pull_page(&[1; 32], &fixture.read_capability, None, 1, NOW_MS + 30)
             .expect("first page");
         assert_eq!(page.objects.len(), 1);
-        let cursor = page.continuation_sequence.expect("continuation");
+        let cursor = page.continuation_cursor.expect("continuation");
+        assert_eq!(cursor.len(), PULL_CURSOR_BYTES);
+        let mut tampered_cursor = cursor.clone();
+        tampered_cursor[10] ^= 1;
+        assert!(matches!(
+            fixture
+                .service
+                .decode_pull_cursor(&[1; 32], &tampered_cursor),
+            Err(BlindVaultServiceError::InvalidPullCursor)
+        ));
+        assert!(matches!(
+            fixture.service.decode_pull_cursor(&[2; 32], &cursor),
+            Err(BlindVaultServiceError::InvalidPullCursor)
+        ));
+
+        // Objects appended after the first page belong to the next snapshot,
+        // never to the in-progress recovery page sequence.
+        let third = fixture.put(7, 8);
+        fixture.service.put(&third, NOW_MS + 25).expect("third");
         let page = fixture
             .service
             .pull_page(
                 &[1; 32],
                 &fixture.read_capability,
-                Some(cursor),
+                Some(&cursor),
                 1,
                 NOW_MS + 30,
             )
             .expect("second page");
         assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].object_id, second.object_id);
+        assert!(page.continuation_cursor.is_none());
 
         let cleanup = fixture
             .service
             .run_cleanup(NOW_MS + 2 * 24 * 60 * 60 * 1_000)
             .expect("cleanup");
-        assert_eq!(cleanup.objects_removed, 2);
+        assert_eq!(cleanup.objects_removed, 3);
         assert_eq!(
             fixture
                 .service
