@@ -23,7 +23,7 @@
 //! Replace `IssuerKey::secret_key` with an HSM/KMS handle behind this module;
 //! do not leak request bodies or add caller metadata to this type.
 //!
-//! Last Modified: v0.1.0-BlindSigner - Initial software-key boundary.
+//! Last Modified: v0.1.1-BlindSigner - Added active-key readiness inspection.
 //! ============================================
 
 use std::collections::HashMap;
@@ -151,6 +151,14 @@ impl BlindSigner {
     #[must_use]
     pub fn key_count(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Returns whether at least one configured key can sign at `now_ms`.
+    #[must_use]
+    pub fn has_active_key(&self, now_ms: u64) -> bool {
+        self.keys.values().any(|key| {
+            now_ms >= key.public_epoch.not_before_ms && now_ms < key.public_epoch.expires_at_ms
+        })
     }
 
     /// Returns canonical non-expired public epochs in key-ID order.

@@ -41,6 +41,10 @@ pub mod api;
 pub mod config;
 pub mod signer;
 
-pub use api::{build_router, decode_sign_response, encode_sign_request, BLIND_ISSUER_CONTENT_TYPE};
+pub use api::{
+    build_router, decode_epoch_snapshot, decode_sign_response, encode_epoch_snapshot,
+    encode_sign_request, BlindIssuerEpochSnapshot, BLIND_ISSUER_CONTENT_TYPE,
+    BLIND_ISSUER_EPOCH_CONTENT_TYPE,
+};
 pub use config::{BlindIssuerConfig, BlindIssuerKeyConfig, ConfigError};
 pub use signer::{BlindSignError, BlindSignRequest, BlindSignResponse, BlindSigner};

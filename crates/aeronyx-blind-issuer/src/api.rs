@@ -11,8 +11,9 @@
 //!
 //! ## Main Functionality
 //! - Authenticates a backend bearer token before buffering the request body.
-//! - Enforces process-wide concurrency and per-second pressure ceilings.
+//! - Enforces private-operation concurrency and per-second pressure ceilings.
 //! - Encodes a fixed, allocation-bounded binary request/response contract.
+//! - Publishes authenticated, public-only key epochs for safe rotation.
 //! - Runs private RSA operations on Tokio's blocking pool.
 //!
 //! ## Calling Relationships
@@ -27,7 +28,8 @@
 //! Keep authentication and pressure middleware outside the `Bytes` extractor.
 //! Never add wallet/account headers or request-body diagnostics.
 //!
-//! Last Modified: v0.1.0-BlindIssuerApi - Initial bounded local API.
+//! Last Modified: v0.2.0-BlindIssuerApi - Added bounded epoch snapshots and
+//! separated authorization from private-operation pressure controls.
 //! ============================================
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -35,7 +37,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::blind_vault::{
-    BLIND_VAULT_BLIND_ADMISSION_VERSION, MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES,
+    BlindVaultBlindIssuerEpoch, BLIND_VAULT_BLIND_ADMISSION_VERSION,
+    MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES, MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS,
+    MAX_BLIND_VAULT_BLIND_ISSUER_EPOCH_MS, MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES,
     MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES,
 };
 use axum::body::{Body, Bytes};
@@ -46,6 +50,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -54,13 +59,31 @@ use crate::signer::{BlindSignError, BlindSignRequest, BlindSignResponse, BlindSi
 
 const REQUEST_MAGIC: [u8; 4] = *b"ANBI";
 const RESPONSE_MAGIC: [u8; 4] = *b"ANBS";
+const EPOCH_RESPONSE_MAGIC: [u8; 4] = *b"ANBE";
+const INTERNAL_WIRE_VERSION: u16 = 1;
 const FRAME_HEADER_BYTES: usize = 38;
+const EPOCH_RESPONSE_HEADER_BYTES: usize = 16;
+const EPOCH_ENTRY_FIXED_BYTES: usize = 60;
 const MAX_SIGN_REQUEST_BYTES: usize = FRAME_HEADER_BYTES + MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES;
+const MAX_EPOCH_RESPONSE_BYTES: usize = EPOCH_RESPONSE_HEADER_BYTES
+    + MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS
+        * (EPOCH_ENTRY_FIXED_BYTES + MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES);
 const AUTHORIZATION_PREFIX: &[u8] = b"Bearer ";
 const CACHE_CONTROL_NO_STORE: &str = "no-store";
 
 /// Content type for the local blind-issuer binary contract.
 pub const BLIND_ISSUER_CONTENT_TYPE: &str = "application/vnd.aeronyx.blind-issuer-v1";
+/// Content type for authenticated public-key epoch snapshots.
+pub const BLIND_ISSUER_EPOCH_CONTENT_TYPE: &str = "application/vnd.aeronyx.blind-issuer-epochs-v1";
+
+/// Public-only issuer key material used by the backend to coordinate rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindIssuerEpochSnapshot {
+    /// Snapshot creation time in Unix milliseconds.
+    pub generated_at_ms: u64,
+    /// Strictly key-ID-sorted, non-expired issuer epochs.
+    pub epochs: Vec<BlindVaultBlindIssuerEpoch>,
+}
 
 /// Bounded internal wire-codec failures.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -154,19 +177,42 @@ pub fn build_router(
     };
     let signing = Router::new()
         .route("/internal/v1/blind-sign", post(sign_handler))
-        .route_layer(middleware::from_fn_with_state(state.clone(), signing_gate))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            signing_pressure_gate,
+        ))
         .layer(DefaultBodyLimit::max(MAX_SIGN_REQUEST_BYTES));
+    let authenticated = signing
+        .merge(Router::new().route("/internal/v1/issuer-epochs", get(epoch_handler)))
+        // [BLIND-ISSUER-EPOCHS 2026-07-23 by Codex] Authorization wraps both
+        // routes, while only the private RSA route consumes signing capacity.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorization_gate,
+        ));
     let health = Router::new().route("/internal/v1/health", get(health_handler));
-    signing.merge(health).with_state(state)
+    authenticated.merge(health).with_state(state)
 }
 
-async fn signing_gate(State(state): State<ApiState>, request: Request, next: Next) -> Response {
-    let Some(_guard) = InFlightGuard::try_acquire(&state.in_flight, state.max_in_flight) else {
-        return empty_response(StatusCode::TOO_MANY_REQUESTS);
-    };
+async fn authorization_gate(
+    State(state): State<ApiState>,
+    request: Request,
+    next: Next,
+) -> Response {
     if !is_authorized(request.headers(), state.auth_token.as_ref().as_slice()) {
         return empty_response(StatusCode::UNAUTHORIZED);
     }
+    next.run(request).await
+}
+
+async fn signing_pressure_gate(
+    State(state): State<ApiState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(_guard) = InFlightGuard::try_acquire(&state.in_flight, state.max_in_flight) else {
+        return empty_response(StatusCode::TOO_MANY_REQUESTS);
+    };
     if !state
         .rate
         .lock()
@@ -200,8 +246,34 @@ async fn sign_handler(State(state): State<ApiState>, headers: HeaderMap, body: B
     }
 }
 
-async fn health_handler() -> Response {
-    empty_response(StatusCode::NO_CONTENT)
+async fn health_handler(State(state): State<ApiState>) -> Response {
+    if state.signer.has_active_key(now_millis()) {
+        empty_response(StatusCode::NO_CONTENT)
+    } else {
+        empty_response(StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
+async fn epoch_handler(State(state): State<ApiState>) -> Response {
+    let generated_at_ms = now_millis();
+    let snapshot = BlindIssuerEpochSnapshot {
+        generated_at_ms,
+        epochs: state.signer.public_epochs(generated_at_ms),
+    };
+    encode_epoch_snapshot(&snapshot).map_or_else(
+        |_| empty_response(StatusCode::INTERNAL_SERVER_ERROR),
+        |bytes| {
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, BLIND_ISSUER_EPOCH_CONTENT_TYPE),
+                    (header::CACHE_CONTROL, CACHE_CONTROL_NO_STORE),
+                ],
+                bytes,
+            )
+                .into_response()
+        },
+    )
 }
 
 fn is_authorized(headers: &HeaderMap, expected: &[u8]) -> bool {
@@ -309,6 +381,149 @@ pub fn decode_sign_response(bytes: &[u8]) -> Result<BlindSignResponse, BlindIssu
     })
 }
 
+/// Encodes a deterministic, allocation-bounded public epoch snapshot.
+///
+/// # Errors
+/// Returns a wire error when an epoch violates key, ordering, or time bounds.
+pub fn encode_epoch_snapshot(
+    snapshot: &BlindIssuerEpochSnapshot,
+) -> Result<Vec<u8>, BlindIssuerWireError> {
+    validate_epoch_snapshot(snapshot)?;
+    let capacity = EPOCH_RESPONSE_HEADER_BYTES
+        + snapshot
+            .epochs
+            .iter()
+            .map(|epoch| EPOCH_ENTRY_FIXED_BYTES + epoch.public_key_der.len())
+            .sum::<usize>();
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(&EPOCH_RESPONSE_MAGIC);
+    bytes.extend_from_slice(&INTERNAL_WIRE_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&snapshot.generated_at_ms.to_be_bytes());
+    let epoch_count =
+        u16::try_from(snapshot.epochs.len()).map_err(|_| BlindIssuerWireError::InvalidFrame)?;
+    bytes.extend_from_slice(&epoch_count.to_be_bytes());
+    for epoch in &snapshot.epochs {
+        bytes.extend_from_slice(&epoch.admission_version.to_be_bytes());
+        bytes.extend_from_slice(&epoch.issuer_key_id);
+        bytes.extend_from_slice(&epoch.not_before_ms.to_be_bytes());
+        bytes.extend_from_slice(&epoch.expires_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&epoch.max_lease_ttl_ms.to_be_bytes());
+        let der_length = u16::try_from(epoch.public_key_der.len())
+            .map_err(|_| BlindIssuerWireError::InvalidFrame)?;
+        bytes.extend_from_slice(&der_length.to_be_bytes());
+        bytes.extend_from_slice(&epoch.public_key_der);
+    }
+    Ok(bytes)
+}
+
+/// Decodes and validates one signer public-key epoch snapshot.
+///
+/// # Errors
+/// Returns a wire error for malformed, oversized, unsorted, or stale epochs.
+pub fn decode_epoch_snapshot(
+    bytes: &[u8],
+) -> Result<BlindIssuerEpochSnapshot, BlindIssuerWireError> {
+    if bytes.len() > MAX_EPOCH_RESPONSE_BYTES {
+        return Err(BlindIssuerWireError::FrameTooLarge);
+    }
+    if bytes.len() < EPOCH_RESPONSE_HEADER_BYTES || bytes[..4] != EPOCH_RESPONSE_MAGIC {
+        return Err(BlindIssuerWireError::InvalidFrame);
+    }
+    let mut cursor = 4;
+    let wire_version = u16::from_be_bytes(take_array(bytes, &mut cursor)?);
+    if wire_version != INTERNAL_WIRE_VERSION {
+        return Err(BlindIssuerWireError::InvalidFrame);
+    }
+    let generated_at_ms = u64::from_be_bytes(take_array(bytes, &mut cursor)?);
+    let epoch_count = usize::from(u16::from_be_bytes(take_array(bytes, &mut cursor)?));
+    if epoch_count > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS {
+        return Err(BlindIssuerWireError::InvalidFrame);
+    }
+    let mut epochs = Vec::with_capacity(epoch_count);
+    for _ in 0..epoch_count {
+        let admission_version = u16::from_be_bytes(take_array(bytes, &mut cursor)?);
+        let issuer_key_id = take_array(bytes, &mut cursor)?;
+        let not_before_ms = u64::from_be_bytes(take_array(bytes, &mut cursor)?);
+        let expires_at_ms = u64::from_be_bytes(take_array(bytes, &mut cursor)?);
+        let max_lease_ttl_ms = u64::from_be_bytes(take_array(bytes, &mut cursor)?);
+        let der_length = usize::from(u16::from_be_bytes(take_array(bytes, &mut cursor)?));
+        let der_end = cursor
+            .checked_add(der_length)
+            .ok_or(BlindIssuerWireError::InvalidFrame)?;
+        let public_key_der = bytes
+            .get(cursor..der_end)
+            .ok_or(BlindIssuerWireError::InvalidFrame)?
+            .to_vec();
+        cursor = der_end;
+        epochs.push(BlindVaultBlindIssuerEpoch {
+            admission_version,
+            issuer_key_id,
+            public_key_der,
+            not_before_ms,
+            expires_at_ms,
+            max_lease_ttl_ms,
+        });
+    }
+    if cursor != bytes.len() {
+        return Err(BlindIssuerWireError::InvalidFrame);
+    }
+    let snapshot = BlindIssuerEpochSnapshot {
+        generated_at_ms,
+        epochs,
+    };
+    validate_epoch_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+fn validate_epoch_snapshot(
+    snapshot: &BlindIssuerEpochSnapshot,
+) -> Result<(), BlindIssuerWireError> {
+    if snapshot.epochs.len() > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS
+        || snapshot
+            .epochs
+            .windows(2)
+            .any(|pair| pair[0].issuer_key_id >= pair[1].issuer_key_id)
+    {
+        return Err(BlindIssuerWireError::InvalidFrame);
+    }
+    for epoch in &snapshot.epochs {
+        let lifetime = epoch
+            .expires_at_ms
+            .checked_sub(epoch.not_before_ms)
+            .ok_or(BlindIssuerWireError::InvalidFrame)?;
+        let derived_key_id: [u8; 32] = Sha256::digest(&epoch.public_key_der).into();
+        if epoch.admission_version != BLIND_VAULT_BLIND_ADMISSION_VERSION
+            || epoch.issuer_key_id.iter().all(|byte| *byte == 0)
+            || epoch.issuer_key_id != derived_key_id
+            || epoch.public_key_der.is_empty()
+            || epoch.public_key_der.len() > MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES
+            || lifetime == 0
+            || lifetime > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCH_MS
+            || epoch.expires_at_ms <= snapshot.generated_at_ms
+            || epoch.max_lease_ttl_ms == 0
+        {
+            return Err(BlindIssuerWireError::InvalidFrame);
+        }
+    }
+    Ok(())
+}
+
+fn take_array<const LENGTH: usize>(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<[u8; LENGTH], BlindIssuerWireError> {
+    let end = cursor
+        .checked_add(LENGTH)
+        .ok_or(BlindIssuerWireError::InvalidFrame)?;
+    let slice = bytes
+        .get(*cursor..end)
+        .ok_or(BlindIssuerWireError::InvalidFrame)?;
+    let mut value = [0; LENGTH];
+    value.copy_from_slice(slice);
+    *cursor = end;
+    Ok(value)
+}
+
 fn empty_response(status: StatusCode) -> Response {
     (
         status,
@@ -397,7 +612,7 @@ mod tests {
         let router = build_router(
             Arc::clone(&signer),
             Zeroizing::new(BACKEND_TOKEN.to_vec()),
-            128,
+            2,
             8,
         );
 
@@ -433,6 +648,41 @@ mod tests {
             "Bearer {}",
             std::str::from_utf8(BACKEND_TOKEN).expect("ASCII backend token")
         );
+        let epoch_response = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/internal/v1/issuer-epochs")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .body(Body::empty())
+                    .expect("epoch request"),
+            )
+            .await
+            .expect("epoch response");
+        assert_eq!(epoch_response.status(), StatusCode::OK);
+        assert_eq!(
+            epoch_response.headers()[header::CONTENT_TYPE],
+            BLIND_ISSUER_EPOCH_CONTENT_TYPE
+        );
+        let epoch_body = to_bytes(epoch_response.into_body(), MAX_EPOCH_RESPONSE_BYTES)
+            .await
+            .expect("epoch body");
+        let epoch_snapshot = decode_epoch_snapshot(&epoch_body).expect("epoch snapshot");
+        assert_eq!(epoch_snapshot.epochs.len(), 1);
+        assert_eq!(epoch_snapshot.epochs[0].issuer_key_id, issuer_key_id);
+        let mut tampered_epoch_body = epoch_body.to_vec();
+        *tampered_epoch_body.last_mut().expect("epoch DER byte") ^= 1;
+        assert_eq!(
+            decode_epoch_snapshot(&tampered_epoch_body),
+            Err(BlindIssuerWireError::InvalidFrame)
+        );
+        let mut trailing_epoch_body = epoch_body.to_vec();
+        trailing_epoch_body.push(0);
+        assert_eq!(
+            decode_epoch_snapshot(&trailing_epoch_body),
+            Err(BlindIssuerWireError::InvalidFrame)
+        );
+
         let response = router
             .clone()
             .oneshot(
@@ -498,5 +748,7 @@ mod tests {
             .expect("health response");
         assert_eq!(health.status(), StatusCode::NO_CONTENT);
         assert_eq!(signer.public_epochs(now_ms).len(), 1);
+        assert!(signer.has_active_key(now_ms));
+        assert!(!signer.has_active_key(now_ms + 2 * 24 * 60 * 60 * 1_000));
     }
 }
