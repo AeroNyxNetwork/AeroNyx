@@ -55,6 +55,11 @@
 //! nodeboard-ready readiness contract. It is operational metadata only and
 //! never includes user traffic, chat payloads, DNS names, destinations, wallet
 //! traffic, voucher secrets, or private keys.
+//! Systemd health and journal reads resolve the current service unit from a
+//! validated operator override or the process cgroup, then fall back to the
+//! historical `aeronyx-server` unit name. This keeps single-node deployments
+//! backward compatible while avoiding false failures on isolated regional or
+//! multi-instance units such as `aeronyx-server-jp1.service`.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -83,6 +88,8 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_QUERY_NAME: &str = "api.aeronyx.network";
 const EGRESS_CHECK_ADDR: &str = "1.1.1.1:443";
 const VPN_SERVICE_NAME: &str = "aeronyx-server";
+const VPN_SERVICE_NAME_ENV: &str = "AERONYX_SYSTEMD_SERVICE";
+const PROC_SELF_CGROUP_PATH: &str = "/proc/self/cgroup";
 const UPGRADE_STATUS_FILE: &str = "/var/lib/aeronyx/upgrade-status.json";
 const AERONYX_STATE_DIR: &str = "/var/lib/aeronyx";
 static RUNTIME_STARTED_AT: OnceLock<u64> = OnceLock::new();
@@ -109,7 +116,7 @@ struct HealthCheck {
 #[derive(Debug, Serialize)]
 struct ServiceManagerStatus {
     manager: &'static str,
-    service_name: &'static str,
+    service_name: String,
     load_state: String,
     active_state: String,
     unit_file_state: String,
@@ -562,7 +569,8 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let configured_mtu = config.mtu();
     let running_mtu = read_tun_mtu(&tun_device).await.ok();
     let ip_range = config.ip_range().to_string();
-    let service_manager = collect_service_manager_status(VPN_SERVICE_NAME).await;
+    let service_name = resolve_vpn_service_name();
+    let service_manager = collect_service_manager_status(&service_name).await;
 
     let mut checks = Vec::new();
     let udp_listener_check = check_udp_listener(listen_addr).await;
@@ -602,7 +610,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let packet_runtime = state.packet_handler.runtime_status();
     let discovery_status = collect_discovery_status_value(&state.peer_store);
     let runtime = collect_runtime_version_status().await;
-    let recent_errors = collect_recent_error_events(VPN_SERVICE_NAME).await;
+    let recent_errors = collect_recent_error_events(&service_name).await;
     let upgrade_status = collect_upgrade_status().await;
     let startup_self_check = collect_startup_self_check(
         &config,
@@ -1742,7 +1750,51 @@ fn build_profile() -> &'static str {
     }
 }
 
-async fn collect_service_manager_status(service_name: &'static str) -> ServiceManagerStatus {
+fn resolve_vpn_service_name() -> String {
+    let operator_override = std::env::var(VPN_SERVICE_NAME_ENV).ok();
+    let process_cgroup = std::fs::read_to_string(PROC_SELF_CGROUP_PATH).ok();
+    resolve_vpn_service_name_from(operator_override.as_deref(), process_cgroup.as_deref())
+}
+
+fn resolve_vpn_service_name_from(
+    operator_override: Option<&str>,
+    process_cgroup: Option<&str>,
+) -> String {
+    operator_override
+        .and_then(validated_systemd_service_name)
+        .or_else(|| process_cgroup.and_then(systemd_service_name_from_cgroup))
+        .unwrap_or_else(|| VPN_SERVICE_NAME.to_string())
+}
+
+fn systemd_service_name_from_cgroup(cgroup: &str) -> Option<String> {
+    cgroup
+        .lines()
+        .flat_map(|line| line.split('/').rev())
+        .find_map(|segment| {
+            if segment.ends_with(".service") {
+                validated_systemd_service_name(segment)
+            } else {
+                None
+            }
+        })
+}
+
+fn validated_systemd_service_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    let valid_length = !value.is_empty() && value.len() <= 255;
+    let valid_prefix = value
+        .bytes()
+        .next()
+        .map(|byte| byte.is_ascii_alphanumeric())
+        .unwrap_or(false);
+    let valid_suffix = value.ends_with(".service") || !value.contains('.');
+    let valid_chars = value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@' | b':')
+    });
+    (valid_length && valid_prefix && valid_suffix && valid_chars).then(|| value.to_string())
+}
+
+async fn collect_service_manager_status(service_name: &str) -> ServiceManagerStatus {
     // Source path:
     //   /root/open/AeroNyx/crates/aeronyx-server/src/api/vpn_health.rs
     //
@@ -1791,7 +1843,7 @@ async fn collect_service_manager_status(service_name: &'static str) -> ServiceMa
             let restart_supported = load_state == "loaded";
             ServiceManagerStatus {
                 manager: "systemd",
-                service_name,
+                service_name: service_name.to_string(),
                 load_state: load_state.clone(),
                 active_state: active_state.clone(),
                 unit_file_state: unit_file_state.clone(),
@@ -1814,7 +1866,7 @@ async fn collect_service_manager_status(service_name: &'static str) -> ServiceMa
             let detail = stderr.trim().chars().take(240).collect::<String>();
             ServiceManagerStatus {
                 manager: "systemd",
-                service_name,
+                service_name: service_name.to_string(),
                 load_state: "unknown".to_string(),
                 active_state: "unknown".to_string(),
                 unit_file_state: "unknown".to_string(),
@@ -1824,7 +1876,7 @@ async fn collect_service_manager_status(service_name: &'static str) -> ServiceMa
         }
         Ok(Err(error)) => ServiceManagerStatus {
             manager: "systemd",
-            service_name,
+            service_name: service_name.to_string(),
             load_state: "unavailable".to_string(),
             active_state: "unavailable".to_string(),
             unit_file_state: "unavailable".to_string(),
@@ -1833,7 +1885,7 @@ async fn collect_service_manager_status(service_name: &'static str) -> ServiceMa
         },
         Err(_) => ServiceManagerStatus {
             manager: "systemd",
-            service_name,
+            service_name: service_name.to_string(),
             load_state: "timeout".to_string(),
             active_state: "timeout".to_string(),
             unit_file_state: "timeout".to_string(),
@@ -2844,6 +2896,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn service_manager_name_prefers_valid_operator_override() {
+        let resolved = resolve_vpn_service_name_from(
+            Some("aeronyx-server-jp1.service"),
+            Some("0::/system.slice/aeronyx-server-us1.service\n"),
+        );
+
+        assert_eq!(resolved, "aeronyx-server-jp1.service");
+    }
+
+    #[test]
+    fn service_manager_name_detects_current_systemd_cgroup() {
+        let resolved = resolve_vpn_service_name_from(
+            None,
+            Some("0::/system.slice/aeronyx-server-jp1.service\n"),
+        );
+
+        assert_eq!(resolved, "aeronyx-server-jp1.service");
+    }
+
+    #[test]
+    fn service_manager_name_rejects_unsafe_override_and_falls_back() {
+        let resolved = resolve_vpn_service_name_from(
+            Some("../../another.service"),
+            Some("0::/system.slice/aeronyx-server-jp1.service\n"),
+        );
+
+        assert_eq!(resolved, "aeronyx-server-jp1.service");
+        assert_eq!(
+            resolve_vpn_service_name_from(Some("bad unit"), None),
+            VPN_SERVICE_NAME
+        );
+        assert_eq!(
+            resolve_vpn_service_name_from(Some("--system"), None),
+            VPN_SERVICE_NAME
+        );
+    }
+
+    #[test]
     fn recommended_ipv4_cidr_matches_thousand_session_profile() {
         assert_eq!(
             recommended_ipv4_cidr("100.64.0.0/24", 1_000),
@@ -3034,7 +3124,7 @@ mod tests {
     fn healthy_service_manager() -> ServiceManagerStatus {
         ServiceManagerStatus {
             manager: "systemd",
-            service_name: VPN_SERVICE_NAME,
+            service_name: VPN_SERVICE_NAME.to_string(),
             load_state: "loaded".to_string(),
             active_state: "active".to_string(),
             unit_file_state: "enabled".to_string(),
