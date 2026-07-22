@@ -18,6 +18,10 @@
 //!   in `memchain.rs` and by `ChatRelayService` in `aeronyx-server`.
 //! - v0.1.0-DiscoveryPhase1: Added `discovery` submodule for signed node
 //!   descriptors used by decentralized peer discovery and encrypted relay.
+//! - v1.0.0-BlindVaultWire: Added a separate, versioned node-blind durable
+//!   object protocol for encrypted contact-vault and optional message-archive
+//!   segments. Its outer metadata deliberately carries no account identity,
+//!   correspondent, application namespace, or public-chain commitment.
 //!
 //! ## Main Functionality
 //!
@@ -28,6 +32,7 @@
 //! - [`memchain`]: 🌟 MemChain application-layer messages
 //! - [`chat`]: 🌟 Chat Relay E2E envelope and media pointer types
 //! - [`discovery`]: Signed node descriptors and public capability hints
+//! - [`blind_vault`]: Anonymous durable ciphertext objects and node receipts
 //!
 //! ### Message Types
 //! - `ClientHello`: Initial handshake from client
@@ -46,6 +51,9 @@
 //!   the crypto/signing logic isolated and independently testable
 //! - The `discovery` module is control-plane metadata only; do not include
 //!   client traffic, payloads, DNS contents, or private keys in descriptors
+//! - [BLIND-VAULT-WIRE 2026-07-22 by Codex] The `blind_vault` protocol is
+//!   independent from MemChain indexing and legacy chat routing. Never add an
+//!   owner/sender/receiver/namespace field to its outer wire structures.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial protocol definitions
@@ -56,8 +64,10 @@
 //! v0.1.0-DiscoveryPhase1 - Added discovery submodule for signed descriptors
 //! v0.2.0-DiscoveryPhase2 - Re-exported bootstrap snapshot type
 //! v0.3.0-DiscoveryPhase4 - Re-exported discovery gossip message helpers
+//! v1.0.0-BlindVaultWire - Added anonymous encrypted durable-object contract
 
 pub mod auth;
+pub mod blind_vault;
 pub mod chat;
 pub mod codec;
 pub mod discovery;
@@ -70,6 +80,11 @@ pub mod version;
 pub use auth::{
     verify_signed_message, AuthError, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
     DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
+};
+pub use blind_vault::{
+    decode_blind_vault_frame, encode_blind_vault_frame, BlindVaultError, BlindVaultFrame,
+    BlindVaultPutRequest, BlindVaultStoredReceipt, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES,
+    BLIND_VAULT_PROTOCOL_VERSION, MAX_BLIND_VAULT_FRAME_BYTES,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
 pub use codec::{Codec, ProtocolCodec};
