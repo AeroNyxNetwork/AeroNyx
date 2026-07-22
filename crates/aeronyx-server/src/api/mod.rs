@@ -38,6 +38,7 @@
 //! - [`directory_replica_status`]: privacy-tiered replica health endpoint
 //! - [`directory_replica_sync`]: bounded concurrent outbound replica coordinator
 //! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
+//! - [`blind_vault`]: node-blind encrypted object lease/store/recovery routes
 //! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
 //!
 //! ⚠️ Important Note for Next Developer:
@@ -87,6 +88,7 @@
 //! v2.7.21-ChatBlobWiring - Compile the encrypted client blob API module.
 //! v2.8.24-DirectorySyncServing - Compile authenticated Directory Chain peer routes.
 //! v2.8.29-DirectoryReplicaCoordinator - Split replica scheduling from server lifecycle.
+//! v1.0.0-BlindVaultApi - Added bounded binary Blind Vault client routes.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -261,6 +263,7 @@ pub mod local;
 // ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
 pub mod chat_handlers;
 pub mod chat_peer;
+pub mod blind_vault;
 pub mod directory_chain_peer;
 pub mod directory_replica_status;
 pub mod directory_replica_sync;

@@ -462,6 +462,7 @@ use rand::RngCore;
 use rusqlite::OptionalExtension;
 
 use crate::api::auth::ensure_jwt_secret;
+use crate::api::blind_vault::build_blind_vault_router;
 use crate::api::chat_handlers::build_chat_router;
 use crate::api::chat_peer::{
     build_chat_peer_router, PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
@@ -1871,6 +1872,7 @@ impl Server {
                 directory_replica_store.clone(),
                 Arc::clone(&directory_replica_sync_runtime),
                 chat_relay.clone(),
+                blind_vault.clone(),
                 Arc::clone(&udp),
                 commitment_sync_tip_notifier,
             );
@@ -2678,6 +2680,7 @@ impl Server {
         directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
         directory_replica_sync_runtime: Arc<DirectoryReplicaSyncRuntime>,
         chat_relay: Option<Arc<ChatRelayService>>,
+        blind_vault: Option<Arc<BlindVaultService>>,
         udp: Arc<UdpTransport>,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
     ) -> JoinHandle<()> {
@@ -2740,6 +2743,13 @@ impl Server {
         let public_directory_full_node_mirror_enabled = directory_full_node_mirror_enabled;
         let public_directory_full_node_mirror_max_producers =
             directory_full_node_mirror_max_producers;
+        // [BLIND-VAULT-API 2026-07-23 by Codex] Storage activation and client
+        // exposure are separate fail-closed decisions. Keep the same gate on
+        // both listeners so an operator cannot accidentally expose the vault
+        // merely by enabling its local maintenance task.
+        let blind_vault_public_api_enabled = self.config.blind_vault.public_api_enabled;
+        let public_blind_vault = blind_vault.clone();
+        let local_blind_vault = blind_vault.clone();
 
         tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
@@ -2763,6 +2773,8 @@ impl Server {
                     commitment_storage.clone(),
                     commitment_lease_authorized_coordinator,
                     public_commitment_sync_tip_notifier,
+                    public_blind_vault,
+                    blind_vault_public_api_enabled,
                 );
                 tokio::spawn(async move {
                     Self::serve_public_discovery_api(public_addr, public_app, shutdown_rx_public)
@@ -2777,9 +2789,20 @@ impl Server {
                 .as_ref()
                 .map(|relay| build_chat_router(Arc::clone(relay)))
                 .unwrap_or_else(axum::Router::new);
+            let blind_vault_router = match (
+                blind_vault_public_api_enabled,
+                local_blind_vault,
+            ) {
+                (true, Some(vault)) => build_blind_vault_router(
+                    vault,
+                    Arc::clone(&node_identity),
+                ),
+                _ => axum::Router::new(),
+            };
             let app = build_mpi_router(mpi_state)
                 .merge(build_voice_router(Arc::clone(&sessions)))
                 .merge(chat_blob_router)
+                .merge(blind_vault_router)
                 .merge(build_vpn_health_router(
                     vpn_health_config,
                     Arc::clone(&ip_pool),
@@ -2983,6 +3006,8 @@ impl Server {
         commitment_storage: Option<Arc<MemoryStorage>>,
         commitment_lease_authorized_coordinator: Option<[u8; 32]>,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
+        blind_vault: Option<Arc<BlindVaultService>>,
+        blind_vault_public_api_enabled: bool,
     ) -> axum::Router {
         let block_peer_store = Arc::clone(&peer_store);
         let block_identity = Arc::clone(&node_identity);
@@ -2998,7 +3023,7 @@ impl Server {
             sessions,
             udp,
             Arc::clone(&peer_store),
-            node_identity,
+            Arc::clone(&node_identity),
             peer_http_client,
         ))
         .merge(build_directory_replica_status_router(
@@ -3022,6 +3047,12 @@ impl Server {
             ))
         } else {
             app
+        };
+        let app = match (blind_vault_public_api_enabled, blind_vault) {
+            (true, Some(vault)) => {
+                app.merge(build_blind_vault_router(vault, node_identity))
+            }
+            _ => app,
         };
         if let Some(storage) = commitment_storage {
             app.merge(build_memchain_peer_router_with_runtime(
