@@ -65,6 +65,7 @@
 //! v0.2.0-DiscoveryPhase2 - Re-exported bootstrap snapshot type
 //! v0.3.0-DiscoveryPhase4 - Re-exported discovery gossip message helpers
 //! v1.0.0-BlindVaultWire - Added anonymous encrypted durable-object contract
+//! v1.1.0-BlindVaultLease - Added anonymous lease and signed deletion contract
 
 pub mod auth;
 pub mod blind_vault;
@@ -82,7 +83,8 @@ pub use auth::{
     DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
 };
 pub use blind_vault::{
-    decode_blind_vault_frame, encode_blind_vault_frame, BlindVaultError, BlindVaultFrame,
+    decode_blind_vault_frame, encode_blind_vault_frame, BlindVaultDeleteRequest,
+    BlindVaultDeletedReceipt, BlindVaultError, BlindVaultFrame, BlindVaultLeaseCreateRequest,
     BlindVaultPutRequest, BlindVaultStoredReceipt, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES,
     BLIND_VAULT_PROTOCOL_VERSION, MAX_BLIND_VAULT_FRAME_BYTES,
 };

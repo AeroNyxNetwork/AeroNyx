@@ -11,6 +11,7 @@
 //! ## Main Functionality
 //! - Defines the immutable encrypted object accepted by a blind vault node.
 //! - Defines a node-signed storage receipt suitable for independent replicas.
+//! - Defines anonymous lease authority and signed object deletion contracts.
 //! - Provides deterministic signing bytes and bounded binary wire framing.
 //! - Enforces coarse ciphertext size classes to reduce content-size leakage.
 //! - Keeps application domain separation inside client ciphertext and keys.
@@ -47,8 +48,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.0.0-BlindVaultWire - Initial node-blind durable object and
-//! signed receipt contract.
+//! Last Modified: v1.1.0-BlindVaultLease - Added anonymous lease authority,
+//! administration-key deletion, and signed deletion receipts.
+//! v1.0.0-BlindVaultWire - Initial durable object and signed receipt contract.
 //! ============================================
 
 use bincode::Options;
@@ -63,10 +65,16 @@ use crate::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 /// replayed as blind-vault authorisation.
 const PUT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Put-v1";
 const RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-StoredReceipt-v1";
+const LEASE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Lease-v1";
+const DELETE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Delete-v1";
+const DELETE_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-DeletedReceipt-v1";
 const FRAME_MAGIC: [u8; 4] = *b"ANBV";
 const FRAME_HEADER_BYTES: usize = 7;
 const FRAME_KIND_PUT: u8 = 1;
 const FRAME_KIND_STORED_RECEIPT: u8 = 2;
+const FRAME_KIND_LEASE_CREATE: u8 = 3;
+const FRAME_KIND_DELETE: u8 = 4;
+const FRAME_KIND_DELETED_RECEIPT: u8 = 5;
 
 /// Initial blind-vault wire version. This version is independent of the VPN
 /// transport and legacy chat-envelope versions.
@@ -90,6 +98,112 @@ pub enum BlindVaultFrame {
     Put(BlindVaultPutRequest),
     /// Node proof that the exact object was accepted for bounded retention.
     StoredReceipt(BlindVaultStoredReceipt),
+    /// Client request to create one anonymous, replica-local lease.
+    LeaseCreate(BlindVaultLeaseCreateRequest),
+    /// Lease administrator request to remove one immutable object.
+    Delete(BlindVaultDeleteRequest),
+    /// Node proof that an exact object was removed or already absent.
+    DeletedReceipt(BlindVaultDeletedReceipt),
+}
+
+/// Anonymous lease metadata signed by its independent administration key.
+///
+/// Admission and quota policy are deliberately outside this structure. A node
+/// must authenticate or rate-limit lease creation separately without adding an
+/// account identity to the durable lease record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultLeaseCreateRequest {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Random identifier unique to one node replica and rotation epoch.
+    pub lease_id: [u8; 32],
+    /// Random idempotency identifier retained across creation retries.
+    pub request_id: [u8; 16],
+    /// Ed25519 key permitted to append immutable objects to this lease.
+    pub write_verifying_key: [u8; 32],
+    /// Separate Ed25519 key permitted to remove objects or retire this lease.
+    pub admin_verifying_key: [u8; 32],
+    /// SHA-256 of the random bearer capability used for private reads.
+    pub read_capability_hash: [u8; 32],
+    /// Absolute Unix timestamp in milliseconds after which the lease expires.
+    pub expires_at_ms: u64,
+    /// Signature by `admin_verifying_key` over all preceding fields.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultLeaseCreateRequest {
+    /// Builds an unsigned anonymous lease request.
+    #[must_use]
+    pub fn new(
+        lease_id: [u8; 32],
+        request_id: [u8; 16],
+        write_verifying_key: [u8; 32],
+        admin_verifying_key: [u8; 32],
+        read_capability_hash: [u8; 32],
+        expires_at_ms: u64,
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            lease_id,
+            request_id,
+            write_verifying_key,
+            admin_verifying_key,
+            read_capability_hash,
+            expires_at_ms,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical lease-creation signing input.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(LEASE_SIGNING_DOMAIN.len() + 154);
+        bytes.extend_from_slice(LEASE_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.lease_id);
+        bytes.extend_from_slice(&self.request_id);
+        bytes.extend_from_slice(&self.write_verifying_key);
+        bytes.extend_from_slice(&self.admin_verifying_key);
+        bytes.extend_from_slice(&self.read_capability_hash);
+        bytes.extend_from_slice(&self.expires_at_ms.to_be_bytes());
+        bytes
+    }
+
+    /// Signs the request with the lease administration key.
+    pub fn sign(&mut self, admin_key: &IdentityKeyPair) -> Result<(), BlindVaultError> {
+        if self.admin_verifying_key != admin_key.public_key_bytes() {
+            return Err(BlindVaultError::AdminIdentityMismatch);
+        }
+        self.signature = admin_key.sign(&self.signing_bytes());
+        Ok(())
+    }
+
+    /// Validates anonymous lease fields and the self-authenticating admin key.
+    pub fn validate_and_verify(
+        &self,
+        now_ms: u64,
+        maximum_lease_ttl_ms: u64,
+    ) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("lease_id", &self.lease_id)?;
+        require_non_zero("request_id", &self.request_id)?;
+        require_non_zero("read_capability_hash", &self.read_capability_hash)?;
+        if self.write_verifying_key == self.admin_verifying_key {
+            return Err(BlindVaultError::LeaseKeyReuse);
+        }
+        let write_key = IdentityPublicKey::from_bytes(&self.write_verifying_key)
+            .map_err(|_| BlindVaultError::InvalidPublicKey)?;
+        let admin_key = IdentityPublicKey::from_bytes(&self.admin_verifying_key)
+            .map_err(|_| BlindVaultError::InvalidPublicKey)?;
+        // Parse both keys even though only the administration key signs this
+        // request. This prevents an unusable lease from entering durable state.
+        let _ = write_key;
+        validate_future_deadline(now_ms, self.expires_at_ms, maximum_lease_ttl_ms)?;
+        admin_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
 }
 
 /// Immutable encrypted object submitted to one blind-vault replica.
@@ -192,13 +306,7 @@ impl BlindVaultPutRequest {
         if sha256(&self.ciphertext) != self.ciphertext_commitment {
             return Err(BlindVaultError::CommitmentMismatch);
         }
-        if self.expires_at_ms <= now_ms {
-            return Err(BlindVaultError::Expired);
-        }
-        if maximum_ttl_ms == 0 || self.expires_at_ms.saturating_sub(now_ms) > maximum_ttl_ms {
-            return Err(BlindVaultError::LifetimeTooLong);
-        }
-        Ok(())
+        validate_future_deadline(now_ms, self.expires_at_ms, maximum_ttl_ms)
     }
 }
 
@@ -304,6 +412,185 @@ impl BlindVaultStoredReceipt {
     }
 }
 
+/// Administration-key request to delete one opaque object.
+///
+/// Nodes retain only a bounded tombstone needed for idempotent retries; no
+/// application deletion reason or account identifier belongs on this frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultDeleteRequest {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Replica-local lease containing the object.
+    pub lease_id: [u8; 32],
+    /// Immutable object to remove.
+    pub object_id: [u8; 32],
+    /// Random idempotency identifier retained across deletion retries.
+    pub request_id: [u8; 16],
+    /// Client request time in Unix milliseconds for bounded replay rejection.
+    pub requested_at_ms: u64,
+    /// Signature by the lease administration key.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultDeleteRequest {
+    /// Builds an unsigned object-deletion request.
+    #[must_use]
+    pub fn new(
+        lease_id: [u8; 32],
+        object_id: [u8; 32],
+        request_id: [u8; 16],
+        requested_at_ms: u64,
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            lease_id,
+            object_id,
+            request_id,
+            requested_at_ms,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical deletion signing input.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(DELETE_SIGNING_DOMAIN.len() + 90);
+        bytes.extend_from_slice(DELETE_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.lease_id);
+        bytes.extend_from_slice(&self.object_id);
+        bytes.extend_from_slice(&self.request_id);
+        bytes.extend_from_slice(&self.requested_at_ms.to_be_bytes());
+        bytes
+    }
+
+    /// Signs the request with the lease administration key.
+    pub fn sign(&mut self, admin_key: &IdentityKeyPair) {
+        self.signature = admin_key.sign(&self.signing_bytes());
+    }
+
+    /// Validates identifiers, request freshness, and administration signature.
+    pub fn validate_and_verify(
+        &self,
+        now_ms: u64,
+        maximum_clock_skew_ms: u64,
+        admin_key: &IdentityPublicKey,
+    ) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("lease_id", &self.lease_id)?;
+        require_non_zero("object_id", &self.object_id)?;
+        require_non_zero("request_id", &self.request_id)?;
+        let skew = if now_ms >= self.requested_at_ms {
+            now_ms - self.requested_at_ms
+        } else {
+            self.requested_at_ms - now_ms
+        };
+        if skew > maximum_clock_skew_ms {
+            return Err(BlindVaultError::RequestTimestampOutsideWindow);
+        }
+        admin_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+}
+
+/// Signed node proof that an opaque object was deleted or had already been
+/// deleted under the same tombstone commitment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultDeletedReceipt {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Replica-local lease from the deletion request.
+    pub lease_id: [u8; 32],
+    /// Removed immutable object identifier.
+    pub object_id: [u8; 32],
+    /// Original deletion request identifier.
+    pub request_id: [u8; 16],
+    /// Commitment of the removed ciphertext, retained only in the tombstone.
+    pub previous_ciphertext_commitment: [u8; 32],
+    /// Node deletion time in Unix milliseconds.
+    pub deleted_at_ms: u64,
+    /// Descriptor identity of the deleting node.
+    pub node_id: [u8; 32],
+    /// Ed25519 signature by `node_id` over the canonical receipt fields.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultDeletedReceipt {
+    /// Builds an unsigned deletion receipt.
+    #[must_use]
+    pub fn new(
+        delete: &BlindVaultDeleteRequest,
+        previous_ciphertext_commitment: [u8; 32],
+        deleted_at_ms: u64,
+        node_id: [u8; 32],
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            lease_id: delete.lease_id,
+            object_id: delete.object_id,
+            request_id: delete.request_id,
+            previous_ciphertext_commitment,
+            deleted_at_ms,
+            node_id,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical deletion-receipt signing input.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(DELETE_RECEIPT_SIGNING_DOMAIN.len() + 154);
+        bytes.extend_from_slice(DELETE_RECEIPT_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.lease_id);
+        bytes.extend_from_slice(&self.object_id);
+        bytes.extend_from_slice(&self.request_id);
+        bytes.extend_from_slice(&self.previous_ciphertext_commitment);
+        bytes.extend_from_slice(&self.deleted_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.node_id);
+        bytes
+    }
+
+    /// Signs this receipt with the node descriptor identity key.
+    pub fn sign(&mut self, node_key: &IdentityKeyPair) -> Result<(), BlindVaultError> {
+        if self.node_id != node_key.public_key_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        self.signature = node_key.sign(&self.signing_bytes());
+        Ok(())
+    }
+
+    /// Validates node identity binding and signature.
+    pub fn validate_and_verify(&self, node_key: &IdentityPublicKey) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("lease_id", &self.lease_id)?;
+        require_non_zero("object_id", &self.object_id)?;
+        require_non_zero("request_id", &self.request_id)?;
+        require_non_zero(
+            "previous_ciphertext_commitment",
+            &self.previous_ciphertext_commitment,
+        )?;
+        if self.node_id != node_key.to_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        node_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+
+    /// Confirms that this receipt answers the exact deletion request.
+    #[must_use]
+    pub fn matches_delete(&self, delete: &BlindVaultDeleteRequest) -> bool {
+        self.version == delete.version
+            && self.lease_id == delete.lease_id
+            && self.object_id == delete.object_id
+            && self.request_id == delete.request_id
+    }
+}
+
 /// Stable, bounded binary encoding with an explicit frame kind outside bincode.
 /// This avoids depending on serde enum discriminants for future evolution.
 pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, BlindVaultError> {
@@ -311,6 +598,11 @@ pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, Blin
         BlindVaultFrame::Put(value) => (FRAME_KIND_PUT, serialize_body(value)?),
         BlindVaultFrame::StoredReceipt(value) => {
             (FRAME_KIND_STORED_RECEIPT, serialize_body(value)?)
+        }
+        BlindVaultFrame::LeaseCreate(value) => (FRAME_KIND_LEASE_CREATE, serialize_body(value)?),
+        BlindVaultFrame::Delete(value) => (FRAME_KIND_DELETE, serialize_body(value)?),
+        BlindVaultFrame::DeletedReceipt(value) => {
+            (FRAME_KIND_DELETED_RECEIPT, serialize_body(value)?)
         }
     };
 
@@ -347,6 +639,9 @@ pub fn decode_blind_vault_frame(bytes: &[u8]) -> Result<BlindVaultFrame, BlindVa
     match bytes[6] {
         FRAME_KIND_PUT => Ok(BlindVaultFrame::Put(deserialize_body(body)?)),
         FRAME_KIND_STORED_RECEIPT => Ok(BlindVaultFrame::StoredReceipt(deserialize_body(body)?)),
+        FRAME_KIND_LEASE_CREATE => Ok(BlindVaultFrame::LeaseCreate(deserialize_body(body)?)),
+        FRAME_KIND_DELETE => Ok(BlindVaultFrame::Delete(deserialize_body(body)?)),
+        FRAME_KIND_DELETED_RECEIPT => Ok(BlindVaultFrame::DeletedReceipt(deserialize_body(body)?)),
         kind => Err(BlindVaultError::UnknownFrameKind(kind)),
     }
 }
@@ -378,6 +673,18 @@ pub enum BlindVaultError {
     /// Ed25519 verification failed.
     #[error("signature verification failed")]
     InvalidSignature,
+    /// Embedded Ed25519 key bytes were not a valid public key.
+    #[error("invalid blind-vault public key")]
+    InvalidPublicKey,
+    /// Lease reused one key for write and administration authority.
+    #[error("lease write and administration keys must be distinct")]
+    LeaseKeyReuse,
+    /// Lease request signer did not match its declared administration key.
+    #[error("lease administration identity does not match its signing key")]
+    AdminIdentityMismatch,
+    /// A signed mutation timestamp was outside the configured replay window.
+    #[error("request timestamp is outside the accepted clock-skew window")]
+    RequestTimestampOutsideWindow,
     /// Receipt signer did not match the declared descriptor identity.
     #[error("receipt node identity does not match its signing key")]
     NodeIdentityMismatch,
@@ -418,6 +725,20 @@ fn require_non_zero(name: &'static str, bytes: &[u8]) -> Result<(), BlindVaultEr
     } else {
         Err(BlindVaultError::ZeroIdentifier(name))
     }
+}
+
+fn validate_future_deadline(
+    now_ms: u64,
+    deadline_ms: u64,
+    maximum_lifetime_ms: u64,
+) -> Result<(), BlindVaultError> {
+    if deadline_ms <= now_ms {
+        return Err(BlindVaultError::Expired);
+    }
+    if maximum_lifetime_ms == 0 || deadline_ms - now_ms > maximum_lifetime_ms {
+        return Err(BlindVaultError::LifetimeTooLong);
+    }
+    Ok(())
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -479,6 +800,23 @@ mod tests {
         IdentityKeyPair::from_bytes(&[9; 32]).expect("valid deterministic node key")
     }
 
+    fn admin_key() -> IdentityKeyPair {
+        IdentityKeyPair::from_bytes(&[11; 32]).expect("valid deterministic admin key")
+    }
+
+    fn signed_lease() -> BlindVaultLeaseCreateRequest {
+        let mut lease = BlindVaultLeaseCreateRequest::new(
+            [1; 32],
+            [8; 16],
+            lease_key().public_key_bytes(),
+            admin_key().public_key_bytes(),
+            sha256(&[13; 32]),
+            NOW_MS + 7 * 24 * 60 * 60 * 1_000,
+        );
+        lease.sign(&admin_key()).expect("matching admin key");
+        lease
+    }
+
     fn signed_put() -> BlindVaultPutRequest {
         let mut put = BlindVaultPutRequest::new(
             [1; 32],
@@ -501,6 +839,39 @@ mod tests {
             encode_blind_vault_frame(&BlindVaultFrame::Put(put.clone())).expect("encode put");
         let decoded = decode_blind_vault_frame(&encoded).expect("decode put");
         assert_eq!(decoded, BlindVaultFrame::Put(put));
+    }
+
+    #[test]
+    fn anonymous_lease_is_self_authenticating_and_round_trips() {
+        let lease = signed_lease();
+        lease
+            .validate_and_verify(NOW_MS, MAX_TTL_MS)
+            .expect("valid anonymous lease");
+
+        let encoded = encode_blind_vault_frame(&BlindVaultFrame::LeaseCreate(lease.clone()))
+            .expect("encode lease");
+        assert_eq!(
+            decode_blind_vault_frame(&encoded).expect("decode lease"),
+            BlindVaultFrame::LeaseCreate(lease)
+        );
+    }
+
+    #[test]
+    fn lease_rejects_write_and_admin_key_reuse() {
+        let key = admin_key();
+        let mut lease = BlindVaultLeaseCreateRequest::new(
+            [1; 32],
+            [8; 16],
+            key.public_key_bytes(),
+            key.public_key_bytes(),
+            sha256(&[13; 32]),
+            NOW_MS + 7 * 24 * 60 * 60 * 1_000,
+        );
+        lease.sign(&key).expect("matching admin key");
+        assert_eq!(
+            lease.validate_and_verify(NOW_MS, MAX_TTL_MS),
+            Err(BlindVaultError::LeaseKeyReuse)
+        );
     }
 
     #[test]
@@ -568,6 +939,45 @@ mod tests {
         assert_eq!(
             receipt.sign(&node_key()),
             Err(BlindVaultError::NodeIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn administration_delete_and_node_receipt_are_independently_signed() {
+        let mut delete = BlindVaultDeleteRequest::new([1; 32], [2; 32], [6; 16], NOW_MS);
+        delete.sign(&admin_key());
+        delete
+            .validate_and_verify(NOW_MS + 50, 1_000, &admin_key().public_key())
+            .expect("valid admin deletion");
+
+        let node = node_key();
+        let mut receipt = BlindVaultDeletedReceipt::new(
+            &delete,
+            signed_put().ciphertext_commitment,
+            NOW_MS + 100,
+            node.public_key_bytes(),
+        );
+        receipt.sign(&node).expect("matching node key");
+        receipt
+            .validate_and_verify(&node.public_key())
+            .expect("valid deletion receipt");
+        assert!(receipt.matches_delete(&delete));
+
+        let encoded = encode_blind_vault_frame(&BlindVaultFrame::DeletedReceipt(receipt.clone()))
+            .expect("encode deletion receipt");
+        assert_eq!(
+            decode_blind_vault_frame(&encoded).expect("decode deletion receipt"),
+            BlindVaultFrame::DeletedReceipt(receipt)
+        );
+    }
+
+    #[test]
+    fn deletion_timestamp_has_bounded_replay_window() {
+        let mut delete = BlindVaultDeleteRequest::new([1; 32], [2; 32], [6; 16], NOW_MS - 1_001);
+        delete.sign(&admin_key());
+        assert_eq!(
+            delete.validate_and_verify(NOW_MS, 1_000, &admin_key().public_key()),
+            Err(BlindVaultError::RequestTimestampOutsideWindow)
         );
     }
 
