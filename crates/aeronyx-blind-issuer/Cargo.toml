@@ -4,12 +4,12 @@
 # [BLIND-ISSUER 2026-07-23 by Codex] This crate is the isolated private-key
 # boundary; it must remain independent from storage-node runtime state.
 # Creation Reason: Isolate RFC 9474 private-key operations from storage nodes.
-# Main Functionality: Loopback-only authenticated blind-signing service and
-# secure key/token generation commands.
+# Main Functionality: Loopback-only authenticated blind-signing service,
+# aggregate operations health, and secure key/token generation commands.
 # Dependencies: aeronyx-core defines the admission scheme and public epoch
 # bounds; no dependency on aeronyx-server is permitted.
 # Important: Never add storage-node, wallet, account, or client-IP state here.
-# Last Modified: v0.1.0-BlindIssuer - Initial isolated signer crate.
+# Last Modified: v0.4.0-BlindIssuer - Added status endpoint test support.
 # ============================================
 
 [package]
@@ -44,6 +44,7 @@ tracing-subscriber = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = "3.12"
 tower = { version = "0.5", features = ["util"] }
 

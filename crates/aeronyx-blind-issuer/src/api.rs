@@ -16,6 +16,8 @@
 //! - Publishes authenticated, public-only key epochs for safe rotation.
 //! - Runs private RSA operations on Tokio's blocking pool.
 //! - Holds concurrency capacity until custody work ends, even after cancellation.
+//! - Exposes authenticated aggregate health without request/user identifiers.
+//! - Opens a monotonic circuit breaker after repeated custody failures.
 //!
 //! ## Calling Relationships
 //! `main.rs` binds this router to loopback; `signer.rs` performs the private
@@ -31,13 +33,13 @@
 //! cancellation cannot release HSM capacity early. Never add wallet/account
 //! headers or request-body diagnostics.
 //!
-//! Last Modified: v0.3.0-BlindIssuerApi - Added cancellation-safe custody
-//! response deadlines while preserving the original router entry point.
+//! Last Modified: v0.4.0-BlindIssuerApi - Added policy composition,
+//! privacy-safe operational snapshots, and custody circuit breaking.
 //! ============================================
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::blind_vault::{
     BlindVaultBlindIssuerEpoch, BLIND_VAULT_BLIND_ADMISSION_VERSION,
@@ -51,14 +53,17 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Extension, Router};
+use axum::{Extension, Json, Router};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::config::DEFAULT_SIGNING_TIMEOUT_MS;
+use crate::config::{
+    DEFAULT_CIRCUIT_COOLDOWN_MS, DEFAULT_CIRCUIT_FAILURE_THRESHOLD, DEFAULT_SIGNING_TIMEOUT_MS,
+};
 use crate::signer::{BlindSignError, BlindSignRequest, BlindSignResponse, BlindSigner};
 
 const REQUEST_MAGIC: [u8; 4] = *b"ANBI";
@@ -79,6 +84,89 @@ const CACHE_CONTROL_NO_STORE: &str = "no-store";
 pub const BLIND_ISSUER_CONTENT_TYPE: &str = "application/vnd.aeronyx.blind-issuer-v1";
 /// Content type for authenticated public-key epoch snapshots.
 pub const BLIND_ISSUER_EPOCH_CONTENT_TYPE: &str = "application/vnd.aeronyx.blind-issuer-epochs-v1";
+
+/// Immutable runtime limits for the local authenticated API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindIssuerApiPolicy {
+    /// Maximum signing requests accepted in one wall-clock second.
+    pub max_requests_per_second: u64,
+    /// Maximum private operations executing concurrently.
+    pub max_in_flight: usize,
+    /// Maximum HTTP wait for one non-cancellable private operation.
+    pub signing_timeout: Duration,
+    /// Consecutive backend failures/timeouts required to open the circuit.
+    pub circuit_failure_threshold: u64,
+    /// Monotonic recovery delay before requests may probe again.
+    pub circuit_cooldown: Duration,
+}
+
+impl BlindIssuerApiPolicy {
+    /// Builds policy with production timeout and circuit-breaker defaults.
+    #[must_use]
+    pub const fn new(max_requests_per_second: u64, max_in_flight: usize) -> Self {
+        Self {
+            max_requests_per_second,
+            max_in_flight,
+            signing_timeout: Duration::from_millis(DEFAULT_SIGNING_TIMEOUT_MS),
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown: Duration::from_millis(DEFAULT_CIRCUIT_COOLDOWN_MS),
+        }
+    }
+
+    /// Replaces the caller wait bound while retaining all other limits.
+    #[must_use]
+    pub const fn with_signing_timeout(mut self, signing_timeout: Duration) -> Self {
+        self.signing_timeout = signing_timeout;
+        self
+    }
+
+    /// Replaces circuit failure and monotonic recovery policy.
+    #[must_use]
+    pub const fn with_circuit_breaker(
+        mut self,
+        failure_threshold: u64,
+        cooldown: Duration,
+    ) -> Self {
+        self.circuit_failure_threshold = failure_threshold;
+        self.circuit_cooldown = cooldown;
+        self
+    }
+}
+
+/// Authenticated aggregate runtime status with no issuance/request dimensions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindIssuerOperationalSnapshot {
+    /// Snapshot creation time in Unix milliseconds.
+    pub generated_at_ms: u64,
+    /// Whether at least one configured key is currently active.
+    pub active_key: bool,
+    /// Number of public/private custody epochs loaded at startup.
+    pub key_count: usize,
+    /// Private operations that have not yet returned from custody.
+    pub in_flight: usize,
+    /// Configured private-operation concurrency ceiling.
+    pub max_in_flight: usize,
+    /// Whether the monotonic circuit is currently rejecting signing calls.
+    pub circuit_open: bool,
+    /// Approximate Unix millisecond recovery time, or zero while closed.
+    pub circuit_open_until_ms: u64,
+    /// Consecutive backend failures/timeouts since the last success.
+    pub consecutive_backend_failures: u64,
+    /// Signing operations that returned a valid bounded response.
+    pub signing_succeeded: u64,
+    /// Backend or blocking-task failures returned to callers.
+    pub backend_failed: u64,
+    /// Caller deadlines exceeded while custody continued in the background.
+    pub signing_timed_out: u64,
+    /// Requests rejected because every private-operation slot was occupied.
+    pub capacity_rejected: u64,
+    /// Requests rejected by the per-second process ceiling.
+    pub rate_rejected: u64,
+    /// Requests rejected while the backend circuit was open.
+    pub circuit_rejected: u64,
+    /// Requests rejected before body extraction due to bad authorization.
+    pub authorization_rejected: u64,
+}
 
 /// Public-only issuer key material used by the backend to coordinate rotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,10 +193,81 @@ struct ApiState {
     signer: Arc<BlindSigner>,
     auth_token: Arc<Zeroizing<Vec<u8>>>,
     in_flight: Arc<AtomicUsize>,
-    max_in_flight: usize,
     rate: Arc<Mutex<RateWindow>>,
-    max_requests_per_second: u64,
-    signing_timeout: Duration,
+    policy: BlindIssuerApiPolicy,
+    breaker: Arc<CircuitBreaker>,
+    metrics: Arc<RuntimeMetrics>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeMetrics {
+    signing_succeeded: AtomicU64,
+    backend_failed: AtomicU64,
+    signing_timed_out: AtomicU64,
+    capacity_rejected: AtomicU64,
+    rate_rejected: AtomicU64,
+    circuit_rejected: AtomicU64,
+    authorization_rejected: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct CircuitState {
+    consecutive_failures: u64,
+    open_until: Option<Instant>,
+    open_until_ms: u64,
+}
+
+#[derive(Debug)]
+struct CircuitBreaker {
+    failure_threshold: u64,
+    cooldown: Duration,
+    state: Mutex<CircuitState>,
+}
+
+impl CircuitBreaker {
+    fn new(failure_threshold: u64, cooldown: Duration) -> Self {
+        Self {
+            failure_threshold,
+            cooldown,
+            state: Mutex::new(CircuitState::default()),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.state
+            .lock()
+            .open_until
+            .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    fn record_success(&self) {
+        let mut state = self.state.lock();
+        state.consecutive_failures = 0;
+        state.open_until = None;
+        state.open_until_ms = 0;
+    }
+
+    fn record_failure(&self, now_ms: u64) {
+        let mut state = self.state.lock();
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= self.failure_threshold {
+            state.open_until = Instant::now().checked_add(self.cooldown);
+            state.open_until_ms =
+                now_ms.saturating_add(self.cooldown.as_millis().try_into().unwrap_or(u64::MAX));
+        }
+    }
+
+    fn snapshot(&self) -> (bool, u64, u64) {
+        let state = self.state.lock();
+        let circuit_open = state
+            .open_until
+            .is_some_and(|deadline| Instant::now() < deadline);
+        (
+            circuit_open,
+            if circuit_open { state.open_until_ms } else { 0 },
+            state.consecutive_failures,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -172,12 +331,10 @@ pub fn build_router(
     max_requests_per_second: u64,
     max_in_flight: usize,
 ) -> Router {
-    build_router_with_timeout(
+    build_router_with_policy(
         signer,
         auth_token,
-        max_requests_per_second,
-        max_in_flight,
-        Duration::from_millis(DEFAULT_SIGNING_TIMEOUT_MS),
+        BlindIssuerApiPolicy::new(max_requests_per_second, max_in_flight),
     )
 }
 
@@ -192,14 +349,34 @@ pub fn build_router_with_timeout(
     max_in_flight: usize,
     signing_timeout: Duration,
 ) -> Router {
+    build_router_with_policy(
+        signer,
+        auth_token,
+        BlindIssuerApiPolicy::new(max_requests_per_second, max_in_flight)
+            .with_signing_timeout(signing_timeout),
+    )
+}
+
+/// Builds the local signer router from one immutable validated runtime policy.
+pub fn build_router_with_policy(
+    signer: Arc<BlindSigner>,
+    auth_token: Zeroizing<Vec<u8>>,
+    policy: BlindIssuerApiPolicy,
+) -> Router {
+    // [BLIND-ISSUER-OPS 2026-07-23 by Codex] Metrics are process-wide,
+    // aggregate-only, and intentionally contain no key/request dimensions.
+    let breaker = Arc::new(CircuitBreaker::new(
+        policy.circuit_failure_threshold,
+        policy.circuit_cooldown,
+    ));
     let state = ApiState {
         signer,
         auth_token: Arc::new(auth_token),
         in_flight: Arc::new(AtomicUsize::new(0)),
-        max_in_flight,
         rate: Arc::new(Mutex::new(RateWindow::default())),
-        max_requests_per_second,
-        signing_timeout,
+        policy,
+        breaker,
+        metrics: Arc::new(RuntimeMetrics::default()),
     };
     let signing = Router::new()
         .route("/internal/v1/blind-sign", post(sign_handler))
@@ -209,9 +386,13 @@ pub fn build_router_with_timeout(
         ))
         .layer(DefaultBodyLimit::max(MAX_SIGN_REQUEST_BYTES));
     let authenticated = signing
-        .merge(Router::new().route("/internal/v1/issuer-epochs", get(epoch_handler)))
-        // [BLIND-ISSUER-EPOCHS 2026-07-23 by Codex] Authorization wraps both
-        // routes, while only the private RSA route consumes signing capacity.
+        .merge(
+            Router::new()
+                .route("/internal/v1/issuer-epochs", get(epoch_handler))
+                .route("/internal/v1/status", get(status_handler)),
+        )
+        // [BLIND-ISSUER-EPOCHS 2026-07-23 by Codex] Authorization wraps all
+        // internal data routes; only private RSA consumes signing capacity.
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authorization_gate,
@@ -226,6 +407,10 @@ async fn authorization_gate(
     next: Next,
 ) -> Response {
     if !is_authorized(request.headers(), state.auth_token.as_ref().as_slice()) {
+        state
+            .metrics
+            .authorization_rejected
+            .fetch_add(1, Ordering::Relaxed);
         return empty_response(StatusCode::UNAUTHORIZED);
     }
     next.run(request).await
@@ -236,14 +421,27 @@ async fn signing_pressure_gate(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(guard) = InFlightGuard::try_acquire(&state.in_flight, state.max_in_flight) else {
+    if state.breaker.is_open() {
+        state
+            .metrics
+            .circuit_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let Some(guard) = InFlightGuard::try_acquire(&state.in_flight, state.policy.max_in_flight)
+    else {
+        state
+            .metrics
+            .capacity_rejected
+            .fetch_add(1, Ordering::Relaxed);
         return empty_response(StatusCode::TOO_MANY_REQUESTS);
     };
     if !state
         .rate
         .lock()
-        .try_take(now_seconds(), state.max_requests_per_second)
+        .try_take(now_seconds(), state.policy.max_requests_per_second)
     {
+        state.metrics.rate_rejected.fetch_add(1, Ordering::Relaxed);
         return empty_response(StatusCode::TOO_MANY_REQUESTS);
     }
     // [BLIND-ISSUER-CANCEL 2026-07-23 by Codex] The handler clones this guard
@@ -273,25 +471,69 @@ async fn sign_handler(
         drop(operation_guard);
         result
     });
-    match tokio::time::timeout(state.signing_timeout, operation).await {
-        Ok(Ok(Ok(response))) => binary_response(&response),
+    match tokio::time::timeout(state.policy.signing_timeout, operation).await {
+        Ok(Ok(Ok(response))) => {
+            state.breaker.record_success();
+            state
+                .metrics
+                .signing_succeeded
+                .fetch_add(1, Ordering::Relaxed);
+            binary_response(&response)
+        }
         Ok(Ok(Err(BlindSignError::InvalidRequest))) => empty_response(StatusCode::BAD_REQUEST),
         Ok(Ok(Err(BlindSignError::UnknownIssuer | BlindSignError::InactiveIssuer))) => {
             empty_response(StatusCode::FORBIDDEN)
         }
         Ok(Ok(Err(BlindSignError::SigningFailed)) | Err(_)) => {
+            state.breaker.record_failure(now_millis());
+            state.metrics.backend_failed.fetch_add(1, Ordering::Relaxed);
             empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
-        Err(_) => empty_response(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_) => {
+            state.breaker.record_failure(now_millis());
+            state
+                .metrics
+                .signing_timed_out
+                .fetch_add(1, Ordering::Relaxed);
+            empty_response(StatusCode::SERVICE_UNAVAILABLE)
+        }
     }
 }
 
 async fn health_handler(State(state): State<ApiState>) -> Response {
-    if state.signer.has_active_key(now_millis()) {
+    if state.signer.has_active_key(now_millis()) && !state.breaker.is_open() {
         empty_response(StatusCode::NO_CONTENT)
     } else {
         empty_response(StatusCode::SERVICE_UNAVAILABLE)
     }
+}
+
+async fn status_handler(State(state): State<ApiState>) -> Response {
+    let generated_at_ms = now_millis();
+    let (circuit_open, circuit_open_until_ms, consecutive_backend_failures) =
+        state.breaker.snapshot();
+    let snapshot = BlindIssuerOperationalSnapshot {
+        generated_at_ms,
+        active_key: state.signer.has_active_key(generated_at_ms),
+        key_count: state.signer.key_count(),
+        in_flight: state.in_flight.load(Ordering::Acquire),
+        max_in_flight: state.policy.max_in_flight,
+        circuit_open,
+        circuit_open_until_ms,
+        consecutive_backend_failures,
+        signing_succeeded: state.metrics.signing_succeeded.load(Ordering::Relaxed),
+        backend_failed: state.metrics.backend_failed.load(Ordering::Relaxed),
+        signing_timed_out: state.metrics.signing_timed_out.load(Ordering::Relaxed),
+        capacity_rejected: state.metrics.capacity_rejected.load(Ordering::Relaxed),
+        rate_rejected: state.metrics.rate_rejected.load(Ordering::Relaxed),
+        circuit_rejected: state.metrics.circuit_rejected.load(Ordering::Relaxed),
+        authorization_rejected: state.metrics.authorization_rejected.load(Ordering::Relaxed),
+    };
+    (
+        [(header::CACHE_CONTROL, CACHE_CONTROL_NO_STORE)],
+        Json(snapshot),
+    )
+        .into_response()
 }
 
 async fn epoch_handler(State(state): State<ApiState>) -> Response {
@@ -602,6 +844,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Condvar, Mutex as StdMutex};
     use std::time::Duration;
 
@@ -655,6 +898,23 @@ mod tests {
         }
     }
 
+    struct SwitchableBackend {
+        failing: Arc<AtomicBool>,
+    }
+
+    impl BlindSigningBackend for SwitchableBackend {
+        fn sign_blinded(
+            &self,
+            _blinded_message: &[u8],
+        ) -> Result<Vec<u8>, BlindSigningBackendError> {
+            if self.failing.load(Ordering::Acquire) {
+                Err(BlindSigningBackendError)
+            } else {
+                Ok(vec![0; MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES])
+            }
+        }
+    }
+
     fn authorized_sign_http_request(body: Vec<u8>, authorization: &str) -> HttpRequest<Body> {
         HttpRequest::builder()
             .method("POST")
@@ -663,6 +923,31 @@ mod tests {
             .header(header::CONTENT_TYPE, BLIND_ISSUER_CONTENT_TYPE)
             .body(Body::from(body))
             .expect("authorized signing request")
+    }
+
+    fn status_http_request(authorization: Option<&str>) -> HttpRequest<Body> {
+        let mut request = HttpRequest::builder().uri("/internal/v1/status");
+        if let Some(authorization) = authorization {
+            request = request.header(header::AUTHORIZATION, authorization);
+        }
+        request.body(Body::empty()).expect("status request")
+    }
+
+    async fn operational_snapshot(
+        router: &Router,
+        authorization: &str,
+    ) -> BlindIssuerOperationalSnapshot {
+        let response = router
+            .clone()
+            .oneshot(status_http_request(Some(authorization)))
+            .await
+            .expect("status response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .expect("status body");
+        serde_json::from_slice(&bytes).expect("status snapshot")
     }
 
     struct BlockingFixture {
@@ -842,6 +1127,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn circuit_breaker_recovers_and_status_stays_aggregate_only() {
+        let now_ms = now_millis();
+        let key_pair =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("RSA key pair");
+        let public_epoch = BlindVaultBlindIssuerEpoch::new(
+            key_pair.pk.to_der().expect("public DER"),
+            now_ms - 60_000,
+            now_ms + 24 * 60 * 60 * 1_000,
+            7 * 24 * 60 * 60 * 1_000,
+        );
+        let issuer_key_id = public_epoch.issuer_key_id;
+        let failing = Arc::new(AtomicBool::new(true));
+        let signer = Arc::new(
+            BlindSigner::from_signing_keys(vec![BlindSigningKey::new(
+                public_epoch,
+                Box::new(SwitchableBackend {
+                    failing: Arc::clone(&failing),
+                }),
+            )
+            .expect("switchable signing key")])
+            .expect("switchable signer"),
+        );
+        let policy =
+            BlindIssuerApiPolicy::new(128, 1).with_circuit_breaker(2, Duration::from_millis(100));
+        let router =
+            build_router_with_policy(signer, Zeroizing::new(BACKEND_TOKEN.to_vec()), policy);
+        let body = encode_sign_request(&BlindSignRequest {
+            version: BLIND_VAULT_BLIND_ADMISSION_VERSION,
+            issuer_key_id,
+            blinded_message: vec![9; MIN_BLIND_VAULT_BLIND_SIGNATURE_BYTES],
+        })
+        .expect("encode request");
+        let authorization = format!(
+            "Bearer {}",
+            std::str::from_utf8(BACKEND_TOKEN).expect("ASCII backend token")
+        );
+
+        let unauthorized = router
+            .clone()
+            .oneshot(status_http_request(None))
+            .await
+            .expect("unauthorized status response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        for _ in 0..2 {
+            let failed = router
+                .clone()
+                .oneshot(authorized_sign_http_request(body.clone(), &authorization))
+                .await
+                .expect("backend failure response");
+            assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let rejected = router
+            .clone()
+            .oneshot(authorized_sign_http_request(body.clone(), &authorization))
+            .await
+            .expect("open circuit response");
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let unhealthy = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/internal/v1/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(unhealthy.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let open = operational_snapshot(&router, &authorization).await;
+        assert!(open.active_key);
+        assert_eq!(open.key_count, 1);
+        assert_eq!(open.in_flight, 0);
+        assert_eq!(open.max_in_flight, 1);
+        assert!(open.circuit_open);
+        assert!(open.circuit_open_until_ms >= open.generated_at_ms);
+        assert_eq!(open.consecutive_backend_failures, 2);
+        assert_eq!(open.backend_failed, 2);
+        assert_eq!(open.signing_timed_out, 0);
+        assert_eq!(open.circuit_rejected, 1);
+        assert_eq!(open.authorization_rejected, 1);
+
+        failing.store(false, Ordering::Release);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let recovered = router
+            .clone()
+            .oneshot(authorized_sign_http_request(body, &authorization))
+            .await
+            .expect("recovered signing response");
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let closed = operational_snapshot(&router, &authorization).await;
+        assert!(!closed.circuit_open);
+        assert_eq!(closed.circuit_open_until_ms, 0);
+        assert_eq!(closed.consecutive_backend_failures, 0);
+        assert_eq!(closed.signing_succeeded, 1);
+    }
+
+    #[tokio::test]
     async fn authenticated_http_signing_finalizes_and_verifies() {
         let now_ms = now_millis();
         let key_pair =
@@ -858,6 +1243,8 @@ mod tests {
             max_requests_per_second: 128,
             max_in_flight: 8,
             signing_timeout_ms: DEFAULT_SIGNING_TIMEOUT_MS,
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown_ms: DEFAULT_CIRCUIT_COOLDOWN_MS,
             keys: vec![BlindIssuerKeyConfig {
                 private_key_der_file: private_path,
                 not_before_unix_secs: now_ms / 1_000 - 60,

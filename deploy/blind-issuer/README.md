@@ -15,6 +15,7 @@ Main Functionality:
 - Provisions an unprivileged custody account and owner-only secret files.
 - Documents authenticated backend frames and safe key rotation.
 - Documents bounded HSM/KMS response deadlines and retry semantics.
+- Documents aggregate status and circuit-breaker recovery.
 - Keeps all private issuer material away from decentralized storage nodes.
 
 Dependencies:
@@ -38,7 +39,7 @@ Important Note for Next Developer:
 - Production private keys should ultimately move behind the existing signer
   boundary into an HSM/KMS without changing the wire contract.
 
-Last Modified: v1.1.0-BlindIssuerDeploy - Added custody timeout operations.
+Last Modified: v1.2.0-BlindIssuerDeploy - Added aggregate status and breaker.
 ============================================
 -->
 
@@ -123,6 +124,13 @@ cannot exceed the configured custody capacity. Upstream retries must use
 bounded exponential backoff; blind signing is deterministic for the same
 validated request, so a retry does not create a linkable redemption identity.
 
+`circuit_failure_threshold` (default 5; allowed 1–100) opens the process-wide
+custody circuit after consecutive backend failures or caller timeouts.
+`circuit_cooldown_ms` (default 30,000ms; allowed 1,000–300,000ms) uses a
+monotonic clock for enforcement. While open, signing returns `503` before body
+extraction. A successful post-cooldown operation closes the circuit and resets
+the consecutive-failure count.
+
 ## Internal API
 
 All responses use `Cache-Control: no-store`. No request-body tracing middleware
@@ -132,12 +140,20 @@ is installed.
 |---|---|---|
 | `GET /internal/v1/health` | none, loopback only | `204` with an active key; otherwise `503` |
 | `GET /internal/v1/issuer-epochs` | Bearer token | bounded `ANBE` public epoch snapshot |
+| `GET /internal/v1/status` | Bearer token | aggregate health/capacity counters; no request dimensions |
 | `POST /internal/v1/blind-sign` | Bearer token | bounded `ANBS` blind signature |
 
 The signing request body is `ANBI || admission_version || issuer_key_id ||
 blinded_message`. It contains no entitlement or user metadata. The Rust crate
 exports `encode_sign_request`, `decode_sign_response`, and
 `decode_epoch_snapshot` as the canonical backend-side codec reference.
+
+The JSON status snapshot contains only process-wide counts: active/key count,
+in-flight capacity, breaker state, successes, backend failures, timeouts, and
+rejections. It never includes blinded bytes, key IDs, wallet/account/device
+identifiers, IP addresses, request IDs, timestamps per request, or issuance
+history. Treat the endpoint as operator telemetry and keep bearer authentication
+enabled even on loopback.
 
 ## Safe Rotation
 

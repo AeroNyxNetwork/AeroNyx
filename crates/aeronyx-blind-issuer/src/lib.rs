@@ -15,6 +15,7 @@
 //! - Keeps policy independent from software RSA, HSM, or KMS custody backends.
 //! - Exposes a loopback-only, backend-authenticated HTTP interface.
 //! - Provides public epoch material without account or issuance metadata.
+//! - Publishes authenticated aggregate health and isolates backend failures.
 //!
 //! ## Dependencies
 //! - `config`: fail-closed listener, key epoch, and secret-file policy.
@@ -35,7 +36,7 @@
 //! - Production key custody should migrate behind a KMS/HSM implementation of
 //!   the signer boundary without changing the internal wire contract.
 //!
-//! Last Modified: v0.3.0-BlindIssuer - Added bounded custody response deadlines.
+//! Last Modified: v0.4.0-BlindIssuer - Added operational policy and breaker state.
 //! ============================================
 
 pub mod api;
@@ -43,12 +44,14 @@ pub mod config;
 pub mod signer;
 
 pub use api::{
-    build_router, build_router_with_timeout, decode_epoch_snapshot, decode_sign_response,
-    encode_epoch_snapshot, encode_sign_request, BlindIssuerEpochSnapshot,
-    BLIND_ISSUER_CONTENT_TYPE, BLIND_ISSUER_EPOCH_CONTENT_TYPE,
+    build_router, build_router_with_policy, build_router_with_timeout, decode_epoch_snapshot,
+    decode_sign_response, encode_epoch_snapshot, encode_sign_request, BlindIssuerApiPolicy,
+    BlindIssuerEpochSnapshot, BlindIssuerOperationalSnapshot, BLIND_ISSUER_CONTENT_TYPE,
+    BLIND_ISSUER_EPOCH_CONTENT_TYPE,
 };
 pub use config::{
-    BlindIssuerConfig, BlindIssuerKeyConfig, ConfigError, DEFAULT_SIGNING_TIMEOUT_MS,
+    BlindIssuerConfig, BlindIssuerKeyConfig, ConfigError, DEFAULT_CIRCUIT_COOLDOWN_MS,
+    DEFAULT_CIRCUIT_FAILURE_THRESHOLD, DEFAULT_SIGNING_TIMEOUT_MS,
 };
 pub use signer::{
     BlindSignError, BlindSignRequest, BlindSignResponse, BlindSigner, BlindSignerBuildError,

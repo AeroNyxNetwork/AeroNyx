@@ -14,6 +14,7 @@
 //! - Reads secrets with `O_NOFOLLOW`, bounded allocation, and owner-only mode.
 //! - Keeps secret bytes in zeroizing buffers until cryptographic parsing.
 //! - Bounds how long HTTP callers wait for non-cancellable custody operations.
+//! - Bounds circuit-breaker failure and recovery policy.
 //!
 //! ## Calling Relationships
 //! `main.rs` loads this policy; `signer.rs` consumes key files; `api.rs`
@@ -27,7 +28,7 @@
 //! Do not add inline private keys or bearer tokens to TOML/environment values.
 //! Secret-manager integration should implement a separate custody backend.
 //!
-//! Last Modified: v0.2.0-BlindIssuerConfig - Added bounded signing timeout.
+//! Last Modified: v0.3.0-BlindIssuerConfig - Added bounded circuit-breaker policy.
 //! ============================================
 
 use std::collections::HashSet;
@@ -52,9 +53,16 @@ const MAX_AUTH_TOKEN_LENGTH: usize = 128;
 const MAX_LEASE_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 const MIN_SIGNING_TIMEOUT_MS: u64 = 100;
 const MAX_SIGNING_TIMEOUT_MS: u64 = 120_000;
+const MIN_CIRCUIT_COOLDOWN_MS: u64 = 1_000;
+const MAX_CIRCUIT_COOLDOWN_MS: u64 = 300_000;
+const MAX_CIRCUIT_FAILURE_THRESHOLD: u64 = 100;
 
 /// Default caller wait bound for one private custody operation.
 pub const DEFAULT_SIGNING_TIMEOUT_MS: u64 = 10_000;
+/// Default consecutive backend failures before the signer circuit opens.
+pub const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u64 = 5;
+/// Default monotonic recovery delay after the signer circuit opens.
+pub const DEFAULT_CIRCUIT_COOLDOWN_MS: u64 = 30_000;
 
 /// Fail-closed issuer startup/configuration failures.
 #[derive(Debug, Error)]
@@ -120,6 +128,12 @@ pub struct BlindIssuerConfig {
     /// capacity permit if the HTTP response times out before an HSM returns.
     #[serde(default = "default_signing_timeout_ms")]
     pub signing_timeout_ms: u64,
+    /// Consecutive backend failures/timeouts required to open the circuit.
+    #[serde(default = "default_circuit_failure_threshold")]
+    pub circuit_failure_threshold: u64,
+    /// Monotonic delay before requests may probe an open circuit again.
+    #[serde(default = "default_circuit_cooldown_ms")]
+    pub circuit_cooldown_ms: u64,
     /// Rotating private-key epochs. Overlap is allowed for safe rollout.
     pub keys: Vec<BlindIssuerKeyConfig>,
 }
@@ -166,6 +180,19 @@ impl BlindIssuerConfig {
         if !(MIN_SIGNING_TIMEOUT_MS..=MAX_SIGNING_TIMEOUT_MS).contains(&self.signing_timeout_ms) {
             return Err(ConfigError::InvalidPolicy(
                 "signing_timeout_ms must be between 100 and 120000",
+            ));
+        }
+        if self.circuit_failure_threshold == 0
+            || self.circuit_failure_threshold > MAX_CIRCUIT_FAILURE_THRESHOLD
+        {
+            return Err(ConfigError::InvalidPolicy(
+                "circuit_failure_threshold must be between 1 and 100",
+            ));
+        }
+        if !(MIN_CIRCUIT_COOLDOWN_MS..=MAX_CIRCUIT_COOLDOWN_MS).contains(&self.circuit_cooldown_ms)
+        {
+            return Err(ConfigError::InvalidPolicy(
+                "circuit_cooldown_ms must be between 1000 and 300000",
             ));
         }
         if self.keys.is_empty() || self.keys.len() > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS {
@@ -241,6 +268,12 @@ impl BlindIssuerConfig {
     pub const fn signing_timeout(&self) -> Duration {
         Duration::from_millis(self.signing_timeout_ms)
     }
+
+    /// Returns the validated monotonic circuit-breaker cooldown.
+    #[must_use]
+    pub const fn circuit_cooldown(&self) -> Duration {
+        Duration::from_millis(self.circuit_cooldown_ms)
+    }
 }
 
 pub(crate) fn read_private_key_der(path: &Path) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
@@ -257,6 +290,14 @@ const fn default_max_in_flight() -> usize {
 
 const fn default_signing_timeout_ms() -> u64 {
     DEFAULT_SIGNING_TIMEOUT_MS
+}
+
+const fn default_circuit_failure_threshold() -> u64 {
+    DEFAULT_CIRCUIT_FAILURE_THRESHOLD
+}
+
+const fn default_circuit_cooldown_ms() -> u64 {
+    DEFAULT_CIRCUIT_COOLDOWN_MS
 }
 
 fn read_bounded_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, ConfigError> {
@@ -339,6 +380,8 @@ mod tests {
             max_requests_per_second: 128,
             max_in_flight: 8,
             signing_timeout_ms: DEFAULT_SIGNING_TIMEOUT_MS,
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown_ms: DEFAULT_CIRCUIT_COOLDOWN_MS,
             keys: vec![BlindIssuerKeyConfig {
                 private_key_der_file: directory.path().join("issuer.der"),
                 not_before_unix_secs: 1_800_000_000,
@@ -363,6 +406,8 @@ mod tests {
             max_requests_per_second: 128,
             max_in_flight: 8,
             signing_timeout_ms: DEFAULT_SIGNING_TIMEOUT_MS,
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown_ms: DEFAULT_CIRCUIT_COOLDOWN_MS,
             keys: vec![BlindIssuerKeyConfig {
                 private_key_der_file: PathBuf::from("/var/lib/aeronyx/issuer.der"),
                 not_before_unix_secs: 1,
@@ -391,6 +436,8 @@ mod tests {
             max_requests_per_second: 128,
             max_in_flight: 8,
             signing_timeout_ms: DEFAULT_SIGNING_TIMEOUT_MS,
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown_ms: DEFAULT_CIRCUIT_COOLDOWN_MS,
             keys: vec![BlindIssuerKeyConfig {
                 private_key_der_file: PathBuf::from("/var/lib/aeronyx/issuer.der"),
                 not_before_unix_secs: 1,
@@ -422,6 +469,11 @@ max_lease_ttl_secs = 1
         let mut config: BlindIssuerConfig = toml::from_str(legacy_toml).expect("legacy config");
         assert_eq!(config.signing_timeout_ms, DEFAULT_SIGNING_TIMEOUT_MS);
         assert_eq!(
+            config.circuit_failure_threshold,
+            DEFAULT_CIRCUIT_FAILURE_THRESHOLD
+        );
+        assert_eq!(config.circuit_cooldown_ms, DEFAULT_CIRCUIT_COOLDOWN_MS);
+        assert_eq!(
             config.signing_timeout(),
             Duration::from_millis(DEFAULT_SIGNING_TIMEOUT_MS)
         );
@@ -430,6 +482,38 @@ max_lease_ttl_secs = 1
         config.signing_timeout_ms = MIN_SIGNING_TIMEOUT_MS - 1;
         assert!(config.validate().is_err());
         config.signing_timeout_ms = MAX_SIGNING_TIMEOUT_MS + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn circuit_breaker_policy_is_bounded() {
+        let mut config = BlindIssuerConfig {
+            listen_addr: "127.0.0.1:9191".to_owned(),
+            auth_token_file: PathBuf::from("/var/lib/aeronyx/backend.token"),
+            max_requests_per_second: 128,
+            max_in_flight: 8,
+            signing_timeout_ms: DEFAULT_SIGNING_TIMEOUT_MS,
+            circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+            circuit_cooldown_ms: DEFAULT_CIRCUIT_COOLDOWN_MS,
+            keys: vec![BlindIssuerKeyConfig {
+                private_key_der_file: PathBuf::from("/var/lib/aeronyx/issuer.der"),
+                not_before_unix_secs: 1,
+                expires_at_unix_secs: 2,
+                max_lease_ttl_secs: 1,
+            }],
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.circuit_cooldown(),
+            Duration::from_millis(DEFAULT_CIRCUIT_COOLDOWN_MS)
+        );
+
+        config.circuit_failure_threshold = 0;
+        assert!(config.validate().is_err());
+        config.circuit_failure_threshold = DEFAULT_CIRCUIT_FAILURE_THRESHOLD;
+        config.circuit_cooldown_ms = MIN_CIRCUIT_COOLDOWN_MS - 1;
+        assert!(config.validate().is_err());
+        config.circuit_cooldown_ms = MAX_CIRCUIT_COOLDOWN_MS + 1;
         assert!(config.validate().is_err());
     }
 }
