@@ -47,6 +47,8 @@
 //!   startup and explicit audits still verify the complete retained history.
 //! - Exports bounded producer blocks and descriptors only after a complete
 //!   audit inside the same `SQLite` read transaction for signed carrier use.
+//! - Retains a bounded, durable registry for permissionless full-node mirrors
+//!   without granting those producers checkpoint, witness, or policy authority.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -80,6 +82,8 @@
 //!     synchronization or any listener starts.
 //! 12. Exchange only opaque epoch/digest policy heads with pinned witnesses;
 //!     reject rollback, same-epoch conflict, and non-contiguous progression.
+//! 13. Admit dynamically discovered mirrors into a capacity-bounded registry;
+//!     promote them out of mirror status atomically if later operator-pinned.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -90,6 +94,8 @@
 //!
 //! ## Important Note for Next Developer
 //! - Never merge remote blocks into `directory_chain_blocks`.
+//! - A Full-node Mirror producer is untrusted replicated evidence. Never include
+//!   mirror registry membership in observation checkpoints or authority policy.
 //! - Never auto-delete, auto-rewind, or auto-select through a quarantined fork.
 //! - A producer-signed block fork/rollback quarantines that producer. A signed
 //!   descriptor equivocation is evidence about the descriptor owner and does
@@ -117,6 +123,7 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.18.0-FullNodeMirror - Added schema v9 bounded non-authoritative mirror registry
 //! v0.17.0-DirectoryPolicyHeadAnchor - Added schema v8 opaque external policy-head anchors and signed receipts
 //! v0.16.0-DirectoryWitnessPolicyEpoch - Added schema v7 signed hash-linked local witness policy history, metadata-head partial-deletion protection, startup reconciliation, and tamper tests
 //! v0.15.0-DirectoryWitnessFailureDrills - Locked partial-receipt restart recovery and current-pin rotation fail-closed behavior with deterministic state-machine coverage
@@ -173,7 +180,8 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 8;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 9;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V8: i64 = 8;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V7: i64 = 7;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V6: i64 = 6;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V5: i64 = 5;
@@ -202,6 +210,17 @@ pub(crate) const MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE: usize = 50;
 pub(crate) const DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES: u64 = 64;
 /// Maximum durable retry delay accepted by the replica store and scheduler.
 pub(crate) const DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS: u64 = 30 * 60;
+/// Hard implementation ceiling for durable permissionless mirror namespaces.
+pub(crate) const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryReplicaImportMode {
+    PinnedAuthority,
+    FullNodeMirror {
+        descriptor_sequence: u64,
+        max_producers: usize,
+    },
+}
 
 /// Failures returned by the producer-isolated replica store.
 #[derive(Debug, thiserror::Error)]
@@ -230,6 +249,9 @@ pub enum DirectoryReplicaStoreError {
     /// The producer is durably isolated pending operator review.
     #[error("directory producer is quarantined: {0}")]
     Quarantined(String),
+    /// The configured durable permissionless mirror namespace ceiling is full.
+    #[error("directory full-node mirror capacity reached")]
+    MirrorCapacity,
 }
 
 /// Aggregate result of a complete replica startup audit.
@@ -237,6 +259,8 @@ pub enum DirectoryReplicaStoreError {
 pub struct DirectoryReplicaAudit {
     /// Number of producer namespaces.
     pub producers: u64,
+    /// Producer namespaces admitted only as non-authoritative mirrors.
+    pub mirror_producers: u64,
     /// Number of producer namespaces currently quarantined.
     pub quarantined_producers: u64,
     /// Number of verified remote blocks.
@@ -286,6 +310,8 @@ pub struct DirectoryReplicaAudit {
 pub struct DirectoryReplicaStoreSnapshot {
     /// Number of producer namespaces currently persisted.
     pub producers: u64,
+    /// Producer namespaces retained only as non-authoritative mirrors.
+    pub mirror_producers: u64,
     /// Number of producer namespaces blocked by durable quarantine.
     pub quarantined_producers: u64,
     /// Number of verified remote blocks retained across all producers.
@@ -927,6 +953,35 @@ pub struct DirectoryReplicaSyncObservation {
     pub requests_sent: u64,
 }
 
+/// Aggregate process-lifetime Full-node Mirror scheduling telemetry.
+///
+/// This intentionally omits identities, endpoints, descriptor hashes, routes,
+/// and response details. Mirror observations are diagnostic transport evidence,
+/// never authority, consensus, fork choice, voting, or finality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirectoryFullNodeMirrorRuntimeSnapshot {
+    /// Completed bounded mirror-selection rounds.
+    pub rounds: u64,
+    /// Valid public candidates considered by the latest round.
+    pub last_round_candidates: u64,
+    /// Capacity-bounded candidates selected by the latest round.
+    pub last_round_selected: u64,
+    /// Authenticated pages accepted in the latest round.
+    pub last_round_succeeded: u64,
+    /// Selected candidates that failed or were rejected in the latest round.
+    pub last_round_failed: u64,
+    /// Authenticated mirror pages accepted during this process lifetime.
+    pub pages_succeeded: u64,
+    /// Failed bounded mirror attempts during this process lifetime.
+    pub attempts_failed: u64,
+    /// Timestamp of the latest completed mirror round.
+    pub last_round_at: Option<u64>,
+    /// Timestamp of the latest authenticated mirror import.
+    pub last_success_at: Option<u64>,
+    /// Timestamp of the latest failed mirror attempt.
+    pub last_failure_at: Option<u64>,
+}
+
 impl DirectoryReplicaSyncObservation {
     fn new(producer: [u8; 32]) -> Self {
         Self {
@@ -956,6 +1011,7 @@ impl DirectoryReplicaSyncObservation {
 pub struct DirectoryReplicaSyncRuntime {
     observations: Mutex<HashMap<[u8; 32], DirectoryReplicaSyncObservation>>,
     observation_witness: Mutex<DirectoryObservationWitnessOutcomeSnapshot>,
+    full_node_mirror: Mutex<DirectoryFullNodeMirrorRuntimeSnapshot>,
 }
 
 impl DirectoryReplicaSyncRuntime {
@@ -1129,6 +1185,45 @@ impl DirectoryReplicaSyncRuntime {
     #[must_use]
     pub fn observation_witness_snapshot(&self) -> DirectoryObservationWitnessOutcomeSnapshot {
         *self.observation_witness.lock()
+    }
+
+    /// Records one aggregate bounded non-authoritative mirror round.
+    pub fn record_full_node_mirror_round(
+        &self,
+        candidates: usize,
+        selected: usize,
+        succeeded: usize,
+        completed_at: u64,
+    ) {
+        if completed_at == 0 || succeeded > selected {
+            return;
+        }
+        let failed = selected.saturating_sub(succeeded);
+        let mut snapshot = self.full_node_mirror.lock();
+        snapshot.rounds = snapshot.rounds.saturating_add(1);
+        snapshot.last_round_candidates = u64::try_from(candidates).unwrap_or(u64::MAX);
+        snapshot.last_round_selected = u64::try_from(selected).unwrap_or(u64::MAX);
+        snapshot.last_round_succeeded = u64::try_from(succeeded).unwrap_or(u64::MAX);
+        snapshot.last_round_failed = u64::try_from(failed).unwrap_or(u64::MAX);
+        snapshot.pages_succeeded = snapshot
+            .pages_succeeded
+            .saturating_add(snapshot.last_round_succeeded);
+        snapshot.attempts_failed = snapshot
+            .attempts_failed
+            .saturating_add(snapshot.last_round_failed);
+        snapshot.last_round_at = Some(completed_at);
+        if succeeded > 0 {
+            snapshot.last_success_at = Some(completed_at);
+        }
+        if failed > 0 {
+            snapshot.last_failure_at = Some(completed_at);
+        }
+    }
+
+    /// Returns aggregate permissionless mirror telemetry without peer metadata.
+    #[must_use]
+    pub fn full_node_mirror_snapshot(&self) -> DirectoryFullNodeMirrorRuntimeSnapshot {
+        *self.full_node_mirror.lock()
     }
 
     /// Returns producer observations in deterministic identity order.
@@ -1979,6 +2074,99 @@ impl DirectoryReplicaStore {
         Self::load_tip(&connection, producer)
     }
 
+    /// Returns durable non-authoritative mirror producer ids in stable order.
+    ///
+    /// Identities are for internal scheduling only and must not be exposed by
+    /// public status. Registry membership grants no checkpoint or witness role.
+    pub(crate) fn mirror_producer_ids(
+        &self,
+    ) -> Result<Vec<[u8; 32]>, DirectoryReplicaStoreError> {
+        let rows = {
+            let connection = self.connection.lock();
+            Self::validate_metadata(&connection, &self.local_node_id)?;
+            let mut statement = connection.prepare(
+                "SELECT producer FROM directory_replica_mirror_producers
+                 ORDER BY last_selected_at DESC, producer ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            drop(connection);
+            rows
+        };
+        rows.into_iter()
+            .map(|value| bytes32(&value, "directory mirror producer"))
+            .collect()
+    }
+
+    /// Verifies that the durable mirror registry fits an operator capacity.
+    ///
+    /// Capacity changes never delete signed history implicitly. Lowering the
+    /// configured ceiling below the retained count therefore fails startup and
+    /// requires an explicit operator decision to raise the ceiling or migrate
+    /// the store.
+    pub(crate) fn ensure_mirror_capacity(
+        &self,
+        max_producers: usize,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !(1..=MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS).contains(&max_producers) {
+            return Err(DirectoryReplicaStoreError::Request(
+                "directory mirror capacity is outside protocol bounds".to_string(),
+            ));
+        }
+        let retained: i64 = self.connection.lock().query_row(
+            "SELECT COUNT(*) FROM directory_replica_mirror_producers",
+            [],
+            |row| row.get(0),
+        )?;
+        let retained = usize::try_from(nonnegative_i64_to_u64(
+            retained,
+            "directory mirror capacity count",
+        )?)
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "directory mirror capacity count exceeds usize".to_string(),
+            )
+        })?;
+        if retained > max_producers {
+            return Err(DirectoryReplicaStoreError::MirrorCapacity);
+        }
+        Ok(())
+    }
+
+    /// Atomically promotes configured producers out of non-authoritative mirror
+    /// classification before authority synchronization starts.
+    pub(crate) fn promote_pinned_producers(
+        &self,
+        producers: &[[u8; 32]],
+    ) -> Result<u64, DirectoryReplicaStoreError> {
+        let mut unique = producers
+            .iter()
+            .copied()
+            .filter(|producer| *producer != [0u8; 32] && *producer != self.local_node_id)
+            .collect::<Vec<_>>();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut promoted = 0u64;
+        for producer in unique {
+            promoted = promoted.saturating_add(u64::try_from(transaction.execute(
+                "DELETE FROM directory_replica_mirror_producers WHERE producer = ?1",
+                params![producer.as_slice()],
+            )?)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "directory mirror promotion count exceeds u64".to_string(),
+                )
+            })?);
+        }
+        transaction.commit()?;
+        drop(connection);
+        Ok(promoted)
+    }
+
     /// Audits the complete replica namespace, then exports one bounded producer
     /// page from the same read transaction.
     ///
@@ -2164,6 +2352,14 @@ impl DirectoryReplicaStore {
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let mut snapshot = DirectoryReplicaStoreSnapshot::default();
+        snapshot.mirror_producers = nonnegative_i64_to_u64(
+            connection.query_row(
+                "SELECT COUNT(*) FROM directory_replica_mirror_producers",
+                [],
+                |row| row.get(0),
+            )?,
+            "directory mirror producer count",
+        )?;
         for (
             producer,
             tip_height,
@@ -3873,6 +4069,63 @@ impl DirectoryReplicaStore {
         signed_response_frame: &[u8],
         observed_at: u64,
     ) -> Result<DirectoryReplicaImportReport, DirectoryReplicaStoreError> {
+        self.import_verified_page_with_mode(
+            producer,
+            blocks,
+            objects,
+            advertised_tip_height,
+            advertised_tip_hash,
+            signed_response_frame,
+            observed_at,
+            DirectoryReplicaImportMode::PinnedAuthority,
+        )
+    }
+
+    /// Re-verifies and atomically imports one permissionless mirror page.
+    ///
+    /// A first accepted page reserves one durable bounded mirror slot. Mirror
+    /// membership never changes the configured producer set used by checkpoint,
+    /// witness, policy-anchor, consensus, or finality code paths.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_verified_mirror_page(
+        &self,
+        producer: [u8; 32],
+        descriptor_sequence: u64,
+        max_producers: usize,
+        blocks: &[DirectoryCommitmentBlockV1],
+        objects: &[SignedNodeDescriptor],
+        advertised_tip_height: u64,
+        advertised_tip_hash: [u8; 32],
+        signed_response_frame: &[u8],
+        observed_at: u64,
+    ) -> Result<DirectoryReplicaImportReport, DirectoryReplicaStoreError> {
+        self.import_verified_page_with_mode(
+            producer,
+            blocks,
+            objects,
+            advertised_tip_height,
+            advertised_tip_hash,
+            signed_response_frame,
+            observed_at,
+            DirectoryReplicaImportMode::FullNodeMirror {
+                descriptor_sequence,
+                max_producers,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_verified_page_with_mode(
+        &self,
+        producer: [u8; 32],
+        blocks: &[DirectoryCommitmentBlockV1],
+        objects: &[SignedNodeDescriptor],
+        advertised_tip_height: u64,
+        advertised_tip_hash: [u8; 32],
+        signed_response_frame: &[u8],
+        observed_at: u64,
+        mode: DirectoryReplicaImportMode,
+    ) -> Result<DirectoryReplicaImportReport, DirectoryReplicaStoreError> {
         if producer == [0u8; 32] || producer == self.local_node_id {
             return Err(DirectoryReplicaStoreError::Request(
                 "remote producer must be non-zero and differ from the local node".to_string(),
@@ -3908,7 +4161,15 @@ impl DirectoryReplicaStore {
 
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let producer_existed = Self::producer_row_exists(&transaction, &producer)?;
         Self::ensure_producer_row(&transaction, &producer, observed_at)?;
+        Self::reconcile_import_mode(
+            &transaction,
+            &producer,
+            observed_at,
+            producer_existed,
+            mode,
+        )?;
         let mut tip = Self::load_tip(&transaction, &producer)?;
         if tip.quarantined {
             return Err(DirectoryReplicaStoreError::Quarantined(
@@ -4621,6 +4882,7 @@ impl DirectoryReplicaStore {
     ) -> Result<DirectoryReplicaAudit, DirectoryReplicaStoreError> {
         Self::validate_metadata(connection, local_node_id)?;
         let producers = Self::load_all_tips(connection)?;
+        let mirror_producers = Self::audit_mirror_registry(connection, local_node_id)?;
         let observation_witness_policies =
             Self::audit_observation_witness_policies(connection, local_node_id)?;
         let observation_witness_remote_policy_anchors =
@@ -4646,6 +4908,7 @@ impl DirectoryReplicaStore {
             ));
         }
         let mut report = DirectoryReplicaAudit {
+            mirror_producers,
             incidents: Self::audit_incidents(connection)?,
             resolutions: Self::audit_resolutions(connection, local_node_id, &producers)?,
             observation_checkpoints,
@@ -4702,6 +4965,68 @@ impl DirectoryReplicaStore {
         Ok(report)
     }
 
+    fn audit_mirror_registry(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+    ) -> Result<u64, DirectoryReplicaStoreError> {
+        let orphaned: i64 = connection.query_row(
+            "SELECT COUNT(*)
+             FROM directory_replica_mirror_producers m
+             LEFT JOIN directory_replica_chains c ON c.producer = m.producer
+             WHERE c.producer IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if orphaned != 0 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory mirror registry contains an orphaned producer".to_string(),
+            ));
+        }
+        let mut statement = connection.prepare(
+            "SELECT producer, admitted_at, last_selected_at, descriptor_sequence
+             FROM directory_replica_mirror_producers ORDER BY producer ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.len() > MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory mirror registry exceeds the protocol capacity".to_string(),
+            ));
+        }
+        for (producer, admitted_at, last_selected_at, descriptor_sequence) in &rows {
+            let producer = bytes32(producer, "directory mirror producer")?;
+            let admitted_at = positive_i64_to_u64(*admitted_at, "directory mirror admission")?;
+            let last_selected_at =
+                positive_i64_to_u64(*last_selected_at, "directory mirror selection")?;
+            let descriptor_sequence = positive_i64_to_u64(
+                *descriptor_sequence,
+                "directory mirror descriptor sequence",
+            )?;
+            if producer == [0u8; 32]
+                || producer == *local_node_id
+                || last_selected_at < admitted_at
+                || descriptor_sequence == 0
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "directory mirror registry row is invalid".to_string(),
+                ));
+            }
+        }
+        u64::try_from(rows.len()).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "directory mirror registry count exceeds u64".to_string(),
+            )
+        })
+    }
+
     fn initialize_schema(
         connection: &mut Connection,
         local_node_id: &[u8; 32],
@@ -4745,6 +5070,16 @@ impl DirectoryReplicaStore {
                      CHECK (last_resolution_digest IS NULL OR length(last_resolution_digest) = 32),
                  updated_at INTEGER NOT NULL CHECK (updated_at > 0)
              );
+             CREATE TABLE IF NOT EXISTS directory_replica_mirror_producers (
+                 producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
+                 admitted_at INTEGER NOT NULL CHECK (admitted_at > 0),
+                 last_selected_at INTEGER NOT NULL CHECK (last_selected_at >= admitted_at),
+                 descriptor_sequence INTEGER NOT NULL CHECK (descriptor_sequence > 0),
+                 FOREIGN KEY (producer) REFERENCES directory_replica_chains(producer)
+                     ON UPDATE RESTRICT ON DELETE RESTRICT
+             );
+             CREATE INDEX IF NOT EXISTS directory_replica_mirrors_by_selection
+                 ON directory_replica_mirror_producers(last_selected_at, producer);
              CREATE TABLE IF NOT EXISTS directory_replica_blocks (
                  producer BLOB NOT NULL CHECK (length(producer) = 32),
                  height INTEGER NOT NULL CHECK (height > 0),
@@ -5012,19 +5347,23 @@ impl DirectoryReplicaStore {
                     DIRECTORY_REPLICA_SCHEMA_VERSION => {
                         Self::require_resolution_columns(transaction)?;
                         Self::require_witness_policy_metadata_columns(transaction)?;
+                        Self::require_mirror_registry_table(transaction)?;
                     }
-                    DIRECTORY_REPLICA_SCHEMA_VERSION_V7
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V8
+                    | DIRECTORY_REPLICA_SCHEMA_VERSION_V7
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V6
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V5
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V4
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V3 => {
                         Self::require_resolution_columns(transaction)?;
                         Self::add_witness_policy_metadata_columns(transaction)?;
+                        Self::require_mirror_registry_table(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V1 | DIRECTORY_REPLICA_SCHEMA_VERSION_V2 => {
                         Self::add_resolution_columns(transaction)?;
                         Self::add_witness_policy_metadata_columns(transaction)?;
+                        Self::require_mirror_registry_table(transaction)?;
                         transaction.execute(
                             "UPDATE directory_replica_chains AS c
                              SET active_incident_digest = (
@@ -5149,6 +5488,23 @@ impl DirectoryReplicaStore {
         Ok(())
     }
 
+    fn require_mirror_registry_table(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        let present: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'directory_replica_mirror_producers'",
+            [],
+            |row| row.get(0),
+        )?;
+        if present != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema v9 mirror registry is missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn metadata_has_column(
         transaction: &Transaction<'_>,
         expected: &str,
@@ -5239,6 +5595,114 @@ impl DirectoryReplicaStore {
                 u64_to_i64(observed_at, "replica observed timestamp")?
             ],
         )?;
+        Ok(())
+    }
+
+    fn producer_row_exists(
+        transaction: &Transaction<'_>,
+        producer: &[u8; 32],
+    ) -> Result<bool, DirectoryReplicaStoreError> {
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM directory_replica_chains WHERE producer = ?1",
+            params![producer.as_slice()],
+            |row| row.get(0),
+        )?;
+        match count {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica producer primary key is inconsistent".to_string(),
+            )),
+        }
+    }
+
+    fn reconcile_import_mode(
+        transaction: &Transaction<'_>,
+        producer: &[u8; 32],
+        observed_at: u64,
+        producer_existed: bool,
+        mode: DirectoryReplicaImportMode,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        match mode {
+            DirectoryReplicaImportMode::PinnedAuthority => {
+                transaction.execute(
+                    "DELETE FROM directory_replica_mirror_producers WHERE producer = ?1",
+                    params![producer.as_slice()],
+                )?;
+            }
+            DirectoryReplicaImportMode::FullNodeMirror {
+                descriptor_sequence,
+                max_producers,
+            } => {
+                if descriptor_sequence == 0
+                    || !(1..=MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS).contains(&max_producers)
+                {
+                    return Err(DirectoryReplicaStoreError::Request(
+                        "directory mirror admission fields are invalid".to_string(),
+                    ));
+                }
+                let registered: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM directory_replica_mirror_producers WHERE producer = ?1
+                     )",
+                    params![producer.as_slice()],
+                    |row| row.get(0),
+                )?;
+                if producer_existed && !registered {
+                    return Err(DirectoryReplicaStoreError::Request(
+                        "authority producer cannot be reclassified as a permissionless mirror"
+                            .to_string(),
+                    ));
+                }
+                if registered {
+                    transaction.execute(
+                        "UPDATE directory_replica_mirror_producers
+                         SET last_selected_at = MAX(last_selected_at, ?2),
+                             descriptor_sequence = MAX(descriptor_sequence, ?3)
+                         WHERE producer = ?1",
+                        params![
+                            producer.as_slice(),
+                            u64_to_i64(observed_at, "directory mirror selection timestamp")?,
+                            u64_to_i64(
+                                descriptor_sequence,
+                                "directory mirror descriptor sequence"
+                            )?
+                        ],
+                    )?;
+                } else {
+                    let mirror_count: i64 = transaction.query_row(
+                        "SELECT COUNT(*) FROM directory_replica_mirror_producers",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    let mirror_count = usize::try_from(nonnegative_i64_to_u64(
+                        mirror_count,
+                        "directory mirror capacity count",
+                    )?)
+                    .map_err(|_| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "directory mirror capacity count exceeds usize".to_string(),
+                        )
+                    })?;
+                    if mirror_count >= max_producers {
+                        return Err(DirectoryReplicaStoreError::MirrorCapacity);
+                    }
+                    transaction.execute(
+                        "INSERT INTO directory_replica_mirror_producers
+                            (producer, admitted_at, last_selected_at, descriptor_sequence)
+                         VALUES (?1, ?2, ?2, ?3)",
+                        params![
+                            producer.as_slice(),
+                            u64_to_i64(observed_at, "directory mirror admission timestamp")?,
+                            u64_to_i64(
+                                descriptor_sequence,
+                                "directory mirror descriptor sequence"
+                            )?
+                        ],
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -7697,6 +8161,146 @@ mod tests {
             resolved_at,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn full_node_mirror_registry_is_bounded_and_promotes_only_by_operator_pin() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x01; 32]).unwrap();
+        let mirror_a = IdentityKeyPair::from_bytes(&[0x02; 32]).unwrap();
+        let mirror_b = IdentityKeyPair::from_bytes(&[0x03; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x04; 32]).unwrap();
+        let object = descriptor(&subject, 1);
+        let block_a = block(&mirror_a, 1, [0u8; 32], &object);
+        let block_b = block(&mirror_b, 1, [0u8; 32], &object);
+        let frame_a = response_frame(
+            &mirror_a,
+            vec![block_a.clone()],
+            false,
+            1,
+            block_a.hash(),
+            [0x05; 16],
+        );
+        let frame_b = response_frame(
+            &mirror_b,
+            vec![block_b.clone()],
+            false,
+            1,
+            block_b.hash(),
+            [0x06; 16],
+        );
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+
+        store
+            .import_verified_mirror_page(
+                mirror_a.public_key_bytes(),
+                7,
+                1,
+                std::slice::from_ref(&block_a),
+                std::slice::from_ref(&object),
+                1,
+                block_a.hash(),
+                &frame_a,
+                NOW + 20,
+            )
+            .unwrap();
+        assert_eq!(store.mirror_producer_ids().unwrap(), vec![mirror_a.public_key_bytes()]);
+        assert_eq!(store.status_snapshot().unwrap().mirror_producers, 1);
+        assert!(matches!(
+            store.import_verified_mirror_page(
+                mirror_b.public_key_bytes(),
+                8,
+                1,
+                std::slice::from_ref(&block_b),
+                std::slice::from_ref(&object),
+                1,
+                block_b.hash(),
+                &frame_b,
+                NOW + 20,
+            ),
+            Err(DirectoryReplicaStoreError::MirrorCapacity)
+        ));
+        assert_eq!(store.producer_tip(&mirror_b.public_key_bytes()).unwrap().tip_height, 0);
+        store
+            .import_verified_mirror_page(
+                mirror_b.public_key_bytes(),
+                8,
+                2,
+                std::slice::from_ref(&block_b),
+                std::slice::from_ref(&object),
+                1,
+                block_b.hash(),
+                &frame_b,
+                NOW + 20,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.ensure_mirror_capacity(1),
+            Err(DirectoryReplicaStoreError::MirrorCapacity)
+        ));
+        store.ensure_mirror_capacity(2).unwrap();
+
+        assert_eq!(
+            store
+                .promote_pinned_producers(&[
+                    mirror_a.public_key_bytes(),
+                    mirror_b.public_key_bytes(),
+                ])
+                .unwrap(),
+            2
+        );
+        assert!(store.mirror_producer_ids().unwrap().is_empty());
+        assert_eq!(store.audit(NOW + 21).unwrap().mirror_producers, 0);
+        assert!(matches!(
+            store.import_verified_mirror_page(
+                mirror_a.public_key_bytes(),
+                9,
+                1,
+                std::slice::from_ref(&block_a),
+                std::slice::from_ref(&object),
+                1,
+                block_a.hash(),
+                &frame_a,
+                NOW + 20,
+            ),
+            Err(DirectoryReplicaStoreError::Request(_))
+        ));
+    }
+
+    #[test]
+    fn schema_v8_is_atomically_migrated_to_v9_mirror_registry() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x07; 32]).unwrap();
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE directory_replica_mirror_producers;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE directory_replica_meta SET schema_version = ?1 WHERE singleton = 1",
+                params![DIRECTORY_REPLICA_SCHEMA_VERSION_V8],
+            )
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21).unwrap();
+        assert_eq!(audit.mirror_producers, 0);
+        let connection = store.connection.lock();
+        let version: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM directory_replica_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
     }
 
     #[test]

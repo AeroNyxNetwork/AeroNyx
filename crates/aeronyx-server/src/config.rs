@@ -52,6 +52,7 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.15.0-FullNodeMirror - Added opt-in bounded non-authoritative Directory mirrors
 //! v0.14.0-DirectoryWitnessThreshold — Added a bounded independent checkpoint corroboration threshold
 //! v0.13.0-DirectorySyncPins — Added fail-closed Directory Sync peer admission pins
 //! v0.12.0-DirectoryChainStore — Added optional fail-closed local directory ledger path
@@ -87,6 +88,7 @@ use crate::management::ManagementConfig;
 const MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS: usize = 3;
 const MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS: usize = 64;
 const MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS: usize = 16;
+const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
 
 // ── Sub-module re-exports (keep callers' use-paths stable) ────────────────
 pub use crate::config_chat_relay::ChatRelayConfig;
@@ -157,6 +159,21 @@ pub struct DiscoveryConfig {
     /// normal round remains below the peer API's per-minute request budget.
     #[serde(default = "DiscoveryConfig::default_directory_chain_sync_interval_secs")]
     pub directory_chain_sync_interval_secs: u64,
+    /// Enables bounded, non-authoritative mirroring from verified public peers.
+    ///
+    /// Mirror producers are selected from permissionless signed discovery, but
+    /// their replicas never participate in configured observation checkpoints,
+    /// witness thresholds, policy anchors, fork choice, consensus, or finality.
+    /// This remains disabled by default for backward compatibility.
+    #[serde(default)]
+    pub directory_full_node_mirror_enabled: bool,
+    /// Maximum distinct permissionless producer namespaces retained as mirrors.
+    ///
+    /// The durable admission registry enforces this ceiling before importing a
+    /// first page, preventing descriptor churn from creating unbounded replica
+    /// namespaces. Operator-pinned producers do not consume mirror capacity.
+    #[serde(default = "DiscoveryConfig::default_directory_full_node_mirror_max_producers")]
+    pub directory_full_node_mirror_max_producers: usize,
     /// Minimum independent accepted receipts required for a local observation
     /// checkpoint to satisfy the external corroboration target.
     ///
@@ -289,6 +306,12 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_directory_chain_sync_interval_secs() -> u64 {
         120
+    }
+
+    /// Default durable capacity for permissionless non-authoritative mirrors.
+    #[must_use]
+    pub const fn default_directory_full_node_mirror_max_producers() -> usize {
+        32
     }
 
     /// Default independent Directory observation witness threshold.
@@ -515,6 +538,21 @@ impl DiscoveryConfig {
             return Err(ServerError::config_invalid(
                 "discovery.directory_chain_sync_interval_secs",
                 "must be between 60 seconds and 24 hours",
+            ));
+        }
+
+        if !(1..=MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS)
+            .contains(&self.directory_full_node_mirror_max_producers)
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.directory_full_node_mirror_max_producers",
+                format!("must be between 1 and {MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS}"),
+            ));
+        }
+        if self.directory_full_node_mirror_enabled && self.directory_chain_path.is_none() {
+            return Err(ServerError::config_invalid(
+                "discovery.directory_full_node_mirror_enabled",
+                "requires discovery.directory_chain_path",
             ));
         }
 
@@ -834,6 +872,9 @@ impl Default for DiscoveryConfig {
             directory_chain_path: None,
             directory_chain_sync_peer_node_ids: Vec::new(),
             directory_chain_sync_interval_secs: Self::default_directory_chain_sync_interval_secs(),
+            directory_full_node_mirror_enabled: false,
+            directory_full_node_mirror_max_producers:
+                Self::default_directory_full_node_mirror_max_producers(),
             directory_observation_witness_min_verified:
                 Self::default_directory_observation_witness_min_verified(),
             verified_delivery_witness_node_ids: Vec::new(),
@@ -1085,6 +1126,11 @@ mod tests {
             config.discovery.directory_chain_sync_interval_secs,
             DiscoveryConfig::default_directory_chain_sync_interval_secs()
         );
+        assert!(!config.discovery.directory_full_node_mirror_enabled);
+        assert_eq!(
+            config.discovery.directory_full_node_mirror_max_producers,
+            DiscoveryConfig::default_directory_full_node_mirror_max_producers()
+        );
         assert_eq!(
             config.discovery.directory_observation_witness_min_verified,
             DiscoveryConfig::default_directory_observation_witness_min_verified()
@@ -1236,6 +1282,8 @@ directory_chain_sync_peer_node_ids = [
   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 ]
 directory_chain_sync_interval_secs = 180
+directory_full_node_mirror_enabled = true
+directory_full_node_mirror_max_producers = 24
 directory_observation_witness_min_verified = 1
 peer_cache_write_interval_secs = 120
 gossip_enabled = true
@@ -1288,6 +1336,8 @@ advertise_onion_middle = true
             vec![[0xcc; 32]]
         );
         assert_eq!(config.discovery.directory_chain_sync_interval_secs, 180);
+        assert!(config.discovery.directory_full_node_mirror_enabled);
+        assert_eq!(config.discovery.directory_full_node_mirror_max_producers, 24);
         assert_eq!(
             config.discovery.directory_observation_witness_min_verified,
             1
@@ -1541,6 +1591,26 @@ directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
 directory_observation_witness_min_verified = 2
 "#;
         assert!(ServerConfig::from_str(witness_threshold_without_pins).is_err());
+
+        let mirror_without_store = r#"
+[discovery]
+enabled = true
+directory_full_node_mirror_enabled = true
+"#;
+        assert!(ServerConfig::from_str(mirror_without_store).is_err());
+
+        for invalid_capacity in [0, 65] {
+            let mirror_capacity = format!(
+                r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+directory_full_node_mirror_enabled = true
+directory_full_node_mirror_max_producers = {invalid_capacity}
+"#
+            );
+            assert!(ServerConfig::from_str(&mirror_capacity).is_err());
+        }
     }
 
     #[test]

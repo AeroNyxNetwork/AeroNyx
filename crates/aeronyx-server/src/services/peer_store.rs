@@ -5168,6 +5168,34 @@ impl PeerStore {
             .cloned()
     }
 
+    /// Returns valid public descriptors for internal bounded peer selection.
+    ///
+    /// Unlike bootstrap export, this read-only accessor does not mutate export
+    /// counters or audit history. Callers must still apply operation-specific
+    /// endpoint safety and trust policy. In particular, public discovery is not
+    /// authority membership, voting weight, consensus, or finality.
+    #[must_use]
+    pub fn valid_public_descriptors(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Vec<SignedNodeDescriptor> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut descriptors = self
+            .peers
+            .read()
+            .values()
+            .filter(|descriptor| descriptor.verify_at(now).is_ok())
+            .filter(|descriptor| descriptor.descriptor.policy.public_discovery)
+            .cloned()
+            .collect::<Vec<_>>();
+        descriptors.sort_by_key(|descriptor| (descriptor.node_id(), descriptor.sequence()));
+        descriptors.truncate(limit);
+        descriptors
+    }
+
     /// Returns valid descriptors that advertise a capability.
     #[must_use]
     pub fn peers_with_capability(
@@ -8744,6 +8772,27 @@ mod tests {
         let snapshot = store.export_bootstrap_snapshot(1_700_000_200, 1_700_000_100, true, None);
         assert_eq!(snapshot.peers.len(), 1);
         assert!(snapshot.peers[0].descriptor.policy.public_discovery);
+    }
+
+    #[test]
+    fn test_valid_public_descriptors_is_bounded_and_filters_private_peers() {
+        let store = PeerStore::new();
+        let public_a = signed_descriptor(1, 1_700_001_000);
+        let public_b = signed_descriptor(2, 1_700_001_000);
+        let private_key = IdentityKeyPair::generate();
+        let mut private = signed_descriptor_for(&private_key, 1, 1_700_001_000);
+        private.descriptor.policy.public_discovery = false;
+        private = SignedNodeDescriptor::sign(private.descriptor, &private_key).unwrap();
+        for descriptor in [public_a, public_b, private] {
+            store.upsert_verified(descriptor, 1_700_000_100).unwrap();
+        }
+
+        assert!(store
+            .valid_public_descriptors(1_700_000_100, 0)
+            .is_empty());
+        let selected = store.valid_public_descriptors(1_700_000_100, 1);
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].descriptor.policy.public_discovery);
     }
 
     #[test]

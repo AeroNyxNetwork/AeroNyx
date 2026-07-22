@@ -35,6 +35,8 @@
 //!   signed evidence frame on local/VPN operator listeners only.
 //! - Reports signed quarantine-resolution counts while keeping mutation
 //!   strictly outside every HTTP listener.
+//! - Reports aggregate Full-node Mirror capacity and bounded round health while
+//!   keeping mirror identities/endpoints out of every public response.
 //!
 //! ## Calling Relationships
 //! - `server.rs` mounts this router separately for public and operator scopes.
@@ -54,6 +56,7 @@
 //!    aggregate pins and threshold without returning policy membership.
 //! 9. Serialize aggregate-only or fingerprint-only detail by listener scope.
 //! 10. Re-verify canonical incident evidence before an operator-only export.
+//! 11. Report mirror transport separately from pinned authority observations.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -78,8 +81,11 @@
 //! - Never mount incident list/export routes on the public listener.
 //! - Never add quarantine mutation here; recovery needs an authenticated,
 //!   audited compare-and-swap command boundary.
+//! - Mirror health must never be folded into checkpoint, witness, policy, vote,
+//!   fork-choice, consensus, or finality labels.
 //!
 //! ## Last Modified
+//! `v0.16.0-FullNodeMirrorStatus` - Added aggregate bounded non-authoritative mirror health.
 //! `v0.15.0-DirectoryWitnessPolicyEpochStatus` - Added aggregate signed policy epoch, change count, pin count, threshold, and runtime-match state while keeping identities and digests host-local.
 //! `v0.14.0-DirectoryWitnessFailureDrillStatus` - Added current-pin completion evidence for the latest witnessed checkpoint so retired receipts cannot be mistaken for live threshold satisfaction.
 //! `v0.13.0-DirectoryMatureWitnessPipelineStatus` - Added an audited mature-checkpoint forward-floor status that does not treat the intentionally unmatured head as a witness failure.
@@ -123,6 +129,7 @@ use crate::api::directory_replica_sync::{
     DIRECTORY_SYNC_MAX_PAGES_PER_ROUND, DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE,
     DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS, DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
 };
+use crate::services::directory_replica::DirectoryFullNodeMirrorRuntimeSnapshot;
 use crate::services::{
     DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaIncidentEvidence,
     DirectoryReplicaIncidentSummary, DirectoryReplicaObservationConvergenceSnapshot,
@@ -150,6 +157,8 @@ struct DirectoryReplicaStatusState {
     configured_producers: Arc<HashSet<[u8; 32]>>,
     witness_min_verified: usize,
     witness_maturity_delay_secs: u64,
+    full_node_mirror_enabled: bool,
+    full_node_mirror_max_producers: usize,
     scope: DirectoryReplicaStatusScope,
 }
 
@@ -287,6 +296,31 @@ struct DirectoryReplicaObservationWitnessOutcomeStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct DirectoryFullNodeMirrorStatus {
+    enabled: bool,
+    status: &'static str,
+    durable_registry: &'static str,
+    max_producers: u64,
+    retained_producers: u64,
+    remaining_capacity: u64,
+    rounds: u64,
+    last_round_candidates: u64,
+    last_round_selected: u64,
+    last_round_succeeded: u64,
+    last_round_failed: u64,
+    pages_succeeded: u64,
+    attempts_failed: u64,
+    last_round_age_seconds: Option<u64>,
+    last_success_age_seconds: Option<u64>,
+    last_failure_age_seconds: Option<u64>,
+    selection_policy: &'static str,
+    transport_policy: &'static str,
+    authority_boundary: &'static str,
+    privacy_boundary: &'static str,
+    security_model: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct DirectoryReplicaProducerStatus {
     producer_fingerprint: String,
     configured: bool,
@@ -344,6 +378,7 @@ struct DirectoryReplicaStatusResponse {
     next_retry_at: Option<u64>,
     next_retry_after_seconds: Option<u64>,
     catch_up_policy: DirectoryReplicaCatchUpPolicy,
+    full_node_mirror: DirectoryFullNodeMirrorStatus,
     observation_convergence: DirectoryReplicaObservationConvergenceStatus,
     observation_checkpoint: DirectoryReplicaObservationCheckpointStatus,
     observation_witness_policy: DirectoryReplicaObservationWitnessPolicyStatus,
@@ -454,6 +489,7 @@ struct DirectoryReplicaRuntimeSummary {
 struct DirectoryReplicaRuntimeSnapshots<'a> {
     producers: &'a [DirectoryReplicaSyncObservation],
     observation_witness: &'a DirectoryObservationWitnessOutcomeSnapshot,
+    full_node_mirror: &'a DirectoryFullNodeMirrorRuntimeSnapshot,
 }
 
 /// Builds the Directory Replica observability route.
@@ -468,6 +504,8 @@ pub fn build_directory_replica_status_router(
     configured_producers: Vec<[u8; 32]>,
     witness_min_verified: usize,
     witness_maturity_delay_secs: u64,
+    full_node_mirror_enabled: bool,
+    full_node_mirror_max_producers: usize,
     scope: DirectoryReplicaStatusScope,
 ) -> Router {
     runtime.register_producers(&configured_producers);
@@ -477,6 +515,8 @@ pub fn build_directory_replica_status_router(
         configured_producers: Arc::new(configured_producers.into_iter().collect()),
         witness_min_verified,
         witness_maturity_delay_secs,
+        full_node_mirror_enabled,
+        full_node_mirror_max_producers,
         scope,
     };
     let router = Router::new().route(
@@ -848,9 +888,11 @@ async fn directory_replica_status_handler(
     };
     let runtime = state.runtime.snapshot();
     let observation_witness_runtime = state.runtime.observation_witness_snapshot();
+    let full_node_mirror_runtime = state.runtime.full_node_mirror_snapshot();
     let runtime_snapshots = DirectoryReplicaRuntimeSnapshots {
         producers: &runtime,
         observation_witness: &observation_witness_runtime,
+        full_node_mirror: &full_node_mirror_runtime,
     };
     Json(build_directory_replica_status_response(
         generated_at,
@@ -866,6 +908,8 @@ async fn directory_replica_status_handler(
         pending_witness_target,
         witness_policy_matches_runtime,
         policy_anchor_current_pinned_witnesses,
+        state.full_node_mirror_enabled,
+        state.full_node_mirror_max_producers,
         state.scope,
     ))
     .into_response()
@@ -1266,6 +1310,65 @@ fn build_observation_witness_outcome_status(
     }
 }
 
+fn build_full_node_mirror_status(
+    generated_at: u64,
+    store_enabled: bool,
+    enabled: bool,
+    max_producers: usize,
+    retained_producers: u64,
+    runtime: &DirectoryFullNodeMirrorRuntimeSnapshot,
+) -> DirectoryFullNodeMirrorStatus {
+    let max_producers = u64::try_from(max_producers).unwrap_or(u64::MAX);
+    let status = if !enabled {
+        "disabled"
+    } else if !store_enabled {
+        "unavailable"
+    } else if retained_producers > max_producers {
+        "capacity_exceeded"
+    } else if runtime.rounds == 0 {
+        "awaiting_round"
+    } else if runtime.last_round_selected > 0 && runtime.last_round_succeeded == 0 {
+        "degraded"
+    } else if retained_producers >= max_producers {
+        "capacity_full"
+    } else {
+        "healthy"
+    };
+    DirectoryFullNodeMirrorStatus {
+        enabled,
+        status,
+        durable_registry: "audited_sqlite_schema_v9",
+        max_producers,
+        retained_producers,
+        remaining_capacity: max_producers.saturating_sub(retained_producers),
+        rounds: runtime.rounds,
+        last_round_candidates: runtime.last_round_candidates,
+        last_round_selected: runtime.last_round_selected,
+        last_round_succeeded: runtime.last_round_succeeded,
+        last_round_failed: runtime.last_round_failed,
+        pages_succeeded: runtime.pages_succeeded,
+        attempts_failed: runtime.attempts_failed,
+        last_round_age_seconds: runtime
+            .last_round_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_success_age_seconds: runtime
+            .last_success_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_failure_age_seconds: runtime
+            .last_failure_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        selection_policy:
+            "valid_public_signed_descriptors_excluding_self_and_operator_pins_rotating_bounded_window",
+        transport_policy: "direct_signed_directory_pages_only_no_carrier_fallback",
+        authority_boundary:
+            "operator_pins_only_for_checkpoints_witnesses_and_policy_anchors",
+        privacy_boundary:
+            "aggregate mirror counts and ages only; no identities endpoints routes payloads or client metadata",
+        security_model:
+            "untrusted_verified_replica_transport_not_authority_consensus_fork_choice_voting_or_finality",
+    }
+}
+
 fn build_directory_replica_status_response(
     generated_at: u64,
     store_enabled: bool,
@@ -1280,6 +1383,8 @@ fn build_directory_replica_status_response(
     pending_witness_target: Option<DirectoryReplicaPendingWitnessTarget>,
     witness_policy_matches_runtime: bool,
     policy_anchor_current_pinned_witnesses: u64,
+    full_node_mirror_enabled: bool,
+    full_node_mirror_max_producers: usize,
     scope: DirectoryReplicaStatusScope,
 ) -> DirectoryReplicaStatusResponse {
     let runtime_by_producer = runtime
@@ -1356,6 +1461,14 @@ fn build_directory_replica_status_response(
             retry_state_persistence: "audited_sqlite",
             successful_import_clears_retry_atomically: true,
         },
+        full_node_mirror: build_full_node_mirror_status(
+            generated_at,
+            store_enabled,
+            full_node_mirror_enabled,
+            full_node_mirror_max_producers,
+            persisted.mirror_producers,
+            runtime.full_node_mirror,
+        ),
         observation_convergence: build_observation_convergence_status(
             store_enabled,
             convergence,
@@ -1533,6 +1646,8 @@ mod tests {
             vec![producer],
             1,
             120,
+            false,
+            32,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         let response = router
@@ -1870,6 +1985,8 @@ mod tests {
             vec![producer],
             1,
             120,
+            false,
+            32,
             DirectoryReplicaStatusScope::LocalOperator,
         );
         let response = router
@@ -1900,6 +2017,8 @@ mod tests {
             vec![producer],
             1,
             120,
+            false,
+            32,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         for uri in [
@@ -1919,6 +2038,8 @@ mod tests {
             vec![producer],
             1,
             120,
+            false,
+            32,
             DirectoryReplicaStatusScope::LocalOperator,
         );
         let list_response = local_router
@@ -2017,6 +2138,8 @@ mod tests {
             vec![producer],
             1,
             120,
+            true,
+            32,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         let public_response = public_router
@@ -2049,6 +2172,8 @@ mod tests {
             vec![producer],
             1,
             120,
+            true,
+            32,
             DirectoryReplicaStatusScope::LocalOperator,
         );
         let local_response = local_router

@@ -474,7 +474,9 @@ use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_rep
 use crate::api::directory_replica_status::{
     build_directory_replica_status_router, DirectoryReplicaStatusScope,
 };
-use crate::api::directory_replica_sync::DirectoryReplicaSyncCoordinator;
+use crate::api::directory_replica_sync::{
+    DirectoryReplicaSyncCoordinator, DirectoryReplicaSyncPolicy,
+};
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     pull_record_commitment_checkpoint, pull_record_commitment_checkpoint_certificate,
@@ -2694,6 +2696,14 @@ impl Server {
             .config
             .discovery
             .directory_chain_sync_interval_secs;
+        let directory_full_node_mirror_enabled = self
+            .config
+            .discovery
+            .directory_full_node_mirror_enabled;
+        let directory_full_node_mirror_max_producers = self
+            .config
+            .discovery
+            .directory_full_node_mirror_max_producers;
         let public_directory_chain_store = directory_chain_store.clone();
         let public_directory_chain_sync_peer_ids = directory_chain_sync_peer_ids.clone();
         let public_directory_observation_witness_min_verified =
@@ -2701,6 +2711,9 @@ impl Server {
         let public_directory_replica_store = directory_replica_store.clone();
         let public_directory_replica_sync_runtime =
             Arc::clone(&directory_replica_sync_runtime);
+        let public_directory_full_node_mirror_enabled = directory_full_node_mirror_enabled;
+        let public_directory_full_node_mirror_max_producers =
+            directory_full_node_mirror_max_producers;
 
         tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
@@ -2719,6 +2732,8 @@ impl Server {
                     public_directory_chain_sync_peer_ids,
                     public_directory_observation_witness_min_verified,
                     directory_observation_witness_maturity_delay_secs,
+                    public_directory_full_node_mirror_enabled,
+                    public_directory_full_node_mirror_max_producers,
                     commitment_storage.clone(),
                     commitment_lease_authorized_coordinator,
                     public_commitment_sync_tip_notifier,
@@ -2822,6 +2837,8 @@ impl Server {
                     directory_chain_sync_peer_ids.clone(),
                     directory_observation_witness_min_verified,
                     directory_observation_witness_maturity_delay_secs,
+                    directory_full_node_mirror_enabled,
+                    directory_full_node_mirror_max_producers,
                     DirectoryReplicaStatusScope::LocalOperator,
                 ));
             let app = if let Some(store) = directory_chain_store {
@@ -2831,6 +2848,7 @@ impl Server {
                     Arc::clone(&peer_store),
                     Arc::clone(&node_identity),
                     directory_chain_sync_peer_ids,
+                    directory_full_node_mirror_enabled,
                 ))
             } else {
                 app
@@ -2934,6 +2952,8 @@ impl Server {
         directory_chain_sync_peer_ids: Vec<[u8; 32]>,
         directory_observation_witness_min_verified: usize,
         directory_observation_witness_maturity_delay_secs: u64,
+        directory_full_node_mirror_enabled: bool,
+        directory_full_node_mirror_max_producers: usize,
         commitment_storage: Option<Arc<MemoryStorage>>,
         commitment_lease_authorized_coordinator: Option<[u8; 32]>,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
@@ -2961,6 +2981,8 @@ impl Server {
             directory_chain_sync_peer_ids.clone(),
             directory_observation_witness_min_verified,
             directory_observation_witness_maturity_delay_secs,
+            directory_full_node_mirror_enabled,
+            directory_full_node_mirror_max_producers,
             DirectoryReplicaStatusScope::PublicAggregate,
         ));
         let app = if let Some(store) = directory_chain_store {
@@ -2970,6 +2992,7 @@ impl Server {
                 directory_peer_store,
                 directory_identity,
                 directory_chain_sync_peer_ids,
+                directory_full_node_mirror_enabled,
             ))
         } else {
             app
@@ -4312,6 +4335,7 @@ impl Server {
         })?;
         info!(
             producers = audit.producers,
+            mirror_producers = audit.mirror_producers,
             quarantined_producers = audit.quarantined_producers,
             blocks = audit.blocks,
             commitments = audit.commitments,
@@ -4337,10 +4361,10 @@ impl Server {
         Ok(Some(Arc::new(store)))
     }
 
-    /// Starts one low-frequency bounded pull per operator-pinned producer.
+    /// Starts bounded authority pulls and optional non-authoritative mirroring.
     ///
-    /// Empty pins are a hard disable. Errors are logged only as stable reason
-    /// buckets, without peer ids, endpoints, descriptor hashes, or route data.
+    /// Empty pins disable checkpoints/witnesses but may still run opt-in mirror
+    /// transport. Errors are logged only as stable aggregate reason buckets.
     fn spawn_directory_replica_sync_task(
         &self,
         peer_store: Arc<PeerStore>,
@@ -4352,8 +4376,18 @@ impl Server {
             .discovery
             .directory_chain_sync_peer_node_id_bytes();
         let store = store?;
-        if peers.is_empty() {
-            info!("[DIRECTORY_REPLICA] Outbound sync disabled; no peers are pinned");
+        let full_node_mirror_enabled = self
+            .config
+            .discovery
+            .directory_full_node_mirror_enabled;
+        let full_node_mirror_max_producers = self
+            .config
+            .discovery
+            .directory_full_node_mirror_max_producers;
+        if peers.is_empty() && !full_node_mirror_enabled {
+            info!(
+                "[DIRECTORY_REPLICA] Outbound sync disabled; no peers are pinned and mirror mode is off"
+            );
             return None;
         }
         let interval_secs = self
@@ -4364,14 +4398,18 @@ impl Server {
             .config
             .discovery
             .directory_observation_witness_min_verified;
-        let coordinator = match DirectoryReplicaSyncCoordinator::new(
+        let coordinator = match DirectoryReplicaSyncCoordinator::new_with_policy(
             peers,
             interval_secs,
             store,
             runtime,
             peer_store,
             Arc::new(self.identity.clone()),
-            witness_min_verified,
+            DirectoryReplicaSyncPolicy {
+                witness_min_verified,
+                full_node_mirror_enabled,
+                full_node_mirror_max_producers,
+            },
         ) {
             Ok(coordinator) => coordinator,
             Err(reason) => {

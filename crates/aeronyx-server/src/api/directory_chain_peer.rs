@@ -17,7 +17,9 @@
 //! - `POST /api/discovery/peer/directory/replica-descriptor-objects`
 //! - `POST /api/discovery/peer/directory/observation-checkpoint-witness`
 //! - `POST /api/discovery/peer/directory/observation-policy-anchor`
-//! - Dedicated operator-pinned admission in addition to live `PeerStore` proof.
+//! - Tiered admission: verified public peers may mirror this node's own signed
+//!   producer history, while replica carrier, witness, and policy-anchor routes
+//!   remain restricted to operator-pinned peers.
 //! - Ed25519 request/response authentication, timestamp freshness, replay
 //!   rejection, per-peer rate limits, body limits, and audit-gated reads.
 //! - Exact content-addressed descriptor batches; no partial object response.
@@ -36,8 +38,8 @@
 //! ## Main Logical Flow
 //! 1. Axum rejects an oversized body before protocol deserialization.
 //! 2. The handler decodes one canonical Directory Sync V1 frame.
-//! 3. Chain id, request bounds, pin, live peer descriptor, timestamp,
-//!    signature, replay id, and rate budget are verified in that order.
+//! 3. Chain id, request bounds, route-specific admission, live peer descriptor,
+//!    timestamp, signature, replay id, and rate budgets are verified.
 //! 4. A blocking worker performs the complete local chain audit and bounded read.
 //! 5. The local producer signs a response binding request id, ordered hashes,
 //!    returned block identities, and the audited tip.
@@ -55,9 +57,9 @@
 //! records, DNS contents, destinations, private keys, or wallet traffic.
 //!
 //! ## Important Note for Next Developer
-//! - Never replace `directory_chain_sync_peer_node_ids` with permissionless
-//!   discovery admission. Both a configured pin and a current signed descriptor
-//!   are required.
+//! - Permissionless admission applies only to the local producer tip, range,
+//!   and descriptor-object routes. Replica carrier, witness, and policy-anchor
+//!   routes always require both a configured pin and a live descriptor.
 //! - Never return a descriptor not committed by the audited local chain.
 //! - Keep request/response limits synchronized with `aeronyx-core` constants.
 //! - Replica import, fork quarantine, and fork choice are separate layers. A
@@ -68,6 +70,7 @@
 //!   signature does not replace any producer block or descriptor signature.
 //!
 //! ## Last Modified
+//! v0.8.0-FullNodeMirror - Added verified-public read admission with pinned authority routes.
 //! v0.7.0-DirectoryPolicyHeadAnchor - Added durable opaque policy-head anchor route.
 //! v0.6.1-DirectoryBoundedMultiBlockCatchUp - Added commitment-bounded multi-block pages.
 //! v0.6.0-DirectoryEvidenceCarrier - Added audited pinned replica-carrier routes.
@@ -124,6 +127,8 @@ use crate::services::{
 const MAX_DIRECTORY_SYNC_REQUEST_BODY_BYTES: usize = 16 * 1024;
 /// Shared inbound budget for each pinned peer identity.
 const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
+/// Global budget bounds aggregate pressure from permissionless verified peers.
+const MAX_DIRECTORY_REQUESTS_GLOBAL_PER_MINUTE: u32 = 512;
 /// Accepted signed request clock skew in either direction.
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Stateful request ids remain rejected for this duration.
@@ -135,11 +140,13 @@ struct DirectoryChainPeerState {
     peer_store: Arc<PeerStore>,
     identity: Arc<IdentityKeyPair>,
     pinned_peers: Arc<HashSet<[u8; 32]>>,
+    allow_public_mirror_reads: bool,
     guard: Arc<Mutex<DirectoryPeerRequestGuard>>,
 }
 
 #[derive(Debug, Default)]
 struct DirectoryPeerRequestGuard {
+    global_window: PeerRateWindow,
     rate_windows: HashMap<[u8; 32], PeerRateWindow>,
     seen_requests: HashMap<([u8; 32], [u8; 16]), u64>,
 }
@@ -157,6 +164,12 @@ impl DirectoryPeerRequestGuard {
         let minute = now / 60;
         self.rate_windows
             .retain(|_, window| window.minute >= minute.saturating_sub(1));
+        if self.global_window.minute != minute {
+            self.global_window = PeerRateWindow { minute, used: 0 };
+        }
+        if self.global_window.used >= MAX_DIRECTORY_REQUESTS_GLOBAL_PER_MINUTE {
+            return false;
+        }
         let window = self.rate_windows.entry(requester).or_default();
         if window.minute != minute {
             *window = PeerRateWindow { minute, used: 0 };
@@ -164,6 +177,7 @@ impl DirectoryPeerRequestGuard {
         if window.used >= MAX_REQUESTS_PER_PEER_PER_MINUTE {
             return false;
         }
+        self.global_window.used = self.global_window.used.saturating_add(1);
         window.used += 1;
         if self.seen_requests.contains_key(&(requester, request_id)) {
             return false;
@@ -171,6 +185,14 @@ impl DirectoryPeerRequestGuard {
         self.seen_requests.insert((requester, request_id), now);
         true
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryPeerAdmission {
+    /// Read-only mirroring of this node's own public signed producer history.
+    VerifiedPublicMirror,
+    /// Authority-sensitive carrier, witness, and policy-anchor operations.
+    PinnedAuthority,
 }
 
 /// Builds the fail-closed Directory Chain peer router.
@@ -187,6 +209,7 @@ pub fn build_directory_chain_peer_router(
         peer_store,
         identity,
         pinned_peer_ids,
+        false,
     )
 }
 
@@ -200,6 +223,7 @@ pub fn build_directory_chain_peer_router_with_replica(
     peer_store: Arc<PeerStore>,
     identity: Arc<IdentityKeyPair>,
     pinned_peer_ids: Vec<[u8; 32]>,
+    allow_public_mirror_reads: bool,
 ) -> Router {
     let state = DirectoryChainPeerState {
         store,
@@ -207,6 +231,7 @@ pub fn build_directory_chain_peer_router_with_replica(
         peer_store,
         identity,
         pinned_peers: Arc::new(pinned_peer_ids.into_iter().collect()),
+        allow_public_mirror_reads,
         guard: Arc::new(Mutex::new(DirectoryPeerRequestGuard::default())),
     };
     let mut router = Router::new()
@@ -245,6 +270,7 @@ pub fn build_directory_chain_peer_router_with_replica(
 
 async fn authenticate_request(
     state: &DirectoryChainPeerState,
+    admission: DirectoryPeerAdmission,
     requester: [u8; 32],
     request_id: [u8; 16],
     request_timestamp: u64,
@@ -255,11 +281,30 @@ async fn authenticate_request(
     if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
         return Err(protocol_error(StatusCode::UNAUTHORIZED, "stale_request"));
     }
-    if !state.pinned_peers.contains(&requester) {
+    if admission == DirectoryPeerAdmission::PinnedAuthority
+        && !state.pinned_peers.contains(&requester)
+    {
         return Err(protocol_error(StatusCode::FORBIDDEN, "peer_not_pinned"));
     }
-    if state.peer_store.get_valid(&requester, now).is_none() {
+    if admission == DirectoryPeerAdmission::VerifiedPublicMirror
+        && !state.allow_public_mirror_reads
+        && !state.pinned_peers.contains(&requester)
+    {
+        return Err(protocol_error(
+            StatusCode::FORBIDDEN,
+            "public_mirror_disabled",
+        ));
+    }
+    let Some(descriptor) = state.peer_store.get_valid(&requester, now) else {
         return Err(protocol_error(StatusCode::FORBIDDEN, "unknown_peer"));
+    };
+    if admission == DirectoryPeerAdmission::VerifiedPublicMirror
+        && !descriptor.descriptor.policy.public_discovery
+    {
+        return Err(protocol_error(
+            StatusCode::FORBIDDEN,
+            "peer_not_public",
+        ));
     }
     if IdentityPublicKey::from_bytes(&requester)
         .and_then(|key| key.verify(signing_bytes, signature))
@@ -346,6 +391,7 @@ async fn tip_handler(State(state): State<DirectoryChainPeerState>, body: Bytes) 
         directory_tip_request_signing_bytes(&chain_id, &request_id, &requester, request_timestamp);
     if let Err(response) = authenticate_request(
         &state,
+        DirectoryPeerAdmission::VerifiedPublicMirror,
         requester,
         request_id,
         request_timestamp,
@@ -425,6 +471,7 @@ async fn block_range_handler(
     );
     if let Err(response) = authenticate_request(
         &state,
+        DirectoryPeerAdmission::VerifiedPublicMirror,
         requester,
         request_id,
         request_timestamp,
@@ -520,6 +567,7 @@ async fn descriptor_objects_handler(
     );
     if let Err(response) = authenticate_request(
         &state,
+        DirectoryPeerAdmission::VerifiedPublicMirror,
         requester,
         request_id,
         request_timestamp,
@@ -609,6 +657,7 @@ async fn replica_block_range_handler(
     );
     if let Err(response) = authenticate_request(
         &state,
+        DirectoryPeerAdmission::PinnedAuthority,
         requester,
         request_id,
         request_timestamp,
@@ -715,6 +764,7 @@ async fn replica_descriptor_objects_handler(
     );
     if let Err(response) = authenticate_request(
         &state,
+        DirectoryPeerAdmission::PinnedAuthority,
         requester,
         request_id,
         request_timestamp,
@@ -805,6 +855,7 @@ async fn observation_checkpoint_witness_handler(
     );
     if let Err(response) = authenticate_request(
         &state,
+        DirectoryPeerAdmission::PinnedAuthority,
         requester,
         request_id,
         request_timestamp,
@@ -904,6 +955,7 @@ async fn observation_policy_anchor_handler(
     );
     if let Err(response) = authenticate_request(
         &state,
+        DirectoryPeerAdmission::PinnedAuthority,
         *requester,
         *request_id,
         *request_timestamp,
@@ -1100,6 +1152,8 @@ mod tests {
 
     fn test_router(
         pinned: bool,
+        public_discovery: bool,
+        allow_public_mirror_reads: bool,
     ) -> (
         Router,
         Arc<IdentityKeyPair>,
@@ -1111,7 +1165,16 @@ mod tests {
         let requester = IdentityKeyPair::from_bytes(&[0xa2; 32]).unwrap();
         let observed = IdentityKeyPair::from_bytes(&[0xa3; 32]).unwrap();
         let observed_descriptor = signed_descriptor(&observed, now);
-        let requester_descriptor = signed_descriptor(&requester, now);
+        let mut requester_node_descriptor = NodeDescriptor::new(
+            requester.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 600,
+            "directory-sync-test",
+        );
+        requester_node_descriptor.policy.public_discovery = public_discovery;
+        let requester_descriptor =
+            SignedNodeDescriptor::sign(requester_node_descriptor, &requester).unwrap();
         let peer_store = Arc::new(PeerStore::new());
         peer_store
             .upsert_verified_from_source(requester_descriptor, now, "directory_sync_test")
@@ -1131,11 +1194,13 @@ mod tests {
             .into_iter()
             .collect();
         (
-            build_directory_chain_peer_router(
+            build_directory_chain_peer_router_with_replica(
                 Arc::new(store),
+                None,
                 peer_store,
                 Arc::clone(&producer),
                 pins,
+                allow_public_mirror_reads,
             ),
             producer,
             requester,
@@ -1160,6 +1225,22 @@ mod tests {
             signature: requester.sign(&signing_bytes),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn request_guard_enforces_global_permissionless_budget() {
+        let mut guard = DirectoryPeerRequestGuard::default();
+        let now = 1_700_000_000;
+        for index in 0..MAX_DIRECTORY_REQUESTS_GLOBAL_PER_MINUTE {
+            let mut requester = [0u8; 32];
+            requester[..4].copy_from_slice(&index.to_le_bytes());
+            requester[31] = 1;
+            let mut request_id = [0u8; 16];
+            request_id[..4].copy_from_slice(&index.to_le_bytes());
+            assert!(guard.admit(requester, request_id, now));
+        }
+        assert!(!guard.admit([0xff; 32], [0xff; 16], now));
+        assert!(guard.admit([0xfe; 32], [0xfe; 16], now + 60));
     }
 
     fn witness_test_router() -> (Router, Arc<IdentityKeyPair>, IdentityKeyPair) {
@@ -1195,6 +1276,7 @@ mod tests {
                 peer_store,
                 Arc::clone(&witness),
                 vec![observer.public_key_bytes()],
+                false,
             ),
             witness,
             observer,
@@ -1276,6 +1358,7 @@ mod tests {
                 peer_store,
                 Arc::clone(&carrier),
                 vec![requester.public_key_bytes(), producer.public_key_bytes()],
+                false,
             ),
             carrier,
             requester,
@@ -1286,7 +1369,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_live_peer_receives_signed_audited_tip_and_replay_is_rejected() {
-        let (router, producer, requester, _) = test_router(true);
+        let (router, producer, requester, _) = test_router(true, true, false);
         let request_id = [0xb1; 16];
         let request = tip_request(&requester, request_id);
         let response = router
@@ -1344,12 +1427,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpinned_peer_is_rejected_even_with_live_descriptor_and_valid_signature() {
-        let (router, _, requester, _) = test_router(false);
+    async fn unpinned_public_peer_can_read_signed_local_producer_tip() {
+        let (router, _, requester, _) = test_router(false, true, true);
         let response = router
             .oneshot(
                 Request::post("/api/discovery/peer/directory/tip")
                     .body(Body::from(tip_request(&requester, [0xb2; 16])))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mirror_mode_disabled_preserves_pinned_only_read_admission() {
+        let (router, _, requester, _) = test_router(false, true, false);
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/tip")
+                    .body(Body::from(tip_request(&requester, [0xba; 16])))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn unpinned_private_peer_cannot_read_signed_local_producer_tip() {
+        let (router, _, requester, _) = test_router(false, false, true);
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/tip")
+                    .body(Body::from(tip_request(&requester, [0xb9; 16])))
                     .unwrap(),
             )
             .await
@@ -1359,7 +1470,7 @@ mod tests {
 
     #[tokio::test]
     async fn block_and_descriptor_routes_return_exact_committed_objects() {
-        let (router, producer, requester, expected_descriptor) = test_router(true);
+        let (router, producer, requester, expected_descriptor) = test_router(true, true, false);
         let timestamp = now_secs();
         let requester_id = requester.public_key_bytes();
         let range_id = [0xb3; 16];

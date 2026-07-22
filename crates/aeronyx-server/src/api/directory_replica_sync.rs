@@ -39,6 +39,8 @@
 //! - Requests up to eight contiguous blocks per page while the peer-side
 //!   commitment cap preserves the original hydration/body budget.
 //! - Cancels an in-flight round when server shutdown is requested.
+//! - Optionally mirrors one direct page from a rotating, bounded set of valid
+//!   public discovery peers without adding them to authority checkpoints.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -68,6 +70,8 @@
 //! 12. Stop the complete round immediately when shutdown wins the select.
 //! 13. Ask missing current pins to retain the opaque current policy head and
 //!     persist only exact accepted signed receipts.
+//! 14. Select verified public mirror candidates, exclude self and authority
+//!     pins, rotate a bounded attempt window, and import only direct signed data.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -85,8 +89,11 @@
 //!   fork choice, consensus, or finality.
 //! - Never use carrier fallback after a noncanonical, wrong-producer, invalid
 //!   signature, or descriptor-hash response; these are security failures.
+//! - Never feed permissionless mirror membership into checkpoints, witnesses,
+//!   policy anchors, fork choice, consensus, voting, or finality.
 //!
 //! ## Last Modified
+//! `v0.14.0-FullNodeMirror` - Added bounded rotating non-authoritative mirror pulls.
 //! `v0.13.0-DirectoryPolicyHeadAnchor` - Added bounded external policy-head anchor rounds.
 //! `v0.12.0-DirectoryBoundedColdCatchUp` - Raised the sparse-page cold catch-up cap while preserving the per-peer request budget.
 //! `v0.11.0-DirectoryWitnessThreshold` - Added retryable pinned-witness corroboration targets.
@@ -109,7 +116,8 @@
 //! from `server.rs` and added deterministic startup synchronization jitter.
 // ============================================
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -188,6 +196,8 @@ pub(crate) const DIRECTORY_SYNC_MAX_PAGES_PER_ROUND: u32 = 8;
 /// Worst-case pages consume the complete round; ordinary sparse blocks can
 /// use the remaining budget without crossing the peer admission ceiling.
 pub(crate) const DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND: u32 = 30;
+/// Permissionless mirror work is intentionally below authority fan-out limits.
+const DIRECTORY_MIRROR_MAX_ATTEMPTS_PER_ROUND: usize = 8;
 
 /// Result of one authenticated outbound replica synchronization page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +340,17 @@ impl DirectoryFramePostError {
     }
 }
 
+/// Immutable authority and mirror policy for one synchronization coordinator.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DirectoryReplicaSyncPolicy {
+    /// Minimum independent pinned witnesses for observation evidence.
+    pub(crate) witness_min_verified: usize,
+    /// Enables non-authoritative permissionless producer mirroring.
+    pub(crate) full_node_mirror_enabled: bool,
+    /// Durable namespace ceiling for permissionless mirror producers.
+    pub(crate) full_node_mirror_max_producers: usize,
+}
+
 /// Coordinates bounded synchronization for operator-pinned Directory producers.
 pub struct DirectoryReplicaSyncCoordinator {
     peers: Arc<[[u8; 32]]>,
@@ -343,6 +364,9 @@ pub struct DirectoryReplicaSyncCoordinator {
     policy_anchor_capabilities: DirectoryWitnessCapabilityCache,
     witness_min_verified: usize,
     restored_retry_states: usize,
+    full_node_mirror_enabled: bool,
+    full_node_mirror_max_producers: usize,
+    mirror_round_cursor: AtomicU64,
 }
 
 impl DirectoryReplicaSyncCoordinator {
@@ -360,14 +384,65 @@ impl DirectoryReplicaSyncCoordinator {
         identity: Arc<IdentityKeyPair>,
         witness_min_verified: usize,
     ) -> Result<Self, &'static str> {
-        if peers.is_empty() {
-            return Err("directory_sync_no_pinned_producers");
+        Self::new_with_policy(
+            peers,
+            interval_secs,
+            store,
+            runtime,
+            peer_store,
+            identity,
+            DirectoryReplicaSyncPolicy {
+                witness_min_verified,
+                full_node_mirror_enabled: false,
+                full_node_mirror_max_producers: 32,
+            },
+        )
+    }
+
+    /// Builds a coordinator with explicit authority and mirror policy.
+    pub(crate) fn new_with_policy(
+        peers: Vec<[u8; 32]>,
+        interval_secs: u64,
+        store: Arc<DirectoryReplicaStore>,
+        runtime: Arc<DirectoryReplicaSyncRuntime>,
+        peer_store: Arc<PeerStore>,
+        identity: Arc<IdentityKeyPair>,
+        policy: DirectoryReplicaSyncPolicy,
+    ) -> Result<Self, &'static str> {
+        let DirectoryReplicaSyncPolicy {
+            witness_min_verified,
+            full_node_mirror_enabled,
+            full_node_mirror_max_producers,
+        } = policy;
+        if peers.is_empty() && !full_node_mirror_enabled {
+            return Err("directory_sync_no_producers_or_mirror_mode");
         }
         if interval_secs == 0 {
             return Err("directory_sync_interval_invalid");
         }
-        if witness_min_verified == 0 || witness_min_verified > peers.len() {
+        if !peers.is_empty()
+            && (witness_min_verified == 0 || witness_min_verified > peers.len())
+        {
             return Err("directory_observation_witness_threshold_invalid");
+        }
+        if full_node_mirror_enabled
+            && !(1..=crate::services::directory_replica::MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS)
+                .contains(&full_node_mirror_max_producers)
+        {
+            return Err("directory_full_node_mirror_capacity_invalid");
+        }
+        store
+            .promote_pinned_producers(&peers)
+            .map_err(|_| "directory_mirror_authority_promotion_failed")?;
+        if full_node_mirror_enabled {
+            store
+                .ensure_mirror_capacity(full_node_mirror_max_producers)
+                .map_err(|error| match error {
+                    DirectoryReplicaStoreError::MirrorCapacity => {
+                        "directory_mirror_registry_exceeds_configured_capacity"
+                    }
+                    _ => "directory_mirror_capacity_audit_failed",
+                })?;
         }
         runtime.register_producers(&peers);
         let retry_states = store
@@ -397,6 +472,9 @@ impl DirectoryReplicaSyncCoordinator {
             policy_anchor_capabilities: DirectoryWitnessCapabilityCache::default(),
             witness_min_verified,
             restored_retry_states,
+            full_node_mirror_enabled,
+            full_node_mirror_max_producers,
+            mirror_round_cursor: AtomicU64::new(0),
         })
     }
 
@@ -414,6 +492,8 @@ impl DirectoryReplicaSyncCoordinator {
                 interval_secs = self.interval.as_secs(),
                 catch_up_interval_secs = DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS,
                 restored_retry_states = self.restored_retry_states,
+                full_node_mirror_enabled = self.full_node_mirror_enabled,
+                full_node_mirror_capacity = self.full_node_mirror_max_producers,
                 "[DIRECTORY_REPLICA] Synchronization coordinator started"
             );
 
@@ -446,11 +526,127 @@ impl DirectoryReplicaSyncCoordinator {
         // Policy rollback detection must not wait for replica convergence. A
         // temporarily unavailable producer cannot be allowed to suppress the
         // independent external high-water check after a host rollback.
-        self.anchor_current_observation_witness_policy().await;
-        if all_producers_synchronized {
+        if !self.peers.is_empty() {
+            self.anchor_current_observation_witness_policy().await;
+        }
+        if !self.peers.is_empty() && all_producers_synchronized {
             self.persist_observation_checkpoint().await;
         }
+        if self.full_node_mirror_enabled {
+            self.synchronize_full_node_mirrors().await;
+        }
         all_producers_synchronized
+    }
+
+    async fn synchronize_full_node_mirrors(&self) {
+        let now = unix_now_secs();
+        let retained = {
+            let store = Arc::clone(&self.store);
+            let Ok(Ok(producers)) =
+                tokio::task::spawn_blocking(move || store.mirror_producer_ids()).await
+            else {
+                self.runtime
+                    .record_full_node_mirror_round(0, 0, 0, now);
+                warn!(
+                    reason = "directory_mirror_registry_read_failed",
+                    "[DIRECTORY_REPLICA] Full-node Mirror round skipped"
+                );
+                return;
+            };
+            producers
+        };
+        let retained_set = retained.iter().copied().collect::<HashSet<_>>();
+        let pinned = self.peers.iter().copied().collect::<HashSet<_>>();
+        let local = self.identity.public_key_bytes();
+        let mut candidates = self
+            .peer_store
+            .valid_public_descriptors(now, usize::MAX)
+            .into_iter()
+            .filter(|descriptor| {
+                let node_id = descriptor.node_id();
+                node_id != local
+                    && !pinned.contains(&node_id)
+                    && descriptor
+                        .descriptor
+                        .public_endpoint
+                        .as_deref()
+                        .is_some_and(commitment_peer_endpoint_is_public)
+            })
+            .map(|descriptor| (descriptor.node_id(), descriptor.sequence()))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(node_id, _)| (!retained_set.contains(node_id), *node_id));
+        let candidate_count = candidates.len();
+        let open_slots = self
+            .full_node_mirror_max_producers
+            .saturating_sub(retained_set.len());
+        let mut new_selected = 0usize;
+        candidates.retain(|(node_id, _)| {
+            if retained_set.contains(node_id) {
+                true
+            } else if new_selected < open_slots {
+                new_selected = new_selected.saturating_add(1);
+                true
+            } else {
+                false
+            }
+        });
+        candidates.truncate(self.full_node_mirror_max_producers);
+        if candidates.is_empty() {
+            self.runtime
+                .record_full_node_mirror_round(candidate_count, 0, 0, now);
+            return;
+        }
+        let cursor = usize::try_from(self.mirror_round_cursor.fetch_add(1, Ordering::Relaxed))
+            .unwrap_or(0)
+            % candidates.len();
+        candidates.rotate_left(cursor);
+        candidates.truncate(DIRECTORY_MIRROR_MAX_ATTEMPTS_PER_ROUND);
+        let selected = candidates.len();
+        let outcomes = stream::iter(candidates)
+            .map(|(producer, descriptor_sequence)| async move {
+                self.synchronize_full_node_mirror(producer, descriptor_sequence)
+                    .await
+            })
+            .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
+            .collect::<Vec<_>>()
+            .await;
+        let succeeded = outcomes.iter().filter(|accepted| **accepted).count();
+        self.runtime.record_full_node_mirror_round(
+            candidate_count,
+            selected,
+            succeeded,
+            unix_now_secs(),
+        );
+        debug!(
+            candidates = candidate_count,
+            selected,
+            succeeded,
+            failed = selected.saturating_sub(succeeded),
+            retained = retained_set.len(),
+            capacity = self.full_node_mirror_max_producers,
+            "[DIRECTORY_REPLICA] Full-node Mirror round completed"
+        );
+    }
+
+    async fn synchronize_full_node_mirror(
+        &self,
+        producer: [u8; 32],
+        descriptor_sequence: u64,
+    ) -> bool {
+        let result = tokio::time::timeout(
+            Duration::from_secs(DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS),
+            pull_directory_chain_mirror_page(
+                Arc::clone(&self.store),
+                self.peer_store.as_ref(),
+                self.identity.as_ref(),
+                &producer,
+                descriptor_sequence,
+                self.full_node_mirror_max_producers,
+                &self.client,
+            ),
+        )
+        .await;
+        matches!(result, Ok(Ok(_)))
     }
 
     async fn synchronize_producer(&self, producer: [u8; 32]) -> bool {
@@ -1247,6 +1443,68 @@ pub async fn pull_directory_chain_page(
     import_directory_range_page(replica_store, *producer, page, objects, requests_made).await
 }
 
+/// Pulls one direct signed page into the bounded non-authoritative mirror set.
+///
+/// The exact discovery descriptor sequence selected for this attempt must still
+/// be current and public when URLs are derived. Mirror pulls never use carrier
+/// fallback and never alter configured checkpoint/witness authority membership.
+async fn pull_directory_chain_mirror_page(
+    replica_store: Arc<DirectoryReplicaStore>,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    producer: &[u8; 32],
+    descriptor_sequence: u64,
+    max_mirror_producers: usize,
+    client: &reqwest::Client,
+) -> Result<DirectorySyncPullOutcome, String> {
+    let request_timestamp = unix_now_secs();
+    let local_tip = replica_store
+        .producer_tip(producer)
+        .map_err(|_| "directory_mirror_tip_unavailable".to_string())?;
+    if local_tip.quarantined {
+        return Err("directory_mirror_producer_quarantined".to_string());
+    }
+    let (range_url, object_url) = directory_mirror_peer_urls(
+        peer_store,
+        producer,
+        descriptor_sequence,
+        request_timestamp,
+    )?;
+    let from_height = local_tip
+        .tip_height
+        .checked_add(1)
+        .ok_or_else(|| "directory_mirror_height_exhausted".to_string())?;
+    let requester = identity.public_key_bytes();
+    let page = request_directory_block_page(
+        identity,
+        producer,
+        client,
+        range_url,
+        from_height,
+        request_timestamp,
+    )
+    .await?;
+    let (objects, requests_made) = hydrate_directory_descriptor_objects(
+        identity,
+        producer,
+        client,
+        object_url,
+        &requester,
+        &page.blocks,
+    )
+    .await?;
+    import_directory_mirror_range_page(
+        replica_store,
+        *producer,
+        descriptor_sequence,
+        max_mirror_producers,
+        page,
+        objects,
+        requests_made,
+    )
+    .await
+}
+
 async fn pull_directory_chain_page_with_carriers(
     replica_store: Arc<DirectoryReplicaStore>,
     peer_store: &PeerStore,
@@ -1393,6 +1651,36 @@ fn directory_sync_peer_urls(
     let object_url =
         commitment_peer_url(endpoint, "/api/discovery/peer/directory/descriptor-objects")
             .map_err(|_| "pinned_directory_peer_invalid_endpoint".to_string())?;
+    Ok((range_url, object_url))
+}
+
+fn directory_mirror_peer_urls(
+    peer_store: &PeerStore,
+    producer: &[u8; 32],
+    descriptor_sequence: u64,
+    request_timestamp: u64,
+) -> Result<(reqwest::Url, reqwest::Url), String> {
+    let descriptor = peer_store
+        .get_valid(producer, request_timestamp)
+        .ok_or_else(|| "directory_mirror_peer_unavailable".to_string())?;
+    if descriptor.sequence() != descriptor_sequence
+        || !descriptor.descriptor.policy.public_discovery
+    {
+        return Err("directory_mirror_descriptor_changed".to_string());
+    }
+    let endpoint = descriptor
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "directory_mirror_peer_missing_endpoint".to_string())?;
+    if !commitment_peer_endpoint_is_public(endpoint) {
+        return Err("directory_mirror_peer_unsafe_endpoint".to_string());
+    }
+    let range_url = commitment_peer_url(endpoint, "/api/discovery/peer/directory/block-range")
+        .map_err(|_| "directory_mirror_peer_invalid_endpoint".to_string())?;
+    let object_url =
+        commitment_peer_url(endpoint, "/api/discovery/peer/directory/descriptor-objects")
+            .map_err(|_| "directory_mirror_peer_invalid_endpoint".to_string())?;
     Ok((range_url, object_url))
 }
 
@@ -1665,6 +1953,53 @@ async fn import_directory_range_page(
     .map_err(|error| match error {
         DirectoryReplicaStoreError::Quarantined(_) => "producer_quarantined".to_string(),
         _ => "directory_replica_import_rejected".to_string(),
+    })?;
+    Ok(DirectorySyncPullOutcome {
+        import,
+        has_more,
+        remote_tip_height,
+        remote_tip_hash,
+        requests_made,
+    })
+}
+
+async fn import_directory_mirror_range_page(
+    replica_store: Arc<DirectoryReplicaStore>,
+    producer: [u8; 32],
+    descriptor_sequence: u64,
+    max_mirror_producers: usize,
+    page: DirectoryRangePage,
+    objects: Vec<SignedNodeDescriptor>,
+    requests_made: u32,
+) -> Result<DirectorySyncPullOutcome, String> {
+    let DirectoryRangePage {
+        blocks,
+        has_more,
+        remote_tip_height,
+        remote_tip_hash,
+        signed_response,
+    } = page;
+    let import = tokio::task::spawn_blocking(move || {
+        replica_store.import_verified_mirror_page(
+            producer,
+            descriptor_sequence,
+            max_mirror_producers,
+            &blocks,
+            &objects,
+            remote_tip_height,
+            remote_tip_hash,
+            &signed_response,
+            unix_now_secs(),
+        )
+    })
+    .await
+    .map_err(|_| "directory_mirror_import_task_failed".to_string())?
+    .map_err(|error| match error {
+        DirectoryReplicaStoreError::MirrorCapacity => "directory_mirror_capacity_full".to_string(),
+        DirectoryReplicaStoreError::Quarantined(_) => {
+            "directory_mirror_producer_quarantined".to_string()
+        }
+        _ => "directory_mirror_import_rejected".to_string(),
     })?;
     Ok(DirectorySyncPullOutcome {
         import,
@@ -2042,39 +2377,51 @@ mod tests {
         let store = Arc::new(store);
         let runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
         assert_eq!(
-            DirectoryReplicaSyncCoordinator::new(
+            DirectoryReplicaSyncCoordinator::new_with_policy(
                 vec![configured],
                 120,
                 Arc::clone(&store),
                 Arc::clone(&runtime),
                 Arc::new(PeerStore::new()),
                 Arc::clone(&local),
-                0,
+                DirectoryReplicaSyncPolicy {
+                    witness_min_verified: 0,
+                    full_node_mirror_enabled: false,
+                    full_node_mirror_max_producers: 32,
+                },
             )
             .err(),
             Some("directory_observation_witness_threshold_invalid")
         );
         assert_eq!(
-            DirectoryReplicaSyncCoordinator::new(
+            DirectoryReplicaSyncCoordinator::new_with_policy(
                 vec![configured],
                 120,
                 Arc::clone(&store),
                 Arc::clone(&runtime),
                 Arc::new(PeerStore::new()),
                 Arc::clone(&local),
-                2,
+                DirectoryReplicaSyncPolicy {
+                    witness_min_verified: 2,
+                    full_node_mirror_enabled: false,
+                    full_node_mirror_max_producers: 32,
+                },
             )
             .err(),
             Some("directory_observation_witness_threshold_invalid")
         );
-        let coordinator = DirectoryReplicaSyncCoordinator::new(
+        let coordinator = DirectoryReplicaSyncCoordinator::new_with_policy(
             vec![configured],
             120,
             store,
             Arc::clone(&runtime),
             Arc::new(PeerStore::new()),
             local,
-            1,
+            DirectoryReplicaSyncPolicy {
+                witness_min_verified: 1,
+                full_node_mirror_enabled: false,
+                full_node_mirror_max_producers: 32,
+            },
         )
         .unwrap();
 

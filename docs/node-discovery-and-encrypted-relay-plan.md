@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.25.0 - Opaque signed Directory witness-policy heads anchored at exact current pins.
+Modification Reason: v0.26.0 - Bounded permissionless Full-node Mirror Mode with an explicit non-authority boundary.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.25.0 - Added monotonic external policy-head anchors without exporting witness membership or claiming consensus.
+Last Modified: v0.26.0 - Added capacity-bounded public mirrors that cannot affect checkpoint, witness, or policy authority.
+Previous: v0.25.0 - Added monotonic external policy-head anchors without exporting witness membership or claiming consensus.
 Previous: v0.24.0 - Distinguished independent multi-node corroboration from one-receipt evidence without claiming consensus.
 Previous: v0.23.0 - Kept recurring witness selection cost fixed while preserving complete startup and explicit operator audits.
 Previous: v0.22.0 - Prevented asymmetric replica schedules from perpetually witnessing a checkpoint that peers have not received yet.
@@ -1024,11 +1025,14 @@ Implemented in Directory Sync V1 serving:
   timestamps, ordered block hashes/object hashes, and the audited tip.
 - `/api/discovery/peer/directory/tip`, `block-range`, and
   `descriptor-objects` use bounded binary frames and exact content addressing.
-- A dedicated `discovery.directory_chain_sync_peer_node_ids` pin list is
-  required in addition to a current valid signed PeerStore descriptor. Empty
-  configuration remains fail-closed and backward compatible.
-- Requests enforce timestamp freshness, replay rejection, per-peer rate
-  limits, strict body/page/object limits, canonical decoding, and chain id.
+- Authority-sensitive carrier, checkpoint-witness, and policy-anchor routes
+  require `discovery.directory_chain_sync_peer_node_ids` plus a current valid
+  signed PeerStore descriptor.
+- When Full-node Mirror Mode is enabled, valid public discovery peers may read
+  only this node's own signed tip, block range, and committed descriptor objects.
+  Disabling the mode preserves the original pinned-only admission behavior.
+- Requests enforce timestamp freshness, replay rejection, per-peer and global
+  rate limits, strict body/page/object limits, canonical decoding, and chain id.
 - Every response is gated by a complete persisted-chain audit. Object batches
   are all-or-nothing and preserve the requested hash order.
 
@@ -1050,6 +1054,32 @@ Implemented in Directory Sync V1 replica pull:
   freshness, response signature, block producer identity, exact object order,
   and every descriptor signature/hash. The replica store independently decodes
   and verifies the signed range evidence again before its atomic transaction.
+
+Implemented in Full-node Mirror Mode V1:
+
+- `discovery.directory_full_node_mirror_enabled` is an explicit default-off
+  opt-in; `directory_full_node_mirror_max_producers` sets a hard 1-64 durable
+  namespace ceiling (default 32).
+- Candidates come only from fresh, signature-verified, publicly discoverable
+  descriptors with safe public endpoints. Self and operator-pinned producers
+  are excluded.
+- Each round rotates through at most eight candidates, imports at most one
+  direct page per candidate, and never uses replica carrier fallback.
+- SQLite schema v9 reserves a mirror slot only in the same transaction as an
+  accepted, fully verified first page. Capacity rejection rolls back the new
+  producer row, so descriptor churn cannot create unbounded namespaces.
+- Mirror membership is durable and intentionally has no automatic eviction in
+  V1. A configured operator pin atomically promotes an existing mirror out of
+  mirror classification; authority producers cannot be silently demoted.
+- Lowering `directory_full_node_mirror_max_producers` below the durable retained
+  count fails mirror coordinator startup. The node never deletes signed history
+  merely to satisfy a changed capacity setting; operators must raise the limit
+  or perform an explicit audited store migration.
+- Mirror producers never enter observation convergence, observation
+  checkpoints, witness thresholds, policy anchors, fork choice, voting,
+  consensus, finality, or financial state.
+- Public status exposes only aggregate capacity, round counts, successes,
+  failures, and freshness. It never exposes mirror identities or endpoints.
 - Exact repeated pages are idempotent. A producer-signed rollback, same-height
   tip fork, block fork, or contradictory empty range persists signed evidence
   and permanently quarantines only that producer; no automatic rewind, delete,
@@ -1156,6 +1186,29 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+2026-07-20 - Added Full-node Mirror Mode V1.
+- Files changed:
+  - crates/aeronyx-server/src/config.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/services/peer_store.rs
+  - crates/aeronyx-server/src/server.rs
+  - deploy/node/server.example.toml
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Security boundary:
+  - Verified public discovery permits only local signed producer-history reads.
+  - Carrier export, witness recomputation, and policy-head anchors remain pinned.
+  - Mirrors are capacity-bounded untrusted evidence and never authority members.
+- Verification:
+  - Configuration default/validation, public/private/disabled admission, global
+    rate limiting, read-only peer selection, schema v8-to-v9 migration, capacity
+    rollback, operator promotion, aggregate status, and runtime telemetry tests.
+- Notes:
+  - Mirror Mode does not turn Directory Chain into global consensus or a
+    financial blockchain. It improves independent data availability only.
+
 2026-07-19 - Added Directory Witness Policy Head Anchor V1.
 - Files changed:
   - crates/aeronyx-core/src/protocol/discovery.rs
