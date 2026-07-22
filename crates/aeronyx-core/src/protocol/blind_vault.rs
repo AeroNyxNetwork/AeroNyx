@@ -14,6 +14,8 @@
 //! - Defines anonymous lease authority and signed object deletion contracts.
 //! - Defines issuer-signed, short-lived bearer admission tickets without
 //!   binding a storage lease to an account identity.
+//! - Defines bounded recovery request/page frames with node-signed ciphertext
+//!   commitments and opaque continuation cursors.
 //! - Provides deterministic signing bytes and bounded binary wire framing.
 //! - Enforces coarse ciphertext size classes to reduce content-size leakage.
 //! - Keeps application domain separation inside client ciphertext and keys.
@@ -53,7 +55,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.2.0-BlindVaultAdmission - Added bounded issuer-signed
+//! Last Modified: v1.3.0-BlindVaultPull - Added bounded signed recovery pages
+//! and per-frame allocation ceilings.
+//! v1.2.0-BlindVaultAdmission - Added bounded issuer-signed
 //! one-time bearer admission contracts.
 //! v1.1.0-BlindVaultLease - Added anonymous lease authority,
 //! administration-key deletion, and signed deletion receipts.
@@ -74,6 +78,7 @@ const PUT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Put-v1";
 const RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-StoredReceipt-v1";
 const LEASE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Lease-v1";
 const ADMISSION_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Admission-v1";
+const PULL_RESPONSE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullResponse-v1";
 const DELETE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Delete-v1";
 const DELETE_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-DeletedReceipt-v1";
 const FRAME_MAGIC: [u8; 4] = *b"ANBV";
@@ -84,14 +89,30 @@ const FRAME_KIND_LEASE_CREATE: u8 = 3;
 const FRAME_KIND_DELETE: u8 = 4;
 const FRAME_KIND_DELETED_RECEIPT: u8 = 5;
 const FRAME_KIND_LEASE_ADMISSION: u8 = 6;
+const FRAME_KIND_PULL_REQUEST: u8 = 7;
+const FRAME_KIND_PULL_RESPONSE: u8 = 8;
 
 /// Initial blind-vault wire version. This version is independent of the VPN
 /// transport and legacy chat-envelope versions.
 pub const BLIND_VAULT_PROTOCOL_VERSION: u16 = 1;
 
-/// Maximum encoded frame accepted by the decoder. The largest v1 ciphertext
-/// class is 256 KiB; the remaining space covers fixed metadata and framing.
-pub const MAX_BLIND_VAULT_FRAME_BYTES: u64 = 272 * 1024;
+/// Maximum mutation/request frame. The largest v1 ciphertext class is 256 KiB;
+/// the remaining space covers fixed metadata and framing.
+pub const MAX_BLIND_VAULT_MUTATION_FRAME_BYTES: u64 = 272 * 1024;
+
+/// Maximum objects returned by one signed recovery page.
+pub const MAX_BLIND_VAULT_PULL_OBJECTS: usize = 16;
+
+/// Maximum opaque server cursor carried by a recovery frame.
+pub const MAX_BLIND_VAULT_PULL_CURSOR_BYTES: usize = 128;
+
+/// Maximum signed pull-response frame: sixteen 256 KiB ciphertext classes plus
+/// bounded metadata. Public request handlers must retain their narrower body
+/// limits and must not apply this response ceiling to attacker-controlled puts.
+pub const MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Absolute largest v1 frame accepted by the generic decoder.
+pub const MAX_BLIND_VAULT_FRAME_BYTES: u64 = MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES;
 
 /// Padded ciphertext size classes accepted by protocol v1.
 ///
@@ -115,6 +136,10 @@ pub enum BlindVaultFrame {
     DeletedReceipt(BlindVaultDeletedReceipt),
     /// One-time bearer admission ticket plus a self-authenticating lease.
     LeaseAdmission(BlindVaultLeaseAdmissionRequest),
+    /// Capability-authenticated request for one stable encrypted-object page.
+    PullRequest(BlindVaultPullRequest),
+    /// Node-signed stable encrypted-object page.
+    PullResponse(BlindVaultPullResponse),
 }
 
 /// Anonymous lease metadata signed by its independent administration key.
@@ -346,6 +371,175 @@ impl BlindVaultLeaseAdmissionRequest {
             now_ms,
             node_maximum_lease_ttl_ms.min(self.admission.maximum_lease_ttl_ms),
         )
+    }
+}
+
+/// Capability-authenticated request for one stable recovery snapshot page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultPullRequest {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Random replica-local lease identifier.
+    pub lease_id: [u8; 32],
+    /// Random bearer read capability whose hash was committed at lease setup.
+    pub read_capability: [u8; 32],
+    /// Empty for the first page; otherwise a node-encrypted snapshot cursor.
+    pub continuation_cursor: Vec<u8>,
+    /// Requested page size, bounded again by node policy.
+    pub limit: u16,
+}
+
+impl BlindVaultPullRequest {
+    /// Validates fixed identifiers and protocol-wide recovery bounds.
+    pub fn validate(&self) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("lease_id", &self.lease_id)?;
+        require_non_zero("read_capability", &self.read_capability)?;
+        if self.limit == 0 || usize::from(self.limit) > MAX_BLIND_VAULT_PULL_OBJECTS {
+            return Err(BlindVaultError::InvalidPullLimit);
+        }
+        if self.continuation_cursor.len() > MAX_BLIND_VAULT_PULL_CURSOR_BYTES {
+            return Err(BlindVaultError::InvalidPullCursorLength);
+        }
+        Ok(())
+    }
+}
+
+/// One immutable ciphertext object returned by a Blind Vault recovery page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultRecoveredObject {
+    /// Replica-local immutable object identifier.
+    pub object_id: [u8; 32],
+    /// Exact client ciphertext including its AEAD nonce, tag, and padding.
+    pub ciphertext: Vec<u8>,
+    /// SHA-256 commitment to the exact ciphertext bytes.
+    pub ciphertext_commitment: [u8; 32],
+    /// Object retention deadline in Unix milliseconds.
+    pub expires_at_ms: u64,
+}
+
+impl BlindVaultRecoveredObject {
+    fn validate_at(&self, generated_at_ms: u64) -> Result<(), BlindVaultError> {
+        require_non_zero("object_id", &self.object_id)?;
+        if !BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES.contains(&self.ciphertext.len()) {
+            return Err(BlindVaultError::InvalidCiphertextSize {
+                actual: self.ciphertext.len(),
+            });
+        }
+        if sha256(&self.ciphertext) != self.ciphertext_commitment {
+            return Err(BlindVaultError::CommitmentMismatch);
+        }
+        if self.expires_at_ms <= generated_at_ms {
+            return Err(BlindVaultError::Expired);
+        }
+        Ok(())
+    }
+}
+
+/// Node-signed bounded recovery page.
+///
+/// The signature authenticates ciphertext commitments rather than hashing the
+/// multi-megabyte ciphertext a second time. Validation recomputes each stored
+/// commitment first, so the signature remains bound to the exact bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultPullResponse {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Replica-local lease answered by this page.
+    pub lease_id: [u8; 32],
+    /// Bounded immutable ciphertext objects in snapshot order.
+    pub objects: Vec<BlindVaultRecoveredObject>,
+    /// Empty when this snapshot is complete; otherwise node-encrypted cursor.
+    pub continuation_cursor: Vec<u8>,
+    /// Node generation time in Unix milliseconds.
+    pub generated_at_ms: u64,
+    /// Descriptor identity of the responding storage node.
+    pub node_id: [u8; 32],
+    /// Ed25519 signature by `node_id` over page commitments and metadata.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultPullResponse {
+    /// Builds an unsigned recovery page.
+    #[must_use]
+    pub fn new(
+        lease_id: [u8; 32],
+        objects: Vec<BlindVaultRecoveredObject>,
+        continuation_cursor: Vec<u8>,
+        generated_at_ms: u64,
+        node_id: [u8; 32],
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            lease_id,
+            objects,
+            continuation_cursor,
+            generated_at_ms,
+            node_id,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical signing input containing each already-validated ciphertext
+    /// commitment, object metadata, and opaque continuation cursor.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let object_bytes = self.objects.len().saturating_mul(76);
+        let mut bytes = Vec::with_capacity(
+            PULL_RESPONSE_SIGNING_DOMAIN.len() + 76 + object_bytes + self.continuation_cursor.len(),
+        );
+        bytes.extend_from_slice(PULL_RESPONSE_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.lease_id);
+        bytes.extend_from_slice(&(self.objects.len() as u16).to_be_bytes());
+        for object in &self.objects {
+            bytes.extend_from_slice(&object.object_id);
+            bytes.extend_from_slice(&(object.ciphertext.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&object.ciphertext_commitment);
+            bytes.extend_from_slice(&object.expires_at_ms.to_be_bytes());
+        }
+        bytes.extend_from_slice(&(self.continuation_cursor.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&self.continuation_cursor);
+        bytes.extend_from_slice(&self.generated_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.node_id);
+        bytes
+    }
+
+    /// Validates page bounds and signs with the responding node identity.
+    pub fn sign(&mut self, node_key: &IdentityKeyPair) -> Result<(), BlindVaultError> {
+        self.validate_fields()?;
+        if self.node_id != node_key.public_key_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        self.signature = node_key.sign(&self.signing_bytes());
+        Ok(())
+    }
+
+    /// Validates all ciphertext commitments, node identity, and page signature.
+    pub fn validate_and_verify(&self, node_key: &IdentityPublicKey) -> Result<(), BlindVaultError> {
+        self.validate_fields()?;
+        if self.node_id != node_key.to_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        node_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+
+    fn validate_fields(&self) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("lease_id", &self.lease_id)?;
+        if self.objects.len() > MAX_BLIND_VAULT_PULL_OBJECTS {
+            return Err(BlindVaultError::InvalidPullLimit);
+        }
+        if self.continuation_cursor.len() > MAX_BLIND_VAULT_PULL_CURSOR_BYTES {
+            return Err(BlindVaultError::InvalidPullCursorLength);
+        }
+        for object in &self.objects {
+            object.validate_at(self.generated_at_ms)?;
+        }
+        Ok(())
     }
 }
 
@@ -738,24 +932,44 @@ impl BlindVaultDeletedReceipt {
 /// This avoids depending on serde enum discriminants for future evolution.
 pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, BlindVaultError> {
     let (kind, body) = match frame {
-        BlindVaultFrame::Put(value) => (FRAME_KIND_PUT, serialize_body(value)?),
-        BlindVaultFrame::StoredReceipt(value) => {
-            (FRAME_KIND_STORED_RECEIPT, serialize_body(value)?)
-        }
-        BlindVaultFrame::LeaseCreate(value) => (FRAME_KIND_LEASE_CREATE, serialize_body(value)?),
-        BlindVaultFrame::Delete(value) => (FRAME_KIND_DELETE, serialize_body(value)?),
-        BlindVaultFrame::DeletedReceipt(value) => {
-            (FRAME_KIND_DELETED_RECEIPT, serialize_body(value)?)
-        }
-        BlindVaultFrame::LeaseAdmission(value) => {
-            (FRAME_KIND_LEASE_ADMISSION, serialize_body(value)?)
-        }
+        BlindVaultFrame::Put(value) => (
+            FRAME_KIND_PUT,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::StoredReceipt(value) => (
+            FRAME_KIND_STORED_RECEIPT,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::LeaseCreate(value) => (
+            FRAME_KIND_LEASE_CREATE,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::Delete(value) => (
+            FRAME_KIND_DELETE,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::DeletedReceipt(value) => (
+            FRAME_KIND_DELETED_RECEIPT,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::LeaseAdmission(value) => (
+            FRAME_KIND_LEASE_ADMISSION,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::PullRequest(value) => (
+            FRAME_KIND_PULL_REQUEST,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::PullResponse(value) => (
+            FRAME_KIND_PULL_RESPONSE,
+            serialize_body(value, MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES)?,
+        ),
     };
 
     let total = FRAME_HEADER_BYTES
         .checked_add(body.len())
         .ok_or(BlindVaultError::FrameTooLarge)?;
-    if total as u64 > MAX_BLIND_VAULT_FRAME_BYTES {
+    if total as u64 > frame_limit_for_kind(kind)? {
         return Err(BlindVaultError::FrameTooLarge);
     }
 
@@ -781,14 +995,42 @@ pub fn decode_blind_vault_frame(bytes: &[u8]) -> Result<BlindVaultFrame, BlindVa
     let version = u16::from_be_bytes([bytes[4], bytes[5]]);
     require_version(version)?;
 
+    let kind = bytes[6];
+    let frame_limit = frame_limit_for_kind(kind)?;
+    if bytes.len() as u64 > frame_limit {
+        return Err(BlindVaultError::FrameTooLarge);
+    }
     let body = &bytes[FRAME_HEADER_BYTES..];
-    match bytes[6] {
-        FRAME_KIND_PUT => Ok(BlindVaultFrame::Put(deserialize_body(body)?)),
-        FRAME_KIND_STORED_RECEIPT => Ok(BlindVaultFrame::StoredReceipt(deserialize_body(body)?)),
-        FRAME_KIND_LEASE_CREATE => Ok(BlindVaultFrame::LeaseCreate(deserialize_body(body)?)),
-        FRAME_KIND_DELETE => Ok(BlindVaultFrame::Delete(deserialize_body(body)?)),
-        FRAME_KIND_DELETED_RECEIPT => Ok(BlindVaultFrame::DeletedReceipt(deserialize_body(body)?)),
-        FRAME_KIND_LEASE_ADMISSION => Ok(BlindVaultFrame::LeaseAdmission(deserialize_body(body)?)),
+    match kind {
+        FRAME_KIND_PUT => Ok(BlindVaultFrame::Put(deserialize_body(body, frame_limit)?)),
+        FRAME_KIND_STORED_RECEIPT => Ok(BlindVaultFrame::StoredReceipt(deserialize_body(
+            body,
+            frame_limit,
+        )?)),
+        FRAME_KIND_LEASE_CREATE => Ok(BlindVaultFrame::LeaseCreate(deserialize_body(
+            body,
+            frame_limit,
+        )?)),
+        FRAME_KIND_DELETE => Ok(BlindVaultFrame::Delete(deserialize_body(
+            body,
+            frame_limit,
+        )?)),
+        FRAME_KIND_DELETED_RECEIPT => Ok(BlindVaultFrame::DeletedReceipt(deserialize_body(
+            body,
+            frame_limit,
+        )?)),
+        FRAME_KIND_LEASE_ADMISSION => Ok(BlindVaultFrame::LeaseAdmission(deserialize_body(
+            body,
+            frame_limit,
+        )?)),
+        FRAME_KIND_PULL_REQUEST => Ok(BlindVaultFrame::PullRequest(deserialize_body(
+            body,
+            frame_limit,
+        )?)),
+        FRAME_KIND_PULL_RESPONSE => Ok(BlindVaultFrame::PullResponse(deserialize_body(
+            body,
+            frame_limit,
+        )?)),
         kind => Err(BlindVaultError::UnknownFrameKind(kind)),
     }
 }
@@ -844,6 +1086,12 @@ pub enum BlindVaultError {
     /// Admission ticket carried an invalid time or lease policy.
     #[error("admission ticket policy is invalid")]
     InvalidAdmissionPolicy,
+    /// Pull page size was zero or exceeded the protocol-wide ceiling.
+    #[error("blind-vault pull limit is invalid")]
+    InvalidPullLimit,
+    /// Opaque pull cursor exceeded the protocol-wide ceiling.
+    #[error("blind-vault pull cursor length is invalid")]
+    InvalidPullCursorLength,
     /// Receipt promised no positive retention interval.
     #[error("receipt storage window is invalid")]
     InvalidReceiptWindow,
@@ -901,21 +1149,35 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn serialize_body<T: Serialize>(value: &T) -> Result<Vec<u8>, BlindVaultError> {
+fn frame_limit_for_kind(kind: u8) -> Result<u64, BlindVaultError> {
+    match kind {
+        FRAME_KIND_PUT
+        | FRAME_KIND_STORED_RECEIPT
+        | FRAME_KIND_LEASE_CREATE
+        | FRAME_KIND_DELETE
+        | FRAME_KIND_DELETED_RECEIPT
+        | FRAME_KIND_LEASE_ADMISSION
+        | FRAME_KIND_PULL_REQUEST => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
+        FRAME_KIND_PULL_RESPONSE => Ok(MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES),
+        unknown => Err(BlindVaultError::UnknownFrameKind(unknown)),
+    }
+}
+
+fn serialize_body<T: Serialize>(value: &T, limit: u64) -> Result<Vec<u8>, BlindVaultError> {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
-        .with_limit(MAX_BLIND_VAULT_FRAME_BYTES)
+        .with_limit(limit)
         .serialize(value)
         .map_err(|_| BlindVaultError::Serialization)
 }
 
-fn deserialize_body<T>(bytes: &[u8]) -> Result<T, BlindVaultError>
+fn deserialize_body<T>(bytes: &[u8], limit: u64) -> Result<T, BlindVaultError>
 where
     T: for<'de> Deserialize<'de>,
 {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
-        .with_limit(MAX_BLIND_VAULT_FRAME_BYTES)
+        .with_limit(limit)
         .reject_trailing_bytes()
         .deserialize(bytes)
         .map_err(|_| BlindVaultError::Deserialization)
@@ -1003,6 +1265,33 @@ mod tests {
         ticket
     }
 
+    fn signed_pull_response() -> BlindVaultPullResponse {
+        let ciphertext = vec![0xB7; BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[3]];
+        let object = BlindVaultRecoveredObject {
+            object_id: [31; 32],
+            ciphertext_commitment: sha256(&ciphertext),
+            ciphertext,
+            expires_at_ms: NOW_MS + 24 * 60 * 60 * 1_000,
+        };
+        let second_ciphertext = vec![0xC3; BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[3]];
+        let second_object = BlindVaultRecoveredObject {
+            object_id: [32; 32],
+            ciphertext_commitment: sha256(&second_ciphertext),
+            ciphertext: second_ciphertext,
+            expires_at_ms: NOW_MS + 24 * 60 * 60 * 1_000,
+        };
+        let node = node_key();
+        let mut response = BlindVaultPullResponse::new(
+            [1; 32],
+            vec![object, second_object],
+            vec![1; 49],
+            NOW_MS,
+            node.public_key_bytes(),
+        );
+        response.sign(&node).expect("sign pull response");
+        response
+    }
+
     #[test]
     fn signed_put_validates_and_round_trips() {
         let put = signed_put();
@@ -1079,6 +1368,61 @@ mod tests {
                 &issuer.public_key(),
             ),
             Err(BlindVaultError::LifetimeTooLong)
+        );
+    }
+
+    #[test]
+    fn signed_pull_page_round_trips_above_mutation_ceiling() {
+        let request = BlindVaultPullRequest {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            lease_id: [1; 32],
+            read_capability: [33; 32],
+            continuation_cursor: Vec::new(),
+            limit: MAX_BLIND_VAULT_PULL_OBJECTS as u16,
+        };
+        request.validate().expect("valid pull request");
+        let request_frame =
+            encode_blind_vault_frame(&BlindVaultFrame::PullRequest(request.clone()))
+                .expect("encode pull request");
+        assert_eq!(
+            decode_blind_vault_frame(&request_frame).expect("decode pull request"),
+            BlindVaultFrame::PullRequest(request)
+        );
+
+        let response = signed_pull_response();
+        response
+            .validate_and_verify(&node_key().public_key())
+            .expect("valid signed response");
+        let encoded = encode_blind_vault_frame(&BlindVaultFrame::PullResponse(response.clone()))
+            .expect("encode pull response");
+        assert!(encoded.len() as u64 > MAX_BLIND_VAULT_MUTATION_FRAME_BYTES);
+        assert_eq!(
+            decode_blind_vault_frame(&encoded).expect("decode pull response"),
+            BlindVaultFrame::PullResponse(response)
+        );
+
+        let mut wrong_kind = encoded;
+        wrong_kind[6] = FRAME_KIND_PUT;
+        assert_eq!(
+            decode_blind_vault_frame(&wrong_kind),
+            Err(BlindVaultError::FrameTooLarge)
+        );
+    }
+
+    #[test]
+    fn pull_page_rejects_ciphertext_and_cursor_tampering() {
+        let mut response = signed_pull_response();
+        response.objects[0].ciphertext[0] ^= 1;
+        assert_eq!(
+            response.validate_and_verify(&node_key().public_key()),
+            Err(BlindVaultError::CommitmentMismatch)
+        );
+
+        let mut response = signed_pull_response();
+        response.continuation_cursor[0] ^= 1;
+        assert_eq!(
+            response.validate_and_verify(&node_key().public_key()),
+            Err(BlindVaultError::InvalidSignature)
         );
     }
 
