@@ -32,6 +32,7 @@
 //! - config_supernode.rs — SuperNodeConfig (re-exported via config_memchain)
 //! - config_saas.rs     — SaasConfig (re-exported via config_memchain)
 //! - config_chat_relay.rs — ChatRelayConfig (re-exported via config_memchain)
+//! - config_blind_vault.rs — BlindVaultConfig (independent node-blind store)
 //! - management.rs      — ManagementConfig (owned by that subsystem)
 //! - server.rs          — consumes ServerConfig for full initialization
 //!
@@ -91,6 +92,7 @@ const MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS: usize = 16;
 const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
 
 // ── Sub-module re-exports (keep callers' use-paths stable) ────────────────
+pub use crate::config_blind_vault::BlindVaultConfig;
 pub use crate::config_chat_relay::ChatRelayConfig;
 pub use crate::config_infra::{
     LimitsConfig, LoggingConfig, NetworkConfig, ServerKeyConfig, TunConfig, VpnConfig,
@@ -929,6 +931,10 @@ pub struct ServerConfig {
     pub memchain: MemChainConfig,
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+    /// [BLIND-VAULT-SERVICE 2026-07-23 by Codex] Independent anonymous
+    /// encrypted-object storage; disabled unless explicitly configured.
+    #[serde(default)]
+    pub blind_vault: BlindVaultConfig,
 }
 
 impl ServerConfig {
@@ -965,6 +971,7 @@ impl ServerConfig {
             .map_err(|e| ServerError::config_invalid("management", e))?;
         self.memchain.validate()?;
         self.discovery.validate()?;
+        self.blind_vault.validate()?;
         if let Some(directory_path) = self.discovery.directory_chain_path.as_deref() {
             let directory_path = directory_path.trim();
             if [
@@ -977,6 +984,26 @@ impl ServerConfig {
                 return Err(ServerError::config_invalid(
                     "discovery.directory_chain_path",
                     "must not reuse a MemChain or ChatRelay database path",
+                ));
+            }
+        }
+        if self.blind_vault.enabled {
+            let blind_vault_path = self.blind_vault.db_path.trim();
+            if [
+                self.memchain.db_path.as_str(),
+                self.memchain.chat_relay.db_path.as_str(),
+            ]
+            .into_iter()
+            .any(|other| other.trim() == blind_vault_path)
+                || self
+                    .discovery
+                    .directory_chain_path
+                    .as_deref()
+                    .is_some_and(|path| path.trim() == blind_vault_path)
+            {
+                return Err(ServerError::config_invalid(
+                    "blind_vault.db_path",
+                    "must not reuse a MemChain, ChatRelay, or Directory Chain database path",
                 ));
             }
         }
@@ -1064,6 +1091,7 @@ impl Default for ServerConfig {
             management: ManagementConfig::default(),
             memchain: MemChainConfig::default(),
             discovery: DiscoveryConfig::default(),
+            blind_vault: BlindVaultConfig::default(),
         }
     }
 }
@@ -1337,7 +1365,10 @@ advertise_onion_middle = true
         );
         assert_eq!(config.discovery.directory_chain_sync_interval_secs, 180);
         assert!(config.discovery.directory_full_node_mirror_enabled);
-        assert_eq!(config.discovery.directory_full_node_mirror_max_producers, 24);
+        assert_eq!(
+            config.discovery.directory_full_node_mirror_max_producers,
+            24
+        );
         assert_eq!(
             config.discovery.directory_observation_witness_min_verified,
             1

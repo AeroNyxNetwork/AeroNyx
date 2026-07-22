@@ -171,6 +171,25 @@ public_discovery = false
 # operator explicitly wants this node to participate in multi-hop relay paths.
 advertise_onion_middle = false
 
+# [BLIND-VAULT-CONFIG 2026-07-23 by Codex] Independent node-blind storage for
+# opaque contact-vault and optional message-archive objects. The schema does
+# not contain account, wallet, sender, receiver, namespace, social-graph, or
+# search-vector fields. Keep this disabled until the anonymous one-time lease
+# admission and public API milestone is released; enabling it today only starts
+# the local storage/cleanup foundation and does not advertise a network
+# capability.
+[blind_vault]
+enabled = false
+db_path = "/var/lib/aeronyx/blind-vault.db"
+max_lease_ttl_secs = 7776000
+max_object_ttl_secs = 2592000
+max_objects_per_lease = 16384
+max_bytes_per_lease = 268435456
+max_pull_objects = 64
+tombstone_ttl_secs = 604800
+mutation_clock_skew_secs = 300
+cleanup_interval_secs = 300
+
 # Commercial VPN nodes should start with MemChain disabled unless the operator
 # explicitly wants local memory-chain services on the same machine.
 [memchain]

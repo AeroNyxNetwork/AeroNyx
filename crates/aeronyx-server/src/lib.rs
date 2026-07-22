@@ -13,6 +13,8 @@
 //! - v1.0.0-MultiTenant: Added config sub-modules (config_chat_relay,
 //!   config_infra, config_memchain, config_saas) that are referenced by
 //!   config.rs via pub use re-exports.
+//! - v1.0.0-BlindVaultService: Added an independent, default-off Blind Vault
+//!   configuration module for anonymous encrypted durable objects.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial server library
@@ -22,6 +24,7 @@
 //! v2.5.0 - Added config_supernode module
 //! v1.0.0-MultiTenant - MinerScheduler added to miner module;
 //!                      config sub-modules declared at crate root
+//! v1.0.0-BlindVaultService - Added bounded Blind Vault configuration
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -34,6 +37,7 @@ pub mod config;
 // v1.0.0-MultiTenant: Config sub-modules referenced by config.rs pub use re-exports.
 // These are declared at crate root (not under config/) because config.rs is a single
 // file module. config.rs re-exports their types via `pub use crate::config_xxx::...`.
+pub mod config_blind_vault;
 pub mod config_chat_relay;
 pub mod config_infra;
 pub mod config_memchain;

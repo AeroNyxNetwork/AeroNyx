@@ -31,7 +31,9 @@
 //   v1.2.0-DNSProxy - Added VPN gateway DNS proxy
 //   v1.1.0-ChatRelay - Added chat_relay submodule
 //   v1.0.0-Membership - Added deny_list submodule + traffic_tracker
+//   v1.0.0-BlindVaultService - Added anonymous encrypted-object storage
 
+pub mod blind_vault;
 pub mod chat_relay;
 pub mod deny_list;
 pub mod directory_chain;
@@ -49,6 +51,11 @@ pub mod traffic_tracker;
 pub mod wallet_routes;
 
 // Re-export primary types
+pub use blind_vault::{
+    BlindVaultCleanupReport, BlindVaultLeaseProvisionOutcome, BlindVaultPullPage,
+    BlindVaultService, BlindVaultServiceError, BlindVaultStatus, BlindVaultStoredObject,
+    SharedBlindVaultService,
+};
 pub use chat_relay::{derive_node_secret, ChatRelayService};
 pub use deny_list::{DenyList, DenyReason};
 pub use directory_chain::{
@@ -60,13 +67,12 @@ pub use directory_replica::{
     DirectoryObservationCheckpointAppendReport, DirectoryObservationWitnessDecision,
     DirectoryObservationWitnessOutcome, DirectoryObservationWitnessOutcomeCounters,
     DirectoryObservationWitnessOutcomeSnapshot, DirectoryObservationWitnessTarget,
-    DirectoryReplicaAudit,
-    DirectoryReplicaImportReport, DirectoryReplicaIncidentEvidence, DirectoryReplicaIncidentPage,
-    DirectoryReplicaIncidentSummary, DirectoryReplicaObservationConvergenceSnapshot,
-    DirectoryReplicaProducerSnapshot, DirectoryReplicaResolutionCommand,
-    DirectoryReplicaResolutionReport, DirectoryReplicaStore, DirectoryReplicaStoreError,
-    DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation, DirectoryReplicaSyncRuntime,
-    DirectoryReplicaTip,
+    DirectoryReplicaAudit, DirectoryReplicaImportReport, DirectoryReplicaIncidentEvidence,
+    DirectoryReplicaIncidentPage, DirectoryReplicaIncidentSummary,
+    DirectoryReplicaObservationConvergenceSnapshot, DirectoryReplicaProducerSnapshot,
+    DirectoryReplicaResolutionCommand, DirectoryReplicaResolutionReport, DirectoryReplicaStore,
+    DirectoryReplicaStoreError, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
+    DirectoryReplicaSyncRuntime, DirectoryReplicaTip,
 };
 pub use dns_proxy::spawn_dns_proxy;
 pub use handshake::HandshakeService;
