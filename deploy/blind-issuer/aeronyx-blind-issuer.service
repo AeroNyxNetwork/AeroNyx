@@ -1,0 +1,100 @@
+# ============================================
+# File: deploy/blind-issuer/aeronyx-blind-issuer.service
+# ============================================
+# [BLIND-ISSUER-DEPLOY 2026-07-23 by Codex] Dedicated systemd boundary for
+# RFC 9474 private-key custody. This unit must never be installed on storage
+# nodes or bundled into deploy/node.
+#
+# Creation Reason:
+# - Run the blind-admission signer beside the entitlement backend without
+#   granting it access to node databases, user state, or the public network.
+#
+# Main Functionality:
+# - Runs as a static unprivileged account with no Linux capabilities.
+# - Restricts network access to localhost and filesystems to read-only views.
+# - Drains in-flight requests on SIGTERM and restarts only after failures.
+#
+# Dependencies:
+# - /usr/local/bin/aeronyx-blind-issuer
+# - /etc/aeronyx/blind-issuer.toml
+# - /var/lib/aeronyx-blind-issuer owner-only key/token files
+#
+# Main Logical Flow:
+# 1. systemd verifies required paths and applies the sandbox.
+# 2. The Rust process independently revalidates listener and secret policy.
+# 3. The backend connects only over the configured loopback address.
+# 4. SIGTERM triggers Axum graceful shutdown before the timeout.
+#
+# Important Note for Next Developer:
+# - Never add CAP_NET_ADMIN, public listen addresses, node databases, or
+#   writable application directories to this unit.
+# - Keep User/Group stable; secret ownership is checked against the process UID.
+# - Do not use DynamicUser unless custody files move to an HSM/KMS backend.
+#
+# Last Modified: v1.0.0-BlindIssuerDeploy - Initial hardened unit.
+# ============================================
+
+[Unit]
+Description=AeroNyx isolated blind-admission issuer
+After=network.target
+AssertPathExists=/usr/local/bin/aeronyx-blind-issuer
+AssertPathExists=/etc/aeronyx/blind-issuer.toml
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=aeronyx-issuer
+Group=aeronyx-issuer
+WorkingDirectory=/
+Environment=RUST_LOG=aeronyx_blind_issuer=info
+ExecStart=/usr/local/bin/aeronyx-blind-issuer serve --config /etc/aeronyx/blind-issuer.toml
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStartSec=30
+TimeoutStopSec=30
+UMask=0077
+LimitNOFILE=1024
+TasksMax=64
+
+# No privilege, device, kernel, home, or writable filesystem access is needed.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RemoveIPC=true
+KeyringMode=private
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# The signer is a localhost dependency of the entitlement backend, never a
+# public Internet service and never an outbound client.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# These paths are explicit documentation of the only custody inputs. The
+# process has no WritePaths and cannot mutate them after startup.
+ReadOnlyPaths=/etc/aeronyx/blind-issuer.toml
+ReadOnlyPaths=/var/lib/aeronyx-blind-issuer
+
+[Install]
+WantedBy=multi-user.target

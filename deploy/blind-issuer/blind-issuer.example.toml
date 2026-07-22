@@ -1,0 +1,40 @@
+# ============================================
+# File: deploy/blind-issuer/blind-issuer.example.toml
+# ============================================
+# [BLIND-ISSUER-DEPLOY 2026-07-23 by Codex] Fail-closed example for the
+# separately operated RFC 9474 signer. Values below are placeholders.
+#
+# Creation Reason:
+# - Provide one reviewed configuration shape for signer deployment and key
+#   rotation without placing private material in source control.
+#
+# Main Functionality:
+# - Pins a loopback-only backend API.
+# - References owner-only token and private-key files by absolute path.
+# - Bounds private operations and key epoch policy.
+#
+# Dependencies:
+# - crates/aeronyx-blind-issuer/src/config.rs
+# - deploy/blind-issuer/aeronyx-blind-issuer.service
+#
+# Important Note for Next Developer:
+# - Replace every epoch timestamp before use. This example intentionally does
+#   not contain a currently active production key.
+# - Never inline token/key bytes or copy this file to a decentralized node.
+# - Epoch duration must not exceed 31 days.
+#
+# Last Modified: v1.0.0-BlindIssuerDeploy - Initial fail-closed template.
+# ============================================
+
+listen_addr = "127.0.0.1:9191"
+auth_token_file = "/var/lib/aeronyx-blind-issuer/backend.token"
+max_requests_per_second = 128
+max_in_flight = 8
+
+# Replace this path and both timestamps before enabling the service. Keep the
+# old and new [[keys]] entries together during a bounded rotation overlap.
+[[keys]]
+private_key_der_file = "/var/lib/aeronyx-blind-issuer/issuer-epoch-1.der"
+not_before_unix_secs = 2000000000
+expires_at_unix_secs = 2000086400
+max_lease_ttl_secs = 604800
