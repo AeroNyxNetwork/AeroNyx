@@ -12,6 +12,7 @@
 //! ## Main Functionality
 //! - Loads bounded rotating issuer epochs from secure local files.
 //! - Signs only already-blinded messages under an active requested key.
+//! - Keeps policy independent from software RSA, HSM, or KMS custody backends.
 //! - Exposes a loopback-only, backend-authenticated HTTP interface.
 //! - Provides public epoch material without account or issuance metadata.
 //!
@@ -34,7 +35,7 @@
 //! - Production key custody should migrate behind a KMS/HSM implementation of
 //!   the signer boundary without changing the internal wire contract.
 //!
-//! Last Modified: v0.1.0-BlindIssuer - Initial isolated signer.
+//! Last Modified: v0.2.0-BlindIssuer - Added replaceable custody backend API.
 //! ============================================
 
 pub mod api;
@@ -47,4 +48,7 @@ pub use api::{
     BLIND_ISSUER_EPOCH_CONTENT_TYPE,
 };
 pub use config::{BlindIssuerConfig, BlindIssuerKeyConfig, ConfigError};
-pub use signer::{BlindSignError, BlindSignRequest, BlindSignResponse, BlindSigner};
+pub use signer::{
+    BlindSignError, BlindSignRequest, BlindSignResponse, BlindSigner, BlindSignerBuildError,
+    BlindSigningBackend, BlindSigningBackendError, BlindSigningKey,
+};
