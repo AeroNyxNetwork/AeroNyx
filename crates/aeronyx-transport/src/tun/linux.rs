@@ -13,6 +13,8 @@
 //! - Async read/write via Tokio
 //! - Non-blocking operating-system interface control
 //! - Device cleanup on drop
+//! - Serialized interface lifecycle transitions
+//! - Bounded external command execution with failed-start rollback
 //!
 //! ## Linux TUN Interface
 //! Linux provides TUN devices through `/dev/net/tun`. The process:
@@ -32,8 +34,12 @@
 //! - Always set `IFF_NO_PI` to avoid packet info headers
 //! - Test with mock implementation when possible
 //! - Keep unsafe ioctl calls inside the audited helpers in this module
+//! - Keep every lifecycle command behind `lifecycle`; concurrent `up` and
+//!   `down` calls must never interleave
 //!
 //! ## Last Modified
+//! v0.3.0 - Serialized lifecycle transitions, bounded `ip` command execution,
+//!          and rolled back partially applied activation state.
 //! v0.2.0 - Moved `ip` operations to Tokio process I/O, centralized ioctl
 //!          safety boundaries, and reused canonical netmask validation.
 //! v0.1.1 - Flush existing global TUN addresses before applying the configured
@@ -45,6 +51,7 @@ use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -52,6 +59,7 @@ use nix::libc;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::error::{Result, TransportError};
@@ -75,6 +83,9 @@ const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 
 /// TUNSETPERSIST ioctl number.
 const TUNSETPERSIST: libc::c_ulong = 0x4004_54cb;
+
+/// Maximum time allowed for one operating-system interface operation.
+const IP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================
 // ifreq Structure
@@ -160,6 +171,34 @@ fn set_nonblocking(fd: RawFd) -> nix::Result<()> {
     Ok(())
 }
 
+/// Runs a child process with a bounded lifetime.
+///
+/// `kill_on_drop` is required because `timeout` cancels by dropping the output
+/// future. Without it, a timed-out `ip` process could continue mutating the
+/// interface after `LinuxTun::up` has started its rollback.
+async fn run_command_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout_duration: Duration,
+) -> std::io::Result<std::process::Output> {
+    // [TUN-COMMAND-TIMEOUT 2026-07-23 by Codex] Keep process cancellation
+    // semantics in one helper so every lifecycle command has the same bound.
+    let mut command = Command::new(program);
+    command.args(args).kill_on_drop(true);
+
+    tokio::time::timeout(timeout_duration, command.output())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{program} command exceeded {} ms",
+                    timeout_duration.as_millis()
+                ),
+            )
+        })?
+}
+
 // ============================================
 // LinuxTun
 // ============================================
@@ -195,6 +234,8 @@ pub struct LinuxTun {
     config: TunConfig,
     /// Whether the device is up
     is_up: AtomicBool,
+    /// Serializes operating-system lifecycle changes.
+    lifecycle: Mutex<()>,
 }
 
 impl LinuxTun {
@@ -276,6 +317,7 @@ impl LinuxTun {
             async_fd,
             config,
             is_up: AtomicBool::new(false),
+            lifecycle: Mutex::new(()),
         })
     }
 
@@ -314,18 +356,80 @@ impl LinuxTun {
         .await
     }
 
+    /// Marks the interface administratively up.
+    async fn set_link_up(&self) -> Result<()> {
+        self.run_ip(
+            &["link", "set", "dev", &self.config.name, "up"],
+            "ip link set up",
+        )
+        .await
+    }
+
+    /// Marks the interface administratively down.
+    async fn set_link_down(&self) -> Result<()> {
+        self.run_ip(
+            &["link", "set", "dev", &self.config.name, "down"],
+            "ip link set down",
+        )
+        .await
+    }
+
+    /// Applies all activation steps while the caller holds `lifecycle`.
+    async fn activate(&self) -> Result<()> {
+        self.configure_address().await?;
+        self.configure_mtu().await?;
+        self.set_link_up().await
+    }
+
+    /// Best-effort cleanup after an activation step returns an error.
+    ///
+    /// Rollback errors are logged but never replace the original activation
+    /// error, which contains the actionable failure reported to the server.
+    async fn rollback_failed_activation(&self) {
+        // [TUN-LIFECYCLE 2026-07-23 by Codex] A failed MTU or link operation
+        // must not leave a partially configured address behind for a later
+        // restart to inherit.
+        if let Err(err) = self.set_link_down().await {
+            warn!(
+                device = %self.config.name,
+                error = %err,
+                "Failed to bring TUN device down during activation rollback"
+            );
+        }
+
+        if let Err(err) = self
+            .run_ip(
+                &["addr", "flush", "dev", &self.config.name, "scope", "global"],
+                "ip addr flush during rollback",
+            )
+            .await
+        {
+            warn!(
+                device = %self.config.name,
+                error = %err,
+                "Failed to flush TUN address during activation rollback"
+            );
+        }
+    }
+
     /// Runs one `ip` operation without blocking the Tokio executor.
     async fn run_ip(&self, args: &[&str], operation: &str) -> Result<()> {
         // [ASYNC-TUN-CONTROL 2026-07-23 by Codex] Interface operations can
         // wait on udev/netlink. Tokio's process driver keeps that wait off the
         // runtime worker that forwards encrypted packets.
-        let output = Command::new("ip")
-            .args(args)
-            .output()
+        let output = run_command_with_timeout("ip", args, IP_COMMAND_TIMEOUT)
             .await
-            .map_err(|err| TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("Failed to run {operation}: {err}"),
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::TimedOut {
+                    TransportError::Timeout {
+                        operation: format!("{operation} for TUN '{}'", self.config.name),
+                    }
+                } else {
+                    TransportError::TunConfigFailed {
+                        name: self.config.name.clone(),
+                        reason: format!("Failed to run {operation}: {err}"),
+                    }
+                }
             })?;
 
         if output.status.success() {
@@ -405,20 +509,21 @@ impl TunDevice for LinuxTun {
     }
 
     async fn up(&self) -> Result<()> {
+        // [TUN-LIFECYCLE 2026-07-23 by Codex] Keep the guard across the whole
+        // transition and rollback so `down` cannot interleave OS mutations.
+        let _lifecycle_guard = self.lifecycle.lock().await;
         info!("Bringing up TUN device: {}", self.config.name);
 
-        // Configure address first
-        self.configure_address().await?;
-
-        // Set MTU
-        self.configure_mtu().await?;
-
-        // Bring interface up
-        self.run_ip(
-            &["link", "set", "dev", &self.config.name, "up"],
-            "ip link set up",
-        )
-        .await?;
+        if let Err(err) = self.activate().await {
+            self.is_up.store(false, Ordering::Release);
+            warn!(
+                device = %self.config.name,
+                error = %err,
+                "TUN activation failed; rolling back partial configuration"
+            );
+            self.rollback_failed_activation().await;
+            return Err(err);
+        }
 
         self.is_up.store(true, Ordering::Release);
         info!(
@@ -430,16 +535,15 @@ impl TunDevice for LinuxTun {
     }
 
     async fn down(&self) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle.lock().await;
         info!("Bringing down TUN device: {}", self.config.name);
 
-        if let Err(err) = self
-            .run_ip(
-                &["link", "set", "dev", &self.config.name, "down"],
-                "ip link set down",
-            )
-            .await
-        {
-            warn!("{}", err);
+        if let Err(err) = self.set_link_down().await {
+            warn!(
+                device = %self.config.name,
+                error = %err,
+                "Failed to bring TUN device down"
+            );
         }
 
         self.is_up.store(false, Ordering::Release);
@@ -498,5 +602,25 @@ mod tests {
 
         // Name should be truncated to IFNAMSIZ - 1
         assert!(ifr.name().len() < libc::IFNAMSIZ);
+    }
+
+    #[tokio::test]
+    async fn command_runner_returns_successful_output() {
+        let output =
+            run_command_with_timeout("/bin/sh", &["-c", "printf aeronyx"], Duration::from_secs(1))
+                .await
+                .expect("short command should complete");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"aeronyx");
+    }
+
+    #[tokio::test]
+    async fn command_runner_times_out() {
+        let error = run_command_with_timeout("/bin/sleep", &["1"], Duration::from_millis(25))
+            .await
+            .expect_err("long command should time out");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }
