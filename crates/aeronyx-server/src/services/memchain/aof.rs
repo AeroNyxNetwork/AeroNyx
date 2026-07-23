@@ -12,6 +12,9 @@
 //!   Blocks use a different record tag (0x02) from Facts (0x01) so
 //!   `replay()` can distinguish them. Added `last_block_hash()` and
 //!   `last_block_height()` for Miner chain-linking.
+//! - v0.6.0-BoundedRecords: Unified Fact/Block record writes behind one
+//!   bounded codec path and made replay reject non-canonical record payloads
+//!   without changing the established bytes on disk.
 //!
 //! ## On-Disk Record Format (v0.5.0)
 //! ```text
@@ -41,15 +44,21 @@
 //! - Tag bytes 0x01/0x02 are stable contracts.
 //! - `last_block_hash` / `last_block_height` are in-memory caches
 //!   populated during `replay()` and updated by `append_block()`.
+//! - [BOUNDED-AOF-RECORDS 2026-07-24 by Codex] Keep the write and replay
+//!   ceilings symmetric. Never replace checked record lengths with lossy casts
+//!   or deserialize length-prefixed records with unbounded codec defaults.
 //!
 //! ## Last Modified
+//! v0.6.0-BoundedRecords - Added symmetric record bounds and canonical replay decoding
 //! v0.2.0 - Initial AOF writer for MemChain fact persistence
 //! v0.5.0 - 🌟 Added Block storage, record tags, chain state tracking
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bincode::Options;
 use parking_lot::RwLock;
+use serde::{de::DeserializeOwned, Serialize};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{debug, info, warn};
@@ -65,6 +74,9 @@ pub const DEFAULT_AOF_FILENAME: &str = ".memchain";
 
 /// Length prefix size (u32 LE).
 const LENGTH_PREFIX_SIZE: usize = 4;
+
+/// Maximum canonical Fact or Block payload accepted on disk.
+const MAX_AOF_RECORD_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Record tag: Fact.
 const TAG_FACT: u8 = 0x01;
@@ -123,22 +135,11 @@ impl AofWriter {
     ///
     /// Record format: `[TAG_FACT (1)][length: u32 LE (4)][bincode payload]`
     pub async fn append_fact(&mut self, fact: &Fact) -> std::io::Result<()> {
-        let payload = bincode::serialize(fact)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let length = payload.len() as u32;
-
-        self.writer.write_all(&[TAG_FACT]).await?;
-        self.writer.write_all(&length.to_le_bytes()).await?;
-        self.writer.write_all(&payload).await?;
-        self.writer.flush().await?;
-
-        self.write_count.fetch_add(1, Ordering::Relaxed);
+        let payload_len = self.append_record(TAG_FACT, fact).await?;
 
         debug!(
             fact_id = hex::encode(fact.fact_id),
-            payload_len = payload.len(),
-            "[AOF] ✅ Fact appended to ledger"
+            payload_len, "[AOF] ✅ Fact appended to ledger"
         );
 
         Ok(())
@@ -150,15 +151,7 @@ impl AofWriter {
     ///
     /// Also updates the in-memory `last_block_hash` and `last_block_height`.
     pub async fn append_block(&mut self, block: &Block) -> std::io::Result<()> {
-        let payload = bincode::serialize(block)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let length = payload.len() as u32;
-
-        self.writer.write_all(&[TAG_BLOCK]).await?;
-        self.writer.write_all(&length.to_le_bytes()).await?;
-        self.writer.write_all(&payload).await?;
-        self.writer.flush().await?;
+        self.append_record(TAG_BLOCK, block).await?;
 
         // Update chain state
         {
@@ -169,9 +162,6 @@ impl AofWriter {
             let mut height = self.last_block_height.write();
             *height = block.header.height;
         }
-
-        self.write_count.fetch_add(1, Ordering::Relaxed);
-
         info!(
             height = block.header.height,
             facts = block.fact_count(),
@@ -180,6 +170,24 @@ impl AofWriter {
         );
 
         Ok(())
+    }
+
+    /// Serializes and appends one canonical bounded record.
+    async fn append_record<T: Serialize>(&mut self, tag: u8, value: &T) -> std::io::Result<usize> {
+        let payload = serialize_record(value)?;
+        let length = u32::try_from(payload.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AOF record length does not fit u32",
+            )
+        })?;
+
+        self.writer.write_all(&[tag]).await?;
+        self.writer.write_all(&length.to_le_bytes()).await?;
+        self.writer.write_all(&payload).await?;
+        self.writer.flush().await?;
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+        Ok(payload.len())
     }
 
     /// Replays all records from the ledger file.
@@ -237,7 +245,7 @@ impl AofWriter {
                     u32::from_le_bytes([tag, remaining_len[0], remaining_len[1], remaining_len[2]])
                         as usize;
 
-                if length > 10 * 1024 * 1024 {
+                if u64::try_from(length).unwrap_or(u64::MAX) > MAX_AOF_RECORD_BYTES {
                     warn!(
                         offset = offset,
                         length = length,
@@ -252,7 +260,7 @@ impl AofWriter {
                     Err(_) => break,
                 }
 
-                if let Ok(fact) = bincode::deserialize::<Fact>(&payload) {
+                if let Ok(fact) = deserialize_record::<Fact>(&payload) {
                     facts.push(fact);
                 }
 
@@ -273,7 +281,7 @@ impl AofWriter {
 
             let length = u32::from_le_bytes(len_buf) as usize;
 
-            if length > 10 * 1024 * 1024 {
+            if u64::try_from(length).unwrap_or(u64::MAX) > MAX_AOF_RECORD_BYTES {
                 warn!(
                     offset = offset,
                     length = length,
@@ -293,7 +301,7 @@ impl AofWriter {
 
             match tag {
                 TAG_FACT => {
-                    if let Ok(fact) = bincode::deserialize::<Fact>(&payload) {
+                    if let Ok(fact) = deserialize_record::<Fact>(&payload) {
                         facts.push(fact);
                     } else {
                         warn!(
@@ -303,7 +311,7 @@ impl AofWriter {
                     }
                 }
                 TAG_BLOCK => {
-                    if let Ok(block) = bincode::deserialize::<Block>(&payload) {
+                    if let Ok(block) = deserialize_record::<Block>(&payload) {
                         last_block = Some(block.header);
                     } else {
                         warn!(
@@ -375,6 +383,30 @@ impl AofWriter {
     }
 }
 
+/// Serializes one AOF payload using the established fixed-integer wire format
+/// and the same ceiling enforced by replay.
+fn serialize_record<T: Serialize>(value: &T) -> std::io::Result<Vec<u8>> {
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_AOF_RECORD_BYTES)
+        .serialize(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Decodes one complete canonical AOF payload under the record ceiling.
+fn deserialize_record<T: DeserializeOwned>(payload: &[u8]) -> Result<T, bincode::Error> {
+    let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    if payload_len > MAX_AOF_RECORD_BYTES {
+        return Err(Box::new(bincode::ErrorKind::SizeLimit));
+    }
+
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_AOF_RECORD_BYTES)
+        .reject_trailing_bytes()
+        .deserialize(payload)
+}
+
 impl std::fmt::Debug for AofWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AofWriter")
@@ -435,6 +467,47 @@ mod tests {
         assert_eq!(facts[0].subject, "first");
         assert_eq!(facts[1].subject, "second");
         assert!(last_block.is_none());
+    }
+
+    #[test]
+    fn test_record_codec_preserves_wire_bytes_and_rejects_trailing_data() {
+        let fact = make_fact(100, "wire-compatible");
+        let legacy = bincode::serialize(&fact).expect("legacy serialization");
+        let canonical = serialize_record(&fact).expect("bounded serialization");
+
+        assert_eq!(canonical, legacy);
+        assert_eq!(
+            deserialize_record::<Fact>(&canonical)
+                .expect("canonical payload")
+                .fact_id,
+            fact.fact_id
+        );
+
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(
+            deserialize_record::<Fact>(&trailing).is_err(),
+            "length-prefixed AOF records must contain exactly one value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_rejects_record_larger_than_replay_ceiling() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(DEFAULT_AOF_FILENAME);
+        let oversized = make_fact(
+            100,
+            &"x".repeat(MAX_AOF_RECORD_BYTES as usize + LENGTH_PREFIX_SIZE),
+        );
+        let mut writer = AofWriter::open(&path).await.expect("open");
+
+        let error = writer
+            .append_fact(&oversized)
+            .await
+            .expect_err("oversized record must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(writer.write_count(), 0);
     }
 
     #[tokio::test]
