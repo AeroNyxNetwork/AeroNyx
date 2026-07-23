@@ -9,6 +9,8 @@
 //!                      v1 timestamp endpoint for backward compatibility.
 //! v1.2.0-ReplayGuard - Reject repeated use of an already verified v1 token
 //!                      challenge through a bounded, expiring replay cache.
+//! v1.1.2-PortablePathTest - Restrict the raw non-UTF-8 filename test to
+//!                      non-Apple Unix targets whose filesystems accept it.
 //! v1.1.1-CrashSafe   - Replace secret-bearing configuration through a synced
 //!                      same-directory temporary file and atomic rename while
 //!                      preserving permissions and valid platform file names.
@@ -1585,7 +1587,10 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // [PORTABLE-PATH-TEST 2026-07-23 by Codex] Darwin rejects this byte sequence
+    // before the atomic replacement code runs, so only test it where it is a
+    // representable filesystem path.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
     fn test_atomic_replace_accepts_non_utf8_file_name() {
         use std::os::unix::ffi::OsStringExt;
