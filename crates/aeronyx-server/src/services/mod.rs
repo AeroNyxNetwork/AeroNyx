@@ -11,6 +11,8 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.13.0-BlindVaultIssuerRuntime - Re-exported the monotonic issuer
+//     installation outcome and aggregate runtime status
 //   v0.12.0-DirectoryWitnessThreshold - Re-exported the audited checkpoint
 //     target used to retry only current pinned witnesses below threshold
 //   v0.11.0-DirectoryWitnessOutcomeTelemetry - Re-exported bounded durable and
@@ -51,10 +53,12 @@ pub mod traffic_tracker;
 pub mod wallet_routes;
 
 // Re-export primary types
+// [BLIND-VAULT-ISSUER-RUNTIME 2026-07-23 by Codex] Keep the authenticated
+// control-plane contract on the public services boundary.
 pub use blind_vault::{
-    BlindVaultCleanupReport, BlindVaultLeaseProvisionOutcome, BlindVaultPullPage,
-    BlindVaultService, BlindVaultServiceError, BlindVaultStatus, BlindVaultStoredObject,
-    SharedBlindVaultService,
+    BlindVaultCleanupReport, BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus,
+    BlindVaultLeaseProvisionOutcome, BlindVaultPullPage, BlindVaultService, BlindVaultServiceError,
+    BlindVaultStatus, BlindVaultStoredObject, SharedBlindVaultService,
 };
 pub use chat_relay::{derive_node_secret, ChatRelayService};
 pub use deny_list::{DenyList, DenyReason};

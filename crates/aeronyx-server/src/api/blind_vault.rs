@@ -39,7 +39,9 @@
 //!   handler; that would apply backpressure after attacker-controlled buffering.
 //! - V1 admission is a signed one-time bearer credential, not blind issuance.
 //!
-//! Last Modified: v1.2.0-BlindVaultIssuerDirectory - Added bounded,
+//! Last Modified: v1.3.0-BlindVaultIssuerRuntime - Kept internal issuer
+//! rotation failures inside one privacy-safe public availability bucket.
+//! v1.2.0-BlindVaultIssuerDirectory - Added bounded,
 //! node-signed public key discovery for V2 issuer rotation.
 //! v1.1.0-BlindVaultBlindAdmission - Added additive V2
 //! redemption on the existing bounded lease route.
@@ -417,7 +419,15 @@ fn binary_response(status: StatusCode, frame: BlindVaultFrame) -> Result<Respons
 
 fn map_service_error(error: BlindVaultServiceError) -> ApiFailure {
     match error {
-        BlindVaultServiceError::Disabled | BlindVaultServiceError::AdmissionUnavailable => {
+        BlindVaultServiceError::Disabled
+        | BlindVaultServiceError::AdmissionUnavailable
+        | BlindVaultServiceError::IssuerDirectoryRollback
+        | BlindVaultServiceError::IssuerDirectoryGenerationConflict
+        | BlindVaultServiceError::IssuerDirectoryContinuity
+        | BlindVaultServiceError::IssuerDirectoryNoActiveEpoch
+        | BlindVaultServiceError::IssuerDirectoryGenerationOutOfRange => {
+            // [BLIND-VAULT-ISSUER-RUNTIME 2026-07-23 by Codex] Runtime
+            // directory administration errors are never a client oracle.
             ApiFailure::new(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
         }
         BlindVaultServiceError::AdmissionIssuerRejected

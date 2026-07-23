@@ -12,6 +12,7 @@
 //! - Self-authenticating anonymous lease provisioning.
 //! - Atomic one-time bearer admission spend + lease creation.
 //! - RFC 9474 blind-admission verification under rotating public epoch keys.
+//! - Persistent monotonic runtime rotation of public issuer epochs.
 //! - Deterministic public issuer-epoch snapshots for node-signed discovery.
 //! - Immutable, idempotent ciphertext object persistence.
 //! - Capability-gated bounded recovery pages with encrypted snapshot cursors.
@@ -51,8 +52,12 @@
 //! - API handlers must run synchronous SQLite methods in `spawn_blocking`.
 //! - Pull cursors must remain lease-bound AEAD ciphertext; never expose the
 //!   internal SQLite sequence or accept a caller-provided raw sequence.
+//! - Runtime issuer updates must remain monotonic, continuity-safe, and atomic
+//!   across both SQLite persistence and in-process readers.
 //!
-//! Last Modified: v1.5.0-BlindVaultAdmissionOnly - Removed the unused direct
+//! Last Modified: v1.6.0-BlindVaultIssuerRuntime - Added persistent monotonic
+//! public issuer-epoch rotation with rollback and continuity protection.
+//! v1.5.0-BlindVaultAdmissionOnly - Removed the unused direct
 //! lease-provisioning bypass and moved tests onto the production admission path.
 //! v1.4.0-BlindVaultIssuerDirectory - Added deterministic
 //! active/future issuer snapshots for authenticated key discovery.
@@ -73,9 +78,10 @@ use std::time::Duration;
 
 use aeronyx_core::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::blind_vault::{
-    BlindVaultBlindIssuerEpoch, BlindVaultBlindLeaseAdmissionRequest, BlindVaultDeleteRequest,
-    BlindVaultDeletedReceipt, BlindVaultError, BlindVaultLeaseAdmissionRequest,
-    BlindVaultLeaseCreateRequest, BlindVaultPutRequest, BlindVaultStoredReceipt,
+    BlindVaultBlindIssuerDirectory, BlindVaultBlindIssuerEpoch,
+    BlindVaultBlindLeaseAdmissionRequest, BlindVaultDeleteRequest, BlindVaultDeletedReceipt,
+    BlindVaultError, BlindVaultLeaseAdmissionRequest, BlindVaultLeaseCreateRequest,
+    BlindVaultPutRequest, BlindVaultStoredReceipt,
 };
 use blind_rsa_signatures::{MessageRandomizer, PublicKeySha384PSSRandomized, Signature};
 use chacha20poly1305::{
@@ -83,7 +89,7 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
 };
 use hmac::{Hmac, Mac};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -97,6 +103,7 @@ const READ_AUTH_KEY_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReadAuth-Key-v1";
 const READ_AUTH_TAG_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReadAuth-Tag-v1";
 const PULL_CURSOR_KEY_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullCursor-Key-v1";
 const PULL_CURSOR_AAD_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullCursor-AAD-v1";
+const BLIND_ISSUER_SET_DIGEST_DOMAIN: &[u8] = b"AeroNyx-BlindVault-IssuerSet-Digest-v1";
 const PULL_CURSOR_VERSION: u8 = 1;
 const PULL_CURSOR_NONCE_BYTES: usize = 24;
 const PULL_CURSOR_PLAINTEXT_BYTES: usize = 16;
@@ -108,11 +115,20 @@ const CLEANUP_LEASE_BATCH: usize = 128;
 const CLEANUP_TOMBSTONE_BATCH: usize = 512;
 const CLEANUP_ADMISSION_SPEND_BATCH: usize = 512;
 
+#[derive(Clone)]
 struct BlindAdmissionIssuer {
-    public_key: PublicKeySha384PSSRandomized,
+    public_key: Arc<PublicKeySha384PSSRandomized>,
     not_before_ms: u64,
     expires_at_ms: u64,
     max_lease_ttl_ms: u64,
+}
+
+struct BlindAdmissionIssuerRuntime {
+    generation: u64,
+    digest: [u8; 32],
+    updated_at_ms: u64,
+    epochs: Vec<BlindVaultBlindIssuerEpoch>,
+    issuers: HashMap<[u8; 32], BlindAdmissionIssuer>,
 }
 
 /// Result of idempotent anonymous lease provisioning.
@@ -122,6 +138,34 @@ pub enum BlindVaultLeaseProvisionOutcome {
     Created,
     /// The exact same signed lease was already present.
     Existing,
+}
+
+/// Result of an authenticated public issuer-directory installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultIssuerInstallOutcome {
+    /// A strictly newer generation was durably installed.
+    Installed {
+        /// Installed monotonic generation.
+        generation: u64,
+    },
+    /// The exact same generation and canonical epoch set was already present.
+    Unchanged {
+        /// Existing monotonic generation.
+        generation: u64,
+    },
+}
+
+/// Aggregate-only public issuer runtime state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultIssuerRuntimeStatus {
+    /// Monotonic directory generation; zero denotes static TOML bootstrap.
+    pub generation: u64,
+    /// Local installation time, or zero for the static bootstrap generation.
+    pub updated_at_ms: u64,
+    /// Number of epochs in the persisted canonical generation.
+    pub epoch_count: usize,
+    /// Number of epochs active at the supplied observation time.
+    pub active_epoch_count: usize,
 }
 
 /// One opaque object returned to an authorised client.
@@ -237,6 +281,21 @@ pub enum BlindVaultServiceError {
     /// Admission issuer configuration could not be parsed safely.
     #[error("blind vault admission issuer configuration is invalid")]
     AdmissionConfigurationInvalid,
+    /// Candidate issuer generation is older than the durable runtime state.
+    #[error("blind vault issuer directory rollback rejected")]
+    IssuerDirectoryRollback,
+    /// Candidate reused a generation for different public issuer material.
+    #[error("blind vault issuer directory generation conflicts")]
+    IssuerDirectoryGenerationConflict,
+    /// Candidate removed or changed an issuer epoch that is still valid.
+    #[error("blind vault issuer directory breaks active epoch continuity")]
+    IssuerDirectoryContinuity,
+    /// Candidate has no issuer epoch active at installation time.
+    #[error("blind vault issuer directory has no active epoch")]
+    IssuerDirectoryNoActiveEpoch,
+    /// Candidate issuer generation cannot be represented durably.
+    #[error("blind vault issuer directory generation is outside the supported range")]
+    IssuerDirectoryGenerationOutOfRange,
     /// Requested object is absent and has no retained tombstone.
     #[error("blind vault object not found")]
     ObjectNotFound,
@@ -256,7 +315,7 @@ pub struct BlindVaultService {
     read_auth_key: Zeroizing<[u8; 32]>,
     pull_cursor_key: Zeroizing<[u8; 32]>,
     admission_issuers: HashMap<[u8; 32], IdentityPublicKey>,
-    blind_admission_issuers: HashMap<[u8; 32], BlindAdmissionIssuer>,
+    blind_admission_issuers: RwLock<BlindAdmissionIssuerRuntime>,
 }
 
 impl BlindVaultService {
@@ -294,26 +353,41 @@ impl BlindVaultService {
                     .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
-        let blind_admission_issuers = config
+        let bootstrap_epochs = config
             .blind_admission_issuer_materials()
             .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?
             .into_iter()
             .map(|material| {
-                PublicKeySha384PSSRandomized::from_der(&material.public_key_der)
-                    .map(|public_key| {
-                        (
-                            material.key_id,
-                            BlindAdmissionIssuer {
-                                public_key,
-                                not_before_ms: material.not_before_ms,
-                                expires_at_ms: material.expires_at_ms,
-                                max_lease_ttl_ms: material.max_lease_ttl_ms,
-                            },
-                        )
-                    })
-                    .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)
+                let epoch = BlindVaultBlindIssuerEpoch::new(
+                    material.public_key_der,
+                    material.not_before_ms,
+                    material.expires_at_ms,
+                    material.max_lease_ttl_ms,
+                );
+                if epoch.issuer_key_id != material.key_id {
+                    return Err(BlindVaultServiceError::AdmissionConfigurationInvalid);
+                }
+                Ok(epoch)
             })
-            .collect::<Result<HashMap<_, _>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
+        // [BLIND-VAULT-ISSUER-RUNTIME 2026-07-23 by Codex] Static TOML is the
+        // backward-compatible generation-zero bootstrap only. Once an
+        // authenticated newer set is installed, the durable SQLite snapshot
+        // wins across restart so stale deployment files cannot roll it back.
+        let bootstrap_runtime = build_blind_issuer_runtime(
+            0,
+            bootstrap_epochs,
+            0,
+            false,
+            config.max_lease_ttl_ms(),
+            &node_identity,
+        )?;
+        let blind_admission_issuers = load_persisted_blind_issuer_runtime(
+            &connection,
+            bootstrap_runtime,
+            config.max_lease_ttl_ms(),
+            &node_identity,
+        )?;
 
         Ok(Self {
             config,
@@ -322,7 +396,7 @@ impl BlindVaultService {
             read_auth_key,
             pull_cursor_key,
             admission_issuers,
-            blind_admission_issuers,
+            blind_admission_issuers: RwLock::new(blind_admission_issuers),
         })
     }
 
@@ -338,31 +412,93 @@ impl BlindVaultService {
         &self,
         now_ms: u64,
     ) -> Result<Vec<BlindVaultBlindIssuerEpoch>, BlindVaultServiceError> {
-        let mut epochs = self
+        Ok(self
             .blind_admission_issuers
+            .read()
+            .epochs
             .iter()
-            .filter(|(_, issuer)| issuer.expires_at_ms > now_ms)
-            .map(|(configured_key_id, issuer)| {
-                let public_key_der = issuer
-                    .public_key
-                    .to_der()
-                    .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?;
-                let epoch = BlindVaultBlindIssuerEpoch::new(
-                    public_key_der,
-                    issuer.not_before_ms,
-                    issuer.expires_at_ms,
-                    issuer.max_lease_ttl_ms,
-                );
-                if &epoch.issuer_key_id != configured_key_id {
-                    return Err(BlindVaultServiceError::AdmissionConfigurationInvalid);
-                }
-                Ok(epoch)
-            })
-            .collect::<Result<Vec<_>, BlindVaultServiceError>>()?;
-        // [BLIND-VAULT-ISSUER-DIRECTORY 2026-07-23 by Codex] HashMap order is
-        // process-randomized; canonical sorting keeps signatures reproducible.
-        epochs.sort_by_key(|epoch| epoch.issuer_key_id);
-        Ok(epochs)
+            .filter(|epoch| epoch.expires_at_ms > now_ms)
+            .cloned()
+            .collect())
+    }
+
+    /// Returns aggregate-only runtime issuer state.
+    #[must_use]
+    pub fn blind_admission_issuer_runtime_status(
+        &self,
+        now_ms: u64,
+    ) -> BlindVaultIssuerRuntimeStatus {
+        let runtime = self.blind_admission_issuers.read();
+        BlindVaultIssuerRuntimeStatus {
+            generation: runtime.generation,
+            updated_at_ms: runtime.updated_at_ms,
+            epoch_count: runtime.epochs.len(),
+            active_epoch_count: runtime
+                .epochs
+                .iter()
+                .filter(|epoch| epoch.not_before_ms <= now_ms && now_ms < epoch.expires_at_ms)
+                .count(),
+        }
+    }
+
+    /// Durably installs one already-authenticated public issuer generation.
+    ///
+    /// The caller owns transport authentication and must never forward issuer
+    /// private material. This method independently validates canonical RSA
+    /// public keys, bounded policy, monotonic generation, active-key
+    /// availability, and continuity of every still-valid published epoch.
+    ///
+    /// # Errors
+    /// Returns a coarse fail-closed error for malformed, stale, conflicting, or
+    /// continuity-breaking candidates and leaves the active runtime unchanged.
+    pub fn install_blind_admission_issuer_epochs(
+        &self,
+        generation: u64,
+        epochs: Vec<BlindVaultBlindIssuerEpoch>,
+        now_ms: u64,
+    ) -> Result<BlindVaultIssuerInstallOutcome, BlindVaultServiceError> {
+        let candidate = build_blind_issuer_runtime(
+            generation,
+            epochs,
+            now_ms,
+            true,
+            self.config.max_lease_ttl_ms(),
+            &self.node_identity,
+        )?;
+        let mut current = self.blind_admission_issuers.write();
+        if now_ms < current.updated_at_ms {
+            return Err(BlindVaultServiceError::IssuerDirectoryRollback);
+        }
+        if candidate.generation < current.generation {
+            return Err(BlindVaultServiceError::IssuerDirectoryRollback);
+        }
+        if candidate.generation == current.generation {
+            return if candidate.digest == current.digest {
+                Ok(BlindVaultIssuerInstallOutcome::Unchanged { generation })
+            } else {
+                Err(BlindVaultServiceError::IssuerDirectoryGenerationConflict)
+            };
+        }
+        for current_epoch in current
+            .epochs
+            .iter()
+            .filter(|epoch| epoch.expires_at_ms > now_ms)
+        {
+            let unchanged = candidate.epochs.iter().any(|candidate_epoch| {
+                candidate_epoch.issuer_key_id == current_epoch.issuer_key_id
+                    && candidate_epoch == current_epoch
+            });
+            if !unchanged {
+                return Err(BlindVaultServiceError::IssuerDirectoryContinuity);
+            }
+        }
+
+        persist_blind_issuer_runtime(&self.connection, &candidate, now_ms)?;
+        let installed_generation = candidate.generation;
+        *current = candidate;
+        Ok(BlindVaultIssuerInstallOutcome::Installed {
+            generation: installed_generation,
+        })
     }
 
     /// Atomically consumes one operator-approved anonymous bearer ticket and
@@ -407,7 +543,10 @@ impl BlindVaultService {
         request.admission.validate_shape()?;
         let issuer = self
             .blind_admission_issuers
+            .read()
+            .issuers
             .get(&request.admission.issuer_key_id)
+            .cloned()
             .ok_or(BlindVaultServiceError::AdmissionIssuerRejected)?;
         if now_ms < issuer.not_before_ms || now_ms >= issuer.expires_at_ms {
             return Err(BlindVaultServiceError::AdmissionIssuerRejected);
@@ -1012,6 +1151,218 @@ impl BlindVaultService {
     }
 }
 
+fn build_blind_issuer_runtime(
+    generation: u64,
+    mut epochs: Vec<BlindVaultBlindIssuerEpoch>,
+    validated_at_ms: u64,
+    require_active_epoch: bool,
+    node_max_lease_ttl_ms: u64,
+    node_identity: &IdentityKeyPair,
+) -> Result<BlindAdmissionIssuerRuntime, BlindVaultServiceError> {
+    if generation > i64::MAX as u64 {
+        return Err(BlindVaultServiceError::IssuerDirectoryGenerationOutOfRange);
+    }
+    epochs.sort_by_key(|epoch| epoch.issuer_key_id);
+    if epochs
+        .iter()
+        .any(|epoch| epoch.max_lease_ttl_ms > node_max_lease_ttl_ms)
+    {
+        return Err(BlindVaultServiceError::AdmissionConfigurationInvalid);
+    }
+
+    // [BLIND-VAULT-ISSUER-RUNTIME 2026-07-23 by Codex] Reuse the protocol's
+    // canonical directory validator instead of maintaining a weaker parallel
+    // interpretation of epoch bounds, ordering, and key fingerprints.
+    let mut validated_directory = BlindVaultBlindIssuerDirectory::new(
+        validated_at_ms,
+        node_identity.public_key_bytes(),
+        epochs.clone(),
+    );
+    validated_directory
+        .sign(node_identity)
+        .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?;
+    if require_active_epoch
+        && !epochs.iter().any(|epoch| {
+            epoch.not_before_ms <= validated_at_ms && validated_at_ms < epoch.expires_at_ms
+        })
+    {
+        return Err(BlindVaultServiceError::IssuerDirectoryNoActiveEpoch);
+    }
+
+    let mut issuers = HashMap::with_capacity(epochs.len());
+    for epoch in &epochs {
+        let public_key = PublicKeySha384PSSRandomized::from_der(&epoch.public_key_der)
+            .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?;
+        let canonical_der = public_key
+            .to_der()
+            .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?;
+        if canonical_der != epoch.public_key_der {
+            return Err(BlindVaultServiceError::AdmissionConfigurationInvalid);
+        }
+        if issuers
+            .insert(
+                epoch.issuer_key_id,
+                BlindAdmissionIssuer {
+                    public_key: Arc::new(public_key),
+                    not_before_ms: epoch.not_before_ms,
+                    expires_at_ms: epoch.expires_at_ms,
+                    max_lease_ttl_ms: epoch.max_lease_ttl_ms,
+                },
+            )
+            .is_some()
+        {
+            return Err(BlindVaultServiceError::AdmissionConfigurationInvalid);
+        }
+    }
+    let digest = blind_issuer_set_digest(&epochs)?;
+    Ok(BlindAdmissionIssuerRuntime {
+        generation,
+        digest,
+        updated_at_ms: validated_at_ms,
+        epochs,
+        issuers,
+    })
+}
+
+fn blind_issuer_set_digest(
+    epochs: &[BlindVaultBlindIssuerEpoch],
+) -> Result<[u8; 32], BlindVaultServiceError> {
+    let epoch_count = u16::try_from(epochs.len())
+        .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?;
+    let mut hasher = Sha256::new();
+    hasher.update(BLIND_ISSUER_SET_DIGEST_DOMAIN);
+    hasher.update(epoch_count.to_be_bytes());
+    for epoch in epochs {
+        let key_length = u16::try_from(epoch.public_key_der.len())
+            .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?;
+        hasher.update(epoch.admission_version.to_be_bytes());
+        hasher.update(epoch.issuer_key_id);
+        hasher.update(key_length.to_be_bytes());
+        hasher.update(&epoch.public_key_der);
+        hasher.update(epoch.not_before_ms.to_be_bytes());
+        hasher.update(epoch.expires_at_ms.to_be_bytes());
+        hasher.update(epoch.max_lease_ttl_ms.to_be_bytes());
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn load_persisted_blind_issuer_runtime(
+    connection: &Connection,
+    bootstrap: BlindAdmissionIssuerRuntime,
+    node_max_lease_ttl_ms: u64,
+    node_identity: &IdentityKeyPair,
+) -> Result<BlindAdmissionIssuerRuntime, BlindVaultServiceError> {
+    let persisted: Option<(i64, Vec<u8>, i64)> = connection
+        .query_row(
+            "SELECT generation, digest, updated_at_ms
+             FROM blind_vault_blind_issuer_state WHERE state_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((generation, digest, updated_at_ms)) = persisted else {
+        return Ok(bootstrap);
+    };
+    let generation = non_negative_u64(generation)?;
+    let updated_at_ms = non_negative_u64(updated_at_ms)?;
+    let persisted_digest: [u8; 32] = fixed_array(&digest)?;
+
+    let mut statement = connection.prepare(
+        "SELECT issuer_key_id, admission_version, public_key_der,
+                not_before_ms, expires_at_ms, max_lease_ttl_ms
+         FROM blind_vault_blind_issuer_epochs
+         ORDER BY issuer_key_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut epochs = Vec::new();
+    for row in rows {
+        let (
+            issuer_key_id,
+            admission_version,
+            public_key_der,
+            not_before_ms,
+            expires_at_ms,
+            max_lease_ttl_ms,
+        ) = row?;
+        let admission_version =
+            u16::try_from(admission_version).map_err(|_| BlindVaultServiceError::CorruptState)?;
+        epochs.push(BlindVaultBlindIssuerEpoch {
+            admission_version,
+            issuer_key_id: fixed_array(&issuer_key_id)?,
+            public_key_der,
+            not_before_ms: non_negative_u64(not_before_ms)?,
+            expires_at_ms: non_negative_u64(expires_at_ms)?,
+            max_lease_ttl_ms: non_negative_u64(max_lease_ttl_ms)?,
+        });
+    }
+    if epochs.is_empty() {
+        return Err(BlindVaultServiceError::CorruptState);
+    }
+    let runtime = build_blind_issuer_runtime(
+        generation,
+        epochs,
+        updated_at_ms,
+        false,
+        node_max_lease_ttl_ms,
+        node_identity,
+    )
+    .map_err(|_| BlindVaultServiceError::CorruptState)?;
+    if runtime.digest != persisted_digest {
+        return Err(BlindVaultServiceError::CorruptState);
+    }
+    Ok(runtime)
+}
+
+fn persist_blind_issuer_runtime(
+    connection: &Mutex<Connection>,
+    runtime: &BlindAdmissionIssuerRuntime,
+    updated_at_ms: u64,
+) -> Result<(), BlindVaultServiceError> {
+    let generation = i64::try_from(runtime.generation)
+        .map_err(|_| BlindVaultServiceError::IssuerDirectoryGenerationOutOfRange)?;
+    let updated_at_ms = sqlite_i64(updated_at_ms)?;
+    let mut connection = connection.lock();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute("DELETE FROM blind_vault_blind_issuer_epochs", [])?;
+    for epoch in &runtime.epochs {
+        transaction.execute(
+            "INSERT INTO blind_vault_blind_issuer_epochs
+             (issuer_key_id, admission_version, public_key_der, not_before_ms,
+              expires_at_ms, max_lease_ttl_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &epoch.issuer_key_id[..],
+                i64::from(epoch.admission_version),
+                &epoch.public_key_der,
+                sqlite_i64(epoch.not_before_ms)?,
+                sqlite_i64(epoch.expires_at_ms)?,
+                sqlite_i64(epoch.max_lease_ttl_ms)?,
+            ],
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO blind_vault_blind_issuer_state
+         (state_id, generation, digest, updated_at_ms)
+         VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT(state_id) DO UPDATE SET
+           generation = excluded.generation,
+           digest = excluded.digest,
+           updated_at_ms = excluded.updated_at_ms",
+        params![generation, &runtime.digest[..], updated_at_ms],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn derive_node_key(
     seed: &[u8],
     domain: &[u8],
@@ -1108,7 +1459,23 @@ fn init_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
             expires_at_ms  INTEGER NOT NULL CHECK(expires_at_ms > consumed_at_ms)
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_blind_vault_admission_spends_expiry
-          ON blind_vault_admission_spends(expires_at_ms);",
+          ON blind_vault_admission_spends(expires_at_ms);
+
+        CREATE TABLE IF NOT EXISTS blind_vault_blind_issuer_state (
+            state_id      INTEGER PRIMARY KEY CHECK(state_id = 1),
+            generation    INTEGER NOT NULL CHECK(generation > 0),
+            digest        BLOB NOT NULL CHECK(length(digest) = 32),
+            updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS blind_vault_blind_issuer_epochs (
+            issuer_key_id       BLOB PRIMARY KEY CHECK(length(issuer_key_id) = 32),
+            admission_version   INTEGER NOT NULL CHECK(admission_version > 0),
+            public_key_der      BLOB NOT NULL,
+            not_before_ms       INTEGER NOT NULL CHECK(not_before_ms >= 0),
+            expires_at_ms       INTEGER NOT NULL CHECK(expires_at_ms > not_before_ms),
+            max_lease_ttl_ms    INTEGER NOT NULL CHECK(max_lease_ttl_ms > 0)
+        ) WITHOUT ROWID;",
     )
 }
 
@@ -1328,6 +1695,20 @@ mod tests {
     use crate::config_blind_vault::BlindVaultBlindAdmissionIssuerConfig;
 
     const NOW_MS: u64 = 1_800_000_000_000;
+
+    fn blind_issuer_epoch(
+        key_pair: &KeyPairSha384PSSRandomized,
+        not_before_ms: u64,
+        expires_at_ms: u64,
+        max_lease_ttl_ms: u64,
+    ) -> BlindVaultBlindIssuerEpoch {
+        BlindVaultBlindIssuerEpoch::new(
+            key_pair.pk.to_der().expect("public key DER"),
+            not_before_ms,
+            expires_at_ms,
+            max_lease_ttl_ms,
+        )
+    }
 
     struct Fixture {
         _directory: TempDir,
@@ -1620,6 +2001,248 @@ mod tests {
             service.provision_lease_with_blind_admission(&forged, NOW_MS + 3),
             Err(BlindVaultServiceError::AdmissionProofRejected)
         ));
+    }
+
+    // [BLIND-VAULT-ISSUER-RUNTIME 2026-07-23 by Codex] Exercise rotation as a
+    // durable state machine: exact retries are idempotent, generation reuse and
+    // rollback fail closed, and still-valid verifier keys cannot disappear.
+    #[test]
+    fn blind_issuer_rotation_is_monotonic_continuous_and_restart_safe() {
+        let old_key =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("old RSA key");
+        let new_key =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("new RSA key");
+        let future_key =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("future RSA key");
+        let max_lease_ttl_ms = 14 * 24 * 60 * 60 * 1_000;
+        let old_epoch = blind_issuer_epoch(
+            &old_key,
+            NOW_MS - 60_000,
+            NOW_MS + 24 * 60 * 60 * 1_000,
+            max_lease_ttl_ms,
+        );
+        let new_epoch = blind_issuer_epoch(
+            &new_key,
+            NOW_MS - 60_000,
+            NOW_MS + 2 * 24 * 60 * 60 * 1_000,
+            max_lease_ttl_ms,
+        );
+        let future_epoch = blind_issuer_epoch(
+            &future_key,
+            NOW_MS + 60_000,
+            NOW_MS + 3 * 24 * 60 * 60 * 1_000,
+            max_lease_ttl_ms,
+        );
+        let directory = tempfile::tempdir().expect("temp directory");
+        let config = BlindVaultConfig {
+            enabled: true,
+            public_api_enabled: true,
+            blind_admission_issuers: vec![BlindVaultBlindAdmissionIssuerConfig {
+                public_key_der_base64: BASE64.encode(&old_epoch.public_key_der),
+                not_before_unix_secs: old_epoch.not_before_ms / 1_000,
+                expires_at_unix_secs: old_epoch.expires_at_ms / 1_000,
+                max_lease_ttl_secs: old_epoch.max_lease_ttl_ms / 1_000,
+            }],
+            db_path: directory.path().join("vault.db").display().to_string(),
+            ..BlindVaultConfig::default()
+        };
+        let node_seed = [61; 32];
+        let service = BlindVaultService::new(
+            config.clone(),
+            IdentityKeyPair::from_bytes(&node_seed).expect("node key"),
+        )
+        .expect("service");
+        assert_eq!(
+            service.blind_admission_issuer_runtime_status(NOW_MS),
+            BlindVaultIssuerRuntimeStatus {
+                generation: 0,
+                updated_at_ms: 0,
+                epoch_count: 1,
+                active_epoch_count: 1,
+            }
+        );
+
+        let rotated = vec![old_epoch.clone(), new_epoch.clone()];
+        assert_eq!(
+            service
+                .install_blind_admission_issuer_epochs(1, rotated.clone(), NOW_MS)
+                .expect("install generation one"),
+            BlindVaultIssuerInstallOutcome::Installed { generation: 1 }
+        );
+        assert_eq!(
+            service
+                .install_blind_admission_issuer_epochs(1, rotated.clone(), NOW_MS)
+                .expect("retry generation one"),
+            BlindVaultIssuerInstallOutcome::Unchanged { generation: 1 }
+        );
+        assert!(matches!(
+            service.install_blind_admission_issuer_epochs(0, rotated.clone(), NOW_MS),
+            Err(BlindVaultServiceError::IssuerDirectoryRollback)
+        ));
+        assert!(matches!(
+            service.install_blind_admission_issuer_epochs(2, rotated.clone(), NOW_MS - 1),
+            Err(BlindVaultServiceError::IssuerDirectoryRollback)
+        ));
+
+        let mut conflicting = rotated.clone();
+        conflicting[1].max_lease_ttl_ms -= 1_000;
+        assert!(matches!(
+            service.install_blind_admission_issuer_epochs(1, conflicting, NOW_MS),
+            Err(BlindVaultServiceError::IssuerDirectoryGenerationConflict)
+        ));
+        assert!(matches!(
+            service.install_blind_admission_issuer_epochs(2, vec![new_epoch.clone()], NOW_MS),
+            Err(BlindVaultServiceError::IssuerDirectoryContinuity)
+        ));
+        assert!(matches!(
+            service.install_blind_admission_issuer_epochs(2, vec![future_epoch], NOW_MS),
+            Err(BlindVaultServiceError::IssuerDirectoryNoActiveEpoch)
+        ));
+        drop(service);
+
+        let restarted = BlindVaultService::new(
+            config,
+            IdentityKeyPair::from_bytes(&node_seed).expect("restart node key"),
+        )
+        .expect("restart service");
+        assert_eq!(
+            restarted.blind_admission_issuer_runtime_status(NOW_MS),
+            BlindVaultIssuerRuntimeStatus {
+                generation: 1,
+                updated_at_ms: NOW_MS,
+                epoch_count: 2,
+                active_epoch_count: 2,
+            }
+        );
+        assert_eq!(
+            restarted
+                .blind_admission_issuer_epochs(NOW_MS)
+                .expect("restarted epochs"),
+            {
+                let mut expected = rotated;
+                expected.sort_by_key(|epoch| epoch.issuer_key_id);
+                expected
+            }
+        );
+
+        let write_key = IdentityKeyPair::from_bytes(&[62; 32]).expect("write key");
+        let admin_key = IdentityKeyPair::from_bytes(&[63; 32]).expect("admin key");
+        let mut lease = BlindVaultLeaseCreateRequest::new(
+            [64; 32],
+            [65; 16],
+            write_key.public_key_bytes(),
+            admin_key.public_key_bytes(),
+            Sha256::digest([66; 32]).into(),
+            NOW_MS + 7 * 24 * 60 * 60 * 1_000,
+        );
+        lease.sign(&admin_key).expect("sign lease");
+        let unsigned = BlindVaultBlindAdmissionToken::new(
+            new_epoch.issuer_key_id,
+            [67; 32],
+            [1; 32],
+            vec![0; 256],
+        );
+        let message = unsigned.message_bytes();
+        let blinding = new_key
+            .pk
+            .blind(&mut DefaultRng, &message)
+            .expect("blind rotated admission");
+        let blind_signature = new_key
+            .sk
+            .blind_sign(&blinding.blind_message)
+            .expect("sign rotated admission");
+        let signature = new_key
+            .pk
+            .finalize(&blind_signature, &blinding, &message)
+            .expect("finalize rotated admission");
+        let admission = BlindVaultBlindAdmissionToken::new(
+            new_epoch.issuer_key_id,
+            [67; 32],
+            blinding.msg_randomizer.expect("message randomizer").0,
+            signature.0,
+        );
+        assert_eq!(
+            restarted
+                .provision_lease_with_blind_admission(
+                    &BlindVaultBlindLeaseAdmissionRequest { admission, lease },
+                    NOW_MS + 1,
+                )
+                .expect("redeem after restart"),
+            BlindVaultLeaseProvisionOutcome::Created
+        );
+    }
+
+    #[test]
+    fn blind_issuer_readers_never_observe_a_partial_generation() {
+        let old_key =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("old RSA key");
+        let new_key =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("new RSA key");
+        let max_lease_ttl_ms = 14 * 24 * 60 * 60 * 1_000;
+        let old_epoch = blind_issuer_epoch(
+            &old_key,
+            NOW_MS - 60_000,
+            NOW_MS + 24 * 60 * 60 * 1_000,
+            max_lease_ttl_ms,
+        );
+        let new_epoch = blind_issuer_epoch(
+            &new_key,
+            NOW_MS - 60_000,
+            NOW_MS + 2 * 24 * 60 * 60 * 1_000,
+            max_lease_ttl_ms,
+        );
+        let directory = tempfile::tempdir().expect("temp directory");
+        let service = Arc::new(
+            BlindVaultService::new(
+                BlindVaultConfig {
+                    enabled: true,
+                    public_api_enabled: true,
+                    blind_admission_issuers: vec![BlindVaultBlindAdmissionIssuerConfig {
+                        public_key_der_base64: BASE64.encode(&old_epoch.public_key_der),
+                        not_before_unix_secs: old_epoch.not_before_ms / 1_000,
+                        expires_at_unix_secs: old_epoch.expires_at_ms / 1_000,
+                        max_lease_ttl_secs: old_epoch.max_lease_ttl_ms / 1_000,
+                    }],
+                    db_path: directory.path().join("vault.db").display().to_string(),
+                    ..BlindVaultConfig::default()
+                },
+                IdentityKeyPair::from_bytes(&[68; 32]).expect("node key"),
+            )
+            .expect("service"),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let service = Arc::clone(&service);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..256 {
+                        let epochs = service
+                            .blind_admission_issuer_epochs(NOW_MS)
+                            .expect("read issuer generation");
+                        assert!(epochs.len() == 1 || epochs.len() == 2);
+                        assert!(epochs
+                            .windows(2)
+                            .all(|pair| pair[0].issuer_key_id < pair[1].issuer_key_id));
+                        std::thread::yield_now();
+                    }
+                });
+            }
+            barrier.wait();
+            assert_eq!(
+                service
+                    .install_blind_admission_issuer_epochs(1, vec![old_epoch, new_epoch], NOW_MS,)
+                    .expect("install generation"),
+                BlindVaultIssuerInstallOutcome::Installed { generation: 1 }
+            );
+        });
+        assert_eq!(
+            service
+                .blind_admission_issuer_runtime_status(NOW_MS)
+                .generation,
+            1
+        );
     }
 
     #[test]
