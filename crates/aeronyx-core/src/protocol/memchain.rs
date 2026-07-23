@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.12-VerifiedDeliveryAnchorWitness
+// Version: 2.8.13-BoundedWireCodec
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -23,6 +23,8 @@
 //   v2.8.12-VerifiedDeliveryAnchorWitness — Appended fixed-size signed node
 //   delivery-anchor witness frames. They carry only generation and digest,
 //   never relay routes, message identifiers, payloads, or delivery counts.
+//   v2.8.13-BoundedWireCodec — Unified outbound and inbound byte ceilings
+//   without changing message discriminants, fields, or valid wire bytes.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -54,8 +56,13 @@
 //     replication requires a separate owner-authorised protocol
 //   - serde_bytes64 is defined in chat.rs; the [u8;64] signature fields here
 //     use the same two-[u8;32] trick for bincode compatibility
+//   - [BOUNDED-WIRE-CODEC 2026-07-23 by Codex] Encode and decode must use the
+//     same 2 MiB payload ceiling. Keep the complete-slice length preflight in
+//     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.13-BoundedWireCodec — Symmetric frame limits, wire compatibility
+//                        tests, and padded-input rejection
 //   v2.8.12-VerifiedDeliveryAnchorWitness — Appended variants 31-32 and
 //                        canonical aggregate-only witness signing contracts
 //   v2.8.11-CoordinatorLeaseRelease — Appended variants 29-30 for authenticated
@@ -74,13 +81,13 @@
 //                        checkpoint reconciliation bytes
 // ============================================================================
 
-use bincode::Options;
 use serde::{de, Deserialize, Deserializer, Serialize};
 
 #[allow(deprecated)]
 use crate::ledger::Fact;
 use crate::ledger::{BlockHeader, MemoryRecord, RecordCommitmentBlockV1, RecordCommitmentHeaderV1};
 use crate::protocol::chat::ChatEnvelope;
+use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
 
 // ============================================
 // Deserialisation size limits
@@ -88,9 +95,6 @@ use crate::protocol::chat::ChatEnvelope;
 
 /// Maximum accepted size for a single MemChain message payload (excluding magic byte).
 const MAX_MEMCHAIN_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
-
-/// Maximum accepted size for a single `ChatEnvelope` when decoded standalone.
-const MAX_ENVELOPE_BYTES: u64 = 128 * 1024; // 128 KB
 
 // ============================================
 // Constants
@@ -1141,9 +1145,13 @@ pub fn verified_delivery_anchor_witness_response_signing_bytes(
 // Encode / Decode helpers
 // ============================================
 
-/// Encodes a `MemChainMessage` into a byte vector with the `0xAE` prefix.
+/// Encodes a `MemChainMessage` into a bounded byte vector with the `0xAE` prefix.
+///
+/// # Errors
+/// Returns `bincode::Error` if serialization fails or the payload exceeds the
+/// 2 MiB MemChain protocol ceiling.
 pub fn encode_memchain(msg: &MemChainMessage) -> std::result::Result<Vec<u8>, bincode::Error> {
-    let payload = bincode::serialize(msg)?;
+    let payload = encode_bincode_bounded(msg, MAX_MEMCHAIN_PAYLOAD_BYTES)?;
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(MEMCHAIN_MAGIC);
     buf.extend_from_slice(&payload);
@@ -1155,12 +1163,15 @@ pub fn encode_memchain(msg: &MemChainMessage) -> std::result::Result<Vec<u8>, bi
 ///
 /// Rejects payloads that would require allocating more than
 /// `MAX_MEMCHAIN_PAYLOAD_BYTES` (2 MB).
+///
+/// # Errors
+/// Returns `bincode::Error` for malformed or oversized payloads.
 pub fn decode_memchain(payload: &[u8]) -> std::result::Result<MemChainMessage, bincode::Error> {
-    bincode::options()
-        .with_limit(MAX_MEMCHAIN_PAYLOAD_BYTES)
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .deserialize(payload)
+    decode_bincode_bounded(
+        payload,
+        MAX_MEMCHAIN_PAYLOAD_BYTES,
+        TrailingBytesPolicy::Allow,
+    )
 }
 
 // ============================================
@@ -1176,7 +1187,7 @@ mod tests {
         MemoryLayer, RecordCommitmentBlockV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, BLOCK_TYPE_NORMAL,
         GENESIS_PREV_HASH,
     };
-    use crate::protocol::chat::{encode_envelope, ChatContentType};
+    use crate::protocol::chat::ChatContentType;
 
     // ── Existing tests (preserved verbatim) ─────────────────────────────
 
@@ -1223,6 +1234,51 @@ mod tests {
             MemChainMessage::Ping { nonce } => assert_eq!(nonce, 42),
             other => panic!("Expected Ping, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_memchain_codec_preserves_wire_bytes_and_small_trailing_compatibility() {
+        let msg = MemChainMessage::Ping {
+            nonce: 0x0102_0304_0506_0708,
+        };
+        let encoded = encode_memchain(&msg).expect("bounded encode");
+        assert_eq!(encoded[0], MEMCHAIN_MAGIC);
+        assert_eq!(
+            &encoded[1..],
+            bincode::serialize(&msg)
+                .expect("legacy wire encoding")
+                .as_slice(),
+            "bounded encoding must not alter existing MemChain wire bytes"
+        );
+
+        let mut payload = encoded[1..].to_vec();
+        payload.extend_from_slice(&[0xAA, 0xBB]);
+        match decode_memchain(&payload).expect("decode with legacy trailing bytes") {
+            MemChainMessage::Ping { nonce } => {
+                assert_eq!(nonce, 0x0102_0304_0506_0708);
+            }
+            other => panic!("Expected Ping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_memchain_codec_rejects_oversized_output_and_padded_input() {
+        let oversized = MemChainMessage::ChatExpired {
+            message_ids: vec![[0xCC; 16]; MAX_MEMCHAIN_PAYLOAD_BYTES as usize / 16 + 1],
+            receiver: [0x42; 32],
+        };
+        assert!(
+            encode_memchain(&oversized).is_err(),
+            "sender must not create a MemChain frame that receivers reject"
+        );
+
+        let msg = MemChainMessage::Ping { nonce: 9 };
+        let mut padded = bincode::serialize(&msg).expect("legacy wire encoding");
+        padded.resize(MAX_MEMCHAIN_PAYLOAD_BYTES as usize + 1, 0);
+        assert!(
+            decode_memchain(&padded).is_err(),
+            "ignored trailing padding must not bypass the complete input ceiling"
+        );
     }
 
     #[test]

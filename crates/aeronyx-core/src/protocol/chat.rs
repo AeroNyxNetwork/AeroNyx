@@ -62,18 +62,22 @@
 //! - `BlindRelayDeliveryReceipt`: terminal-signed proof that an exact opaque
 //!   payload reached the store-and-forward acceptance boundary. The receipt
 //!   contains no sender, receiver, endpoint, online-state, or plaintext data.
+//! - [BOUNDED-WIRE-CODEC 2026-07-23 by Codex] Chat and blind-relay encoders
+//!   share the same byte ceilings as their decoders. Keep legacy small trailing
+//!   bytes only for `ChatEnvelope`; blind-relay frames remain canonical.
 //!
 //! ## Last Modified
+//! v1.3.0-BoundedWireCodec - Symmetric frame limits and padded-input rejection
 //! v1.2.0-BlindRelayDeliveryReceipt - Added terminal-signed opaque delivery receipt
 //! v1.1.0-BlindRelayEnvelope — Added opaque node-to-node relay envelope skeleton
 //! v1.0.0-ChatRelay — Initial implementation
 
-use bincode::Options;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
+use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
 
 // ============================================
 // Deserialisation size limit
@@ -505,6 +509,11 @@ impl BlindRelayDeliveryReceipt {
 }
 
 /// Encodes a blind relay envelope with a bounded bincode cap.
+///
+/// # Errors
+/// Returns `CoreError::MessageTooLarge` when the opaque blob exceeds its
+/// protocol class, or `CoreError::MalformedMessage` when bounded serialization
+/// fails.
 pub fn encode_blind_relay_envelope(envelope: &BlindRelayEnvelope) -> Result<Vec<u8>, CoreError> {
     if envelope.encrypted_blob.len() > MAX_BLIND_RELAY_BLOB_BYTES {
         return Err(CoreError::MessageTooLarge {
@@ -512,20 +521,23 @@ pub fn encode_blind_relay_envelope(envelope: &BlindRelayEnvelope) -> Result<Vec<
             actual: envelope.encrypted_blob.len(),
         });
     }
-    bincode::options()
-        .with_fixint_encoding()
-        .with_limit(MAX_BLIND_RELAY_ENVELOPE_BYTES)
-        .serialize(envelope)
+    encode_bincode_bounded(envelope, MAX_BLIND_RELAY_ENVELOPE_BYTES)
         .map_err(|err| CoreError::malformed(format!("blind relay envelope encode: {err}")))
 }
 
 /// Decodes a blind relay envelope with size bounds and blob cap checks.
+///
+/// # Errors
+/// Returns `CoreError::MalformedMessage` for malformed, non-canonical, or
+/// oversized frames, and `CoreError::MessageTooLarge` when the decoded opaque
+/// blob exceeds its protocol class.
 pub fn decode_blind_relay_envelope(bytes: &[u8]) -> Result<BlindRelayEnvelope, CoreError> {
-    let envelope: BlindRelayEnvelope = bincode::options()
-        .with_fixint_encoding()
-        .with_limit(MAX_BLIND_RELAY_ENVELOPE_BYTES)
-        .deserialize(bytes)
-        .map_err(|err| CoreError::malformed(format!("blind relay envelope decode: {err}")))?;
+    let envelope: BlindRelayEnvelope = decode_bincode_bounded(
+        bytes,
+        MAX_BLIND_RELAY_ENVELOPE_BYTES,
+        TrailingBytesPolicy::Reject,
+    )
+    .map_err(|err| CoreError::malformed(format!("blind relay envelope decode: {err}")))?;
     if envelope.encrypted_blob.len() > MAX_BLIND_RELAY_BLOB_BYTES {
         return Err(CoreError::MessageTooLarge {
             max: MAX_BLIND_RELAY_BLOB_BYTES,
@@ -603,9 +615,10 @@ pub struct MediaPointer {
 /// Encodes a `ChatEnvelope` to bytes using bincode.
 ///
 /// # Errors
-/// Returns `bincode::Error` if serialisation fails (should not happen in practice).
+/// Returns `bincode::Error` if serialisation fails or the encoded envelope
+/// exceeds the 128 KiB protocol ceiling.
 pub fn encode_envelope(envelope: &ChatEnvelope) -> Result<Vec<u8>, bincode::Error> {
-    bincode::serialize(envelope)
+    encode_bincode_bounded(envelope, MAX_ENVELOPE_BYTES)
 }
 
 /// Decodes a `ChatEnvelope` from a bincode byte slice.
@@ -617,11 +630,7 @@ pub fn encode_envelope(envelope: &ChatEnvelope) -> Result<Vec<u8>, bincode::Erro
 /// # Errors
 /// Returns `bincode::Error` if the bytes are malformed, truncated, or too large.
 pub fn decode_envelope(bytes: &[u8]) -> Result<ChatEnvelope, bincode::Error> {
-    bincode::options()
-        .with_limit(MAX_ENVELOPE_BYTES)
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .deserialize(bytes)
+    decode_bincode_bounded(bytes, MAX_ENVELOPE_BYTES, TrailingBytesPolicy::Allow)
 }
 
 // ============================================
@@ -632,6 +641,7 @@ pub fn decode_envelope(bytes: &[u8]) -> Result<ChatEnvelope, bincode::Error> {
 mod tests {
     use super::*;
     use crate::crypto::IdentityKeyPair;
+    use bincode::Options;
 
     /// Helper: build a minimal ChatEnvelope with a real Ed25519 signature.
     fn make_signed_envelope(kp: &IdentityKeyPair) -> ChatEnvelope {
@@ -773,6 +783,11 @@ mod tests {
         let env = make_signed_envelope(&kp);
 
         let bytes = encode_envelope(&env).expect("encode");
+        assert_eq!(
+            bytes,
+            bincode::serialize(&env).expect("legacy wire encoding"),
+            "bounded encoding must not alter existing ChatEnvelope wire bytes"
+        );
         let decoded = decode_envelope(&bytes).expect("decode");
 
         assert_eq!(env.message_id, decoded.message_id);
@@ -786,6 +801,37 @@ mod tests {
 
         // Decoded envelope must still verify
         assert!(decoded.verify_signature().is_ok());
+    }
+
+    #[test]
+    fn test_envelope_codec_preserves_small_trailing_compatibility() {
+        let kp = IdentityKeyPair::generate();
+        let env = make_signed_envelope(&kp);
+        let mut bytes = encode_envelope(&env).expect("encode");
+        bytes.extend_from_slice(&[0xAA, 0xBB]);
+
+        let decoded = decode_envelope(&bytes).expect("decode with legacy trailing bytes");
+        assert_eq!(decoded.message_id, env.message_id);
+        assert_eq!(decoded.ciphertext, env.ciphertext);
+    }
+
+    #[test]
+    fn test_envelope_codec_rejects_oversized_output_and_padded_input() {
+        let kp = IdentityKeyPair::generate();
+        let mut oversized = make_signed_envelope(&kp);
+        oversized.ciphertext = vec![0xCC; MAX_ENVELOPE_BYTES as usize];
+        assert!(
+            encode_envelope(&oversized).is_err(),
+            "sender must not create an envelope that receivers reject"
+        );
+
+        let env = make_signed_envelope(&kp);
+        let mut padded = bincode::serialize(&env).expect("legacy wire encoding");
+        padded.resize(MAX_ENVELOPE_BYTES as usize + 1, 0);
+        assert!(
+            decode_envelope(&padded).is_err(),
+            "ignored trailing padding must not bypass the complete input ceiling"
+        );
     }
 
     #[test]
@@ -884,9 +930,30 @@ mod tests {
         let env = make_blind_envelope(&kp);
 
         let bytes = encode_blind_relay_envelope(&env).unwrap();
+        assert_eq!(
+            bytes,
+            bincode::options()
+                .with_fixint_encoding()
+                .serialize(&env)
+                .expect("legacy wire encoding"),
+            "shared bounded codec must preserve blind-relay wire bytes"
+        );
         let decoded = decode_blind_relay_envelope(&bytes).unwrap();
 
         assert_eq!(decoded, env);
+    }
+
+    #[test]
+    fn test_blind_relay_rejects_trailing_bytes() {
+        let kp = IdentityKeyPair::generate();
+        let env = make_blind_envelope(&kp);
+        let mut bytes = encode_blind_relay_envelope(&env).unwrap();
+        bytes.push(0xAA);
+
+        assert!(
+            decode_blind_relay_envelope(&bytes).is_err(),
+            "canonical node-peer frames must reject trailing bytes"
+        );
     }
 
     #[test]

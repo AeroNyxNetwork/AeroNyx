@@ -7,9 +7,15 @@
 //! Provides binary serialization and deserialization for protocol
 //! messages, enabling efficient wire-format encoding.
 //!
+//! ## Modification Reason
+//! - v0.2.0-BoundedBincode: Centralised bounded bincode encoding and decoding
+//!   so protocol senders cannot create frames that receivers must reject, and
+//!   input byte limits cannot be bypassed with ignored trailing padding.
+//!
 //! ## Main Functionality
 //! - `Codec` trait: Generic encode/decode interface
 //! - `ProtocolCodec`: Implementation for all message types
+//! - Bounded bincode helpers shared by application-layer wire protocols
 //! - Zero-copy parsing where possible
 //!
 //! ## Wire Format
@@ -25,17 +31,75 @@
 //! - Always validate buffer lengths before reading
 //! - Use checked arithmetic to prevent overflows
 //! - Keep parsing zero-allocation where possible
+//! - [BOUNDED-WIRE-CODEC 2026-07-23 by Codex] Every variable-size bincode
+//!   protocol must apply the same byte ceiling while encoding and decoding.
+//!   Keep the explicit input-length preflight: bincode's read limit alone does
+//!   not account for ignored trailing bytes.
 //!
 //! ## Last Modified
+//! v0.2.0-BoundedBincode - Added symmetric bounded bincode helpers
 //! v0.1.0 - Initial codec implementation
 
+use bincode::Options;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::error::{CoreError, Result};
 use crate::protocol::messages::{
     ClientHello, DataPacket, MessageType, ServerHello, CLIENT_HELLO_SIZE, DATA_PACKET_HEADER_SIZE,
     SERVER_HELLO_SIZE,
 };
+
+// ============================================
+// Bounded application-layer bincode
+// ============================================
+
+/// Controls whether a bounded decoder accepts bytes after one complete value.
+///
+/// Compatibility-sensitive legacy protocols use `Allow`; canonical node-peer
+/// frames use `Reject`. The byte ceiling is enforced against the complete input
+/// slice before either policy is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrailingBytesPolicy {
+    /// Preserve legacy behavior that ignores a small trailing suffix.
+    Allow,
+    /// Require one canonical value to consume the complete input.
+    Reject,
+}
+
+/// Serializes one application-layer value with fixed-width integers and a hard
+/// output ceiling.
+///
+/// [BOUNDED-WIRE-CODEC 2026-07-23 by Codex] Keeping this helper crate-private
+/// prevents protocol modules from drifting onto incompatible bincode defaults.
+pub(crate) fn encode_bincode_bounded<T: Serialize>(
+    value: &T,
+    limit: u64,
+) -> std::result::Result<Vec<u8>, bincode::Error> {
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(limit)
+        .serialize(value)
+}
+
+/// Deserializes one application-layer value after enforcing the ceiling against
+/// the complete input slice.
+pub(crate) fn decode_bincode_bounded<T: DeserializeOwned>(
+    bytes: &[u8],
+    limit: u64,
+    trailing_bytes: TrailingBytesPolicy,
+) -> std::result::Result<T, bincode::Error> {
+    let input_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if input_len > limit {
+        return Err(Box::new(bincode::ErrorKind::SizeLimit));
+    }
+
+    let options = bincode::options().with_fixint_encoding().with_limit(limit);
+    match trailing_bytes {
+        TrailingBytesPolicy::Allow => options.allow_trailing_bytes().deserialize(bytes),
+        TrailingBytesPolicy::Reject => options.reject_trailing_bytes().deserialize(bytes),
+    }
+}
 
 // ============================================
 // Codec Trait
@@ -326,6 +390,78 @@ pub fn decode_data_packet(buf: &[u8]) -> Result<DataPacket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct BoundedFixture {
+        sequence: u64,
+        payload: Vec<u8>,
+    }
+
+    #[test]
+    fn bounded_bincode_preserves_legacy_wire_bytes() {
+        let fixture = BoundedFixture {
+            sequence: 0x0102_0304_0506_0708,
+            payload: vec![0xA5; 24],
+        };
+
+        let legacy = bincode::serialize(&fixture).expect("legacy encoding");
+        let bounded = encode_bincode_bounded(&fixture, 128).expect("bounded encoding");
+
+        assert_eq!(bounded, legacy);
+        assert_eq!(
+            decode_bincode_bounded::<BoundedFixture>(&bounded, 128, TrailingBytesPolicy::Reject)
+                .expect("bounded decoding"),
+            fixture
+        );
+    }
+
+    #[test]
+    fn bounded_bincode_applies_trailing_policy_within_limit() {
+        let fixture = BoundedFixture {
+            sequence: 7,
+            payload: vec![0x42; 8],
+        };
+        let mut encoded = encode_bincode_bounded(&fixture, 128).expect("bounded encoding");
+        encoded.extend_from_slice(&[0xAA, 0xBB]);
+
+        assert_eq!(
+            decode_bincode_bounded::<BoundedFixture>(&encoded, 128, TrailingBytesPolicy::Allow)
+                .expect("legacy trailing bytes remain accepted"),
+            fixture
+        );
+        assert!(
+            decode_bincode_bounded::<BoundedFixture>(&encoded, 128, TrailingBytesPolicy::Reject)
+                .is_err(),
+            "canonical frames must reject trailing bytes"
+        );
+    }
+
+    #[test]
+    fn bounded_bincode_rejects_output_and_full_input_over_limit() {
+        let oversized = BoundedFixture {
+            sequence: 9,
+            payload: vec![0xCC; 128],
+        };
+        assert!(
+            encode_bincode_bounded(&oversized, 64).is_err(),
+            "outbound frames must obey the same limit as inbound frames"
+        );
+
+        let fixture = BoundedFixture {
+            sequence: 9,
+            payload: vec![0xCC; 8],
+        };
+        let mut padded = bincode::serialize(&fixture).expect("legacy encoding");
+        padded.resize(65, 0);
+        assert!(matches!(
+            decode_bincode_bounded::<BoundedFixture>(
+                &padded,
+                64,
+                TrailingBytesPolicy::Allow
+            ),
+            Err(error) if matches!(*error, bincode::ErrorKind::SizeLimit)
+        ));
+    }
 
     #[test]
     fn test_client_hello_roundtrip() {
