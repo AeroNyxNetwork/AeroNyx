@@ -11,8 +11,9 @@
 //! - Keeps the service disabled by default for backward compatibility.
 //! - Bounds lease lifetime, object lifetime, per-lease count/bytes, page size,
 //!   admission lifetime, deletion tombstones, and maintenance work.
-//! - Keeps public routes fail-closed unless at least one V1 Ed25519 issuer or
-//!   V2 RFC 9474 RSA epoch key is explicitly pinned by the node operator.
+//! - Keeps public routes fail-closed unless at least one V1 Ed25519 issuer,
+//!   static V2 RSA epoch, or V2 update authority is explicitly pinned.
+//! - Bounds the freshness of authority-signed runtime issuer generations.
 //! - Validates that one corrupted or malicious lease cannot consume unbounded
 //!   storage or request work.
 //!
@@ -32,7 +33,9 @@
 //!   replace them with account, wallet, device, or application allowlists.
 //! - Keep byte/count limits finite even on official nodes.
 //!
-//! Last Modified: v1.2.0-BlindVaultBlindAdmission - Added bounded RSA epoch
+//! Last Modified: v1.3.0-BlindVaultIssuerAuthority - Added pinned Ed25519
+//! authorities and bounded freshness for authenticated runtime issuer updates.
+//! v1.2.0-BlindVaultBlindAdmission - Added bounded RSA epoch
 //! policies for unlinkable V2 admission.
 //! v1.1.0-BlindVaultAdmission - Added default-off public API and
 //! pinned anonymous admission issuer policy.
@@ -60,6 +63,7 @@ const MAX_PULL_OBJECTS_HARD: usize = 256;
 const LARGEST_PROTOCOL_OBJECT_BYTES: u64 = 256 * 1024;
 const MAX_ADMISSION_ISSUERS: usize = 16;
 const MAX_ADMISSION_TICKET_TTL_SECS_HARD: u64 = 7 * 24 * 60 * 60;
+const MAX_BLIND_ISSUER_UPDATE_AGE_SECS_HARD: u64 = 24 * 60 * 60;
 
 /// Operator-pinned public policy for one rotating RFC 9474 issuer key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +101,13 @@ pub struct BlindVaultConfig {
     /// Tickets carry no account or application identity.
     #[serde(default)]
     pub admission_issuer_public_keys: Vec<String>,
+    /// Ed25519 authorities allowed to sign complete V2 runtime issuer
+    /// generations. Private authority keys must never be placed on this node.
+    #[serde(default)]
+    pub blind_issuer_update_authority_public_keys: Vec<String>,
+    /// Maximum accepted age of an authority-signed runtime issuer update.
+    #[serde(default = "BlindVaultConfig::default_blind_issuer_update_max_age_secs")]
+    pub blind_issuer_update_max_age_secs: u64,
     /// Rotating RFC 9474 public issuer keys for unlinkable V2 credentials.
     /// Private signing keys must never be placed on a storage node.
     #[serde(default)]
@@ -145,6 +156,10 @@ impl BlindVaultConfig {
 
     const fn default_max_admission_ticket_ttl_secs() -> u64 {
         24 * 60 * 60
+    }
+
+    const fn default_blind_issuer_update_max_age_secs() -> u64 {
+        5 * 60
     }
 
     const fn default_max_object_ttl_secs() -> u64 {
@@ -237,50 +252,52 @@ impl BlindVaultConfig {
                 "must be between 1 second and 7 days",
             ));
         }
+        if self.blind_issuer_update_max_age_secs == 0
+            || self.blind_issuer_update_max_age_secs > MAX_BLIND_ISSUER_UPDATE_AGE_SECS_HARD
+        {
+            return Err(invalid(
+                "blind_issuer_update_max_age_secs",
+                "must be between 1 second and 24 hours",
+            ));
+        }
         let issuer_keys = self.admission_issuer_key_bytes()?;
         let blind_issuers = self.blind_admission_issuer_materials()?;
-        if self.public_api_enabled && issuer_keys.is_empty() && blind_issuers.is_empty() {
+        let update_authorities = self.blind_issuer_update_authority_key_bytes()?;
+        if self.public_api_enabled
+            && issuer_keys.is_empty()
+            && blind_issuers.is_empty()
+            && update_authorities.is_empty()
+        {
             return Err(invalid(
                 "admission_issuer_public_keys",
-                "must pin at least one V1 or V2 issuer when the public API is enabled",
+                "must pin at least one V1 issuer, V2 epoch, or V2 update authority when the public API is enabled",
             ));
         }
         Ok(())
     }
 
     /// Parses and validates the bounded issuer allowlist.
+    ///
+    /// # Errors
+    /// Returns a configuration error for malformed, duplicate, or excessive
+    /// Ed25519 keys.
     pub fn admission_issuer_key_bytes(&self) -> Result<Vec<[u8; 32]>> {
-        if self.admission_issuer_public_keys.len() > MAX_ADMISSION_ISSUERS {
-            return Err(invalid(
-                "admission_issuer_public_keys",
-                "must contain no more than 16 keys",
-            ));
-        }
-        let mut unique = HashSet::with_capacity(self.admission_issuer_public_keys.len());
-        let mut parsed = Vec::with_capacity(self.admission_issuer_public_keys.len());
-        for encoded in &self.admission_issuer_public_keys {
-            let mut bytes = [0_u8; 32];
-            hex::decode_to_slice(encoded.trim(), &mut bytes).map_err(|_| {
-                invalid(
-                    "admission_issuer_public_keys",
-                    "each key must be exactly 32 bytes of hexadecimal",
-                )
-            })?;
-            IdentityPublicKey::from_bytes(&bytes).map_err(|_| {
-                invalid(
-                    "admission_issuer_public_keys",
-                    "contains an invalid Ed25519 public key",
-                )
-            })?;
-            if !unique.insert(bytes) {
-                return Err(invalid(
-                    "admission_issuer_public_keys",
-                    "must not contain duplicate keys",
-                ));
-            }
-            parsed.push(bytes);
-        }
-        Ok(parsed)
+        parse_unique_ed25519_keys(
+            "admission_issuer_public_keys",
+            &self.admission_issuer_public_keys,
+        )
+    }
+
+    /// Parses the bounded allowlist of runtime issuer-update authorities.
+    ///
+    /// # Errors
+    /// Returns a configuration error for malformed, duplicate, or excessive
+    /// Ed25519 authority keys.
+    pub fn blind_issuer_update_authority_key_bytes(&self) -> Result<Vec<[u8; 32]>> {
+        parse_unique_ed25519_keys(
+            "blind_issuer_update_authority_public_keys",
+            &self.blind_issuer_update_authority_public_keys,
+        )
     }
 
     /// Parses bounded V2 RSA issuer epochs and derives canonical key IDs.
@@ -396,6 +413,12 @@ impl BlindVaultConfig {
     pub const fn max_admission_ticket_ttl_ms(&self) -> u64 {
         self.max_admission_ticket_ttl_secs.saturating_mul(1_000)
     }
+
+    /// Maximum authority-signed issuer-update age in milliseconds.
+    #[must_use]
+    pub const fn blind_issuer_update_max_age_ms(&self) -> u64 {
+        self.blind_issuer_update_max_age_secs.saturating_mul(1_000)
+    }
 }
 
 impl Default for BlindVaultConfig {
@@ -404,6 +427,8 @@ impl Default for BlindVaultConfig {
             enabled: false,
             public_api_enabled: false,
             admission_issuer_public_keys: Vec::new(),
+            blind_issuer_update_authority_public_keys: Vec::new(),
+            blind_issuer_update_max_age_secs: Self::default_blind_issuer_update_max_age_secs(),
             blind_admission_issuers: Vec::new(),
             max_admission_ticket_ttl_secs: Self::default_max_admission_ticket_ttl_secs(),
             db_path: Self::default_db_path(),
@@ -417,6 +442,32 @@ impl Default for BlindVaultConfig {
             cleanup_interval_secs: Self::default_cleanup_interval_secs(),
         }
     }
+}
+
+// [BLIND-VAULT-ISSUER-AUTHORITY 2026-07-23 by Codex] Both admission and
+// control-plane keys use the same bounded Ed25519 representation, but remain
+// separate allowlists so an issuer can never silently gain rotation authority.
+fn parse_unique_ed25519_keys(
+    field: &'static str,
+    encoded_keys: &[String],
+) -> Result<Vec<[u8; 32]>> {
+    if encoded_keys.len() > MAX_ADMISSION_ISSUERS {
+        return Err(invalid(field, "must contain no more than 16 keys"));
+    }
+    let mut unique = HashSet::with_capacity(encoded_keys.len());
+    let mut parsed = Vec::with_capacity(encoded_keys.len());
+    for encoded in encoded_keys {
+        let mut bytes = [0_u8; 32];
+        hex::decode_to_slice(encoded.trim(), &mut bytes)
+            .map_err(|_| invalid(field, "each key must be exactly 32 bytes of hexadecimal"))?;
+        IdentityPublicKey::from_bytes(&bytes)
+            .map_err(|_| invalid(field, "contains an invalid Ed25519 public key"))?;
+        if !unique.insert(bytes) {
+            return Err(invalid(field, "must not contain duplicate keys"));
+        }
+        parsed.push(bytes);
+    }
+    Ok(parsed)
 }
 
 fn invalid(field: &'static str, message: &'static str) -> ServerError {
@@ -460,6 +511,10 @@ mod tests {
             config.max_admission_ticket_ttl_ms(),
             config.max_admission_ticket_ttl_secs * 1_000
         );
+        assert_eq!(
+            config.blind_issuer_update_max_age_ms(),
+            config.blind_issuer_update_max_age_secs * 1_000
+        );
     }
 
     #[test]
@@ -482,6 +537,39 @@ mod tests {
             ..valid
         };
         assert!(duplicate.validate().is_err());
+    }
+
+    // [BLIND-VAULT-ISSUER-AUTHORITY 2026-07-23 by Codex] A node may bootstrap
+    // with no static V2 RSA key and remain fail-closed until a fresh signed
+    // generation arrives from a separately pinned authority.
+    #[test]
+    fn public_api_accepts_unique_runtime_update_authority() {
+        let authority = aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[23; 32])
+            .expect("authority key");
+        let valid = BlindVaultConfig {
+            enabled: true,
+            public_api_enabled: true,
+            blind_issuer_update_authority_public_keys: vec![hex::encode(
+                authority.public_key_bytes(),
+            )],
+            ..BlindVaultConfig::default()
+        };
+        valid.validate().expect("valid authority-only bootstrap");
+
+        let duplicate = BlindVaultConfig {
+            blind_issuer_update_authority_public_keys: vec![
+                hex::encode(authority.public_key_bytes()),
+                hex::encode(authority.public_key_bytes()),
+            ],
+            ..valid.clone()
+        };
+        assert!(duplicate.validate().is_err());
+
+        let invalid_age = BlindVaultConfig {
+            blind_issuer_update_max_age_secs: 0,
+            ..valid
+        };
+        assert!(invalid_age.validate().is_err());
     }
 
     // [BLIND-VAULT-BLIND-ISSUER 2026-07-23 by Codex] A rotating RSA key can

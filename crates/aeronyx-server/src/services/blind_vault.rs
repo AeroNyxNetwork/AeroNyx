@@ -12,6 +12,7 @@
 //! - Self-authenticating anonymous lease provisioning.
 //! - Atomic one-time bearer admission spend + lease creation.
 //! - RFC 9474 blind-admission verification under rotating public epoch keys.
+//! - Authority-authenticated installation of complete public issuer generations.
 //! - Persistent monotonic runtime rotation of public issuer epochs.
 //! - Deterministic public issuer-epoch snapshots for node-signed discovery.
 //! - Immutable, idempotent ciphertext object persistence.
@@ -52,10 +53,13 @@
 //! - API handlers must run synchronous SQLite methods in `spawn_blocking`.
 //! - Pull cursors must remain lease-bound AEAD ciphertext; never expose the
 //!   internal SQLite sequence or accept a caller-provided raw sequence.
-//! - Runtime issuer updates must remain monotonic, continuity-safe, and atomic
-//!   across both SQLite persistence and in-process readers.
+//! - Runtime issuer updates must be signed by a separately pinned authority,
+//!   then remain monotonic, continuity-safe, and atomic across both SQLite
+//!   persistence and in-process readers.
 //!
-//! Last Modified: v1.6.0-BlindVaultIssuerRuntime - Added persistent monotonic
+//! Last Modified: v1.7.0-BlindVaultIssuerAuthority - Added pinned authority
+//! verification and closed the unauthenticated runtime installer boundary.
+//! v1.6.0-BlindVaultIssuerRuntime - Added persistent monotonic
 //! public issuer-epoch rotation with rollback and continuity protection.
 //! v1.5.0-BlindVaultAdmissionOnly - Removed the unused direct
 //! lease-provisioning bypass and moved tests onto the production admission path.
@@ -78,7 +82,7 @@ use std::time::Duration;
 
 use aeronyx_core::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::blind_vault::{
-    BlindVaultBlindIssuerDirectory, BlindVaultBlindIssuerEpoch,
+    BlindVaultBlindIssuerDirectory, BlindVaultBlindIssuerEpoch, BlindVaultBlindIssuerUpdate,
     BlindVaultBlindLeaseAdmissionRequest, BlindVaultDeleteRequest, BlindVaultDeletedReceipt,
     BlindVaultError, BlindVaultLeaseAdmissionRequest, BlindVaultLeaseCreateRequest,
     BlindVaultPutRequest, BlindVaultStoredReceipt,
@@ -281,6 +285,12 @@ pub enum BlindVaultServiceError {
     /// Admission issuer configuration could not be parsed safely.
     #[error("blind vault admission issuer configuration is invalid")]
     AdmissionConfigurationInvalid,
+    /// Runtime issuer update was not signed by a node-pinned authority.
+    #[error("blind vault issuer update authority rejected")]
+    IssuerDirectoryAuthorityRejected,
+    /// Runtime issuer update was malformed, stale, or cryptographically invalid.
+    #[error("blind vault issuer update signature rejected")]
+    IssuerDirectoryUpdateRejected,
     /// Candidate issuer generation is older than the durable runtime state.
     #[error("blind vault issuer directory rollback rejected")]
     IssuerDirectoryRollback,
@@ -315,6 +325,7 @@ pub struct BlindVaultService {
     read_auth_key: Zeroizing<[u8; 32]>,
     pull_cursor_key: Zeroizing<[u8; 32]>,
     admission_issuers: HashMap<[u8; 32], IdentityPublicKey>,
+    blind_issuer_update_authorities: HashMap<[u8; 32], IdentityPublicKey>,
     blind_admission_issuers: RwLock<BlindAdmissionIssuerRuntime>,
 }
 
@@ -345,6 +356,16 @@ impl BlindVaultService {
         let pull_cursor_key = derive_node_key(seed.as_ref(), PULL_CURSOR_KEY_DOMAIN)?;
         let admission_issuers = config
             .admission_issuer_key_bytes()
+            .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?
+            .into_iter()
+            .map(|bytes| {
+                IdentityPublicKey::from_bytes(&bytes)
+                    .map(|key| (bytes, key))
+                    .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        let blind_issuer_update_authorities = config
+            .blind_issuer_update_authority_key_bytes()
             .map_err(|_| BlindVaultServiceError::AdmissionConfigurationInvalid)?
             .into_iter()
             .map(|bytes| {
@@ -396,6 +417,7 @@ impl BlindVaultService {
             read_auth_key,
             pull_cursor_key,
             admission_issuers,
+            blind_issuer_update_authorities,
             blind_admission_issuers: RwLock::new(blind_admission_issuers),
         })
     }
@@ -441,17 +463,50 @@ impl BlindVaultService {
         }
     }
 
-    /// Durably installs one already-authenticated public issuer generation.
+    /// Verifies and durably installs one authority-signed issuer generation.
     ///
-    /// The caller owns transport authentication and must never forward issuer
-    /// private material. This method independently validates canonical RSA
-    /// public keys, bounded policy, monotonic generation, active-key
+    /// The signed object is independent of the management transport. Nodes
+    /// therefore enforce the same authority, freshness, monotonicity, and
+    /// continuity policy for an authenticated backend channel, offline
+    /// operator tool, or future node-to-node control plane.
+    ///
+    /// # Errors
+    /// Returns a coarse fail-closed error for an unpinned authority, malformed
+    /// signature, stale update, rollback, conflict, or continuity failure.
+    pub fn install_signed_blind_admission_issuer_update(
+        &self,
+        update: &BlindVaultBlindIssuerUpdate,
+        now_ms: u64,
+    ) -> Result<BlindVaultIssuerInstallOutcome, BlindVaultServiceError> {
+        // [BLIND-VAULT-ISSUER-AUTHORITY 2026-07-23 by Codex] Resolve by the
+        // signed authority ID before verification and collapse all protocol
+        // failures so management callers cannot use the node as a signature or
+        // freshness oracle.
+        let authority = self
+            .blind_issuer_update_authorities
+            .get(&update.authority_id)
+            .ok_or(BlindVaultServiceError::IssuerDirectoryAuthorityRejected)?;
+        update
+            .validate_and_verify(
+                now_ms,
+                self.config.blind_issuer_update_max_age_ms(),
+                self.config.mutation_clock_skew_ms(),
+                authority,
+            )
+            .map_err(|_| BlindVaultServiceError::IssuerDirectoryUpdateRejected)?;
+        self.install_blind_admission_issuer_epochs(update.generation, update.epochs.clone(), now_ms)
+    }
+
+    /// Durably installs one cryptographically authenticated issuer generation.
+    ///
+    /// This private state-machine boundary independently validates canonical
+    /// RSA public keys, bounded policy, monotonic generation, active-key
     /// availability, and continuity of every still-valid published epoch.
     ///
     /// # Errors
     /// Returns a coarse fail-closed error for malformed, stale, conflicting, or
     /// continuity-breaking candidates and leaves the active runtime unchanged.
-    pub fn install_blind_admission_issuer_epochs(
+    fn install_blind_admission_issuer_epochs(
         &self,
         generation: u64,
         epochs: Vec<BlindVaultBlindIssuerEpoch>,
@@ -2169,6 +2224,109 @@ mod tests {
                 )
                 .expect("redeem after restart"),
             BlindVaultLeaseProvisionOutcome::Created
+        );
+    }
+
+    // [BLIND-VAULT-ISSUER-AUTHORITY 2026-07-23 by Codex] The public update
+    // boundary verifies a separately pinned Ed25519 authority before the
+    // existing atomic generation state machine can observe candidate epochs.
+    #[test]
+    fn signed_issuer_update_rejects_forgery_staleness_and_unknown_authority() {
+        let authority = IdentityKeyPair::from_bytes(&[69; 32]).expect("authority key");
+        let unpinned_authority =
+            IdentityKeyPair::from_bytes(&[70; 32]).expect("unpinned authority key");
+        let old_key =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("old RSA key");
+        let new_key =
+            KeyPairSha384PSSRandomized::generate(&mut DefaultRng, 2048).expect("new RSA key");
+        let max_lease_ttl_ms = 14 * 24 * 60 * 60 * 1_000;
+        let old_epoch = blind_issuer_epoch(
+            &old_key,
+            NOW_MS - 60_000,
+            NOW_MS + 24 * 60 * 60 * 1_000,
+            max_lease_ttl_ms,
+        );
+        let new_epoch = blind_issuer_epoch(
+            &new_key,
+            NOW_MS - 60_000,
+            NOW_MS + 2 * 24 * 60 * 60 * 1_000,
+            max_lease_ttl_ms,
+        );
+        let directory = tempfile::tempdir().expect("temp directory");
+        let service = BlindVaultService::new(
+            BlindVaultConfig {
+                enabled: true,
+                public_api_enabled: true,
+                blind_issuer_update_authority_public_keys: vec![hex::encode(
+                    authority.public_key_bytes(),
+                )],
+                blind_admission_issuers: vec![BlindVaultBlindAdmissionIssuerConfig {
+                    public_key_der_base64: BASE64.encode(&old_epoch.public_key_der),
+                    not_before_unix_secs: old_epoch.not_before_ms / 1_000,
+                    expires_at_unix_secs: old_epoch.expires_at_ms / 1_000,
+                    max_lease_ttl_secs: old_epoch.max_lease_ttl_ms / 1_000,
+                }],
+                db_path: directory.path().join("vault.db").display().to_string(),
+                ..BlindVaultConfig::default()
+            },
+            IdentityKeyPair::from_bytes(&[71; 32]).expect("node key"),
+        )
+        .expect("service");
+
+        let mut epochs = vec![old_epoch, new_epoch];
+        epochs.sort_by_key(|epoch| epoch.issuer_key_id);
+        let mut update = BlindVaultBlindIssuerUpdate::new(
+            1,
+            NOW_MS,
+            authority.public_key_bytes(),
+            epochs.clone(),
+        );
+        update.sign(&authority).expect("sign update");
+        assert_eq!(
+            service
+                .install_signed_blind_admission_issuer_update(&update, NOW_MS)
+                .expect("install signed update"),
+            BlindVaultIssuerInstallOutcome::Installed { generation: 1 }
+        );
+        assert_eq!(
+            service
+                .install_signed_blind_admission_issuer_update(&update, NOW_MS)
+                .expect("idempotent signed replay"),
+            BlindVaultIssuerInstallOutcome::Unchanged { generation: 1 }
+        );
+
+        let mut forged = update.clone();
+        forged.generation = 2;
+        assert!(matches!(
+            service.install_signed_blind_admission_issuer_update(&forged, NOW_MS),
+            Err(BlindVaultServiceError::IssuerDirectoryUpdateRejected)
+        ));
+        assert!(matches!(
+            service.install_signed_blind_admission_issuer_update(
+                &update,
+                NOW_MS + 5 * 60 * 1_000 + 1,
+            ),
+            Err(BlindVaultServiceError::IssuerDirectoryUpdateRejected)
+        ));
+
+        let mut unpinned = BlindVaultBlindIssuerUpdate::new(
+            2,
+            NOW_MS,
+            unpinned_authority.public_key_bytes(),
+            epochs,
+        );
+        unpinned
+            .sign(&unpinned_authority)
+            .expect("sign unpinned update");
+        assert!(matches!(
+            service.install_signed_blind_admission_issuer_update(&unpinned, NOW_MS),
+            Err(BlindVaultServiceError::IssuerDirectoryAuthorityRejected)
+        ));
+        assert_eq!(
+            service
+                .blind_admission_issuer_runtime_status(NOW_MS)
+                .generation,
+            1
         );
     }
 

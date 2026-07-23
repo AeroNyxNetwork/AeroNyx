@@ -175,14 +175,22 @@ advertise_onion_middle = false
 # opaque contact-vault and optional message-archive objects. The schema does
 # not contain account, wallet, sender, receiver, namespace, social-graph, or
 # search-vector fields. Keep it disabled until the operator has provisioned a
-# dedicated database and pinned at least one admission issuer.
+# dedicated database and pinned at least one admission issuer or update
+# authority.
 [blind_vault]
 enabled = false
 # Public client routes additionally require this explicit gate and at least one
-# pinned issuer key. V1 Ed25519 bearer tickets remain compatible; new
-# deployments should pin a rotating V2 RFC 9474 RSA issuer below.
+# pinned issuer/update-authority key. V1 Ed25519 bearer tickets remain
+# compatible; new deployments should use rotating V2 RFC 9474 RSA issuers.
 public_api_enabled = false
 admission_issuer_public_keys = []
+# [BLIND-VAULT-ISSUER-AUTHORITY 2026-07-23 by Codex] These Ed25519 keys may
+# sign complete public V2 issuer generations. The authority private key stays
+# offline or in the authenticated issuer service and is never copied here.
+# Authority-only bootstrap remains fail-closed until the first signed
+# generation arrives.
+blind_issuer_update_authority_public_keys = []
+blind_issuer_update_max_age_secs = 300
 max_admission_ticket_ttl_secs = 86400
 db_path = "/var/lib/aeronyx/blind-vault.db"
 max_lease_ttl_secs = 7776000

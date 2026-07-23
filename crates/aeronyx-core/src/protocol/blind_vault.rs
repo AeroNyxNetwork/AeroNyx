@@ -18,6 +18,7 @@
 //!   redemption cannot be linked to its issuance transcript.
 //! - Defines a node-signed issuer-epoch directory for authenticated key
 //!   discovery and overlap-safe rotation.
+//! - Defines an authority-signed issuer update for storage-node rotation.
 //! - Defines bounded recovery request/page frames with node-signed ciphertext
 //!   commitments and opaque continuation cursors.
 //! - Provides deterministic signing bytes and bounded binary wire framing.
@@ -58,7 +59,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.5.0-BlindVaultIssuerDirectory - Added signed public
+//! Last Modified: v1.6.0-BlindVaultIssuerUpdate - Added a transport-independent
+//! authority-signed runtime issuer update contract.
+//! v1.5.0-BlindVaultIssuerDirectory - Added signed public
 //! issuer-epoch discovery for safe blind-signing key rotation.
 //! v1.4.0-BlindVaultBlindAdmission - Added an unlinkable
 //! RFC 9474 redemption contract while preserving the V1 bearer frame.
@@ -88,6 +91,7 @@ const ADMISSION_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Admission-v1";
 const BLIND_ADMISSION_MESSAGE_DOMAIN: &[u8] = b"AeroNyx-BlindVault-BlindAdmission-v2";
 const BLIND_ADMISSION_SPEND_DOMAIN: &[u8] = b"AeroNyx-BlindVault-BlindSpend-v2";
 const BLIND_ISSUER_DIRECTORY_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-IssuerDirectory-v1";
+const BLIND_ISSUER_UPDATE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-IssuerUpdate-v1";
 const PULL_RESPONSE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullResponse-v1";
 const DELETE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Delete-v1";
 const DELETE_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-DeletedReceipt-v1";
@@ -612,29 +616,14 @@ impl BlindVaultBlindIssuerDirectory {
     /// Canonical key-directory signing input.
     #[must_use]
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let epoch_bytes = self
-            .epochs
-            .iter()
-            .map(|epoch| 90usize.saturating_add(epoch.public_key_der.len()))
-            .sum::<usize>();
+        let epoch_bytes = blind_issuer_epoch_bytes_capacity(&self.epochs);
         let mut bytes =
             Vec::with_capacity(BLIND_ISSUER_DIRECTORY_SIGNING_DOMAIN.len() + 44 + epoch_bytes);
         bytes.extend_from_slice(BLIND_ISSUER_DIRECTORY_SIGNING_DOMAIN);
         bytes.extend_from_slice(&self.version.to_be_bytes());
         bytes.extend_from_slice(&self.generated_at_ms.to_be_bytes());
         bytes.extend_from_slice(&self.node_id);
-        let epoch_count = u16::try_from(self.epochs.len()).unwrap_or(u16::MAX);
-        bytes.extend_from_slice(&epoch_count.to_be_bytes());
-        for epoch in &self.epochs {
-            bytes.extend_from_slice(&epoch.admission_version.to_be_bytes());
-            bytes.extend_from_slice(&epoch.issuer_key_id);
-            let der_length = u16::try_from(epoch.public_key_der.len()).unwrap_or(u16::MAX);
-            bytes.extend_from_slice(&der_length.to_be_bytes());
-            bytes.extend_from_slice(&epoch.public_key_der);
-            bytes.extend_from_slice(&epoch.not_before_ms.to_be_bytes());
-            bytes.extend_from_slice(&epoch.expires_at_ms.to_be_bytes());
-            bytes.extend_from_slice(&epoch.max_lease_ttl_ms.to_be_bytes());
-        }
+        append_blind_issuer_epochs(&mut bytes, &self.epochs);
         bytes
     }
 
@@ -696,6 +685,152 @@ impl BlindVaultBlindIssuerDirectory {
             return Err(BlindVaultError::BlindIssuerEpochOrderInvalid);
         }
         Ok(())
+    }
+}
+
+/// [BLIND-VAULT-ISSUER-UPDATE 2026-07-23 by Codex]
+/// Authority-signed public issuer generation accepted by storage nodes.
+///
+/// This object is transport-independent: a backend management channel, an
+/// offline operator tool, or a future node synchronization layer may carry the
+/// exact same signed bytes. It contains no issuer private key or issuance,
+/// account, wallet, lease, storage, or client-network identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultBlindIssuerUpdate {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Strictly increasing control-plane generation, starting at one.
+    pub generation: u64,
+    /// Update creation time in Unix milliseconds.
+    pub generated_at_ms: u64,
+    /// Ed25519 authority identity explicitly pinned by the node operator.
+    pub authority_id: [u8; 32],
+    /// Strictly key-ID-sorted active and pre-announced future epochs.
+    pub epochs: Vec<BlindVaultBlindIssuerEpoch>,
+    /// Ed25519 authority signature over every preceding field.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultBlindIssuerUpdate {
+    /// Builds one unsigned issuer update.
+    #[must_use]
+    pub const fn new(
+        generation: u64,
+        generated_at_ms: u64,
+        authority_id: [u8; 32],
+        epochs: Vec<BlindVaultBlindIssuerEpoch>,
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            generation,
+            generated_at_ms,
+            authority_id,
+            epochs,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical authority-signing input.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let epoch_bytes = blind_issuer_epoch_bytes_capacity(&self.epochs);
+        let mut bytes =
+            Vec::with_capacity(BLIND_ISSUER_UPDATE_SIGNING_DOMAIN.len() + 52 + epoch_bytes);
+        bytes.extend_from_slice(BLIND_ISSUER_UPDATE_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.generation.to_be_bytes());
+        bytes.extend_from_slice(&self.generated_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.authority_id);
+        append_blind_issuer_epochs(&mut bytes, &self.epochs);
+        bytes
+    }
+
+    /// Validates and signs this update with its declared authority identity.
+    ///
+    /// # Errors
+    /// Returns a bounded invariant or identity error for malformed input.
+    pub fn sign(&mut self, authority_key: &IdentityKeyPair) -> Result<(), BlindVaultError> {
+        self.validate_fields()?;
+        if self.authority_id != authority_key.public_key_bytes() {
+            return Err(BlindVaultError::BlindIssuerAuthorityMismatch);
+        }
+        self.signature = authority_key.sign(&self.signing_bytes());
+        Ok(())
+    }
+
+    /// Verifies bounds, freshness, pinned authority identity, and signature.
+    ///
+    /// # Errors
+    /// Returns a fail-closed protocol error for stale, forged, or malformed
+    /// updates.
+    pub fn validate_and_verify(
+        &self,
+        now_ms: u64,
+        maximum_age_ms: u64,
+        maximum_clock_skew_ms: u64,
+        authority_key: &IdentityPublicKey,
+    ) -> Result<(), BlindVaultError> {
+        self.validate_fields()?;
+        if maximum_age_ms == 0
+            || self.generated_at_ms > now_ms.saturating_add(maximum_clock_skew_ms)
+            || now_ms.saturating_sub(self.generated_at_ms) > maximum_age_ms
+        {
+            return Err(BlindVaultError::BlindIssuerUpdateTimestampOutsideWindow);
+        }
+        if self.authority_id != authority_key.to_bytes() {
+            return Err(BlindVaultError::BlindIssuerAuthorityMismatch);
+        }
+        authority_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+
+    fn validate_fields(&self) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("blind_issuer_update_authority_id", &self.authority_id)?;
+        if self.generation == 0 {
+            return Err(BlindVaultError::InvalidBlindIssuerUpdateGeneration);
+        }
+        if self.epochs.is_empty() {
+            return Err(BlindVaultError::BlindIssuerUpdateHasNoEpochs);
+        }
+        if self.epochs.len() > MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS {
+            return Err(BlindVaultError::TooManyBlindIssuerEpochs);
+        }
+        for epoch in &self.epochs {
+            epoch.validate_at(self.generated_at_ms)?;
+        }
+        if self
+            .epochs
+            .windows(2)
+            .any(|pair| pair[0].issuer_key_id >= pair[1].issuer_key_id)
+        {
+            return Err(BlindVaultError::BlindIssuerEpochOrderInvalid);
+        }
+        Ok(())
+    }
+}
+
+fn blind_issuer_epoch_bytes_capacity(epochs: &[BlindVaultBlindIssuerEpoch]) -> usize {
+    epochs
+        .iter()
+        .map(|epoch| 90usize.saturating_add(epoch.public_key_der.len()))
+        .sum()
+}
+
+fn append_blind_issuer_epochs(bytes: &mut Vec<u8>, epochs: &[BlindVaultBlindIssuerEpoch]) {
+    let epoch_count = u16::try_from(epochs.len()).unwrap_or(u16::MAX);
+    bytes.extend_from_slice(&epoch_count.to_be_bytes());
+    for epoch in epochs {
+        bytes.extend_from_slice(&epoch.admission_version.to_be_bytes());
+        bytes.extend_from_slice(&epoch.issuer_key_id);
+        let der_length = u16::try_from(epoch.public_key_der.len()).unwrap_or(u16::MAX);
+        bytes.extend_from_slice(&der_length.to_be_bytes());
+        bytes.extend_from_slice(&epoch.public_key_der);
+        bytes.extend_from_slice(&epoch.not_before_ms.to_be_bytes());
+        bytes.extend_from_slice(&epoch.expires_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&epoch.max_lease_ttl_ms.to_be_bytes());
     }
 }
 
@@ -1460,6 +1595,19 @@ pub enum BlindVaultError {
     /// Signed issuer discovery data was stale or implausibly far in the future.
     #[error("blind issuer directory timestamp is outside the accepted window")]
     IssuerDirectoryTimestampOutsideWindow,
+    /// An authority update used generation zero, which is reserved for local
+    /// static bootstrap state.
+    #[error("blind issuer update generation must start at one")]
+    InvalidBlindIssuerUpdateGeneration,
+    /// An authority update attempted to install no usable issuer epochs.
+    #[error("blind issuer update contains no epochs")]
+    BlindIssuerUpdateHasNoEpochs,
+    /// Declared update authority did not match the pinned verification key.
+    #[error("blind issuer update authority does not match its signing key")]
+    BlindIssuerAuthorityMismatch,
+    /// Authority update was stale or implausibly far in the future.
+    #[error("blind issuer update timestamp is outside the accepted window")]
+    BlindIssuerUpdateTimestampOutsideWindow,
     /// Pull page size was zero or exceeded the protocol-wide ceiling.
     #[error("blind-vault pull limit is invalid")]
     InvalidPullLimit,
@@ -1691,6 +1839,19 @@ mod tests {
         directory
     }
 
+    // [BLIND-VAULT-ISSUER-UPDATE 2026-07-23 by Codex] The update signature
+    // authenticates the complete canonical generation independently of the
+    // transport that carries it to a storage node.
+    fn signed_blind_issuer_update() -> BlindVaultBlindIssuerUpdate {
+        let mut epochs = signed_blind_issuer_directory().epochs;
+        epochs.sort_by_key(|epoch| epoch.issuer_key_id);
+        let authority = admission_issuer_key();
+        let mut update =
+            BlindVaultBlindIssuerUpdate::new(1, NOW_MS, authority.public_key_bytes(), epochs);
+        update.sign(&authority).expect("sign issuer update");
+        update
+    }
+
     #[test]
     fn signed_put_validates_and_round_trips() {
         let put = signed_put();
@@ -1841,6 +2002,75 @@ mod tests {
         assert_eq!(
             stale.validate_and_verify(NOW_MS + 60_001, 60_000, 5_000, &node_key().public_key(),),
             Err(BlindVaultError::IssuerDirectoryTimestampOutsideWindow)
+        );
+    }
+
+    #[test]
+    fn authority_signed_issuer_update_is_canonical_and_fresh() {
+        let update = signed_blind_issuer_update();
+        update
+            .validate_and_verify(
+                NOW_MS + 1_000,
+                60_000,
+                5_000,
+                &admission_issuer_key().public_key(),
+            )
+            .expect("valid authority-signed issuer update");
+
+        let encoded = serialize_body(&update, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)
+            .expect("serialize transport-independent update");
+        let decoded: BlindVaultBlindIssuerUpdate =
+            deserialize_body(&encoded, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)
+                .expect("deserialize transport-independent update");
+        assert_eq!(decoded, update);
+    }
+
+    #[test]
+    fn issuer_update_rejects_forgery_wrong_authority_and_staleness() {
+        let mut forged = signed_blind_issuer_update();
+        forged.generation = 2;
+        assert_eq!(
+            forged
+                .validate_and_verify(NOW_MS, 60_000, 5_000, &admission_issuer_key().public_key(),),
+            Err(BlindVaultError::InvalidSignature)
+        );
+
+        let wrong_authority = IdentityKeyPair::from_bytes(&[29; 32]).expect("wrong authority key");
+        let update = signed_blind_issuer_update();
+        assert_eq!(
+            update.validate_and_verify(NOW_MS, 60_000, 5_000, &wrong_authority.public_key(),),
+            Err(BlindVaultError::BlindIssuerAuthorityMismatch)
+        );
+        assert_eq!(
+            update.validate_and_verify(
+                NOW_MS + 60_001,
+                60_000,
+                5_000,
+                &admission_issuer_key().public_key(),
+            ),
+            Err(BlindVaultError::BlindIssuerUpdateTimestampOutsideWindow)
+        );
+    }
+
+    #[test]
+    fn issuer_update_rejects_reserved_generation_and_empty_epoch_set() {
+        let authority = admission_issuer_key();
+        let mut generation_zero = BlindVaultBlindIssuerUpdate::new(
+            0,
+            NOW_MS,
+            authority.public_key_bytes(),
+            signed_blind_issuer_directory().epochs,
+        );
+        assert_eq!(
+            generation_zero.sign(&authority),
+            Err(BlindVaultError::InvalidBlindIssuerUpdateGeneration)
+        );
+
+        let mut empty =
+            BlindVaultBlindIssuerUpdate::new(1, NOW_MS, authority.public_key_bytes(), Vec::new());
+        assert_eq!(
+            empty.sign(&authority),
+            Err(BlindVaultError::BlindIssuerUpdateHasNoEpochs)
         );
     }
 

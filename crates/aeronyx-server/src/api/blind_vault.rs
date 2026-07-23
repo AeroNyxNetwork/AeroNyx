@@ -33,13 +33,15 @@
 //! - Never add account auth, client IP logs, object IDs, capabilities, ticket
 //!   IDs, ciphertext, commitments, cursor bytes, or raw errors to logs.
 //! - Never mount these routes merely because local storage is enabled. Public
-//!   API enablement and a pinned admission issuer are separate fail-closed
-//!   configuration requirements.
+//!   API enablement and a pinned admission issuer/update authority are
+//!   separate fail-closed configuration requirements.
 //! - Do not replace route middleware with a permit acquired inside a `Bytes`
 //!   handler; that would apply backpressure after attacker-controlled buffering.
 //! - V1 admission is a signed one-time bearer credential, not blind issuance.
 //!
-//! Last Modified: v1.3.0-BlindVaultIssuerRuntime - Kept internal issuer
+//! Last Modified: v1.4.0-BlindVaultIssuerAuthority - Kept authority-update
+//! failures inside the coarse non-client service bucket.
+//! v1.3.0-BlindVaultIssuerRuntime - Kept internal issuer
 //! rotation failures inside one privacy-safe public availability bucket.
 //! v1.2.0-BlindVaultIssuerDirectory - Added bounded,
 //! node-signed public key discovery for V2 issuer rotation.
@@ -421,6 +423,8 @@ fn map_service_error(error: BlindVaultServiceError) -> ApiFailure {
     match error {
         BlindVaultServiceError::Disabled
         | BlindVaultServiceError::AdmissionUnavailable
+        | BlindVaultServiceError::IssuerDirectoryAuthorityRejected
+        | BlindVaultServiceError::IssuerDirectoryUpdateRejected
         | BlindVaultServiceError::IssuerDirectoryRollback
         | BlindVaultServiceError::IssuerDirectoryGenerationConflict
         | BlindVaultServiceError::IssuerDirectoryContinuity
