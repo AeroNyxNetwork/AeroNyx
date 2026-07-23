@@ -15,6 +15,9 @@
 //! - v0.6.0-BoundedRecords: Unified Fact/Block record writes behind one
 //!   bounded codec path and made replay reject non-canonical record payloads
 //!   without changing the established bytes on disk.
+//! - v0.7.0-TornTailRecovery: Unified record framing for replay and startup
+//!   recovery. A partial physical tail is truncated to the last complete
+//!   record; fully framed corruption remains a fail-closed startup error.
 //!
 //! ## On-Disk Record Format (v0.5.0)
 //! ```text
@@ -47,8 +50,12 @@
 //! - [BOUNDED-AOF-RECORDS 2026-07-24 by Codex] Keep the write and replay
 //!   ceilings symmetric. Never replace checked record lengths with lossy casts
 //!   or deserialize length-prefixed records with unbounded codec defaults.
+//! - [AOF-TORN-TAIL-RECOVERY 2026-07-24 by Codex] Repair only an incomplete
+//!   physical tail. Do not silently truncate or skip a complete corrupt record;
+//!   operators must retain evidence and choose an explicit recovery action.
 //!
 //! ## Last Modified
+//! v0.7.0-TornTailRecovery - Added shared framing and fail-closed startup recovery
 //! v0.6.0-BoundedRecords - Added symmetric record bounds and canonical replay decoding
 //! v0.2.0 - Initial AOF writer for MemChain fact persistence
 //! v0.5.0 - 🌟 Added Block storage, record tags, chain state tracking
@@ -60,7 +67,7 @@ use bincode::Options;
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{debug, info, warn};
 
 use aeronyx_core::ledger::{Block, BlockHeader, Fact, GENESIS_PREV_HASH};
@@ -83,6 +90,24 @@ const TAG_FACT: u8 = 0x01;
 
 /// Record tag: Block.
 const TAG_BLOCK: u8 = 0x02;
+
+#[derive(Clone, Copy)]
+enum AofRecordKind {
+    Fact,
+    Block,
+}
+
+struct AofRecordFrame {
+    kind: AofRecordKind,
+    payload: Vec<u8>,
+    next_offset: u64,
+}
+
+enum AofFrameRead {
+    Complete(AofRecordFrame),
+    CleanEof,
+    TornTail,
+}
 
 // ============================================
 // AofWriter
@@ -110,6 +135,15 @@ impl AofWriter {
     /// Opens (or creates) the append-only ledger file.
     pub async fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let recovered_bytes = repair_torn_tail(&path).await?;
+
+        if recovered_bytes > 0 {
+            warn!(
+                path = %path.display(),
+                recovered_bytes,
+                "[AOF] Recovered incomplete physical tail before opening for append"
+            );
+        }
 
         let file = OpenOptions::new()
             .create(true)
@@ -211,6 +245,7 @@ impl AofWriter {
             return Ok((Vec::new(), None));
         }
 
+        let file_len = tokio::fs::metadata(path).await?.len();
         let file = File::open(path).await?;
         let mut reader = BufReader::new(file);
         let mut facts = Vec::new();
@@ -218,118 +253,24 @@ impl AofWriter {
         let mut offset: u64 = 0;
 
         loop {
-            // Read one byte to determine format
-            let mut tag_buf = [0u8; 1];
-            match reader.read_exact(&mut tag_buf).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => {
-                    warn!(offset = offset, error = %e, "[AOF] ⚠️ Error reading tag, stopping");
-                    break;
+            match read_next_frame(&mut reader, offset, file_len).await? {
+                AofFrameRead::Complete(frame) => {
+                    match decode_frame(frame.kind, &frame.payload, offset)? {
+                        DecodedAofRecord::Fact(fact) => facts.push(fact),
+                        DecodedAofRecord::Block(header) => last_block = Some(header),
+                    }
+                    offset = frame.next_offset;
                 }
-            }
-
-            let tag = tag_buf[0];
-
-            // Detect legacy format: if first byte looks like part of a u32 LE
-            // length (not 0x01 or 0x02), we're in legacy mode.
-            if tag != TAG_FACT && tag != TAG_BLOCK {
-                // Legacy format: tag_buf[0] is the first byte of a u32 LE length.
-                // Read remaining 3 bytes of the length.
-                let mut remaining_len = [0u8; 3];
-                match reader.read_exact(&mut remaining_len).await {
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-                let length =
-                    u32::from_le_bytes([tag, remaining_len[0], remaining_len[1], remaining_len[2]])
-                        as usize;
-
-                if u64::try_from(length).unwrap_or(u64::MAX) > MAX_AOF_RECORD_BYTES {
+                AofFrameRead::CleanEof => break,
+                AofFrameRead::TornTail => {
                     warn!(
                         offset = offset,
-                        length = length,
-                        "[AOF] ⚠️ Absurd legacy record length, stopping"
+                        file_len,
+                        "[AOF] Incomplete physical tail found during replay; append-open will repair it"
                     );
                     break;
                 }
-
-                let mut payload = vec![0u8; length];
-                match reader.read_exact(&mut payload).await {
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-
-                if let Ok(fact) = deserialize_record::<Fact>(&payload) {
-                    facts.push(fact);
-                }
-
-                offset += (LENGTH_PREFIX_SIZE + length) as u64;
-                continue;
             }
-
-            // v0.5.0 format: read length prefix
-            let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
-            match reader.read_exact(&mut len_buf).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => {
-                    warn!(offset = offset, error = %e, "[AOF] ⚠️ Error reading length, stopping");
-                    break;
-                }
-            }
-
-            let length = u32::from_le_bytes(len_buf) as usize;
-
-            if u64::try_from(length).unwrap_or(u64::MAX) > MAX_AOF_RECORD_BYTES {
-                warn!(
-                    offset = offset,
-                    length = length,
-                    "[AOF] ⚠️ Absurd record length, stopping"
-                );
-                break;
-            }
-
-            let mut payload = vec![0u8; length];
-            match reader.read_exact(&mut payload).await {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(offset = offset, error = %e, "[AOF] ⚠️ Truncated record, skipping");
-                    break;
-                }
-            }
-
-            match tag {
-                TAG_FACT => {
-                    if let Ok(fact) = deserialize_record::<Fact>(&payload) {
-                        facts.push(fact);
-                    } else {
-                        warn!(
-                            offset = offset,
-                            "[AOF] ⚠️ Failed to deserialise Fact record"
-                        );
-                    }
-                }
-                TAG_BLOCK => {
-                    if let Ok(block) = deserialize_record::<Block>(&payload) {
-                        last_block = Some(block.header);
-                    } else {
-                        warn!(
-                            offset = offset,
-                            "[AOF] ⚠️ Failed to deserialise Block record"
-                        );
-                    }
-                }
-                _ => {
-                    warn!(
-                        offset = offset,
-                        tag = tag,
-                        "[AOF] ⚠️ Unknown record tag, skipping"
-                    );
-                }
-            }
-
-            offset += (1 + LENGTH_PREFIX_SIZE + length) as u64;
         }
 
         info!(
@@ -381,6 +322,163 @@ impl AofWriter {
             );
         }
     }
+}
+
+enum DecodedAofRecord {
+    Fact(Fact),
+    Block(BlockHeader),
+}
+
+/// Reads exactly one tagged or legacy frame without interpreting its payload.
+async fn read_next_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    offset: u64,
+    file_len: u64,
+) -> std::io::Result<AofFrameRead> {
+    if offset == file_len {
+        return Ok(AofFrameRead::CleanEof);
+    }
+    if offset > file_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "AOF parser offset exceeds file length",
+        ));
+    }
+
+    let mut marker = [0u8; 1];
+    if !read_exact_or_torn(reader, &mut marker).await? {
+        return Ok(AofFrameRead::TornTail);
+    }
+
+    let (kind, header_len, length) = if marker[0] == TAG_FACT || marker[0] == TAG_BLOCK {
+        let mut length_bytes = [0u8; LENGTH_PREFIX_SIZE];
+        if !read_exact_or_torn(reader, &mut length_bytes).await? {
+            return Ok(AofFrameRead::TornTail);
+        }
+        let kind = if marker[0] == TAG_FACT {
+            AofRecordKind::Fact
+        } else {
+            AofRecordKind::Block
+        };
+        (
+            kind,
+            1_u64 + LENGTH_PREFIX_SIZE as u64,
+            u64::from(u32::from_le_bytes(length_bytes)),
+        )
+    } else {
+        let mut remaining_length = [0u8; LENGTH_PREFIX_SIZE - 1];
+        if !read_exact_or_torn(reader, &mut remaining_length).await? {
+            return Ok(AofFrameRead::TornTail);
+        }
+        (
+            AofRecordKind::Fact,
+            LENGTH_PREFIX_SIZE as u64,
+            u64::from(u32::from_le_bytes([
+                marker[0],
+                remaining_length[0],
+                remaining_length[1],
+                remaining_length[2],
+            ])),
+        )
+    };
+
+    if length > MAX_AOF_RECORD_BYTES {
+        return Err(invalid_record_error(
+            offset,
+            format!("record length {length} exceeds {MAX_AOF_RECORD_BYTES} bytes"),
+        ));
+    }
+
+    let next_offset = offset
+        .checked_add(header_len)
+        .and_then(|value| value.checked_add(length))
+        .ok_or_else(|| invalid_record_error(offset, "record offset overflow"))?;
+    if next_offset > file_len {
+        return Ok(AofFrameRead::TornTail);
+    }
+
+    let payload_len = usize::try_from(length)
+        .map_err(|_| invalid_record_error(offset, "record length does not fit usize"))?;
+    let mut payload = vec![0u8; payload_len];
+    if !read_exact_or_torn(reader, &mut payload).await? {
+        return Ok(AofFrameRead::TornTail);
+    }
+
+    Ok(AofFrameRead::Complete(AofRecordFrame {
+        kind,
+        payload,
+        next_offset,
+    }))
+}
+
+async fn read_exact_or_torn<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut [u8],
+) -> std::io::Result<bool> {
+    match reader.read_exact(buffer).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn decode_frame(
+    kind: AofRecordKind,
+    payload: &[u8],
+    offset: u64,
+) -> std::io::Result<DecodedAofRecord> {
+    match kind {
+        AofRecordKind::Fact => deserialize_record::<Fact>(payload)
+            .map(DecodedAofRecord::Fact)
+            .map_err(|error| {
+                invalid_record_error(offset, format!("invalid Fact payload: {error}"))
+            }),
+        AofRecordKind::Block => deserialize_record::<Block>(payload)
+            .map(|block| DecodedAofRecord::Block(block.header))
+            .map_err(|error| {
+                invalid_record_error(offset, format!("invalid Block payload: {error}"))
+            }),
+    }
+}
+
+/// Removes only a partial physical tail left by an interrupted append.
+async fn repair_torn_tail(path: &Path) -> std::io::Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+
+    let file_len = tokio::fs::metadata(path).await?.len();
+    if file_len == 0 {
+        return Ok(0);
+    }
+
+    let file = OpenOptions::new().read(true).write(true).open(path).await?;
+    let mut reader = BufReader::new(file);
+    let mut offset = 0_u64;
+
+    loop {
+        match read_next_frame(&mut reader, offset, file_len).await? {
+            AofFrameRead::Complete(frame) => {
+                decode_frame(frame.kind, &frame.payload, offset)?;
+                offset = frame.next_offset;
+            }
+            AofFrameRead::CleanEof => return Ok(0),
+            AofFrameRead::TornTail => {
+                let recovered_bytes = file_len.saturating_sub(offset);
+                let file = reader.into_inner();
+                file.set_len(offset).await?;
+                file.sync_data().await?;
+                return Ok(recovered_bytes);
+            }
+        }
+    }
+}
+
+fn invalid_record_error(offset: u64, detail: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("AOF corruption at offset {offset}: {detail}"),
+    )
 }
 
 /// Serializes one AOF payload using the established fixed-integer wire format
@@ -508,6 +606,71 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(writer.write_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_open_repairs_torn_tail_before_future_appends() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(DEFAULT_AOF_FILENAME);
+
+        {
+            let mut writer = AofWriter::open(&path).await.expect("open");
+            writer
+                .append_fact(&make_fact(100, "before-crash"))
+                .await
+                .expect("append");
+        }
+        let valid_len = tokio::fs::metadata(&path).await.expect("metadata").len();
+
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .await
+                .expect("append torn tail");
+            file.write_all(&[TAG_FACT, 8, 0])
+                .await
+                .expect("write torn tail");
+            file.flush().await.expect("flush torn tail");
+        }
+        assert!(tokio::fs::metadata(&path).await.expect("metadata").len() > valid_len);
+
+        let mut writer = AofWriter::open(&path).await.expect("repair and reopen");
+        assert_eq!(
+            tokio::fs::metadata(&path).await.expect("metadata").len(),
+            valid_len
+        );
+        writer
+            .append_fact(&make_fact(200, "after-recovery"))
+            .await
+            .expect("append after recovery");
+        drop(writer);
+
+        let (facts, last_block) = AofWriter::replay(&path).await.expect("replay");
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].subject, "before-crash");
+        assert_eq!(facts[1].subject, "after-recovery");
+        assert!(last_block.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_complete_corrupt_record_without_truncating() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(DEFAULT_AOF_FILENAME);
+        let corrupt_record = [TAG_FACT, 1, 0, 0, 0, 0];
+        tokio::fs::write(&path, corrupt_record)
+            .await
+            .expect("write corrupt record");
+
+        let error = AofWriter::open(&path)
+            .await
+            .expect_err("complete corruption must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            tokio::fs::metadata(&path).await.expect("metadata").len(),
+            corrupt_record.len() as u64
+        );
     }
 
     #[tokio::test]
