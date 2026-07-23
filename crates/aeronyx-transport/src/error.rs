@@ -24,6 +24,7 @@
 //! - System errors should be logged with context
 //!
 //! ## Last Modified
+//! v0.1.1 - Simplified retry classification without changing error semantics.
 //! v0.1.0 - Initial error definitions
 
 use std::io;
@@ -252,14 +253,17 @@ impl TransportError {
     /// Transient errors may succeed if the operation is retried.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::Timeout { .. } => true,
+        // [TRANSPORT-ERROR-CLASSIFICATION 2026-07-23 by Codex] Keep the
+        // variant-level policy explicit while preserving the source kind for
+        // wrapped I/O errors.
+        matches!(
+            self,
+            Self::Timeout { .. } | Self::SendFailed { .. } | Self::ReceiveFailed { .. }
+        ) || match self {
             Self::Io { source, .. } => matches!(
                 source.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
             ),
-            Self::SendFailed { .. } => true,
-            Self::ReceiveFailed { .. } => true,
             _ => false,
         }
     }

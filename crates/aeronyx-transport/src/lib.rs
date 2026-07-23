@@ -1,10 +1,10 @@
 // ============================================
 // File: crates/aeronyx-transport/src/lib.rs
 // ============================================
-//! # AeroNyx Transport - Network I/O Layer
+//! # `AeroNyx` Transport - Network I/O Layer
 //!
 //! ## Creation Reason
-//! Provides network transport abstractions for the AeroNyx privacy network,
+//! Provides network transport abstractions for the `AeroNyx` privacy network,
 //! including UDP sockets for client communication and TUN devices for
 //! IP packet tunneling.
 //!
@@ -72,6 +72,7 @@
 //! - Mock implementations available with `mock` feature
 //!
 //! ## Last Modified
+//! v0.1.1 - Normalized Rust documentation markup for transport names.
 //! v0.1.0 - Initial transport layer implementation
 
 #![warn(missing_docs)]

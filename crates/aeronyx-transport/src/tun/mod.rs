@@ -13,7 +13,7 @@
 //! - Unified interface via `TunDevice` trait
 //!
 //! ## Platform Implementations
-//! - `linux`: Uses `/dev/net/tun` with IFF_TUN
+//! - `linux`: Uses `/dev/net/tun` with `IFF_TUN`
 //! - `mock`: In-memory implementation for testing
 //!
 //! ## What is a TUN Device?
@@ -51,12 +51,13 @@
 //! ```
 //!
 //! ## ⚠️ Important Note for Next Developer
-//! - TUN operations require root or CAP_NET_ADMIN capability
+//! - TUN operations require root or `CAP_NET_ADMIN` capability
 //! - TUN packets are raw IP (no Ethernet header)
 //! - Device names are limited to 15 characters on Linux
 //! - Always clean up devices on shutdown
 //!
 //! ## Last Modified
+//! v0.1.1 - Normalized Linux capability and flag documentation markup.
 //! v0.1.0 - Initial TUN module structure
 
 // Platform-specific implementations

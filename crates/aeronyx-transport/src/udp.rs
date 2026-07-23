@@ -12,28 +12,33 @@
 //! - Socket binding with address reuse
 //! - Async send/receive operations
 //! - Graceful shutdown support
+//! - Cancellation of in-flight socket operations during shutdown
 //!
 //! ## Design Choices
-//! - Uses SO_REUSEADDR for quick rebinding after restart
+//! - Uses `SO_REUSEADDR` for quick rebinding after restart
 //! - Non-blocking operations with Tokio
-//! - Atomic shutdown flag for coordinated cleanup
+//! - Tokio watch channel for race-free shutdown notification
 //!
 //! ## ⚠️ Important Note for Next Developer
 //! - UDP is connectionless - no guaranteed delivery
 //! - Maximum UDP payload is ~65507 bytes
 //! - Consider firewall rules when binding to public addresses
+//! - Keep socket operations inside `run_until_shutdown` so future operations
+//!   preserve the in-flight cancellation contract
 //!
 //! ## Last Modified
+//! v0.2.0 - Added race-free in-flight I/O cancellation and removed the
+//!          redundant internal socket `Arc`.
 //! v0.1.1 - Removed a stale tracing import after transport lint review.
 //! v0.1.0 - Initial UDP transport implementation
 
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tracing::{debug, info, trace};
 
 use crate::error::{Result, TransportError};
@@ -42,6 +47,36 @@ use crate::traits::{PacketSource, Transport};
 // ============================================
 // UdpTransport
 // ============================================
+
+/// One-way, process-local shutdown signal shared by all in-flight operations.
+#[derive(Debug)]
+struct ShutdownSignal {
+    sender: watch::Sender<bool>,
+}
+
+impl ShutdownSignal {
+    /// Creates an active signal.
+    fn new() -> Self {
+        let (sender, _receiver) = watch::channel(false);
+        Self { sender }
+    }
+
+    /// Returns whether shutdown has been requested.
+    fn is_triggered(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    /// Triggers shutdown and returns `true` only for the first caller.
+    fn trigger(&self) -> bool {
+        !self.sender.send_replace(true)
+    }
+
+    /// Waits until shutdown is requested.
+    async fn cancelled(&self) {
+        let mut receiver = self.sender.subscribe();
+        let _closed = receiver.wait_for(|is_shutdown| *is_shutdown).await;
+    }
+}
 
 /// UDP-based transport implementation.
 ///
@@ -66,11 +101,11 @@ use crate::traits::{PacketSource, Transport};
 /// ```
 pub struct UdpTransport {
     /// Underlying UDP socket
-    socket: Arc<UdpSocket>,
+    socket: UdpSocket,
     /// Local address we're bound to
     local_addr: SocketAddr,
-    /// Shutdown flag
-    shutdown: AtomicBool,
+    /// Race-free shutdown notification for current and future operations
+    shutdown: ShutdownSignal,
 }
 
 impl UdpTransport {
@@ -105,7 +140,11 @@ impl UdpTransport {
     ///
     /// # Errors
     /// Returns error if binding fails.
+    #[allow(clippy::unused_async)]
     pub async fn bind_addr(addr: SocketAddr) -> Result<Self> {
+        // [UDP-BIND-COMPAT 2026-07-23 by Codex] This public method remains
+        // async for API compatibility. Socket creation is non-blocking and
+        // must complete before Tokio can safely adopt the descriptor.
         info!("Binding UDP transport to {}", addr);
 
         // Create socket with socket2 for more control
@@ -148,16 +187,19 @@ impl UdpTransport {
         info!("UDP transport bound to {}", local_addr);
 
         Ok(Self {
-            socket: Arc::new(tokio_socket),
+            socket: tokio_socket,
             local_addr,
-            shutdown: AtomicBool::new(false),
+            shutdown: ShutdownSignal::new(),
         })
     }
 
     /// Returns the number of bytes available to read.
     ///
     /// This is an estimate and may not be exact.
-    pub fn readable_bytes(&self) -> Result<usize> {
+    ///
+    /// # Errors
+    /// This compatibility method currently does not return an error.
+    pub const fn readable_bytes(&self) -> Result<usize> {
         // Note: This is not directly available in Tokio UdpSocket
         // We could use ioctl FIONREAD, but for now just return 0
         Ok(0)
@@ -166,24 +208,47 @@ impl UdpTransport {
     /// Checks if the transport has been shut down.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
+        self.shutdown.is_triggered()
+    }
+
+    /// Runs one cancel-safe socket future until completion or shutdown.
+    ///
+    /// Tokio UDP send/receive futures are cancel-safe. The final state check
+    /// closes the narrow race where both branches become ready together.
+    async fn run_until_shutdown<T>(&self, operation: impl Future<Output = Result<T>>) -> Result<T> {
+        // [UDP-SHUTDOWN 2026-07-23 by Codex] A watch channel retains the
+        // shutdown value, so an operation cannot miss notification between
+        // its initial state check and registration with `select!`.
+        if self.is_shutdown() {
+            return Err(TransportError::ShuttingDown);
+        }
+
+        let result = tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => Err(TransportError::ShuttingDown),
+            result = operation => result,
+        }?;
+
+        if self.is_shutdown() {
+            Err(TransportError::ShuttingDown)
+        } else {
+            Ok(result)
+        }
     }
 }
 
 #[async_trait]
 impl Transport for UdpTransport {
     async fn recv(&self, buf: &mut [u8]) -> Result<(usize, PacketSource)> {
-        if self.is_shutdown() {
-            return Err(TransportError::ShuttingDown);
-        }
-
-        let (len, addr) =
+        let receive = async {
             self.socket
                 .recv_from(buf)
                 .await
-                .map_err(|e| TransportError::ReceiveFailed {
-                    reason: e.to_string(),
-                })?;
+                .map_err(|error| TransportError::ReceiveFailed {
+                    reason: error.to_string(),
+                })
+        };
+        let (len, addr) = self.run_until_shutdown(receive).await?;
 
         trace!("Received {} bytes from {}", len, addr);
 
@@ -191,18 +256,16 @@ impl Transport for UdpTransport {
     }
 
     async fn send(&self, buf: &[u8], dest: &SocketAddr) -> Result<usize> {
-        if self.is_shutdown() {
-            return Err(TransportError::ShuttingDown);
-        }
-
-        let len = self
-            .socket
-            .send_to(buf, dest)
-            .await
-            .map_err(|e| TransportError::SendFailed {
-                dest: *dest,
-                reason: e.to_string(),
-            })?;
+        let send = async {
+            self.socket
+                .send_to(buf, dest)
+                .await
+                .map_err(|error| TransportError::SendFailed {
+                    dest: *dest,
+                    reason: error.to_string(),
+                })
+        };
+        let len = self.run_until_shutdown(send).await?;
 
         trace!("Sent {} bytes to {}", len, dest);
 
@@ -214,15 +277,15 @@ impl Transport for UdpTransport {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        debug!("Shutting down UDP transport");
-
-        // Set shutdown flag
-        self.shutdown.store(true, Ordering::Release);
+        if self.shutdown.trigger() {
+            info!("UDP transport shutdown requested");
+        } else {
+            debug!("UDP transport shutdown already requested");
+        }
 
         // Note: Tokio UdpSocket doesn't have an explicit close method
         // The socket will be closed when dropped
 
-        info!("UDP transport shutdown complete");
         Ok(())
     }
 
@@ -236,7 +299,7 @@ impl std::fmt::Debug for UdpTransport {
         f.debug_struct("UdpTransport")
             .field("local_addr", &self.local_addr)
             .field("shutdown", &self.is_shutdown())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -281,9 +344,11 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown() {
         let transport = UdpTransport::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = transport.local_addr().unwrap();
 
         assert!(transport.is_active());
 
+        transport.shutdown().await.unwrap();
         transport.shutdown().await.unwrap();
 
         assert!(!transport.is_active());
@@ -293,6 +358,39 @@ mod tests {
         let mut buf = [0u8; 1024];
         let result = transport.recv(&mut buf).await;
         assert!(matches!(result, Err(TransportError::ShuttingDown)));
+
+        let result = transport.send(b"closed", &local_addr).await;
+        assert!(matches!(result, Err(TransportError::ShuttingDown)));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_cancels_all_pending_receivers() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const RECEIVER_COUNT: usize = 8;
+
+        let transport = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let mut receivers = Vec::with_capacity(RECEIVER_COUNT);
+
+        for _ in 0..RECEIVER_COUNT {
+            let transport = Arc::clone(&transport);
+            receivers.push(tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                transport.recv(&mut buf).await
+            }));
+        }
+
+        tokio::task::yield_now().await;
+        transport.shutdown().await.unwrap();
+
+        for receiver in receivers {
+            let result = tokio::time::timeout(Duration::from_secs(1), receiver)
+                .await
+                .expect("pending receive should wake during shutdown")
+                .expect("receive task should not panic");
+            assert!(matches!(result, Err(TransportError::ShuttingDown)));
+        }
     }
 
     #[tokio::test]
@@ -310,9 +408,10 @@ mod tests {
         // Drop the first transport
         drop(transport1);
 
-        // Should be able to bind to the same port immediately due to SO_REUSEADDR
-        // Note: This may still fail occasionally due to TIME_WAIT, but should mostly work
-        let _transport2 = UdpTransport::bind_addr(addr).await;
-        // We don't assert success here because it's timing-dependent
+        // UDP has no TCP TIME_WAIT state, so rebinding after dropping the
+        // previous owner is deterministic.
+        UdpTransport::bind_addr(addr)
+            .await
+            .expect("released UDP address should be immediately reusable");
     }
 }
