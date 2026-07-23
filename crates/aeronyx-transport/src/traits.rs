@@ -11,6 +11,7 @@
 //! - `Transport`: UDP-like datagram transport interface
 //! - `TunDevice`: TUN device read/write interface
 //! - `PacketSource`: Metadata about received packets
+//! - `TunConfig`: Validated, platform-neutral TUN configuration
 //!
 //! ## Design Philosophy
 //! - Traits enable mock implementations for testing
@@ -22,8 +23,11 @@
 //! - All trait methods are async for consistency
 //! - Implementations must be Send + Sync for use in async contexts
 //! - Buffer management is caller's responsibility
+//! - Platform implementations must consume `TunConfig::netmask_prefix` rather
+//!   than deriving a prefix independently
 //!
 //! ## Last Modified
+//! v0.2.0 - Added canonical contiguous-netmask validation and prefix conversion.
 //! v0.1.0 - Initial trait definitions
 
 use std::net::SocketAddr;
@@ -295,6 +299,35 @@ impl TunConfig {
         self
     }
 
+    /// Returns the CIDR prefix represented by the configured IPv4 netmask.
+    ///
+    /// # Errors
+    /// Returns [`crate::error::TransportError::InvalidConfig`] when the mask
+    /// contains non-contiguous one bits.
+    pub fn netmask_prefix(&self) -> Result<u8> {
+        use crate::error::TransportError;
+
+        // [TUN-CONFIG 2026-07-23 by Codex] Keep mask validation in the
+        // platform-neutral config so every TUN backend applies one invariant.
+        let bits = u32::from(self.netmask);
+        let prefix = u8::try_from(bits.leading_ones()).map_err(|_| {
+            TransportError::invalid_config("netmask", "IPv4 prefix length exceeds 32 bits")
+        })?;
+        let expected = match prefix {
+            0 => 0,
+            _ => u32::MAX << (u32::BITS - u32::from(prefix)),
+        };
+
+        if bits != expected {
+            return Err(TransportError::invalid_config(
+                "netmask",
+                format!("{} is not a contiguous IPv4 netmask", self.netmask),
+            ));
+        }
+
+        Ok(prefix)
+    }
+
     /// Validates the configuration.
     ///
     /// # Errors
@@ -329,6 +362,8 @@ impl TunConfig {
                 "MTU cannot exceed 9000 bytes",
             ));
         }
+
+        self.netmask_prefix()?;
 
         Ok(())
     }
@@ -401,5 +436,30 @@ mod tests {
         // MTU too large
         let config = TunConfig::new("tun0").with_mtu(10000);
         assert!(config.validate().is_err());
+
+        // Non-contiguous masks must not be silently reinterpreted as a CIDR.
+        let config = TunConfig::new("tun0").with_netmask(std::net::Ipv4Addr::new(255, 0, 255, 0));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_tun_config_netmask_prefix() {
+        for (netmask, expected_prefix) in [
+            (std::net::Ipv4Addr::UNSPECIFIED, 0),
+            (std::net::Ipv4Addr::new(255, 0, 0, 0), 8),
+            (std::net::Ipv4Addr::new(255, 255, 252, 0), 22),
+            (std::net::Ipv4Addr::new(255, 255, 255, 0), 24),
+            (std::net::Ipv4Addr::BROADCAST, 32),
+        ] {
+            let config = TunConfig::new("tun0").with_netmask(netmask);
+            assert!(matches!(
+                config.netmask_prefix(),
+                Ok(actual_prefix) if actual_prefix == expected_prefix
+            ));
+        }
+
+        let invalid =
+            TunConfig::new("tun0").with_netmask(std::net::Ipv4Addr::new(255, 255, 255, 1));
+        assert!(invalid.netmask_prefix().is_err());
     }
 }

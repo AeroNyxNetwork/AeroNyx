@@ -24,6 +24,7 @@
 //! - Consider firewall rules when binding to public addresses
 //!
 //! ## Last Modified
+//! v0.1.1 - Removed a stale tracing import after transport lint review.
 //! v0.1.0 - Initial UDP transport implementation
 
 use std::net::SocketAddr;
@@ -33,7 +34,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, info, trace};
 
 use crate::error::{Result, TransportError};
 use crate::traits::{PacketSource, Transport};

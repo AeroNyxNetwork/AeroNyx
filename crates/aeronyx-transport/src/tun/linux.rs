@@ -11,6 +11,7 @@
 //! - TUN device creation via ioctl
 //! - IP address and route configuration
 //! - Async read/write via Tokio
+//! - Non-blocking operating-system interface control
 //! - Device cleanup on drop
 //!
 //! ## Linux TUN Interface
@@ -28,29 +29,30 @@
 //! ## ⚠️ Important Note for Next Developer
 //! - This implementation requires Linux-specific headers
 //! - Device creation may fail without proper permissions
-//! - Always set IFF_NO_PI to avoid packet info headers
+//! - Always set `IFF_NO_PI` to avoid packet info headers
 //! - Test with mock implementation when possible
+//! - Keep unsafe ioctl calls inside the audited helpers in this module
 //!
 //! ## Last Modified
+//! v0.2.0 - Moved `ip` operations to Tokio process I/O, centralized ioctl
+//!          safety boundaries, and reused canonical netmask validation.
 //! v0.1.1 - Flush existing global TUN addresses before applying the configured
 //!          address so CIDR changes such as /24 -> /22 take effect on restart.
 //! v0.1.0 - Initial Linux TUN implementation
 
-#![cfg(target_os = "linux")]
-
-use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::process::Command;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::libc;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use tracing::{debug, error, info, warn};
+use tokio::process::Command;
+use tracing::{debug, info, warn};
 
 use crate::error::{Result, TransportError};
 use crate::traits::{TunConfig, TunDevice};
@@ -62,10 +64,10 @@ use crate::traits::{TunConfig, TunDevice};
 /// Path to the TUN device clone device.
 const TUN_DEVICE_PATH: &str = "/dev/net/tun";
 
-/// IFF_TUN flag - TUN device (no Ethernet headers).
+/// `IFF_TUN` flag - TUN device (no Ethernet headers).
 const IFF_TUN: libc::c_short = 0x0001;
 
-/// IFF_NO_PI flag - Do not provide packet information.
+/// `IFF_NO_PI` flag - Do not provide packet information.
 const IFF_NO_PI: libc::c_short = 0x1000;
 
 /// TUNSETIFF ioctl number.
@@ -98,13 +100,13 @@ impl IfReq {
         let name_bytes = name.as_bytes();
         let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
         for (i, &byte) in name_bytes[..copy_len].iter().enumerate() {
-            ifr.ifr_name[i] = byte as libc::c_char;
+            ifr.ifr_name[i] = libc::c_char::from_ne_bytes([byte]);
         }
 
         ifr
     }
 
-    fn with_flags(mut self, flags: libc::c_short) -> Self {
+    const fn with_flags(mut self, flags: libc::c_short) -> Self {
         self.ifr_flags = flags;
         self
     }
@@ -114,10 +116,48 @@ impl IfReq {
             .ifr_name
             .iter()
             .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
+            .map(|&c| u8::from_ne_bytes(c.to_ne_bytes()))
             .collect();
         String::from_utf8_lossy(&bytes).into_owned()
     }
+}
+
+// ============================================
+// Audited Linux syscall boundary
+// ============================================
+
+/// Binds an open TUN clone descriptor to the requested interface.
+#[allow(unsafe_code)]
+fn set_tun_interface(fd: RawFd, request: &mut IfReq) -> std::io::Result<()> {
+    // [TUN-SYSCALL 2026-07-23 by Codex] `request` is repr(C), fully
+    // initialized, mutable for the duration of ioctl, and `fd` is owned by the
+    // live File in `LinuxTun::create`.
+    let result = unsafe { libc::ioctl(fd, TUNSETIFF, request) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Updates persistence for an already configured TUN descriptor.
+#[allow(unsafe_code)]
+fn set_tun_persistence(fd: RawFd, persist: bool) -> std::io::Result<()> {
+    // [TUN-SYSCALL 2026-07-23 by Codex] TUNSETPERSIST accepts an integer value
+    // and does not retain a pointer. The descriptor remains owned by File.
+    let result = unsafe { libc::ioctl(fd, TUNSETPERSIST, i32::from(persist)) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Enables non-blocking mode while preserving every existing descriptor flag.
+fn set_nonblocking(fd: RawFd) -> nix::Result<()> {
+    let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok(())
 }
 
 // ============================================
@@ -129,7 +169,7 @@ impl IfReq {
 /// # Features
 /// - Creates TUN device via `/dev/net/tun`
 /// - Configures IP address and routing
-/// - Async read/write via Tokio AsyncFd
+/// - Async read/write via Tokio `AsyncFd`
 /// - Automatic cleanup on drop
 ///
 /// # Example
@@ -165,11 +205,12 @@ impl LinuxTun {
     ///
     /// # Errors
     /// - `TunCreateFailed`: If device creation fails
-    /// - `PermissionDenied`: If lacking CAP_NET_ADMIN
+    /// - `PermissionDenied`: If lacking `CAP_NET_ADMIN`
     ///
     /// # Requirements
-    /// - Must run as root or have CAP_NET_ADMIN
+    /// - Must run as root or have `CAP_NET_ADMIN`
     /// - `/dev/net/tun` must exist
+    #[allow(clippy::unused_async)]
     pub async fn create(config: TunConfig) -> Result<Self> {
         // Validate configuration
         config.validate()?;
@@ -184,7 +225,7 @@ impl LinuxTun {
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
                     TransportError::PermissionDenied {
-                        operation: format!("open {}", TUN_DEVICE_PATH),
+                        operation: format!("open {TUN_DEVICE_PATH}"),
                     }
                 } else {
                     TransportError::tun_create_failed(&config.name, e.to_string())
@@ -196,13 +237,10 @@ impl LinuxTun {
         // Configure TUN device via ioctl
         let mut ifr = IfReq::new(&config.name).with_flags(IFF_TUN | IFF_NO_PI);
 
-        let result = unsafe { libc::ioctl(fd, TUNSETIFF as libc::c_ulong, &mut ifr) };
-
-        if result < 0 {
-            let err = std::io::Error::last_os_error();
+        if let Err(err) = set_tun_interface(fd, &mut ifr) {
             return Err(TransportError::tun_create_failed(
                 &config.name,
-                format!("TUNSETIFF failed: {}", err),
+                format!("TUNSETIFF failed: {err}"),
             ));
         }
 
@@ -212,38 +250,22 @@ impl LinuxTun {
 
         // Set persistence if requested
         if config.persist {
-            let persist_result = unsafe { libc::ioctl(fd, TUNSETPERSIST as libc::c_ulong, 1) };
-            if persist_result < 0 {
-                warn!(
-                    "Failed to set TUN persistence: {}",
-                    std::io::Error::last_os_error()
-                );
+            if let Err(err) = set_tun_persistence(fd, true) {
+                warn!("Failed to set TUN persistence: {}", err);
             }
         }
 
         // Set non-blocking mode
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(TransportError::tun_create_failed(
+        set_nonblocking(fd).map_err(|err| {
+            TransportError::tun_create_failed(
                 &config.name,
-                "Failed to get file flags",
-            ));
-        }
-
-        let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        if result < 0 {
-            return Err(TransportError::tun_create_failed(
-                &config.name,
-                "Failed to set non-blocking mode",
-            ));
-        }
+                format!("Failed to set non-blocking mode: {err}"),
+            )
+        })?;
 
         // Create async fd wrapper
         let async_fd = AsyncFd::new(file).map_err(|e| {
-            TransportError::tun_create_failed(
-                &config.name,
-                format!("AsyncFd creation failed: {}", e),
-            )
+            TransportError::tun_create_failed(&config.name, format!("AsyncFd creation failed: {e}"))
         })?;
 
         // Update config with actual name
@@ -261,83 +283,60 @@ impl LinuxTun {
     ///
     /// This is a simpler alternative to netlink-based configuration.
     async fn configure_address(&self) -> Result<()> {
-        let addr = format!("{}/{}", self.config.address, self.netmask_to_cidr());
+        let addr = format!("{}/{}", self.config.address, self.config.netmask_prefix()?);
 
         debug!("Configuring TUN address: {} on {}", addr, self.config.name);
 
         // The TUN device is owned by AeroNyx. Flush global addresses first so
         // maintenance changes to the configured CIDR cannot be masked by an
         // older address such as 100.64.0.1/24 already being present.
-        let flush_output = Command::new("ip")
-            .args(["addr", "flush", "dev", &self.config.name, "scope", "global"])
-            .output()
-            .map_err(|e| TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("Failed to run ip flush command: {}", e),
-            })?;
-
-        if !flush_output.status.success() {
-            let stderr = String::from_utf8_lossy(&flush_output.stderr);
-            return Err(TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("ip addr flush failed: {}", stderr),
-            });
-        }
-
-        let output = Command::new("ip")
-            .args(["addr", "add", &addr, "dev", &self.config.name])
-            .output()
-            .map_err(|e| TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("Failed to run ip command: {}", e),
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("ip addr add failed: {}", stderr),
-            });
-        }
-
-        Ok(())
+        self.run_ip(
+            &["addr", "flush", "dev", &self.config.name, "scope", "global"],
+            "ip addr flush",
+        )
+        .await?;
+        self.run_ip(
+            &["addr", "add", &addr, "dev", &self.config.name],
+            "ip addr add",
+        )
+        .await
     }
 
     /// Sets the device MTU.
     async fn configure_mtu(&self) -> Result<()> {
         debug!("Setting MTU to {} on {}", self.config.mtu, self.config.name);
 
-        let output = Command::new("ip")
-            .args([
-                "link",
-                "set",
-                "dev",
-                &self.config.name,
-                "mtu",
-                &self.config.mtu.to_string(),
-            ])
-            .output()
-            .map_err(|e| TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("Failed to set MTU: {}", e),
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("ip link set mtu failed: {}", stderr),
-            });
-        }
-
-        Ok(())
+        let mtu = self.config.mtu.to_string();
+        self.run_ip(
+            &["link", "set", "dev", &self.config.name, "mtu", &mtu],
+            "ip link set mtu",
+        )
+        .await
     }
 
-    /// Converts netmask to CIDR prefix length.
-    fn netmask_to_cidr(&self) -> u8 {
-        let octets = self.config.netmask.octets();
-        let bits: u32 = u32::from_be_bytes(octets);
-        bits.count_ones() as u8
+    /// Runs one `ip` operation without blocking the Tokio executor.
+    async fn run_ip(&self, args: &[&str], operation: &str) -> Result<()> {
+        // [ASYNC-TUN-CONTROL 2026-07-23 by Codex] Interface operations can
+        // wait on udev/netlink. Tokio's process driver keeps that wait off the
+        // runtime worker that forwards encrypted packets.
+        let output = Command::new("ip")
+            .args(args)
+            .output()
+            .await
+            .map_err(|err| TransportError::TunConfigFailed {
+                name: self.config.name.clone(),
+                reason: format!("Failed to run {operation}: {err}"),
+            })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(TransportError::TunConfigFailed {
+            name: self.config.name.clone(),
+            reason: format!("{operation} failed: {}", stderr.trim()),
+        })
     }
 }
 
@@ -352,15 +351,8 @@ impl TunDevice for LinuxTun {
             })?;
 
             match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let result =
-                    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-
-                if result < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(result as usize)
-                }
+                let mut file = inner.get_ref();
+                file.read(buf)
             }) {
                 Ok(Ok(len)) => return Ok(len),
                 Ok(Err(e)) => {
@@ -368,7 +360,7 @@ impl TunDevice for LinuxTun {
                         reason: e.to_string(),
                     })
                 }
-                Err(_would_block) => continue,
+                Err(_would_block) => {}
             }
         }
     }
@@ -382,15 +374,8 @@ impl TunDevice for LinuxTun {
             })?;
 
             match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let result =
-                    unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
-
-                if result < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(result as usize)
-                }
+                let mut file = inner.get_ref();
+                file.write(buf)
             }) {
                 Ok(Ok(len)) => return Ok(len),
                 Ok(Err(e)) => {
@@ -398,7 +383,7 @@ impl TunDevice for LinuxTun {
                         reason: e.to_string(),
                     })
                 }
-                Err(_would_block) => continue,
+                Err(_would_block) => {}
             }
         }
     }
@@ -429,21 +414,11 @@ impl TunDevice for LinuxTun {
         self.configure_mtu().await?;
 
         // Bring interface up
-        let output = Command::new("ip")
-            .args(["link", "set", "dev", &self.config.name, "up"])
-            .output()
-            .map_err(|e| TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("Failed to bring up interface: {}", e),
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("ip link set up failed: {}", stderr),
-            });
-        }
+        self.run_ip(
+            &["link", "set", "dev", &self.config.name, "up"],
+            "ip link set up",
+        )
+        .await?;
 
         self.is_up.store(true, Ordering::Release);
         info!(
@@ -457,17 +432,14 @@ impl TunDevice for LinuxTun {
     async fn down(&self) -> Result<()> {
         info!("Bringing down TUN device: {}", self.config.name);
 
-        let output = Command::new("ip")
-            .args(["link", "set", "dev", &self.config.name, "down"])
-            .output()
-            .map_err(|e| TransportError::TunConfigFailed {
-                name: self.config.name.clone(),
-                reason: format!("Failed to bring down interface: {}", e),
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("ip link set down failed: {}", stderr);
+        if let Err(err) = self
+            .run_ip(
+                &["link", "set", "dev", &self.config.name, "down"],
+                "ip link set down",
+            )
+            .await
+        {
+            warn!("{}", err);
         }
 
         self.is_up.store(false, Ordering::Release);
@@ -496,7 +468,7 @@ impl std::fmt::Debug for LinuxTun {
             .field("address", &self.config.address)
             .field("mtu", &self.config.mtu)
             .field("is_up", &self.is_up())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -526,18 +498,5 @@ mod tests {
 
         // Name should be truncated to IFNAMSIZ - 1
         assert!(ifr.name().len() < libc::IFNAMSIZ);
-    }
-
-    #[test]
-    fn test_netmask_to_cidr() {
-        // We can't easily test this without creating a TUN device
-        // Test the logic directly
-        let mask_24 = Ipv4Addr::new(255, 255, 255, 0);
-        let bits: u32 = u32::from_be_bytes(mask_24.octets());
-        assert_eq!(bits.count_ones(), 24);
-
-        let mask_16 = Ipv4Addr::new(255, 255, 0, 0);
-        let bits: u32 = u32::from_be_bytes(mask_16.octets());
-        assert_eq!(bits.count_ones(), 16);
     }
 }

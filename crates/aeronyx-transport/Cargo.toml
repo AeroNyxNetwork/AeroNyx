@@ -5,12 +5,15 @@
 # ============================================
 # Creation Reason: Abstracts network transport operations including
 #                  UDP sockets and TUN device management.
+# Modification Reason: Keep Linux interface configuration off Tokio workers by
+#                      using Tokio's asynchronous child-process integration.
 #
 # Main Functionality:
 # - UDP socket management for client communication
 # - TUN device creation and management
 # - Transport trait abstractions for testability
 # - Platform-specific implementations
+# - Async operating-system network configuration
 #
 # Dependencies:
 # - Used by: aeronyx-server
@@ -25,8 +28,10 @@
 # - TUN operations require root/CAP_NET_ADMIN
 # - Platform-specific code is isolated in submodules
 # - Mock implementations provided for testing
+# - Do not call blocking process APIs from async transport methods
 #
-# Last Modified: v0.1.0 - Initial transport layer
+# Last Modified: v0.2.0-AsyncTunControl - Added Tokio process support for
+#                non-blocking Linux TUN configuration.
 # ============================================
 
 [package]
@@ -46,7 +51,7 @@ categories = ["network-programming", "asynchronous"]
 aeronyx-common = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "fs"] }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "fs", "process"] }
 async-trait = { workspace = true }
 
 # Networking
