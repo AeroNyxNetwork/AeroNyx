@@ -28,6 +28,8 @@
 //!   retain rollback evidence without receiving policy members or endpoints
 //! - Replica-carrier frames that transport already audited producer evidence
 //!   without allowing the carrier to replace the producer's signatures
+//! - Shared bounded fixed-integer codec policy for canonical control-plane
+//!   frames and descriptor signing bytes
 //!
 //! ## Dependencies
 //! - crates/aeronyx-core/src/crypto/keys.rs: IdentityKeyPair / IdentityPublicKey
@@ -74,8 +76,12 @@
 //!   validator membership, consensus, governance, or finality.
 //! - A replica carrier proves transport of its audited copy. It cannot author,
 //!   rewrite, finalize, or select the producer's signed chain.
+//! - [BOUNDED-DISCOVERY-CODEC 2026-07-24 by Codex] Discovery and Directory
+//!   Sync frames are canonical control-plane messages. Keep strict trailing
+//!   rejection and the complete-input size preflight in the shared codec.
 //!
 //! ## Last Modified
+//! v0.12.0-BoundedControlPlaneCodec - Unified bounded discovery and directory wire encoding
 //! v0.11.0-DirectoryPolicyHeadAnchor - Added privacy-bounded external policy-head anchor frames
 //! v0.10.0-DirectoryEvidenceCarrier - Added producer-bound audited replica transport frames
 //! v0.9.0-DirectoryObservationWitness - Added bounded independently recomputed checkpoint witness frames
@@ -89,13 +95,13 @@
 //! v0.3.0-DiscoveryPhase4 - Added bounded discovery gossip messages
 // ============================================================================
 
-use bincode::Options;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::crypto::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
 use crate::ledger::merkle_root;
+use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
 
 // ============================================
 // Serialization constants
@@ -350,11 +356,7 @@ fn legacy_descriptor_v1_signing_bytes(descriptor: &NodeDescriptor) -> Result<Vec
         policy: &descriptor.policy,
     };
 
-    bincode::options()
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .with_limit(MAX_DESCRIPTOR_BYTES)
-        .serialize(&legacy)
+    encode_bincode_bounded(&legacy, MAX_DESCRIPTOR_BYTES)
         .map_err(|err| CoreError::malformed(format!("legacy node descriptor serialization: {err}")))
 }
 
@@ -419,11 +421,7 @@ impl NodeDescriptor {
             return legacy_descriptor_v1_signing_bytes(self);
         }
 
-        bincode::options()
-            .with_fixint_encoding()
-            .allow_trailing_bytes()
-            .with_limit(MAX_DESCRIPTOR_BYTES)
-            .serialize(self)
+        encode_bincode_bounded(self, MAX_DESCRIPTOR_BYTES)
             .map_err(|err| CoreError::malformed(format!("node descriptor serialization: {err}")))
     }
 }
@@ -1881,10 +1879,7 @@ pub fn directory_policy_anchor_response_signing_bytes(
 /// # Errors
 /// Returns `CoreError::MalformedMessage` when serialization fails.
 pub fn encode_directory_sync_message(message: &DirectorySyncMessage) -> Result<Vec<u8>, CoreError> {
-    let payload = bincode::options()
-        .with_fixint_encoding()
-        .with_limit(MAX_DIRECTORY_SYNC_MESSAGE_BYTES)
-        .serialize(message)
+    let payload = encode_bincode_bounded(message, MAX_DIRECTORY_SYNC_MESSAGE_BYTES)
         .map_err(|error| CoreError::malformed(format!("directory sync encode: {error}")))?;
     let mut frame = Vec::with_capacity(payload.len() + 1);
     frame.push(DIRECTORY_SYNC_MAGIC);
@@ -1901,12 +1896,12 @@ pub fn decode_directory_sync_message(bytes: &[u8]) -> Result<DirectorySyncMessag
     if bytes.first().copied() != Some(DIRECTORY_SYNC_MAGIC) {
         return Err(CoreError::malformed("directory sync magic mismatch"));
     }
-    bincode::options()
-        .with_fixint_encoding()
-        .with_limit(MAX_DIRECTORY_SYNC_MESSAGE_BYTES)
-        .reject_trailing_bytes()
-        .deserialize(&bytes[1..])
-        .map_err(|error| CoreError::malformed(format!("directory sync decode: {error}")))
+    decode_bincode_bounded(
+        &bytes[1..],
+        MAX_DIRECTORY_SYNC_MESSAGE_BYTES,
+        TrailingBytesPolicy::Reject,
+    )
+    .map_err(|error| CoreError::malformed(format!("directory sync decode: {error}")))
 }
 
 // ============================================
@@ -2021,10 +2016,7 @@ pub enum NodeDiscoveryMessage {
 /// # Errors
 /// Returns `CoreError::MalformedMessage` when serialization fails.
 pub fn encode_discovery_message(message: &NodeDiscoveryMessage) -> Result<Vec<u8>, CoreError> {
-    bincode::options()
-        .with_fixint_encoding()
-        .with_limit(MAX_DISCOVERY_MESSAGE_BYTES)
-        .serialize(message)
+    encode_bincode_bounded(message, MAX_DISCOVERY_MESSAGE_BYTES)
         .map_err(|err| CoreError::malformed(format!("discovery message encode: {err}")))
 }
 
@@ -2033,11 +2025,12 @@ pub fn encode_discovery_message(message: &NodeDiscoveryMessage) -> Result<Vec<u8
 /// # Errors
 /// Returns `CoreError::MalformedMessage` when decoding fails.
 pub fn decode_discovery_message(bytes: &[u8]) -> Result<NodeDiscoveryMessage, CoreError> {
-    bincode::options()
-        .with_fixint_encoding()
-        .with_limit(MAX_DISCOVERY_MESSAGE_BYTES)
-        .deserialize(bytes)
-        .map_err(|err| CoreError::malformed(format!("discovery message decode: {err}")))
+    decode_bincode_bounded(
+        bytes,
+        MAX_DISCOVERY_MESSAGE_BYTES,
+        TrailingBytesPolicy::Reject,
+    )
+    .map_err(|err| CoreError::malformed(format!("discovery message decode: {err}")))
 }
 
 // ============================================
@@ -2047,6 +2040,7 @@ pub fn decode_discovery_message(bytes: &[u8]) -> Result<NodeDiscoveryMessage, Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bincode::Options;
 
     fn descriptor_for(kp: &IdentityKeyPair) -> NodeDescriptor {
         let mut descriptor = NodeDescriptor::new(
@@ -2228,14 +2222,37 @@ mod tests {
     #[test]
     fn test_discovery_message_snapshot_request_roundtrip() {
         let message = NodeDiscoveryMessage::SnapshotRequest {
-            requested_at: 1_700_000_100,
-            limit: Some(128),
+            requested_at: 0x0102_0304_0506_0708,
+            limit: Some(0x090a),
         };
 
         let bytes = encode_discovery_message(&message).unwrap();
         let decoded = decode_discovery_message(&bytes).unwrap();
 
         assert_eq!(decoded, message);
+        assert_eq!(
+            bytes,
+            [
+                0x00, 0x00, 0x00, 0x00, // enum variant
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // timestamp
+                0x01, // Some
+                0x0a, 0x09, // limit
+            ],
+            "the bounded codec must preserve the established discovery wire bytes"
+        );
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(
+            decode_discovery_message(&trailing).is_err(),
+            "canonical discovery messages must reject trailing bytes"
+        );
+
+        let padded = vec![0; MAX_DISCOVERY_MESSAGE_BYTES as usize + 1];
+        assert!(
+            decode_discovery_message(&padded).is_err(),
+            "the complete discovery input must obey the protocol ceiling"
+        );
     }
 
     #[test]
