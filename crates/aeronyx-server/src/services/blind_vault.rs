@@ -16,6 +16,8 @@
 //! - Persistent monotonic runtime rotation of public issuer epochs.
 //! - Deterministic public issuer-epoch snapshots for node-signed discovery.
 //! - Immutable, idempotent ciphertext object persistence.
+//! - Pre-transaction signature authentication with in-transaction authority
+//!   revalidation for contention-safe write admission.
 //! - Capability-gated bounded recovery pages with encrypted snapshot cursors.
 //! - Administration-key object deletion with signed node receipts.
 //! - Transactional per-lease count/byte quotas and bounded expiry cleanup.
@@ -57,7 +59,10 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.7.0-BlindVaultIssuerAuthority - Added pinned authority
+//! Last Modified: v1.8.0-BlindVaultAuthPipeline - Moved client signature
+//! verification outside SQLite write transactions and added authority
+//! revalidation at the atomic mutation boundary.
+//! v1.7.0-BlindVaultIssuerAuthority - Added pinned authority
 //! verification and closed the unauthenticated runtime installer boundary.
 //! v1.6.0-BlindVaultIssuerRuntime - Added persistent monotonic
 //! public issuer-epoch rotation with rollback and continuity protection.
@@ -671,6 +676,52 @@ impl BlindVaultService {
         Ok(BlindVaultLeaseProvisionOutcome::Created)
     }
 
+    /// Loads one immutable lease-authority snapshot without opening a write
+    /// transaction. Callers must revalidate the relevant authority bytes after
+    /// acquiring their mutation transaction because an expired lease can be
+    /// removed and its random identifier reprovisioned between these phases.
+    fn lease_runtime_snapshot(
+        &self,
+        lease_id: &[u8; 32],
+    ) -> Result<LeaseRuntimeRow, BlindVaultServiceError> {
+        let connection = self.connection.lock();
+        load_lease_runtime(&connection, lease_id)?.ok_or(BlindVaultServiceError::LeaseNotFound)
+    }
+
+    /// Authenticates an object write before competing for `SQLite`'s single `WAL`
+    /// writer. This prevents invalid-signature traffic from holding an
+    /// immediate transaction during public-key verification.
+    fn authenticate_put_request(
+        &self,
+        request: &BlindVaultPutRequest,
+        now_ms: u64,
+    ) -> Result<[u8; 32], BlindVaultServiceError> {
+        let lease = self.lease_runtime_snapshot(&request.lease_id)?;
+        if lease.expires_at_ms <= now_ms || request.expires_at_ms > lease.expires_at_ms {
+            return Err(BlindVaultServiceError::LeaseExpired);
+        }
+        let write_key = IdentityPublicKey::from_bytes(&lease.write_verifying_key)
+            .map_err(|_| BlindVaultServiceError::CorruptState)?;
+        request.validate_and_verify(now_ms, self.config.max_object_ttl_ms(), &write_key)?;
+        Ok(lease.write_verifying_key)
+    }
+
+    /// Authenticates a deletion before competing for `SQLite`'s single `WAL`
+    /// writer. Lease expiry semantics remain backward compatible: an
+    /// administration key may delete retained ciphertext until cleanup removes
+    /// the lease.
+    fn authenticate_delete_request(
+        &self,
+        request: &BlindVaultDeleteRequest,
+        now_ms: u64,
+    ) -> Result<[u8; 32], BlindVaultServiceError> {
+        let lease = self.lease_runtime_snapshot(&request.lease_id)?;
+        let admin_key = IdentityPublicKey::from_bytes(&lease.admin_verifying_key)
+            .map_err(|_| BlindVaultServiceError::CorruptState)?;
+        request.validate_and_verify(now_ms, self.config.mutation_clock_skew_ms(), &admin_key)?;
+        Ok(lease.admin_verifying_key)
+    }
+
     /// Stores one immutable ciphertext and returns a node-signed acceptance
     /// receipt. Exact retries return a new signature over the original
     /// acceptance time without increasing usage.
@@ -679,7 +730,10 @@ impl BlindVaultService {
         request: &BlindVaultPutRequest,
         now_ms: u64,
     ) -> Result<BlindVaultStoredReceipt, BlindVaultServiceError> {
-        request.validate(now_ms, self.config.max_object_ttl_ms())?;
+        // [BLIND-VAULT-AUTH-PIPELINE 2026-07-23 by Codex] Expensive Ed25519
+        // verification happens before BEGIN IMMEDIATE. The transaction still
+        // compares the authority snapshot to close the delete/reprovision race.
+        let authenticated_write_key = self.authenticate_put_request(request, now_ms)?;
         let now = sqlite_i64(now_ms)?;
         let expires_at = sqlite_i64(request.expires_at_ms)?;
 
@@ -687,15 +741,15 @@ impl BlindVaultService {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let lease = load_lease_runtime(&transaction, &request.lease_id)?
             .ok_or(BlindVaultServiceError::LeaseNotFound)?;
+        if lease.write_verifying_key != authenticated_write_key {
+            return Err(BlindVaultServiceError::LeaseConflict);
+        }
         if lease.expires_at_ms <= now_ms {
             return Err(BlindVaultServiceError::LeaseExpired);
         }
         if request.expires_at_ms > lease.expires_at_ms {
             return Err(BlindVaultServiceError::LeaseExpired);
         }
-        let write_key = IdentityPublicKey::from_bytes(&lease.write_verifying_key)
-            .map_err(|_| BlindVaultServiceError::CorruptState)?;
-        request.validate_and_verify(now_ms, self.config.max_object_ttl_ms(), &write_key)?;
 
         let tombstoned: bool = transaction.query_row(
             "SELECT EXISTS(
@@ -890,6 +944,9 @@ impl BlindVaultService {
         request: &BlindVaultDeleteRequest,
         now_ms: u64,
     ) -> Result<BlindVaultDeletedReceipt, BlindVaultServiceError> {
+        // [BLIND-VAULT-AUTH-PIPELINE 2026-07-23 by Codex] Reject forged or
+        // stale administration requests without acquiring the WAL write lock.
+        let authenticated_admin_key = self.authenticate_delete_request(request, now_ms)?;
         let now = sqlite_i64(now_ms)?;
         let tombstone_expiry = now_ms
             .checked_add(self.config.tombstone_ttl_secs.saturating_mul(1_000))
@@ -900,9 +957,9 @@ impl BlindVaultService {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let lease = load_lease_runtime(&transaction, &request.lease_id)?
             .ok_or(BlindVaultServiceError::LeaseNotFound)?;
-        let admin_key = IdentityPublicKey::from_bytes(&lease.admin_verifying_key)
-            .map_err(|_| BlindVaultServiceError::CorruptState)?;
-        request.validate_and_verify(now_ms, self.config.mutation_clock_skew_ms(), &admin_key)?;
+        if lease.admin_verifying_key != authenticated_admin_key {
+            return Err(BlindVaultServiceError::LeaseConflict);
+        }
 
         let existing: Option<(Vec<u8>, i64)> = transaction
             .query_row(
@@ -1437,7 +1494,7 @@ struct LeaseProvisioningRow {
     expires_at_ms: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct LeaseRuntimeRow {
     write_verifying_key: [u8; 32],
     admin_verifying_key: [u8; 32],
@@ -1630,10 +1687,10 @@ fn load_lease_provisioning(
 }
 
 fn load_lease_runtime(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     lease_id: &[u8; 32],
 ) -> Result<Option<LeaseRuntimeRow>, BlindVaultServiceError> {
-    let row: Option<(Vec<u8>, Vec<u8>, i64, i64, i64)> = transaction
+    let row: Option<(Vec<u8>, Vec<u8>, i64, i64, i64)> = connection
         .query_row(
             "SELECT write_verifying_key, admin_verifying_key, expires_at_ms,
                     object_count, byte_count
@@ -2431,6 +2488,47 @@ mod tests {
                 .pull_page(&[1; 32], &[0; 32], None, 10, NOW_MS + 30),
             Err(BlindVaultServiceError::ReadUnauthorized)
         ));
+    }
+
+    #[test]
+    fn invalid_mutation_signatures_do_not_compete_for_the_sqlite_writer() {
+        let fixture = Fixture::new(10, 1024 * 1024);
+        fixture.provision();
+        let stored = fixture.put(3, 4);
+        fixture
+            .service
+            .put(&stored, NOW_MS + 10)
+            .expect("store object before writer contention");
+
+        let blocker =
+            Connection::open(&fixture.service.config.db_path).expect("open competing connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold competing write transaction");
+
+        let wrong_key = IdentityKeyPair::from_bytes(&[11; 32]).expect("wrong authority key");
+        let mut invalid_put = fixture.put(5, 6);
+        invalid_put.sign(&wrong_key);
+        assert!(matches!(
+            fixture.service.put(&invalid_put, NOW_MS + 20),
+            Err(BlindVaultServiceError::Protocol(
+                BlindVaultError::InvalidSignature
+            ))
+        ));
+
+        let mut invalid_delete =
+            BlindVaultDeleteRequest::new([1; 32], [3; 32], [7; 16], NOW_MS + 20);
+        invalid_delete.sign(&wrong_key);
+        assert!(matches!(
+            fixture.service.delete(&invalid_delete, NOW_MS + 20),
+            Err(BlindVaultServiceError::Protocol(
+                BlindVaultError::InvalidSignature
+            ))
+        ));
+
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("release competing write transaction");
     }
 
     #[test]
