@@ -20,6 +20,9 @@
 #   nodes where Git cannot be pulled safely. This supports drain-aware binary
 #   replacement with hash verification, config validation, backup, restart, and
 #   post-restart health checks.
+# - Harden staged-binary promotion with a bounded cold-start health wait,
+#   mapped-running-binary backup, and atomic rollback when restart or health
+#   verification fails.
 # - Add a privacy-safe `relay-probe` command that sends one synthetic opaque
 #   BlindRelay envelope through the local node to a discovered ChatRelay peer
 #   and reports only aggregate counter deltas. The command also reports
@@ -97,6 +100,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.18.0-node-entrypoint - Made staged-binary promotion model-startup-aware and rollback-safe.
 # v1.17.0-node-entrypoint - Added bootstrap snapshot refresh and fleet drift check commands.
 # v1.16.0-node-entrypoint - Added fleet-smoke --two-hop multi-hop relay path proof.
 # v1.15.0-node-entrypoint - Added fleet-smoke public mesh smoke test command.
@@ -129,6 +133,8 @@ DEFAULT_REPO_DIR="/opt/aeronyx/AeroNyx"
 DEFAULT_CONFIG_FILE="/etc/aeronyx/server.toml"
 DEFAULT_SERVICE_NAME="aeronyx-server"
 UPGRADE_STATUS_FILE="/var/lib/aeronyx/upgrade-status.json"
+PROMOTE_HEALTH_RETRIES="${AERONYX_PROMOTE_HEALTH_RETRIES:-90}"
+PROMOTE_HEALTH_DELAY="${AERONYX_PROMOTE_HEALTH_DELAY:-2}"
 
 COMMAND=""
 REPO_DIR="${AERONYX_REPO_DIR:-${DEFAULT_REPO_DIR}}"
@@ -2614,6 +2620,63 @@ sha256_file() {
     die "sha256sum or shasum is required for binary promotion"
 }
 
+validate_promote_health_polling() {
+    case "${PROMOTE_HEALTH_RETRIES}" in
+        ''|*[!0-9]*|0) die "AERONYX_PROMOTE_HEALTH_RETRIES must be a positive integer" ;;
+    esac
+    case "${PROMOTE_HEALTH_DELAY}" in
+        ''|*[!0-9]*|0) die "AERONYX_PROMOTE_HEALTH_DELAY must be a positive integer" ;;
+    esac
+}
+
+promotion_backup_source() {
+    local target_binary="$1"
+    local main_pid
+    main_pid="$(systemctl show "${SERVICE_NAME}" --property=MainPID --value 2>/dev/null || true)"
+    case "${main_pid}" in
+        ''|*[!0-9]*|0)
+            printf '%s\n' "${target_binary}"
+            ;;
+        *)
+            if [ -r "/proc/${main_pid}/exe" ]; then
+                printf '%s\n' "/proc/${main_pid}/exe"
+            else
+                printf '%s\n' "${target_binary}"
+            fi
+            ;;
+    esac
+}
+
+wait_for_promoted_service_health() {
+    local attempt
+    for ((attempt = 1; attempt <= PROMOTE_HEALTH_RETRIES; attempt++)); do
+        if systemctl is-active --quiet "${SERVICE_NAME}" \
+            && curl -fsS --max-time 3 http://127.0.0.1:8421/api/vpn/health >/dev/null 2>&1; then
+            ok "${SERVICE_NAME} health endpoint ready after ${attempt} attempt(s)"
+            return 0
+        fi
+        if [ "${attempt}" -lt "${PROMOTE_HEALTH_RETRIES}" ]; then
+            sleep "${PROMOTE_HEALTH_DELAY}"
+        fi
+    done
+    return 1
+}
+
+rollback_promoted_binary() {
+    local backup="$1"
+    local target_binary="$2"
+    local rollback_target="${target_binary}.rollback.$$"
+
+    warn "Promoted binary failed readiness; restoring the previous running release"
+    systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    install -m 0755 "${backup}" "${rollback_target}"
+    mv -f "${rollback_target}" "${target_binary}"
+    if ! systemctl start "${SERVICE_NAME}"; then
+        return 1
+    fi
+    wait_for_promoted_service_health
+}
+
 confirm_promote_binary() {
     [ "${YES}" -eq 1 ] && return
     [ "${DRY_RUN}" -eq 1 ] && return
@@ -2632,10 +2695,12 @@ CONFIRM
 
 run_promote_binary() {
     validate_service_name
+    validate_promote_health_polling
 
     [ -n "${PROMOTE_BINARY_PATH}" ] || die "promote-binary requires --binary PATH"
     [ -f "${PROMOTE_BINARY_PATH}" ] || die "Staged binary not found: ${PROMOTE_BINARY_PATH}"
     command -v systemctl >/dev/null 2>&1 || die "promote-binary requires systemctl"
+    command -v curl >/dev/null 2>&1 || die "promote-binary requires curl"
 
     local target_binary
     target_binary="${REPO_DIR}/target/release/aeronyx-server"
@@ -2691,22 +2756,30 @@ run_promote_binary() {
         die "Staged binary cannot validate config: ${CONFIG_FILE}"
     fi
 
-    local timestamp backup tmp_target
+    local timestamp backup backup_source tmp_target
     timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
     backup="${target_binary}.bak.${timestamp}.promote"
     tmp_target="${target_binary}.tmp.${timestamp}.promote"
+    backup_source="$(promotion_backup_source "${target_binary}")"
 
-    cp -p "${target_binary}" "${backup}"
+    # [NODE-BINARY-PROMOTION 2026-07-23 by Codex] Cargo may have already
+    # replaced the on-disk path while systemd still runs the previous mapped
+    # executable. Back up the actual live release so rollback is truthful.
+    cp --dereference -p "${backup_source}" "${backup}"
     ok "Backup created: ${backup}"
 
     install -m 0755 "${PROMOTE_BINARY_PATH}" "${tmp_target}"
     mv -f "${tmp_target}" "${target_binary}"
     ok "Promoted staged binary to ${target_binary}"
 
-    log "Restarting ${SERVICE_NAME}"
-    systemctl restart "${SERVICE_NAME}"
-    systemctl is-active "${SERVICE_NAME}" >/dev/null
-    ok "${SERVICE_NAME} restarted"
+    log "Restarting ${SERVICE_NAME}; waiting up to $((PROMOTE_HEALTH_RETRIES * PROMOTE_HEALTH_DELAY)) seconds for cold-start health"
+    if ! systemctl restart "${SERVICE_NAME}" || ! wait_for_promoted_service_health; then
+        if rollback_promoted_binary "${backup}" "${target_binary}"; then
+            die "Promoted binary failed readiness and the previous release was restored."
+        fi
+        die "Promoted binary failed readiness and rollback did not recover ${SERVICE_NAME}."
+    fi
+    ok "${SERVICE_NAME} restarted and passed cold-start health"
 
     show_discovery_readiness
     run_health
