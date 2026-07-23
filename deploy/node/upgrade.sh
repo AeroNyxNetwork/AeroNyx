@@ -12,6 +12,8 @@
 #   running or failed without scraping shell logs.
 # - Inject the current Git commit into release builds so nodeboard can display
 #   exact Rust runtime provenance after source upgrades.
+# - Require the repository-tracked Cargo.lock and build with --locked so an
+#   upgrade cannot silently resolve a different dependency graph.
 # - Add production systemd unit synchronization, rollback, no-restart, and
 #   health polling controls while preserving active-session protection and
 #   validating operator-provided service names.
@@ -87,8 +89,11 @@
 # - Rollback must stop the service and atomically rename a staged executable
 #   into place. Directly copying over a running Linux executable fails with
 #   ETXTBSY and can leave the node without a usable rollback.
+# - Keep Cargo.lock tracked for this binary workspace. Dependency updates must
+#   be reviewed in source control, never resolved ad hoc during node upgrade.
 #
 # Last Modified:
+# v1.15.0-node-deploy - Requires the tracked Cargo.lock dependency graph for release builds.
 # v1.14.0-node-deploy - Hardened model-aware restart readiness, running-image
 #                       backup, and atomic binary rollback after a reproduced
 #                       ETXTBSY failure on US1.
@@ -445,11 +450,15 @@ build_release() {
 
     log "Building release binary"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s cargo build -p aeronyx-server --release\n' "${REPO_DIR}" "${build_git_commit}"
+        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s cargo build --locked -p aeronyx-server --release\n' "${REPO_DIR}" "${build_git_commit}"
     else
+        # [REPRODUCIBLE-RUST-BUILD 2026-07-23 by Codex] Fail before Cargo can
+        # resolve or update dependencies outside the reviewed release graph.
+        [ -f "${REPO_DIR}/Cargo.lock" ] \
+            || die "Tracked Cargo.lock is required for reproducible node upgrades."
         (
             cd "${REPO_DIR}"
-            AERONYX_GIT_COMMIT="${build_git_commit}" cargo build -p aeronyx-server --release
+            AERONYX_GIT_COMMIT="${build_git_commit}" cargo build --locked -p aeronyx-server --release
         )
     fi
 }

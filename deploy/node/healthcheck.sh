@@ -34,9 +34,12 @@
 # - Align default/fallback VPN pool with the commercial 1000-session profile.
 # - Auto-detect the live systemd repository path when operators run the script
 #   from a non-standard checkout without passing --repo-dir.
+# - Verify that the binary workspace has a repository-tracked Cargo.lock so
+#   operators can distinguish reproducible releases from ad hoc dependency
+#   resolution.
 #
 # Main Functionality:
-# - Checks repository, binary, config, registration state, systemd status,
+# - Checks repository, tracked Cargo.lock, binary, config, registration state, systemd status,
 #   host capacity, IP forwarding, NAT runtime/persistence, local VPN health
 #   endpoint, release-backup retention, and capacity telemetry.
 # - Records commercial capacity risk as structured checks and JSON.
@@ -66,8 +69,11 @@
 # - Explicit --repo-dir must always override systemd auto-detection.
 # - Keep VPN network diagnostics aligned with vpn.virtual_ip_range and
 #   tun.device_name from the installed config.
+# - Treat an absent or untracked Cargo.lock as a release-health failure. This is
+#   a binary workspace; dependency changes must be code-reviewed.
 #
 # Last Modified:
+# v1.21.0-node-deploy - Added the tracked Cargo.lock reproducible-build gate.
 # v1.20.0-node-deploy - Keep healthcheck JSON output alive when optional network restore unit is absent.
 # v1.19.0-node-deploy - Added discovery readiness JSON for ChatRelay/quorum.
 # v1.18.0-node-deploy - Added operator_action JSON summary for nodeboard.
@@ -399,6 +405,19 @@ check_host_capacity() {
 
 check_repo_and_binary() {
     check_file "${REPO_DIR}/Cargo.toml" "repository Cargo.toml"
+    check_file "${REPO_DIR}/Cargo.lock" "repository Cargo.lock"
+    if command -v git >/dev/null 2>&1 \
+        && git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        # [REPRODUCIBLE-RUST-BUILD 2026-07-23 by Codex] Existence alone is not
+        # enough: an operator-local generated lockfile is not release evidence.
+        if git -C "${REPO_DIR}" ls-files --error-unmatch -- Cargo.lock >/dev/null 2>&1; then
+            pass "repository Cargo.lock is tracked"
+        else
+            fail "repository Cargo.lock is not tracked; release dependencies are not reproducible"
+        fi
+    else
+        warn "repository Cargo.lock tracking check skipped; Git metadata unavailable"
+    fi
     check_file "${REPO_DIR}/target/release/aeronyx-server" "release binary"
     check_file "${CONFIG_FILE}" "config"
     check_file "/etc/aeronyx/node_info.json" "node registration"

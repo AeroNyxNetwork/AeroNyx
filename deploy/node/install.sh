@@ -25,6 +25,8 @@
 #   archaeology.
 # - Inject the current Git commit into release builds so nodeboard can display
 #   exact Rust runtime provenance after install or upgrade.
+# - Require the repository-tracked Cargo.lock and build with --locked so fresh
+#   nodes cannot resolve a dependency graph different from the audited release.
 # - Remove stale AeroNyx 100.64.0.0/* NAT rules during network refresh so
 #   commercial pool migrations, such as /24 to /22, do not leave overlapping
 #   MASQUERADE rules in the persisted iptables set.
@@ -67,7 +69,7 @@
 # - Clones or uses the AeroNyx repository.
 # - Creates /etc/aeronyx and /var/lib/aeronyx state directories.
 # - Installs a safe default server.toml without overwriting existing config.
-# - Builds aeronyx-server release binary.
+# - Builds the aeronyx-server release binary from the pinned Cargo.lock graph.
 # - Verifies, installs, and enables the systemd service.
 # - Optionally configures IP forwarding/NAT and registers/starts the node.
 # - Persists VPN forwarding/NAT across host reboots.
@@ -108,8 +110,11 @@
 # - Keep --set-vpn-cidr restricted to --network-only. Changing the persisted
 #   pool is safe without restart, but Rust/TUN capacity only changes after a
 #   separate maintenance-window service restart.
+# - Keep Cargo.lock tracked for this binary workspace. Do not remove --locked
+#   from production builds or regenerate the lockfile during node deployment.
 #
 # Last Modified:
+# v1.25.0-node-deploy - Requires the tracked Cargo.lock dependency graph for release builds.
 # v1.24.0-node-deploy - Keeps --print-plan free of remote progress reporting
 #                       side effects and warning noise.
 # v1.23.0-node-deploy - Adds structured install report context for nodeboard.
@@ -1126,11 +1131,15 @@ build_binary() {
     build_git_commit="$(resolve_build_git_commit)"
     log "Building aeronyx-server release binary"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s cargo build -p aeronyx-server --release\n' "${REPO_DIR}" "${build_git_commit}"
+        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s cargo build --locked -p aeronyx-server --release\n' "${REPO_DIR}" "${build_git_commit}"
     else
+        # [REPRODUCIBLE-RUST-BUILD 2026-07-23 by Codex] AeroNyx ships binaries,
+        # so every production node must compile the repository-reviewed graph.
+        [ -f "${REPO_DIR}/Cargo.lock" ] \
+            || die "Tracked Cargo.lock is required for reproducible node builds."
         (
             cd "${REPO_DIR}"
-            AERONYX_GIT_COMMIT="${build_git_commit}" cargo build -p aeronyx-server --release
+            AERONYX_GIT_COMMIT="${build_git_commit}" cargo build --locked -p aeronyx-server --release
         )
     fi
 }
