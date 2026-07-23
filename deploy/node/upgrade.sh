@@ -25,6 +25,10 @@
 #   repairs.
 # - Refuse source upgrades from a tracked-dirty Git worktree unless the
 #   operator explicitly opts in.
+# - [NODE-UPGRADE-ROLLBACK 2026-07-23 by Codex] Wait for model-backed MemChain
+#   cold starts before declaring a restart
+#   unhealthy, preserve the actual running executable when the on-disk binary
+#   was already replaced, and perform rollback replacement atomically.
 #
 # Main Functionality:
 # - Pulls the configured branch.
@@ -39,6 +43,8 @@
 # - Restarts systemd service and verifies post-upgrade health.
 # - Restores the previous systemd unit and binary if restart or health
 #   verification fails.
+# - Backs up the executable currently mapped by systemd so an earlier staged
+#   build cannot silently replace the real rollback artifact.
 # - Prunes old release backups after a successful upgrade.
 # - Writes /var/lib/aeronyx/upgrade-status.json with stage/status/message
 #   metadata only; never writes registration codes, private keys, client IPs,
@@ -75,8 +81,17 @@
 #   directories can remain untracked on production nodes.
 # - Keep upgrade-status.json privacy-safe. It is an operator progress file, not
 #   a support log and not a traffic/debug dump.
+# - Keep the default health window long enough for local Embedding/NER models
+#   and startup ledger audits. Do not shorten it to a generic web-server
+#   timeout.
+# - Rollback must stop the service and atomically rename a staged executable
+#   into place. Directly copying over a running Linux executable fails with
+#   ETXTBSY and can leave the node without a usable rollback.
 #
 # Last Modified:
+# v1.14.0-node-deploy - Hardened model-aware restart readiness, running-image
+#                       backup, and atomic binary rollback after a reproduced
+#                       ETXTBSY failure on US1.
 # v1.13.0-node-deploy - Added privacy-safe local upgrade status snapshots for
 #                       nodeboard/healthcheck/operator automation.
 # v1.12.0-node-deploy - Injects AERONYX_GIT_COMMIT into release builds for
@@ -131,7 +146,7 @@ SERVICE_UNIT_ONLY=0
 ALLOW_DIRTY=0
 NO_RESTART=0
 KEEP_RELEASES=10
-HEALTH_RETRIES=10
+HEALTH_RETRIES=90
 HEALTH_DELAY=2
 BACKUP_BINARY=""
 BACKUP_SERVICE_FILE=""
@@ -172,7 +187,7 @@ Options:
                       Only sync aeronyx-network-restore.service; no pull/build/restart.
   --allow-dirty      Allow source upgrade when tracked Git files are modified.
   --keep-releases N   Keep latest N binary/unit backups after success. Default: 10
-  --health-retries N  Health polling attempts after restart. Default: 10
+  --health-retries N  Health polling attempts after restart. Default: 90
   --health-delay N    Seconds between health polling attempts. Default: 2
   --dry-run           Print actions without changing the host.
   -h, --help          Show this help.
@@ -294,6 +309,13 @@ validate_keep_releases() {
         || die "--keep-releases must be a positive integer."
 }
 
+validate_health_polling() {
+    printf '%s' "${HEALTH_RETRIES}" | grep -Eq '^[1-9][0-9]*$' \
+        || die "--health-retries must be a positive integer."
+    printf '%s' "${HEALTH_DELAY}" | grep -Eq '^[1-9][0-9]*$' \
+        || die "--health-delay must be a positive integer."
+}
+
 validate_option_combinations() {
     if [ "${SERVICE_UNIT_ONLY}" -eq 1 ] && [ "${NETWORK_RESTORE_ONLY}" -eq 1 ]; then
         die "--service-unit-only and --network-restore-only are mutually exclusive."
@@ -381,14 +403,26 @@ ensure_tracked_worktree_clean() {
 }
 
 backup_current_binary() {
-    local binary stamp
+    local backup_source binary main_pid running_executable stamp
     binary="${REPO_DIR}/target/release/aeronyx-server"
     [ -f "${binary}" ] || return
+
+    backup_source="${binary}"
+    if [ "${DRY_RUN}" -eq 0 ]; then
+        main_pid="$(systemctl show "${SERVICE_NAME}" --property=MainPID --value 2>/dev/null || true)"
+        if printf '%s' "${main_pid}" | grep -Eq '^[1-9][0-9]*$'; then
+            running_executable="/proc/${main_pid}/exe"
+            if [ -r "${running_executable}" ] && ! cmp -s "${running_executable}" "${binary}"; then
+                backup_source="${running_executable}"
+                warn "On-disk binary differs from the running process; backing up the mapped executable."
+            fi
+        fi
+    fi
 
     stamp="$(date -u +%Y%m%d_%H%M%S)"
     BACKUP_BINARY="${RELEASE_DIR}/aeronyx-server.${stamp}"
     run mkdir -p "${RELEASE_DIR}"
-    run cp "${binary}" "${BACKUP_BINARY}"
+    run cp --dereference "${backup_source}" "${BACKUP_BINARY}"
     ok "Current binary backed up to ${BACKUP_BINARY}"
 }
 
@@ -591,10 +625,12 @@ health_endpoint_ok() {
 }
 
 wait_for_health() {
-    local attempt
+    local attempt max_wait_seconds
+    max_wait_seconds=$((HEALTH_RETRIES * HEALTH_DELAY))
 
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] poll http://127.0.0.1:8421/api/vpn/health up to %s times\n' "${HEALTH_RETRIES}"
+        printf '[DRY-RUN] poll http://127.0.0.1:8421/api/vpn/health up to %s times (%ss)\n' \
+            "${HEALTH_RETRIES}" "${max_wait_seconds}"
         return 0
     fi
 
@@ -613,8 +649,9 @@ wait_for_health() {
 }
 
 rollback_binary() {
-    local binary
+    local binary rollback_staging
     binary="${REPO_DIR}/target/release/aeronyx-server"
+    rollback_staging="${binary}.rollback.$$"
 
     if [ -z "${BACKUP_BINARY}" ]; then
         warn "Rollback skipped; no backup binary path recorded."
@@ -626,12 +663,18 @@ rollback_binary() {
     fi
 
     warn "Rolling back to previous binary: ${BACKUP_BINARY}"
+    run systemctl stop "${SERVICE_NAME}"
     rollback_service_unit
     rollback_network_restore_unit
-    run cp "${BACKUP_BINARY}" "${binary}"
+    run install -m 0755 "${BACKUP_BINARY}" "${rollback_staging}"
+    run mv -f "${rollback_staging}" "${binary}"
     run systemctl daemon-reload
     run systemctl restart "${SERVICE_NAME}"
     run systemctl is-active "${SERVICE_NAME}"
+    if ! wait_for_health; then
+        warn "Rollback service started but did not become healthy within the configured window."
+        return 1
+    fi
 }
 
 restart_service() {
@@ -721,6 +764,7 @@ prune_release_backups() {
 main() {
     validate_service_name
     validate_keep_releases
+    validate_health_polling
     validate_option_combinations
     require_root
     trap 'handle_upgrade_error $?' ERR
