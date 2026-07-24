@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.16.0-DirectoryMirrorCarrierCapability - Added a fail-closed staged
+//! advertisement gate for signed Directory Mirror carrier capability
 //! v0.15.0-FullNodeMirror - Added opt-in bounded non-authoritative Directory mirrors
 //! v0.14.0-DirectoryWitnessThreshold — Added a bounded independent checkpoint corroboration threshold
 //! v0.13.0-DirectorySyncPins — Added fail-closed Directory Sync peer admission pins
@@ -169,6 +171,14 @@ pub struct DiscoveryConfig {
     /// This remains disabled by default for backward compatibility.
     #[serde(default)]
     pub directory_full_node_mirror_enabled: bool,
+    /// Publishes the signed `DirectoryMirrorCarrier` descriptor capability.
+    ///
+    /// [MIRROR-CAPABILITY 2026-07-24 by Codex] This staged rollout gate stays
+    /// disabled by default because older binaries cannot decode a newly
+    /// appended capability enum variant. Enable it only after the peer fleet
+    /// has upgraded, and only on a public, routeable Full-node Mirror.
+    #[serde(default)]
+    pub advertise_directory_mirror_carrier: bool,
     /// Maximum distinct permissionless producer namespaces retained as mirrors.
     ///
     /// The durable admission registry enforces this ceiling before importing a
@@ -557,6 +567,39 @@ impl DiscoveryConfig {
                 "requires discovery.directory_chain_path",
             ));
         }
+        if self.advertise_directory_mirror_carrier {
+            if !self.enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.advertise_directory_mirror_carrier",
+                    "requires discovery.enabled = true",
+                ));
+            }
+            if !self.directory_full_node_mirror_enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.advertise_directory_mirror_carrier",
+                    "requires discovery.directory_full_node_mirror_enabled = true",
+                ));
+            }
+            if !self.public_discovery {
+                return Err(ServerError::config_invalid(
+                    "discovery.advertise_directory_mirror_carrier",
+                    "requires discovery.public_discovery = true",
+                ));
+            }
+            if self.public_api_listen_addr.is_none()
+                || self
+                    .public_endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::is_empty)
+                    .unwrap_or(true)
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.advertise_directory_mirror_carrier",
+                    "requires discovery.public_api_listen_addr and discovery.public_endpoint",
+                ));
+            }
+        }
 
         if !self.verified_delivery_witness_node_ids.is_empty()
             || self.verified_delivery_witness_required_for_restore
@@ -875,6 +918,7 @@ impl Default for DiscoveryConfig {
             directory_chain_sync_peer_node_ids: Vec::new(),
             directory_chain_sync_interval_secs: Self::default_directory_chain_sync_interval_secs(),
             directory_full_node_mirror_enabled: false,
+            advertise_directory_mirror_carrier: false,
             directory_full_node_mirror_max_producers:
                 Self::default_directory_full_node_mirror_max_producers(),
             directory_observation_witness_min_verified:
@@ -1155,6 +1199,7 @@ mod tests {
             DiscoveryConfig::default_directory_chain_sync_interval_secs()
         );
         assert!(!config.discovery.directory_full_node_mirror_enabled);
+        assert!(!config.discovery.advertise_directory_mirror_carrier);
         assert_eq!(
             config.discovery.directory_full_node_mirror_max_producers,
             DiscoveryConfig::default_directory_full_node_mirror_max_producers()
@@ -1311,6 +1356,7 @@ directory_chain_sync_peer_node_ids = [
 ]
 directory_chain_sync_interval_secs = 180
 directory_full_node_mirror_enabled = true
+advertise_directory_mirror_carrier = false
 directory_full_node_mirror_max_producers = 24
 directory_observation_witness_min_verified = 1
 peer_cache_write_interval_secs = 120
@@ -1365,6 +1411,7 @@ advertise_onion_middle = true
         );
         assert_eq!(config.discovery.directory_chain_sync_interval_secs, 180);
         assert!(config.discovery.directory_full_node_mirror_enabled);
+        assert!(!config.discovery.advertise_directory_mirror_carrier);
         assert_eq!(
             config.discovery.directory_full_node_mirror_max_producers,
             24
@@ -1629,6 +1676,49 @@ enabled = true
 directory_full_node_mirror_enabled = true
 "#;
         assert!(ServerConfig::from_str(mirror_without_store).is_err());
+
+        let valid_carrier_advertisement = r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+directory_full_node_mirror_enabled = true
+advertise_directory_mirror_carrier = true
+public_discovery = true
+public_endpoint = "https://node.example.com"
+public_api_listen_addr = "0.0.0.0:8422"
+"#;
+        let config = ServerConfig::from_str(valid_carrier_advertisement).unwrap();
+        assert!(config.discovery.advertise_directory_mirror_carrier);
+
+        // [MIRROR-CAPABILITY 2026-07-24 by Codex] Never publish a signed
+        // capability for a disabled/private/unreachable carrier role.
+        for invalid_carrier_advertisement in [
+            r#"
+[discovery]
+enabled = true
+advertise_directory_mirror_carrier = true
+"#,
+            r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+directory_full_node_mirror_enabled = true
+advertise_directory_mirror_carrier = true
+public_discovery = false
+public_endpoint = "https://node.example.com"
+public_api_listen_addr = "0.0.0.0:8422"
+"#,
+            r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+directory_full_node_mirror_enabled = true
+advertise_directory_mirror_carrier = true
+public_discovery = true
+"#,
+        ] {
+            assert!(ServerConfig::from_str(invalid_carrier_advertisement).is_err());
+        }
 
         for invalid_capacity in [0, 65] {
             let mirror_capacity = format!(

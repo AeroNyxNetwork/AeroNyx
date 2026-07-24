@@ -127,6 +127,11 @@ directory_chain_sync_interval_secs = 120
 # contributes to checkpoints/witness thresholds, or establishes finality.
 # Disabled by default. Requires directory_chain_path when enabled.
 directory_full_node_mirror_enabled = false
+# [MIRROR-CAPABILITY 2026-07-24 by Codex] Staged signed capability rollout.
+# Keep false until every discovery peer has upgraded to a decoder that knows
+# DirectoryMirrorCarrier. Enabling requires Mirror Mode, public discovery, a
+# public endpoint, and the public discovery API listener.
+advertise_directory_mirror_carrier = false
 # Durable mirror namespace ceiling (1-64). Existing operator-pinned producers
 # do not consume this capacity. No automatic eviction is performed in V1.
 directory_full_node_mirror_max_producers = 32

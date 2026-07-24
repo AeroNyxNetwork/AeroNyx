@@ -41,6 +41,8 @@
 //!   without exposing producers, carriers, endpoints, or selected paths.
 //! - Reports aggregate routeable carrier and signed-region-hint diversity
 //!   counts while explicitly rejecting operator/ASN diversity claims.
+//! - Separates signed carrier capability evidence from unadvertised
+//!   compatibility fallback so absence is never misreported as support.
 //! - Distinguishes mirror convergence, bounded catch-up progress, and failures
 //!   so one accepted page cannot be misreported as a fully healthy replica.
 //!
@@ -93,6 +95,8 @@
 //! - Recovery telemetry is aggregate transport health, never carrier reputation.
 //!
 //! ## Last Modified
+//! `v0.20.0-SignedMirrorCarrierStatus` - Separated authenticated capability
+//! advertisements from unadvertised compatibility fallback counts and policy.
 //! `v0.19.0-MirrorSourceDiversityStatus` - Added aggregate routeability and
 //! signed-region-hint selection observations with an explicit trust limitation.
 //! `v0.18.0-MirrorBoundedCatchUpStatus` - Added truthful converged/catching-up
@@ -333,9 +337,13 @@ struct DirectoryFullNodeMirrorStatus {
     recovery_failed: u64,
     last_recovery_carrier_candidates: u64,
     last_recovery_routeable_carrier_candidates: u64,
+    last_recovery_explicit_capability_candidates: u64,
+    last_recovery_unadvertised_compatibility_candidates: u64,
     last_recovery_capability_cached_unavailable: u64,
     last_recovery_carriers_selected: u64,
     last_recovery_routeable_carriers_selected: u64,
+    last_recovery_explicit_capability_selected: u64,
+    last_recovery_unadvertised_compatibility_selected: u64,
     last_recovery_selected_region_hints: u64,
     last_recovery_distinct_region_hints: u64,
     last_round_age_seconds: Option<u64>,
@@ -346,6 +354,7 @@ struct DirectoryFullNodeMirrorStatus {
     last_recovery_failure_age_seconds: Option<u64>,
     selection_policy: &'static str,
     carrier_selection_policy: &'static str,
+    capability_rollout_policy: &'static str,
     diversity_limit: &'static str,
     transport_policy: &'static str,
     authority_boundary: &'static str,
@@ -1394,11 +1403,19 @@ fn build_full_node_mirror_status(
         last_recovery_carrier_candidates: runtime.last_recovery_carrier_candidates,
         last_recovery_routeable_carrier_candidates: runtime
             .last_recovery_routeable_carrier_candidates,
+        last_recovery_explicit_capability_candidates: runtime
+            .last_recovery_explicit_capability_candidates,
+        last_recovery_unadvertised_compatibility_candidates: runtime
+            .last_recovery_unadvertised_compatibility_candidates,
         last_recovery_capability_cached_unavailable: runtime
             .last_recovery_capability_cached_unavailable,
         last_recovery_carriers_selected: runtime.last_recovery_carriers_selected,
         last_recovery_routeable_carriers_selected: runtime
             .last_recovery_routeable_carriers_selected,
+        last_recovery_explicit_capability_selected: runtime
+            .last_recovery_explicit_capability_selected,
+        last_recovery_unadvertised_compatibility_selected: runtime
+            .last_recovery_unadvertised_compatibility_selected,
         last_recovery_selected_region_hints: runtime.last_recovery_selected_region_hints,
         last_recovery_distinct_region_hints: runtime.last_recovery_distinct_region_hints,
         last_round_age_seconds: runtime
@@ -1422,7 +1439,9 @@ fn build_full_node_mirror_status(
         selection_policy:
             "valid_public_signed_descriptors_excluding_self_and_operator_pins_non_quarantined_routeable_and_fresh_first_rotating_bounded_window",
         carrier_selection_policy:
-            "descriptor_sequence_scoped_capability_filter_then_local_routeability_freshness_rotation_and_same_tier_signed_region_hint_diversity",
+            "descriptor_sequence_scoped_negative_filter_then_local_routeability_signed_directory_mirror_capability_freshness_rotation_and_same_tier_signed_region_hint_diversity",
+        capability_rollout_policy:
+            "explicit_signed_capability_is_reported_separately;_unadvertised_descriptors_remain_discoverable_as_compatibility_fallback_but_are_never_classified_as_capability_supporting_or_assumed_to_be_old",
         diversity_limit:
             "signed_region_hints_are_untrusted_availability_metadata_not_operator_asn_jurisdiction_or_sybil_resistance_proof",
         transport_policy:
@@ -1430,7 +1449,7 @@ fn build_full_node_mirror_status(
         authority_boundary:
             "operator_pins_only_for_checkpoints_witnesses_and_policy_anchors",
         privacy_boundary:
-            "aggregate mirror counts ages routeability capability-skips and signed-region-hint cardinality only; no identities descriptor-sequences endpoints regions routes payloads or client metadata",
+            "aggregate mirror counts ages routeability signed-capability unadvertised-fallback capability-skips and signed-region-hint cardinality only; no identities descriptor-sequences endpoints regions routes payloads or client metadata",
         security_model:
             "untrusted_verified_replica_transport_not_authority_consensus_fork_choice_voting_or_finality",
     }
@@ -2060,9 +2079,13 @@ mod tests {
             requests_sent: 7,
             last_recovery_carrier_candidates: 4,
             last_recovery_routeable_carrier_candidates: 3,
+            last_recovery_explicit_capability_candidates: 2,
+            last_recovery_unadvertised_compatibility_candidates: 2,
             last_recovery_capability_cached_unavailable: 1,
             last_recovery_carriers_selected: 2,
             last_recovery_routeable_carriers_selected: 2,
+            last_recovery_explicit_capability_selected: 2,
+            last_recovery_unadvertised_compatibility_selected: 0,
             last_recovery_selected_region_hints: 2,
             last_recovery_distinct_region_hints: 2,
             last_round_at: Some(90),
@@ -2077,14 +2100,27 @@ mod tests {
         assert_eq!(status.last_round_requests_sent, 7);
         assert_eq!(status.last_recovery_carrier_candidates, 4);
         assert_eq!(status.last_recovery_routeable_carrier_candidates, 3);
+        assert_eq!(status.last_recovery_explicit_capability_candidates, 2);
+        assert_eq!(
+            status.last_recovery_unadvertised_compatibility_candidates,
+            2
+        );
         assert_eq!(status.last_recovery_capability_cached_unavailable, 1);
         assert_eq!(status.last_recovery_carriers_selected, 2);
         assert_eq!(status.last_recovery_routeable_carriers_selected, 2);
+        assert_eq!(status.last_recovery_explicit_capability_selected, 2);
+        assert_eq!(
+            status.last_recovery_unadvertised_compatibility_selected,
+            0
+        );
         assert_eq!(status.last_recovery_selected_region_hints, 2);
         assert_eq!(status.last_recovery_distinct_region_hints, 2);
         assert!(status
             .diversity_limit
             .contains("not_operator_asn_jurisdiction_or_sybil_resistance_proof"));
+        assert!(status
+            .capability_rollout_policy
+            .contains("unadvertised_descriptors_remain_discoverable"));
 
         let degraded = DirectoryFullNodeMirrorRuntimeSnapshot {
             last_round_failed: 1,

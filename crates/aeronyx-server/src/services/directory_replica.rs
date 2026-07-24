@@ -139,6 +139,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.22.0-SignedMirrorCarrierTelemetry - Separated signed carrier capability
+//! evidence from unadvertised compatibility fallback
 //! v0.21.0-MirrorSourceDiversityTelemetry - Added privacy-safe aggregate
 //! routeability and signed-region-hint carrier selection observations
 //! v0.20.1-MirrorCarrierRangeAvailability - Added a typed unavailable-range
@@ -1041,6 +1043,14 @@ pub struct DirectoryFullNodeMirrorRuntimeSnapshot {
     pub last_recovery_carrier_candidates: u64,
     /// Latest candidates with fresh local routeability evidence.
     pub last_recovery_routeable_carrier_candidates: u64,
+    /// Latest candidates with a signed Directory Mirror carrier capability.
+    pub last_recovery_explicit_capability_candidates: u64,
+    /// Latest candidates retained only as unadvertised compatibility fallback.
+    ///
+    /// These peers may be old or may have deliberately opted out. They remain
+    /// discoverable but are never classified as capability supporting until a
+    /// signed descriptor explicitly says so.
+    pub last_recovery_unadvertised_compatibility_candidates: u64,
     /// Latest valid carriers skipped for the exact signed descriptor sequence
     /// after an explicit optional replica-endpoint absence response.
     pub last_recovery_capability_cached_unavailable: u64,
@@ -1048,6 +1058,10 @@ pub struct DirectoryFullNodeMirrorRuntimeSnapshot {
     pub last_recovery_carriers_selected: u64,
     /// Latest selected carriers with fresh local routeability evidence.
     pub last_recovery_routeable_carriers_selected: u64,
+    /// Latest selected carriers with explicit signed capability.
+    pub last_recovery_explicit_capability_selected: u64,
+    /// Latest selected unadvertised compatibility fallbacks.
+    pub last_recovery_unadvertised_compatibility_selected: u64,
     /// Latest selected carriers that supplied a non-empty signed region hint.
     pub last_recovery_selected_region_hints: u64,
     /// Distinct signed region hints in the latest bounded selection.
@@ -1376,21 +1390,39 @@ impl DirectoryReplicaSyncRuntime {
         &self,
         candidates: u64,
         routeable_candidates: u64,
+        explicit_capability_candidates: u64,
+        unadvertised_compatibility_candidates: u64,
         capability_cached_unavailable: u64,
         selected: u64,
         selected_routeable: u64,
+        selected_explicit_capability: u64,
+        selected_unadvertised_compatibility: u64,
         selected_region_hints: u64,
         distinct_region_hints: u64,
     ) {
         let mut snapshot = self.full_node_mirror.lock();
         snapshot.last_recovery_carrier_candidates = candidates;
         snapshot.last_recovery_routeable_carrier_candidates = routeable_candidates.min(candidates);
+        snapshot.last_recovery_explicit_capability_candidates =
+            explicit_capability_candidates.min(candidates);
+        snapshot.last_recovery_unadvertised_compatibility_candidates =
+            unadvertised_compatibility_candidates.min(candidates.saturating_sub(
+                snapshot.last_recovery_explicit_capability_candidates,
+            ));
         snapshot.last_recovery_capability_cached_unavailable =
             capability_cached_unavailable.min(candidates);
         snapshot.last_recovery_carriers_selected = selected.min(candidates);
         snapshot.last_recovery_routeable_carriers_selected = selected_routeable
             .min(snapshot.last_recovery_carriers_selected)
             .min(snapshot.last_recovery_routeable_carrier_candidates);
+        snapshot.last_recovery_explicit_capability_selected =
+            selected_explicit_capability.min(snapshot.last_recovery_carriers_selected);
+        snapshot.last_recovery_unadvertised_compatibility_selected =
+            selected_unadvertised_compatibility.min(
+                snapshot
+                    .last_recovery_carriers_selected
+                    .saturating_sub(snapshot.last_recovery_explicit_capability_selected),
+            );
         snapshot.last_recovery_selected_region_hints =
             selected_region_hints.min(snapshot.last_recovery_carriers_selected);
         snapshot.last_recovery_distinct_region_hints =
@@ -8491,7 +8523,7 @@ mod tests {
         // [MIRROR-CATCHUP 2026-07-24 by Codex] One producer converges, one
         // advances under the bounded budget, and one fails after prior pages.
         runtime.record_full_node_mirror_catch_up_round(5, 3, 1, 1, 1, 7, 11, NOW + 1);
-        runtime.record_full_node_mirror_carrier_selection(5, 4, 1, 2, 2, 2, 2);
+        runtime.record_full_node_mirror_carrier_selection(5, 4, 3, 2, 1, 2, 2, 2, 0, 2, 2);
         runtime.record_full_node_mirror_recovery(true, NOW + 2);
         runtime.record_full_node_mirror_recovery(false, NOW + 3);
 
@@ -8511,9 +8543,19 @@ mod tests {
         assert_eq!(snapshot.recovery_failed, 1);
         assert_eq!(snapshot.last_recovery_carrier_candidates, 5);
         assert_eq!(snapshot.last_recovery_routeable_carrier_candidates, 4);
+        assert_eq!(snapshot.last_recovery_explicit_capability_candidates, 3);
+        assert_eq!(
+            snapshot.last_recovery_unadvertised_compatibility_candidates,
+            2
+        );
         assert_eq!(snapshot.last_recovery_capability_cached_unavailable, 1);
         assert_eq!(snapshot.last_recovery_carriers_selected, 2);
         assert_eq!(snapshot.last_recovery_routeable_carriers_selected, 2);
+        assert_eq!(snapshot.last_recovery_explicit_capability_selected, 2);
+        assert_eq!(
+            snapshot.last_recovery_unadvertised_compatibility_selected,
+            0
+        );
         assert_eq!(snapshot.last_recovery_selected_region_hints, 2);
         assert_eq!(snapshot.last_recovery_distinct_region_hints, 2);
         assert_eq!(snapshot.last_recovery_attempt_at, Some(NOW + 3));

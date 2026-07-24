@@ -305,6 +305,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.35-DirectoryMirrorCarrierCapability - Added rollout-gated signed
+//     self-advertisement for audited non-authoritative replica carriers
 //   v1.0.0-BlindVaultService - Fail-closed initialization and bounded cleanup
 //     for the independent anonymous encrypted-object store
 //   v2.8.34-DirectoryPolicyHeadAnchor - Anchored opaque witness-policy heads at
@@ -7536,6 +7538,19 @@ impl Server {
         if config.discovery.advertise_onion_middle && advertises_peer_api {
             capabilities.push(NodeCapability::OnionMiddle);
         }
+        // [MIRROR-CAPABILITY 2026-07-24 by Codex] This capability is an
+        // operator-controlled staged rollout because pre-upgrade binaries
+        // cannot decode the appended enum variant. Re-check every runtime
+        // prerequisite here even though parsed configuration validates them,
+        // since tests and embedders may construct ServerConfig directly.
+        if config.discovery.advertise_directory_mirror_carrier
+            && config.discovery.directory_full_node_mirror_enabled
+            && config.discovery.directory_chain_path.is_some()
+            && config.discovery.public_discovery
+            && advertises_peer_api
+        {
+            capabilities.push(NodeCapability::DirectoryMirrorCarrier);
+        }
         if config.memchain.is_enabled() {
             capabilities.push(NodeCapability::EncryptedStorage);
         }
@@ -10577,6 +10592,58 @@ mod tests {
             .descriptor
             .capabilities
             .contains(&NodeCapability::PrivacyRelay));
+    }
+
+    #[test]
+    fn directory_mirror_carrier_capability_is_rollout_gated_and_runtime_honest() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.discovery.public_discovery = true;
+        config.discovery.directory_chain_path =
+            Some("/var/lib/aeronyx/directory-chain.db".to_string());
+        config.discovery.directory_full_node_mirror_enabled = true;
+
+        // [MIRROR-CAPABILITY 2026-07-24 by Codex] A compatible binary must not
+        // change its wire advertisement until the operator completes the
+        // mixed-version decoder rollout.
+        let identity = IdentityKeyPair::generate();
+        let staged = Server::build_self_discovery_descriptor_for(
+            &config,
+            &identity,
+            1_800_000_000,
+        )
+        .unwrap();
+        assert!(!staged
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::DirectoryMirrorCarrier));
+
+        config.discovery.advertise_directory_mirror_carrier = true;
+        let advertised = Server::build_self_discovery_descriptor_for(
+            &config,
+            &identity,
+            1_800_000_001,
+        )
+        .unwrap();
+        assert!(advertised
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::DirectoryMirrorCarrier));
+        assert!(advertised.verify_at(1_800_000_002).is_ok());
+
+        config.discovery.public_discovery = false;
+        let private = Server::build_self_discovery_descriptor_for(
+            &config,
+            &identity,
+            1_800_000_002,
+        )
+        .unwrap();
+        assert!(!private
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::DirectoryMirrorCarrier));
     }
 
     #[test]

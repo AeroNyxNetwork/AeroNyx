@@ -44,6 +44,9 @@
 //!   recovery without adding any mirror or carrier to authority checkpoints.
 //! - Prioritizes fresh routeable recovery carriers and uses signed region hints
 //!   only as a best-effort same-tier fault-domain diversity signal.
+//! - Prefers an explicit signed Directory Mirror carrier capability while
+//!   retaining separately measured unadvertised compatibility fallback during
+//!   staged fleet rollout.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -104,6 +107,8 @@
 //!   carrier while serving a recovery request.
 //!
 //! ## Last Modified
+//! `v0.19.0-SignedMirrorCarrierSelection` - Preferred signed carrier
+//! advertisements and separated unadvertised compatibility fallback telemetry.
 //! `v0.18.0-MirrorCarrierCapabilityMemory` - Added bounded descriptor-sequence-scoped
 //! negative capability memory for recovery carriers.
 //! `v0.17.0-MirrorSourceDiversity` - Added routeability/freshness-aware carrier
@@ -157,7 +162,7 @@ use aeronyx_core::protocol::discovery::{
     directory_replica_descriptor_objects_request_signing_bytes,
     directory_replica_descriptor_objects_response_signing_bytes, encode_directory_sync_message,
     DirectoryCommitmentBlockV1, DirectoryObservationCheckpointV1, DirectorySyncMessage,
-    SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+    NodeCapability, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
     DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
     DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
     DIRECTORY_POLICY_ANCHOR_CONFLICT_V1, DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1,
@@ -272,6 +277,7 @@ struct DirectoryMirrorPullFailure {
 struct DirectoryMirrorRecoveryCarrierCandidate {
     node_id: [u8; 32],
     descriptor_sequence: u64,
+    explicitly_advertised: bool,
     routeable: bool,
     freshness_rank: u8,
     rotation_rank: usize,
@@ -279,8 +285,15 @@ struct DirectoryMirrorRecoveryCarrierCandidate {
 }
 
 impl DirectoryMirrorRecoveryCarrierCandidate {
-    const fn availability_tier(&self) -> (u8, u8) {
-        ((!self.routeable) as u8, self.freshness_rank)
+    const fn availability_tier(&self) -> (u8, u8, u8) {
+        // [MIRROR-CAPABILITY 2026-07-24 by Codex] Local reachability remains
+        // stronger than self-reported metadata. Within the same reachability
+        // tier, an authenticated capability is preferred before freshness.
+        (
+            (!self.routeable) as u8,
+            (!self.explicitly_advertised) as u8,
+            self.freshness_rank,
+        )
     }
 }
 
@@ -297,8 +310,12 @@ struct DirectoryMirrorRecoveryCarrierSelection {
     carriers: Vec<DirectoryMirrorRecoveryCarrier>,
     candidate_count: u64,
     routeable_candidate_count: u64,
+    explicitly_advertised_candidate_count: u64,
+    unadvertised_compatibility_candidate_count: u64,
     capability_cached_unavailable_count: u64,
     selected_routeable_count: u64,
+    selected_explicitly_advertised_count: u64,
+    selected_unadvertised_compatibility_count: u64,
     selected_region_hint_count: u64,
     distinct_selected_region_hint_count: u64,
 }
@@ -1822,9 +1839,13 @@ async fn pull_directory_chain_mirror_page_with_recovery(
             runtime.record_full_node_mirror_carrier_selection(
                 carrier_selection.candidate_count,
                 carrier_selection.routeable_candidate_count,
+                carrier_selection.explicitly_advertised_candidate_count,
+                carrier_selection.unadvertised_compatibility_candidate_count,
                 carrier_selection.capability_cached_unavailable_count,
                 u64::try_from(carrier_selection.carriers.len()).unwrap_or(u64::MAX),
                 carrier_selection.selected_routeable_count,
+                carrier_selection.selected_explicitly_advertised_count,
+                carrier_selection.selected_unadvertised_compatibility_count,
                 carrier_selection.selected_region_hint_count,
                 carrier_selection.distinct_selected_region_hint_count,
             );
@@ -2195,6 +2216,9 @@ fn directory_mirror_recovery_carriers(
 
     // [MIRROR-DIVERSITY 2026-07-24 by Codex] Routeability is local observed
     // evidence and therefore outranks self-reported descriptor metadata.
+    // [MIRROR-CAPABILITY 2026-07-24 by Codex] Within that local-evidence tier,
+    // signed carrier capability outranks separately measured unadvertised
+    // compatibility fallback.
     // Freshness is bucketed to avoid permanent affinity to tiny timestamp
     // differences; deterministic rotation remains the tie-breaker.
     let candidate_count = u64::try_from(descriptors.len()).unwrap_or(u64::MAX);
@@ -2205,6 +2229,20 @@ fn directory_mirror_recovery_carriers(
             .count(),
     )
     .unwrap_or(u64::MAX);
+    let explicitly_advertised_candidate_count = u64::try_from(
+        descriptors
+            .iter()
+            .filter(|descriptor| {
+                descriptor
+                    .descriptor
+                    .capabilities
+                    .contains(&NodeCapability::DirectoryMirrorCarrier)
+            })
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let unadvertised_compatibility_candidate_count =
+        candidate_count.saturating_sub(explicitly_advertised_candidate_count);
     let capability_cached_unavailable_count = u64::try_from(
         descriptors
             .iter()
@@ -2238,10 +2276,15 @@ fn directory_mirror_recovery_carriers(
                 .map(str::trim)
                 .filter(|region| !region.is_empty())
                 .map(str::to_ascii_lowercase);
+            let explicitly_advertised = descriptor
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::DirectoryMirrorCarrier);
             let node_id = descriptor.node_id();
             DirectoryMirrorRecoveryCarrierCandidate {
                 node_id,
                 descriptor_sequence: descriptor.sequence(),
+                explicitly_advertised,
                 routeable: peer_store.is_routeable_now(&node_id, now),
                 freshness_rank,
                 rotation_rank,
@@ -2250,8 +2293,14 @@ fn directory_mirror_recovery_carriers(
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| {
-        let (routeability_rank, freshness_rank) = candidate.availability_tier();
-        (routeability_rank, freshness_rank, candidate.rotation_rank)
+        let (routeability_rank, capability_rank, freshness_rank) =
+            candidate.availability_tier();
+        (
+            routeability_rank,
+            capability_rank,
+            freshness_rank,
+            candidate.rotation_rank,
+        )
     });
 
     let mut selected = Vec::with_capacity(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE);
@@ -2291,11 +2340,27 @@ fn directory_mirror_recovery_carriers(
             .collect(),
         candidate_count,
         routeable_candidate_count,
+        explicitly_advertised_candidate_count,
+        unadvertised_compatibility_candidate_count,
         capability_cached_unavailable_count,
         selected_routeable_count: u64::try_from(
             selected
                 .iter()
                 .filter(|candidate| candidate.routeable)
+                .count(),
+        )
+        .unwrap_or(u64::MAX),
+        selected_explicitly_advertised_count: u64::try_from(
+            selected
+                .iter()
+                .filter(|candidate| candidate.explicitly_advertised)
+                .count(),
+        )
+        .unwrap_or(u64::MAX),
+        selected_unadvertised_compatibility_count: u64::try_from(
+            selected
+                .iter()
+                .filter(|candidate| !candidate.explicitly_advertised)
                 .count(),
         )
         .unwrap_or(u64::MAX),
@@ -3382,6 +3447,10 @@ mod tests {
             selection.carriers.len(),
             DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE
         );
+        assert_eq!(selection.explicitly_advertised_candidate_count, 0);
+        assert_eq!(selection.unadvertised_compatibility_candidate_count, 5);
+        assert_eq!(selection.selected_explicitly_advertised_count, 0);
+        assert_eq!(selection.selected_unadvertised_compatibility_count, 2);
         assert!(selection
             .carriers
             .iter()
@@ -3411,17 +3480,18 @@ mod tests {
         // include two identical signed region hints. The second selected peer
         // must use the different hint without sacrificing routeability or
         // descriptor freshness. These hints are not operator/ASN proof.
-        for (seed, issued_at, region, routeable) in [
-            (0xd3, now - 1, Some("region-a"), true),
-            (0xd4, now - 2, Some("REGION-A"), true),
-            (0xd5, now - 3, Some("region-b"), true),
+        for (seed, issued_at, region, routeable, advertised) in [
+            (0xd3, now - 1, Some("region-a"), true, true),
+            (0xd4, now - 2, Some("REGION-A"), true, false),
+            (0xd5, now - 3, Some("region-b"), true, true),
             (
                 0xd6,
                 now - DIRECTORY_MIRROR_RECOVERY_FRESH_DESCRIPTOR_SECS - 1,
                 Some("region-c"),
                 true,
+                true,
             ),
-            (0xd7, now - 4, Some("region-d"), false),
+            (0xd7, now - 4, Some("region-d"), false, true),
         ] {
             let identity = IdentityKeyPair::from_bytes(&[seed; 32]).unwrap();
             let mut descriptor = aeronyx_core::protocol::discovery::NodeDescriptor::new(
@@ -3434,6 +3504,11 @@ mod tests {
             descriptor.policy.public_discovery = true;
             descriptor.policy.region = region.map(str::to_string);
             descriptor.public_endpoint = Some(format!("http://8.8.8.{seed}:8422"));
+            if advertised {
+                descriptor
+                    .capabilities
+                    .push(NodeCapability::DirectoryMirrorCarrier);
+            }
             store
                 .upsert_verified_from_source(
                     SignedNodeDescriptor::sign(descriptor, &identity).unwrap(),
@@ -3486,8 +3561,12 @@ mod tests {
         );
         assert_eq!(selection.candidate_count, 5);
         assert_eq!(selection.routeable_candidate_count, 4);
+        assert_eq!(selection.explicitly_advertised_candidate_count, 4);
+        assert_eq!(selection.unadvertised_compatibility_candidate_count, 1);
         assert_eq!(selection.carriers.len(), 2);
         assert_eq!(selection.selected_routeable_count, 2);
+        assert_eq!(selection.selected_explicitly_advertised_count, 2);
+        assert_eq!(selection.selected_unadvertised_compatibility_count, 0);
         assert_eq!(selection.selected_region_hint_count, 2);
         assert_eq!(selection.distinct_selected_region_hint_count, 2);
         assert!(selection
@@ -3540,8 +3619,11 @@ mod tests {
             now,
         );
         assert_eq!(selection.candidate_count, 3);
+        assert_eq!(selection.explicitly_advertised_candidate_count, 0);
+        assert_eq!(selection.unadvertised_compatibility_candidate_count, 3);
         assert_eq!(selection.capability_cached_unavailable_count, 1);
         assert_eq!(selection.carriers.len(), 2);
+        assert_eq!(selection.selected_unadvertised_compatibility_count, 2);
         assert!(!selection
             .carriers
             .iter()

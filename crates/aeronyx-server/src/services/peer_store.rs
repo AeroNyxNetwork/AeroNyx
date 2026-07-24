@@ -155,6 +155,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.63.0-DirectoryMirrorCarrierCapability - Added the signed mirror-carrier
+//! role to route-surface fingerprints and privacy-safe capability labels
 //! v0.62.0-VerifiedDeliveryWitnessAdmission - Added fail-closed bilateral requester pins for witness writes
 //! v0.61.0-VerifiedDeliveryExternalWitness - Added aggregate external witness status and startup fail-closed clearing
 //! v0.60.0-VerifiedDeliveryRollbackAnchor - Track signed cache generations and fail closed on local delivery-evidence rollback
@@ -5115,6 +5117,10 @@ impl PeerStore {
                 NodeCapability::EncryptedStorage => 3,
                 NodeCapability::AgentRelay => 4,
                 NodeCapability::OnionMiddle => 5,
+                // [MIRROR-CAPABILITY 2026-07-24 by Codex] Keep the appended
+                // role distinct so enabling it invalidates stale routeability
+                // evidence bound to an older signed transport surface.
+                NodeCapability::DirectoryMirrorCarrier => 6,
             })
             .collect::<Vec<_>>();
         capabilities.sort_unstable();
@@ -6390,6 +6396,7 @@ impl PeerStore {
             NodeCapability::EncryptedStorage => "encrypted_storage",
             NodeCapability::AgentRelay => "agent_relay",
             NodeCapability::OnionMiddle => "onion_middle",
+            NodeCapability::DirectoryMirrorCarrier => "directory_mirror_carrier",
         }
     }
 
@@ -7461,8 +7468,25 @@ mod tests {
         kem_changed_body.kem_alg = 1;
         kem_changed_body.kem_public = [7u8; 32];
         let kem_changed = SignedNodeDescriptor::sign(kem_changed_body, &peer_kp).unwrap();
-        store.upsert_verified(kem_changed, now + 30).unwrap();
+        store
+            .upsert_verified(kem_changed.clone(), now + 30)
+            .unwrap();
         assert!(!store.is_routeable_now(&node_id, now + 31));
+
+        store.record_route_forward_success(&node_id, now + 32);
+        let mut capability_changed_body = kem_changed.descriptor;
+        capability_changed_body.sequence = 10;
+        capability_changed_body.issued_at = now + 40;
+        capability_changed_body.expires_at = now + 4_040;
+        capability_changed_body
+            .capabilities
+            .push(NodeCapability::DirectoryMirrorCarrier);
+        let capability_changed =
+            SignedNodeDescriptor::sign(capability_changed_body, &peer_kp).unwrap();
+        store.upsert_verified(capability_changed, now + 40).unwrap();
+        // [MIRROR-CAPABILITY 2026-07-24 by Codex] A newly advertised carrier
+        // surface must be probed; a prior role's success cannot be inherited.
+        assert!(!store.is_routeable_now(&node_id, now + 41));
     }
 
     #[test]

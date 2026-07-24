@@ -76,11 +76,16 @@
 //!   validator membership, consensus, governance, or finality.
 //! - A replica carrier proves transport of its audited copy. It cannot author,
 //!   rewrite, finalize, or select the producer's signed chain.
+//! - [MIRROR-CAPABILITY 2026-07-24 by Codex] New capability variants must be
+//!   appended, never reordered. Advertise `DirectoryMirrorCarrier` only after
+//!   the operator has enabled the staged mixed-version rollout gate.
 //! - [BOUNDED-DISCOVERY-CODEC 2026-07-24 by Codex] Discovery and Directory
 //!   Sync frames are canonical control-plane messages. Keep strict trailing
 //!   rejection and the complete-input size preflight in the shared codec.
 //!
 //! ## Last Modified
+//! v0.13.0-DirectoryMirrorCarrierCapability - Added a signed, rollout-gated
+//! Directory Mirror carrier capability without changing prior discriminants
 //! v0.12.0-BoundedControlPlaneCodec - Unified bounded discovery and directory wire encoding
 //! v0.11.0-DirectoryPolicyHeadAnchor - Added privacy-bounded external policy-head anchor frames
 //! v0.10.0-DirectoryEvidenceCarrier - Added producer-bound audited replica transport frames
@@ -224,6 +229,13 @@ pub enum NodeCapability {
     AgentRelay,
     /// Future no-exit onion middle-hop relay.
     OnionMiddle,
+    /// Audited non-authoritative Directory replica carrier.
+    ///
+    /// [MIRROR-CAPABILITY 2026-07-24 by Codex] This variant is appended to
+    /// preserve every existing bincode discriminant. Mixed-version fleets must
+    /// upgrade decoders before operators enable advertisement because an old
+    /// binary cannot decode a capability variant it does not know.
+    DirectoryMirrorCarrier,
 }
 
 // ============================================
@@ -2073,6 +2085,43 @@ mod tests {
         assert!(signed.verify_at(1_700_000_100).is_ok());
         assert_eq!(signed.node_id(), kp.public_key_bytes());
         assert_eq!(signed.sequence(), 7);
+    }
+
+    #[test]
+    fn directory_mirror_carrier_capability_is_appended_and_signature_bound() {
+        // [MIRROR-CAPABILITY 2026-07-24 by Codex] Existing enum positions are
+        // part of the bincode wire contract. Appending the staged capability
+        // keeps OnionMiddle at 4 and assigns the new carrier role to 5.
+        assert_eq!(
+            bincode::serialize(&NodeCapability::OnionMiddle).unwrap(),
+            4u32.to_le_bytes()
+        );
+        assert_eq!(
+            bincode::serialize(&NodeCapability::DirectoryMirrorCarrier).unwrap(),
+            5u32.to_le_bytes()
+        );
+
+        let identity = IdentityKeyPair::generate();
+        let mut descriptor = descriptor_for(&identity);
+        descriptor
+            .capabilities
+            .push(NodeCapability::DirectoryMirrorCarrier);
+        let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
+        assert!(signed.verify_at(1_700_000_100).is_ok());
+
+        let encoded = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {
+            descriptor: signed,
+        })
+        .unwrap();
+        let decoded = decode_discovery_message(&encoded).unwrap();
+        let NodeDiscoveryMessage::DescriptorAnnounce { descriptor } = decoded else {
+            panic!("unexpected discovery message variant");
+        };
+        assert!(descriptor
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::DirectoryMirrorCarrier));
+        assert!(descriptor.verify_at(1_700_000_100).is_ok());
     }
 
     #[test]
