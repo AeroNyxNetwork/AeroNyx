@@ -26,6 +26,8 @@
 //! - Independent checkpoint root recomputation before a signed witness decision.
 //! - Monotonic opaque policy-head retention before a signed anchor decision.
 //! - Audited producer-replica export with a separate carrier signature layer.
+//! - Explicit lagging-carrier responses that let a requester continue to the
+//!   next verified carrier without retrying malformed protocol requests.
 //! - Multi-block catch-up pages capped to one block's maximum aggregate
 //!   commitment budget and stopped before repeated descriptor objects.
 //!
@@ -72,6 +74,8 @@
 //!   descriptor signature and grants no authority.
 //!
 //! ## Last Modified
+//! v0.9.1-MirrorCarrierRangeAvailability - Distinguished valid unavailable
+//! replica ranges from malformed requests for bounded carrier failover.
 //! v0.9.0-MirrorRecovery - Added bounded verified-public recovery for audited mirror namespaces.
 //! v0.8.0-FullNodeMirror - Added verified-public read admission with pinned authority routes.
 //! v0.7.0-DirectoryPolicyHeadAnchor - Added durable opaque policy-head anchor route.
@@ -1190,6 +1194,13 @@ fn replica_store_error_response(error: &DirectoryReplicaStoreError) -> Response 
         DirectoryReplicaStoreError::Request(_) => {
             protocol_error(StatusCode::BAD_REQUEST, "invalid_replica_request")
         }
+        // [MIRROR-CARRIER 2026-07-24 by Codex] A lagging carrier is an
+        // availability miss, not evidence that the signed request is invalid.
+        // A distinct 404 keeps true 400 contract failures fail-closed while the
+        // requester advances to another bounded verified carrier.
+        DirectoryReplicaStoreError::RangeNotRetained { .. } => {
+            protocol_error(StatusCode::NOT_FOUND, "replica_range_not_retained")
+        }
         DirectoryReplicaStoreError::Quarantined(_) => {
             protocol_error(StatusCode::CONFLICT, "producer_quarantined")
         }
@@ -1328,12 +1339,21 @@ mod tests {
         producer: &[u8; 32],
         request_id: [u8; 16],
     ) -> Vec<u8> {
+        replica_range_request_from_height(requester, producer, 1, request_id)
+    }
+
+    fn replica_range_request_from_height(
+        requester: &IdentityKeyPair,
+        producer: &[u8; 32],
+        from_height: u64,
+        request_id: [u8; 16],
+    ) -> Vec<u8> {
         let timestamp = now_secs();
         let requester_id = requester.public_key_bytes();
         let signing_bytes = directory_replica_block_range_request_signing_bytes(
             &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
             producer,
-            1,
+            from_height,
             1,
             &request_id,
             &requester_id,
@@ -1342,7 +1362,7 @@ mod tests {
         encode_directory_sync_message(&DirectorySyncMessage::ReplicaBlockRangeRequestV1 {
             chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
             producer: *producer,
-            from_height: 1,
+            from_height,
             limit: 1,
             request_id,
             requester: requester_id,
@@ -1800,6 +1820,30 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(!has_more);
         assert_eq!(tip_height, 1);
+
+        // [MIRROR-CARRIER 2026-07-24 by Codex] A valid request beyond this
+        // carrier's retained producer tip is retryable availability, not a
+        // malformed-frame response that would abort the bounded carrier list.
+        let unavailable_response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-block-range")
+                    .body(Body::from(replica_range_request_from_height(
+                        &requester,
+                        &producer_id,
+                        3,
+                        [0xcc; 16],
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unavailable_response.status(), StatusCode::NOT_FOUND);
+        let unavailable_body = to_bytes(unavailable_response.into_body(), 128)
+            .await
+            .unwrap();
+        assert_eq!(&unavailable_body[..], b"replica_range_not_retained");
+
         let descriptor_hash = blocks[0].commitments[0].descriptor_hash;
         let object_id = [0xcd; 16];
         let object_timestamp = now_secs();

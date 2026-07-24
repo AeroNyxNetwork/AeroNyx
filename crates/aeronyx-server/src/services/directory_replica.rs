@@ -52,6 +52,8 @@
 //!   without granting those producers checkpoint, witness, or policy authority.
 //! - Gates public carrier recovery reads on that durable mirror registry while
 //!   preserving exact producer signatures, object hashes, and quarantine state.
+//! - Distinguishes a lagging carrier's unavailable range from a malformed
+//!   request so recovery can continue without weakening contract validation.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -135,6 +137,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.20.1-MirrorCarrierRangeAvailability - Added a typed unavailable-range
+//! result for audited carrier reads so lagging mirrors remain safely retryable
 //! v0.20.0-MirrorBoundedCatchUp - Added aggregate converged/catching-up mirror
 //! outcomes and truthful multi-page request telemetry
 //! v0.19.1-ProducerScopedExportAudit - Isolated transactional carrier audits
@@ -278,6 +282,19 @@ pub enum DirectoryReplicaStoreError {
     /// A public recovery read requested a namespace not retained as a mirror.
     #[error("directory full-node mirror namespace is not retained")]
     MirrorNotRetained,
+    /// [MIRROR-CARRIER 2026-07-24 by Codex] The requested producer range is
+    /// valid, but this carrier has not retained that height yet. Keep this
+    /// distinct from malformed requests so callers may try another carrier
+    /// without making protocol-contract failures retryable.
+    #[error(
+        "directory replica range from height {from_height} is beyond retained tip {tip_height}"
+    )]
+    RangeNotRetained {
+        /// First block height requested by the authenticated peer.
+        from_height: u64,
+        /// Highest producer block fully audited on this carrier.
+        tip_height: u64,
+    },
 }
 
 /// Aggregate result of a complete replica startup audit.
@@ -2334,9 +2351,10 @@ impl DirectoryReplicaStore {
             ));
         }
         if from_height > tip.tip_height.saturating_add(1) {
-            return Err(DirectoryReplicaStoreError::Request(
-                "replica evidence range starts beyond the audited tip".to_string(),
-            ));
+            return Err(DirectoryReplicaStoreError::RangeNotRetained {
+                from_height,
+                tip_height: tip.tip_height,
+            });
         }
         let mut statement = transaction.prepare(
             "SELECT block_blob FROM directory_replica_blocks
@@ -8826,6 +8844,13 @@ mod tests {
         assert_eq!(page.blocks, vec![replica_block.clone()]);
         assert_eq!(page.tip_height, 1);
         assert_eq!(page.tip_hash, replica_block.hash());
+        assert!(matches!(
+            source.audited_evidence_page(&producer.public_key_bytes(), 3, 1, NOW + 21),
+            Err(DirectoryReplicaStoreError::RangeNotRetained {
+                from_height: 3,
+                tip_height: 1,
+            })
+        ));
         let descriptor_hash = replica_block.commitments[0].descriptor_hash;
         assert_eq!(
             source
