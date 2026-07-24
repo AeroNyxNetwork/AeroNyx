@@ -333,6 +333,7 @@ struct DirectoryFullNodeMirrorStatus {
     recovery_failed: u64,
     last_recovery_carrier_candidates: u64,
     last_recovery_routeable_carrier_candidates: u64,
+    last_recovery_capability_cached_unavailable: u64,
     last_recovery_carriers_selected: u64,
     last_recovery_routeable_carriers_selected: u64,
     last_recovery_selected_region_hints: u64,
@@ -1393,6 +1394,8 @@ fn build_full_node_mirror_status(
         last_recovery_carrier_candidates: runtime.last_recovery_carrier_candidates,
         last_recovery_routeable_carrier_candidates: runtime
             .last_recovery_routeable_carrier_candidates,
+        last_recovery_capability_cached_unavailable: runtime
+            .last_recovery_capability_cached_unavailable,
         last_recovery_carriers_selected: runtime.last_recovery_carriers_selected,
         last_recovery_routeable_carriers_selected: runtime
             .last_recovery_routeable_carriers_selected,
@@ -1419,15 +1422,15 @@ fn build_full_node_mirror_status(
         selection_policy:
             "valid_public_signed_descriptors_excluding_self_and_operator_pins_non_quarantined_routeable_and_fresh_first_rotating_bounded_window",
         carrier_selection_policy:
-            "local_routeability_then_descriptor_freshness_then_rotation_with_same_tier_signed_region_hint_diversity",
+            "descriptor_sequence_scoped_capability_filter_then_local_routeability_freshness_rotation_and_same_tier_signed_region_hint_diversity",
         diversity_limit:
             "signed_region_hints_are_untrusted_availability_metadata_not_operator_asn_jurisdiction_or_sybil_resistance_proof",
         transport_policy:
-            "bounded_multi_page_direct_first_then_at_most_two_verified_public_carriers_per_page_for_availability_failures_only",
+            "bounded_multi_page_direct_first_then_at_most_two_verified_public_carriers_per_page_with_explicit_absence_cached_only_for_the_exact_signed_descriptor_sequence",
         authority_boundary:
             "operator_pins_only_for_checkpoints_witnesses_and_policy_anchors",
         privacy_boundary:
-            "aggregate mirror counts ages routeability and signed-region-hint cardinality only; no identities endpoints regions routes payloads or client metadata",
+            "aggregate mirror counts ages routeability capability-skips and signed-region-hint cardinality only; no identities descriptor-sequences endpoints regions routes payloads or client metadata",
         security_model:
             "untrusted_verified_replica_transport_not_authority_consensus_fork_choice_voting_or_finality",
     }
@@ -2057,6 +2060,7 @@ mod tests {
             requests_sent: 7,
             last_recovery_carrier_candidates: 4,
             last_recovery_routeable_carrier_candidates: 3,
+            last_recovery_capability_cached_unavailable: 1,
             last_recovery_carriers_selected: 2,
             last_recovery_routeable_carriers_selected: 2,
             last_recovery_selected_region_hints: 2,
@@ -2073,6 +2077,7 @@ mod tests {
         assert_eq!(status.last_round_requests_sent, 7);
         assert_eq!(status.last_recovery_carrier_candidates, 4);
         assert_eq!(status.last_recovery_routeable_carrier_candidates, 3);
+        assert_eq!(status.last_recovery_capability_cached_unavailable, 1);
         assert_eq!(status.last_recovery_carriers_selected, 2);
         assert_eq!(status.last_recovery_routeable_carriers_selected, 2);
         assert_eq!(status.last_recovery_selected_region_hints, 2);

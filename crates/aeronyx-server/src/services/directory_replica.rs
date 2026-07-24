@@ -1041,6 +1041,9 @@ pub struct DirectoryFullNodeMirrorRuntimeSnapshot {
     pub last_recovery_carrier_candidates: u64,
     /// Latest candidates with fresh local routeability evidence.
     pub last_recovery_routeable_carrier_candidates: u64,
+    /// Latest valid carriers skipped for the exact signed descriptor sequence
+    /// after an explicit optional replica-endpoint absence response.
+    pub last_recovery_capability_cached_unavailable: u64,
     /// Capacity-bounded carriers selected by the latest recovery.
     pub last_recovery_carriers_selected: u64,
     /// Latest selected carriers with fresh local routeability evidence.
@@ -1365,13 +1368,15 @@ impl DirectoryReplicaSyncRuntime {
 
     /// Records aggregate properties of the latest bounded carrier selection.
     ///
-    /// [MIRROR-DIVERSITY 2026-07-24 by Codex] Signed region values are reduced
-    /// to counts before this boundary. This method never receives identities,
-    /// endpoint URLs, region strings, producer identities, or selected order.
+    /// [MIRROR-CAPABILITY 2026-07-24 by Codex] Capability and signed-region
+    /// values are reduced to counts before this boundary. This method never
+    /// receives identities, endpoint URLs, region strings, producer
+    /// identities, descriptor sequences, or selected order.
     pub fn record_full_node_mirror_carrier_selection(
         &self,
         candidates: u64,
         routeable_candidates: u64,
+        capability_cached_unavailable: u64,
         selected: u64,
         selected_routeable: u64,
         selected_region_hints: u64,
@@ -1380,6 +1385,8 @@ impl DirectoryReplicaSyncRuntime {
         let mut snapshot = self.full_node_mirror.lock();
         snapshot.last_recovery_carrier_candidates = candidates;
         snapshot.last_recovery_routeable_carrier_candidates = routeable_candidates.min(candidates);
+        snapshot.last_recovery_capability_cached_unavailable =
+            capability_cached_unavailable.min(candidates);
         snapshot.last_recovery_carriers_selected = selected.min(candidates);
         snapshot.last_recovery_routeable_carriers_selected = selected_routeable
             .min(snapshot.last_recovery_carriers_selected)
@@ -8484,7 +8491,7 @@ mod tests {
         // [MIRROR-CATCHUP 2026-07-24 by Codex] One producer converges, one
         // advances under the bounded budget, and one fails after prior pages.
         runtime.record_full_node_mirror_catch_up_round(5, 3, 1, 1, 1, 7, 11, NOW + 1);
-        runtime.record_full_node_mirror_carrier_selection(5, 4, 2, 2, 2, 2);
+        runtime.record_full_node_mirror_carrier_selection(5, 4, 1, 2, 2, 2, 2);
         runtime.record_full_node_mirror_recovery(true, NOW + 2);
         runtime.record_full_node_mirror_recovery(false, NOW + 3);
 
@@ -8504,6 +8511,7 @@ mod tests {
         assert_eq!(snapshot.recovery_failed, 1);
         assert_eq!(snapshot.last_recovery_carrier_candidates, 5);
         assert_eq!(snapshot.last_recovery_routeable_carrier_candidates, 4);
+        assert_eq!(snapshot.last_recovery_capability_cached_unavailable, 1);
         assert_eq!(snapshot.last_recovery_carriers_selected, 2);
         assert_eq!(snapshot.last_recovery_routeable_carriers_selected, 2);
         assert_eq!(snapshot.last_recovery_selected_region_hints, 2);

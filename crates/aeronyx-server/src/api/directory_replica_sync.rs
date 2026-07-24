@@ -104,6 +104,8 @@
 //!   carrier while serving a recovery request.
 //!
 //! ## Last Modified
+//! `v0.18.0-MirrorCarrierCapabilityMemory` - Added bounded descriptor-sequence-scoped
+//! negative capability memory for recovery carriers.
 //! `v0.17.0-MirrorSourceDiversity` - Added routeability/freshness-aware carrier
 //! ordering, best-effort signed-region diversity, aggregate selection data, and
 //! explicit proxy bypass for authenticated node-to-node synchronization.
@@ -136,7 +138,7 @@
 //! from `server.rs` and added deterministic startup synchronization jitter.
 // ============================================
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -242,6 +244,10 @@ const DIRECTORY_MIRROR_RECOVERY_ROTATION_SECS: u64 = 5 * 60;
 const DIRECTORY_MIRROR_RECOVERY_FRESH_DESCRIPTOR_SECS: u64 = 10 * 60;
 /// Valid but older descriptors remain fallback candidates after fresher peers.
 const DIRECTORY_MIRROR_RECOVERY_AGING_DESCRIPTOR_SECS: u64 = 30 * 60;
+/// [MIRROR-CAPABILITY 2026-07-24 by Codex] Bound process-local negative
+/// capability memory under permissionless descriptor churn. A newer signed
+/// descriptor sequence is always eligible without waiting for a timer.
+const DIRECTORY_MIRROR_CARRIER_CAPABILITY_CACHE_MAX_ENTRIES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryMirrorPullSource {
@@ -262,6 +268,7 @@ struct DirectoryMirrorPullFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DirectoryMirrorRecoveryCarrierCandidate {
     node_id: [u8; 32],
+    descriptor_sequence: u64,
     routeable: bool,
     freshness_rank: u8,
     rotation_rank: usize,
@@ -274,12 +281,20 @@ impl DirectoryMirrorRecoveryCarrierCandidate {
     }
 }
 
+/// Descriptor-bound carrier selected for one authenticated recovery attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectoryMirrorRecoveryCarrier {
+    node_id: [u8; 32],
+    descriptor_sequence: u64,
+}
+
 /// Privacy-safe result of one bounded recovery-carrier selection.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct DirectoryMirrorRecoveryCarrierSelection {
-    carriers: Vec<[u8; 32]>,
+    carriers: Vec<DirectoryMirrorRecoveryCarrier>,
     candidate_count: u64,
     routeable_candidate_count: u64,
+    capability_cached_unavailable_count: u64,
     selected_routeable_count: u64,
     selected_region_hint_count: u64,
     distinct_selected_region_hint_count: u64,
@@ -410,6 +425,85 @@ impl DirectoryWitnessCapabilityCache {
     }
 }
 
+/// Bounded negative capability cache for optional mirror-carrier endpoints.
+///
+/// [MIRROR-CAPABILITY 2026-07-24 by Codex] Only explicit endpoint absence
+/// (`404`, `405`, or `501`) is cached. Transport failures, admission pressure,
+/// and every cryptographic or canonical verification failure remain uncached.
+/// Entries are bound to the exact authenticated descriptor sequence so a
+/// software upgrade becomes immediately probeable. The FIFO is process-local,
+/// bounded, and never exported as peer identity or reputation.
+#[derive(Debug, Default)]
+struct DirectoryMirrorCarrierCapabilityCache {
+    state: Mutex<DirectoryMirrorCarrierCapabilityCacheState>,
+}
+
+#[derive(Debug, Default)]
+struct DirectoryMirrorCarrierCapabilityCacheState {
+    unsupported_descriptor_sequences: HashMap<[u8; 32], u64>,
+    insertion_order: VecDeque<([u8; 32], u64)>,
+}
+
+impl DirectoryMirrorCarrierCapabilityCache {
+    fn should_attempt(&self, carrier: &[u8; 32], descriptor_sequence: u64) -> bool {
+        match self
+            .state
+            .lock()
+            .unsupported_descriptor_sequences
+            .get(carrier)
+        {
+            Some(unsupported_sequence) => *unsupported_sequence != descriptor_sequence,
+            None => true,
+        }
+    }
+
+    fn record_unsupported(&self, carrier: [u8; 32], descriptor_sequence: u64) {
+        let mut state = self.state.lock();
+        state
+            .insertion_order
+            .retain(|(existing, _)| *existing != carrier);
+        if !state
+            .unsupported_descriptor_sequences
+            .contains_key(&carrier)
+        {
+            while state.unsupported_descriptor_sequences.len()
+                >= DIRECTORY_MIRROR_CARRIER_CAPABILITY_CACHE_MAX_ENTRIES
+            {
+                let Some((oldest, oldest_sequence)) = state.insertion_order.pop_front() else {
+                    state.unsupported_descriptor_sequences.clear();
+                    break;
+                };
+                if state
+                    .unsupported_descriptor_sequences
+                    .get(&oldest)
+                    .is_some_and(|current| *current == oldest_sequence)
+                {
+                    state.unsupported_descriptor_sequences.remove(&oldest);
+                }
+            }
+        }
+        state
+            .unsupported_descriptor_sequences
+            .insert(carrier, descriptor_sequence);
+        state
+            .insertion_order
+            .push_back((carrier, descriptor_sequence));
+    }
+
+    fn record_supported(&self, carrier: &[u8; 32]) {
+        let mut state = self.state.lock();
+        state.unsupported_descriptor_sequences.remove(carrier);
+        state
+            .insertion_order
+            .retain(|(existing, _)| existing != carrier);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state.lock().unsupported_descriptor_sequences.len()
+    }
+}
+
 /// Typed result boundary for untrusted peer HTTP exchange.
 ///
 /// Keeping the status code typed until the caller applies operation-specific
@@ -461,6 +555,7 @@ pub struct DirectoryReplicaSyncCoordinator {
     client: reqwest::Client,
     witness_capabilities: DirectoryWitnessCapabilityCache,
     policy_anchor_capabilities: DirectoryWitnessCapabilityCache,
+    mirror_carrier_capabilities: DirectoryMirrorCarrierCapabilityCache,
     witness_min_verified: usize,
     restored_retry_states: usize,
     full_node_mirror_enabled: bool,
@@ -574,6 +669,7 @@ impl DirectoryReplicaSyncCoordinator {
             client,
             witness_capabilities: DirectoryWitnessCapabilityCache::default(),
             policy_anchor_capabilities: DirectoryWitnessCapabilityCache::default(),
+            mirror_carrier_capabilities: DirectoryMirrorCarrierCapabilityCache::default(),
             witness_min_verified,
             restored_retry_states,
             full_node_mirror_enabled,
@@ -768,6 +864,7 @@ impl DirectoryReplicaSyncCoordinator {
                     Arc::clone(&self.store),
                     self.runtime.as_ref(),
                     self.peer_store.as_ref(),
+                    &self.mirror_carrier_capabilities,
                     self.identity.as_ref(),
                     &producer,
                     descriptor_sequence,
@@ -1637,6 +1734,7 @@ async fn pull_directory_chain_mirror_page_with_recovery(
     replica_store: Arc<DirectoryReplicaStore>,
     runtime: &DirectoryReplicaSyncRuntime,
     peer_store: &PeerStore,
+    carrier_capabilities: &DirectoryMirrorCarrierCapabilityCache,
     identity: &IdentityKeyPair,
     producer: &[u8; 32],
     descriptor_sequence: u64,
@@ -1663,6 +1761,7 @@ async fn pull_directory_chain_mirror_page_with_recovery(
             let mut prior_requests = 1u32;
             let carrier_selection = directory_mirror_recovery_carriers(
                 peer_store,
+                carrier_capabilities,
                 producer,
                 &identity.public_key_bytes(),
                 unix_now_secs(),
@@ -1673,6 +1772,7 @@ async fn pull_directory_chain_mirror_page_with_recovery(
             runtime.record_full_node_mirror_carrier_selection(
                 carrier_selection.candidate_count,
                 carrier_selection.routeable_candidate_count,
+                carrier_selection.capability_cached_unavailable_count,
                 u64::try_from(carrier_selection.carriers.len()).unwrap_or(u64::MAX),
                 carrier_selection.selected_routeable_count,
                 carrier_selection.selected_region_hint_count,
@@ -1686,12 +1786,14 @@ async fn pull_directory_chain_mirror_page_with_recovery(
                     producer,
                     descriptor_sequence,
                     max_mirror_producers,
-                    &carrier,
+                    &carrier.node_id,
+                    carrier.descriptor_sequence,
                     client,
                 )
                 .await
                 {
                     Ok(mut outcome) => {
+                        carrier_capabilities.record_supported(&carrier.node_id);
                         outcome.requests_made =
                             outcome.requests_made.saturating_add(prior_requests);
                         return Ok((outcome, DirectoryMirrorPullSource::PublicCarrier));
@@ -1699,6 +1801,10 @@ async fn pull_directory_chain_mirror_page_with_recovery(
                     Err(carrier_reason)
                         if directory_mirror_failure_allows_recovery(&carrier_reason) =>
                     {
+                        if directory_mirror_carrier_capability_unavailable(&carrier_reason) {
+                            carrier_capabilities
+                                .record_unsupported(carrier.node_id, carrier.descriptor_sequence);
+                        }
                         prior_requests = prior_requests.saturating_add(1);
                         debug!(
                             reason = carrier_reason,
@@ -1799,6 +1905,7 @@ async fn pull_directory_chain_mirror_page_via_carrier(
     descriptor_sequence: u64,
     max_mirror_producers: usize,
     carrier: &[u8; 32],
+    carrier_descriptor_sequence: u64,
     client: &reqwest::Client,
 ) -> Result<DirectorySyncPullOutcome, String> {
     let request_timestamp = unix_now_secs();
@@ -1808,8 +1915,12 @@ async fn pull_directory_chain_mirror_page_via_carrier(
     if local_tip.quarantined {
         return Err("directory_mirror_producer_quarantined".to_string());
     }
-    let (range_url, object_url) =
-        directory_mirror_recovery_carrier_urls(peer_store, carrier, request_timestamp)?;
+    let (range_url, object_url) = directory_mirror_recovery_carrier_urls(
+        peer_store,
+        carrier,
+        carrier_descriptor_sequence,
+        request_timestamp,
+    )?;
     let from_height = local_tip
         .tip_height
         .checked_add(1)
@@ -1935,6 +2046,7 @@ fn directory_mirror_failure_allows_recovery(reason: &str) -> bool {
             | "directory_replica_range_transport_failed"
             | "directory_replica_objects_transport_failed"
             | "directory_mirror_recovery_carrier_unavailable"
+            | "directory_mirror_recovery_carrier_descriptor_changed"
             | "directory_mirror_recovery_carrier_not_public"
             | "directory_mirror_recovery_carrier_missing_endpoint"
             | "directory_mirror_recovery_carrier_unsafe_endpoint"
@@ -1954,7 +2066,27 @@ fn directory_mirror_failure_allows_recovery(reason: &str) -> bool {
         else {
             continue;
         };
-        return matches!(status, 403 | 404 | 408 | 429) || status >= 500;
+        return matches!(status, 403 | 404 | 405 | 408 | 429) || status >= 500;
+    }
+    false
+}
+
+fn directory_mirror_carrier_capability_unavailable(reason: &str) -> bool {
+    // [MIRROR-CAPABILITY 2026-07-24 by Codex] Cache only explicit absence of
+    // optional replica-carrier endpoints. A direct producer endpoint, generic
+    // transport error, overload response, or invalid signed frame must not
+    // suppress a future carrier attempt.
+    for prefix in [
+        "directory_replica_range_http_status_",
+        "directory_replica_objects_http_status_",
+    ] {
+        let Some(status) = reason
+            .strip_prefix(prefix)
+            .and_then(|value| value.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        return matches!(status, 404 | 405 | 501);
     }
     false
 }
@@ -1972,6 +2104,7 @@ fn should_continue_directory_mirror_catch_up(
 
 fn directory_mirror_recovery_carriers(
     peer_store: &PeerStore,
+    capability_cache: &DirectoryMirrorCarrierCapabilityCache,
     producer: &[u8; 32],
     requester: &[u8; 32],
     now: u64,
@@ -2009,8 +2142,29 @@ fn directory_mirror_recovery_carriers(
     // evidence and therefore outranks self-reported descriptor metadata.
     // Freshness is bucketed to avoid permanent affinity to tiny timestamp
     // differences; deterministic rotation remains the tie-breaker.
+    let candidate_count = u64::try_from(descriptors.len()).unwrap_or(u64::MAX);
+    let routeable_candidate_count = u64::try_from(
+        descriptors
+            .iter()
+            .filter(|descriptor| peer_store.is_routeable_now(&descriptor.node_id(), now))
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let capability_cached_unavailable_count = u64::try_from(
+        descriptors
+            .iter()
+            .filter(|descriptor| {
+                !capability_cache.should_attempt(&descriptor.node_id(), descriptor.sequence())
+            })
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+
     let mut candidates = descriptors
         .into_iter()
+        .filter(|descriptor| {
+            capability_cache.should_attempt(&descriptor.node_id(), descriptor.sequence())
+        })
         .enumerate()
         .map(|(rotation_rank, descriptor)| {
             let issued_at = descriptor.descriptor.issued_at;
@@ -2032,6 +2186,7 @@ fn directory_mirror_recovery_carriers(
             let node_id = descriptor.node_id();
             DirectoryMirrorRecoveryCarrierCandidate {
                 node_id,
+                descriptor_sequence: descriptor.sequence(),
                 routeable: peer_store.is_routeable_now(&node_id, now),
                 freshness_rank,
                 rotation_rank,
@@ -2044,14 +2199,6 @@ fn directory_mirror_recovery_carriers(
         (routeability_rank, freshness_rank, candidate.rotation_rank)
     });
 
-    let candidate_count = u64::try_from(candidates.len()).unwrap_or(u64::MAX);
-    let routeable_candidate_count = u64::try_from(
-        candidates
-            .iter()
-            .filter(|candidate| candidate.routeable)
-            .count(),
-    )
-    .unwrap_or(u64::MAX);
     let mut selected = Vec::with_capacity(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE);
     let mut selected_regions = HashSet::new();
     while !candidates.is_empty() && selected.len() < DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE
@@ -2080,9 +2227,16 @@ fn directory_mirror_recovery_carriers(
     }
 
     DirectoryMirrorRecoveryCarrierSelection {
-        carriers: selected.iter().map(|candidate| candidate.node_id).collect(),
+        carriers: selected
+            .iter()
+            .map(|candidate| DirectoryMirrorRecoveryCarrier {
+                node_id: candidate.node_id,
+                descriptor_sequence: candidate.descriptor_sequence,
+            })
+            .collect(),
         candidate_count,
         routeable_candidate_count,
+        capability_cached_unavailable_count,
         selected_routeable_count: u64::try_from(
             selected
                 .iter()
@@ -2233,11 +2387,19 @@ fn directory_replica_carrier_urls(
 fn directory_mirror_recovery_carrier_urls(
     peer_store: &PeerStore,
     carrier: &[u8; 32],
+    descriptor_sequence: u64,
     request_timestamp: u64,
 ) -> Result<(reqwest::Url, reqwest::Url), String> {
     let descriptor = peer_store
         .get_valid(carrier, request_timestamp)
         .ok_or_else(|| "directory_mirror_recovery_carrier_unavailable".to_string())?;
+    // [MIRROR-CAPABILITY 2026-07-24 by Codex] Bind endpoint derivation to the
+    // same authenticated descriptor sequence selected by capability policy.
+    // A concurrent descriptor change retries through a fresh selection rather
+    // than probing or caching an endpoint under the wrong sequence.
+    if descriptor.sequence() != descriptor_sequence {
+        return Err("directory_mirror_recovery_carrier_descriptor_changed".to_string());
+    }
     if !descriptor.descriptor.policy.public_discovery {
         return Err("directory_mirror_recovery_carrier_not_public".to_string());
     }
@@ -3061,9 +3223,11 @@ mod tests {
             "directory_range_transport_failed",
             "directory_objects_transport_failed",
             "directory_range_http_status_404",
+            "directory_replica_range_http_status_405",
             "directory_replica_range_http_status_429",
             "directory_replica_objects_http_status_503",
             "directory_mirror_recovery_carrier_unavailable",
+            "directory_mirror_recovery_carrier_descriptor_changed",
         ] {
             assert!(directory_mirror_failure_allows_recovery(reason));
         }
@@ -3117,6 +3281,7 @@ mod tests {
         let producer = IdentityKeyPair::from_bytes(&[0xe1; 32]).unwrap();
         let requester = IdentityKeyPair::from_bytes(&[0xe2; 32]).unwrap();
         let store = PeerStore::new();
+        let capability_cache = DirectoryMirrorCarrierCapabilityCache::default();
         let mut expected_excluded = HashSet::new();
         expected_excluded.insert(producer.public_key_bytes());
         expected_excluded.insert(requester.public_key_bytes());
@@ -3143,6 +3308,7 @@ mod tests {
 
         let selection = directory_mirror_recovery_carriers(
             &store,
+            &capability_cache,
             &producer.public_key_bytes(),
             &requester.public_key_bytes(),
             now,
@@ -3154,11 +3320,12 @@ mod tests {
         assert!(selection
             .carriers
             .iter()
-            .all(|candidate| !expected_excluded.contains(candidate)));
+            .all(|candidate| !expected_excluded.contains(&candidate.node_id)));
         assert_eq!(
             selection,
             directory_mirror_recovery_carriers(
                 &store,
+                &capability_cache,
                 &producer.public_key_bytes(),
                 &requester.public_key_bytes(),
                 now,
@@ -3172,6 +3339,7 @@ mod tests {
         let producer = IdentityKeyPair::from_bytes(&[0xd1; 32]).unwrap();
         let requester = IdentityKeyPair::from_bytes(&[0xd2; 32]).unwrap();
         let store = PeerStore::new();
+        let capability_cache = DirectoryMirrorCarrierCapabilityCache::default();
         let mut fresh_routeable = HashSet::new();
 
         // [MIRROR-DIVERSITY 2026-07-24 by Codex] Three fresh routeable peers
@@ -3246,6 +3414,7 @@ mod tests {
 
         let selection = directory_mirror_recovery_carriers(
             &store,
+            &capability_cache,
             &producer.public_key_bytes(),
             &requester.public_key_bytes(),
             now,
@@ -3259,8 +3428,60 @@ mod tests {
         assert!(selection
             .carriers
             .iter()
-            .all(|candidate| fresh_routeable.contains(candidate)));
-        assert!(!selection.carriers.contains(&quarantined.public_key_bytes()));
+            .all(|candidate| fresh_routeable.contains(&candidate.node_id)));
+        assert!(!selection
+            .carriers
+            .iter()
+            .any(|candidate| candidate.node_id == quarantined.public_key_bytes()));
+    }
+
+    #[test]
+    fn mirror_recovery_selection_skips_only_the_cached_descriptor_sequence() {
+        let now = unix_now_secs();
+        let producer = IdentityKeyPair::from_bytes(&[0xc1; 32]).unwrap();
+        let requester = IdentityKeyPair::from_bytes(&[0xc2; 32]).unwrap();
+        let store = PeerStore::new();
+        let capability_cache = DirectoryMirrorCarrierCapabilityCache::default();
+        let mut carriers = Vec::new();
+
+        for seed in [0xc3, 0xc4, 0xc5] {
+            let identity = IdentityKeyPair::from_bytes(&[seed; 32]).unwrap();
+            let mut descriptor = aeronyx_core::protocol::discovery::NodeDescriptor::new(
+                identity.public_key_bytes(),
+                7,
+                now.saturating_sub(1),
+                now + 600,
+                "mirror-capability-test",
+            );
+            descriptor.policy.public_discovery = true;
+            descriptor.public_endpoint = Some(format!("http://8.8.8.{seed}:8422"));
+            store
+                .upsert_verified_from_source(
+                    SignedNodeDescriptor::sign(descriptor, &identity).unwrap(),
+                    now,
+                    "directory_mirror_capability_test",
+                )
+                .unwrap();
+            store.record_route_forward_success(&identity.public_key_bytes(), now);
+            carriers.push(identity.public_key_bytes());
+        }
+
+        capability_cache.record_unsupported(carriers[0], 7);
+        let selection = directory_mirror_recovery_carriers(
+            &store,
+            &capability_cache,
+            &producer.public_key_bytes(),
+            &requester.public_key_bytes(),
+            now,
+        );
+        assert_eq!(selection.candidate_count, 3);
+        assert_eq!(selection.capability_cached_unavailable_count, 1);
+        assert_eq!(selection.carriers.len(), 2);
+        assert!(!selection
+            .carriers
+            .iter()
+            .any(|candidate| candidate.node_id == carriers[0]));
+        assert!(capability_cache.should_attempt(&carriers[0], 8));
     }
 
     #[test]
@@ -3601,6 +3822,95 @@ mod tests {
 
         cache.record_supported(&witness);
         assert!(cache.should_attempt(&witness, 7));
+    }
+
+    #[test]
+    fn mirror_carrier_capability_cache_is_bounded_and_failure_specific() {
+        let cache = DirectoryMirrorCarrierCapabilityCache::default();
+        for index in 0..=DIRECTORY_MIRROR_CARRIER_CAPABILITY_CACHE_MAX_ENTRIES {
+            let mut carrier = [0u8; 32];
+            carrier[..8].copy_from_slice(
+                &u64::try_from(index)
+                    .expect("test cache index fits u64")
+                    .to_be_bytes(),
+            );
+            cache.record_unsupported(carrier, 1);
+        }
+        let mut oldest = [0u8; 32];
+        oldest[..8].copy_from_slice(&0u64.to_be_bytes());
+        let mut newest = [0u8; 32];
+        newest[..8].copy_from_slice(
+            &u64::try_from(DIRECTORY_MIRROR_CARRIER_CAPABILITY_CACHE_MAX_ENTRIES)
+                .expect("test cache capacity fits u64")
+                .to_be_bytes(),
+        );
+        assert_eq!(
+            cache.len(),
+            DIRECTORY_MIRROR_CARRIER_CAPABILITY_CACHE_MAX_ENTRIES
+        );
+        assert!(cache.should_attempt(&oldest, 1));
+        assert!(!cache.should_attempt(&newest, 1));
+        assert!(cache.should_attempt(&newest, 2));
+
+        for reason in [
+            "directory_replica_range_http_status_404",
+            "directory_replica_range_http_status_405",
+            "directory_replica_objects_http_status_501",
+        ] {
+            assert!(directory_mirror_carrier_capability_unavailable(reason));
+        }
+        for reason in [
+            "directory_range_http_status_404",
+            "directory_replica_range_transport_failed",
+            "directory_replica_range_http_status_403",
+            "directory_replica_range_http_status_408",
+            "directory_replica_range_http_status_429",
+            "directory_replica_range_http_status_500",
+            "directory_replica_range_response_invalid_signature",
+        ] {
+            assert!(!directory_mirror_carrier_capability_unavailable(reason));
+        }
+    }
+
+    #[test]
+    fn mirror_carrier_endpoint_is_bound_to_selected_descriptor_sequence() {
+        let now = unix_now_secs();
+        let store = PeerStore::new();
+        let carrier = IdentityKeyPair::from_bytes(&[0x92; 32]).unwrap();
+        let mut descriptor = aeronyx_core::protocol::discovery::NodeDescriptor::new(
+            carrier.public_key_bytes(),
+            7,
+            now.saturating_sub(1),
+            now + 600,
+            "mirror-capability-sequence-test",
+        );
+        descriptor.policy.public_discovery = true;
+        descriptor.public_endpoint = Some("http://8.8.8.146:8422".to_string());
+        store
+            .upsert_verified_from_source(
+                SignedNodeDescriptor::sign(descriptor, &carrier).unwrap(),
+                now,
+                "directory_mirror_capability_sequence_test",
+            )
+            .unwrap();
+
+        assert!(directory_mirror_recovery_carrier_urls(
+            &store,
+            &carrier.public_key_bytes(),
+            7,
+            now,
+        )
+        .is_ok());
+        assert_eq!(
+            directory_mirror_recovery_carrier_urls(
+                &store,
+                &carrier.public_key_bytes(),
+                8,
+                now,
+            )
+            .unwrap_err(),
+            "directory_mirror_recovery_carrier_descriptor_changed"
+        );
     }
 
     #[test]
