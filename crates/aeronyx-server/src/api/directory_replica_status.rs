@@ -39,6 +39,8 @@
 //!   keeping mirror identities/endpoints out of every public response.
 //! - Reports aggregate direct-first carrier recovery attempts and outcomes
 //!   without exposing producers, carriers, endpoints, or selected paths.
+//! - Distinguishes mirror convergence, bounded catch-up progress, and failures
+//!   so one accepted page cannot be misreported as a fully healthy replica.
 //!
 //! ## Calling Relationships
 //! - `server.rs` mounts this router separately for public and operator scopes.
@@ -89,6 +91,8 @@
 //! - Recovery telemetry is aggregate transport health, never carrier reputation.
 //!
 //! ## Last Modified
+//! `v0.18.0-MirrorBoundedCatchUpStatus` - Added truthful converged/catching-up
+//! mirror outcomes and bounded page/request telemetry.
 //! `v0.17.0-MirrorRecoveryStatus` - Added aggregate direct-first carrier recovery outcomes.
 //! `v0.16.0-FullNodeMirrorStatus` - Added aggregate bounded non-authoritative mirror health.
 //! `v0.15.0-DirectoryWitnessPolicyEpochStatus` - Added aggregate signed policy epoch, change count, pin count, threshold, and runtime-match state while keeping identities and digests host-local.
@@ -313,7 +317,12 @@ struct DirectoryFullNodeMirrorStatus {
     last_round_selected: u64,
     last_round_succeeded: u64,
     last_round_failed: u64,
+    last_round_converged: u64,
+    last_round_catching_up: u64,
+    last_round_pages_succeeded: u64,
+    last_round_requests_sent: u64,
     pages_succeeded: u64,
+    requests_sent: u64,
     attempts_failed: u64,
     recovery_attempts: u64,
     recovery_succeeded: u64,
@@ -1338,8 +1347,10 @@ fn build_full_node_mirror_status(
         "capacity_exceeded"
     } else if runtime.rounds == 0 {
         "awaiting_round"
-    } else if runtime.last_round_selected > 0 && runtime.last_round_succeeded == 0 {
+    } else if runtime.last_round_failed > 0 {
         "degraded"
+    } else if runtime.last_round_catching_up > 0 {
+        "catching_up"
     } else if retained_producers >= max_producers {
         "capacity_full"
     } else {
@@ -1357,7 +1368,12 @@ fn build_full_node_mirror_status(
         last_round_selected: runtime.last_round_selected,
         last_round_succeeded: runtime.last_round_succeeded,
         last_round_failed: runtime.last_round_failed,
+        last_round_converged: runtime.last_round_converged,
+        last_round_catching_up: runtime.last_round_catching_up,
+        last_round_pages_succeeded: runtime.last_round_pages_succeeded,
+        last_round_requests_sent: runtime.last_round_requests_sent,
         pages_succeeded: runtime.pages_succeeded,
+        requests_sent: runtime.requests_sent,
         attempts_failed: runtime.attempts_failed,
         recovery_attempts: runtime.recovery_attempts,
         recovery_succeeded: runtime.recovery_succeeded,
@@ -1383,7 +1399,7 @@ fn build_full_node_mirror_status(
         selection_policy:
             "valid_public_signed_descriptors_excluding_self_and_operator_pins_rotating_bounded_window",
         transport_policy:
-            "direct_first_then_at_most_two_verified_public_carriers_for_availability_failures_only",
+            "bounded_multi_page_direct_first_then_at_most_two_verified_public_carriers_per_page_for_availability_failures_only",
         authority_boundary:
             "operator_pins_only_for_checkpoints_witnesses_and_policy_anchors",
         privacy_boundary:
@@ -1998,6 +2014,42 @@ mod tests {
         assert_eq!(status.process_rounds, 1);
         assert_eq!(status.process_attempts, 2);
         assert_eq!(status.telemetry_persistence_failures, 1);
+    }
+
+    #[test]
+    fn full_node_mirror_status_does_not_report_partial_progress_as_healthy() {
+        // [MIRROR-CATCHUP 2026-07-24 by Codex] One accepted page is not proof
+        // that a mirror has reached the authenticated producer tip.
+        let catching_up = DirectoryFullNodeMirrorRuntimeSnapshot {
+            rounds: 1,
+            last_round_candidates: 3,
+            last_round_selected: 2,
+            last_round_succeeded: 2,
+            last_round_converged: 1,
+            last_round_catching_up: 1,
+            last_round_pages_succeeded: 4,
+            last_round_requests_sent: 7,
+            pages_succeeded: 4,
+            requests_sent: 7,
+            last_round_at: Some(90),
+            last_success_at: Some(90),
+            ..DirectoryFullNodeMirrorRuntimeSnapshot::default()
+        };
+        let status = build_full_node_mirror_status(100, true, true, 32, 2, &catching_up);
+        assert_eq!(status.status, "catching_up");
+        assert_eq!(status.last_round_converged, 1);
+        assert_eq!(status.last_round_catching_up, 1);
+        assert_eq!(status.last_round_pages_succeeded, 4);
+        assert_eq!(status.last_round_requests_sent, 7);
+
+        let degraded = DirectoryFullNodeMirrorRuntimeSnapshot {
+            last_round_failed: 1,
+            ..catching_up
+        };
+        assert_eq!(
+            build_full_node_mirror_status(100, true, true, 32, 2, &degraded).status,
+            "degraded"
+        );
     }
 
     #[tokio::test]

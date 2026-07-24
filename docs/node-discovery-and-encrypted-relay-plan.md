@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.26.0 - Bounded permissionless Full-node Mirror Mode with an explicit non-authority boundary.
+Modification Reason: v0.27.0 - Bounded multi-page Full-node Mirror catch-up with truthful convergence status.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.26.0 - Added capacity-bounded public mirrors that cannot affect checkpoint, witness, or policy authority.
+Last Modified: v0.27.0 - Distinguished mirror convergence from bounded catch-up progress and terminal failure.
+Previous: v0.26.0 - Added capacity-bounded public mirrors that cannot affect checkpoint, witness, or policy authority.
 Previous: v0.25.0 - Added monotonic external policy-head anchors without exporting witness membership or claiming consensus.
 Previous: v0.24.0 - Distinguished independent multi-node corroboration from one-receipt evidence without claiming consensus.
 Previous: v0.23.0 - Kept recurring witness selection cost fixed while preserving complete startup and explicit operator audits.
@@ -1186,6 +1187,37 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+<!-- [MIRROR-CATCHUP 2026-07-24 by Codex] -->
+2026-07-24 - Added Bounded Full-node Mirror Catch-up V1.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Production problem:
+  - A selected public mirror previously imported at most one page per round.
+  - One accepted page was counted as success even when the signed producer tip
+    proved that the mirror still had additional authenticated history to pull.
+- Runtime behavior:
+  - Each selected producer may advance through at most four pages and twenty-four
+    successful HTTP requests inside the existing 45-second producer deadline.
+    A new page starts only when the remaining budget can contain its complete
+    worst-case direct/carrier/object request sequence.
+  - Direct producer reads remain first; only availability/admission failures
+    may use at most two independently authenticated public carriers per page.
+  - Producer outcomes are classified as converged, catching up, or failed.
+    Accepted page/request totals remain aggregate-only.
+- Compatibility:
+  - Existing status fields remain present. New convergence, progress, page,
+    and request fields are additive.
+  - Existing one-result runtime recording remains available as a compatibility
+    wrapper for internal callers.
+- Security boundary:
+  - Multi-page catch-up cannot add checkpoint/witness/policy authority.
+  - Every block and object is still verified against the original producer.
+  - This improves availability and recovery speed only; it is not fork choice,
+    voting, quorum, consensus, global finality, or a financial blockchain.
+
 2026-07-20 - Added Full-node Mirror Mode V1.
 - Files changed:
   - crates/aeronyx-server/src/config.rs

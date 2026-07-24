@@ -135,6 +135,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.20.0-MirrorBoundedCatchUp - Added aggregate converged/catching-up mirror
+//! outcomes and truthful multi-page request telemetry
 //! v0.19.1-ProducerScopedExportAudit - Isolated transactional carrier audits
 //! by producer without weakening target-chain verification
 //! v0.19.0-MirrorRecovery - Added registry-gated public recovery reads and carrier import tests
@@ -990,12 +992,22 @@ pub struct DirectoryFullNodeMirrorRuntimeSnapshot {
     pub last_round_candidates: u64,
     /// Capacity-bounded candidates selected by the latest round.
     pub last_round_selected: u64,
-    /// Authenticated pages accepted in the latest round.
+    /// Selected producers that completed without a terminal failure.
     pub last_round_succeeded: u64,
     /// Selected candidates that failed or were rejected in the latest round.
     pub last_round_failed: u64,
+    /// Selected producers that reached their authenticated signed tip.
+    pub last_round_converged: u64,
+    /// Selected producers that advanced but still have authenticated lag.
+    pub last_round_catching_up: u64,
+    /// Authenticated pages accepted in the latest round.
+    pub last_round_pages_succeeded: u64,
+    /// Successful HTTP requests consumed by the latest round.
+    pub last_round_requests_sent: u64,
     /// Authenticated mirror pages accepted during this process lifetime.
     pub pages_succeeded: u64,
+    /// Successful mirror HTTP requests during this process lifetime.
+    pub requests_sent: u64,
     /// Failed bounded mirror attempts during this process lifetime.
     pub attempts_failed: u64,
     /// Direct-page failures that entered bounded carrier recovery.
@@ -1231,24 +1243,63 @@ impl DirectoryReplicaSyncRuntime {
         succeeded: usize,
         completed_at: u64,
     ) {
-        if completed_at == 0 || succeeded > selected {
+        self.record_full_node_mirror_catch_up_round(
+            candidates,
+            selected,
+            succeeded,
+            0,
+            selected.saturating_sub(succeeded),
+            u64::try_from(succeeded).unwrap_or(u64::MAX),
+            0,
+            completed_at,
+        );
+    }
+
+    /// Records one aggregate bounded multi-page mirror catch-up round.
+    ///
+    /// [MIRROR-CATCHUP 2026-07-24 by Codex] Outcome buckets are mutually
+    /// exclusive at producer level. Page/request totals remain aggregate-only
+    /// and cannot reveal which public producer or carrier served the data.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_full_node_mirror_catch_up_round(
+        &self,
+        candidates: usize,
+        selected: usize,
+        converged: usize,
+        catching_up: usize,
+        failed: usize,
+        pages_succeeded: u64,
+        requests_sent: u64,
+        completed_at: u64,
+    ) {
+        if completed_at == 0
+            || converged
+                .saturating_add(catching_up)
+                .saturating_add(failed)
+                != selected
+        {
             return;
         }
-        let failed = selected.saturating_sub(succeeded);
+        let succeeded = converged.saturating_add(catching_up);
         let mut snapshot = self.full_node_mirror.lock();
         snapshot.rounds = snapshot.rounds.saturating_add(1);
         snapshot.last_round_candidates = u64::try_from(candidates).unwrap_or(u64::MAX);
         snapshot.last_round_selected = u64::try_from(selected).unwrap_or(u64::MAX);
         snapshot.last_round_succeeded = u64::try_from(succeeded).unwrap_or(u64::MAX);
         snapshot.last_round_failed = u64::try_from(failed).unwrap_or(u64::MAX);
+        snapshot.last_round_converged = u64::try_from(converged).unwrap_or(u64::MAX);
+        snapshot.last_round_catching_up = u64::try_from(catching_up).unwrap_or(u64::MAX);
+        snapshot.last_round_pages_succeeded = pages_succeeded;
+        snapshot.last_round_requests_sent = requests_sent;
         snapshot.pages_succeeded = snapshot
             .pages_succeeded
-            .saturating_add(snapshot.last_round_succeeded);
+            .saturating_add(pages_succeeded);
+        snapshot.requests_sent = snapshot.requests_sent.saturating_add(requests_sent);
         snapshot.attempts_failed = snapshot
             .attempts_failed
             .saturating_add(snapshot.last_round_failed);
         snapshot.last_round_at = Some(completed_at);
-        if succeeded > 0 {
+        if pages_succeeded > 0 {
             snapshot.last_success_at = Some(completed_at);
         }
         if failed > 0 {
@@ -8366,13 +8417,22 @@ mod tests {
     #[test]
     fn full_node_mirror_runtime_tracks_only_aggregate_recovery_outcomes() {
         let runtime = DirectoryReplicaSyncRuntime::default();
-        runtime.record_full_node_mirror_round(5, 2, 1, NOW + 1);
+        // [MIRROR-CATCHUP 2026-07-24 by Codex] One producer converges, one
+        // advances under the bounded budget, and one fails after prior pages.
+        runtime.record_full_node_mirror_catch_up_round(5, 3, 1, 1, 1, 7, 11, NOW + 1);
         runtime.record_full_node_mirror_recovery(true, NOW + 2);
         runtime.record_full_node_mirror_recovery(false, NOW + 3);
 
         let snapshot = runtime.full_node_mirror_snapshot();
         assert_eq!(snapshot.rounds, 1);
-        assert_eq!(snapshot.pages_succeeded, 1);
+        assert_eq!(snapshot.last_round_succeeded, 2);
+        assert_eq!(snapshot.last_round_failed, 1);
+        assert_eq!(snapshot.last_round_converged, 1);
+        assert_eq!(snapshot.last_round_catching_up, 1);
+        assert_eq!(snapshot.last_round_pages_succeeded, 7);
+        assert_eq!(snapshot.last_round_requests_sent, 11);
+        assert_eq!(snapshot.pages_succeeded, 7);
+        assert_eq!(snapshot.requests_sent, 11);
         assert_eq!(snapshot.attempts_failed, 1);
         assert_eq!(snapshot.recovery_attempts, 2);
         assert_eq!(snapshot.recovery_succeeded, 1);
@@ -8380,6 +8440,19 @@ mod tests {
         assert_eq!(snapshot.last_recovery_attempt_at, Some(NOW + 3));
         assert_eq!(snapshot.last_recovery_success_at, Some(NOW + 2));
         assert_eq!(snapshot.last_recovery_failure_at, Some(NOW + 3));
+    }
+
+    #[test]
+    fn legacy_full_node_mirror_round_recording_remains_compatible() {
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        runtime.record_full_node_mirror_round(4, 2, 1, NOW + 1);
+
+        let snapshot = runtime.full_node_mirror_snapshot();
+        assert_eq!(snapshot.last_round_succeeded, 1);
+        assert_eq!(snapshot.last_round_failed, 1);
+        assert_eq!(snapshot.last_round_converged, 1);
+        assert_eq!(snapshot.last_round_catching_up, 0);
+        assert_eq!(snapshot.pages_succeeded, 1);
     }
 
     #[test]

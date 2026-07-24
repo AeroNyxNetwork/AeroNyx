@@ -39,9 +39,9 @@
 //! - Requests up to eight contiguous blocks per page while the peer-side
 //!   commitment cap preserves the original hydration/body budget.
 //! - Cancels an in-flight round when server shutdown is requested.
-//! - Optionally mirrors one page from a rotating, bounded set of valid public
-//!   discovery peers, using direct-first bounded carrier recovery without
-//!   adding any mirror or carrier to authority checkpoints.
+//! - Optionally mirrors bounded multi-page prefixes from a rotating, bounded
+//!   set of valid public discovery peers, using direct-first bounded carrier
+//!   recovery without adding any mirror or carrier to authority checkpoints.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -72,9 +72,10 @@
 //! 13. Ask missing current pins to retain the opaque current policy head and
 //!     persist only exact accepted signed receipts.
 //! 14. Select verified public mirror candidates, exclude self and authority
-//!     pins, and try the producer directly before at most two public carriers.
-//!     Every imported block remains signed by the original producer; a carrier
-//!     signs only the response envelope and never gains authority.
+//!     pins, and catch each selection up within a strict page, request, and
+//!     wall-clock budget. Try the producer directly before at most two public
+//!     carriers. Every imported block remains signed by the original producer;
+//!     a carrier signs only the response envelope and never gains authority.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -98,6 +99,8 @@
 //!   carrier while serving a recovery request.
 //!
 //! ## Last Modified
+//! `v0.16.0-MirrorBoundedCatchUp` - Added truthful converged/catching-up
+//! outcomes and bounded multi-page mirror synchronization.
 //! `v0.15.2-MirrorRecoveryDeadline` - Allowed audited public carriers to
 //! complete within the bounded producer round.
 //! `v0.15.1-MirrorRecoveryDiagnostics` - Added privacy-safe carrier failure diagnostics.
@@ -213,8 +216,18 @@ pub(crate) const DIRECTORY_SYNC_MAX_PAGES_PER_ROUND: u32 = 8;
 pub(crate) const DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND: u32 = 30;
 /// Permissionless mirror work is intentionally below authority fan-out limits.
 const DIRECTORY_MIRROR_MAX_ATTEMPTS_PER_ROUND: usize = 8;
+/// [MIRROR-CATCHUP 2026-07-24 by Codex] A permissionless producer may advance
+/// several authenticated pages per selection, but never consume the larger
+/// pinned-authority budget in one round.
+pub(crate) const DIRECTORY_MIRROR_MAX_PAGES_PER_PRODUCER_ROUND: u32 = 4;
+/// Successful direct/carrier range and object hydration requests are bounded
+/// independently from the 45-second wall-clock deadline.
+pub(crate) const DIRECTORY_MIRROR_REQUEST_BUDGET_PER_PRODUCER_ROUND: u32 = 24;
 /// One direct mirror failure may try at most two independent public carriers.
 const DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE: usize = 2;
+/// One direct failure and one unsuccessful recovery carrier can precede the
+/// existing worst-case successful carrier page.
+const DIRECTORY_MIRROR_MAX_REQUESTS_PER_PAGE: u32 = DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE + 1;
 /// Keep carrier choice stable within a round while avoiding permanent affinity.
 const DIRECTORY_MIRROR_RECOVERY_ROTATION_SECS: u64 = 5 * 60;
 
@@ -228,6 +241,19 @@ enum DirectoryMirrorPullSource {
 struct DirectoryMirrorPullFailure {
     reason: String,
     recovery_attempted: bool,
+}
+
+/// Aggregate result for one selected permissionless producer.
+///
+/// This deliberately carries no producer, carrier, endpoint, hash, or route.
+/// A producer can make durable progress without yet reaching the signed tip;
+/// that state must be reported as catching up instead of healthy/converged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DirectoryMirrorProducerRoundOutcome {
+    pages_succeeded: u32,
+    requests_sent: u32,
+    converged: bool,
+    failed: bool,
 }
 
 /// Result of one authenticated outbound replica synchronization page.
@@ -641,18 +667,36 @@ impl DirectoryReplicaSyncCoordinator {
             .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
             .collect::<Vec<_>>()
             .await;
-        let succeeded = outcomes.iter().filter(|accepted| **accepted).count();
-        self.runtime.record_full_node_mirror_round(
+        let converged = outcomes.iter().filter(|outcome| outcome.converged).count();
+        let catching_up = outcomes
+            .iter()
+            .filter(|outcome| !outcome.converged && !outcome.failed)
+            .count();
+        let failed = outcomes.iter().filter(|outcome| outcome.failed).count();
+        let pages_succeeded = outcomes.iter().fold(0u64, |total, outcome| {
+            total.saturating_add(u64::from(outcome.pages_succeeded))
+        });
+        let requests_sent = outcomes.iter().fold(0u64, |total, outcome| {
+            total.saturating_add(u64::from(outcome.requests_sent))
+        });
+        self.runtime.record_full_node_mirror_catch_up_round(
             candidate_count,
             selected,
-            succeeded,
+            converged,
+            catching_up,
+            failed,
+            pages_succeeded,
+            requests_sent,
             unix_now_secs(),
         );
         debug!(
             candidates = candidate_count,
             selected,
-            succeeded,
-            failed = selected.saturating_sub(succeeded),
+            converged,
+            catching_up,
+            failed,
+            pages_succeeded,
+            requests_sent,
             retained = retained_set.len(),
             capacity = self.full_node_mirror_max_producers,
             "[DIRECTORY_REPLICA] Full-node Mirror round completed"
@@ -663,40 +707,82 @@ impl DirectoryReplicaSyncCoordinator {
         &self,
         producer: [u8; 32],
         descriptor_sequence: u64,
-    ) -> bool {
-        let result = tokio::time::timeout(
-            Duration::from_secs(DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS),
-            pull_directory_chain_mirror_page_with_recovery(
-                Arc::clone(&self.store),
-                self.peer_store.as_ref(),
-                self.identity.as_ref(),
-                &producer,
-                descriptor_sequence,
-                self.full_node_mirror_max_producers,
-                &self.client,
-            ),
-        )
-        .await;
-        match result {
-            Ok(Ok((_, DirectoryMirrorPullSource::DirectProducer))) => true,
-            Ok(Ok((_, DirectoryMirrorPullSource::PublicCarrier))) => {
+    ) -> DirectoryMirrorProducerRoundOutcome {
+        // [MIRROR-CATCHUP 2026-07-24 by Codex] Use one absolute deadline for
+        // every page so a slow carrier cannot multiply the producer budget.
+        // Completed page metrics remain available if a later page times out.
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS);
+        let mut round = DirectoryMirrorProducerRoundOutcome::default();
+        loop {
+            let result = tokio::time::timeout_at(
+                deadline,
+                pull_directory_chain_mirror_page_with_recovery(
+                    Arc::clone(&self.store),
+                    self.peer_store.as_ref(),
+                    self.identity.as_ref(),
+                    &producer,
+                    descriptor_sequence,
+                    self.full_node_mirror_max_producers,
+                    &self.client,
+                ),
+            )
+            .await;
+            let (outcome, source) = match result {
+                Ok(Ok(value)) => value,
+                Ok(Err(failure)) => {
+                    if failure.recovery_attempted {
+                        self.runtime
+                            .record_full_node_mirror_recovery(false, unix_now_secs());
+                    }
+                    debug!(
+                        reason = failure.reason,
+                        recovery_attempted = failure.recovery_attempted,
+                        pages_succeeded = round.pages_succeeded,
+                        requests_sent = round.requests_sent,
+                        "[DIRECTORY_REPLICA] Full-node Mirror pull rejected"
+                    );
+                    round.failed = true;
+                    return round;
+                }
+                Err(_) => {
+                    debug!(
+                        reason = "directory_mirror_producer_round_timeout",
+                        pages_succeeded = round.pages_succeeded,
+                        requests_sent = round.requests_sent,
+                        "[DIRECTORY_REPLICA] Full-node Mirror catch-up deadline reached"
+                    );
+                    round.failed = true;
+                    return round;
+                }
+            };
+            round.pages_succeeded = round.pages_succeeded.saturating_add(1);
+            round.requests_sent = round.requests_sent.saturating_add(outcome.requests_made);
+            if source == DirectoryMirrorPullSource::PublicCarrier {
                 self.runtime
                     .record_full_node_mirror_recovery(true, unix_now_secs());
-                true
             }
-            Ok(Err(failure)) => {
-                if failure.recovery_attempted {
-                    self.runtime
-                        .record_full_node_mirror_recovery(false, unix_now_secs());
-                }
-                debug!(
-                    reason = failure.reason,
-                    recovery_attempted = failure.recovery_attempted,
-                    "[DIRECTORY_REPLICA] Full-node Mirror pull rejected"
+            if directory_sync_outcome_is_checkpoint_complete(&outcome) {
+                round.converged = true;
+                return round;
+            }
+            if !outcome.has_more {
+                warn!(
+                    reason = "directory_mirror_terminal_page_not_converged",
+                    pages_succeeded = round.pages_succeeded,
+                    requests_sent = round.requests_sent,
+                    "[DIRECTORY_REPLICA] Full-node Mirror terminal page failed convergence"
                 );
-                false
+                round.failed = true;
+                return round;
             }
-            Err(_) => false,
+            if !should_continue_directory_mirror_catch_up(
+                round.pages_succeeded,
+                round.requests_sent,
+                outcome.has_more,
+            ) {
+                return round;
+            }
         }
     }
 
@@ -1521,6 +1607,11 @@ async fn pull_directory_chain_mirror_page_with_recovery(
     {
         Ok(outcome) => Ok((outcome, DirectoryMirrorPullSource::DirectProducer)),
         Err(reason) if directory_mirror_failure_allows_recovery(&reason) => {
+            // [MIRROR-CATCHUP 2026-07-24 by Codex] Conservatively reserve one
+            // request for the direct attempt even when endpoint validation may
+            // have failed before transport. Each retryable carrier failure can
+            // consume at most its range request before another carrier is used.
+            let mut prior_requests = 1u32;
             let carriers = directory_mirror_recovery_carriers(
                 peer_store,
                 producer,
@@ -1541,14 +1632,14 @@ async fn pull_directory_chain_mirror_page_with_recovery(
                 .await
                 {
                     Ok(mut outcome) => {
-                        // Conservatively account for the failed direct range
-                        // request without retaining the selected carrier.
-                        outcome.requests_made = outcome.requests_made.saturating_add(1);
+                        outcome.requests_made =
+                            outcome.requests_made.saturating_add(prior_requests);
                         return Ok((outcome, DirectoryMirrorPullSource::PublicCarrier));
                     }
                     Err(carrier_reason)
                         if directory_mirror_failure_allows_recovery(&carrier_reason) =>
                     {
+                        prior_requests = prior_requests.saturating_add(1);
                         debug!(
                             reason = carrier_reason,
                             "[DIRECTORY_REPLICA] Full-node Mirror recovery carrier unavailable"
@@ -1806,6 +1897,17 @@ fn directory_mirror_failure_allows_recovery(reason: &str) -> bool {
         return matches!(status, 403 | 404 | 408 | 429) || status >= 500;
     }
     false
+}
+
+fn should_continue_directory_mirror_catch_up(
+    pages_completed: u32,
+    requests_used: u32,
+    has_more: bool,
+) -> bool {
+    has_more
+        && pages_completed < DIRECTORY_MIRROR_MAX_PAGES_PER_PRODUCER_ROUND
+        && requests_used.saturating_add(DIRECTORY_MIRROR_MAX_REQUESTS_PER_PAGE)
+            <= DIRECTORY_MIRROR_REQUEST_BUDGET_PER_PRODUCER_ROUND
 }
 
 fn directory_mirror_recovery_carriers(
@@ -2823,6 +2925,34 @@ mod tests {
         ] {
             assert!(!directory_mirror_failure_allows_recovery(reason));
         }
+    }
+
+    #[test]
+    fn mirror_catch_up_stops_at_page_request_or_convergence_boundaries() {
+        // [MIRROR-CATCHUP 2026-07-24 by Codex] Permissionless work must remain
+        // strictly below the pinned producer budget.
+        assert!(DIRECTORY_MIRROR_MAX_PAGES_PER_PRODUCER_ROUND < DIRECTORY_SYNC_MAX_PAGES_PER_ROUND);
+        assert!(
+            DIRECTORY_MIRROR_REQUEST_BUDGET_PER_PRODUCER_ROUND
+                < DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND
+        );
+        assert!(
+            DIRECTORY_MIRROR_MAX_REQUESTS_PER_PAGE
+                <= DIRECTORY_MIRROR_REQUEST_BUDGET_PER_PRODUCER_ROUND
+        );
+        assert!(should_continue_directory_mirror_catch_up(1, 1, true));
+        assert!(should_continue_directory_mirror_catch_up(1, 5, true));
+        assert!(!should_continue_directory_mirror_catch_up(1, 1, false));
+        assert!(!should_continue_directory_mirror_catch_up(
+            DIRECTORY_MIRROR_MAX_PAGES_PER_PRODUCER_ROUND,
+            1,
+            true
+        ));
+        assert!(!should_continue_directory_mirror_catch_up(
+            1,
+            6,
+            true
+        ));
     }
 
     #[test]
