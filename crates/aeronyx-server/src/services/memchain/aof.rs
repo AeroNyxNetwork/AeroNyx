@@ -4,7 +4,7 @@
 //! # AOF — Append-Only File Storage
 //!
 //! ## Creation Reason
-//! Provides durable, crash-safe persistence for MemChain Facts and Blocks
+//! Provides durable, crash-safe persistence for `MemChain` Facts and Blocks
 //! using a simple append-only binary file (`.memchain`).
 //!
 //! ## Modification Reason
@@ -18,6 +18,9 @@
 //! - v0.7.0-TornTailRecovery: Unified record framing for replay and startup
 //!   recovery. A partial physical tail is truncated to the last complete
 //!   record; fully framed corruption remains a fail-closed startup error.
+//! - v0.8.0-SemanticIntegrity: Validate content-addressed Fact identifiers,
+//!   Block Merkle roots, and Block ancestry without changing the disk format.
+//!   Added a read-only aggregate verification report for operator tooling.
 //!
 //! ## On-Disk Record Format (v0.5.0)
 //! ```text
@@ -40,10 +43,12 @@
 //!
 //! ## Crash Safety
 //! - Writes are followed by `flush()`.
-//! - Trailing partial records are detected + skipped during `replay()`.
+//! - Replay reports trailing partial records; append-open repairs only that
+//!   incomplete physical tail before accepting another write.
 //!
 //! ## ⚠️ Important Note for Next Developer
-//! - NEVER truncate or rewrite the `.memchain` file.
+//! - NEVER truncate or rewrite the `.memchain` file except through the
+//!   exact torn-tail recovery path after a complete semantic scan.
 //! - Tag bytes 0x01/0x02 are stable contracts.
 //! - `last_block_hash` / `last_block_height` are in-memory caches
 //!   populated during `replay()` and updated by `append_block()`.
@@ -53,12 +58,22 @@
 //! - [AOF-TORN-TAIL-RECOVERY 2026-07-24 by Codex] Repair only an incomplete
 //!   physical tail. Do not silently truncate or skip a complete corrupt record;
 //!   operators must retain evidence and choose an explicit recovery action.
+//! - [AOF-SEMANTIC-INTEGRITY 2026-07-24 by Codex] Keep semantic validation
+//!   independent from framing. The existing bytes are a rollback contract;
+//!   content IDs, Merkle roots, and ancestry provide compatible integrity
+//!   checks while a future frame migration is designed separately.
 //!
 //! ## Last Modified
+//! v0.8.0-SemanticIntegrity - Added semantic scanning and aggregate verification
 //! v0.7.0-TornTailRecovery - Added shared framing and fail-closed startup recovery
 //! v0.6.0-BoundedRecords - Added symmetric record bounds and canonical replay decoding
-//! v0.2.0 - Initial AOF writer for MemChain fact persistence
+//! v0.2.0 - Initial AOF writer for `MemChain` fact persistence
 //! v0.5.0 - 🌟 Added Block storage, record tags, chain state tracking
+
+// [AOF-LEGACY-WIRE 2026-07-24 by Codex] The deprecated Block type is the
+// persisted v0.5 wire contract. Migrating it in place would make rollback
+// binaries unable to read the AOF, so deprecation is intentionally scoped here.
+#![allow(deprecated)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,7 +85,7 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{debug, info, warn};
 
-use aeronyx_core::ledger::{Block, BlockHeader, Fact, GENESIS_PREV_HASH};
+use aeronyx_core::ledger::{merkle_root, Block, BlockHeader, Fact, GENESIS_PREV_HASH};
 
 // ============================================
 // Constants
@@ -91,6 +106,31 @@ const TAG_FACT: u8 = 0x01;
 /// Record tag: Block.
 const TAG_BLOCK: u8 = 0x02;
 
+/// Privacy-safe result of a read-only AOF integrity scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AofVerificationReport {
+    /// Total bytes observed when the scan started.
+    pub file_bytes: u64,
+    /// Bytes belonging to complete, semantically valid records.
+    pub valid_bytes: u64,
+    /// Number of standalone Fact records.
+    pub fact_records: u64,
+    /// Number of Block records.
+    pub block_records: u64,
+    /// Height of the last valid Block, or zero when no Block exists.
+    pub last_block_height: u64,
+    /// Incomplete physical tail bytes; zero means the file ended cleanly.
+    pub torn_tail_bytes: u64,
+}
+
+impl AofVerificationReport {
+    /// Returns true when every byte belongs to a complete valid record.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.torn_tail_bytes == 0 && self.valid_bytes == self.file_bytes
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AofRecordKind {
     Fact,
@@ -109,11 +149,22 @@ enum AofFrameRead {
     TornTail,
 }
 
+struct AofScanResult {
+    facts: Vec<Fact>,
+    last_block: Option<BlockHeader>,
+    report: AofVerificationReport,
+}
+
+struct AofRecovery {
+    recovered_bytes: u64,
+    last_block: Option<BlockHeader>,
+}
+
 // ============================================
 // AofWriter
 // ============================================
 
-/// Append-only file writer for MemChain Fact and Block persistence.
+/// Append-only file writer for `MemChain` Fact and Block persistence.
 ///
 /// # Thread Safety
 /// `AofWriter` is **not** `Sync` by itself (it wraps `BufWriter<File>`).
@@ -133,17 +184,30 @@ pub struct AofWriter {
 
 impl AofWriter {
     /// Opens (or creates) the append-only ledger file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be inspected or opened, or when a
+    /// complete existing record fails framing or semantic integrity checks.
     pub async fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let recovered_bytes = repair_torn_tail(&path).await?;
+        let recovery = repair_torn_tail(&path).await?;
 
-        if recovered_bytes > 0 {
+        if recovery.recovered_bytes > 0 {
             warn!(
                 path = %path.display(),
-                recovered_bytes,
+                recovered_bytes = recovery.recovered_bytes,
                 "[AOF] Recovered incomplete physical tail before opening for append"
             );
         }
+        let last_block_hash = recovery
+            .last_block
+            .as_ref()
+            .map_or(GENESIS_PREV_HASH, BlockHeader::hash);
+        let last_block_height = recovery
+            .last_block
+            .as_ref()
+            .map_or(0, |header| header.height);
 
         let file = OpenOptions::new()
             .create(true)
@@ -160,15 +224,21 @@ impl AofWriter {
             writer: BufWriter::new(file),
             path,
             write_count: AtomicU64::new(0),
-            last_block_hash: RwLock::new(GENESIS_PREV_HASH),
-            last_block_height: RwLock::new(0),
+            last_block_hash: RwLock::new(last_block_hash),
+            last_block_height: RwLock::new(last_block_height),
         })
     }
 
     /// Appends a single Fact to the ledger file.
     ///
     /// Record format: `[TAG_FACT (1)][length: u32 LE (4)][bincode payload]`
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when the Fact identifier does not match its
+    /// content, or an I/O error when encoding, writing, or flushing fails.
     pub async fn append_fact(&mut self, fact: &Fact) -> std::io::Result<()> {
+        validate_fact_integrity(fact).map_err(invalid_append_error)?;
         let payload_len = self.append_record(TAG_FACT, fact).await?;
 
         debug!(
@@ -184,7 +254,19 @@ impl AofWriter {
     /// Record format: `[TAG_BLOCK (1)][length: u32 LE (4)][bincode payload]`
     ///
     /// Also updates the in-memory `last_block_hash` and `last_block_height`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when Fact identifiers, the Merkle root, height,
+    /// or previous Block hash are inconsistent, or an I/O error on persistence.
     pub async fn append_block(&mut self, block: &Block) -> std::io::Result<()> {
+        validate_block_payload(block).map_err(invalid_append_error)?;
+        let expected_height = self
+            .last_block_height()
+            .checked_add(1)
+            .ok_or_else(|| invalid_append_error("Block height overflow"))?;
+        validate_expected_parent(block, expected_height, self.last_block_hash())
+            .map_err(invalid_append_error)?;
         self.append_record(TAG_BLOCK, block).await?;
 
         // Update chain state
@@ -207,7 +289,11 @@ impl AofWriter {
     }
 
     /// Serializes and appends one canonical bounded record.
-    async fn append_record<T: Serialize>(&mut self, tag: u8, value: &T) -> std::io::Result<usize> {
+    async fn append_record<T: Serialize + Sync>(
+        &mut self,
+        tag: u8,
+        value: &T,
+    ) -> std::io::Result<usize> {
         let payload = serialize_record(value)?;
         let length = u32::try_from(payload.len()).map_err(|_| {
             std::io::Error::new(
@@ -226,61 +312,49 @@ impl AofWriter {
 
     /// Replays all records from the ledger file.
     ///
-    /// Returns Facts (for MemPool rehydration). Blocks are processed
+    /// Returns Facts (for `MemPool` rehydration). Blocks are processed
     /// internally to rebuild `last_block_hash` / `last_block_height`.
     ///
     /// Supports both:
     /// - **v0.5.0 format**: `[tag][u32 LE length][payload]`
     /// - **v0.3.0 legacy format**: `[u32 LE length][payload]` (tag-less, all Facts)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or when a complete record
+    /// fails framing, decoding, content-address, Merkle, or ancestry checks.
     pub async fn replay(
         path: impl AsRef<Path>,
     ) -> std::io::Result<(Vec<Fact>, Option<BlockHeader>)> {
         let path = path.as_ref();
-
-        if !path.exists() {
-            info!(
-                path = %path.display(),
-                "[AOF] No existing ledger file, starting fresh"
+        let scan = scan_aof(path, true).await?;
+        if scan.report.torn_tail_bytes > 0 {
+            warn!(
+                offset = scan.report.valid_bytes,
+                file_len = scan.report.file_bytes,
+                torn_tail_bytes = scan.report.torn_tail_bytes,
+                "[AOF] Incomplete physical tail found during replay; append-open will repair it"
             );
-            return Ok((Vec::new(), None));
-        }
-
-        let file_len = tokio::fs::metadata(path).await?.len();
-        let file = File::open(path).await?;
-        let mut reader = BufReader::new(file);
-        let mut facts = Vec::new();
-        let mut last_block: Option<BlockHeader> = None;
-        let mut offset: u64 = 0;
-
-        loop {
-            match read_next_frame(&mut reader, offset, file_len).await? {
-                AofFrameRead::Complete(frame) => {
-                    match decode_frame(frame.kind, &frame.payload, offset)? {
-                        DecodedAofRecord::Fact(fact) => facts.push(fact),
-                        DecodedAofRecord::Block(header) => last_block = Some(header),
-                    }
-                    offset = frame.next_offset;
-                }
-                AofFrameRead::CleanEof => break,
-                AofFrameRead::TornTail => {
-                    warn!(
-                        offset = offset,
-                        file_len,
-                        "[AOF] Incomplete physical tail found during replay; append-open will repair it"
-                    );
-                    break;
-                }
-            }
         }
 
         info!(
             path = %path.display(),
-            facts_loaded = facts.len(),
-            last_block_height = last_block.as_ref().map_or(0, |b| b.height),
+            facts_loaded = scan.facts.len(),
+            last_block_height = scan.last_block.as_ref().map_or(0, |b| b.height),
             "[AOF] ✅ Ledger replay complete"
         );
 
-        Ok((facts, last_block))
+        Ok((scan.facts, scan.last_block))
+    }
+
+    /// Performs a read-only framing, content-address, Merkle, and ancestry scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or when a complete record
+    /// fails framing, decoding, content-address, Merkle, or ancestry checks.
+    pub async fn verify(path: impl AsRef<Path>) -> std::io::Result<AofVerificationReport> {
+        Ok(scan_aof(path.as_ref(), false).await?.report)
     }
 
     /// Returns the number of records written in this session.
@@ -326,7 +400,89 @@ impl AofWriter {
 
 enum DecodedAofRecord {
     Fact(Fact),
-    Block(BlockHeader),
+    Block(Block),
+}
+
+/// Scans framing and semantic integrity without mutating the AOF.
+async fn scan_aof(path: &Path, retain_facts: bool) -> std::io::Result<AofScanResult> {
+    if !path.exists() {
+        info!(
+            path = %path.display(),
+            "[AOF] No existing ledger file, starting fresh"
+        );
+        return Ok(AofScanResult {
+            facts: Vec::new(),
+            last_block: None,
+            report: AofVerificationReport {
+                file_bytes: 0,
+                valid_bytes: 0,
+                fact_records: 0,
+                block_records: 0,
+                last_block_height: 0,
+                torn_tail_bytes: 0,
+            },
+        });
+    }
+
+    let file_len = tokio::fs::metadata(path).await?.len();
+    let file = File::open(path).await?;
+    let mut reader = BufReader::new(file);
+    let mut facts = Vec::new();
+    let mut last_block: Option<BlockHeader> = None;
+    let mut fact_records = 0_u64;
+    let mut block_records = 0_u64;
+    let mut offset = 0_u64;
+    let mut torn_tail_bytes = 0_u64;
+
+    loop {
+        match read_next_frame(&mut reader, offset, file_len).await? {
+            AofFrameRead::Complete(frame) => {
+                match decode_frame(frame.kind, &frame.payload, offset)? {
+                    DecodedAofRecord::Fact(fact) => {
+                        validate_fact_integrity(&fact)
+                            .map_err(|detail| invalid_record_error(offset, detail))?;
+                        fact_records = fact_records.saturating_add(1);
+                        if retain_facts {
+                            facts.push(fact);
+                        }
+                    }
+                    DecodedAofRecord::Block(block) => {
+                        validate_block_payload(&block)
+                            .map_err(|detail| invalid_record_error(offset, detail))?;
+                        if let Some(previous) = last_block.as_ref() {
+                            let expected_height =
+                                previous.height.checked_add(1).ok_or_else(|| {
+                                    invalid_record_error(offset, "Block height overflow")
+                                })?;
+                            validate_expected_parent(&block, expected_height, previous.hash())
+                                .map_err(|detail| invalid_record_error(offset, detail))?;
+                        }
+                        block_records = block_records.saturating_add(1);
+                        last_block = Some(block.header);
+                    }
+                }
+                offset = frame.next_offset;
+            }
+            AofFrameRead::CleanEof => break,
+            AofFrameRead::TornTail => {
+                torn_tail_bytes = file_len.saturating_sub(offset);
+                break;
+            }
+        }
+    }
+
+    Ok(AofScanResult {
+        facts,
+        report: AofVerificationReport {
+            file_bytes: file_len,
+            valid_bytes: offset,
+            fact_records,
+            block_records,
+            last_block_height: last_block.as_ref().map_or(0, |header| header.height),
+            torn_tail_bytes,
+        },
+        last_block,
+    })
 }
 
 /// Reads exactly one tagged or legacy frame without interpreting its payload.
@@ -434,7 +590,7 @@ fn decode_frame(
                 invalid_record_error(offset, format!("invalid Fact payload: {error}"))
             }),
         AofRecordKind::Block => deserialize_record::<Block>(payload)
-            .map(|block| DecodedAofRecord::Block(block.header))
+            .map(DecodedAofRecord::Block)
             .map_err(|error| {
                 invalid_record_error(offset, format!("invalid Block payload: {error}"))
             }),
@@ -442,36 +598,64 @@ fn decode_frame(
 }
 
 /// Removes only a partial physical tail left by an interrupted append.
-async fn repair_torn_tail(path: &Path) -> std::io::Result<u64> {
-    if !path.exists() {
-        return Ok(0);
+async fn repair_torn_tail(path: &Path) -> std::io::Result<AofRecovery> {
+    let scan = scan_aof(path, false).await?;
+    if scan.report.torn_tail_bytes > 0 {
+        let file = OpenOptions::new().read(true).write(true).open(path).await?;
+        file.set_len(scan.report.valid_bytes).await?;
+        file.sync_data().await?;
     }
 
-    let file_len = tokio::fs::metadata(path).await?.len();
-    if file_len == 0 {
-        return Ok(0);
+    Ok(AofRecovery {
+        recovered_bytes: scan.report.torn_tail_bytes,
+        last_block: scan.last_block,
+    })
+}
+
+fn validate_fact_integrity(fact: &Fact) -> Result<(), String> {
+    if fact.verify_id() {
+        Ok(())
+    } else {
+        Err("Fact content does not match fact_id".to_string())
+    }
+}
+
+fn validate_block_payload(block: &Block) -> Result<(), String> {
+    for (index, fact) in block.facts.iter().enumerate() {
+        validate_fact_integrity(fact)
+            .map_err(|detail| format!("Block Fact index {index} is invalid: {detail}"))?;
     }
 
-    let file = OpenOptions::new().read(true).write(true).open(path).await?;
-    let mut reader = BufReader::new(file);
-    let mut offset = 0_u64;
-
-    loop {
-        match read_next_frame(&mut reader, offset, file_len).await? {
-            AofFrameRead::Complete(frame) => {
-                decode_frame(frame.kind, &frame.payload, offset)?;
-                offset = frame.next_offset;
-            }
-            AofFrameRead::CleanEof => return Ok(0),
-            AofFrameRead::TornTail => {
-                let recovered_bytes = file_len.saturating_sub(offset);
-                let file = reader.into_inner();
-                file.set_len(offset).await?;
-                file.sync_data().await?;
-                return Ok(recovered_bytes);
-            }
-        }
+    let fact_ids: Vec<[u8; 32]> = block.facts.iter().map(|fact| fact.fact_id).collect();
+    if merkle_root(&fact_ids) != block.header.merkle_root {
+        return Err("Block Merkle root does not match contained Facts".to_string());
     }
+
+    Ok(())
+}
+
+fn validate_expected_parent(
+    block: &Block,
+    expected_height: u64,
+    expected_prev_hash: [u8; 32],
+) -> Result<(), String> {
+    if block.header.height != expected_height {
+        return Err(format!(
+            "Block height {} does not follow expected height {expected_height}",
+            block.header.height
+        ));
+    }
+    if block.header.prev_block_hash != expected_prev_hash {
+        return Err("Block previous hash does not match accepted AOF prefix".to_string());
+    }
+    Ok(())
+}
+
+fn invalid_append_error(detail: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("refusing invalid AOF append: {detail}"),
+    )
 }
 
 fn invalid_record_error(offset: u64, detail: impl std::fmt::Display) -> std::io::Error {
@@ -531,16 +715,30 @@ mod tests {
         Fact::new(ts, subject.into(), "pred".into(), "obj".into())
     }
 
-    fn make_block(height: u64, facts: Vec<Fact>) -> Block {
+    fn make_linked_block(height: u64, previous_hash: [u8; 32], facts: Vec<Fact>) -> Block {
         let leaf_ids: Vec<[u8; 32]> = facts.iter().map(|f| f.fact_id).collect();
         let header = BlockHeader {
             height,
             timestamp: 1_700_000_000,
-            prev_block_hash: GENESIS_PREV_HASH,
+            prev_block_hash: previous_hash,
             merkle_root: merkle_root(&leaf_ids),
             block_type: BLOCK_TYPE_NORMAL,
         };
         Block::new(header, facts)
+    }
+
+    fn make_block(height: u64, facts: Vec<Fact>) -> Block {
+        make_linked_block(height, GENESIS_PREV_HASH, facts)
+    }
+
+    fn tagged_frame<T: Serialize>(tag: u8, value: &T) -> Vec<u8> {
+        let payload = serialize_record(value).expect("serialize frame");
+        let length = u32::try_from(payload.len()).expect("test frame length");
+        let mut frame = Vec::with_capacity(1 + LENGTH_PREFIX_SIZE + payload.len());
+        frame.push(tag);
+        frame.extend_from_slice(&length.to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame
     }
 
     #[tokio::test]
@@ -609,6 +807,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_append_rejects_fact_with_mismatched_content_id() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(DEFAULT_AOF_FILENAME);
+        let mut tampered = make_fact(100, "original");
+        tampered.subject = "tampered".to_string();
+        let mut writer = AofWriter::open(&path).await.expect("open");
+
+        let error = writer
+            .append_fact(&tampered)
+            .await
+            .expect_err("mismatched content id must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(writer.write_count(), 0);
+        assert_eq!(tokio::fs::metadata(&path).await.expect("metadata").len(), 0);
+    }
+
+    #[tokio::test]
     async fn test_open_repairs_torn_tail_before_future_appends() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join(DEFAULT_AOF_FILENAME);
@@ -674,6 +890,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_verify_rejects_semantically_tampered_fact() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(DEFAULT_AOF_FILENAME);
+        let mut tampered = make_fact(100, "original");
+        tampered.subject = "tampered".to_string();
+        tokio::fs::write(&path, tagged_frame(TAG_FACT, &tampered))
+            .await
+            .expect("write tampered Fact");
+
+        let error = AofWriter::verify(&path)
+            .await
+            .expect_err("semantic tampering must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match fact_id"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_rejects_block_merkle_tampering() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(DEFAULT_AOF_FILENAME);
+        let mut block = make_block(1, vec![make_fact(100, "fact")]);
+        block.header.merkle_root[0] ^= 0x80;
+        tokio::fs::write(&path, tagged_frame(TAG_BLOCK, &block))
+            .await
+            .expect("write tampered Block");
+
+        let error = AofWriter::verify(&path)
+            .await
+            .expect_err("Merkle tampering must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("Merkle root"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_rejects_broken_block_ancestry() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(DEFAULT_AOF_FILENAME);
+        let first = make_block(1, vec![make_fact(100, "first")]);
+        let second = make_linked_block(2, GENESIS_PREV_HASH, vec![make_fact(200, "second")]);
+        let mut bytes = tagged_frame(TAG_BLOCK, &first);
+        bytes.extend_from_slice(&tagged_frame(TAG_BLOCK, &second));
+        tokio::fs::write(&path, bytes)
+            .await
+            .expect("write broken chain");
+
+        let error = AofWriter::verify(&path)
+            .await
+            .expect_err("broken ancestry must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("previous hash"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_reports_torn_tail_without_mutating_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(DEFAULT_AOF_FILENAME);
+        let frame = tagged_frame(TAG_FACT, &make_fact(100, "valid"));
+        let mut bytes = frame.clone();
+        bytes.extend_from_slice(&[TAG_BLOCK, 8, 0]);
+        tokio::fs::write(&path, &bytes)
+            .await
+            .expect("write torn file");
+
+        let report = AofWriter::verify(&path).await.expect("verify");
+
+        assert!(!report.is_clean());
+        assert_eq!(report.file_bytes, bytes.len() as u64);
+        assert_eq!(report.valid_bytes, frame.len() as u64);
+        assert_eq!(report.fact_records, 1);
+        assert_eq!(report.block_records, 0);
+        assert_eq!(report.torn_tail_bytes, 3);
+        assert_eq!(
+            tokio::fs::metadata(&path).await.expect("metadata").len(),
+            bytes.len() as u64,
+            "read-only verification must not repair the file"
+        );
+    }
+
+    #[tokio::test]
     async fn test_append_block_and_replay() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join(DEFAULT_AOF_FILENAME);
@@ -694,6 +992,30 @@ mod tests {
         assert_eq!(facts.len(), 1);
         let header = last_block.expect("should have block");
         assert_eq!(header.height, 1);
+    }
+
+    #[tokio::test]
+    async fn test_reopen_restores_chain_state_without_manual_setter() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(DEFAULT_AOF_FILENAME);
+        let first = make_block(1, vec![make_fact(100, "first")]);
+        {
+            let mut writer = AofWriter::open(&path).await.expect("open");
+            writer.append_block(&first).await.expect("append first");
+        }
+
+        let second = make_linked_block(2, first.header.hash(), vec![make_fact(200, "second")]);
+        {
+            let mut writer = AofWriter::open(&path).await.expect("reopen");
+            assert_eq!(writer.last_block_height(), 1);
+            assert_eq!(writer.last_block_hash(), first.header.hash());
+            writer.append_block(&second).await.expect("append second");
+        }
+
+        let report = AofWriter::verify(&path).await.expect("verify");
+        assert!(report.is_clean());
+        assert_eq!(report.block_records, 2);
+        assert_eq!(report.last_block_height, 2);
     }
 
     #[tokio::test]

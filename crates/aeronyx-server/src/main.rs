@@ -15,6 +15,8 @@
 //!   constructing Server, closing the first-start unauthenticated window.
 //! - v1.2.0-DirectoryReplicaQuarantineResolution: add host-local incident
 //!   inspection and node-identity-signed compare-and-swap resolution commands.
+//! - v1.3.0-AofIntegrityCommand: add a read-only, privacy-safe MemChain AOF
+//!   verification command for framing, semantic, Merkle, and ancestry checks.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -25,6 +27,7 @@
 //! v1.1.0-SectionSafeAuth - Resolve/migrate API secret before server startup
 //! v1.2.0-DirectoryReplicaQuarantineResolution - Add audited host-local
 //! quarantine inspection and resolution without exposing a mutation API
+//! v1.3.0-AofIntegrityCommand - Add aggregate-only `memchain verify-aof`
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,7 +42,7 @@ use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_server::api::auth::ensure_api_secret;
 use aeronyx_server::management::models::StoredNodeInfo;
 use aeronyx_server::services::{
-    DirectoryReplicaResolutionCommand, DirectoryReplicaStore, DirectoryReplicaTip,
+    AofWriter, DirectoryReplicaResolutionCommand, DirectoryReplicaStore, DirectoryReplicaTip,
 };
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
 
@@ -94,6 +97,10 @@ enum Commands {
         config: PathBuf,
     },
 
+    /// Inspect MemChain persistence without exposing memory contents
+    #[command(subcommand)]
+    Memchain(MemchainCommands),
+
     /// Show node public key (for troubleshooting)
     #[command(hide = true)]
     Pubkey {
@@ -109,6 +116,20 @@ enum Commands {
     /// Inspect or resolve a quarantined Directory Replica producer locally
     #[command(subcommand)]
     DirectoryReplica(DirectoryReplicaCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum MemchainCommands {
+    /// Verify AOF framing, content IDs, Merkle roots, and Block ancestry
+    VerifyAof {
+        /// Optional AOF path override
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Path to configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -178,6 +199,7 @@ async fn main() {
         Commands::Start { config } => cmd_start(config).await,
         Commands::Status { config } => cmd_status(config).await,
         Commands::Validate { config } => cmd_validate(config).await,
+        Commands::Memchain(command) => cmd_memchain(command).await,
         Commands::Pubkey { config, format } => cmd_pubkey(config, format).await,
         Commands::DirectoryReplica(command) => cmd_directory_replica(command).await,
     };
@@ -501,6 +523,62 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     }
     println!();
 
+    Ok(())
+}
+
+/// Runs read-only `MemChain` operator commands.
+async fn cmd_memchain(command: MemchainCommands) -> anyhow::Result<()> {
+    match command {
+        MemchainCommands::VerifyAof { path, config } => {
+            cmd_memchain_verify_aof(&config, path).await
+        }
+    }
+}
+
+/// Verifies only aggregate AOF integrity and never prints record contents.
+async fn cmd_memchain_verify_aof(
+    config_path: &PathBuf,
+    path_override: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let path = if let Some(path) = path_override {
+        path
+    } else {
+        let config = if config_path.exists() {
+            ServerConfig::load(config_path).await?
+        } else {
+            ServerConfig::default()
+        };
+        PathBuf::from(config.memchain.aof_path)
+    };
+    let report = AofWriter::verify(&path)
+        .await
+        .with_context(|| format!("verify MemChain AOF {}", path.display()))?;
+
+    // [AOF-INTEGRITY-CLI 2026-07-24 by Codex] This output is deliberately
+    // aggregate-only. Never add Fact values, identities, hashes, signatures,
+    // or record-level offsets to the operator command.
+    println!("MemChain AOF integrity");
+    println!("  path: {}", path.display());
+    println!("  file_bytes: {}", report.file_bytes);
+    println!("  valid_bytes: {}", report.valid_bytes);
+    println!("  fact_records: {}", report.fact_records);
+    println!("  block_records: {}", report.block_records);
+    println!("  last_block_height: {}", report.last_block_height);
+    println!("  torn_tail_bytes: {}", report.torn_tail_bytes);
+    println!(
+        "  status: {}",
+        if report.is_clean() {
+            "verified"
+        } else {
+            "torn_tail_detected"
+        }
+    );
+    println!("  privacy: aggregate integrity metadata only; no record contents or identities");
+
+    anyhow::ensure!(
+        report.is_clean(),
+        "AOF has an incomplete physical tail; start the node through the guarded recovery path"
+    );
     Ok(())
 }
 
@@ -928,5 +1006,21 @@ mod tests {
         assert_eq!(parse_hex32(&"a5".repeat(32), "test").unwrap(), [0xa5; 32]);
         assert!(parse_hex32(&"a5".repeat(31), "test").is_err());
         assert!(parse_hex32(&format!("{}gg", "a5".repeat(31)), "test").is_err());
+    }
+
+    #[test]
+    fn memchain_verify_aof_cli_accepts_explicit_read_only_path() {
+        let cli = Cli::try_parse_from([
+            "aeronyx-server",
+            "memchain",
+            "verify-aof",
+            "--path",
+            "/tmp/test.memchain",
+        ])
+        .unwrap();
+        let Commands::Memchain(MemchainCommands::VerifyAof { path, .. }) = cli.command else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(path, Some(PathBuf::from("/tmp/test.memchain")));
     }
 }
