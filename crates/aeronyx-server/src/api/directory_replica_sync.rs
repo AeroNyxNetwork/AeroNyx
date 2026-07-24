@@ -206,6 +206,9 @@ const DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS: u64 = 60;
 pub(crate) const DIRECTORY_OBSERVATION_WITNESS_MATURITY_INTERVALS: u64 = 1;
 /// Hard response ceiling shared with the core Directory Sync decoder.
 const MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES: usize = 512 * 1024;
+/// Peer protocol errors are fixed ASCII codes. Keep non-success reads tiny so
+/// an unauthenticated endpoint cannot turn diagnostics into a memory sink.
+const MAX_DIRECTORY_SYNC_ERROR_BODY_BYTES: usize = 128;
 /// Multi-block pages accelerate cold catch-up. Peer handlers cap each returned
 /// page to one block's maximum aggregate commitment budget, so hydration keeps
 /// the same body and request ceiling as the original one-block transport.
@@ -511,21 +514,68 @@ impl DirectoryMirrorCarrierCapabilityCache {
 /// The type deliberately carries no URL, response body, peer identity, or
 /// request material because failures can flow into operator telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryPeerErrorCode {
+    ReplicaNotFound,
+    ReplicaRangeNotRetained,
+    MirrorReplicaNotRetained,
+    ReplicaObjectNotFound,
+}
+
+impl DirectoryPeerErrorCode {
+    fn parse(body: &[u8]) -> Option<Self> {
+        match body {
+            b"replica_not_found" => Some(Self::ReplicaNotFound),
+            b"replica_range_not_retained" => Some(Self::ReplicaRangeNotRetained),
+            b"mirror_replica_not_retained" => Some(Self::MirrorReplicaNotRetained),
+            b"replica_object_not_found" => Some(Self::ReplicaObjectNotFound),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplicaNotFound => "replica_not_found",
+            Self::ReplicaRangeNotRetained => "replica_range_not_retained",
+            Self::MirrorReplicaNotRetained => "mirror_replica_not_retained",
+            Self::ReplicaObjectNotFound => "replica_object_not_found",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryFramePostError {
     Transport,
-    HttpStatus(u16),
+    HttpStatus {
+        status: u16,
+        peer_code: Option<DirectoryPeerErrorCode>,
+    },
     Response(BoundedHttpResponseError),
 }
 
 impl DirectoryFramePostError {
     const fn witness_capability_unavailable(self) -> bool {
-        matches!(self, Self::HttpStatus(404 | 405 | 501))
+        matches!(
+            self,
+            Self::HttpStatus {
+                status: 404 | 405 | 501,
+                peer_code: None
+            }
+        )
     }
 
     fn stable_reason(self, operation: &str) -> String {
         match self {
             Self::Transport => format!("directory_{operation}_transport_failed"),
-            Self::HttpStatus(status) => {
+            Self::HttpStatus {
+                peer_code: Some(peer_code),
+                ..
+            } => {
+                format!("directory_{operation}_peer_{}", peer_code.as_str())
+            }
+            Self::HttpStatus {
+                status,
+                peer_code: None,
+            } => {
                 format!("directory_{operation}_http_status_{status}")
             }
             Self::Response(error) => format!("directory_{operation}_{}", error.as_str()),
@@ -1550,7 +1600,7 @@ async fn request_observation_checkpoint_witness(
             debug!(
                 reason = "directory_observation_witness_capability_unavailable",
                 http_status = match error {
-                    DirectoryFramePostError::HttpStatus(status) => status,
+                    DirectoryFramePostError::HttpStatus { status, .. } => status,
                     _ => 0,
                 },
                 "[DIRECTORY_REPLICA] Peer descriptor does not currently expose witness service"
@@ -2045,6 +2095,11 @@ fn directory_mirror_failure_allows_recovery(reason: &str) -> bool {
             | "directory_objects_transport_failed"
             | "directory_replica_range_transport_failed"
             | "directory_replica_objects_transport_failed"
+            | "directory_replica_range_peer_replica_not_found"
+            | "directory_replica_range_peer_replica_range_not_retained"
+            | "directory_replica_range_peer_mirror_replica_not_retained"
+            | "directory_replica_objects_peer_replica_object_not_found"
+            | "directory_replica_objects_peer_mirror_replica_not_retained"
             | "directory_mirror_recovery_carrier_unavailable"
             | "directory_mirror_recovery_carrier_descriptor_changed"
             | "directory_mirror_recovery_carrier_not_public"
@@ -2745,9 +2800,17 @@ async fn post_directory_frame_typed(
         .await
         .map_err(|_| DirectoryFramePostError::Transport)?;
     if !response.status().is_success() {
-        return Err(DirectoryFramePostError::HttpStatus(
-            response.status().as_u16(),
-        ));
+        let status = response.status().as_u16();
+        // [MIRROR-CAPABILITY 2026-07-24 by Codex] A 404 can mean either that
+        // an optional route is absent or that this carrier has not retained
+        // the requested producer/range yet. Read only the tiny fixed protocol
+        // code so temporary lag is never cached as missing software support.
+        let peer_code =
+            read_bounded_http_response(response, MAX_DIRECTORY_SYNC_ERROR_BODY_BYTES)
+                .await
+                .ok()
+                .and_then(|body| DirectoryPeerErrorCode::parse(&body));
+        return Err(DirectoryFramePostError::HttpStatus { status, peer_code });
     }
     read_bounded_http_response(response, MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES)
         .await
@@ -3226,6 +3289,8 @@ mod tests {
             "directory_replica_range_http_status_405",
             "directory_replica_range_http_status_429",
             "directory_replica_objects_http_status_503",
+            "directory_replica_range_peer_replica_range_not_retained",
+            "directory_replica_objects_peer_replica_object_not_found",
             "directory_mirror_recovery_carrier_unavailable",
             "directory_mirror_recovery_carrier_descriptor_changed",
         ] {
@@ -3867,6 +3932,9 @@ mod tests {
             "directory_replica_range_http_status_429",
             "directory_replica_range_http_status_500",
             "directory_replica_range_response_invalid_signature",
+            "directory_replica_range_peer_replica_not_found",
+            "directory_replica_range_peer_replica_range_not_retained",
+            "directory_replica_objects_peer_replica_object_not_found",
         ] {
             assert!(!directory_mirror_carrier_capability_unavailable(reason));
         }
@@ -3916,14 +3984,35 @@ mod tests {
     #[test]
     fn witness_capability_http_statuses_are_narrow_and_typed() {
         for status in [404, 405, 501] {
-            assert!(DirectoryFramePostError::HttpStatus(status).witness_capability_unavailable());
+            assert!(DirectoryFramePostError::HttpStatus {
+                status,
+                peer_code: None,
+            }
+            .witness_capability_unavailable());
         }
         for status in [400, 401, 403, 409, 429, 500, 503] {
-            assert!(!DirectoryFramePostError::HttpStatus(status).witness_capability_unavailable());
+            assert!(!DirectoryFramePostError::HttpStatus {
+                status,
+                peer_code: None,
+            }
+            .witness_capability_unavailable());
         }
         assert_eq!(
-            DirectoryFramePostError::HttpStatus(404).stable_reason("range"),
+            DirectoryFramePostError::HttpStatus {
+                status: 404,
+                peer_code: None,
+            }
+            .stable_reason("range"),
             "directory_range_http_status_404"
+        );
+        let lagging_carrier = DirectoryFramePostError::HttpStatus {
+            status: 404,
+            peer_code: Some(DirectoryPeerErrorCode::ReplicaRangeNotRetained),
+        };
+        assert!(!lagging_carrier.witness_capability_unavailable());
+        assert_eq!(
+            lagging_carrier.stable_reason("replica_range"),
+            "directory_replica_range_peer_replica_range_not_retained"
         );
         assert_eq!(
             DirectoryFramePostError::Response(BoundedHttpResponseError::TooLarge)
