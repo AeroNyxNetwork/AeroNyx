@@ -54,6 +54,8 @@
 //!   preserving exact producer signatures, object hashes, and quarantine state.
 //! - Distinguishes a lagging carrier's unavailable range from a malformed
 //!   request so recovery can continue without weakening contract validation.
+//! - Records only aggregate routeability and signed-region-hint diversity for
+//!   the latest bounded carrier selection, never peer identities or endpoints.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -137,6 +139,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.21.0-MirrorSourceDiversityTelemetry - Added privacy-safe aggregate
+//! routeability and signed-region-hint carrier selection observations
 //! v0.20.1-MirrorCarrierRangeAvailability - Added a typed unavailable-range
 //! result for audited carrier reads so lagging mirrors remain safely retryable
 //! v0.20.0-MirrorBoundedCatchUp - Added aggregate converged/catching-up mirror
@@ -1033,6 +1037,21 @@ pub struct DirectoryFullNodeMirrorRuntimeSnapshot {
     pub recovery_succeeded: u64,
     /// Bounded carrier recovery attempts that exhausted or failed closed.
     pub recovery_failed: u64,
+    /// Valid non-quarantined public carriers considered by the latest recovery.
+    pub last_recovery_carrier_candidates: u64,
+    /// Latest candidates with fresh local routeability evidence.
+    pub last_recovery_routeable_carrier_candidates: u64,
+    /// Capacity-bounded carriers selected by the latest recovery.
+    pub last_recovery_carriers_selected: u64,
+    /// Latest selected carriers with fresh local routeability evidence.
+    pub last_recovery_routeable_carriers_selected: u64,
+    /// Latest selected carriers that supplied a non-empty signed region hint.
+    pub last_recovery_selected_region_hints: u64,
+    /// Distinct signed region hints in the latest bounded selection.
+    ///
+    /// This is an availability hint only, not operator, ASN, jurisdiction,
+    /// identity, Sybil-resistance, consensus, or finality evidence.
+    pub last_recovery_distinct_region_hints: u64,
     /// Timestamp of the latest completed mirror round.
     pub last_round_at: Option<u64>,
     /// Timestamp of the latest authenticated mirror import.
@@ -1342,6 +1361,33 @@ impl DirectoryReplicaSyncRuntime {
             snapshot.recovery_failed = snapshot.recovery_failed.saturating_add(1);
             snapshot.last_recovery_failure_at = Some(completed_at);
         }
+    }
+
+    /// Records aggregate properties of the latest bounded carrier selection.
+    ///
+    /// [MIRROR-DIVERSITY 2026-07-24 by Codex] Signed region values are reduced
+    /// to counts before this boundary. This method never receives identities,
+    /// endpoint URLs, region strings, producer identities, or selected order.
+    pub fn record_full_node_mirror_carrier_selection(
+        &self,
+        candidates: u64,
+        routeable_candidates: u64,
+        selected: u64,
+        selected_routeable: u64,
+        selected_region_hints: u64,
+        distinct_region_hints: u64,
+    ) {
+        let mut snapshot = self.full_node_mirror.lock();
+        snapshot.last_recovery_carrier_candidates = candidates;
+        snapshot.last_recovery_routeable_carrier_candidates = routeable_candidates.min(candidates);
+        snapshot.last_recovery_carriers_selected = selected.min(candidates);
+        snapshot.last_recovery_routeable_carriers_selected = selected_routeable
+            .min(snapshot.last_recovery_carriers_selected)
+            .min(snapshot.last_recovery_routeable_carrier_candidates);
+        snapshot.last_recovery_selected_region_hints =
+            selected_region_hints.min(snapshot.last_recovery_carriers_selected);
+        snapshot.last_recovery_distinct_region_hints =
+            distinct_region_hints.min(snapshot.last_recovery_selected_region_hints);
     }
 
     /// Returns aggregate permissionless mirror telemetry without peer metadata.
@@ -8438,6 +8484,7 @@ mod tests {
         // [MIRROR-CATCHUP 2026-07-24 by Codex] One producer converges, one
         // advances under the bounded budget, and one fails after prior pages.
         runtime.record_full_node_mirror_catch_up_round(5, 3, 1, 1, 1, 7, 11, NOW + 1);
+        runtime.record_full_node_mirror_carrier_selection(5, 4, 2, 2, 2, 2);
         runtime.record_full_node_mirror_recovery(true, NOW + 2);
         runtime.record_full_node_mirror_recovery(false, NOW + 3);
 
@@ -8455,6 +8502,12 @@ mod tests {
         assert_eq!(snapshot.recovery_attempts, 2);
         assert_eq!(snapshot.recovery_succeeded, 1);
         assert_eq!(snapshot.recovery_failed, 1);
+        assert_eq!(snapshot.last_recovery_carrier_candidates, 5);
+        assert_eq!(snapshot.last_recovery_routeable_carrier_candidates, 4);
+        assert_eq!(snapshot.last_recovery_carriers_selected, 2);
+        assert_eq!(snapshot.last_recovery_routeable_carriers_selected, 2);
+        assert_eq!(snapshot.last_recovery_selected_region_hints, 2);
+        assert_eq!(snapshot.last_recovery_distinct_region_hints, 2);
         assert_eq!(snapshot.last_recovery_attempt_at, Some(NOW + 3));
         assert_eq!(snapshot.last_recovery_success_at, Some(NOW + 2));
         assert_eq!(snapshot.last_recovery_failure_at, Some(NOW + 3));

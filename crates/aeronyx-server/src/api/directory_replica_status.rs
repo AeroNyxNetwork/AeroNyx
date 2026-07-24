@@ -39,6 +39,8 @@
 //!   keeping mirror identities/endpoints out of every public response.
 //! - Reports aggregate direct-first carrier recovery attempts and outcomes
 //!   without exposing producers, carriers, endpoints, or selected paths.
+//! - Reports aggregate routeable carrier and signed-region-hint diversity
+//!   counts while explicitly rejecting operator/ASN diversity claims.
 //! - Distinguishes mirror convergence, bounded catch-up progress, and failures
 //!   so one accepted page cannot be misreported as a fully healthy replica.
 //!
@@ -91,6 +93,8 @@
 //! - Recovery telemetry is aggregate transport health, never carrier reputation.
 //!
 //! ## Last Modified
+//! `v0.19.0-MirrorSourceDiversityStatus` - Added aggregate routeability and
+//! signed-region-hint selection observations with an explicit trust limitation.
 //! `v0.18.0-MirrorBoundedCatchUpStatus` - Added truthful converged/catching-up
 //! mirror outcomes and bounded page/request telemetry.
 //! `v0.17.0-MirrorRecoveryStatus` - Added aggregate direct-first carrier recovery outcomes.
@@ -327,6 +331,12 @@ struct DirectoryFullNodeMirrorStatus {
     recovery_attempts: u64,
     recovery_succeeded: u64,
     recovery_failed: u64,
+    last_recovery_carrier_candidates: u64,
+    last_recovery_routeable_carrier_candidates: u64,
+    last_recovery_carriers_selected: u64,
+    last_recovery_routeable_carriers_selected: u64,
+    last_recovery_selected_region_hints: u64,
+    last_recovery_distinct_region_hints: u64,
     last_round_age_seconds: Option<u64>,
     last_success_age_seconds: Option<u64>,
     last_failure_age_seconds: Option<u64>,
@@ -334,6 +344,8 @@ struct DirectoryFullNodeMirrorStatus {
     last_recovery_success_age_seconds: Option<u64>,
     last_recovery_failure_age_seconds: Option<u64>,
     selection_policy: &'static str,
+    carrier_selection_policy: &'static str,
+    diversity_limit: &'static str,
     transport_policy: &'static str,
     authority_boundary: &'static str,
     privacy_boundary: &'static str,
@@ -1378,6 +1390,14 @@ fn build_full_node_mirror_status(
         recovery_attempts: runtime.recovery_attempts,
         recovery_succeeded: runtime.recovery_succeeded,
         recovery_failed: runtime.recovery_failed,
+        last_recovery_carrier_candidates: runtime.last_recovery_carrier_candidates,
+        last_recovery_routeable_carrier_candidates: runtime
+            .last_recovery_routeable_carrier_candidates,
+        last_recovery_carriers_selected: runtime.last_recovery_carriers_selected,
+        last_recovery_routeable_carriers_selected: runtime
+            .last_recovery_routeable_carriers_selected,
+        last_recovery_selected_region_hints: runtime.last_recovery_selected_region_hints,
+        last_recovery_distinct_region_hints: runtime.last_recovery_distinct_region_hints,
         last_round_age_seconds: runtime
             .last_round_at
             .map(|timestamp| generated_at.saturating_sub(timestamp)),
@@ -1397,13 +1417,17 @@ fn build_full_node_mirror_status(
             .last_recovery_failure_at
             .map(|timestamp| generated_at.saturating_sub(timestamp)),
         selection_policy:
-            "valid_public_signed_descriptors_excluding_self_and_operator_pins_rotating_bounded_window",
+            "valid_public_signed_descriptors_excluding_self_and_operator_pins_non_quarantined_routeable_and_fresh_first_rotating_bounded_window",
+        carrier_selection_policy:
+            "local_routeability_then_descriptor_freshness_then_rotation_with_same_tier_signed_region_hint_diversity",
+        diversity_limit:
+            "signed_region_hints_are_untrusted_availability_metadata_not_operator_asn_jurisdiction_or_sybil_resistance_proof",
         transport_policy:
             "bounded_multi_page_direct_first_then_at_most_two_verified_public_carriers_per_page_for_availability_failures_only",
         authority_boundary:
             "operator_pins_only_for_checkpoints_witnesses_and_policy_anchors",
         privacy_boundary:
-            "aggregate mirror counts and ages only; no identities endpoints routes payloads or client metadata",
+            "aggregate mirror counts ages routeability and signed-region-hint cardinality only; no identities endpoints regions routes payloads or client metadata",
         security_model:
             "untrusted_verified_replica_transport_not_authority_consensus_fork_choice_voting_or_finality",
     }
@@ -2031,6 +2055,12 @@ mod tests {
             last_round_requests_sent: 7,
             pages_succeeded: 4,
             requests_sent: 7,
+            last_recovery_carrier_candidates: 4,
+            last_recovery_routeable_carrier_candidates: 3,
+            last_recovery_carriers_selected: 2,
+            last_recovery_routeable_carriers_selected: 2,
+            last_recovery_selected_region_hints: 2,
+            last_recovery_distinct_region_hints: 2,
             last_round_at: Some(90),
             last_success_at: Some(90),
             ..DirectoryFullNodeMirrorRuntimeSnapshot::default()
@@ -2041,6 +2071,15 @@ mod tests {
         assert_eq!(status.last_round_catching_up, 1);
         assert_eq!(status.last_round_pages_succeeded, 4);
         assert_eq!(status.last_round_requests_sent, 7);
+        assert_eq!(status.last_recovery_carrier_candidates, 4);
+        assert_eq!(status.last_recovery_routeable_carrier_candidates, 3);
+        assert_eq!(status.last_recovery_carriers_selected, 2);
+        assert_eq!(status.last_recovery_routeable_carriers_selected, 2);
+        assert_eq!(status.last_recovery_selected_region_hints, 2);
+        assert_eq!(status.last_recovery_distinct_region_hints, 2);
+        assert!(status
+            .diversity_limit
+            .contains("not_operator_asn_jurisdiction_or_sybil_resistance_proof"));
 
         let degraded = DirectoryFullNodeMirrorRuntimeSnapshot {
             last_round_failed: 1,

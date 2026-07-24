@@ -42,6 +42,8 @@
 //! - Optionally mirrors bounded multi-page prefixes from a rotating, bounded
 //!   set of valid public discovery peers, using direct-first bounded carrier
 //!   recovery without adding any mirror or carrier to authority checkpoints.
+//! - Prioritizes fresh routeable recovery carriers and uses signed region hints
+//!   only as a best-effort same-tier fault-domain diversity signal.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -76,6 +78,9 @@
 //!     wall-clock budget. Try the producer directly before at most two public
 //!     carriers. Every imported block remains signed by the original producer;
 //!     a carrier signs only the response envelope and never gains authority.
+//! 15. Prefer fresh routeability evidence, rotate equally healthy candidates,
+//!     and avoid repeating a signed region hint when an equally healthy
+//!     alternative exists. Region hints never prove operator or ASN diversity.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -99,6 +104,9 @@
 //!   carrier while serving a recovery request.
 //!
 //! ## Last Modified
+//! `v0.17.0-MirrorSourceDiversity` - Added routeability/freshness-aware carrier
+//! ordering, best-effort signed-region diversity, aggregate selection data, and
+//! explicit proxy bypass for authenticated node-to-node synchronization.
 //! `v0.16.0-MirrorBoundedCatchUp` - Added truthful converged/catching-up
 //! outcomes and bounded multi-page mirror synchronization.
 //! `v0.15.2-MirrorRecoveryDeadline` - Allowed audited public carriers to
@@ -230,6 +238,10 @@ const DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE: usize = 2;
 const DIRECTORY_MIRROR_MAX_REQUESTS_PER_PAGE: u32 = DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE + 1;
 /// Keep carrier choice stable within a round while avoiding permanent affinity.
 const DIRECTORY_MIRROR_RECOVERY_ROTATION_SECS: u64 = 5 * 60;
+/// Recently issued descriptors are preferred within the same routeability tier.
+const DIRECTORY_MIRROR_RECOVERY_FRESH_DESCRIPTOR_SECS: u64 = 10 * 60;
+/// Valid but older descriptors remain fallback candidates after fresher peers.
+const DIRECTORY_MIRROR_RECOVERY_AGING_DESCRIPTOR_SECS: u64 = 30 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryMirrorPullSource {
@@ -241,6 +253,36 @@ enum DirectoryMirrorPullSource {
 struct DirectoryMirrorPullFailure {
     reason: String,
     recovery_attempted: bool,
+}
+
+/// Internal carrier candidate used only during one bounded recovery selection.
+///
+/// The signed region is an untrusted availability hint. It must never be
+/// interpreted as proof of a distinct operator, ASN, jurisdiction, or identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryMirrorRecoveryCarrierCandidate {
+    node_id: [u8; 32],
+    routeable: bool,
+    freshness_rank: u8,
+    rotation_rank: usize,
+    signed_region_hint: Option<String>,
+}
+
+impl DirectoryMirrorRecoveryCarrierCandidate {
+    const fn availability_tier(&self) -> (u8, u8) {
+        ((!self.routeable) as u8, self.freshness_rank)
+    }
+}
+
+/// Privacy-safe result of one bounded recovery-carrier selection.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DirectoryMirrorRecoveryCarrierSelection {
+    carriers: Vec<[u8; 32]>,
+    candidate_count: u64,
+    routeable_candidate_count: u64,
+    selected_routeable_count: u64,
+    selected_region_hint_count: u64,
+    distinct_selected_region_hint_count: u64,
 }
 
 /// Aggregate result for one selected permissionless producer.
@@ -511,6 +553,11 @@ impl DirectoryReplicaSyncCoordinator {
         runtime.restore_retry_states(&retry_states);
         let restored_retry_states = retry_states.len();
         let client = reqwest::Client::builder()
+            // [MIRROR-DIVERSITY 2026-07-24 by Codex] Directory Sync endpoints
+            // are authenticated direct node relationships. Inheriting host
+            // HTTP(S)_PROXY settings would add an unreviewed metadata observer
+            // and common failure domain despite the signed frame boundary.
+            .no_proxy()
             .connect_timeout(Duration::from_secs(DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS))
             .timeout(Duration::from_secs(DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::none())
@@ -719,6 +766,7 @@ impl DirectoryReplicaSyncCoordinator {
                 deadline,
                 pull_directory_chain_mirror_page_with_recovery(
                     Arc::clone(&self.store),
+                    self.runtime.as_ref(),
                     self.peer_store.as_ref(),
                     self.identity.as_ref(),
                     &producer,
@@ -1587,6 +1635,7 @@ pub async fn pull_directory_chain_page(
 /// descriptor, hash-chain, and durable integrity failures stop immediately.
 async fn pull_directory_chain_mirror_page_with_recovery(
     replica_store: Arc<DirectoryReplicaStore>,
+    runtime: &DirectoryReplicaSyncRuntime,
     peer_store: &PeerStore,
     identity: &IdentityKeyPair,
     producer: &[u8; 32],
@@ -1612,13 +1661,24 @@ async fn pull_directory_chain_mirror_page_with_recovery(
             // have failed before transport. Each retryable carrier failure can
             // consume at most its range request before another carrier is used.
             let mut prior_requests = 1u32;
-            let carriers = directory_mirror_recovery_carriers(
+            let carrier_selection = directory_mirror_recovery_carriers(
                 peer_store,
                 producer,
                 &identity.public_key_bytes(),
                 unix_now_secs(),
             );
-            for carrier in carriers {
+            // [MIRROR-DIVERSITY 2026-07-24 by Codex] Persist only aggregate
+            // selection properties. Carrier identities, endpoints, regions,
+            // producer identities, and route order never enter telemetry.
+            runtime.record_full_node_mirror_carrier_selection(
+                carrier_selection.candidate_count,
+                carrier_selection.routeable_candidate_count,
+                u64::try_from(carrier_selection.carriers.len()).unwrap_or(u64::MAX),
+                carrier_selection.selected_routeable_count,
+                carrier_selection.selected_region_hint_count,
+                carrier_selection.distinct_selected_region_hint_count,
+            );
+            for carrier in carrier_selection.carriers {
                 match pull_directory_chain_mirror_page_via_carrier(
                     Arc::clone(&replica_store),
                     peer_store,
@@ -1915,14 +1975,15 @@ fn directory_mirror_recovery_carriers(
     producer: &[u8; 32],
     requester: &[u8; 32],
     now: u64,
-) -> Vec<[u8; 32]> {
-    let mut carriers = peer_store
+) -> DirectoryMirrorRecoveryCarrierSelection {
+    let mut descriptors = peer_store
         .valid_public_descriptors(now, usize::MAX)
         .into_iter()
         .filter(|descriptor| {
             let node_id = descriptor.node_id();
             node_id != *producer
                 && node_id != *requester
+                && !peer_store.is_route_quarantined_now(&node_id, now)
                 && descriptor.descriptor.policy.public_discovery
                 && descriptor
                     .descriptor
@@ -1930,20 +1991,115 @@ fn directory_mirror_recovery_carriers(
                     .as_deref()
                     .is_some_and(commitment_peer_endpoint_is_public)
         })
-        .map(|descriptor| descriptor.node_id())
         .collect::<Vec<_>>();
-    carriers.sort_unstable();
-    carriers.dedup();
-    if !carriers.is_empty() {
-        let producer_seed = u64::from_be_bytes(producer[..8].try_into().unwrap_or([0u8; 8]));
-        let requester_seed = u64::from_be_bytes(requester[..8].try_into().unwrap_or([0u8; 8]));
-        let epoch_seed = now / DIRECTORY_MIRROR_RECOVERY_ROTATION_SECS;
-        let cursor = usize::try_from(producer_seed ^ requester_seed ^ epoch_seed).unwrap_or(0)
-            % carriers.len();
-        carriers.rotate_left(cursor);
-        carriers.truncate(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE);
+    descriptors.sort_by_key(SignedNodeDescriptor::node_id);
+    descriptors.dedup_by_key(|descriptor| descriptor.node_id());
+    if descriptors.is_empty() {
+        return DirectoryMirrorRecoveryCarrierSelection::default();
     }
-    carriers
+
+    let producer_seed = u64::from_be_bytes(producer[..8].try_into().unwrap_or([0u8; 8]));
+    let requester_seed = u64::from_be_bytes(requester[..8].try_into().unwrap_or([0u8; 8]));
+    let epoch_seed = now / DIRECTORY_MIRROR_RECOVERY_ROTATION_SECS;
+    let cursor = usize::try_from(producer_seed ^ requester_seed ^ epoch_seed).unwrap_or(0)
+        % descriptors.len();
+    descriptors.rotate_left(cursor);
+
+    // [MIRROR-DIVERSITY 2026-07-24 by Codex] Routeability is local observed
+    // evidence and therefore outranks self-reported descriptor metadata.
+    // Freshness is bucketed to avoid permanent affinity to tiny timestamp
+    // differences; deterministic rotation remains the tie-breaker.
+    let mut candidates = descriptors
+        .into_iter()
+        .enumerate()
+        .map(|(rotation_rank, descriptor)| {
+            let issued_at = descriptor.descriptor.issued_at;
+            let age = now.checked_sub(issued_at);
+            let freshness_rank = match age {
+                Some(age) if age <= DIRECTORY_MIRROR_RECOVERY_FRESH_DESCRIPTOR_SECS => 0,
+                Some(age) if age <= DIRECTORY_MIRROR_RECOVERY_AGING_DESCRIPTOR_SECS => 1,
+                Some(_) => 2,
+                None => 3,
+            };
+            let signed_region_hint = descriptor
+                .descriptor
+                .policy
+                .region
+                .as_deref()
+                .map(str::trim)
+                .filter(|region| !region.is_empty())
+                .map(str::to_ascii_lowercase);
+            let node_id = descriptor.node_id();
+            DirectoryMirrorRecoveryCarrierCandidate {
+                node_id,
+                routeable: peer_store.is_routeable_now(&node_id, now),
+                freshness_rank,
+                rotation_rank,
+                signed_region_hint,
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| {
+        let (routeability_rank, freshness_rank) = candidate.availability_tier();
+        (routeability_rank, freshness_rank, candidate.rotation_rank)
+    });
+
+    let candidate_count = u64::try_from(candidates.len()).unwrap_or(u64::MAX);
+    let routeable_candidate_count = u64::try_from(
+        candidates
+            .iter()
+            .filter(|candidate| candidate.routeable)
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let mut selected = Vec::with_capacity(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE);
+    let mut selected_regions = HashSet::new();
+    while !candidates.is_empty() && selected.len() < DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE
+    {
+        let best_tier = candidates[0].availability_tier();
+        let position = candidates
+            .iter()
+            .position(|candidate| {
+                candidate.availability_tier() == best_tier
+                    && candidate
+                        .signed_region_hint
+                        .as_ref()
+                        .is_some_and(|region| !selected_regions.contains(region))
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .position(|candidate| candidate.availability_tier() == best_tier)
+            })
+            .unwrap_or(0);
+        let candidate = candidates.remove(position);
+        if let Some(region) = candidate.signed_region_hint.as_ref() {
+            selected_regions.insert(region.clone());
+        }
+        selected.push(candidate);
+    }
+
+    DirectoryMirrorRecoveryCarrierSelection {
+        carriers: selected.iter().map(|candidate| candidate.node_id).collect(),
+        candidate_count,
+        routeable_candidate_count,
+        selected_routeable_count: u64::try_from(
+            selected
+                .iter()
+                .filter(|candidate| candidate.routeable)
+                .count(),
+        )
+        .unwrap_or(u64::MAX),
+        selected_region_hint_count: u64::try_from(
+            selected
+                .iter()
+                .filter(|candidate| candidate.signed_region_hint.is_some())
+                .count(),
+        )
+        .unwrap_or(u64::MAX),
+        distinct_selected_region_hint_count: u64::try_from(selected_regions.len())
+            .unwrap_or(u64::MAX),
+    }
 }
 
 async fn pull_directory_chain_page_via_carrier(
@@ -2985,18 +3141,22 @@ mod tests {
                 .unwrap();
         }
 
-        let selected = directory_mirror_recovery_carriers(
+        let selection = directory_mirror_recovery_carriers(
             &store,
             &producer.public_key_bytes(),
             &requester.public_key_bytes(),
             now,
         );
-        assert_eq!(selected.len(), DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE);
-        assert!(selected
+        assert_eq!(
+            selection.carriers.len(),
+            DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE
+        );
+        assert!(selection
+            .carriers
             .iter()
             .all(|candidate| !expected_excluded.contains(candidate)));
         assert_eq!(
-            selected,
+            selection,
             directory_mirror_recovery_carriers(
                 &store,
                 &producer.public_key_bytes(),
@@ -3004,6 +3164,103 @@ mod tests {
                 now,
             )
         );
+    }
+
+    #[test]
+    fn mirror_recovery_carrier_selection_prefers_live_diverse_fresh_peers() {
+        let now = unix_now_secs();
+        let producer = IdentityKeyPair::from_bytes(&[0xd1; 32]).unwrap();
+        let requester = IdentityKeyPair::from_bytes(&[0xd2; 32]).unwrap();
+        let store = PeerStore::new();
+        let mut fresh_routeable = HashSet::new();
+
+        // [MIRROR-DIVERSITY 2026-07-24 by Codex] Three fresh routeable peers
+        // include two identical signed region hints. The second selected peer
+        // must use the different hint without sacrificing routeability or
+        // descriptor freshness. These hints are not operator/ASN proof.
+        for (seed, issued_at, region, routeable) in [
+            (0xd3, now - 1, Some("region-a"), true),
+            (0xd4, now - 2, Some("REGION-A"), true),
+            (0xd5, now - 3, Some("region-b"), true),
+            (
+                0xd6,
+                now - DIRECTORY_MIRROR_RECOVERY_FRESH_DESCRIPTOR_SECS - 1,
+                Some("region-c"),
+                true,
+            ),
+            (0xd7, now - 4, Some("region-d"), false),
+        ] {
+            let identity = IdentityKeyPair::from_bytes(&[seed; 32]).unwrap();
+            let mut descriptor = aeronyx_core::protocol::discovery::NodeDescriptor::new(
+                identity.public_key_bytes(),
+                1,
+                issued_at,
+                now + 600,
+                "mirror-diversity-test",
+            );
+            descriptor.policy.public_discovery = true;
+            descriptor.policy.region = region.map(str::to_string);
+            descriptor.public_endpoint = Some(format!("http://8.8.8.{seed}:8422"));
+            store
+                .upsert_verified_from_source(
+                    SignedNodeDescriptor::sign(descriptor, &identity).unwrap(),
+                    now,
+                    "directory_mirror_diversity_test",
+                )
+                .unwrap();
+            if routeable {
+                store.record_route_forward_success(&identity.public_key_bytes(), now);
+            }
+            if routeable
+                && issued_at >= now.saturating_sub(DIRECTORY_MIRROR_RECOVERY_FRESH_DESCRIPTOR_SECS)
+            {
+                fresh_routeable.insert(identity.public_key_bytes());
+            }
+        }
+
+        let quarantined = IdentityKeyPair::from_bytes(&[0xd8; 32]).unwrap();
+        let mut quarantined_descriptor = aeronyx_core::protocol::discovery::NodeDescriptor::new(
+            quarantined.public_key_bytes(),
+            1,
+            now - 1,
+            now + 600,
+            "mirror-diversity-test",
+        );
+        quarantined_descriptor.policy.public_discovery = true;
+        quarantined_descriptor.policy.region = Some("region-e".to_string());
+        quarantined_descriptor.public_endpoint = Some("http://8.8.8.216:8422".to_string());
+        store
+            .upsert_verified_from_source(
+                SignedNodeDescriptor::sign(quarantined_descriptor, &quarantined).unwrap(),
+                now,
+                "directory_mirror_diversity_test",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            store.record_route_forward_failure(
+                &quarantined.public_key_bytes(),
+                now,
+                "request_failed",
+            );
+        }
+
+        let selection = directory_mirror_recovery_carriers(
+            &store,
+            &producer.public_key_bytes(),
+            &requester.public_key_bytes(),
+            now,
+        );
+        assert_eq!(selection.candidate_count, 5);
+        assert_eq!(selection.routeable_candidate_count, 4);
+        assert_eq!(selection.carriers.len(), 2);
+        assert_eq!(selection.selected_routeable_count, 2);
+        assert_eq!(selection.selected_region_hint_count, 2);
+        assert_eq!(selection.distinct_selected_region_hint_count, 2);
+        assert!(selection
+            .carriers
+            .iter()
+            .all(|candidate| fresh_routeable.contains(candidate)));
+        assert!(!selection.carriers.contains(&quarantined.public_key_bytes()));
     }
 
     #[test]
