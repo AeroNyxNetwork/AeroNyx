@@ -38,6 +38,9 @@
 //!   as evidence without treating peer count as consensus or fork choice.
 //! - Operator-pinned divergent checkpoints become durable storage incidents;
 //!   the verified relation still reaches startup/runtime policy unchanged.
+//! - Strict startup witness reconciliation may contact an operator-pinned
+//!   identity through an authentic expired cache descriptor, preventing an
+//!   outage/TTL boot loop while retaining signed-response verification.
 //! - Direction-isolated checkpoint telemetry: serving a requester updates only
 //!   service counters and cannot manufacture local convergence or divergence.
 //! - Audit-gated block pages assembled from one SQLite snapshot and
@@ -97,6 +100,9 @@
 //!   canonical chain; they are operator evidence until consensus is designed.
 //! - Only explicit operator pins may turn signed checkpoint evidence into a
 //!   startup gate. Permissionless discovery peers remain evidence-only.
+//! - Expired descriptors are never live peers. Their endpoints may be used
+//!   only as transport hints for operator-pinned witness reconciliation, where
+//!   the response is independently bound to the pinned Ed25519 identity.
 //! - A trusted divergent-prefix incident must not be converted into a generic
 //!   transport failure: callers need the verified divergence to fail closed.
 //! - Never derive outbound checkpoint state from an inbound request. The peer
@@ -184,7 +190,7 @@ use aeronyx_core::protocol::memchain::{
     VERIFIED_DELIVERY_WITNESS_GAP_V1, VERIFIED_DELIVERY_WITNESS_IDEMPOTENT_V1,
     VERIFIED_DELIVERY_WITNESS_STALE_V1,
 };
-use aeronyx_core::protocol::NodeCapability;
+use aeronyx_core::protocol::{NodeCapability, SignedNodeDescriptor};
 use sha2::{Digest, Sha256};
 
 use crate::services::memchain::storage_ops::{
@@ -936,6 +942,29 @@ async fn block_announce_handler(State(state): State<MemChainPeerState>, body: By
     }
 }
 
+// [PINNED-WITNESS-BOOTSTRAP 2026-07-26 by Codex] Descriptor freshness is an
+// explicit trust-boundary choice. Only the operator-pinned witness path may use
+// an authentic expired cache record as a transport hint; every permissionless
+// and route-bearing path remains current-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitmentPeerDescriptorPolicy {
+    CurrentOnly,
+    AllowExpiredForPinnedWitness,
+}
+
+fn commitment_peer_descriptor(
+    peer_store: &PeerStore,
+    node_id: &[u8; 32],
+    now: u64,
+    policy: CommitmentPeerDescriptorPolicy,
+) -> Option<SignedNodeDescriptor> {
+    peer_store.get_valid(node_id, now).or_else(|| {
+        (policy == CommitmentPeerDescriptorPolicy::AllowExpiredForPinnedWitness)
+            .then(|| peer_store.get_signature_verified_cached(node_id))
+            .flatten()
+    })
+}
+
 /// Obtains and verifies one signed chain-checkpoint comparison from the pinned
 /// coordinator. The response proves peer attestation, not network consensus.
 ///
@@ -958,6 +987,7 @@ pub async fn pull_record_commitment_checkpoint(
         coordinator_node_id,
         client,
         false,
+        CommitmentPeerDescriptorPolicy::CurrentOnly,
         &commitment_peer_endpoint_is_public,
     )
     .await
@@ -970,15 +1000,20 @@ async fn pull_record_commitment_checkpoint_with_endpoint_policy<F>(
     coordinator_node_id: &[u8; 32],
     client: &reqwest::Client,
     track_trusted_witness_incidents: bool,
+    descriptor_policy: CommitmentPeerDescriptorPolicy,
     endpoint_allowed: &F,
 ) -> Result<CommitmentCheckpointOutcome, String>
 where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
 {
     let request_timestamp = now_secs();
-    let coordinator = peer_store
-        .get_valid(coordinator_node_id, request_timestamp)
-        .ok_or_else(|| "pinned_coordinator_unavailable".to_string())?;
+    let coordinator = commitment_peer_descriptor(
+        peer_store,
+        coordinator_node_id,
+        request_timestamp,
+        descriptor_policy,
+    )
+    .ok_or_else(|| "pinned_coordinator_unavailable".to_string())?;
     let endpoint = coordinator
         .descriptor
         .public_endpoint
@@ -1717,6 +1752,7 @@ where
         max_witnesses,
         false,
         None,
+        CommitmentPeerDescriptorPolicy::CurrentOnly,
         &endpoint_allowed,
     )
     .await
@@ -1741,7 +1777,12 @@ where
         if *node_id == self_node_id || candidate_ids.contains(node_id) {
             continue;
         }
-        let Some(peer) = peer_store.get_valid(node_id, now) else {
+        let Some(peer) = commitment_peer_descriptor(
+            peer_store,
+            node_id,
+            now,
+            CommitmentPeerDescriptorPolicy::AllowExpiredForPinnedWitness,
+        ) else {
             continue;
         };
         if peer
@@ -1763,6 +1804,7 @@ where
         witness_node_ids.len().min(MAX_PINNED_WITNESSES_PER_ROUND),
         true,
         Some(minimum_certificate_signers),
+        CommitmentPeerDescriptorPolicy::AllowExpiredForPinnedWitness,
         &endpoint_allowed,
     )
     .await
@@ -1777,6 +1819,7 @@ async fn reconcile_record_commitment_candidate_ids<F>(
     max_witnesses: usize,
     track_trusted_witness_incidents: bool,
     minimum_certificate_signers: Option<usize>,
+    descriptor_policy: CommitmentPeerDescriptorPolicy,
     endpoint_allowed: &F,
 ) -> CommitmentReconciliationOutcome
 where
@@ -1807,6 +1850,7 @@ where
             &candidate_node_id,
             client,
             track_trusted_witness_incidents,
+            descriptor_policy,
             endpoint_allowed,
         )
         .await
@@ -3559,7 +3603,9 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
 
-    use aeronyx_core::protocol::{NodeDescriptor, NodeDiscoveryMessage, SignedNodeDescriptor};
+    use aeronyx_core::protocol::{
+        NodeBootstrapSnapshot, NodeDescriptor, NodeDiscoveryMessage, SignedNodeDescriptor,
+    };
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -5659,6 +5705,7 @@ mod tests {
             &responder_identity.public_key_bytes(),
             &client,
             false,
+            CommitmentPeerDescriptorPolicy::CurrentOnly,
             &allow_test_endpoint,
         )
         .await
@@ -5695,6 +5742,7 @@ mod tests {
             &responder_identity.public_key_bytes(),
             &client,
             false,
+            CommitmentPeerDescriptorPolicy::CurrentOnly,
             &allow_test_endpoint,
         )
         .await
@@ -5993,6 +6041,104 @@ mod tests {
         assert_eq!(round.failed, 0);
         assert_eq!(round.certificate_signers, 1);
         assert!(!round.certificate_persisted);
+        assert_eq!(
+            local.record_commitment_checkpoint_status().evidence_records,
+            1
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // [PINNED-WITNESS-BOOTSTRAP 2026-07-26 by Codex] Reproduces a real
+    // production outage: strict witness verification runs before gossip can
+    // refresh descriptors after a long reboot. The expired descriptor is only
+    // a transport hint; the response still verifies against the pinned key.
+    #[tokio::test]
+    async fn pinned_witness_round_recovers_through_authentic_expired_cache_descriptor() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let pinned_witness = Arc::new(IdentityKeyPair::generate());
+        let local = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let witness_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        local.audit_record_commitment_chain().await.unwrap();
+        local
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        witness_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+
+        let witness_peers = Arc::new(PeerStore::new());
+        admit_peer(&witness_peers, &coordinator, None, now);
+        let router = build_memchain_peer_router(
+            Arc::clone(&witness_storage),
+            witness_peers,
+            Arc::clone(&pinned_witness),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut expired = NodeDescriptor::new(
+            pinned_witness.public_key_bytes(),
+            1,
+            now.saturating_sub(1_200),
+            now.saturating_sub(600),
+            "expired-pinned-witness-test",
+        );
+        expired.public_endpoint = Some(format!("http://{address}"));
+        expired.capabilities = vec![NodeCapability::EncryptedStorage];
+        let expired = SignedNodeDescriptor::sign(expired, &pinned_witness).unwrap();
+        let coordinator_peers = PeerStore::new();
+        let imported = coordinator_peers.load_peer_cache_snapshot_from_source(
+            &NodeBootstrapSnapshot::new(now, vec![expired]),
+            now,
+            "test_expired_cache",
+        );
+        assert_eq!(imported.inserted, 1);
+        assert!(coordinator_peers
+            .get_valid(&pinned_witness.public_key_bytes(), now)
+            .is_none());
+        assert!(commitment_peer_descriptor(
+            &coordinator_peers,
+            &pinned_witness.public_key_bytes(),
+            now,
+            CommitmentPeerDescriptorPolicy::CurrentOnly,
+        )
+        .is_none());
+        assert!(commitment_peer_descriptor(
+            &coordinator_peers,
+            &pinned_witness.public_key_bytes(),
+            now,
+            CommitmentPeerDescriptorPolicy::AllowExpiredForPinnedWitness,
+        )
+        .is_some());
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let round = reconcile_record_commitment_pinned_witnesses_with_endpoint_policy(
+            &local,
+            &coordinator_peers,
+            &coordinator,
+            &client,
+            &[pinned_witness.public_key_bytes()],
+            1,
+            |_| true,
+        )
+        .await;
+
+        assert_eq!(round.eligible_witnesses, 1);
+        assert_eq!(round.attempted, 1);
+        assert_eq!(round.verified, 1);
+        assert_eq!(round.converged, 1);
+        assert_eq!(round.failed, 0);
         assert_eq!(
             local.record_commitment_checkpoint_status().evidence_records,
             1

@@ -15,6 +15,8 @@
 //! - Capability queries: find peers that advertise a required protocol role
 //! - Expiry cleanup and monitoring snapshots
 //! - Bootstrap snapshot loading with per-descriptor import reporting
+//! - Signature-verified expired descriptor lookup for operator-pinned startup
+//!   evidence only; expired records remain forbidden for routing and liveness
 //! - Discovery gossip message application and snapshot response generation
 //! - Privacy-safe discovery audit events for rate-limit, policy, import, and
 //!   snapshot export operations
@@ -5171,6 +5173,29 @@ impl PeerStore {
             .read()
             .get(node_id)
             .filter(|descriptor| descriptor.verify_at(now).is_ok())
+            .cloned()
+    }
+
+    /// Returns an authentic cached descriptor without requiring time validity.
+    ///
+    /// [PINNED-WITNESS-BOOTSTRAP 2026-07-26 by Codex] This narrow accessor
+    /// breaks the strict-startup deadlock where every cached witness descriptor
+    /// expires while a node is offline and witness reconciliation runs before
+    /// gossip listeners can refresh it. Callers must independently pin the
+    /// returned node identity, validate the endpoint, and verify the signed
+    /// protocol response against that identity.
+    ///
+    /// This accessor must never be used for liveness, gossip export, relay
+    /// selection, route planning, quorum, capacity, or public peer counts.
+    #[must_use]
+    pub(crate) fn get_signature_verified_cached(
+        &self,
+        node_id: &[u8; 32],
+    ) -> Option<SignedNodeDescriptor> {
+        self.peers
+            .read()
+            .get(node_id)
+            .filter(|descriptor| descriptor.verify_signature().is_ok())
             .cloned()
     }
 
