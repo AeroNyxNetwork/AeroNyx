@@ -45,6 +45,9 @@
 # - Add `carrier-smoke` as a read-only release gate for signed Directory Mirror
 #   recovery. It calls only the running node's loopback operator route and
 #   returns aggregate evidence without firewall or database mutation.
+# - Add `carrier-cold-bootstrap-smoke` as an isolated release gate that rebuilds
+#   a fresh in-memory replica from producer-signed history transported by an
+#   explicitly advertised carrier. The live replica database is never opened.
 # - Add a read-only discovery readiness summary to `status` so operators can
 #   see ChatRelay advertisement and peer quorum state without hand-curling the
 #   public peer API.
@@ -103,6 +106,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.20.0-node-entrypoint - Added isolated carrier-assisted cold-bootstrap smoke.
 # v1.19.0-node-entrypoint - Added read-only Directory Mirror carrier-smoke.
 # v1.18.0-node-entrypoint - Made staged-binary promotion model-startup-aware and rollback-safe.
 # v1.17.0-node-entrypoint - Added bootstrap snapshot refresh and fleet drift check commands.
@@ -212,6 +216,7 @@ Commands:
   relay-probe Send one synthetic BlindRelay route probe to a discovered peer.
   fleet-smoke Verify a public multi-node discovery + blind relay mesh.
   carrier-smoke Verify signed Directory Mirror carrier recovery without import.
+  carrier-cold-bootstrap-smoke Rebuild an isolated replica through a signed carrier.
   refresh-bootstrap Refresh the signed discovery bootstrap snapshot.
   fleet-drift-check Read-only check for seed/snapshot/binary drift.
   promote-binary Promote a staged aeronyx-server binary with drain checks.
@@ -290,6 +295,12 @@ Command-specific options:
     --json                  Emit the stable aggregate JSON contract.
     --json-only             Emit only the stable aggregate JSON contract.
 
+  carrier-cold-bootstrap-smoke:
+    --config PATH           Running node config. Default: /etc/aeronyx/server.toml.
+    --repo-dir PATH         Repository containing the release binary.
+    --json                  Emit the stable aggregate JSON contract.
+    --json-only             Emit only the stable aggregate JSON contract.
+
   refresh-bootstrap:
     --source-endpoint URL     Discovery base URL to fetch /api/discovery/snapshot from.
                               Default: local 127.0.0.1 discovery API from --config.
@@ -324,6 +335,7 @@ Examples:
   ./deploy/node/aeronyx-node.sh relay-probe --json
   ./deploy/node/aeronyx-node.sh fleet-smoke --endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --two-hop --json
   ./deploy/node/aeronyx-node.sh carrier-smoke --json
+  ./deploy/node/aeronyx-node.sh carrier-cold-bootstrap-smoke --json
   sudo ./deploy/node/aeronyx-node.sh refresh-bootstrap --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422
   ./deploy/node/aeronyx-node.sh fleet-drift-check --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --json
   sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
@@ -2641,23 +2653,40 @@ resolve_node_binary() {
     printf '%s\n' "${candidate}"
 }
 
-# [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] Keep this release gate on the
-# running node's loopback-only operator API; it must never mutate the replica
-# store or expose selected producer/carrier identities.
-run_carrier_smoke() {
+# [CARRIER-COLD-BOOTSTRAP 2026-07-26 by Codex] Keep Directory Replica release
+# gates on the loopback-only operator API and share one invocation path so their
+# config, output, and binary-selection behavior cannot drift.
+run_directory_replica_smoke() {
+    local operation="$1"
+    local label="$2"
+    local storage_effect="$3"
     local binary
     binary="$(resolve_node_binary)" || die "aeronyx-server binary not found; set --repo-dir to the deployed repository"
     [ -r "${CONFIG_FILE}" ] || die "Node config not readable: ${CONFIG_FILE}"
     if [ "${JSON_ONLY}" -ne 1 ]; then
-        log "Verifying explicit signed Directory Mirror carrier recovery"
-        log "Storage effect: none (read-only retained-anchor verification)"
+        log "${label}"
+        log "Storage effect: ${storage_effect}"
         log "Privacy boundary: aggregate evidence only; no identities, endpoints, hashes, routes, payloads, or user metadata"
     fi
     if [ "${JSON}" -eq 1 ] || [ "${JSON_ONLY}" -eq 1 ]; then
-        "${binary}" directory-replica carrier-smoke --config "${CONFIG_FILE}" --json
+        "${binary}" directory-replica "${operation}" --config "${CONFIG_FILE}" --json
     else
-        "${binary}" directory-replica carrier-smoke --config "${CONFIG_FILE}"
+        "${binary}" directory-replica "${operation}" --config "${CONFIG_FILE}"
     fi
+}
+
+run_carrier_smoke() {
+    run_directory_replica_smoke \
+        "carrier-smoke" \
+        "Verifying explicit signed Directory Mirror carrier recovery" \
+        "none (read-only retained-anchor verification)"
+}
+
+run_carrier_cold_bootstrap_smoke() {
+    run_directory_replica_smoke \
+        "carrier-cold-bootstrap-smoke" \
+        "Rebuilding an isolated Directory Replica through an explicit signed carrier" \
+        "isolated in-memory store only (live replica database is never opened)"
 }
 
 sha256_file() {
@@ -3214,11 +3243,12 @@ AeroNyx Node Operator
 7) Recent logs
 8) Refresh network/IP pool
 9) Verify Directory Mirror carrier
-10) Exit
+10) Verify carrier-assisted cold bootstrap
+11) Exit
 MENU
     printf 'Select an action: '
     local choice
-    IFS= read -r choice || choice="10"
+    IFS= read -r choice || choice="11"
 
     case "${choice}" in
         1)
@@ -3257,7 +3287,10 @@ MENU
         9)
             run_carrier_smoke
             ;;
-        10|"")
+        10)
+            run_carrier_cold_bootstrap_smoke
+            ;;
+        11|"")
             ok "No action selected"
             ;;
         *)
@@ -3308,6 +3341,9 @@ main() {
             ;;
         carrier-smoke)
             run_carrier_smoke
+            ;;
+        carrier-cold-bootstrap-smoke)
+            run_carrier_cold_bootstrap_smoke
             ;;
         refresh-bootstrap)
             run_refresh_bootstrap

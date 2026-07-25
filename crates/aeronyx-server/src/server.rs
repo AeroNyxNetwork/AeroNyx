@@ -482,7 +482,8 @@ use crate::api::directory_replica_status::{
     build_directory_replica_status_router, DirectoryReplicaStatusScope,
 };
 use crate::api::directory_replica_sync::{
-    run_directory_mirror_carrier_smoke, DirectoryMirrorCarrierSmokeReport,
+    run_directory_carrier_cold_bootstrap_smoke, run_directory_mirror_carrier_smoke,
+    DirectoryCarrierColdBootstrapSmokeReport, DirectoryMirrorCarrierSmokeReport,
     DirectoryReplicaSyncCoordinator, DirectoryReplicaSyncPolicy,
 };
 use crate::api::memchain_peer::{
@@ -2759,6 +2760,11 @@ impl Server {
         let directory_carrier_smoke_identity = Arc::clone(&node_identity);
         let directory_carrier_smoke_gate = Arc::new(TokioMutex::new(()));
         let directory_carrier_smoke_last_started_at = Arc::new(AtomicU64::new(0));
+        let directory_cold_bootstrap_http_client = directory_carrier_smoke_http_client.clone();
+        let directory_cold_bootstrap_peer_store = Arc::clone(&peer_store);
+        let directory_cold_bootstrap_identity = Arc::clone(&node_identity);
+        let directory_cold_bootstrap_gate = Arc::new(TokioMutex::new(()));
+        let directory_cold_bootstrap_last_started_at = Arc::new(AtomicU64::new(0));
         let commitment_storage = mpi_state
             .as_ref()
             .and_then(|state| state.storage.clone());
@@ -2769,6 +2775,7 @@ impl Server {
             .config
             .discovery
             .directory_chain_sync_peer_node_id_bytes();
+        let directory_cold_bootstrap_producers = Arc::new(directory_chain_sync_peer_ids.clone());
         let directory_observation_witness_min_verified = self
             .config
             .discovery
@@ -2985,6 +2992,82 @@ impl Server {
                                 Err(_) => (
                                     axum::http::StatusCode::GATEWAY_TIMEOUT,
                                     DirectoryMirrorCarrierSmokeReport::unavailable(
+                                        "smoke_deadline_exceeded",
+                                    ),
+                                ),
+                            };
+                            (status, axum::Json(report))
+                        }
+                    }),
+                )
+                // [CARRIER-COLD-BOOTSTRAP 2026-07-26 by Codex] This operator
+                // route never touches the live replica store and is omitted
+                // from the public discovery listener. It replays one pinned
+                // producer genesis page through an explicit signed carrier
+                // into a fresh SQLite in-memory store, then drops that store.
+                .route(
+                    "/api/discovery/directory/carrier-cold-bootstrap-smoke",
+                    axum::routing::post(move || {
+                        let producers = Arc::clone(&directory_cold_bootstrap_producers);
+                        let peer_store = Arc::clone(&directory_cold_bootstrap_peer_store);
+                        let identity = Arc::clone(&directory_cold_bootstrap_identity);
+                        let client = directory_cold_bootstrap_http_client.clone();
+                        let gate = Arc::clone(&directory_cold_bootstrap_gate);
+                        let last_started_at =
+                            Arc::clone(&directory_cold_bootstrap_last_started_at);
+                        async move {
+                            let configured_count = producers.len();
+                            let Ok(_permit) = gate.try_lock_owned() else {
+                                return (
+                                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    axum::Json(
+                                        DirectoryCarrierColdBootstrapSmokeReport::busy(
+                                            configured_count,
+                                        ),
+                                    ),
+                                );
+                            };
+                            let now = unix_now_secs();
+                            let last = last_started_at.load(Ordering::Acquire);
+                            let elapsed = now.saturating_sub(last);
+                            if last != 0
+                                && elapsed < DIRECTORY_MIRROR_CARRIER_SMOKE_COOLDOWN_SECS
+                            {
+                                return (
+                                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    axum::Json(
+                                        DirectoryCarrierColdBootstrapSmokeReport::cooldown(
+                                            configured_count,
+                                            DIRECTORY_MIRROR_CARRIER_SMOKE_COOLDOWN_SECS
+                                                .saturating_sub(elapsed),
+                                        ),
+                                    ),
+                                );
+                            }
+                            last_started_at.store(now, Ordering::Release);
+                            let result = tokio::time::timeout(
+                                Duration::from_secs(
+                                    DIRECTORY_MIRROR_CARRIER_SMOKE_DEADLINE_SECS,
+                                ),
+                                run_directory_carrier_cold_bootstrap_smoke(
+                                    producers.as_ref(),
+                                    &peer_store,
+                                    &identity,
+                                    client.as_deref(),
+                                ),
+                            )
+                            .await;
+                            let (status, report) = match result {
+                                Ok(report) if report.success => {
+                                    (axum::http::StatusCode::OK, report)
+                                }
+                                Ok(report) => {
+                                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, report)
+                                }
+                                Err(_) => (
+                                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                                    DirectoryCarrierColdBootstrapSmokeReport::unavailable(
+                                        configured_count,
                                         "smoke_deadline_exceeded",
                                     ),
                                 ),

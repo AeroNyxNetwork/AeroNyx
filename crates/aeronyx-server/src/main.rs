@@ -148,6 +148,17 @@ enum DirectoryReplicaCommands {
         json: bool,
     },
 
+    /// Prove an empty replica can bootstrap through an explicit public carrier
+    CarrierColdBootstrapSmoke {
+        /// Path to the running node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Verify an incident and print its exact compare-and-swap state
     InspectIncident {
         /// Content-addressed incident digest (64 hexadecimal characters)
@@ -623,6 +634,9 @@ async fn cmd_directory_replica(command: DirectoryReplicaCommands) -> anyhow::Res
         DirectoryReplicaCommands::CarrierSmoke { config, json } => {
             cmd_directory_replica_carrier_smoke(&config, json).await
         }
+        DirectoryReplicaCommands::CarrierColdBootstrapSmoke { config, json } => {
+            cmd_directory_replica_carrier_cold_bootstrap_smoke(&config, json).await
+        }
         DirectoryReplicaCommands::InspectIncident { digest, config } => {
             cmd_directory_replica_inspect(&config, &digest).await
         }
@@ -655,78 +669,110 @@ async fn cmd_directory_replica_carrier_smoke(
     config_path: &PathBuf,
     emit_json: bool,
 ) -> anyhow::Result<()> {
+    cmd_directory_replica_operator_smoke(
+        config_path,
+        emit_json,
+        "carrier-smoke",
+        "Directory Mirror carrier smoke",
+        &[
+            "retained_producers",
+            "eligible_retained_producers",
+            "explicit_carrier_candidates",
+            "attempted_carriers",
+            "verified_blocks",
+            "verified_descriptor_objects",
+            "storage_effect",
+        ],
+    )
+    .await
+}
+
+/// Proves that an empty isolated replica can bootstrap without the producer.
+async fn cmd_directory_replica_carrier_cold_bootstrap_smoke(
+    config_path: &PathBuf,
+    emit_json: bool,
+) -> anyhow::Result<()> {
+    cmd_directory_replica_operator_smoke(
+        config_path,
+        emit_json,
+        "carrier-cold-bootstrap-smoke",
+        "Directory carrier cold-bootstrap smoke",
+        &[
+            "configured_producers",
+            "eligible_producers",
+            "explicit_carrier_candidates",
+            "attempted_carriers",
+            "imported_blocks",
+            "imported_commitments",
+            "bootstrapped_tip_height",
+            "live_store_effect",
+        ],
+    )
+    .await
+}
+
+/// Calls one bounded local-only Directory Replica smoke endpoint.
+async fn cmd_directory_replica_operator_smoke(
+    config_path: &PathBuf,
+    emit_json: bool,
+    operation: &'static str,
+    title: &'static str,
+    fields: &[&str],
+) -> anyhow::Result<()> {
     const MAX_SMOKE_RESPONSE_BYTES: usize = 64 * 1024;
 
     let config = ServerConfig::load(config_path)
         .await
         .with_context(|| format!("load node config {}", config_path.display()))?;
-    let url = directory_replica_carrier_smoke_url(&config);
-    // [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] Keep the host-local CLI on
-    // loopback and independent of HTTP(S)_PROXY. The response is bounded while
-    // streaming; Content-Length is advisory and never trusted as the limit.
+    let url = directory_replica_operator_smoke_url(&config, operation);
+    // [CARRIER-COLD-BOOTSTRAP 2026-07-26 by Codex] Both smoke commands stay
+    // on loopback, ignore proxy settings, reject redirects, and stream into a
+    // hard response limit. `Content-Length` is never trusted as the bound.
     let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(45))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .context("initialize local carrier-smoke HTTP client")?;
+        .context("initialize local Directory Replica smoke HTTP client")?;
     let mut response = client
         .post(url)
         .send()
         .await
-        .context("contact the running node carrier-smoke endpoint")?;
+        .context("contact the running node Directory Replica smoke endpoint")?;
     let http_status = response.status();
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .context("read bounded carrier-smoke response")?
+        .context("read bounded Directory Replica smoke response")?
     {
         anyhow::ensure!(
             body.len().saturating_add(chunk.len()) <= MAX_SMOKE_RESPONSE_BYTES,
-            "carrier-smoke response exceeded its local protocol bound"
+            "Directory Replica smoke response exceeded its local protocol bound"
         );
         body.extend_from_slice(&chunk);
     }
     let report: serde_json::Value =
-        serde_json::from_slice(&body).context("decode carrier-smoke response")?;
+        serde_json::from_slice(&body).context("decode Directory Replica smoke response")?;
     if emit_json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
-        println!("Directory Mirror carrier smoke");
+        println!("{title}");
         println!(
             "  status: {}",
             report["status"].as_str().unwrap_or("unavailable")
         );
-        println!(
-            "  retained_producers: {}",
-            report["retained_producers"].as_u64().unwrap_or(0)
-        );
-        println!(
-            "  eligible_retained_producers: {}",
-            report["eligible_retained_producers"].as_u64().unwrap_or(0)
-        );
-        println!(
-            "  explicit_carrier_candidates: {}",
-            report["explicit_carrier_candidates"].as_u64().unwrap_or(0)
-        );
-        println!(
-            "  attempted_carriers: {}",
-            report["attempted_carriers"].as_u64().unwrap_or(0)
-        );
-        println!(
-            "  verified_blocks: {}",
-            report["verified_blocks"].as_u64().unwrap_or(0)
-        );
-        println!(
-            "  verified_descriptor_objects: {}",
-            report["verified_descriptor_objects"].as_u64().unwrap_or(0)
-        );
-        println!(
-            "  storage_effect: {}",
-            report["storage_effect"].as_str().unwrap_or("none_read_only")
-        );
+        for field in fields {
+            let value = &report[*field];
+            if let Some(value) = value.as_str() {
+                println!("  {field}: {value}");
+            } else if let Some(value) = value.as_u64() {
+                println!("  {field}: {value}");
+            } else if let Some(value) = value.as_bool() {
+                println!("  {field}: {value}");
+            }
+        }
         if let Some(reason) = report["failure_reason"].as_str() {
             println!("  failure_reason: {reason}");
         }
@@ -739,21 +785,21 @@ async fn cmd_directory_replica_carrier_smoke(
     }
     anyhow::ensure!(
         http_status.is_success() && report["success"].as_bool() == Some(true),
-        "Directory Mirror carrier smoke was not verified"
+        "Directory Replica smoke was not verified"
     );
     Ok(())
 }
 
 /// Resolve the loopback operator API independently from the UDP tunnel socket.
 ///
-/// [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] `network.listen_addr` is the
+/// [CARRIER-COLD-BOOTSTRAP 2026-07-26 by Codex] `network.listen_addr` is the
 /// privacy tunnel's UDP endpoint and cannot accept this HTTP request. Reusing
 /// only the configured operator API port preserves custom deployments while
 /// ensuring the CLI never follows a non-loopback bind address.
-fn directory_replica_carrier_smoke_url(config: &ServerConfig) -> String {
+fn directory_replica_operator_smoke_url(config: &ServerConfig, operation: &str) -> String {
     format!(
-        "http://127.0.0.1:{}/api/discovery/directory/carrier-smoke",
-        config.memchain.api_listen_addr.port()
+        "http://127.0.0.1:{}/api/discovery/directory/{operation}",
+        config.memchain.api_listen_addr.port(),
     )
 }
 
@@ -1151,9 +1197,28 @@ mod tests {
         config.memchain.api_listen_addr = "0.0.0.0:19421".parse().unwrap();
 
         assert_eq!(
-            directory_replica_carrier_smoke_url(&config),
+            directory_replica_operator_smoke_url(&config, "carrier-smoke"),
             "http://127.0.0.1:19421/api/discovery/directory/carrier-smoke"
         );
+    }
+
+    #[test]
+    fn directory_replica_cold_bootstrap_smoke_cli_is_read_only_and_json_capable() {
+        let cli = Cli::try_parse_from([
+            "aeronyx-server",
+            "directory-replica",
+            "carrier-cold-bootstrap-smoke",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::DirectoryReplica(
+            DirectoryReplicaCommands::CarrierColdBootstrapSmoke { json, config },
+        ) = cli.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert!(json);
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
     }
 
     #[test]
