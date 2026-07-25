@@ -52,8 +52,9 @@
 //! - Allows pinned producers to recover through bounded explicitly advertised
 //!   permissionless carriers after direct and pinned-carrier availability
 //!   failures, without granting those carriers authority.
-//! - Runs an operator-only cold-bootstrap smoke that replays one producer-signed
-//!   genesis page through an explicit carrier into a fresh in-memory store.
+//! - Runs an operator-only cold-bootstrap smoke that replays a bounded
+//!   multi-page producer-signed genesis prefix through rotating explicit
+//!   carriers into a fresh in-memory store.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -91,8 +92,10 @@
 //! 15. Prefer fresh routeability evidence, rotate equally healthy candidates,
 //!     and avoid repeating a signed region hint when an equally healthy
 //!     alternative exists. Region hints never prove operator or ASN diversity.
-//! 16. On explicit operator request, prove cold recovery in an isolated
-//!     in-memory replica and discard it without touching the live store.
+//! 16. On explicit operator request, prove bounded multi-page cold recovery in
+//!     an isolated in-memory replica. Rotate the first carrier between pages,
+//!     retry only availability failures, stop closed on cryptographic or import
+//!     failures, then discard the replica without touching the live store.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -114,8 +117,14 @@
 //!   policy anchors, fork choice, consensus, voting, or finality.
 //! - Mirror carrier recovery is one level only. Never recursively fetch from a
 //!   carrier while serving a recovery request.
+//! - A carrier availability failure may select another authenticated carrier.
+//!   A signature, chain, commitment, noncanonical, or import failure must stop
+//!   the isolated recovery immediately; never use failover to hide bad evidence.
 //!
 //! ## Last Modified
+//! `v0.22.0-CarrierMultiPageRecovery` - Extended isolated cold bootstrap to a
+//! bounded multi-page prefix with carrier rotation, availability-only failover,
+//! conservative request accounting, and a complete post-import store audit.
 //! `v0.21.0-CarrierColdBootstrap` - Added bounded explicit-carrier recovery for
 //! pinned producers and an isolated carrier-assisted cold-bootstrap release gate.
 //! `v0.20.0-ReadOnlyCarrierSmoke` - Added explicit-carrier-only retained-anchor
@@ -279,6 +288,49 @@ const DIRECTORY_MIRROR_CARRIER_CAPABILITY_CACHE_MAX_ENTRIES: usize = 256;
 const DIRECTORY_MIRROR_CARRIER_SMOKE_MAX_PRODUCERS: usize = 2;
 /// An isolated smoke checks only a bounded number of configured producers.
 const DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_MAX_PRODUCERS: usize = 2;
+/// [CARRIER-MULTIPAGE-RECOVERY 2026-07-26 by Codex] Three pages prove
+/// continuation beyond genesis without turning an operator smoke into an
+/// unbounded full-chain download.
+const DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_MAX_PAGES: u32 = 3;
+/// Failed carrier attempts are charged at the complete worst-case page cost.
+/// The smoke shares the existing pinned-producer round ceiling and records the
+/// exact range/object requests consumed before a failed carrier is replaced.
+const DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET: u32 =
+    DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryCarrierRecoveryDisposition {
+    RetryAvailabilityFailure,
+    StopClosed,
+}
+
+fn directory_carrier_recovery_disposition(reason: &str) -> DirectoryCarrierRecoveryDisposition {
+    if directory_mirror_failure_allows_recovery(reason) {
+        DirectoryCarrierRecoveryDisposition::RetryAvailabilityFailure
+    } else {
+        DirectoryCarrierRecoveryDisposition::StopClosed
+    }
+}
+
+/// Internal failure carrying conservative network-request accounting.
+///
+/// [CARRIER-MULTIPAGE-RECOVERY 2026-07-26 by Codex] This is intentionally
+/// private and never serialized: peer-controlled reasons remain mapped to
+/// stable privacy-safe buckets before leaving the coordinator.
+#[derive(Debug)]
+struct DirectoryCarrierPullFailure {
+    reason: String,
+    requests_made: u32,
+}
+
+impl DirectoryCarrierPullFailure {
+    fn new(reason: String, requests_made: u32) -> Self {
+        Self {
+            reason,
+            requests_made,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryMirrorPullSource {
@@ -423,13 +475,14 @@ impl DirectoryMirrorCarrierSmokeReport {
     }
 }
 
-/// Aggregate result of replaying a pinned producer's first signed page through
-/// an explicit public carrier into a fresh in-memory replica.
+/// Aggregate result of replaying a pinned producer's signed genesis prefix
+/// through explicit public carriers into a fresh in-memory replica.
 ///
-/// [CARRIER-COLD-BOOTSTRAP 2026-07-26 by Codex] The report proves that a node
-/// with no retained producer state can establish a producer-signed genesis
-/// prefix without contacting that producer. It exposes no selected identities,
-/// endpoints, hashes, descriptors, routes, payloads, or user metadata.
+/// [CARRIER-MULTIPAGE-RECOVERY 2026-07-26 by Codex] The report proves that a
+/// node with no retained producer state can establish and continue a bounded
+/// producer-signed prefix without contacting that producer. It exposes no
+/// selected identities, endpoints, hashes, descriptors, routes, payloads, or
+/// user metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DirectoryCarrierColdBootstrapSmokeReport {
     pub success: bool,
@@ -442,9 +495,16 @@ pub(crate) struct DirectoryCarrierColdBootstrapSmokeReport {
     pub explicit_carrier_candidates: u64,
     pub selected_routeable_carriers: u64,
     pub attempted_carriers: u64,
+    pub availability_failovers: u64,
+    pub distinct_successful_carriers: u64,
+    pub pages_imported: u64,
+    pub requests_used: u64,
+    pub request_budget: u64,
     pub imported_blocks: u64,
     pub imported_commitments: u64,
     pub bootstrapped_tip_height: u64,
+    pub multi_page_prefix_verified: bool,
+    pub reached_observed_remote_tip: bool,
     pub carrier_signature_verified: bool,
     pub producer_chain_verified: bool,
     pub genesis_anchor_verified: bool,
@@ -471,9 +531,18 @@ impl DirectoryCarrierColdBootstrapSmokeReport {
             explicit_carrier_candidates: 0,
             selected_routeable_carriers: 0,
             attempted_carriers: 0,
+            availability_failovers: 0,
+            distinct_successful_carriers: 0,
+            pages_imported: 0,
+            requests_used: 0,
+            request_budget: u64::from(
+                DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET,
+            ),
             imported_blocks: 0,
             imported_commitments: 0,
             bootstrapped_tip_height: 0,
+            multi_page_prefix_verified: false,
+            reached_observed_remote_tip: false,
             carrier_signature_verified: false,
             producer_chain_verified: false,
             genesis_anchor_verified: false,
@@ -564,6 +633,23 @@ pub(crate) const fn should_continue_directory_replica_catch_up(
         && pages_completed < DIRECTORY_SYNC_MAX_PAGES_PER_ROUND
         && requests_used.saturating_add(DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE)
             <= DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND
+}
+
+/// Whether the isolated carrier cold-bootstrap smoke may request another page.
+///
+/// [CARRIER-MULTIPAGE-RECOVERY 2026-07-26 by Codex] Reserve a complete
+/// worst-case page before continuing. The attempt loop applies the same check
+/// before every carrier, so an availability failure can never overrun the
+/// operator smoke budget.
+const fn should_continue_directory_carrier_cold_bootstrap(
+    pages_completed: u32,
+    requests_used: u32,
+    has_more: bool,
+) -> bool {
+    has_more
+        && pages_completed < DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_MAX_PAGES
+        && requests_used.saturating_add(DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE)
+            <= DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET
 }
 
 const fn directory_sync_next_round_delay(
@@ -2331,9 +2417,11 @@ pub(crate) async fn run_directory_mirror_carrier_smoke(
 
 /// Cold-bootstraps one operator-pinned producer through an explicit carrier.
 ///
-/// The target producer is never contacted. Every attempt gets a new SQLite
-/// `:memory:` store, starts at height one, imports exactly one bounded page,
-/// and runs the complete replica audit before the store is dropped.
+/// The target producer is never contacted. Every producer attempt gets one new
+/// SQLite `:memory:` store, starts at height one, imports up to three bounded
+/// pages, rotates the first carrier between pages, and runs the complete
+/// replica audit before the store is dropped. Only transport/availability
+/// failures may try another carrier; evidence or import failures stop closed.
 pub(crate) async fn run_directory_carrier_cold_bootstrap_smoke(
     configured_producers: &[[u8; 32]],
     peer_store: &PeerStore,
@@ -2387,82 +2475,168 @@ pub(crate) async fn run_directory_carrier_cold_bootstrap_smoke(
             continue;
         }
 
-        for carrier in selection.carriers {
-            report.attempted_carriers = report.attempted_carriers.saturating_add(1);
-            let local_node_id = requester;
-            let isolated_store = match tokio::task::spawn_blocking(move || {
-                DirectoryReplicaStore::open(":memory:", local_node_id, unix_now_secs())
-                    .map(|(store, _)| Arc::new(store))
-            })
-            .await
-            {
-                Ok(Ok(store)) => store,
-                _ => {
-                    last_failure = "isolated_store_initialization_failed";
-                    continue;
-                }
-            };
-            let outcome = match pull_directory_chain_pinned_page_via_discovered_carrier(
-                Arc::clone(&isolated_store),
-                peer_store,
-                identity,
-                &producer,
-                carrier,
-                client,
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(reason) => {
-                    last_failure = directory_mirror_carrier_smoke_failure_bucket(&reason);
-                    continue;
-                }
-            };
-            let verification_store = Arc::clone(&isolated_store);
-            let verification = tokio::task::spawn_blocking(move || {
-                let tip = verification_store.producer_tip(&producer)?;
-                let audit = verification_store.audit(unix_now_secs())?;
-                let mirrors = verification_store.mirror_producer_ids()?;
-                if tip.tip_height == 0
-                    || tip.quarantined
-                    || audit.producers != 1
-                    || audit.mirror_producers != 0
-                    || audit.quarantined_producers != 0
-                    || audit.blocks != tip.tip_height
-                    || !mirrors.is_empty()
-                {
-                    return Err(DirectoryReplicaStoreError::Integrity(
-                        "isolated cold-bootstrap audit contract mismatch".to_string(),
-                    ));
-                }
-                Ok((tip.tip_height, audit.blocks, audit.commitments))
-            })
-            .await;
-            let Ok(Ok((tip_height, audited_blocks, audited_commitments))) = verification else {
-                last_failure = "isolated_store_audit_failed";
-                continue;
-            };
-            if outcome.import.blocks_inserted == 0
-                || outcome.import.tip_height != tip_height
-                || audited_blocks < outcome.import.blocks_inserted
-                || audited_commitments < outcome.import.commitments_inserted
-            {
-                last_failure = "isolated_store_import_contract_mismatch";
+        let local_node_id = requester;
+        let isolated_store = match tokio::task::spawn_blocking(move || {
+            DirectoryReplicaStore::open(":memory:", local_node_id, unix_now_secs())
+                .map(|(store, _)| Arc::new(store))
+        })
+        .await
+        {
+            Ok(Ok(store)) => store,
+            _ => {
+                last_failure = "isolated_store_initialization_failed";
                 continue;
             }
+        };
+        let carriers = selection.carriers;
+        let mut pages_imported = 0u32;
+        let mut requests_used = 0u32;
+        let mut imported_blocks = 0u64;
+        let mut imported_commitments = 0u64;
+        let mut successful_carriers = HashSet::new();
+        let mut last_outcome = None;
+        let mut producer_attempt_failed = false;
 
-            report.success = true;
-            report.status = "verified";
-            report.imported_blocks = outcome.import.blocks_inserted;
-            report.imported_commitments = outcome.import.commitments_inserted;
-            report.bootstrapped_tip_height = tip_height;
+        while pages_imported < DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_MAX_PAGES {
+            let first_carrier = usize::try_from(pages_imported)
+                .unwrap_or(0)
+                .checked_rem(carriers.len())
+                .unwrap_or(0);
+            let mut page_outcome = None;
+
+            for offset in 0..carriers.len() {
+                if requests_used.saturating_add(DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE)
+                    > DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET
+                {
+                    last_failure = "smoke_request_budget_exhausted";
+                    producer_attempt_failed = true;
+                    break;
+                }
+                let carrier = carriers[(first_carrier + offset) % carriers.len()];
+                report.attempted_carriers = report.attempted_carriers.saturating_add(1);
+                match pull_directory_chain_pinned_page_via_discovered_carrier(
+                    Arc::clone(&isolated_store),
+                    peer_store,
+                    identity,
+                    &producer,
+                    carrier,
+                    client,
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        requests_used = requests_used.saturating_add(outcome.requests_made);
+                        successful_carriers.insert(carrier.node_id);
+                        page_outcome = Some(outcome);
+                        break;
+                    }
+                    Err(failure)
+                        if directory_carrier_recovery_disposition(&failure.reason)
+                            == DirectoryCarrierRecoveryDisposition::RetryAvailabilityFailure =>
+                    {
+                        // [CARRIER-MULTIPAGE-RECOVERY 2026-07-26 by Codex]
+                        // The tracked pull reports every range/object request
+                        // consumed before failure. A complete page is still
+                        // reserved before the next carrier is attempted.
+                        requests_used = requests_used.saturating_add(failure.requests_made);
+                        report.availability_failovers =
+                            report.availability_failovers.saturating_add(1);
+                        last_failure =
+                            directory_mirror_carrier_smoke_failure_bucket(&failure.reason);
+                    }
+                    Err(failure) => {
+                        requests_used = requests_used.saturating_add(failure.requests_made);
+                        report.requests_used = report.requests_used.max(u64::from(requests_used));
+                        report.failure_reason = Some(
+                            directory_mirror_carrier_smoke_failure_bucket(&failure.reason),
+                        );
+                        return report;
+                    }
+                }
+            }
+
+            let Some(outcome) = page_outcome else {
+                producer_attempt_failed = true;
+                break;
+            };
+            pages_imported = pages_imported.saturating_add(1);
+            imported_blocks = imported_blocks.saturating_add(outcome.import.blocks_inserted);
+            imported_commitments =
+                imported_commitments.saturating_add(outcome.import.commitments_inserted);
             report.carrier_signature_verified = true;
-            report.producer_chain_verified = true;
-            report.genesis_anchor_verified = true;
-            report.isolated_store_audit_verified = true;
-            report.failure_reason = None;
-            return report;
+            last_outcome = Some(outcome);
+
+            if !should_continue_directory_carrier_cold_bootstrap(
+                pages_imported,
+                requests_used,
+                outcome.has_more,
+            ) {
+                break;
+            }
         }
+
+        report.pages_imported = report.pages_imported.max(u64::from(pages_imported));
+        report.requests_used = report.requests_used.max(u64::from(requests_used));
+        if producer_attempt_failed {
+            continue;
+        }
+        let Some(last_outcome) = last_outcome else {
+            last_failure = "no_cold_bootstrap_evidence";
+            continue;
+        };
+        if pages_imported < 2 {
+            last_failure = "insufficient_multi_page_evidence";
+            continue;
+        }
+
+        let verification_store = Arc::clone(&isolated_store);
+        let verification = tokio::task::spawn_blocking(move || {
+            let tip = verification_store.producer_tip(&producer)?;
+            let audit = verification_store.audit(unix_now_secs())?;
+            let mirrors = verification_store.mirror_producer_ids()?;
+            if tip.tip_height == 0
+                || tip.quarantined
+                || audit.producers != 1
+                || audit.mirror_producers != 0
+                || audit.quarantined_producers != 0
+                || audit.blocks != tip.tip_height
+                || !mirrors.is_empty()
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "isolated cold-bootstrap audit contract mismatch".to_string(),
+                ));
+            }
+            Ok((tip.tip_height, audit.blocks, audit.commitments))
+        })
+        .await;
+        let Ok(Ok((tip_height, audited_blocks, audited_commitments))) = verification else {
+            last_failure = "isolated_store_audit_failed";
+            continue;
+        };
+        if imported_blocks == 0
+            || last_outcome.import.tip_height != tip_height
+            || audited_blocks != imported_blocks
+            || audited_commitments != imported_commitments
+        {
+            last_failure = "isolated_store_import_contract_mismatch";
+            continue;
+        }
+
+        report.success = true;
+        report.status = "verified";
+        report.distinct_successful_carriers =
+            u64::try_from(successful_carriers.len()).unwrap_or(u64::MAX);
+        report.imported_blocks = imported_blocks;
+        report.imported_commitments = imported_commitments;
+        report.bootstrapped_tip_height = tip_height;
+        report.multi_page_prefix_verified = true;
+        report.reached_observed_remote_tip =
+            directory_sync_outcome_is_checkpoint_complete(&last_outcome);
+        report.producer_chain_verified = true;
+        report.genesis_anchor_verified = true;
+        report.isolated_store_audit_verified = true;
+        report.failure_reason = None;
+        return report;
     }
     report.failure_reason = Some(last_failure);
     report
@@ -2662,16 +2836,18 @@ async fn pull_directory_chain_page_with_carriers(
                         );
                         return Ok(outcome);
                     }
-                    Err(carrier_reason)
-                        if directory_mirror_failure_allows_recovery(&carrier_reason) =>
+                    Err(carrier_failure)
+                        if directory_mirror_failure_allows_recovery(&carrier_failure.reason) =>
                     {
-                        if directory_mirror_carrier_capability_unavailable(&carrier_reason) {
+                        if directory_mirror_carrier_capability_unavailable(&carrier_failure.reason)
+                        {
                             carrier_capabilities
                                 .record_unsupported(carrier.node_id, carrier.descriptor_sequence);
                         }
-                        prior_requests = prior_requests.saturating_add(1);
+                        prior_requests =
+                            prior_requests.saturating_add(carrier_failure.requests_made);
                     }
-                    Err(carrier_reason) => return Err(carrier_reason),
+                    Err(carrier_failure) => return Err(carrier_failure.reason),
                 }
             }
             Err("directory_carrier_fallback_exhausted".to_string())
@@ -3063,24 +3239,27 @@ async fn pull_directory_chain_pinned_page_via_discovered_carrier(
     producer: &[u8; 32],
     carrier: DirectoryMirrorRecoveryCarrier,
     client: &reqwest::Client,
-) -> Result<DirectorySyncPullOutcome, String> {
+) -> Result<DirectorySyncPullOutcome, DirectoryCarrierPullFailure> {
     let request_timestamp = unix_now_secs();
     let local_tip = replica_store
         .producer_tip(producer)
-        .map_err(|_| "replica_tip_unavailable".to_string())?;
+        .map_err(|_| DirectoryCarrierPullFailure::new("replica_tip_unavailable".to_string(), 0))?;
     if local_tip.quarantined {
-        return Err("producer_quarantined".to_string());
+        return Err(DirectoryCarrierPullFailure::new(
+            "producer_quarantined".to_string(),
+            0,
+        ));
     }
     let (range_url, object_url) = directory_mirror_recovery_carrier_urls(
         peer_store,
         &carrier.node_id,
         carrier.descriptor_sequence,
         request_timestamp,
-    )?;
-    let from_height = local_tip
-        .tip_height
-        .checked_add(1)
-        .ok_or_else(|| "replica_height_exhausted".to_string())?;
+    )
+    .map_err(|reason| DirectoryCarrierPullFailure::new(reason, 0))?;
+    let from_height = local_tip.tip_height.checked_add(1).ok_or_else(|| {
+        DirectoryCarrierPullFailure::new("replica_height_exhausted".to_string(), 0)
+    })?;
     let requester = identity.public_key_bytes();
     let page = request_directory_replica_block_page(
         identity,
@@ -3091,8 +3270,9 @@ async fn pull_directory_chain_pinned_page_via_discovered_carrier(
         from_height,
         request_timestamp,
     )
-    .await?;
-    let (objects, requests_made) = hydrate_directory_replica_descriptor_objects(
+    .await
+    .map_err(|reason| DirectoryCarrierPullFailure::new(reason, 1))?;
+    let (objects, requests_made) = hydrate_directory_replica_descriptor_objects_tracked(
         identity,
         producer,
         &carrier.node_id,
@@ -3102,7 +3282,9 @@ async fn pull_directory_chain_pinned_page_via_discovered_carrier(
         &page.blocks,
     )
     .await?;
-    import_directory_range_page(replica_store, *producer, page, objects, requests_made).await
+    import_directory_range_page(replica_store, *producer, page, objects, requests_made)
+        .await
+        .map_err(|reason| DirectoryCarrierPullFailure::new(reason, requests_made))
 }
 
 fn directory_sync_peer_urls(
@@ -3389,6 +3571,26 @@ async fn hydrate_directory_replica_descriptor_objects(
     requester: &[u8; 32],
     blocks: &[DirectoryCommitmentBlockV1],
 ) -> Result<(Vec<SignedNodeDescriptor>, u32), String> {
+    hydrate_directory_replica_descriptor_objects_tracked(
+        identity, producer, carrier, client, object_url, requester, blocks,
+    )
+    .await
+    .map_err(|failure| failure.reason)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_directory_replica_descriptor_objects_tracked(
+    identity: &IdentityKeyPair,
+    producer: &[u8; 32],
+    carrier: &[u8; 32],
+    client: &reqwest::Client,
+    object_url: reqwest::Url,
+    requester: &[u8; 32],
+    blocks: &[DirectoryCommitmentBlockV1],
+) -> Result<(Vec<SignedNodeDescriptor>, u32), DirectoryCarrierPullFailure> {
+    // [CARRIER-MULTIPAGE-RECOVERY 2026-07-26 by Codex] Count the successful
+    // range plus each object request at its dispatch boundary so carrier
+    // failover cannot reset or understate the operator smoke budget.
     let descriptor_hashes = blocks
         .iter()
         .flat_map(|block| {
@@ -3398,7 +3600,8 @@ async fn hydrate_directory_replica_descriptor_objects(
                 .map(|commitment| commitment.descriptor_hash)
         })
         .collect::<Vec<_>>();
-    let requests_made = directory_sync_request_count_for_objects(descriptor_hashes.len());
+    // The successful range request has already been consumed before hydration.
+    let mut requests_made = 1u32;
     let mut objects = Vec::with_capacity(descriptor_hashes.len());
     for hashes in descriptor_hashes.chunks(MAX_DIRECTORY_SYNC_OBJECTS_V1) {
         let request_timestamp = unix_now_secs();
@@ -3421,10 +3624,16 @@ async fn hydrate_directory_replica_descriptor_objects(
             request_timestamp,
             signature: identity.sign(&signing_bytes),
         };
-        let frame = encode_directory_sync_message(&request)
-            .map_err(|_| "directory_replica_object_request_encode_failed".to_string())?;
-        let response =
-            post_directory_frame(client, object_url.clone(), frame, "replica_objects").await?;
+        let frame = encode_directory_sync_message(&request).map_err(|_| {
+            DirectoryCarrierPullFailure::new(
+                "directory_replica_object_request_encode_failed".to_string(),
+                requests_made,
+            )
+        })?;
+        requests_made = requests_made.saturating_add(1);
+        let response = post_directory_frame(client, object_url.clone(), frame, "replica_objects")
+            .await
+            .map_err(|reason| DirectoryCarrierPullFailure::new(reason, requests_made))?;
         let mut verified = verify_replica_descriptor_objects_response(
             &response,
             &request_id,
@@ -3432,7 +3641,8 @@ async fn hydrate_directory_replica_descriptor_objects(
             carrier,
             hashes,
             request_timestamp,
-        )?;
+        )
+        .map_err(|reason| DirectoryCarrierPullFailure::new(reason, requests_made))?;
         objects.append(&mut verified);
     }
     Ok((objects, requests_made))
@@ -3840,9 +4050,72 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeronyx_core::protocol::discovery::{
+        DirectoryDescriptorCommitmentV1, NodeDescriptor,
+    };
+    use axum::{http::StatusCode, routing::post, Router};
     use tempfile::TempDir;
 
     const TEST_NOW: u64 = 1_700_000_000;
+
+    fn carrier_hydration_test_context(
+    ) -> (
+        IdentityKeyPair,
+        IdentityKeyPair,
+        IdentityKeyPair,
+        DirectoryCommitmentBlockV1,
+    ) {
+        let requester = IdentityKeyPair::from_bytes(&[0x81; 32]).unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x82; 32]).unwrap();
+        let carrier = IdentityKeyPair::from_bytes(&[0x83; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x84; 32]).unwrap();
+        let descriptor = SignedNodeDescriptor::sign(
+            NodeDescriptor::new(
+                subject.public_key_bytes(),
+                1,
+                TEST_NOW - 10,
+                TEST_NOW + 3_600,
+                "carrier-hydration-test",
+            ),
+            &subject,
+        )
+        .unwrap();
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            TEST_NOW,
+            [0u8; 32],
+            vec![commitment],
+            &producer,
+        )
+        .unwrap();
+        (requester, producer, carrier, block)
+    }
+
+    async fn carrier_hydration_test_endpoint(
+        status: StatusCode,
+        body: Vec<u8>,
+    ) -> (reqwest::Url, JoinHandle<()>) {
+        let app = Router::new().route(
+            "/",
+            post(move || {
+                let body = body.clone();
+                async move { (status, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
+            server,
+        )
+    }
 
     #[test]
     fn startup_delay_is_stable_bounded_and_identity_spread() {
@@ -4042,6 +4315,117 @@ mod tests {
         assert_eq!(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE, 2);
     }
 
+    #[test]
+    fn carrier_cold_bootstrap_multi_page_budget_is_bounded() {
+        // [CARRIER-MULTIPAGE-RECOVERY 2026-07-26 by Codex] Every attempt
+        // reserves a full worst-case page while accounting the exact requests
+        // already consumed. Sparse pages can prove multi-page continuation;
+        // dense pages stop before crossing the normal producer-round ceiling.
+        assert_eq!(DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_MAX_PAGES, 3);
+        assert_eq!(
+            DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET,
+            DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND
+        );
+        assert!(should_continue_directory_carrier_cold_bootstrap(1, 1, true));
+        assert!(should_continue_directory_carrier_cold_bootstrap(2, 2, true));
+        assert!(!should_continue_directory_carrier_cold_bootstrap(
+            DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_MAX_PAGES,
+            0,
+            true,
+        ));
+        assert!(!should_continue_directory_carrier_cold_bootstrap(
+            1, 0, false,
+        ));
+        assert!(!should_continue_directory_carrier_cold_bootstrap(
+            1,
+            DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET,
+            true,
+        ));
+    }
+
+    #[test]
+    fn carrier_cold_bootstrap_retries_only_availability_failures() {
+        for reason in [
+            "directory_replica_range_transport_failed",
+            "directory_replica_objects_transport_failed",
+            "directory_replica_range_http_status_503",
+            "directory_replica_range_peer_replica_range_not_retained",
+            "directory_mirror_recovery_carrier_descriptor_changed",
+        ] {
+            assert_eq!(
+                directory_carrier_recovery_disposition(reason),
+                DirectoryCarrierRecoveryDisposition::RetryAvailabilityFailure
+            );
+        }
+        for reason in [
+            "directory_replica_range_response_noncanonical",
+            "directory_replica_range_response_invalid_signature",
+            "directory_replica_object_response_hash_mismatch",
+            "directory_replica_import_rejected",
+            "producer_quarantined",
+        ] {
+            assert_eq!(
+                directory_carrier_recovery_disposition(reason),
+                DirectoryCarrierRecoveryDisposition::StopClosed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_hydration_availability_failure_preserves_request_count() {
+        let (requester, producer, carrier, block) = carrier_hydration_test_context();
+        let (object_url, server) =
+            carrier_hydration_test_endpoint(StatusCode::SERVICE_UNAVAILABLE, Vec::new()).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let failure = hydrate_directory_replica_descriptor_objects_tracked(
+            &requester,
+            &producer.public_key_bytes(),
+            &carrier.public_key_bytes(),
+            &client,
+            object_url,
+            &requester.public_key_bytes(),
+            &[block],
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        // One already-successful range plus one dispatched object request.
+        assert_eq!(failure.requests_made, 2);
+        assert_eq!(
+            directory_carrier_recovery_disposition(&failure.reason),
+            DirectoryCarrierRecoveryDisposition::RetryAvailabilityFailure
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_hydration_corruption_stops_closed_without_losing_request_count() {
+        let (requester, producer, carrier, block) = carrier_hydration_test_context();
+        let (object_url, server) =
+            carrier_hydration_test_endpoint(StatusCode::OK, b"corrupt-frame".to_vec()).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let failure = hydrate_directory_replica_descriptor_objects_tracked(
+            &requester,
+            &producer.public_key_bytes(),
+            &carrier.public_key_bytes(),
+            &client,
+            object_url,
+            &requester.public_key_bytes(),
+            &[block],
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert_eq!(failure.requests_made, 2);
+        assert_eq!(
+            directory_carrier_recovery_disposition(&failure.reason),
+            DirectoryCarrierRecoveryDisposition::StopClosed
+        );
+    }
+
     #[tokio::test]
     async fn cold_bootstrap_smoke_fails_closed_without_transport() {
         let local = IdentityKeyPair::from_bytes(&[0xc1; 32]).unwrap();
@@ -4062,6 +4446,12 @@ mod tests {
             Some("smoke_http_client_initialization_failed")
         );
         assert_eq!(report.live_store_effect, "none_isolated_memory_store_only");
+        assert_eq!(report.pages_imported, 0);
+        assert_eq!(
+            report.request_budget,
+            u64::from(DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET)
+        );
+        assert!(!report.multi_page_prefix_verified);
     }
 
     #[test]
