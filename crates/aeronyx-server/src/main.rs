@@ -660,10 +660,7 @@ async fn cmd_directory_replica_carrier_smoke(
     let config = ServerConfig::load(config_path)
         .await
         .with_context(|| format!("load node config {}", config_path.display()))?;
-    let url = format!(
-        "http://127.0.0.1:{}/api/discovery/directory/carrier-smoke",
-        config.listen_addr().port()
-    );
+    let url = directory_replica_carrier_smoke_url(&config);
     // [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] Keep the host-local CLI on
     // loopback and independent of HTTP(S)_PROXY. The response is bounded while
     // streaming; Content-Length is advisory and never trusted as the limit.
@@ -745,6 +742,19 @@ async fn cmd_directory_replica_carrier_smoke(
         "Directory Mirror carrier smoke was not verified"
     );
     Ok(())
+}
+
+/// Resolve the loopback operator API independently from the UDP tunnel socket.
+///
+/// [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] `network.listen_addr` is the
+/// privacy tunnel's UDP endpoint and cannot accept this HTTP request. Reusing
+/// only the configured operator API port preserves custom deployments while
+/// ensuring the CLI never follows a non-loopback bind address.
+fn directory_replica_carrier_smoke_url(config: &ServerConfig) -> String {
+    format!(
+        "http://127.0.0.1:{}/api/discovery/directory/carrier-smoke",
+        config.memchain.api_listen_addr.port()
+    )
 }
 
 #[derive(Debug)]
@@ -1133,6 +1143,17 @@ mod tests {
         };
         assert!(json);
         assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+    }
+
+    #[test]
+    fn directory_replica_carrier_smoke_targets_operator_api_not_udp_tunnel() {
+        let mut config = ServerConfig::default();
+        config.memchain.api_listen_addr = "0.0.0.0:19421".parse().unwrap();
+
+        assert_eq!(
+            directory_replica_carrier_smoke_url(&config),
+            "http://127.0.0.1:19421/api/discovery/directory/carrier-smoke"
+        );
     }
 
     #[test]
