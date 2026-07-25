@@ -213,6 +213,8 @@
 //  89. Externally anchors the opaque current Directory witness-policy head at
 //      its exact pinned witnesses and audits monotonic remote heads plus signed
 //      local receipts before listeners start, without exporting policy members.
+//  90. Mounts a rate-limited local/VPN-only Directory Mirror carrier smoke
+//      route that verifies retained signed evidence without importing it.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -480,6 +482,7 @@ use crate::api::directory_replica_status::{
     build_directory_replica_status_router, DirectoryReplicaStatusScope,
 };
 use crate::api::directory_replica_sync::{
+    run_directory_mirror_carrier_smoke, DirectoryMirrorCarrierSmokeReport,
     DirectoryReplicaSyncCoordinator, DirectoryReplicaSyncPolicy,
 };
 use crate::api::memchain_peer::{
@@ -560,6 +563,12 @@ const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PROBE_REQUEST_LIMIT: usize = 8;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
+/// Manual mirror-carrier verification is local-only but remains low frequency.
+const DIRECTORY_MIRROR_CARRIER_SMOKE_COOLDOWN_SECS: u64 = 30;
+/// [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] Bound the complete
+/// multi-producer verification round, including descriptor hydration. Per-request
+/// HTTP timeouts alone cannot cap a paginated or multi-carrier smoke.
+const DIRECTORY_MIRROR_CARRIER_SMOKE_DEADLINE_SECS: u64 = 35;
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
 /// Coalesce verified-delivery bursts before atomically refreshing peer cache.
@@ -2733,6 +2742,23 @@ impl Server {
         let smoke_node_identity = Arc::clone(&node_identity);
         let smoke_peer_http_client = Arc::clone(&peer_http_client);
         let smoke_local_capability_status = local_capability_status.clone();
+        // [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] Directory evidence
+        // transport never inherits host proxy settings or follows redirects:
+        // either would add an unreviewed metadata observer/identity boundary.
+        let directory_carrier_smoke_http_client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(12))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(1)
+            .build()
+            .ok()
+            .map(Arc::new);
+        let directory_carrier_smoke_store = directory_replica_store.clone();
+        let directory_carrier_smoke_peer_store = Arc::clone(&peer_store);
+        let directory_carrier_smoke_identity = Arc::clone(&node_identity);
+        let directory_carrier_smoke_gate = Arc::new(TokioMutex::new(()));
+        let directory_carrier_smoke_last_started_at = Arc::new(AtomicU64::new(0));
         let commitment_storage = mpi_state
             .as_ref()
             .and_then(|state| state.storage.clone());
@@ -2898,6 +2924,72 @@ impl Server {
                                 "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
                                 "privacy_boundary": "operator smoke returns aggregate counters only; no endpoints, route ids, selected hops, receiver keys, encrypted payloads, client IPs, destinations, DNS contents, private keys, wallet-level traffic, or social graph metadata",
                             }))
+                        }
+                    }),
+                )
+                // [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] This route is
+                // intentionally absent from `build_public_discovery_router`.
+                // Single-flight and cooldown bound work even if a VPN client
+                // repeatedly calls the operator listener.
+                .route(
+                    "/api/discovery/directory/carrier-smoke",
+                    axum::routing::post(move || {
+                        let store = directory_carrier_smoke_store.clone();
+                        let peer_store = Arc::clone(&directory_carrier_smoke_peer_store);
+                        let identity = Arc::clone(&directory_carrier_smoke_identity);
+                        let client = directory_carrier_smoke_http_client.clone();
+                        let gate = Arc::clone(&directory_carrier_smoke_gate);
+                        let last_started_at =
+                            Arc::clone(&directory_carrier_smoke_last_started_at);
+                        async move {
+                            let Ok(_permit) = gate.try_lock_owned() else {
+                                return (
+                                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    axum::Json(DirectoryMirrorCarrierSmokeReport::busy()),
+                                );
+                            };
+                            let now = unix_now_secs();
+                            let last = last_started_at.load(Ordering::Acquire);
+                            let elapsed = now.saturating_sub(last);
+                            if last != 0
+                                && elapsed < DIRECTORY_MIRROR_CARRIER_SMOKE_COOLDOWN_SECS
+                            {
+                                return (
+                                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    axum::Json(DirectoryMirrorCarrierSmokeReport::cooldown(
+                                        DIRECTORY_MIRROR_CARRIER_SMOKE_COOLDOWN_SECS
+                                            .saturating_sub(elapsed),
+                                    )),
+                                );
+                            }
+                            last_started_at.store(now, Ordering::Release);
+                            let result = tokio::time::timeout(
+                                Duration::from_secs(
+                                    DIRECTORY_MIRROR_CARRIER_SMOKE_DEADLINE_SECS,
+                                ),
+                                run_directory_mirror_carrier_smoke(
+                                    store,
+                                    &peer_store,
+                                    &identity,
+                                    client.as_deref(),
+                                ),
+                            )
+                            .await;
+                            let (status, report) = match result {
+                                Ok(report) if report.success => {
+                                    (axum::http::StatusCode::OK, report)
+                                }
+                                Ok(report) => {
+                                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, report)
+                                }
+                                Err(_) => (
+                                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                                    DirectoryMirrorCarrierSmokeReport::unavailable(
+                                        "smoke_deadline_exceeded",
+                                    ),
+                                ),
+                            };
+                            (status, axum::Json(report))
                         }
                     }),
                 )

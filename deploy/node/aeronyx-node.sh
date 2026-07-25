@@ -42,6 +42,9 @@
 #   JSON in `status` instead of printing full endpoint payloads. This keeps the
 #   one-command operator view readable for humans and AI assistants while
 #   preserving the explicit privacy boundary.
+# - Add `carrier-smoke` as a read-only release gate for signed Directory Mirror
+#   recovery. It calls only the running node's loopback operator route and
+#   returns aggregate evidence without firewall or database mutation.
 # - Add a read-only discovery readiness summary to `status` so operators can
 #   see ChatRelay advertisement and peer quorum state without hand-curling the
 #   public peer API.
@@ -100,6 +103,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.19.0-node-entrypoint - Added read-only Directory Mirror carrier-smoke.
 # v1.18.0-node-entrypoint - Made staged-binary promotion model-startup-aware and rollback-safe.
 # v1.17.0-node-entrypoint - Added bootstrap snapshot refresh and fleet drift check commands.
 # v1.16.0-node-entrypoint - Added fleet-smoke --two-hop multi-hop relay path proof.
@@ -207,6 +211,7 @@ Commands:
   onion-middle Enable or disable no-exit OnionMiddle capability in server.toml.
   relay-probe Send one synthetic BlindRelay route probe to a discovered peer.
   fleet-smoke Verify a public multi-node discovery + blind relay mesh.
+  carrier-smoke Verify signed Directory Mirror carrier recovery without import.
   refresh-bootstrap Refresh the signed discovery bootstrap snapshot.
   fleet-drift-check Read-only check for seed/snapshot/binary drift.
   promote-binary Promote a staged aeronyx-server binary with drain checks.
@@ -279,6 +284,12 @@ Command-specific options:
     --json                  Emit JSON result for nodeboard/automation.
     --json-only             Emit only JSON.
 
+  carrier-smoke:
+    --config PATH           Running node config. Default: /etc/aeronyx/server.toml.
+    --repo-dir PATH         Repository containing the release binary.
+    --json                  Emit the stable aggregate JSON contract.
+    --json-only             Emit only the stable aggregate JSON contract.
+
   refresh-bootstrap:
     --source-endpoint URL     Discovery base URL to fetch /api/discovery/snapshot from.
                               Default: local 127.0.0.1 discovery API from --config.
@@ -312,6 +323,7 @@ Examples:
   ./deploy/node/aeronyx-node.sh status
   ./deploy/node/aeronyx-node.sh relay-probe --json
   ./deploy/node/aeronyx-node.sh fleet-smoke --endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --two-hop --json
+  ./deploy/node/aeronyx-node.sh carrier-smoke --json
   sudo ./deploy/node/aeronyx-node.sh refresh-bootstrap --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422
   ./deploy/node/aeronyx-node.sh fleet-drift-check --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --json
   sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
@@ -2607,6 +2619,47 @@ raise SystemExit(0 if ok else 3)
 PY
 }
 
+resolve_node_binary() {
+    local candidate pid
+    candidate="${REPO_DIR}/target/release/aeronyx-server"
+    if [ -x "${candidate}" ]; then
+        printf '%s\n' "${candidate}"
+        return
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        pid="$(systemctl show "${SERVICE_NAME}" --property=MainPID --value 2>/dev/null || true)"
+        if printf '%s' "${pid}" | grep -Eq '^[1-9][0-9]*$' && [ -L "/proc/${pid}/exe" ]; then
+            candidate="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+            if [ -x "${candidate}" ]; then
+                printf '%s\n' "${candidate}"
+                return
+            fi
+        fi
+    fi
+    candidate="$(command -v aeronyx-server 2>/dev/null || true)"
+    [ -n "${candidate}" ] && [ -x "${candidate}" ] || return 1
+    printf '%s\n' "${candidate}"
+}
+
+# [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] Keep this release gate on the
+# running node's loopback-only operator API; it must never mutate the replica
+# store or expose selected producer/carrier identities.
+run_carrier_smoke() {
+    local binary
+    binary="$(resolve_node_binary)" || die "aeronyx-server binary not found; set --repo-dir to the deployed repository"
+    [ -r "${CONFIG_FILE}" ] || die "Node config not readable: ${CONFIG_FILE}"
+    if [ "${JSON_ONLY}" -ne 1 ]; then
+        log "Verifying explicit signed Directory Mirror carrier recovery"
+        log "Storage effect: none (read-only retained-anchor verification)"
+        log "Privacy boundary: aggregate evidence only; no identities, endpoints, hashes, routes, payloads, or user metadata"
+    fi
+    if [ "${JSON}" -eq 1 ] || [ "${JSON_ONLY}" -eq 1 ]; then
+        "${binary}" directory-replica carrier-smoke --config "${CONFIG_FILE}" --json
+    else
+        "${binary}" directory-replica carrier-smoke --config "${CONFIG_FILE}"
+    fi
+}
+
 sha256_file() {
     local path="$1"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -3160,11 +3213,12 @@ AeroNyx Node Operator
 6) Service status
 7) Recent logs
 8) Refresh network/IP pool
-9) Exit
+9) Verify Directory Mirror carrier
+10) Exit
 MENU
     printf 'Select an action: '
     local choice
-    IFS= read -r choice || choice="9"
+    IFS= read -r choice || choice="10"
 
     case "${choice}" in
         1)
@@ -3200,7 +3254,10 @@ MENU
             IFS= read -r SET_VPN_CIDR
             run_network
             ;;
-        9|"")
+        9)
+            run_carrier_smoke
+            ;;
+        10|"")
             ok "No action selected"
             ;;
         *)
@@ -3248,6 +3305,9 @@ main() {
             ;;
         fleet-smoke)
             run_fleet_smoke
+            ;;
+        carrier-smoke)
+            run_carrier_smoke
             ;;
         refresh-bootstrap)
             run_refresh_bootstrap

@@ -56,6 +56,8 @@
 //!   request so recovery can continue without weakening contract validation.
 //! - Records only aggregate routeability and signed-region-hint diversity for
 //!   the latest bounded carrier selection, never peer identities or endpoints.
+//! - Re-verifies one carrier-returned retained mirror anchor without importing
+//!   it, enabling a production smoke test with no authority or storage change.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
@@ -95,6 +97,8 @@
 //! 14. Permit public recovery reads only for producers still present in that
 //!     registry, while preserving the general reader for pinned authority use;
 //!     re-audit the complete requested producer namespace transactionally.
+//! 15. For operator carrier smoke, audit one retained local anchor, verify the
+//!     carrier frame and all producer/object evidence, then discard the page.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -139,6 +143,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.23.0-ReadOnlyCarrierSmoke - Added retained-anchor carrier verification
+//! with no replica import, authority mutation, or incident-state mutation
 //! v0.22.0-SignedMirrorCarrierTelemetry - Separated signed carrier capability
 //! evidence from unadvertised compatibility fallback
 //! v0.21.0-MirrorSourceDiversityTelemetry - Added privacy-safe aggregate
@@ -4466,6 +4472,125 @@ impl DirectoryReplicaStore {
                 max_producers,
             },
         )
+    }
+
+    /// Re-verifies one carrier-returned page against a retained mirror anchor.
+    ///
+    /// [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] This is deliberately a
+    /// read-only release-gate primitive. It audits the complete local producer
+    /// namespace in a deferred transaction, re-verifies the carrier response,
+    /// checks exact descriptor coverage, and validates any producer-signed
+    /// continuation after the retained anchor. It never imports blocks,
+    /// reserves mirror capacity, changes authority, clears retry state, or
+    /// writes quarantine evidence.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when the producer is not a
+    /// retained mirror, the local anchor is missing, or any carrier, producer,
+    /// pagination, descriptor, hash-chain, or signature evidence is invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_retained_carrier_page(
+        &self,
+        producer: [u8; 32],
+        from_height: u64,
+        blocks: &[DirectoryCommitmentBlockV1],
+        objects: &[SignedNodeDescriptor],
+        advertised_tip_height: u64,
+        advertised_tip_hash: [u8; 32],
+        signed_response_frame: &[u8],
+        observed_at: u64,
+    ) -> Result<(u64, u64), DirectoryReplicaStoreError> {
+        if producer == [0u8; 32]
+            || producer == self.local_node_id
+            || from_height == 0
+            || blocks.is_empty()
+            || blocks.len() > usize::from(MAX_DIRECTORY_SYNC_BLOCKS_V1)
+            || blocks
+                .first()
+                .is_some_and(|block| block.header.height != from_height)
+            || signed_response_frame.is_empty()
+            || signed_response_frame.len() > MAX_DIRECTORY_SYNC_EVIDENCE_BYTES
+            || observed_at == 0
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "read-only carrier verification fields are invalid".to_string(),
+            ));
+        }
+        let has_more = verify_range_response_evidence(
+            signed_response_frame,
+            &producer,
+            blocks,
+            advertised_tip_height,
+            &advertised_tip_hash,
+            observed_at,
+        )?;
+        validate_page_tip_contract(
+            blocks,
+            has_more,
+            advertised_tip_height,
+            &advertised_tip_hash,
+        )?;
+        let descriptors = validate_exact_descriptor_objects(blocks, objects)?;
+        let local_anchor =
+            self.audited_mirror_evidence_page(&producer, from_height, 1, observed_at)?;
+        let Some(anchor) = local_anchor.blocks.first() else {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "retained mirror anchor is missing".to_string(),
+            ));
+        };
+        if blocks.first() != Some(anchor) {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "carrier page does not match the retained mirror anchor".to_string(),
+            ));
+        }
+
+        let mut previous_hash = anchor.hash();
+        let mut previous_timestamp = anchor.header.timestamp;
+        let mut expected_height = from_height.checked_add(1).ok_or_else(|| {
+            DirectoryReplicaStoreError::Integrity(
+                "read-only carrier verification height exhausted".to_string(),
+            )
+        })?;
+        for block in blocks.iter().skip(1) {
+            block.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                expected_height,
+                &previous_hash,
+                previous_timestamp,
+                observed_at,
+            )?;
+            previous_hash = block.hash();
+            previous_timestamp = block.header.timestamp;
+            expected_height = expected_height.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "read-only carrier verification height exhausted".to_string(),
+                )
+            })?;
+        }
+
+        for block in blocks {
+            for commitment in &block.commitments {
+                let descriptor = descriptors.get(&commitment.descriptor_hash).ok_or_else(|| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "carrier page is missing an exact descriptor object".to_string(),
+                    )
+                })?;
+                let derived = DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor)
+                    .map_err(|error| {
+                        DirectoryReplicaStoreError::Descriptor(error.to_string())
+                    })?;
+                if derived != *commitment {
+                    return Err(DirectoryReplicaStoreError::Integrity(
+                        "carrier descriptor object does not match its block commitment".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok((
+            u64::try_from(blocks.len()).unwrap_or(u64::MAX),
+            u64::try_from(objects.len()).unwrap_or(u64::MAX),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9025,6 +9150,25 @@ mod tests {
         assert_eq!(
             mirror_destination.mirror_producer_ids().unwrap(),
             vec![producer.public_key_bytes()]
+        );
+        assert_eq!(
+            mirror_destination
+                .verify_retained_carrier_page(
+                    producer.public_key_bytes(),
+                    1,
+                    &page.blocks,
+                    std::slice::from_ref(&object),
+                    page.tip_height,
+                    page.tip_hash,
+                    &frame,
+                    NOW + 20,
+                )
+                .unwrap(),
+            (1, 1)
+        );
+        assert_eq!(
+            mirror_destination.producer_tip(&producer.public_key_bytes()).unwrap().tip_height,
+            1
         );
 
         let mut producer_tampered_block = replica_block.clone();

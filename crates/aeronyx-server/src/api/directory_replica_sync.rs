@@ -47,6 +47,8 @@
 //! - Prefers an explicit signed Directory Mirror carrier capability while
 //!   retaining separately measured unadvertised compatibility fallback during
 //!   staged fleet rollout.
+//! - Runs a bounded operator-only carrier smoke against one retained anchor
+//!   without direct-producer fallback, replica import, or authority mutation.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -107,6 +109,8 @@
 //!   carrier while serving a recovery request.
 //!
 //! ## Last Modified
+//! `v0.20.0-ReadOnlyCarrierSmoke` - Added explicit-carrier-only retained-anchor
+//! verification for release gates and post-upgrade operator checks.
 //! `v0.19.0-SignedMirrorCarrierSelection` - Preferred signed carrier
 //! advertisements and separated unadvertised compatibility fallback telemetry.
 //! `v0.18.0-MirrorCarrierCapabilityMemory` - Added bounded descriptor-sequence-scoped
@@ -172,6 +176,7 @@ use aeronyx_core::protocol::discovery::{
 use futures::{stream, StreamExt};
 use parking_lot::Mutex;
 use rand::RngCore;
+use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -256,6 +261,8 @@ const DIRECTORY_MIRROR_RECOVERY_AGING_DESCRIPTOR_SECS: u64 = 30 * 60;
 /// capability memory under permissionless descriptor churn. A newer signed
 /// descriptor sequence is always eligible without waiting for a timer.
 const DIRECTORY_MIRROR_CARRIER_CAPABILITY_CACHE_MAX_ENTRIES: usize = 256;
+/// A manual smoke remains bounded even when the mirror registry is full.
+const DIRECTORY_MIRROR_CARRIER_SMOKE_MAX_PRODUCERS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryMirrorPullSource {
@@ -318,6 +325,96 @@ struct DirectoryMirrorRecoveryCarrierSelection {
     selected_unadvertised_compatibility_count: u64,
     selected_region_hint_count: u64,
     distinct_selected_region_hint_count: u64,
+}
+
+/// Privacy-safe result of one read-only signed carrier verification.
+///
+/// [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] This contract intentionally
+/// omits producer/carrier identities, endpoints, region hints, hashes, block
+/// timestamps, descriptor contents, and route order. It is safe to show in
+/// local operator tooling but must remain off the public discovery listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DirectoryMirrorCarrierSmokeReport {
+    pub success: bool,
+    pub status: &'static str,
+    pub contract_version: &'static str,
+    pub source: &'static str,
+    pub scope: &'static str,
+    pub retained_producers: u64,
+    pub eligible_retained_producers: u64,
+    pub explicit_carrier_candidates: u64,
+    pub selected_routeable_carriers: u64,
+    pub attempted_carriers: u64,
+    pub verified_blocks: u64,
+    pub verified_descriptor_objects: u64,
+    pub carrier_signature_verified: bool,
+    pub producer_evidence_verified: bool,
+    pub local_anchor_verified: bool,
+    pub storage_effect: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
+    pub privacy_invariant: &'static str,
+    pub privacy_boundary: &'static str,
+}
+
+impl DirectoryMirrorCarrierSmokeReport {
+    fn pending() -> Self {
+        Self {
+            success: false,
+            status: "unavailable",
+            contract_version: "directory_mirror_carrier_smoke.v1",
+            source: "rust_local_operator_smoke",
+            scope: "local_or_vpn_operator_api_only",
+            retained_producers: 0,
+            eligible_retained_producers: 0,
+            explicit_carrier_candidates: 0,
+            selected_routeable_carriers: 0,
+            attempted_carriers: 0,
+            verified_blocks: 0,
+            verified_descriptor_objects: 0,
+            carrier_signature_verified: false,
+            producer_evidence_verified: false,
+            local_anchor_verified: false,
+            storage_effect: "none_read_only",
+            failure_reason: None,
+            retry_after_seconds: None,
+            privacy_invariant:
+                "carriers transport signed public protocol evidence but gain no authority",
+            privacy_boundary:
+                "aggregate verification status only; no producer or carrier identities, endpoints, regions, hashes, descriptors, routes, selected hops, payloads, client IPs, destinations, DNS contents, Memory Chain records, private keys, wallet traffic, or social graph metadata",
+        }
+    }
+
+    pub(crate) fn unavailable(reason: &'static str) -> Self {
+        let mut report = Self::pending();
+        report.failure_reason = Some(reason);
+        report
+    }
+
+    pub(crate) fn busy() -> Self {
+        let mut report = Self::unavailable("smoke_in_progress");
+        report.status = "busy";
+        report
+    }
+
+    pub(crate) fn cooldown(retry_after_seconds: u64) -> Self {
+        let mut report = Self::unavailable("smoke_cooldown");
+        report.status = "cooldown";
+        report.retry_after_seconds = Some(retry_after_seconds);
+        report
+    }
+}
+
+struct DirectoryMirrorCarrierSmokeAttemptContext<'a> {
+    replica_store: Arc<DirectoryReplicaStore>,
+    peer_store: &'a PeerStore,
+    identity: &'a IdentityKeyPair,
+    client: &'a reqwest::Client,
+    producer: [u8; 32],
+    retained_tip_height: u64,
+    requester: [u8; 32],
 }
 
 /// Aggregate result for one selected permissionless producer.
@@ -2029,6 +2126,208 @@ async fn pull_directory_chain_mirror_page_via_carrier(
     .await
 }
 
+/// Verifies that at least one explicit signed mirror carrier can return one
+/// locally retained producer anchor and its exact descriptor objects.
+///
+/// No direct producer request is attempted. The returned evidence is audited
+/// against the local retained mirror and then discarded without import.
+pub(crate) async fn run_directory_mirror_carrier_smoke(
+    replica_store: Option<Arc<DirectoryReplicaStore>>,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: Option<&reqwest::Client>,
+) -> DirectoryMirrorCarrierSmokeReport {
+    let Some(replica_store) = replica_store else {
+        return DirectoryMirrorCarrierSmokeReport::unavailable("replica_store_disabled");
+    };
+    let Some(client) = client else {
+        return DirectoryMirrorCarrierSmokeReport::unavailable(
+            "smoke_http_client_initialization_failed",
+        );
+    };
+    let Ok(producers) = replica_store.mirror_producer_ids() else {
+        return DirectoryMirrorCarrierSmokeReport::unavailable(
+            "retained_mirror_registry_audit_failed",
+        );
+    };
+    let mut report = DirectoryMirrorCarrierSmokeReport::pending();
+    report.retained_producers = u64::try_from(producers.len()).unwrap_or(u64::MAX);
+    if producers.is_empty() {
+        report.failure_reason = Some("no_retained_mirror_producers");
+        return report;
+    }
+
+    let capability_cache = DirectoryMirrorCarrierCapabilityCache::default();
+    let requester = identity.public_key_bytes();
+    let mut last_failure = "no_retained_mirror_evidence";
+    for producer in producers
+        .into_iter()
+        .take(DIRECTORY_MIRROR_CARRIER_SMOKE_MAX_PRODUCERS)
+    {
+        let tip = match replica_store.producer_tip(&producer) {
+            Ok(tip) if tip.tip_height > 0 && !tip.quarantined => tip,
+            Ok(_) => continue,
+            Err(_) => {
+                last_failure = "retained_mirror_tip_audit_failed";
+                continue;
+            }
+        };
+        report.eligible_retained_producers =
+            report.eligible_retained_producers.saturating_add(1);
+        let selection = directory_mirror_recovery_carriers_with_requirement(
+            peer_store,
+            &capability_cache,
+            &producer,
+            &requester,
+            unix_now_secs(),
+            true,
+        );
+        report.explicit_carrier_candidates = report
+            .explicit_carrier_candidates
+            .max(selection.explicitly_advertised_candidate_count);
+        report.selected_routeable_carriers = report
+            .selected_routeable_carriers
+            .max(selection.selected_routeable_count);
+        if selection.carriers.is_empty() {
+            last_failure = "no_explicit_carrier_candidates";
+            continue;
+        }
+
+        for carrier in selection.carriers {
+            report.attempted_carriers = report.attempted_carriers.saturating_add(1);
+            let context = DirectoryMirrorCarrierSmokeAttemptContext {
+                replica_store: Arc::clone(&replica_store),
+                peer_store,
+                identity,
+                client,
+                producer,
+                retained_tip_height: tip.tip_height,
+                requester,
+            };
+            match verify_directory_mirror_carrier_smoke_candidate(&context, carrier).await {
+                Ok((verified_blocks, verified_descriptor_objects)) => {
+                    report.success = true;
+                    report.status = "verified";
+                    report.verified_blocks = verified_blocks;
+                    report.verified_descriptor_objects = verified_descriptor_objects;
+                    report.carrier_signature_verified = true;
+                    report.producer_evidence_verified = true;
+                    report.local_anchor_verified = true;
+                    report.failure_reason = None;
+                    return report;
+                }
+                Err((reason, carrier_signature_verified)) => {
+                    report.carrier_signature_verified |= carrier_signature_verified;
+                    last_failure = reason;
+                }
+            }
+        }
+    }
+    report.failure_reason = Some(last_failure);
+    report
+}
+
+async fn verify_directory_mirror_carrier_smoke_candidate(
+    context: &DirectoryMirrorCarrierSmokeAttemptContext<'_>,
+    carrier: DirectoryMirrorRecoveryCarrier,
+) -> Result<(u64, u64), (&'static str, bool)> {
+    let request_timestamp = unix_now_secs();
+    let (range_url, object_url) = directory_mirror_recovery_carrier_urls(
+        context.peer_store,
+        &carrier.node_id,
+        carrier.descriptor_sequence,
+        request_timestamp,
+    )
+    .map_err(|reason| {
+        (
+            directory_mirror_carrier_smoke_failure_bucket(&reason),
+            false,
+        )
+    })?;
+    let page = request_directory_replica_block_page(
+        context.identity,
+        &context.producer,
+        &carrier.node_id,
+        context.client,
+        range_url,
+        context.retained_tip_height,
+        request_timestamp,
+    )
+    .await
+    .map_err(|reason| {
+        (
+            directory_mirror_carrier_smoke_failure_bucket(&reason),
+            false,
+        )
+    })?;
+    let (objects, _) = hydrate_directory_replica_descriptor_objects(
+        context.identity,
+        &context.producer,
+        &carrier.node_id,
+        context.client,
+        object_url,
+        &context.requester,
+        &page.blocks,
+    )
+    .await
+    .map_err(|reason| {
+        (
+            directory_mirror_carrier_smoke_failure_bucket(&reason),
+            true,
+        )
+    })?;
+    let DirectoryRangePage {
+        blocks,
+        has_more: _,
+        remote_tip_height,
+        remote_tip_hash,
+        signed_response,
+    } = page;
+    let store = Arc::clone(&context.replica_store);
+    let producer = context.producer;
+    let retained_tip_height = context.retained_tip_height;
+    tokio::task::spawn_blocking(move || {
+        store.verify_retained_carrier_page(
+            producer,
+            retained_tip_height,
+            &blocks,
+            &objects,
+            remote_tip_height,
+            remote_tip_hash,
+            &signed_response,
+            unix_now_secs(),
+        )
+    })
+    .await
+    .map_err(|_| ("carrier_verification_task_failed", true))?
+    .map_err(|_| ("carrier_evidence_rejected", true))
+}
+
+fn directory_mirror_carrier_smoke_failure_bucket(reason: &str) -> &'static str {
+    if reason.contains("_transport_failed")
+        || reason.contains("_http_status_")
+        || reason.contains("_peer_replica_")
+        || reason.contains("_peer_mirror_")
+        || reason.contains("_carrier_unavailable")
+        || reason.contains("_carrier_descriptor_changed")
+        || reason.contains("_carrier_not_public")
+        || reason.contains("_carrier_missing_endpoint")
+        || reason.contains("_carrier_unsafe_endpoint")
+        || reason.contains("_carrier_invalid_endpoint")
+    {
+        "carrier_unavailable"
+    } else if reason.contains("_response_")
+        || reason.contains("_invalid_")
+        || reason.contains("_hash_mismatch")
+        || reason.contains("_noncanonical")
+        || reason.contains("_contract_mismatch")
+    {
+        "carrier_evidence_rejected"
+    } else {
+        "carrier_request_failed"
+    }
+}
+
 async fn pull_directory_chain_page_with_carriers(
     replica_store: Arc<DirectoryReplicaStore>,
     peer_store: &PeerStore,
@@ -2185,6 +2484,24 @@ fn directory_mirror_recovery_carriers(
     requester: &[u8; 32],
     now: u64,
 ) -> DirectoryMirrorRecoveryCarrierSelection {
+    directory_mirror_recovery_carriers_with_requirement(
+        peer_store,
+        capability_cache,
+        producer,
+        requester,
+        now,
+        false,
+    )
+}
+
+fn directory_mirror_recovery_carriers_with_requirement(
+    peer_store: &PeerStore,
+    capability_cache: &DirectoryMirrorCarrierCapabilityCache,
+    producer: &[u8; 32],
+    requester: &[u8; 32],
+    now: u64,
+    require_explicitly_advertised: bool,
+) -> DirectoryMirrorRecoveryCarrierSelection {
     let mut descriptors = peer_store
         .valid_public_descriptors(now, usize::MAX)
         .into_iter()
@@ -2199,6 +2516,11 @@ fn directory_mirror_recovery_carriers(
                     .public_endpoint
                     .as_deref()
                     .is_some_and(commitment_peer_endpoint_is_public)
+                && (!require_explicitly_advertised
+                    || descriptor
+                        .descriptor
+                        .capabilities
+                        .contains(&NodeCapability::DirectoryMirrorCarrier))
         })
         .collect::<Vec<_>>();
     descriptors.sort_by_key(SignedNodeDescriptor::node_id);
@@ -3577,6 +3899,22 @@ mod tests {
             .carriers
             .iter()
             .any(|candidate| candidate.node_id == quarantined.public_key_bytes()));
+
+        // [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] Manual verification must
+        // never silently fall back to an unadvertised compatibility carrier.
+        let smoke_selection = directory_mirror_recovery_carriers_with_requirement(
+            &store,
+            &capability_cache,
+            &producer.public_key_bytes(),
+            &requester.public_key_bytes(),
+            now,
+            true,
+        );
+        assert_eq!(smoke_selection.candidate_count, 4);
+        assert_eq!(smoke_selection.explicitly_advertised_candidate_count, 4);
+        assert_eq!(smoke_selection.unadvertised_compatibility_candidate_count, 0);
+        assert_eq!(smoke_selection.selected_explicitly_advertised_count, 2);
+        assert_eq!(smoke_selection.selected_unadvertised_compatibility_count, 0);
     }
 
     #[test]
@@ -3629,6 +3967,28 @@ mod tests {
             .iter()
             .any(|candidate| candidate.node_id == carriers[0]));
         assert!(capability_cache.should_attempt(&carriers[0], 8));
+    }
+
+    #[test]
+    fn carrier_smoke_failures_collapse_to_privacy_safe_buckets() {
+        assert_eq!(
+            directory_mirror_carrier_smoke_failure_bucket(
+                "directory_replica_range_http_status_503"
+            ),
+            "carrier_unavailable"
+        );
+        assert_eq!(
+            directory_mirror_carrier_smoke_failure_bucket(
+                "directory_replica_object_response_invalid_signature"
+            ),
+            "carrier_evidence_rejected"
+        );
+        assert_eq!(
+            directory_mirror_carrier_smoke_failure_bucket(
+                "directory_replica_range_request_encode_failed"
+            ),
+            "carrier_request_failed"
+        );
     }
 
     #[test]

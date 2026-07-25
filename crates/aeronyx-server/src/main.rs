@@ -17,6 +17,8 @@
 //!   inspection and node-identity-signed compare-and-swap resolution commands.
 //! - v1.3.0-AofIntegrityCommand: add a read-only, privacy-safe MemChain AOF
 //!   verification command for framing, semantic, Merkle, and ancestry checks.
+//! - v1.4.0-DirectoryCarrierSmoke: add a bounded local API client that proves
+//!   explicit signed mirror-carrier recovery without importing evidence.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -28,6 +30,7 @@
 //! v1.2.0-DirectoryReplicaQuarantineResolution - Add audited host-local
 //! quarantine inspection and resolution without exposing a mutation API
 //! v1.3.0-AofIntegrityCommand - Add aggregate-only `memchain verify-aof`
+//! v1.4.0-DirectoryCarrierSmoke - Add read-only `directory-replica carrier-smoke`
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -113,7 +116,7 @@ enum Commands {
         format: String,
     },
 
-    /// Inspect or resolve a quarantined Directory Replica producer locally
+    /// Inspect, verify, or resolve Directory Replica state locally
     #[command(subcommand)]
     DirectoryReplica(DirectoryReplicaCommands),
 }
@@ -134,6 +137,17 @@ enum MemchainCommands {
 
 #[derive(Subcommand, Debug)]
 enum DirectoryReplicaCommands {
+    /// Verify one explicit signed mirror carrier without importing evidence
+    CarrierSmoke {
+        /// Path to the running node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Verify an incident and print its exact compare-and-swap state
     InspectIncident {
         /// Content-addressed incident digest (64 hexadecimal characters)
@@ -606,6 +620,9 @@ async fn cmd_pubkey(config_path: PathBuf, format: String) -> anyhow::Result<()> 
 /// Runs privileged Directory Replica operations without a network endpoint.
 async fn cmd_directory_replica(command: DirectoryReplicaCommands) -> anyhow::Result<()> {
     match command {
+        DirectoryReplicaCommands::CarrierSmoke { config, json } => {
+            cmd_directory_replica_carrier_smoke(&config, json).await
+        }
         DirectoryReplicaCommands::InspectIncident { digest, config } => {
             cmd_directory_replica_inspect(&config, &digest).await
         }
@@ -631,6 +648,103 @@ async fn cmd_directory_replica(command: DirectoryReplicaCommands) -> anyhow::Res
             cmd_directory_replica_resolve(&config, &request).await
         }
     }
+}
+
+/// Calls the running node's local-only read-only carrier verification route.
+async fn cmd_directory_replica_carrier_smoke(
+    config_path: &PathBuf,
+    emit_json: bool,
+) -> anyhow::Result<()> {
+    const MAX_SMOKE_RESPONSE_BYTES: usize = 64 * 1024;
+
+    let config = ServerConfig::load(config_path)
+        .await
+        .with_context(|| format!("load node config {}", config_path.display()))?;
+    let url = format!(
+        "http://127.0.0.1:{}/api/discovery/directory/carrier-smoke",
+        config.listen_addr().port()
+    );
+    // [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] Keep the host-local CLI on
+    // loopback and independent of HTTP(S)_PROXY. The response is bounded while
+    // streaming; Content-Length is advisory and never trusted as the limit.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(45))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("initialize local carrier-smoke HTTP client")?;
+    let mut response = client
+        .post(url)
+        .send()
+        .await
+        .context("contact the running node carrier-smoke endpoint")?;
+    let http_status = response.status();
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("read bounded carrier-smoke response")?
+    {
+        anyhow::ensure!(
+            body.len().saturating_add(chunk.len()) <= MAX_SMOKE_RESPONSE_BYTES,
+            "carrier-smoke response exceeded its local protocol bound"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    let report: serde_json::Value =
+        serde_json::from_slice(&body).context("decode carrier-smoke response")?;
+    if emit_json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("Directory Mirror carrier smoke");
+        println!(
+            "  status: {}",
+            report["status"].as_str().unwrap_or("unavailable")
+        );
+        println!(
+            "  retained_producers: {}",
+            report["retained_producers"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  eligible_retained_producers: {}",
+            report["eligible_retained_producers"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  explicit_carrier_candidates: {}",
+            report["explicit_carrier_candidates"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  attempted_carriers: {}",
+            report["attempted_carriers"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  verified_blocks: {}",
+            report["verified_blocks"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  verified_descriptor_objects: {}",
+            report["verified_descriptor_objects"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  storage_effect: {}",
+            report["storage_effect"].as_str().unwrap_or("none_read_only")
+        );
+        if let Some(reason) = report["failure_reason"].as_str() {
+            println!("  failure_reason: {reason}");
+        }
+        println!(
+            "  privacy: {}",
+            report["privacy_boundary"]
+                .as_str()
+                .unwrap_or("aggregate verification metadata only")
+        );
+    }
+    anyhow::ensure!(
+        http_status.is_success() && report["success"].as_bool() == Some(true),
+        "Directory Mirror carrier smoke was not verified"
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -999,6 +1113,26 @@ mod tests {
         };
         assert_eq!(expected_tip_height, 7);
         assert_eq!(expected_previous_resolution_digest, None);
+    }
+
+    #[test]
+    fn directory_replica_carrier_smoke_cli_is_read_only_and_json_capable() {
+        let cli = Cli::try_parse_from([
+            "aeronyx-server",
+            "directory-replica",
+            "carrier-smoke",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::DirectoryReplica(DirectoryReplicaCommands::CarrierSmoke {
+            json,
+            config,
+        }) = cli.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert!(json);
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
     }
 
     #[test]
