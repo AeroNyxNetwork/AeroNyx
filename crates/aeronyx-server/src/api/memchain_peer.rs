@@ -453,6 +453,25 @@ struct MemChainPeerState {
     block_announce_notifier: Option<mpsc::Sender<u64>>,
 }
 
+// [PINNED-WITNESS-BOOTSTRAP 2026-07-26 by Codex] A follower may use an
+// authentic expired cache descriptor only for its explicitly pinned
+// coordinator's signed checkpoint/lease control traffic. The request timestamp
+// and payload signature are still verified by each handler. This breaks the
+// reverse half of the cold-start deadlock without admitting stale
+// permissionless peers to block sync, routing, gossip, or public membership.
+fn coordinator_control_requester_is_admitted(
+    state: &MemChainPeerState,
+    requester: &[u8; 32],
+    now: u64,
+) -> bool {
+    state.peer_store.get_valid(requester, now).is_some()
+        || (state.lease_authorized_coordinator == Some(*requester)
+            && state
+                .peer_store
+                .get_signature_verified_cached(requester)
+                .is_some())
+}
+
 #[derive(Debug, Default)]
 struct PeerRequestGuard {
     rate_windows: HashMap<[u8; 32], PeerRateWindow>,
@@ -1317,9 +1336,17 @@ where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
 {
     let request_timestamp = now_secs();
-    let witness = peer_store
-        .get_valid(witness_node_id, request_timestamp)
-        .ok_or_else(|| "lease_release_witness_unavailable".to_string())?;
+    // [PINNED-WITNESS-BOOTSTRAP 2026-07-26 by Codex] The caller supplies an
+    // operator-pinned witness identity and verifies the signed response against
+    // that exact key, so an authentic expired descriptor is only an endpoint
+    // recovery hint during cold start.
+    let witness = commitment_peer_descriptor(
+        peer_store,
+        witness_node_id,
+        request_timestamp,
+        CommitmentPeerDescriptorPolicy::AllowExpiredForPinnedWitness,
+    )
+    .ok_or_else(|| "lease_release_witness_unavailable".to_string())?;
     let endpoint = witness
         .descriptor
         .public_endpoint
@@ -1395,9 +1422,16 @@ where
         return Err("lease_policy_invalid".to_string());
     }
     let request_timestamp = now_secs();
-    let witness = peer_store
-        .get_valid(witness_node_id, request_timestamp)
-        .ok_or_else(|| "lease_witness_unavailable".to_string())?;
+    // [PINNED-WITNESS-BOOTSTRAP 2026-07-26 by Codex] Lease acquisition has the
+    // same explicit identity pin and signed-response boundary as startup
+    // checkpoint reconciliation. Descriptor expiry cannot grant authority.
+    let witness = commitment_peer_descriptor(
+        peer_store,
+        witness_node_id,
+        request_timestamp,
+        CommitmentPeerDescriptorPolicy::AllowExpiredForPinnedWitness,
+    )
+    .ok_or_else(|| "lease_witness_unavailable".to_string())?;
     let endpoint = witness
         .descriptor
         .public_endpoint
@@ -3001,7 +3035,7 @@ async fn coordinator_lease_handler(
     if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
         return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
     }
-    if state.peer_store.get_valid(&coordinator, now).is_none() {
+    if !coordinator_control_requester_is_admitted(&state, &coordinator, now) {
         return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
     }
     let signing_bytes = record_coordinator_lease_request_signing_bytes(
@@ -3137,7 +3171,7 @@ async fn coordinator_lease_release_handler(
     if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
         return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
     }
-    if state.peer_store.get_valid(&coordinator, now).is_none() {
+    if !coordinator_control_requester_is_admitted(&state, &coordinator, now) {
         return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
     }
     let signing_bytes = record_coordinator_lease_release_request_signing_bytes(
@@ -3389,7 +3423,7 @@ async fn checkpoint_handler(State(state): State<MemChainPeerState>, body: Bytes)
     if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
         return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
     }
-    if state.peer_store.get_valid(&requester, now).is_none() {
+    if !coordinator_control_requester_is_admitted(&state, &requester, now) {
         return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
     }
     let signing_bytes = record_chain_checkpoint_request_signing_bytes(
@@ -6051,9 +6085,10 @@ mod tests {
     }
 
     // [PINNED-WITNESS-BOOTSTRAP 2026-07-26 by Codex] Reproduces a real
-    // production outage: strict witness verification runs before gossip can
-    // refresh descriptors after a long reboot. The expired descriptor is only
-    // a transport hint; the response still verifies against the pinned key.
+    // production outage: strict witness verification and all-witness lease
+    // acquisition run before gossip can refresh either side after a long
+    // reboot. Expired descriptors are transport/admission hints only; every
+    // request and response still verifies against the exact pinned keys.
     #[tokio::test]
     async fn pinned_witness_round_recovers_through_authentic_expired_cache_descriptor() {
         let now = now_secs();
@@ -6072,11 +6107,29 @@ mod tests {
             .unwrap();
 
         let witness_peers = Arc::new(PeerStore::new());
-        admit_peer(&witness_peers, &coordinator, None, now);
-        let router = build_memchain_peer_router(
+        let expired_coordinator = NodeDescriptor::new(
+            coordinator.public_key_bytes(),
+            1,
+            now.saturating_sub(1_200),
+            now.saturating_sub(600),
+            "expired-pinned-coordinator-test",
+        );
+        let expired_coordinator =
+            SignedNodeDescriptor::sign(expired_coordinator, &coordinator).unwrap();
+        let imported = witness_peers.load_peer_cache_snapshot_from_source(
+            &NodeBootstrapSnapshot::new(now, vec![expired_coordinator]),
+            now,
+            "test_expired_coordinator_cache",
+        );
+        assert_eq!(imported.inserted, 1);
+        assert!(witness_peers
+            .get_valid(&coordinator.public_key_bytes(), now)
+            .is_none());
+        let router = build_memchain_peer_router_with_coordinator_lease(
             Arc::clone(&witness_storage),
             witness_peers,
             Arc::clone(&pinned_witness),
+            Some(coordinator.public_key_bytes()),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -6143,6 +6196,35 @@ mod tests {
             local.record_commitment_checkpoint_status().evidence_records,
             1
         );
+
+        let instance_id = [0x6a; 32];
+        let lease = request_record_commitment_coordinator_lease_with_endpoint_policy(
+            &local,
+            &coordinator_peers,
+            &coordinator,
+            &pinned_witness.public_key_bytes(),
+            &instance_id,
+            MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+            &client,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert!(lease.lease_epoch > 0);
+        assert!(lease.valid_for_secs > 0);
+
+        let released = release_record_commitment_coordinator_lease_with_endpoint_policy(
+            &coordinator_peers,
+            &coordinator,
+            &pinned_witness.public_key_bytes(),
+            &instance_id,
+            &client,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(released.lease_epoch, lease.lease_epoch);
+        assert!(released.released_at >= now);
 
         server.abort();
         let _ = server.await;

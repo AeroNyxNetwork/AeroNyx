@@ -94,8 +94,10 @@
 //!     alternative exists. Region hints never prove operator or ASN diversity.
 //! 16. On explicit operator request, prove bounded multi-page cold recovery in
 //!     an isolated in-memory replica. Rotate the first carrier between pages,
-//!     retry only availability failures, stop closed on cryptographic or import
-//!     failures, then discard the replica without touching the live store.
+//!     retry only availability failures, and preserve an already verified
+//!     multi-page prefix if a later page becomes unavailable. Stop closed on
+//!     cryptographic or import failures, then discard the replica without
+//!     touching the live store.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -120,8 +122,13 @@
 //! - A carrier availability failure may select another authenticated carrier.
 //!   A signature, chain, commitment, noncanonical, or import failure must stop
 //!   the isolated recovery immediately; never use failover to hide bad evidence.
+//! - Once at least two pages form an audited producer-signed genesis prefix, a
+//!   later availability failure may end the smoke as a verified partial-prefix
+//!   result. It must never claim the observed remote tip was reached.
 //!
 //! ## Last Modified
+//! `v0.22.1-CarrierPartialPrefix` - Preserved and fully audited a verified
+//! multi-page prefix when a later carrier page becomes unavailable.
 //! `v0.22.0-CarrierMultiPageRecovery` - Extended isolated cold bootstrap to a
 //! bounded multi-page prefix with carrier rotation, availability-only failover,
 //! conservative request accounting, and a complete post-import store audit.
@@ -650,6 +657,12 @@ const fn should_continue_directory_carrier_cold_bootstrap(
         && pages_completed < DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_MAX_PAGES
         && requests_used.saturating_add(DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE)
             <= DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET
+}
+
+/// Whether the isolated store contains enough pages to prove multi-page
+/// third-party recovery after a later availability-only failure.
+const fn directory_carrier_cold_bootstrap_prefix_ready(pages_completed: u32) -> bool {
+    pages_completed >= 2
 }
 
 const fn directory_sync_next_round_delay(
@@ -2509,7 +2522,6 @@ pub(crate) async fn run_directory_carrier_cold_bootstrap_smoke(
                     > DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET
                 {
                     last_failure = "smoke_request_budget_exhausted";
-                    producer_attempt_failed = true;
                     break;
                 }
                 let carrier = carriers[(first_carrier + offset) % carriers.len()];
@@ -2556,7 +2568,14 @@ pub(crate) async fn run_directory_carrier_cold_bootstrap_smoke(
             }
 
             let Some(outcome) = page_outcome else {
-                producer_attempt_failed = true;
+                // [CARRIER-PARTIAL-PREFIX 2026-07-26 by Codex] A carrier may
+                // retain only a bounded prefix or become unavailable after
+                // serving earlier pages. Two or more imported pages already
+                // prove multi-page third-party recovery once the isolated
+                // store passes its full chain audit below. Availability may
+                // stop extension, but must not erase verified evidence.
+                producer_attempt_failed =
+                    !directory_carrier_cold_bootstrap_prefix_ready(pages_imported);
                 break;
             };
             pages_imported = pages_imported.saturating_add(1);
@@ -2584,7 +2603,7 @@ pub(crate) async fn run_directory_carrier_cold_bootstrap_smoke(
             last_failure = "no_cold_bootstrap_evidence";
             continue;
         };
-        if pages_imported < 2 {
+        if !directory_carrier_cold_bootstrap_prefix_ready(pages_imported) {
             last_failure = "insufficient_multi_page_evidence";
             continue;
         }
@@ -4341,6 +4360,9 @@ mod tests {
             DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET,
             true,
         ));
+        assert!(!directory_carrier_cold_bootstrap_prefix_ready(1));
+        assert!(directory_carrier_cold_bootstrap_prefix_ready(2));
+        assert!(directory_carrier_cold_bootstrap_prefix_ready(3));
     }
 
     #[test]
