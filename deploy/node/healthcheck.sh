@@ -7,6 +7,8 @@
 #   nodes after install, upgrade, or incident response.
 #
 # Modification Reason:
+# - [GIT-WORKTREE-COMPAT 2026-07-26 by Codex] Audit tracked changes in regular
+#   clones and linked Git worktrees without relying on `.git` directory shape.
 # - Add privacy-safe discovery readiness JSON for ChatRelay capability and
 #   peer quorum so nodeboard and AI maintenance tools can see route-readiness
 #   blockers without parsing operator text.
@@ -73,6 +75,7 @@
 #   a binary workspace; dependency changes must be code-reviewed.
 #
 # Last Modified:
+# v1.22.0-node-deploy - Supports linked Git worktrees in runtime metadata checks.
 # v1.21.0-node-deploy - Added the tracked Cargo.lock reproducible-build gate.
 # v1.20.0-node-deploy - Keep healthcheck JSON output alive when optional network restore unit is absent.
 # v1.19.0-node-deploy - Added discovery readiness JSON for ChatRelay/quorum.
@@ -429,7 +432,11 @@ check_repo_and_binary() {
 check_runtime_metadata() {
     local active_since dirty_lines journal_output journal_warnings
 
-    if command -v git >/dev/null 2>&1 && [ -d "${REPO_DIR}/.git" ]; then
+    # [GIT-WORKTREE-COMPAT 2026-07-26 by Codex] `git rev-parse` works for both
+    # normal clones and linked worktrees where `.git` is a pointer file.
+    if command -v git >/dev/null 2>&1 \
+        && [ -d "${REPO_DIR}" ] \
+        && git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         dirty_lines="$(git -C "${REPO_DIR}" status --short --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
         if [ "${dirty_lines:-0}" = "0" ]; then
             pass "git tracked worktree clean"

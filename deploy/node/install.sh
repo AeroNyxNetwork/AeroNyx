@@ -8,6 +8,8 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - [GIT-WORKTREE-COMPAT 2026-07-26 by Codex] Recognize linked Git worktrees
+#   through Git plumbing instead of requiring `.git` to be a directory.
 # - [PINNED-RUST-BUILD 2026-07-26 by Codex] Pin production builds to the
 #   repository-declared Rust toolchain and compile into a
 #   toolchain/service-scoped target directory before atomically promoting the
@@ -121,6 +123,7 @@
 # - Keep Cargo output outside the live repo target until validation succeeds.
 #
 # Last Modified:
+# v1.27.0-node-deploy - Supports both regular clones and linked Git worktrees.
 # v1.26.0-node-deploy - Pins the Rust compiler, isolates build artifacts by
 #                       toolchain/service, and atomically promotes the binary.
 # v1.25.0-node-deploy - Requires the tracked Cargo.lock dependency graph for release builds.
@@ -189,7 +192,7 @@ SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
-SCRIPT_VERSION="v1.26.0-node-deploy"
+SCRIPT_VERSION="v1.27.0-node-deploy"
 
 REPO_URL="${AERONYX_REPO_URL:-${DEFAULT_REPO_URL}}"
 BRANCH="${AERONYX_BRANCH:-${DEFAULT_BRANCH}}"
@@ -1052,8 +1055,15 @@ ensure_tracked_worktree_clean() {
     ok "Tracked Git worktree clean"
 }
 
+is_git_worktree() {
+    [ -d "${REPO_DIR}" ] \
+        && git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
 prepare_repo() {
-    if [ -d "${REPO_DIR}/.git" ]; then
+    # [GIT-WORKTREE-COMPAT 2026-07-26 by Codex] In a linked worktree `.git`
+    # is a pointer file, so filesystem shape is not valid repository evidence.
+    if is_git_worktree; then
         log "Using existing repository: ${REPO_DIR}"
         ensure_tracked_worktree_clean
         run git -C "${REPO_DIR}" fetch origin "${BRANCH}"

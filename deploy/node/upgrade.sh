@@ -7,6 +7,8 @@
 #   nodes without requiring manual git/build/systemd commands.
 #
 # Modification Reason:
+# - [GIT-WORKTREE-COMPAT 2026-07-26 by Codex] Accept regular clones and linked
+#   Git worktrees as valid upgrade sources.
 # - [PINNED-RUST-BUILD 2026-07-26 by Codex] Pin release builds to
 #   rust-toolchain.toml, isolate Cargo output from the live binary, validate the
 #   staged result, and promote it atomically.
@@ -98,6 +100,7 @@
 #   binary path until candidate validation succeeds.
 #
 # Last Modified:
+# v1.17.0-node-deploy - Supports linked Git worktrees in the upgrade path.
 # v1.16.0-node-deploy - Pins the Rust compiler and atomically promotes builds
 #                       from a toolchain/service-scoped target directory.
 # v1.15.0-node-deploy - Requires the tracked Cargo.lock dependency graph for release builds.
@@ -481,6 +484,11 @@ ensure_tracked_worktree_clean() {
     git -C "${REPO_DIR}" diff --cached --quiet --ignore-submodules -- \
         || die "Tracked Git worktree has staged changes. Commit/stash them or re-run with --allow-dirty."
     ok "Tracked Git worktree clean"
+}
+
+is_git_worktree() {
+    [ -d "${REPO_DIR}" ] \
+        && git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1
 }
 
 backup_current_binary() {
@@ -902,7 +910,9 @@ main() {
     fi
     set_upgrade_step "dependencies" "Checking Rust toolchain and repository prerequisites."
     ensure_cargo_path
-    [ -d "${REPO_DIR}/.git" ] || die "Repository not found: ${REPO_DIR}"
+    # [GIT-WORKTREE-COMPAT 2026-07-26 by Codex] Ask Git instead of assuming
+    # `.git` is a directory; linked production worktrees use a pointer file.
+    is_git_worktree || die "Git worktree not found: ${REPO_DIR}"
     ensure_tracked_worktree_clean
     set_upgrade_step "backup" "Backing up current release binary before upgrade."
     backup_current_binary
