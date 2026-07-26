@@ -1394,12 +1394,21 @@ Latest entry:
   - Runtime, peer-handler, and public-status focused tests passed.
   - All 1,202 `aeronyx-server` library tests passed.
   - Strict `clippy::all` completed successfully and the release binary built.
-- Required live validation:
-  - Deploy the same commit to one observer and one carrier behind the
-    zero-active-session gate.
-  - Force one bounded direct-witness availability failure, then confirm the
-    observer recovery success and carrier-side forwarded counters each advance
-    exactly once without identity-bearing logs.
+- Live validation:
+  - Deployed the same release to US1 and Noway1 through the rollback-protected
+    binary promoter after both reported zero active privacy-network sessions.
+  - Rejected only US1-to-Korean1 TCP/8422 control-plane traffic. On the next
+    bounded witness round, US1 advanced recovery to `attempts=1/succeeded=1`
+    and Noway1 advanced carrier service to `requests=1/forwarded=1`; every
+    carrier failure bucket remained zero and the round remained `2/2 accepted`.
+  - Removed the fault and observed three further `2/2 accepted` rounds.
+    Recovery and carrier counters remained exactly one, proving automatic
+    direct-first restoration.
+  - Korean1 direct access returned HTTP 200 after cleanup. All three services
+    remained healthy, and no temporary firewall marker remained on any node.
+  - Carrier request-scoped success logging was removed before the final smoke.
+    Service journals contained no carrier event carrying checkpoint sequence,
+    identity, route, endpoint, frame, digest, signature, or payload metadata.
 
 <!-- [WITNESS-CARRIER-LIVE 2026-07-27 by Codex] -->
 2026-07-27 - Validated Bounded Observation Witness Carrier Recovery V1 across
