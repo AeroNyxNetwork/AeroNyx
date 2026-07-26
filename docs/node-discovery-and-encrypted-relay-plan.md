@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.31.0 - Authenticated pinned-peer observation-certificate exchange and freshness-gated durable import.
+Modification Reason: v0.32.0 - Bounded mature-witness backlog catch-up after restart.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.31.0 - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Added a POST-only pinned-peer certificate route plus an operator pull command that separately verifies transport identity, exact frame bytes, local observer/witness pins, threshold, and checkpoint age before schema-v10 import.
+Last Modified: v0.32.0 - [WITNESS-CATCHUP 2026-07-26 by Codex] Added bounded multi-checkpoint witness catch-up with strict forward progress, same-sequence retry suppression, and additive backlog telemetry.
+Previous: v0.31.0 - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Added a POST-only pinned-peer certificate route plus an operator pull command that separately verifies transport identity, exact frame bytes, local observer/witness pins, threshold, and checkpoint age before schema-v10 import.
 Previous: v0.30.0 - [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] Added schema v10 and a host-local import command that binds exact foreign certificate bytes and local trust policy into a node-signed, hash-linked, rollback-audited history.
 Previous: v0.29.0 - [PORTABLE-CERTIFICATE-VERIFIER 2026-07-26 by Codex] Added a fail-closed offline verifier command with exact frame SHA-256, canonical-codec, chain, time, pinned observer/witness policy, checkpoint, local threshold, and signature checks.
 Previous: v0.28.0 - [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] Added operator-only export of one observer-signed checkpoint plus independently signed current-pin witness receipts.
@@ -1358,6 +1359,41 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+<!-- [WITNESS-CATCHUP 2026-07-26 by Codex] -->
+2026-07-26 - Added Bounded Observation Witness Catch-up.
+- Production evidence:
+  - A strict 900-second certificate pull from Korean1 correctly rejected US1's
+    latest fully witnessed checkpoint as stale.
+  - The same pinned observer and two-witness policy succeeded inside the
+    explicit 3600-second recovery ceiling at checkpoint age 1792 seconds.
+  - Runtime outcomes showed fresh successful `2/2` witness rounds, proving the
+    delay was a persistent sequence backlog rather than transport or signature
+    failure.
+- Root cause:
+  - Each 120-second synchronization round appended one new checkpoint but
+    witnessed only one older checkpoint. A restart backlog therefore remained
+    constant even while every witness request succeeded.
+- Behavior:
+  - One synchronized round may now advance at most four distinct mature
+    checkpoint sequences.
+  - Missing witnesses for one sequence remain concurrent, but checkpoint
+    sequences are processed strictly in order.
+  - If the audited selector returns the same or an older sequence, the batch
+    stops immediately instead of retrying that checkpoint in the same round.
+  - The existing one-interval maturity delay, current-pin threshold, canonical
+    signature verification, capability cache, and durable outcome telemetry are
+    unchanged.
+  - Status adds `catch_up_checkpoint_budget_per_round` and
+    `pending_to_head_sequence_gap`; all existing fields and policy labels remain
+    backward compatible.
+- Security and privacy boundary:
+  - Catch-up remains bounded to four checkpoints and at most the configured
+    pinned witnesses for each checkpoint.
+  - No public identity, endpoint, checkpoint hash, signature, route, payload,
+    client metadata, or user-plane data is added to status or logs.
+  - Witness receipts remain independent recomputation evidence, never votes,
+    quorum, consensus, fork choice, or finality.
+
 <!-- [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] -->
 2026-07-26 - Added Authenticated Certificate Exchange V1.
 - Files changed:

@@ -32,6 +32,9 @@
 //! - Continues witnessing a mature checkpoint until the configured number of
 //!   current pinned peers have independently recomputed it, while skipping
 //!   pins whose canonical receipts are already durable.
+//! - [WITNESS-CATCHUP 2026-07-26 by Codex] Advances a bounded batch of distinct
+//!   mature checkpoints per synchronization round so restart backlog converges
+//!   instead of remaining permanently one-for-one with newly appended heads.
 //! - Anchors the current opaque witness-policy head with current pinned peers,
 //!   skipping peers whose canonical policy receipt is already durable.
 //! - Tries the producer directly first, then uses another pinned node as an
@@ -76,9 +79,10 @@
 //! 8. If every producer reaches its signed tip, append an idempotent local
 //!    observation checkpoint from a blocking worker.
 //! 9. After one complete synchronization interval, ask not-yet-recorded pinned
-//!    peers to independently recompute the next forward mature checkpoint
-//!    below its configured corroboration target; persist only canonical accepted
-//!    receipts, never trust an unavailable or conflicting result.
+//!    peers to independently recompute up to four distinct forward mature
+//!    checkpoints below their configured corroboration target; persist only
+//!    canonical accepted receipts, never trust an unavailable or conflicting
+//!    result, and stop the batch if the selector does not advance.
 //! 10. Treat an explicitly unsupported witness endpoint as peer unavailability
 //!     and retry only after that peer publishes a newer signed descriptor.
 //! 11. Persist bounded aggregate witness outcomes and mirror the current
@@ -133,8 +137,14 @@
 //! - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] A valid transport response is
 //!   not trust by itself. Importers must additionally verify the certificate's
 //!   observer, witness signatures, current local pins, threshold, and age.
+//! - [WITNESS-CATCHUP 2026-07-26 by Codex] Keep catch-up sequential across
+//!   checkpoint sequences and concurrent only across missing pinned witnesses.
+//!   Never retry the same sequence twice in one batch or remove the hard batch
+//!   ceiling; those rules bound request amplification during peer failure.
 //!
 //! ## Last Modified
+//! `v0.24.0-BoundedWitnessCatchUp` - Added a four-checkpoint mature witness
+//! catch-up budget with strict sequence advancement and no same-round retry.
 //! `v0.23.0-AuthenticatedCertificateExchange` - Added hardened pinned-source
 //! portable observation-certificate pull and exact response verification.
 //! `v0.22.1-CarrierPartialPrefix` - Preserved and fully audited a verified
@@ -253,6 +263,10 @@ pub(crate) const DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS: u64 = 60;
 const DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// External witnesses receive one complete producer-sync interval to catch up.
 pub(crate) const DIRECTORY_OBSERVATION_WITNESS_MATURITY_INTERVALS: u64 = 1;
+/// [WITNESS-CATCHUP 2026-07-26 by Codex] Maximum distinct mature checkpoints
+/// witnessed after one producer-sync round. Four closes a restart backlog while
+/// keeping two-pin deployments at or below eight witness requests per round.
+pub(crate) const DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND: usize = 4;
 /// Hard response ceiling shared with the core Directory Sync decoder.
 const MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES: usize = 512 * 1024;
 /// Peer protocol errors are fixed ASCII codes. Keep non-success reads tiny so
@@ -736,6 +750,22 @@ const fn directory_sync_next_round_delay(
     }
 }
 
+/// Whether one bounded witness catch-up batch may attempt this checkpoint.
+///
+/// The strict sequence comparison prevents a partially available witness set
+/// from receiving repeated requests for the same checkpoint in one round.
+const fn should_attempt_observation_witness_catch_up(
+    checkpoints_attempted: usize,
+    previous_sequence: Option<u64>,
+    candidate_sequence: u64,
+) -> bool {
+    checkpoints_attempted < DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND
+        && match previous_sequence {
+            Some(previous) => candidate_sequence > previous,
+            None => true,
+        }
+}
+
 fn directory_sync_request_count_for_objects(object_count: usize) -> u32 {
     let object_requests = object_count.div_ceil(MAX_DIRECTORY_SYNC_OBJECTS_V1);
     1u32.saturating_add(u32::try_from(object_requests).unwrap_or(u32::MAX))
@@ -1100,6 +1130,8 @@ impl DirectoryReplicaSyncCoordinator {
                 startup_delay_secs = startup_delay.as_secs(),
                 interval_secs = self.interval.as_secs(),
                 catch_up_interval_secs = DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS,
+                witness_catch_up_checkpoints_per_round =
+                    DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND,
                 restored_retry_states = self.restored_retry_states,
                 full_node_mirror_enabled = self.full_node_mirror_enabled,
                 full_node_mirror_capacity = self.full_node_mirror_max_producers,
@@ -1444,7 +1476,7 @@ impl DirectoryReplicaSyncCoordinator {
                     producer_count = report.producer_count,
                     "[DIRECTORY_REPLICA] Complete observation checkpoint evaluated"
                 );
-                self.witness_mature_observation_checkpoint().await;
+                self.witness_mature_observation_checkpoints().await;
             }
             Ok(Err(_)) | Err(_) => {
                 warn!(
@@ -1455,9 +1487,7 @@ impl DirectoryReplicaSyncCoordinator {
         }
     }
 
-    async fn witness_mature_observation_checkpoint(&self) {
-        let store = Arc::clone(&self.store);
-        let eligible_witnesses = Arc::clone(&self.peers);
+    async fn witness_mature_observation_checkpoints(&self) {
         let minimum_witnesses = self.witness_min_verified;
         let observed_at = unix_now_secs();
         let maturity_delay_secs = self
@@ -1468,61 +1498,93 @@ impl DirectoryReplicaSyncCoordinator {
         if matured_before == 0 {
             return;
         }
-        let target = match tokio::task::spawn_blocking(move || {
-            store.next_audited_mature_observation_checkpoint_below_witness_threshold(
-                matured_before,
-                observed_at,
-                minimum_witnesses,
-                eligible_witnesses.as_ref(),
-            )
-        })
-        .await
-        {
-            Ok(Ok(Some(target))) => target,
-            Ok(Ok(None)) => return,
-            Ok(Err(_)) | Err(_) => {
-                warn!(
-                    reason = "directory_observation_checkpoint_audit_failed",
-                    "[DIRECTORY_REPLICA] External witness round skipped"
-                );
-                return;
-            }
-        };
-        let checkpoint = target.checkpoint.clone();
-        debug!(
-            checkpoint_sequence = checkpoint.sequence,
-            checkpoint_age_seconds = observed_at.saturating_sub(checkpoint.observed_at),
-            maturity_delay_secs,
-            retained_pinned_witnesses = target.witnessed_by.len(),
-            minimum_witnesses = target.minimum_witnesses,
-            "[DIRECTORY_REPLICA] Mature checkpoint below witness target selected"
-        );
-        let outcomes = stream::iter(
-            self.peers
-                .iter()
-                .copied()
-                .filter(|witness| !target.witnessed_by.contains(witness)),
-        )
-        .map(|witness| {
-            let checkpoint = checkpoint.clone();
-            async move {
-                request_observation_checkpoint_witness(
-                    Arc::clone(&self.store),
-                    self.peer_store.as_ref(),
-                    self.identity.as_ref(),
-                    &witness,
-                    &self.client,
-                    &self.witness_capabilities,
-                    checkpoint,
+        let mut checkpoints_attempted = 0usize;
+        let mut previous_sequence = None;
+        loop {
+            let store = Arc::clone(&self.store);
+            let eligible_witnesses = Arc::clone(&self.peers);
+            let target = match tokio::task::spawn_blocking(move || {
+                store.next_audited_mature_observation_checkpoint_below_witness_threshold(
+                    matured_before,
+                    observed_at,
+                    minimum_witnesses,
+                    eligible_witnesses.as_ref(),
                 )
-                .await
+            })
+            .await
+            {
+                Ok(Ok(Some(target))) => target,
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) | Err(_) => {
+                    warn!(
+                        reason = "directory_observation_checkpoint_audit_failed",
+                        checkpoints_attempted,
+                        "[DIRECTORY_REPLICA] External witness catch-up batch stopped"
+                    );
+                    break;
+                }
+            };
+            let checkpoint = target.checkpoint.clone();
+            if !should_attempt_observation_witness_catch_up(
+                checkpoints_attempted,
+                previous_sequence,
+                checkpoint.sequence,
+            ) {
+                debug!(
+                    checkpoints_attempted,
+                    previous_sequence = ?previous_sequence,
+                    candidate_sequence = checkpoint.sequence,
+                    catch_up_budget =
+                        DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND,
+                    "[DIRECTORY_REPLICA] External witness catch-up batch bounded"
+                );
+                break;
             }
-        })
-        .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
-        .collect::<Vec<_>>()
-        .await;
-        self.record_witness_outcome_round(checkpoint.sequence, outcomes)
+            debug!(
+                checkpoint_sequence = checkpoint.sequence,
+                checkpoint_age_seconds = observed_at.saturating_sub(checkpoint.observed_at),
+                maturity_delay_secs,
+                retained_pinned_witnesses = target.witnessed_by.len(),
+                minimum_witnesses = target.minimum_witnesses,
+                checkpoints_attempted,
+                catch_up_budget = DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND,
+                "[DIRECTORY_REPLICA] Mature checkpoint below witness target selected"
+            );
+            let outcomes = stream::iter(
+                self.peers
+                    .iter()
+                    .copied()
+                    .filter(|witness| !target.witnessed_by.contains(witness)),
+            )
+            .map(|witness| {
+                let checkpoint = checkpoint.clone();
+                async move {
+                    request_observation_checkpoint_witness(
+                        Arc::clone(&self.store),
+                        self.peer_store.as_ref(),
+                        self.identity.as_ref(),
+                        &witness,
+                        &self.client,
+                        &self.witness_capabilities,
+                        checkpoint,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
+            .collect::<Vec<_>>()
             .await;
+            self.record_witness_outcome_round(checkpoint.sequence, outcomes)
+                .await;
+            checkpoints_attempted = checkpoints_attempted.saturating_add(1);
+            previous_sequence = Some(checkpoint.sequence);
+        }
+        debug!(
+            checkpoints_attempted,
+            last_checkpoint_sequence = ?previous_sequence,
+            catch_up_budget = DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND,
+            "[DIRECTORY_REPLICA] External witness catch-up batch completed"
+        );
     }
 
     async fn anchor_current_observation_witness_policy(&self) {
@@ -4432,6 +4494,27 @@ mod tests {
             directory_sync_next_round_delay(already_fast, false),
             already_fast
         );
+    }
+
+    #[test]
+    fn witness_catch_up_requires_forward_progress_and_stops_at_budget() {
+        assert!(should_attempt_observation_witness_catch_up(0, None, 41));
+        assert!(should_attempt_observation_witness_catch_up(1, Some(41), 42));
+        assert!(!should_attempt_observation_witness_catch_up(
+            1,
+            Some(41),
+            41
+        ));
+        assert!(!should_attempt_observation_witness_catch_up(
+            1,
+            Some(41),
+            40
+        ));
+        assert!(!should_attempt_observation_witness_catch_up(
+            DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND,
+            Some(44),
+            45
+        ));
     }
 
     #[test]

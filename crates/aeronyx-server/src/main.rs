@@ -373,7 +373,7 @@ async fn cmd_register(
             println!("   Owner:    {}", info.owner_wallet);
             println!();
             println!("If you want to re-register, delete the file:");
-            println!("   rm {}", node_info_path);
+            println!("   rm {node_info_path}");
             return Ok(());
         }
     }
@@ -422,7 +422,7 @@ async fn cmd_register(
             println!();
         }
         Err(e) => {
-            println!("❌ Registration failed: {}", e);
+            println!("❌ Registration failed: {e}");
             println!();
             println!("Please check:");
             println!("  • Is the registration code correct?");
@@ -488,7 +488,7 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
             println!("❌ Registration data is corrupted.");
             println!();
             println!("Please re-register your node:");
-            println!("  rm {}", node_info_path);
+            println!("  rm {node_info_path}");
             println!("  aeronyx-server register --code <YOUR_CODE>");
             std::process::exit(1);
         }
@@ -585,7 +585,7 @@ async fn cmd_status(config_path: PathBuf) -> anyhow::Result<()> {
                 Ok(meta) => {
                     let size_kb = meta.len() as f64 / 1024.0;
                     if size_kb < 1024.0 {
-                        println!("   AOF Size:      {:.1} KB", size_kb);
+                        println!("   AOF Size:      {size_kb:.1} KB");
                     } else {
                         println!("   AOF Size:      {:.2} MB", size_kb / 1024.0);
                     }
@@ -623,7 +623,7 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     println!("Network:");
     println!("   Listen:     {}", config.listen_addr());
     if let Some(ep) = &config.network.public_endpoint {
-        println!("   Public:     {}", ep);
+        println!("   Public:     {ep}");
     }
     println!();
     println!("AeroNyx Privacy Protocol:");
@@ -648,10 +648,10 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     println!("Discovery:");
     println!("   Enabled:          {}", config.discovery.enabled);
     if let Some(path) = &config.discovery.bootstrap_snapshot_path {
-        println!("   Snapshot Path:    {}", path);
+        println!("   Snapshot Path:    {path}");
     }
     if let Some(url) = &config.discovery.bootstrap_snapshot_url {
-        println!("   Snapshot URL:     {}", url);
+        println!("   Snapshot URL:     {url}");
         println!(
             "   Fetch Timeout:    {}s",
             config.discovery.fetch_timeout_secs
@@ -955,8 +955,7 @@ fn read_bounded_observation_certificate_frame(path: &Path) -> anyhow::Result<Vec
         .context("certificate frame bound does not fit u64")?;
     anyhow::ensure!(
         metadata.len() <= maximum,
-        "observation certificate frame exceeds {} bytes",
-        MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES
+        "observation certificate frame exceeds {MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES} bytes"
     );
 
     let read_limit = maximum.saturating_add(1);
@@ -970,8 +969,7 @@ fn read_bounded_observation_certificate_frame(path: &Path) -> anyhow::Result<Vec
     anyhow::ensure!(!frame.is_empty(), "observation certificate frame is empty");
     anyhow::ensure!(
         frame.len() <= MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES,
-        "observation certificate changed while reading or exceeds {} bytes",
-        MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES
+        "observation certificate changed while reading or exceeds {MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES} bytes"
     );
     Ok(frame)
 }

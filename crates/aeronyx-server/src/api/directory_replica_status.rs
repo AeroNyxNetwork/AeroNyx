@@ -29,6 +29,9 @@
 //!   threshold, and runtime match without exposing member identities or hashes.
 //! - Declares the mature, forward-only witness target policy without exposing
 //!   checkpoint hashes, witness identities, or peer scheduling details.
+//! - [WITNESS-CATCHUP 2026-07-26 by Codex] Reports the bounded per-round
+//!   checkpoint budget and pending-to-head sequence gap so operators can
+//!   distinguish healthy backlog convergence from a stuck witness pipeline.
 //! - Declares that recurring selection verification is history-bounded while
 //!   complete retained-history audit remains a startup and operator boundary.
 //! - Lists bounded incident summaries and exports one independently re-verified
@@ -111,6 +114,8 @@
 //! - Recovery telemetry is aggregate transport health, never carrier reputation.
 //!
 //! ## Last Modified
+//! `v0.23.0-BoundedWitnessCatchUpStatus` - Added additive catch-up budget and
+//! sequence-gap fields without exposing witness identity or endpoint data.
 //! `v0.22.0-ObservationCertificateImportStatus` -
 //! [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] Added local-operator-only
 //! aggregate capacity, sequence, and signed-head visibility for schema v10.
@@ -168,6 +173,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::api::directory_replica_sync::{
+    DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND,
     DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS, DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS,
     DIRECTORY_SYNC_MAX_PAGES_PER_ROUND, DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE,
     DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS, DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
@@ -295,9 +301,11 @@ struct DirectoryReplicaObservationWitnessPipelineStatus {
     head_maturity_status: &'static str,
     forward_floor_clear: bool,
     pending_mature_checkpoint_sequence: Option<u64>,
+    pending_to_head_sequence_gap: Option<u64>,
     pending_current_pinned_witnesses: Option<u64>,
     required_external_witnesses: u64,
     pending_witnesses_remaining: Option<u64>,
+    catch_up_checkpoint_budget_per_round: usize,
     target_policy: &'static str,
     health_basis: &'static str,
     privacy_boundary: &'static str,
@@ -1497,12 +1505,19 @@ fn build_observation_witness_pipeline_status(
             && pending_target.is_none(),
         pending_mature_checkpoint_sequence: pending_target
             .map(|target| target.checkpoint_sequence),
+        pending_to_head_sequence_gap: pending_target.map(|target| {
+            persisted
+                .observation_checkpoint_sequence
+                .saturating_sub(target.checkpoint_sequence)
+        }),
         pending_current_pinned_witnesses: pending_target
             .map(|target| target.current_pinned_witnesses),
         required_external_witnesses,
         pending_witnesses_remaining: pending_target.map(|target| {
             required_external_witnesses.saturating_sub(target.current_pinned_witnesses)
         }),
+        catch_up_checkpoint_budget_per_round:
+            DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND,
         target_policy: "next_forward_mature_checkpoint_below_pinned_witness_target",
         health_basis: "audited_mature_checkpoint_forward_floor_not_unmatured_head",
         privacy_boundary:
@@ -2112,12 +2127,20 @@ mod tests {
             Some(120)
         );
         assert_eq!(
+            parsed["observation_witness_pipeline"]["catch_up_checkpoint_budget_per_round"].as_u64(),
+            Some(
+                u64::try_from(DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND)
+                    .unwrap()
+            )
+        );
+        assert_eq!(
             parsed["observation_witness_pipeline"]["forward_floor_clear"].as_bool(),
             Some(false)
         );
         assert!(
             parsed["observation_witness_pipeline"]["pending_mature_checkpoint_sequence"].is_null()
         );
+        assert!(parsed["observation_witness_pipeline"]["pending_to_head_sequence_gap"].is_null());
         assert_eq!(
             parsed["observation_witness_outcomes"]["source_status"].as_str(),
             Some("awaiting_witness_round")
@@ -2242,6 +2265,11 @@ mod tests {
         assert!(caught_up.forward_floor_clear);
         assert_eq!(caught_up.required_external_witnesses, 2);
         assert_eq!(caught_up.pending_mature_checkpoint_sequence, None);
+        assert_eq!(caught_up.pending_to_head_sequence_gap, None);
+        assert_eq!(
+            caught_up.catch_up_checkpoint_budget_per_round,
+            DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND
+        );
 
         let pending = build_observation_witness_pipeline_status(
             110,
@@ -2258,6 +2286,7 @@ mod tests {
         assert_eq!(pending.head_maturity_status, "mature");
         assert!(!pending.forward_floor_clear);
         assert_eq!(pending.pending_mature_checkpoint_sequence, Some(8));
+        assert_eq!(pending.pending_to_head_sequence_gap, Some(1));
         assert_eq!(pending.pending_current_pinned_witnesses, Some(1));
         assert_eq!(pending.pending_witnesses_remaining, Some(1));
     }
