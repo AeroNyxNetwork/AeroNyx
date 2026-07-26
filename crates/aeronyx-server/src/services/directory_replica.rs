@@ -56,6 +56,9 @@
 //!   request so recovery can continue without weakening contract validation.
 //! - Records only aggregate routeability and signed-region-hint diversity for
 //!   the latest bounded carrier selection, never peer identities or endpoints.
+//! - [WITNESS-CARRIER 2026-07-26 by Codex] Retains process-only aggregate
+//!   witness-carrier selection/outcome telemetry without any peer, route,
+//!   endpoint, request, checkpoint, frame, or signature metadata.
 //! - Re-verifies one carrier-returned retained mirror anchor without importing
 //!   it, enabling a production smoke test with no authority or storage change.
 //! - Builds operator-scoped portable observation certificates only from the
@@ -105,6 +108,8 @@
 //! 16. For operator certificate export, re-verify the latest receipt set,
 //!     exact checkpoint, current pins, threshold, and every signature without
 //!     mutating retained evidence.
+//! 17. Record only aggregate witness availability-recovery counters in memory;
+//!     durable witness truth remains the independently signed receipt store.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -132,6 +137,9 @@
 //!   policy head. It neither reveals nor approves policy membership.
 //! - Witness outcome telemetry is aggregate diagnostic evidence only. Never add
 //!   witness identities, endpoints, request ids, signatures, or hashes to it.
+//! - [WITNESS-CARRIER 2026-07-26 by Codex] Recovery telemetry must remain
+//!   process-only and aggregate. It is neither durable evidence nor peer
+//!   reputation and must not influence witness policy or checkpoint truth.
 //! - Witness policy epochs describe only this operator's local evidence target.
 //!   They are not a validator set, vote, quorum, fork choice, consensus, or
 //!   finality, and public status must never expose their full member identities.
@@ -153,6 +161,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.25.0-BoundedWitnessCarrierTelemetry - Added process-only aggregate
+//! availability-recovery telemetry with no authority or persistence changes
 //! v0.24.0-PortableObservationCertificate - Added current-pin, threshold-gated,
 //! fail-closed portable checkpoint evidence export
 //! v0.23.0-ReadOnlyCarrierSmoke - Added retained-anchor carrier verification
@@ -1214,6 +1224,44 @@ pub struct DirectoryReplicaRetryState {
     pub backoff_skips: u64,
 }
 
+/// Process-lifetime aggregate checkpoint-witness carrier telemetry.
+///
+/// [WITNESS-CARRIER 2026-07-26 by Codex] These counters describe bounded
+/// availability recovery only. They intentionally omit observer, witness,
+/// carrier, endpoint, route, descriptor-sequence, checkpoint-hash, and frame
+/// data and are never interpreted as authority or reputation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirectoryObservationWitnessRecoverySnapshot {
+    /// Bounded carrier selections after a direct-path availability failure.
+    pub selections: u64,
+    /// Candidates visible to the latest selection.
+    pub latest_candidates: u64,
+    /// Latest candidates with fresh local routeability evidence.
+    pub latest_routeable_candidates: u64,
+    /// Latest candidates skipped by descriptor-sequence capability memory.
+    pub latest_capability_cached_unavailable: u64,
+    /// Capacity-bounded carriers selected by the latest recovery.
+    pub latest_selected: u64,
+    /// Total carrier HTTP attempts during this process lifetime.
+    pub attempts: u64,
+    /// Carrier envelopes successfully verified before inner witness validation.
+    pub succeeded: u64,
+    /// Explicit optional carrier- or target-route absence outcomes.
+    pub capability_unavailable: u64,
+    /// Availability-only carrier or target transport failures.
+    pub transport_failures: u64,
+    /// Recoveries exhausted without a verified carrier envelope.
+    pub exhausted: u64,
+    /// Canonical, signature, admission, or target-contract failures that stopped closed.
+    pub failed_closed: u64,
+    /// Latest selection or carrier attempt timestamp.
+    pub last_attempt_at: Option<u64>,
+    /// Latest verified carrier-envelope timestamp.
+    pub last_success_at: Option<u64>,
+    /// Latest exhausted or fail-closed recovery timestamp.
+    pub last_failure_at: Option<u64>,
+}
+
 /// Runtime-only synchronization observation for one pinned producer.
 ///
 /// These fields intentionally contain no endpoint, full response, descriptor,
@@ -1366,6 +1414,7 @@ impl DirectoryReplicaSyncObservation {
 pub struct DirectoryReplicaSyncRuntime {
     observations: Mutex<HashMap<[u8; 32], DirectoryReplicaSyncObservation>>,
     observation_witness: Mutex<DirectoryObservationWitnessOutcomeSnapshot>,
+    observation_witness_recovery: Mutex<DirectoryObservationWitnessRecoverySnapshot>,
     full_node_mirror: Mutex<DirectoryFullNodeMirrorRuntimeSnapshot>,
 }
 
@@ -1540,6 +1589,84 @@ impl DirectoryReplicaSyncRuntime {
     #[must_use]
     pub fn observation_witness_snapshot(&self) -> DirectoryObservationWitnessOutcomeSnapshot {
         *self.observation_witness.lock()
+    }
+
+    /// Records aggregate properties of one bounded witness-carrier selection.
+    ///
+    /// Identity-bearing candidate data is reduced to counts before this
+    /// boundary and is never retained by runtime status.
+    pub fn record_observation_witness_recovery_selection(
+        &self,
+        candidates: u64,
+        routeable_candidates: u64,
+        capability_cached_unavailable: u64,
+        selected: u64,
+        attempted_at: u64,
+    ) {
+        if attempted_at == 0 {
+            return;
+        }
+        let mut snapshot = self.observation_witness_recovery.lock();
+        snapshot.selections = snapshot.selections.saturating_add(1);
+        snapshot.latest_candidates = candidates;
+        snapshot.latest_routeable_candidates = routeable_candidates.min(candidates);
+        snapshot.latest_capability_cached_unavailable =
+            capability_cached_unavailable.min(candidates);
+        snapshot.latest_selected = selected.min(candidates);
+        snapshot.last_attempt_at = Some(attempted_at);
+    }
+
+    /// Records one carrier transport attempt using mutually exclusive buckets.
+    pub fn record_observation_witness_recovery_attempt(
+        &self,
+        succeeded: bool,
+        capability_unavailable: bool,
+        completed_at: u64,
+    ) {
+        if completed_at == 0 || (succeeded && capability_unavailable) {
+            return;
+        }
+        let mut snapshot = self.observation_witness_recovery.lock();
+        snapshot.attempts = snapshot.attempts.saturating_add(1);
+        snapshot.last_attempt_at = Some(completed_at);
+        if succeeded {
+            snapshot.succeeded = snapshot.succeeded.saturating_add(1);
+            snapshot.last_success_at = Some(completed_at);
+        } else if capability_unavailable {
+            snapshot.capability_unavailable = snapshot.capability_unavailable.saturating_add(1);
+        } else {
+            snapshot.transport_failures = snapshot.transport_failures.saturating_add(1);
+        }
+    }
+
+    /// Records one bounded recovery that exhausted every selected carrier.
+    pub fn record_observation_witness_recovery_exhausted(&self, completed_at: u64) {
+        if completed_at == 0 {
+            return;
+        }
+        let mut snapshot = self.observation_witness_recovery.lock();
+        snapshot.exhausted = snapshot.exhausted.saturating_add(1);
+        snapshot.last_failure_at = Some(completed_at);
+    }
+
+    /// Records a carrier or target contract failure that stopped closed.
+    pub fn record_observation_witness_recovery_failed_closed(&self, completed_at: u64) {
+        if completed_at == 0 {
+            return;
+        }
+        let mut snapshot = self.observation_witness_recovery.lock();
+        snapshot.attempts = snapshot.attempts.saturating_add(1);
+        snapshot.failed_closed = snapshot.failed_closed.saturating_add(1);
+        snapshot.last_attempt_at = Some(completed_at);
+        snapshot.last_failure_at = Some(completed_at);
+    }
+
+    /// Returns process-lifetime aggregate witness-carrier telemetry.
+    #[must_use]
+    pub fn observation_witness_recovery_snapshot(
+        &self,
+    ) -> DirectoryObservationWitnessRecoverySnapshot {
+        *self.observation_witness_recovery.lock()
     }
 
     /// Records one aggregate bounded non-authoritative mirror round.
@@ -12031,6 +12158,33 @@ mod tests {
         assert_eq!(snapshot.last_success_at, Some(NOW));
         assert_eq!(snapshot.last_failure_at, Some(NOW));
         assert_eq!(snapshot.telemetry_persistence_failures, 1);
+    }
+
+    #[test]
+    fn witness_recovery_runtime_keeps_only_aggregate_transport_outcomes() {
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        runtime.record_observation_witness_recovery_selection(5, 3, 1, 2, NOW);
+        runtime.record_observation_witness_recovery_attempt(false, true, NOW + 1);
+        runtime.record_observation_witness_recovery_attempt(false, false, NOW + 2);
+        runtime.record_observation_witness_recovery_attempt(true, false, NOW + 3);
+        runtime.record_observation_witness_recovery_exhausted(NOW + 4);
+        runtime.record_observation_witness_recovery_failed_closed(NOW + 5);
+
+        let snapshot = runtime.observation_witness_recovery_snapshot();
+        assert_eq!(snapshot.selections, 1);
+        assert_eq!(snapshot.latest_candidates, 5);
+        assert_eq!(snapshot.latest_routeable_candidates, 3);
+        assert_eq!(snapshot.latest_capability_cached_unavailable, 1);
+        assert_eq!(snapshot.latest_selected, 2);
+        assert_eq!(snapshot.attempts, 4);
+        assert_eq!(snapshot.succeeded, 1);
+        assert_eq!(snapshot.capability_unavailable, 1);
+        assert_eq!(snapshot.transport_failures, 1);
+        assert_eq!(snapshot.exhausted, 1);
+        assert_eq!(snapshot.failed_closed, 1);
+        assert_eq!(snapshot.last_attempt_at, Some(NOW + 5));
+        assert_eq!(snapshot.last_success_at, Some(NOW + 3));
+        assert_eq!(snapshot.last_failure_at, Some(NOW + 5));
     }
 
     #[test]

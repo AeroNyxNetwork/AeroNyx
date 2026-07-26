@@ -30,6 +30,8 @@
 //!   retain rollback evidence without receiving policy members or endpoints
 //! - Authenticated observation-certificate exchange frames that let pinned
 //!   nodes transport exact portable evidence without making it public
+//! - [WITNESS-CARRIER 2026-07-26 by Codex] Bounded witness-carrier frames that
+//!   preserve the exact observer and witness signatures across one transport hop
 //! - Replica-carrier frames that transport already audited producer evidence
 //!   without allowing the carrier to replace the producer's signatures
 //! - Shared bounded fixed-integer codec policy for canonical control-plane
@@ -63,6 +65,8 @@
 //!     observer and return a signed receipt without learning policy members
 //! 13. A pinned node may request the latest portable observation certificate;
 //!     the response binds the exact certificate bytes and SHA-256 digest
+//! 14. A pinned carrier may forward one exact observer-signed witness request
+//!     and return one exact witness-signed response without becoming authority
 //!
 //! ## Important Note for Next Developer
 //! - Do not put private keys, client IPs, destination metadata, DNS contents,
@@ -86,6 +90,9 @@
 //! - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Certificate transport is
 //!   restricted to authenticated pinned peers. Append wire variants only;
 //!   changing the existing enum order breaks mixed-version bincode peers.
+//! - [WITNESS-CARRIER 2026-07-26 by Codex] A carrier signature authenticates
+//!   one bounded transport envelope only. It must never replace the exact target
+//!   witness signature or authorize recursive forwarding.
 //! - A policy-head anchor proves only that one witness retained an opaque
 //!   observer-signed epoch/digest at a time. It is not policy approval, a vote,
 //!   validator membership, consensus, governance, or finality.
@@ -99,6 +106,8 @@
 //!   rejection and the complete-input size preflight in the shared codec.
 //!
 //! ## Last Modified
+//! v0.16.0-BoundedWitnessCarrier - Added append-only exact-frame carrier
+//! request/response contracts without granting the carrier witness authority
 //! v0.15.0-AuthenticatedCertificateExchange - Added pinned-peer request and
 //! response frames binding exact portable certificate bytes
 //! v0.14.0-PortableObservationCertificate - Added bounded offline-verifiable
@@ -1880,6 +1889,61 @@ pub enum DirectorySyncMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+    /// Relays one exact observer-signed witness request through a carrier.
+    ///
+    /// [WITNESS-CARRIER 2026-07-26 by Codex] This variant is appended to
+    /// preserve every existing bincode enum index. The carrier is transport
+    /// only: it cannot alter the inner request, choose another witness, or
+    /// produce an accepted witness receipt.
+    ObservationCheckpointWitnessCarrierRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Random carrier-request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Observer that signed both this envelope and the inner request.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Exact pinned witness that must evaluate the inner request.
+        witness: [u8; 32],
+        /// SHA-256 of the exact canonical inner witness-request frame.
+        witness_request_sha256: [u8; 32],
+        /// Canonical observer-signed witness-request frame.
+        #[serde(with = "serde_bytes")]
+        witness_request_frame: Vec<u8>,
+        /// Observer signature binding target, digest, and frame length.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns one exact witness-signed response through a carrier.
+    ///
+    /// The carrier signature authenticates only the bounded transport
+    /// envelope. Receivers must independently verify the inner response
+    /// against the original observer request and the exact pinned witness.
+    ObservationCheckpointWitnessCarrierResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Carrier-request identifier copied from the outer request.
+        request_id: [u8; 16],
+        /// Observer identity copied from the authenticated outer request.
+        requester: [u8; 32],
+        /// Exact witness that signed the inner response.
+        witness: [u8; 32],
+        /// Independent carrier transporting the exact response frame.
+        carrier: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// SHA-256 of the exact inner request frame.
+        witness_request_sha256: [u8; 32],
+        /// SHA-256 of the exact inner response frame.
+        witness_response_sha256: [u8; 32],
+        /// Canonical witness-signed response frame.
+        #[serde(with = "serde_bytes")]
+        witness_response_frame: Vec<u8>,
+        /// Carrier signature binding request, target, digests, and frame length.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn directory_sync_signing_digest<'a>(
@@ -2231,6 +2295,72 @@ pub fn directory_observation_witness_response_signing_bytes(
             responder.as_slice(),
             response_timestamp.as_slice(),
             outcome.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by an observation-witness carrier request.
+///
+/// The digest binds the exact inner frame by both SHA-256 and byte length. The
+/// carrier must independently recompute both before forwarding the frame.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_observation_witness_carrier_request_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+    witness: &[u8; 32],
+    witness_request_sha256: &[u8; 32],
+    witness_request_frame_bytes: u64,
+) -> [u8; 32] {
+    let request_timestamp = request_timestamp.to_le_bytes();
+    let witness_request_frame_bytes = witness_request_frame_bytes.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ObservationWitnessCarrierRequest-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            request_timestamp.as_slice(),
+            witness.as_slice(),
+            witness_request_sha256.as_slice(),
+            witness_request_frame_bytes.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by an observation-witness carrier response.
+///
+/// A carrier authenticates bounded transport only. The caller must recompute
+/// both frame digests and verify the inner witness response independently.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_observation_witness_carrier_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    witness: &[u8; 32],
+    carrier: &[u8; 32],
+    response_timestamp: u64,
+    witness_request_sha256: &[u8; 32],
+    witness_response_sha256: &[u8; 32],
+    witness_response_frame_bytes: u64,
+) -> [u8; 32] {
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let witness_response_frame_bytes = witness_response_frame_bytes.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ObservationWitnessCarrierResponse-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            witness.as_slice(),
+            carrier.as_slice(),
+            response_timestamp.as_slice(),
+            witness_request_sha256.as_slice(),
+            witness_response_sha256.as_slice(),
+            witness_response_frame_bytes.as_slice(),
         ],
     )
 }
@@ -3588,6 +3718,7 @@ mod tests {
     fn test_directory_observation_witness_frames_are_canonical_and_bound() {
         let observer = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
         let witness = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let carrier = IdentityKeyPair::from_bytes(&[0x70; 32]).unwrap();
         let producer_a = IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap();
         let producer_b = IdentityKeyPair::from_bytes(&[0x74; 32]).unwrap();
         let checkpoint = DirectoryObservationCheckpointV1::new_signed(
@@ -3632,8 +3763,8 @@ mod tests {
             checkpoint: checkpoint.clone(),
             signature: observer.sign(&request_digest),
         };
-        let encoded = encode_directory_sync_message(&request).unwrap();
-        let decoded = decode_directory_sync_message(&encoded).unwrap();
+        let request_frame = encode_directory_sync_message(&request).unwrap();
+        let decoded = decode_directory_sync_message(&request_frame).unwrap();
         assert_eq!(decoded, request);
 
         let response_digest = directory_observation_witness_response_signing_bytes(
@@ -3657,8 +3788,11 @@ mod tests {
             outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
             signature: witness.sign(&response_digest),
         };
-        let encoded = encode_directory_sync_message(&response).unwrap();
-        assert_eq!(decode_directory_sync_message(&encoded).unwrap(), response);
+        let response_frame = encode_directory_sync_message(&response).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&response_frame).unwrap(),
+            response
+        );
         let DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
             responder,
             signature,
@@ -3671,6 +3805,78 @@ mod tests {
             .unwrap()
             .verify(&response_digest, &signature)
             .unwrap();
+
+        let carrier_request_id = [0x6f; 16];
+        let witness_request_sha256: [u8; 32] = Sha256::digest(&request_frame).into();
+        let carrier_request_digest = directory_observation_witness_carrier_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &carrier_request_id,
+            &observer.public_key_bytes(),
+            1_700_000_303,
+            &witness.public_key_bytes(),
+            &witness_request_sha256,
+            u64::try_from(request_frame.len()).unwrap(),
+        );
+        let carrier_request = DirectorySyncMessage::ObservationCheckpointWitnessCarrierRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id: carrier_request_id,
+            requester: observer.public_key_bytes(),
+            request_timestamp: 1_700_000_303,
+            witness: witness.public_key_bytes(),
+            witness_request_sha256,
+            witness_request_frame: request_frame.clone(),
+            signature: observer.sign(&carrier_request_digest),
+        };
+        let carrier_request_frame = encode_directory_sync_message(&carrier_request).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&carrier_request_frame).unwrap(),
+            carrier_request
+        );
+
+        let witness_response_sha256: [u8; 32] = Sha256::digest(&response_frame).into();
+        let carrier_response_digest = directory_observation_witness_carrier_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &carrier_request_id,
+            &observer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            &carrier.public_key_bytes(),
+            1_700_000_304,
+            &witness_request_sha256,
+            &witness_response_sha256,
+            u64::try_from(response_frame.len()).unwrap(),
+        );
+        let carrier_response =
+            DirectorySyncMessage::ObservationCheckpointWitnessCarrierResponseV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                request_id: carrier_request_id,
+                requester: observer.public_key_bytes(),
+                witness: witness.public_key_bytes(),
+                carrier: carrier.public_key_bytes(),
+                response_timestamp: 1_700_000_304,
+                witness_request_sha256,
+                witness_response_sha256,
+                witness_response_frame: response_frame,
+                signature: carrier.sign(&carrier_response_digest),
+            };
+        let carrier_response_frame = encode_directory_sync_message(&carrier_response).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&carrier_response_frame).unwrap(),
+            carrier_response
+        );
+        assert_ne!(
+            carrier_request_digest,
+            directory_observation_witness_carrier_request_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &carrier_request_id,
+                &observer.public_key_bytes(),
+                1_700_000_303,
+                &witness.public_key_bytes(),
+                &witness_request_sha256,
+                u64::try_from(request_frame.len())
+                    .unwrap()
+                    .saturating_add(1),
+            )
+        );
 
         let altered = directory_observation_witness_response_signing_bytes(
             &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,

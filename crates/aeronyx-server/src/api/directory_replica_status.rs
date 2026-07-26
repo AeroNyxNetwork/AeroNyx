@@ -47,6 +47,9 @@
 //!   keeping mirror identities/endpoints out of every public response.
 //! - Reports aggregate direct-first carrier recovery attempts and outcomes
 //!   without exposing producers, carriers, endpoints, or selected paths.
+//! - [WITNESS-CARRIER 2026-07-26 by Codex] Reports process-only aggregate
+//!   witness-carrier selection, success, capability, transport, exhaustion, and
+//!   fail-closed counters without retaining witness or carrier identities.
 //! - Reports aggregate routeable carrier and signed-region-hint diversity
 //!   counts while explicitly rejecting operator/ASN diversity claims.
 //! - Separates signed carrier capability evidence from unadvertised
@@ -78,6 +81,8 @@
 //!     the local/VPN operator scope.
 //! 13. Report mirror transport and bounded recovery separately from pinned
 //!     authority observations.
+//! 14. Report witness availability recovery separately from durable witness
+//!     evidence so carrier success is never presented as authority or consensus.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -112,8 +117,12 @@
 //! - Mirror health must never be folded into checkpoint, witness, policy, vote,
 //!   fork-choice, consensus, or finality labels.
 //! - Recovery telemetry is aggregate transport health, never carrier reputation.
+//! - [WITNESS-CARRIER 2026-07-26 by Codex] Never expose the selected carrier,
+//!   target witness, endpoint, request id, checkpoint hash, or exact route.
 //!
 //! ## Last Modified
+//! `v0.24.0-BoundedWitnessCarrierRecoveryStatus` - Added additive process-only
+//! direct-first recovery counters and explicit authority/privacy boundaries.
 //! `v0.23.0-BoundedWitnessCatchUpStatus` - Added additive catch-up budget and
 //! sequence-gap fields without exposing witness identity or endpoint data.
 //! `v0.22.0-ObservationCertificateImportStatus` -
@@ -174,12 +183,14 @@ use tracing::warn;
 
 use crate::api::directory_replica_sync::{
     DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND,
-    DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS, DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS,
-    DIRECTORY_SYNC_MAX_PAGES_PER_ROUND, DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE,
-    DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS, DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
+    DIRECTORY_OBSERVATION_WITNESS_RECOVERY_MAX_CARRIERS, DIRECTORY_SYNC_CATCH_UP_INTERVAL_SECS,
+    DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS, DIRECTORY_SYNC_MAX_PAGES_PER_ROUND,
+    DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE, DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS,
+    DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
 };
 use crate::services::directory_replica::{
-    DirectoryFullNodeMirrorRuntimeSnapshot, MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS,
+    DirectoryFullNodeMirrorRuntimeSnapshot, DirectoryObservationWitnessRecoverySnapshot,
+    MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS,
 };
 use crate::services::{
     DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaIncidentEvidence,
@@ -350,6 +361,32 @@ struct DirectoryReplicaObservationWitnessOutcomeStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct DirectoryReplicaObservationWitnessRecoveryStatus {
+    source_status: &'static str,
+    status: &'static str,
+    direct_first: bool,
+    max_carriers_per_witness: usize,
+    selections: u64,
+    latest_candidates: u64,
+    latest_routeable_candidates: u64,
+    latest_capability_cached_unavailable: u64,
+    latest_selected: u64,
+    attempts: u64,
+    succeeded: u64,
+    capability_unavailable: u64,
+    transport_failures: u64,
+    exhausted: u64,
+    failed_closed: u64,
+    last_attempt_age_seconds: Option<u64>,
+    last_success_age_seconds: Option<u64>,
+    last_failure_age_seconds: Option<u64>,
+    recovery_policy: &'static str,
+    authority_boundary: &'static str,
+    privacy_boundary: &'static str,
+    security_model: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct DirectoryFullNodeMirrorStatus {
     enabled: bool,
     status: &'static str,
@@ -477,6 +514,7 @@ struct DirectoryReplicaStatusResponse {
     observation_witness_policy: DirectoryReplicaObservationWitnessPolicyStatus,
     observation_witness_pipeline: DirectoryReplicaObservationWitnessPipelineStatus,
     observation_witness_outcomes: DirectoryReplicaObservationWitnessOutcomeStatus,
+    observation_witness_recovery: DirectoryReplicaObservationWitnessRecoveryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     observation_certificate_imports: Option<DirectoryObservationCertificateImportStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -614,6 +652,7 @@ struct DirectoryReplicaRuntimeSummary {
 struct DirectoryReplicaRuntimeSnapshots<'a> {
     producers: &'a [DirectoryReplicaSyncObservation],
     observation_witness: &'a DirectoryObservationWitnessOutcomeSnapshot,
+    observation_witness_recovery: &'a DirectoryObservationWitnessRecoverySnapshot,
     full_node_mirror: &'a DirectoryFullNodeMirrorRuntimeSnapshot,
 }
 
@@ -1159,10 +1198,13 @@ async fn directory_replica_status_handler(
     };
     let runtime = state.runtime.snapshot();
     let observation_witness_runtime = state.runtime.observation_witness_snapshot();
+    let observation_witness_recovery_runtime =
+        state.runtime.observation_witness_recovery_snapshot();
     let full_node_mirror_runtime = state.runtime.full_node_mirror_snapshot();
     let runtime_snapshots = DirectoryReplicaRuntimeSnapshots {
         producers: &runtime,
         observation_witness: &observation_witness_runtime,
+        observation_witness_recovery: &observation_witness_recovery_runtime,
         full_node_mirror: &full_node_mirror_runtime,
     };
     Json(build_directory_replica_status_response(
@@ -1588,6 +1630,63 @@ fn build_observation_witness_outcome_status(
     }
 }
 
+fn build_observation_witness_recovery_status(
+    generated_at: u64,
+    store_enabled: bool,
+    runtime: &DirectoryObservationWitnessRecoverySnapshot,
+) -> DirectoryReplicaObservationWitnessRecoveryStatus {
+    let latest_failure_is_newer = match (runtime.last_failure_at, runtime.last_success_at) {
+        (Some(failure), Some(success)) => failure > success,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let status = if !store_enabled {
+        "disabled"
+    } else if latest_failure_is_newer && runtime.failed_closed > 0 {
+        "failed_closed"
+    } else if latest_failure_is_newer && runtime.exhausted > 0 {
+        "exhausted"
+    } else if runtime.succeeded > 0 {
+        "recovered"
+    } else {
+        "standby"
+    };
+    DirectoryReplicaObservationWitnessRecoveryStatus {
+        source_status: "process_runtime_aggregate",
+        status,
+        direct_first: true,
+        max_carriers_per_witness: DIRECTORY_OBSERVATION_WITNESS_RECOVERY_MAX_CARRIERS,
+        selections: runtime.selections,
+        latest_candidates: runtime.latest_candidates,
+        latest_routeable_candidates: runtime.latest_routeable_candidates,
+        latest_capability_cached_unavailable: runtime.latest_capability_cached_unavailable,
+        latest_selected: runtime.latest_selected,
+        attempts: runtime.attempts,
+        succeeded: runtime.succeeded,
+        capability_unavailable: runtime.capability_unavailable,
+        transport_failures: runtime.transport_failures,
+        exhausted: runtime.exhausted,
+        failed_closed: runtime.failed_closed,
+        last_attempt_age_seconds: runtime
+            .last_attempt_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_success_age_seconds: runtime
+            .last_success_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_failure_age_seconds: runtime
+            .last_failure_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        recovery_policy:
+            "direct_first_then_at_most_two_explicit_signed_carriers_for_availability_only_failures",
+        authority_boundary:
+            "carrier_authenticates_transport_only;_exact_pinned_witness_signature_remains_required",
+        privacy_boundary:
+            "aggregate process counters and ages only; no observer witness carrier endpoint route descriptor sequence checkpoint hash frame or user-plane data",
+        security_model:
+            "bounded_availability_recovery_not_authority_reputation_vote_quorum_fork_choice_consensus_or_finality",
+    }
+}
+
 fn build_full_node_mirror_status(
     generated_at: u64,
     store_enabled: bool,
@@ -1847,6 +1946,11 @@ fn build_directory_replica_status_response(
             &persisted.observation_witness_outcomes,
             runtime.observation_witness,
         ),
+        observation_witness_recovery: build_observation_witness_recovery_status(
+            generated_at,
+            store_enabled,
+            runtime.observation_witness_recovery,
+        ),
         observation_certificate_imports,
         producers,
         privacy_invariant:
@@ -1978,6 +2082,18 @@ mod tests {
             1,
             4,
             2,
+        );
+        runtime.record_observation_witness_recovery_selection(
+            3,
+            2,
+            0,
+            2,
+            now_secs().saturating_sub(2),
+        );
+        runtime.record_observation_witness_recovery_attempt(
+            true,
+            false,
+            now_secs().saturating_sub(1),
         );
         Ok((Arc::new(store), runtime, producer_id))
     }
@@ -2178,6 +2294,26 @@ mod tests {
             Some(
                 "diagnostic_aggregate_not_peer_reputation_vote_quorum_fork_choice_consensus_or_finality"
             )
+        );
+        assert_eq!(
+            parsed["observation_witness_recovery"]["status"].as_str(),
+            Some("recovered")
+        );
+        assert_eq!(
+            parsed["observation_witness_recovery"]["direct_first"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["observation_witness_recovery"]["max_carriers_per_witness"].as_u64(),
+            Some(u64::try_from(DIRECTORY_OBSERVATION_WITNESS_RECOVERY_MAX_CARRIERS).unwrap())
+        );
+        assert_eq!(
+            parsed["observation_witness_recovery"]["attempts"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["observation_witness_recovery"]["succeeded"].as_u64(),
+            Some(1)
         );
         assert!(parsed.get("producers").is_none());
         assert!(!body_text.contains(&hex::encode(producer)));

@@ -35,6 +35,9 @@
 //! - [WITNESS-CATCHUP 2026-07-26 by Codex] Advances a bounded batch of distinct
 //!   mature checkpoints per synchronization round so restart backlog converges
 //!   instead of remaining permanently one-for-one with newly appended heads.
+//! - [WITNESS-CARRIER 2026-07-26 by Codex] Keeps witness requests direct-first,
+//!   then tries at most two operator-pinned, explicitly advertised carriers
+//!   only after bounded availability failures.
 //! - Anchors the current opaque witness-policy head with current pinned peers,
 //!   skipping peers whose canonical policy receipt is already durable.
 //! - Tries the producer directly first, then uses another pinned node as an
@@ -85,26 +88,30 @@
 //!    result, and stop the batch if the selector does not advance.
 //! 10. Treat an explicitly unsupported witness endpoint as peer unavailability
 //!     and retry only after that peer publishes a newer signed descriptor.
-//! 11. Persist bounded aggregate witness outcomes and mirror the current
+//! 11. If direct witness transport is unavailable, try at most two current,
+//!     operator-pinned `DirectoryMirrorCarrier` descriptors. Each attempt uses
+//!     a fresh inner request id; target rejection or invalid evidence stops
+//!     closed, while the exact witness signature remains mandatory.
+//! 12. Persist bounded aggregate witness outcomes and mirror the current
 //!     process round into runtime telemetry without retaining witness identity.
-//! 12. Stop the complete round immediately when shutdown wins the select.
-//! 13. Ask missing current pins to retain the opaque current policy head and
+//! 13. Stop the complete round immediately when shutdown wins the select.
+//! 14. Ask missing current pins to retain the opaque current policy head and
 //!     persist only exact accepted signed receipts.
-//! 14. Select verified public mirror candidates, exclude self and authority
+//! 15. Select verified public mirror candidates, exclude self and authority
 //!     pins, and catch each selection up within a strict page, request, and
 //!     wall-clock budget. Try the producer directly before at most two public
 //!     carriers. Every imported block remains signed by the original producer;
 //!     a carrier signs only the response envelope and never gains authority.
-//! 15. Prefer fresh routeability evidence, rotate equally healthy candidates,
+//! 16. Prefer fresh routeability evidence, rotate equally healthy candidates,
 //!     and avoid repeating a signed region hint when an equally healthy
 //!     alternative exists. Region hints never prove operator or ASN diversity.
-//! 16. On explicit operator request, prove bounded multi-page cold recovery in
+//! 17. On explicit operator request, prove bounded multi-page cold recovery in
 //!     an isolated in-memory replica. Rotate the first carrier between pages,
 //!     retry only availability failures, and preserve an already verified
 //!     multi-page prefix if a later page becomes unavailable. Stop closed on
 //!     cryptographic or import failures, then discard the replica without
 //!     touching the live store.
-//! 17. On explicit operator request, fetch one portable observation certificate
+//! 18. On explicit operator request, fetch one portable observation certificate
 //!     from an expected pinned identity and verify request binding, responder
 //!     signature, freshness, frame size, and SHA-256 before local policy import.
 //!
@@ -141,8 +148,15 @@
 //!   checkpoint sequences and concurrent only across missing pinned witnesses.
 //!   Never retry the same sequence twice in one batch or remove the hard batch
 //!   ceiling; those rules bound request amplification during peer failure.
+//! - [WITNESS-CARRIER 2026-07-26 by Codex] Carrier fallback is availability
+//!   recovery, not trust recovery. Select only current explicit carrier
+//!   capabilities that are also local operator pins, never recurse, and stop
+//!   on any target rejection, noncanonical frame, contract, or signature fault.
+//!   Keep the dedicated 16 KiB inner and 32 KiB outer response ceilings.
 //!
 //! ## Last Modified
+//! `v0.25.0-BoundedWitnessCarrierRecovery` - Added direct-first, at-most-two,
+//! pinned explicit-carrier witness recovery with exact target verification.
 //! `v0.24.0-BoundedWitnessCatchUp` - Added a four-checkpoint mature witness
 //! catch-up budget with strict sequence advancement and no same-round retry.
 //! `v0.23.0-AuthenticatedCertificateExchange` - Added hardened pinned-source
@@ -205,6 +219,8 @@ use aeronyx_core::protocol::discovery::{
     directory_descriptor_objects_response_signing_bytes,
     directory_observation_certificate_request_signing_bytes,
     directory_observation_certificate_response_signing_bytes,
+    directory_observation_witness_carrier_request_signing_bytes,
+    directory_observation_witness_carrier_response_signing_bytes,
     directory_observation_witness_request_signing_bytes,
     directory_observation_witness_response_signing_bytes,
     directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
@@ -267,6 +283,16 @@ pub(crate) const DIRECTORY_OBSERVATION_WITNESS_MATURITY_INTERVALS: u64 = 1;
 /// witnessed after one producer-sync round. Four closes a restart backlog while
 /// keeping two-pin deployments at or below eight witness requests per round.
 pub(crate) const DIRECTORY_OBSERVATION_WITNESS_CATCH_UP_CHECKPOINTS_PER_ROUND: usize = 4;
+/// [WITNESS-CARRIER 2026-07-26 by Codex] Maximum authenticated transport
+/// carriers tried after one exact witness direct path has an availability-only
+/// failure. Cryptographic, canonical, admission, and evidence failures stop.
+pub(crate) const DIRECTORY_OBSERVATION_WITNESS_RECOVERY_MAX_CARRIERS: usize = 2;
+/// Exact witness responses are tiny. The carrier enforces this inner-frame
+/// ceiling before signing its transport envelope.
+const MAX_DIRECTORY_OBSERVATION_WITNESS_CARRIER_INNER_RESPONSE_BODY_BYTES: usize = 16 * 1024;
+/// Bounds the signed outer carrier envelope independently from general
+/// Directory block/object responses.
+const MAX_DIRECTORY_OBSERVATION_WITNESS_CARRIER_RESPONSE_BODY_BYTES: usize = 32 * 1024;
 /// Hard response ceiling shared with the core Directory Sync decoder.
 const MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES: usize = 512 * 1024;
 /// Peer protocol errors are fixed ASCII codes. Keep non-success reads tiny so
@@ -918,6 +944,10 @@ enum DirectoryPeerErrorCode {
     ReplicaRangeNotRetained,
     MirrorReplicaNotRetained,
     ReplicaObjectNotFound,
+    WitnessTargetUnavailable,
+    WitnessTargetCapabilityUnavailable,
+    WitnessTargetRejected,
+    WitnessTargetInvalidResponse,
 }
 
 impl DirectoryPeerErrorCode {
@@ -927,6 +957,12 @@ impl DirectoryPeerErrorCode {
             b"replica_range_not_retained" => Some(Self::ReplicaRangeNotRetained),
             b"mirror_replica_not_retained" => Some(Self::MirrorReplicaNotRetained),
             b"replica_object_not_found" => Some(Self::ReplicaObjectNotFound),
+            b"witness_target_unavailable" => Some(Self::WitnessTargetUnavailable),
+            b"witness_target_capability_unavailable" => {
+                Some(Self::WitnessTargetCapabilityUnavailable)
+            }
+            b"witness_target_rejected" => Some(Self::WitnessTargetRejected),
+            b"witness_target_invalid_response" => Some(Self::WitnessTargetInvalidResponse),
             _ => None,
         }
     }
@@ -937,6 +973,10 @@ impl DirectoryPeerErrorCode {
             Self::ReplicaRangeNotRetained => "replica_range_not_retained",
             Self::MirrorReplicaNotRetained => "mirror_replica_not_retained",
             Self::ReplicaObjectNotFound => "replica_object_not_found",
+            Self::WitnessTargetUnavailable => "witness_target_unavailable",
+            Self::WitnessTargetCapabilityUnavailable => "witness_target_capability_unavailable",
+            Self::WitnessTargetRejected => "witness_target_rejected",
+            Self::WitnessTargetInvalidResponse => "witness_target_invalid_response",
         }
     }
 }
@@ -1003,6 +1043,7 @@ pub struct DirectoryReplicaSyncCoordinator {
     identity: Arc<IdentityKeyPair>,
     client: reqwest::Client,
     witness_capabilities: DirectoryWitnessCapabilityCache,
+    witness_carrier_capabilities: DirectoryMirrorCarrierCapabilityCache,
     policy_anchor_capabilities: DirectoryWitnessCapabilityCache,
     mirror_carrier_capabilities: DirectoryMirrorCarrierCapabilityCache,
     witness_min_verified: usize,
@@ -1107,6 +1148,7 @@ impl DirectoryReplicaSyncCoordinator {
             identity,
             client,
             witness_capabilities: DirectoryWitnessCapabilityCache::default(),
+            witness_carrier_capabilities: DirectoryMirrorCarrierCapabilityCache::default(),
             policy_anchor_capabilities: DirectoryWitnessCapabilityCache::default(),
             mirror_carrier_capabilities: DirectoryMirrorCarrierCapabilityCache::default(),
             witness_min_verified,
@@ -1564,8 +1606,11 @@ impl DirectoryReplicaSyncCoordinator {
                         self.peer_store.as_ref(),
                         self.identity.as_ref(),
                         &witness,
+                        self.peers.as_ref(),
                         &self.client,
                         &self.witness_capabilities,
+                        &self.witness_carrier_capabilities,
+                        self.runtime.as_ref(),
                         checkpoint,
                     )
                     .await
@@ -1960,34 +2005,187 @@ async fn request_observation_checkpoint_witness(
     peer_store: &PeerStore,
     identity: &IdentityKeyPair,
     witness: &[u8; 32],
+    eligible_carriers: &[[u8; 32]],
     client: &reqwest::Client,
     capability_cache: &DirectoryWitnessCapabilityCache,
+    carrier_capability_cache: &DirectoryMirrorCarrierCapabilityCache,
+    runtime: &DirectoryReplicaSyncRuntime,
     checkpoint: DirectoryObservationCheckpointV1,
 ) -> DirectoryObservationWitnessOutcome {
+    let requester = identity.public_key_bytes();
     let request_timestamp = unix_now_secs();
-    let Some(descriptor) = peer_store.get_valid(witness, request_timestamp) else {
-        return DirectoryObservationWitnessOutcome::PeerUnavailable;
-    };
-    let Some(endpoint) = descriptor.descriptor.public_endpoint.as_deref() else {
-        return DirectoryObservationWitnessOutcome::PeerUnavailable;
-    };
-    if !commitment_peer_endpoint_is_public(endpoint) {
-        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+    let mut direct_transport_failed = false;
+    let direct = peer_store
+        .get_valid(witness, request_timestamp)
+        .and_then(|descriptor| {
+            let endpoint = descriptor.descriptor.public_endpoint.as_deref()?;
+            if !commitment_peer_endpoint_is_public(endpoint) {
+                return None;
+            }
+            Some((descriptor.sequence(), endpoint.to_string()))
+        });
+    if let Some((descriptor_sequence, endpoint)) = direct {
+        if !capability_cache.should_attempt(witness, descriptor_sequence) {
+            debug!(
+                reason = "directory_observation_witness_capability_cached_unavailable",
+                "[DIRECTORY_REPLICA] Witness request skipped for unchanged signed descriptor"
+            );
+            return DirectoryObservationWitnessOutcome::PeerUnavailable;
+        }
+        let Ok(url) = commitment_peer_url(
+            &endpoint,
+            "/api/discovery/peer/directory/observation-checkpoint-witness",
+        ) else {
+            return DirectoryObservationWitnessOutcome::PeerUnavailable;
+        };
+        let request = match build_observation_witness_request(identity, checkpoint.clone()) {
+            Ok(request) => request,
+            Err(outcome) => return outcome,
+        };
+        match post_directory_frame_typed(client, url, request.frame.clone()).await {
+            Ok(response) => {
+                capability_cache.record_supported(witness);
+                return verify_and_persist_observation_witness_response(
+                    store, response, &request, witness,
+                )
+                .await;
+            }
+            Err(error) if error.witness_capability_unavailable() => {
+                capability_cache.record_unsupported(*witness, descriptor_sequence);
+                debug!(
+                    reason = "directory_observation_witness_capability_unavailable",
+                    "[DIRECTORY_REPLICA] Peer descriptor does not currently expose witness service"
+                );
+                return DirectoryObservationWitnessOutcome::PeerUnavailable;
+            }
+            Err(error) if observation_witness_failure_allows_carrier(error) => {
+                direct_transport_failed = true;
+            }
+            Err(DirectoryFramePostError::Response(_)) => {
+                return DirectoryObservationWitnessOutcome::VerificationFailure;
+            }
+            Err(_) => return DirectoryObservationWitnessOutcome::TransportFailure,
+        }
     }
-    let descriptor_sequence = descriptor.sequence();
-    if !capability_cache.should_attempt(witness, descriptor_sequence) {
-        debug!(
-            reason = "directory_observation_witness_capability_cached_unavailable",
-            "[DIRECTORY_REPLICA] Witness request skipped for unchanged signed descriptor"
-        );
-        return DirectoryObservationWitnessOutcome::PeerUnavailable;
+
+    // [WITNESS-CARRIER 2026-07-26 by Codex] Direct endpoint absence and
+    // availability-only failures may use at most two explicitly advertised
+    // carriers. Carriers transport a fresh exact inner request; they cannot
+    // sign the witness receipt or change its expected responder.
+    let carrier_selection = directory_observation_witness_recovery_carriers(
+        peer_store,
+        carrier_capability_cache,
+        witness,
+        &requester,
+        eligible_carriers,
+        request_timestamp,
+    );
+    runtime.record_observation_witness_recovery_selection(
+        carrier_selection.candidate_count,
+        carrier_selection.routeable_candidate_count,
+        carrier_selection.capability_cached_unavailable_count,
+        u64::try_from(carrier_selection.carriers.len()).unwrap_or(u64::MAX),
+        request_timestamp,
+    );
+    if carrier_selection.carriers.is_empty() {
+        runtime.record_observation_witness_recovery_exhausted(request_timestamp);
+        return observation_witness_unavailable_recovery_outcome(direct_transport_failed);
     }
-    let Ok(url) = commitment_peer_url(
-        endpoint,
-        "/api/discovery/peer/directory/observation-checkpoint-witness",
-    ) else {
-        return DirectoryObservationWitnessOutcome::PeerUnavailable;
-    };
+    for carrier in carrier_selection
+        .carriers
+        .into_iter()
+        .take(DIRECTORY_OBSERVATION_WITNESS_RECOVERY_MAX_CARRIERS)
+    {
+        let request = match build_observation_witness_request(identity, checkpoint.clone()) {
+            Ok(request) => request,
+            Err(outcome) => return outcome,
+        };
+        let response = match request_observation_witness_via_carrier(
+            peer_store, identity, witness, carrier, client, &request,
+        )
+        .await
+        {
+            Ok(response) => {
+                carrier_capability_cache.record_supported(&carrier.node_id);
+                runtime.record_observation_witness_recovery_attempt(true, false, request_timestamp);
+                response
+            }
+            Err(error) if error.witness_capability_unavailable() => {
+                carrier_capability_cache
+                    .record_unsupported(carrier.node_id, carrier.descriptor_sequence);
+                runtime.record_observation_witness_recovery_attempt(false, true, request_timestamp);
+                continue;
+            }
+            Err(DirectoryFramePostError::HttpStatus {
+                peer_code: Some(DirectoryPeerErrorCode::WitnessTargetUnavailable),
+                ..
+            })
+            | Err(DirectoryFramePostError::Transport) => {
+                runtime.record_observation_witness_recovery_attempt(
+                    false,
+                    false,
+                    request_timestamp,
+                );
+                continue;
+            }
+            Err(DirectoryFramePostError::HttpStatus {
+                peer_code: Some(DirectoryPeerErrorCode::WitnessTargetCapabilityUnavailable),
+                ..
+            }) => {
+                if let Some(descriptor) = peer_store.get_valid(witness, unix_now_secs()) {
+                    capability_cache.record_unsupported(*witness, descriptor.sequence());
+                }
+                runtime.record_observation_witness_recovery_attempt(false, true, request_timestamp);
+                runtime.record_observation_witness_recovery_exhausted(request_timestamp);
+                return DirectoryObservationWitnessOutcome::PeerUnavailable;
+            }
+            Err(DirectoryFramePostError::HttpStatus {
+                peer_code:
+                    Some(
+                        DirectoryPeerErrorCode::WitnessTargetRejected
+                        | DirectoryPeerErrorCode::WitnessTargetInvalidResponse,
+                    ),
+                ..
+            })
+            | Err(DirectoryFramePostError::Response(_)) => {
+                runtime.record_observation_witness_recovery_failed_closed(request_timestamp);
+                return DirectoryObservationWitnessOutcome::VerificationFailure;
+            }
+            Err(error) if observation_witness_carrier_failure_allows_next(error) => {
+                runtime.record_observation_witness_recovery_attempt(
+                    false,
+                    false,
+                    request_timestamp,
+                );
+                continue;
+            }
+            Err(_) => {
+                runtime.record_observation_witness_recovery_failed_closed(request_timestamp);
+                return DirectoryObservationWitnessOutcome::VerificationFailure;
+            }
+        };
+        return verify_and_persist_observation_witness_response(store, response, &request, witness)
+            .await;
+    }
+    runtime.record_observation_witness_recovery_exhausted(request_timestamp);
+    DirectoryObservationWitnessOutcome::TransportFailure
+}
+
+#[derive(Debug, Clone)]
+struct ObservationWitnessRequest {
+    request_id: [u8; 16],
+    requester: [u8; 32],
+    request_timestamp: u64,
+    checkpoint_sequence: u64,
+    checkpoint_hash: [u8; 32],
+    frame: Vec<u8>,
+}
+
+fn build_observation_witness_request(
+    identity: &IdentityKeyPair,
+    checkpoint: DirectoryObservationCheckpointV1,
+) -> Result<ObservationWitnessRequest, DirectoryObservationWitnessOutcome> {
+    let request_timestamp = unix_now_secs();
     let mut request_id = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut request_id);
     let requester = identity.public_key_bytes();
@@ -2000,7 +2198,7 @@ async fn request_observation_checkpoint_witness(
         request_timestamp,
         &checkpoint_hash,
     );
-    let request = DirectorySyncMessage::ObservationCheckpointWitnessRequestV1 {
+    let message = DirectorySyncMessage::ObservationCheckpointWitnessRequestV1 {
         chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
         request_id,
         requester,
@@ -2008,36 +2206,197 @@ async fn request_observation_checkpoint_witness(
         checkpoint,
         signature: identity.sign(&signing_bytes),
     };
-    let Ok(frame) = encode_directory_sync_message(&request) else {
-        return DirectoryObservationWitnessOutcome::VerificationFailure;
-    };
-    let response = match post_directory_frame_typed(client, url, frame).await {
-        Ok(response) => {
-            capability_cache.record_supported(witness);
-            response
-        }
-        Err(error) if error.witness_capability_unavailable() => {
-            capability_cache.record_unsupported(*witness, descriptor_sequence);
-            debug!(
-                reason = "directory_observation_witness_capability_unavailable",
-                http_status = match error {
-                    DirectoryFramePostError::HttpStatus { status, .. } => status,
-                    _ => 0,
-                },
-                "[DIRECTORY_REPLICA] Peer descriptor does not currently expose witness service"
-            );
-            return DirectoryObservationWitnessOutcome::PeerUnavailable;
-        }
-        Err(_) => return DirectoryObservationWitnessOutcome::TransportFailure,
-    };
-    let verified = match verify_observation_witness_response(
-        &response,
-        &request_id,
-        &requester,
-        witness,
+    let frame = encode_directory_sync_message(&message)
+        .map_err(|_| DirectoryObservationWitnessOutcome::VerificationFailure)?;
+    Ok(ObservationWitnessRequest {
+        request_id,
+        requester,
         request_timestamp,
         checkpoint_sequence,
-        &checkpoint_hash,
+        checkpoint_hash,
+        frame,
+    })
+}
+
+const fn observation_witness_failure_allows_carrier(error: DirectoryFramePostError) -> bool {
+    match error {
+        DirectoryFramePostError::Transport => true,
+        DirectoryFramePostError::HttpStatus {
+            status,
+            peer_code: None,
+        } => matches!(status, 408 | 429 | 500 | 502 | 503 | 504),
+        DirectoryFramePostError::HttpStatus {
+            peer_code: Some(DirectoryPeerErrorCode::WitnessTargetUnavailable),
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// [WITNESS-CARRIER 2026-07-26 by Codex] Preserves the pre-recovery outcome
+/// distinction when no carrier can be attempted.
+const fn observation_witness_unavailable_recovery_outcome(
+    direct_transport_failed: bool,
+) -> DirectoryObservationWitnessOutcome {
+    if direct_transport_failed {
+        DirectoryObservationWitnessOutcome::TransportFailure
+    } else {
+        DirectoryObservationWitnessOutcome::PeerUnavailable
+    }
+}
+
+const fn observation_witness_carrier_failure_allows_next(error: DirectoryFramePostError) -> bool {
+    match error {
+        DirectoryFramePostError::Transport => true,
+        DirectoryFramePostError::HttpStatus {
+            status,
+            peer_code: None,
+        } => matches!(status, 403 | 408 | 429 | 500 | 502 | 503 | 504),
+        DirectoryFramePostError::HttpStatus {
+            peer_code: Some(DirectoryPeerErrorCode::WitnessTargetUnavailable),
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+async fn request_observation_witness_via_carrier(
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    witness: &[u8; 32],
+    carrier: DirectoryMirrorRecoveryCarrier,
+    client: &reqwest::Client,
+    request: &ObservationWitnessRequest,
+) -> Result<Vec<u8>, DirectoryFramePostError> {
+    let request_timestamp = unix_now_secs();
+    let url = directory_observation_witness_carrier_url(peer_store, &carrier, request_timestamp)
+        .map_err(|_| DirectoryFramePostError::Transport)?;
+    let mut carrier_request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut carrier_request_id);
+    let request_sha256: [u8; 32] = Sha256::digest(&request.frame).into();
+    let frame_bytes = u64::try_from(request.frame.len()).unwrap_or(u64::MAX);
+    let signing_bytes = directory_observation_witness_carrier_request_signing_bytes(
+        &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        &carrier_request_id,
+        &request.requester,
+        request_timestamp,
+        witness,
+        &request_sha256,
+        frame_bytes,
+    );
+    let message = DirectorySyncMessage::ObservationCheckpointWitnessCarrierRequestV1 {
+        chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        request_id: carrier_request_id,
+        requester: request.requester,
+        request_timestamp,
+        witness: *witness,
+        witness_request_sha256: request_sha256,
+        witness_request_frame: request.frame.clone(),
+        signature: identity.sign(&signing_bytes),
+    };
+    let frame = encode_directory_sync_message(&message)
+        .map_err(|_| DirectoryFramePostError::Response(BoundedHttpResponseError::BodyRead))?;
+    let response = post_directory_frame_typed_with_response_limit(
+        client,
+        url,
+        frame,
+        MAX_DIRECTORY_OBSERVATION_WITNESS_CARRIER_RESPONSE_BODY_BYTES,
+    )
+    .await?;
+    verify_observation_witness_carrier_response(
+        &response,
+        &carrier_request_id,
+        &request.requester,
+        witness,
+        &carrier.node_id,
+        request_timestamp,
+        &request_sha256,
+    )
+    .map_err(|_| DirectoryFramePostError::Response(BoundedHttpResponseError::BodyRead))
+}
+
+fn verify_observation_witness_carrier_response(
+    frame: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_requester: &[u8; 32],
+    expected_witness: &[u8; 32],
+    expected_carrier: &[u8; 32],
+    request_timestamp: u64,
+    expected_request_sha256: &[u8; 32],
+) -> Result<Vec<u8>, String> {
+    let response = decode_directory_sync_message(frame)
+        .map_err(|_| "observation_witness_carrier_response_decode_failed".to_string())?;
+    let canonical = encode_directory_sync_message(&response)
+        .map_err(|_| "observation_witness_carrier_response_encode_failed".to_string())?;
+    if canonical != frame {
+        return Err("observation_witness_carrier_response_noncanonical".to_string());
+    }
+    let DirectorySyncMessage::ObservationCheckpointWitnessCarrierResponseV1 {
+        chain_id,
+        request_id,
+        requester,
+        witness,
+        carrier,
+        response_timestamp,
+        witness_request_sha256,
+        witness_response_sha256,
+        witness_response_frame,
+        signature,
+    } = response
+    else {
+        return Err("observation_witness_carrier_response_unexpected_message".to_string());
+    };
+    let actual_response_sha256: [u8; 32] = Sha256::digest(&witness_response_frame).into();
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || request_id != *expected_request_id
+        || requester != *expected_requester
+        || witness != *expected_witness
+        || carrier != *expected_carrier
+        || witness_request_sha256 != *expected_request_sha256
+        || witness_response_sha256 == [0u8; 32]
+        || witness_response_sha256 != actual_response_sha256
+        || witness_response_frame.is_empty()
+        || witness_response_frame.len()
+            > MAX_DIRECTORY_OBSERVATION_WITNESS_CARRIER_INNER_RESPONSE_BODY_BYTES
+        || response_timestamp.abs_diff(unix_now_secs())
+            > DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS
+        || response_timestamp.saturating_add(DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS)
+            < request_timestamp
+    {
+        return Err("observation_witness_carrier_response_contract_mismatch".to_string());
+    }
+    let frame_bytes = u64::try_from(witness_response_frame.len()).unwrap_or(u64::MAX);
+    let signing_bytes = directory_observation_witness_carrier_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &requester,
+        &witness,
+        &carrier,
+        response_timestamp,
+        &witness_request_sha256,
+        &witness_response_sha256,
+        frame_bytes,
+    );
+    IdentityPublicKey::from_bytes(&carrier)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .map_err(|_| "observation_witness_carrier_response_invalid_signature".to_string())?;
+    Ok(witness_response_frame)
+}
+
+async fn verify_and_persist_observation_witness_response(
+    store: Arc<DirectoryReplicaStore>,
+    response: Vec<u8>,
+    request: &ObservationWitnessRequest,
+    witness: &[u8; 32],
+) -> DirectoryObservationWitnessOutcome {
+    let verified = match verify_observation_witness_response(
+        &response,
+        &request.request_id,
+        &request.requester,
+        witness,
+        request.request_timestamp,
+        request.checkpoint_sequence,
+        &request.checkpoint_hash,
     ) {
         Ok(verified) => verified,
         Err(reason) if reason == "observation_witness_evidence_unavailable" => {
@@ -3099,6 +3458,46 @@ fn directory_mirror_recovery_carriers_with_requirement(
     now: u64,
     require_explicitly_advertised: bool,
 ) -> DirectoryMirrorRecoveryCarrierSelection {
+    directory_mirror_recovery_carriers_with_policy(
+        peer_store,
+        capability_cache,
+        producer,
+        requester,
+        now,
+        require_explicitly_advertised,
+        None,
+    )
+}
+
+fn directory_observation_witness_recovery_carriers(
+    peer_store: &PeerStore,
+    capability_cache: &DirectoryMirrorCarrierCapabilityCache,
+    witness: &[u8; 32],
+    requester: &[u8; 32],
+    eligible_carriers: &[[u8; 32]],
+    now: u64,
+) -> DirectoryMirrorRecoveryCarrierSelection {
+    directory_mirror_recovery_carriers_with_policy(
+        peer_store,
+        capability_cache,
+        witness,
+        requester,
+        now,
+        true,
+        Some(eligible_carriers),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn directory_mirror_recovery_carriers_with_policy(
+    peer_store: &PeerStore,
+    capability_cache: &DirectoryMirrorCarrierCapabilityCache,
+    producer: &[u8; 32],
+    requester: &[u8; 32],
+    now: u64,
+    require_explicitly_advertised: bool,
+    eligible_carriers: Option<&[[u8; 32]]>,
+) -> DirectoryMirrorRecoveryCarrierSelection {
     let mut descriptors = peer_store
         .valid_public_descriptors(now, usize::MAX)
         .into_iter()
@@ -3106,6 +3505,8 @@ fn directory_mirror_recovery_carriers_with_requirement(
             let node_id = descriptor.node_id();
             node_id != *producer
                 && node_id != *requester
+                && eligible_carriers
+                    .is_none_or(|eligible| eligible.iter().any(|candidate| *candidate == node_id))
                 && !peer_store.is_route_quarantined_now(&node_id, now)
                 && descriptor.descriptor.policy.public_discovery
                 && descriptor
@@ -3522,6 +3923,40 @@ fn directory_mirror_recovery_carrier_urls(
     )
     .map_err(|_| "directory_mirror_recovery_carrier_invalid_endpoint".to_string())?;
     Ok((range_url, object_url))
+}
+
+fn directory_observation_witness_carrier_url(
+    peer_store: &PeerStore,
+    carrier: &DirectoryMirrorRecoveryCarrier,
+    request_timestamp: u64,
+) -> Result<reqwest::Url, String> {
+    let descriptor = peer_store
+        .get_valid(&carrier.node_id, request_timestamp)
+        .ok_or_else(|| "directory_witness_carrier_unavailable".to_string())?;
+    if descriptor.sequence() != carrier.descriptor_sequence {
+        return Err("directory_witness_carrier_descriptor_changed".to_string());
+    }
+    if !descriptor.descriptor.policy.public_discovery
+        || !descriptor
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::DirectoryMirrorCarrier)
+    {
+        return Err("directory_witness_carrier_not_advertised".to_string());
+    }
+    let endpoint = descriptor
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "directory_witness_carrier_missing_endpoint".to_string())?;
+    if !commitment_peer_endpoint_is_public(endpoint) {
+        return Err("directory_witness_carrier_unsafe_endpoint".to_string());
+    }
+    commitment_peer_url(
+        endpoint,
+        "/api/discovery/peer/directory/observation-checkpoint-witness-carrier",
+    )
+    .map_err(|_| "directory_witness_carrier_invalid_endpoint".to_string())
 }
 
 async fn request_directory_block_page(
@@ -3988,6 +4423,21 @@ async fn post_directory_frame_typed(
     url: reqwest::Url,
     frame: Vec<u8>,
 ) -> Result<Vec<u8>, DirectoryFramePostError> {
+    post_directory_frame_typed_with_response_limit(
+        client,
+        url,
+        frame,
+        MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES,
+    )
+    .await
+}
+
+async fn post_directory_frame_typed_with_response_limit(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    frame: Vec<u8>,
+    response_body_limit: usize,
+) -> Result<Vec<u8>, DirectoryFramePostError> {
     let response = client
         .post(url)
         .header("content-type", "application/octet-stream")
@@ -4007,7 +4457,7 @@ async fn post_directory_frame_typed(
             .and_then(|body| DirectoryPeerErrorCode::parse(&body));
         return Err(DirectoryFramePostError::HttpStatus { status, peer_code });
     }
-    read_bounded_http_response(response, MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES)
+    read_bounded_http_response(response, response_body_limit)
         .await
         .map_err(DirectoryFramePostError::Response)
 }
@@ -4966,6 +5416,64 @@ mod tests {
     }
 
     #[test]
+    fn witness_recovery_selects_only_operator_pinned_explicit_carriers() {
+        let now = unix_now_secs();
+        let observer = IdentityKeyPair::from_bytes(&[0xb1; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0xb2; 32]).unwrap();
+        let pinned_carrier = IdentityKeyPair::from_bytes(&[0xb3; 32]).unwrap();
+        let public_outsider = IdentityKeyPair::from_bytes(&[0xb4; 32]).unwrap();
+        let store = PeerStore::new();
+        let capability_cache = DirectoryMirrorCarrierCapabilityCache::default();
+        for (identity, endpoint) in [
+            (&pinned_carrier, "http://8.8.8.179:8422"),
+            (&public_outsider, "http://8.8.8.180:8422"),
+        ] {
+            let mut descriptor = aeronyx_core::protocol::discovery::NodeDescriptor::new(
+                identity.public_key_bytes(),
+                1,
+                now.saturating_sub(1),
+                now + 600,
+                "witness-carrier-selection-test",
+            );
+            descriptor.policy.public_discovery = true;
+            descriptor.public_endpoint = Some(endpoint.to_string());
+            descriptor
+                .capabilities
+                .push(NodeCapability::DirectoryMirrorCarrier);
+            store
+                .upsert_verified_from_source(
+                    SignedNodeDescriptor::sign(descriptor, identity).unwrap(),
+                    now,
+                    "witness_carrier_selection_test",
+                )
+                .unwrap();
+            store.record_route_forward_success(&identity.public_key_bytes(), now);
+        }
+        let eligible = [
+            witness.public_key_bytes(),
+            pinned_carrier.public_key_bytes(),
+        ];
+        let selection = directory_observation_witness_recovery_carriers(
+            &store,
+            &capability_cache,
+            &witness.public_key_bytes(),
+            &observer.public_key_bytes(),
+            &eligible,
+            now,
+        );
+        assert_eq!(selection.candidate_count, 1);
+        assert_eq!(selection.carriers.len(), 1);
+        assert_eq!(
+            selection.carriers[0].node_id,
+            pinned_carrier.public_key_bytes()
+        );
+        assert_ne!(
+            selection.carriers[0].node_id,
+            public_outsider.public_key_bytes()
+        );
+    }
+
+    #[test]
     fn mirror_recovery_selection_skips_only_the_cached_descriptor_sequence() {
         let now = unix_now_secs();
         let producer = IdentityKeyPair::from_bytes(&[0xc1; 32]).unwrap();
@@ -5444,6 +5952,195 @@ mod tests {
             &checkpoint_hash,
         )
         .is_err());
+    }
+
+    #[test]
+    fn witness_carrier_response_binds_exact_transport_and_inner_frame() {
+        let observer = IdentityKeyPair::from_bytes(&[0x81; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0x82; 32]).unwrap();
+        let carrier = IdentityKeyPair::from_bytes(&[0x83; 32]).unwrap();
+        let other_carrier = IdentityKeyPair::from_bytes(&[0x84; 32]).unwrap();
+        let request_id = [0x85; 16];
+        let witness_request_sha256 = [0x86; 32];
+        let witness_response_frame = vec![0x87; 96];
+        let witness_response_sha256: [u8; 32] = Sha256::digest(&witness_response_frame).into();
+        let now = unix_now_secs();
+        let signing_bytes = directory_observation_witness_carrier_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            &carrier.public_key_bytes(),
+            now,
+            &witness_request_sha256,
+            &witness_response_sha256,
+            u64::try_from(witness_response_frame.len()).unwrap(),
+        );
+        let response = DirectorySyncMessage::ObservationCheckpointWitnessCarrierResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            requester: observer.public_key_bytes(),
+            witness: witness.public_key_bytes(),
+            carrier: carrier.public_key_bytes(),
+            response_timestamp: now,
+            witness_request_sha256,
+            witness_response_sha256,
+            witness_response_frame: witness_response_frame.clone(),
+            signature: carrier.sign(&signing_bytes),
+        };
+        let frame = encode_directory_sync_message(&response).unwrap();
+        assert_eq!(
+            verify_observation_witness_carrier_response(
+                &frame,
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                &carrier.public_key_bytes(),
+                now,
+                &witness_request_sha256,
+            )
+            .unwrap(),
+            witness_response_frame
+        );
+        assert_eq!(
+            verify_observation_witness_carrier_response(
+                &frame,
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                &other_carrier.public_key_bytes(),
+                now,
+                &witness_request_sha256,
+            )
+            .unwrap_err(),
+            "observation_witness_carrier_response_contract_mismatch"
+        );
+
+        let mut tampered = response;
+        let DirectorySyncMessage::ObservationCheckpointWitnessCarrierResponseV1 {
+            witness_response_frame,
+            ..
+        } = &mut tampered
+        else {
+            unreachable!();
+        };
+        witness_response_frame[0] ^= 1;
+        assert_eq!(
+            verify_observation_witness_carrier_response(
+                &encode_directory_sync_message(&tampered).unwrap(),
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                &carrier.public_key_bytes(),
+                now,
+                &witness_request_sha256,
+            )
+            .unwrap_err(),
+            "observation_witness_carrier_response_contract_mismatch"
+        );
+
+        let oversized_inner =
+            vec![0x88; MAX_DIRECTORY_OBSERVATION_WITNESS_CARRIER_INNER_RESPONSE_BODY_BYTES + 1];
+        let oversized_sha256: [u8; 32] = Sha256::digest(&oversized_inner).into();
+        let oversized_signing = directory_observation_witness_carrier_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            &carrier.public_key_bytes(),
+            now,
+            &witness_request_sha256,
+            &oversized_sha256,
+            u64::try_from(oversized_inner.len()).unwrap(),
+        );
+        let oversized = DirectorySyncMessage::ObservationCheckpointWitnessCarrierResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            requester: observer.public_key_bytes(),
+            witness: witness.public_key_bytes(),
+            carrier: carrier.public_key_bytes(),
+            response_timestamp: now,
+            witness_request_sha256,
+            witness_response_sha256: oversized_sha256,
+            witness_response_frame: oversized_inner,
+            signature: carrier.sign(&oversized_signing),
+        };
+        assert_eq!(
+            verify_observation_witness_carrier_response(
+                &encode_directory_sync_message(&oversized).unwrap(),
+                &request_id,
+                &observer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                &carrier.public_key_bytes(),
+                now,
+                &witness_request_sha256,
+            )
+            .unwrap_err(),
+            "observation_witness_carrier_response_contract_mismatch"
+        );
+    }
+
+    #[test]
+    fn witness_carrier_fallback_is_availability_only() {
+        for error in [
+            DirectoryFramePostError::Transport,
+            DirectoryFramePostError::HttpStatus {
+                status: 408,
+                peer_code: None,
+            },
+            DirectoryFramePostError::HttpStatus {
+                status: 503,
+                peer_code: None,
+            },
+            DirectoryFramePostError::HttpStatus {
+                status: 503,
+                peer_code: Some(DirectoryPeerErrorCode::WitnessTargetUnavailable),
+            },
+        ] {
+            assert!(observation_witness_failure_allows_carrier(error));
+        }
+        for error in [
+            DirectoryFramePostError::HttpStatus {
+                status: 403,
+                peer_code: None,
+            },
+            DirectoryFramePostError::HttpStatus {
+                status: 424,
+                peer_code: Some(DirectoryPeerErrorCode::WitnessTargetCapabilityUnavailable),
+            },
+            DirectoryFramePostError::HttpStatus {
+                status: 502,
+                peer_code: Some(DirectoryPeerErrorCode::WitnessTargetRejected),
+            },
+            DirectoryFramePostError::Response(BoundedHttpResponseError::BodyRead),
+        ] {
+            assert!(!observation_witness_failure_allows_carrier(error));
+        }
+        assert!(observation_witness_carrier_failure_allows_next(
+            DirectoryFramePostError::HttpStatus {
+                status: 403,
+                peer_code: None,
+            }
+        ));
+        assert!(!observation_witness_carrier_failure_allows_next(
+            DirectoryFramePostError::HttpStatus {
+                status: 502,
+                peer_code: Some(DirectoryPeerErrorCode::WitnessTargetRejected),
+            }
+        ));
+        assert_eq!(DIRECTORY_OBSERVATION_WITNESS_RECOVERY_MAX_CARRIERS, 2);
+    }
+
+    #[test]
+    fn witness_recovery_without_carriers_preserves_direct_transport_failure() {
+        assert_eq!(
+            observation_witness_unavailable_recovery_outcome(true),
+            DirectoryObservationWitnessOutcome::TransportFailure
+        );
+        assert_eq!(
+            observation_witness_unavailable_recovery_outcome(false),
+            DirectoryObservationWitnessOutcome::PeerUnavailable
+        );
     }
 
     #[test]

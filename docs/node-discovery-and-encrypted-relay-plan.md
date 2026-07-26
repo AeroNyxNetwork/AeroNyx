@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.32.0 - Bounded mature-witness backlog catch-up after restart.
+Modification Reason: v0.33.0 - Bounded checkpoint-witness carrier recovery.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.32.0 - [WITNESS-CATCHUP 2026-07-26 by Codex] Added bounded multi-checkpoint witness catch-up with strict forward progress, same-sequence retry suppression, and additive backlog telemetry.
+Last Modified: v0.33.0 - [WITNESS-CARRIER 2026-07-26 by Codex] Added direct-first, one-hop, bounded checkpoint-witness availability recovery through explicitly advertised operator-pinned carriers without expanding witness authority.
+Previous: v0.32.0 - [WITNESS-CATCHUP 2026-07-26 by Codex] Added bounded multi-checkpoint witness catch-up with strict forward progress, same-sequence retry suppression, and additive backlog telemetry.
 Previous: v0.31.0 - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Added a POST-only pinned-peer certificate route plus an operator pull command that separately verifies transport identity, exact frame bytes, local observer/witness pins, threshold, and checkpoint age before schema-v10 import.
 Previous: v0.30.0 - [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] Added schema v10 and a host-local import command that binds exact foreign certificate bytes and local trust policy into a node-signed, hash-linked, rollback-audited history.
 Previous: v0.29.0 - [PORTABLE-CERTIFICATE-VERIFIER 2026-07-26 by Codex] Added a fail-closed offline verifier command with exact frame SHA-256, canonical-codec, chain, time, pinned observer/witness policy, checkpoint, local threshold, and signature checks.
@@ -1359,6 +1360,69 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+<!-- [WITNESS-CARRIER 2026-07-26 by Codex] -->
+2026-07-26 - Added Bounded Observation Witness Carrier Recovery V1.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Problem solved:
+  - A pinned witness may remain healthy and independently hold all producer
+    evidence while its direct observer-to-witness route is temporarily
+    unavailable. Direct-only transport delayed otherwise valid external
+    evidence and could grow a mature checkpoint backlog after network faults.
+- Trust architecture:
+  - The observer signs one exact inner witness request.
+  - The target witness independently recomputes the checkpoint and signs the
+    exact witness response under the existing policy.
+  - A carrier verifies and forwards those exact frames once, then signs only a
+    transport envelope binding both frame digests and the exact identities.
+  - The carrier cannot create, replace, approve, aggregate, or finalize witness
+    evidence. Only the configured target witness signature can satisfy policy.
+- Admission and bounds:
+  - Direct witness transport always runs first.
+  - Fallback is permitted only after endpoint absence or bounded availability
+    failure, never after contract, canonical-codec, signature, or target
+    rejection failures.
+  - The observer selects at most two carriers that are both local operator pins
+    and current signed descriptors explicitly advertising
+    `DirectoryMirrorCarrier`.
+  - The carrier accepts only pinned requesters and pinned target witnesses,
+    resolves the target by node identity from the validated Peer Store, allows
+    only public IP literals, disables environment proxies and redirects, caps
+    the inner response at 16 KiB, uses a 10-second deadline, and never recurses.
+  - The observer applies a separate 32 KiB ceiling to the complete signed
+    carrier envelope instead of the general 512 KiB Directory page ceiling.
+  - Each carrier attempt uses a fresh inner request id so a lost direct response
+    cannot turn the witness replay guard into a false protocol failure.
+- Failure semantics:
+  - Carrier admission or availability failure may try the next bounded carrier.
+  - If direct transport failed and no carrier is eligible, the existing
+    `transport_failure` outcome is preserved rather than relabeled unavailable.
+  - Target capability absence is counted as capability unavailable, exhausts
+    that recovery without trying equivalent routes, and remains peer unavailable.
+  - Target rejection, invalid target response, wrong binding, noncanonical
+    frame, digest mismatch, or signature failure stops closed immediately.
+  - The existing exact witness receipt persistence and restart audit remain the
+    only durable evidence path.
+- Observability and privacy:
+  - Status adds process-only aggregate selections, candidates, attempts,
+    successes, capability misses, transport failures, exhaustion, and
+    fail-closed counts.
+  - No carrier identity, witness identity, endpoint, route, request id,
+    checkpoint hash, frame, signature, client metadata, or user-plane content
+    is retained or exposed.
+  - Recovery counters are transport diagnostics, never peer reputation, votes,
+    quorum, consensus, fork choice, governance, or finality.
+- Compatibility:
+  - New bincode variants are appended, preserving every existing discriminant.
+  - Unsupported carrier routes are cached only for the exact signed descriptor
+    sequence and are probed again after the peer publishes a newer descriptor.
+  - Direct witness behavior and all existing status fields remain compatible.
+
 <!-- [WITNESS-CATCHUP 2026-07-26 by Codex] -->
 2026-07-26 - Added Bounded Observation Witness Catch-up.
 - Production evidence:
