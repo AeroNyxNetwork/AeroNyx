@@ -212,6 +212,15 @@ pub const DIRECTORY_OBSERVATION_CERTIFICATE_MAGIC: u8 = 0xc7;
 /// without allowing attacker-controlled allocations.
 const MAX_DIRECTORY_OBSERVATION_CERTIFICATE_BYTES: u64 = 64 * 1024;
 
+/// Maximum complete portable observation-certificate frame size.
+///
+/// [PORTABLE-CERTIFICATE-VERIFIER 2026-07-26 by Codex] File, stdin, and
+/// transport adapters must enforce this bound before allocating or decoding.
+/// Keeping the complete-frame limit beside the canonical codec prevents each
+/// adapter from inventing a subtly different allocation policy.
+pub const MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES: usize =
+    MAX_DIRECTORY_OBSERVATION_CERTIFICATE_BYTES as usize + 1;
+
 // ============================================
 // Serde helper for [u8; 64]
 // ============================================

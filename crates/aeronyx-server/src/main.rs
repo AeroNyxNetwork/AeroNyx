@@ -19,6 +19,8 @@
 //!   verification command for framing, semantic, Merkle, and ancestry checks.
 //! - v1.4.0-DirectoryCarrierSmoke: add a bounded local API client that proves
 //!   explicit signed mirror-carrier recovery without importing evidence.
+//! - v1.5.0-PortableObservationCertificateVerifier: add a bounded offline
+//!   verifier for exact Directory observation-certificate frames.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -31,17 +33,26 @@
 //! quarantine inspection and resolution without exposing a mutation API
 //! v1.3.0-AofIntegrityCommand - Add aggregate-only `memchain verify-aof`
 //! v1.4.0-DirectoryCarrierSmoke - Add read-only `directory-replica carrier-smoke`
+//! v1.5.0-PortableObservationCertificateVerifier - Add fail-closed offline
+//! certificate verification with exact frame SHA-256 binding
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aeronyx_core::crypto::IdentityKeyPair;
+use aeronyx_core::protocol::discovery::{
+    decode_directory_observation_certificate, encode_directory_observation_certificate,
+    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES,
+};
 use aeronyx_server::api::auth::ensure_api_secret;
 use aeronyx_server::management::models::StoredNodeInfo;
 use aeronyx_server::services::{
@@ -137,6 +148,33 @@ enum MemchainCommands {
 
 #[derive(Subcommand, Debug)]
 enum DirectoryReplicaCommands {
+    /// Verify one exact portable observation certificate without network access
+    VerifyObservationCertificate {
+        /// Path to the canonical binary certificate frame
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Expected SHA-256 of the exact binary frame
+        #[arg(long)]
+        expected_sha256: String,
+
+        /// Trusted observer node identity (64 hexadecimal characters)
+        #[arg(long)]
+        expected_observer: String,
+
+        /// Trusted witness node identity; repeat for every allowed witness
+        #[arg(long = "allowed-witness", required = true)]
+        allowed_witnesses: Vec<String>,
+
+        /// Locally required count of distinct trusted witness receipts
+        #[arg(long)]
+        minimum_witnesses: u16,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Verify one explicit signed mirror carrier without importing evidence
     CarrierSmoke {
         /// Path to the running node configuration file
@@ -631,6 +669,21 @@ async fn cmd_pubkey(config_path: PathBuf, format: String) -> anyhow::Result<()> 
 /// Runs privileged Directory Replica operations without a network endpoint.
 async fn cmd_directory_replica(command: DirectoryReplicaCommands) -> anyhow::Result<()> {
     match command {
+        DirectoryReplicaCommands::VerifyObservationCertificate {
+            input,
+            expected_sha256,
+            expected_observer,
+            allowed_witnesses,
+            minimum_witnesses,
+            json,
+        } => cmd_directory_replica_verify_observation_certificate(
+            &input,
+            &expected_sha256,
+            &expected_observer,
+            &allowed_witnesses,
+            minimum_witnesses,
+            json,
+        ),
         DirectoryReplicaCommands::CarrierSmoke { config, json } => {
             cmd_directory_replica_carrier_smoke(&config, json).await
         }
@@ -662,6 +715,282 @@ async fn cmd_directory_replica(command: DirectoryReplicaCommands) -> anyhow::Res
             cmd_directory_replica_resolve(&config, &request).await
         }
     }
+}
+
+/// Stable aggregate output from the offline certificate verifier.
+///
+/// Full observer and witness public keys remain inside the caller-supplied
+/// certificate frame. The CLI emits only a short observer fingerprint because
+/// operators need useful provenance without casually copying the complete
+/// witness set into logs or automation output.
+#[derive(Debug, serde::Serialize)]
+struct DirectoryObservationCertificateVerificationReport {
+    contract_version: &'static str,
+    status: &'static str,
+    protocol_version: u16,
+    chain_id: String,
+    certificate_id: String,
+    certificate_sha256: String,
+    frame_bytes: usize,
+    checkpoint_sequence: u64,
+    checkpoint_hash: String,
+    checkpoint_observed_at: u64,
+    checkpoint_age_seconds: u64,
+    observer_fingerprint: String,
+    trust_policy_status: &'static str,
+    policy_minimum_witnesses: u16,
+    policy_allowed_witnesses: usize,
+    certificate_minimum_witnesses: u16,
+    witness_receipts: usize,
+    verified_at: u64,
+    security_model: &'static str,
+    privacy_boundary: &'static str,
+}
+
+/// Operator-owned trust policy applied after self-contained signature checks.
+///
+/// Certificate identities are not trust anchors merely because their
+/// signatures are valid. This explicit policy is reusable by a future durable
+/// certificate mirror or gossip importer without trusting a certificate's
+/// self-declared witness threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryObservationCertificateTrustPolicy {
+    expected_observer: [u8; 32],
+    allowed_witnesses: Vec<[u8; 32]>,
+    minimum_witnesses: u16,
+}
+
+impl DirectoryObservationCertificateTrustPolicy {
+    fn parse(
+        expected_observer_hex: &str,
+        allowed_witness_hex: &[String],
+        minimum_witnesses: u16,
+    ) -> anyhow::Result<Self> {
+        let expected_observer = parse_hex32(expected_observer_hex, "expected observer identity")?;
+        anyhow::ensure!(
+            expected_observer != [0u8; 32],
+            "expected observer identity cannot be zero"
+        );
+        anyhow::ensure!(
+            !allowed_witness_hex.is_empty()
+                && allowed_witness_hex.len()
+                    <= aeronyx_core::protocol::discovery::MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1,
+            "allowed witness set must contain between 1 and {} identities",
+            aeronyx_core::protocol::discovery::MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1
+        );
+
+        let mut allowed_witnesses = allowed_witness_hex
+            .iter()
+            .map(|value| parse_hex32(value, "allowed witness identity"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            allowed_witnesses
+                .iter()
+                .all(|identity| { *identity != [0u8; 32] && *identity != expected_observer }),
+            "allowed witnesses must be non-zero and distinct from the observer"
+        );
+        allowed_witnesses.sort_unstable();
+        anyhow::ensure!(
+            !allowed_witnesses
+                .windows(2)
+                .any(|identities| identities[0] == identities[1]),
+            "allowed witness set contains a duplicate identity"
+        );
+        anyhow::ensure!(
+            minimum_witnesses > 0 && usize::from(minimum_witnesses) <= allowed_witnesses.len(),
+            "minimum witnesses must be between 1 and the allowed witness count"
+        );
+        Ok(Self {
+            expected_observer,
+            allowed_witnesses,
+            minimum_witnesses,
+        })
+    }
+
+    fn verify(
+        &self,
+        certificate: &aeronyx_core::protocol::discovery::DirectoryObservationCertificateV1,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            certificate.checkpoint.observer == self.expected_observer,
+            "observation certificate observer does not match the pinned observer"
+        );
+        anyhow::ensure!(
+            certificate.receipts.iter().all(|receipt| self
+                .allowed_witnesses
+                .binary_search(&receipt.responder)
+                .is_ok()),
+            "observation certificate contains a witness outside the allowed set"
+        );
+        anyhow::ensure!(
+            certificate.receipts.len() >= usize::from(self.minimum_witnesses),
+            "observation certificate does not satisfy the local witness threshold"
+        );
+        Ok(())
+    }
+}
+
+/// Verifies one exact portable observation-certificate frame offline.
+///
+/// [PORTABLE-CERTIFICATE-VERIFIER 2026-07-26 by Codex] The external frame
+/// digest is checked before decoding. The canonical re-encoding check then
+/// ensures that every accepted byte sequence has one stable representation
+/// before observer and witness signatures are trusted.
+fn cmd_directory_replica_verify_observation_certificate(
+    input_path: &Path,
+    expected_sha256_hex: &str,
+    expected_observer_hex: &str,
+    allowed_witness_hex: &[String],
+    minimum_witnesses: u16,
+    emit_json: bool,
+) -> anyhow::Result<()> {
+    let expected_sha256 = parse_hex32(expected_sha256_hex, "certificate SHA-256")?;
+    let trust_policy = DirectoryObservationCertificateTrustPolicy::parse(
+        expected_observer_hex,
+        allowed_witness_hex,
+        minimum_witnesses,
+    )?;
+    let frame = read_bounded_observation_certificate_frame(input_path)?;
+    let verified_at = unix_timestamp_now()?;
+    let report = verify_directory_observation_certificate_frame(
+        &frame,
+        &expected_sha256,
+        &trust_policy,
+        verified_at,
+    )?;
+
+    if emit_json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("AeroNyx Directory observation certificate");
+        println!("  status: {}", report.status);
+        println!("  certificate_id: {}", report.certificate_id);
+        println!("  certificate_sha256: {}", report.certificate_sha256);
+        println!("  frame_bytes: {}", report.frame_bytes);
+        println!("  checkpoint_sequence: {}", report.checkpoint_sequence);
+        println!("  checkpoint_hash: {}", report.checkpoint_hash);
+        println!(
+            "  checkpoint_observed_at: {}",
+            report.checkpoint_observed_at
+        );
+        println!(
+            "  checkpoint_age_seconds: {}",
+            report.checkpoint_age_seconds
+        );
+        println!("  observer_fingerprint: {}", report.observer_fingerprint);
+        println!(
+            "  trusted_witnesses: {}/{} required ({} allowed)",
+            report.witness_receipts,
+            report.policy_minimum_witnesses,
+            report.policy_allowed_witnesses
+        );
+        println!("  trust_policy: {}", report.trust_policy_status);
+        println!("  security_model: {}", report.security_model);
+        println!("  privacy: {}", report.privacy_boundary);
+    }
+    Ok(())
+}
+
+/// Reads a certificate through the protocol-owned complete-frame bound.
+fn read_bounded_observation_certificate_frame(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut file = File::open(path)
+        .with_context(|| format!("open observation certificate {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect observation certificate {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "observation certificate input must be a regular file"
+    );
+
+    let maximum = u64::try_from(MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES)
+        .context("certificate frame bound does not fit u64")?;
+    anyhow::ensure!(
+        metadata.len() <= maximum,
+        "observation certificate frame exceeds {} bytes",
+        MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES
+    );
+
+    let read_limit = maximum.saturating_add(1);
+    let initial_capacity =
+        usize::try_from(metadata.len()).context("certificate frame length does not fit usize")?;
+    let mut frame = Vec::with_capacity(initial_capacity);
+    file.by_ref()
+        .take(read_limit)
+        .read_to_end(&mut frame)
+        .with_context(|| format!("read observation certificate {}", path.display()))?;
+    anyhow::ensure!(!frame.is_empty(), "observation certificate frame is empty");
+    anyhow::ensure!(
+        frame.len() <= MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES,
+        "observation certificate changed while reading or exceeds {} bytes",
+        MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES
+    );
+    Ok(frame)
+}
+
+/// Applies exact-frame, canonical-codec, chain, time, and signature checks.
+fn verify_directory_observation_certificate_frame(
+    frame: &[u8],
+    expected_sha256: &[u8; 32],
+    trust_policy: &DirectoryObservationCertificateTrustPolicy,
+    verified_at: u64,
+) -> anyhow::Result<DirectoryObservationCertificateVerificationReport> {
+    anyhow::ensure!(verified_at > 0, "verification time must be positive");
+    anyhow::ensure!(
+        !frame.is_empty() && frame.len() <= MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES,
+        "observation certificate frame size is outside the protocol bound"
+    );
+
+    let frame_sha256: [u8; 32] = Sha256::digest(frame).into();
+    anyhow::ensure!(
+        &frame_sha256 == expected_sha256,
+        "observation certificate frame SHA-256 mismatch"
+    );
+
+    let certificate = decode_directory_observation_certificate(frame)
+        .context("decode canonical observation certificate")?;
+    let canonical_frame = encode_directory_observation_certificate(&certificate)
+        .context("re-encode canonical observation certificate")?;
+    anyhow::ensure!(
+        canonical_frame == frame,
+        "observation certificate frame is not canonically encoded"
+    );
+    certificate
+        .verify_at(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID, verified_at)
+        .context("verify observation certificate signatures and bindings")?;
+    trust_policy.verify(&certificate)?;
+
+    let checkpoint_hash = certificate.checkpoint.hash();
+    let certificate_id = certificate.hash();
+    Ok(DirectoryObservationCertificateVerificationReport {
+        contract_version: "directory_observation_certificate_verification.v1",
+        status: "verified",
+        protocol_version: certificate.protocol_version,
+        chain_id: hex::encode(certificate.chain_id),
+        certificate_id: hex::encode(certificate_id),
+        certificate_sha256: hex::encode(frame_sha256),
+        frame_bytes: frame.len(),
+        checkpoint_sequence: certificate.checkpoint.sequence,
+        checkpoint_hash: hex::encode(checkpoint_hash),
+        checkpoint_observed_at: certificate.checkpoint.observed_at,
+        checkpoint_age_seconds: verified_at.saturating_sub(certificate.checkpoint.observed_at),
+        observer_fingerprint: hex::encode(&certificate.checkpoint.observer[..6]),
+        trust_policy_status: "matched",
+        policy_minimum_witnesses: trust_policy.minimum_witnesses,
+        policy_allowed_witnesses: trust_policy.allowed_witnesses.len(),
+        certificate_minimum_witnesses: certificate.minimum_witnesses,
+        witness_receipts: certificate.receipts.len(),
+        verified_at,
+        security_model: "pinned observer plus locally pinned witness policy over independent signatures; no validator set, voting weight, fork choice, consensus, global finality, transaction inclusion, or proof of user content",
+        privacy_boundary: "aggregate directory observation evidence only; no endpoints, routes, client IPs, message ids, payloads, ciphertext, memory records, DNS contents, destinations, private keys, wallet traffic, or social graph metadata",
+    })
+}
+
+fn unix_timestamp_now() -> anyhow::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")
+        .map(|duration| duration.as_secs())
 }
 
 /// Calls the running node's local-only read-only carrier verification route.
@@ -1135,6 +1464,225 @@ struct KeyFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeronyx_core::protocol::discovery::{
+        directory_observation_witness_response_signing_bytes, DirectoryObservationCertificateV1,
+        DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
+        DirectoryObservationWitnessReceiptV1, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+    };
+
+    fn portable_observation_certificate_fixture() -> (Vec<u8>, [u8; 32], [u8; 32], Vec<[u8; 32]>) {
+        let observer = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x32; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x33; 32]).unwrap();
+        let witness_a = IdentityKeyPair::from_bytes(&[0x34; 32]).unwrap();
+        let witness_b = IdentityKeyPair::from_bytes(&[0x35; 32]).unwrap();
+        let checkpoint = DirectoryObservationCheckpointV1::new_signed(
+            7,
+            1_700_000_700,
+            [0x36; 32],
+            2,
+            vec![
+                DirectoryObservationTipV1 {
+                    producer: producer_a.public_key_bytes(),
+                    tip_height: 41,
+                    tip_hash: [0x37; 32],
+                },
+                DirectoryObservationTipV1 {
+                    producer: producer_b.public_key_bytes(),
+                    tip_height: 42,
+                    tip_hash: [0x38; 32],
+                },
+            ],
+            [0x39; 32],
+            &observer,
+        )
+        .unwrap();
+
+        let receipt = |witness: &IdentityKeyPair, request_id: [u8; 16], response_timestamp: u64| {
+            let checkpoint_hash = checkpoint.hash();
+            let signing_bytes = directory_observation_witness_response_signing_bytes(
+                &checkpoint.chain_id,
+                &request_id,
+                &checkpoint.observer,
+                checkpoint.sequence,
+                &checkpoint_hash,
+                &witness.public_key_bytes(),
+                response_timestamp,
+                DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+            );
+            DirectoryObservationWitnessReceiptV1 {
+                chain_id: checkpoint.chain_id,
+                request_id,
+                observer: checkpoint.observer,
+                checkpoint_sequence: checkpoint.sequence,
+                checkpoint_hash,
+                responder: witness.public_key_bytes(),
+                response_timestamp,
+                outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+                signature: witness.sign(&signing_bytes),
+            }
+        };
+        let receipt_b = receipt(&witness_b, [0x3a; 16], 1_700_000_702);
+        let receipt_a = receipt(&witness_a, [0x3b; 16], 1_700_000_701);
+        let certificate = DirectoryObservationCertificateV1::new_verified(
+            checkpoint,
+            2,
+            vec![receipt_b, receipt_a],
+            1_700_000_702,
+        )
+        .unwrap();
+        let frame = encode_directory_observation_certificate(&certificate).unwrap();
+        let frame_sha256 = Sha256::digest(&frame).into();
+        (
+            frame,
+            frame_sha256,
+            observer.public_key_bytes(),
+            vec![witness_a.public_key_bytes(), witness_b.public_key_bytes()],
+        )
+    }
+
+    #[test]
+    fn directory_observation_certificate_verifier_cli_requires_explicit_trust_policy() {
+        let expected_sha256 = "a5".repeat(32);
+        let expected_observer = "b6".repeat(32);
+        let witness_a = "c7".repeat(32);
+        let witness_b = "d8".repeat(32);
+        let cli = Cli::try_parse_from([
+            "aeronyx-server",
+            "directory-replica",
+            "verify-observation-certificate",
+            "--input",
+            "/tmp/observation.certificate",
+            "--expected-sha256",
+            &expected_sha256,
+            "--expected-observer",
+            &expected_observer,
+            "--allowed-witness",
+            &witness_a,
+            "--allowed-witness",
+            &witness_b,
+            "--minimum-witnesses",
+            "2",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::DirectoryReplica(DirectoryReplicaCommands::VerifyObservationCertificate {
+            input,
+            expected_sha256: parsed_sha256,
+            expected_observer: parsed_observer,
+            allowed_witnesses,
+            minimum_witnesses,
+            json,
+        }) = cli.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(input, PathBuf::from("/tmp/observation.certificate"));
+        assert_eq!(parsed_sha256, expected_sha256);
+        assert_eq!(parsed_observer, expected_observer);
+        assert_eq!(allowed_witnesses, vec![witness_a, witness_b]);
+        assert_eq!(minimum_witnesses, 2);
+        assert!(json);
+    }
+
+    #[test]
+    fn directory_observation_certificate_verifier_is_bounded_and_fail_closed() {
+        // [PORTABLE-CERTIFICATE-VERIFIER 2026-07-26 by Codex] The server-side
+        // adapter must preserve the core verifier's canonical and signature
+        // checks rather than treating a matching transport digest as trust.
+        let (frame, frame_sha256, observer, witnesses) = portable_observation_certificate_fixture();
+        let allowed_witness_hex = witnesses.iter().map(hex::encode).collect::<Vec<_>>();
+        let trust_policy = DirectoryObservationCertificateTrustPolicy::parse(
+            &hex::encode(observer),
+            &allowed_witness_hex,
+            2,
+        )
+        .unwrap();
+        let report = verify_directory_observation_certificate_frame(
+            &frame,
+            &frame_sha256,
+            &trust_policy,
+            1_700_000_702,
+        )
+        .unwrap();
+        assert_eq!(report.status, "verified");
+        assert_eq!(report.checkpoint_sequence, 7);
+        assert_eq!(report.trust_policy_status, "matched");
+        assert_eq!(report.policy_minimum_witnesses, 2);
+        assert_eq!(report.policy_allowed_witnesses, 2);
+        assert_eq!(report.certificate_minimum_witnesses, 2);
+        assert_eq!(report.witness_receipts, 2);
+        assert_eq!(report.frame_bytes, frame.len());
+        assert_eq!(report.observer_fingerprint.len(), 12);
+
+        let mut wrong_sha256 = frame_sha256;
+        wrong_sha256[0] ^= 0x80;
+        assert!(verify_directory_observation_certificate_frame(
+            &frame,
+            &wrong_sha256,
+            &trust_policy,
+            1_700_000_702,
+        )
+        .is_err());
+
+        let mut tampered = frame.clone();
+        let final_byte = tampered.last_mut().unwrap();
+        *final_byte ^= 0x01;
+        let tampered_sha256 = Sha256::digest(&tampered).into();
+        assert!(verify_directory_observation_certificate_frame(
+            &tampered,
+            &tampered_sha256,
+            &trust_policy,
+            1_700_000_702,
+        )
+        .is_err());
+
+        let oversized =
+            vec![0u8; MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES.saturating_add(1)];
+        let oversized_sha256 = Sha256::digest(&oversized).into();
+        assert!(verify_directory_observation_certificate_frame(
+            &oversized,
+            &oversized_sha256,
+            &trust_policy,
+            1_700_000_702,
+        )
+        .is_err());
+
+        let wrong_observer_policy = DirectoryObservationCertificateTrustPolicy::parse(
+            &"e9".repeat(32),
+            &allowed_witness_hex,
+            2,
+        )
+        .unwrap();
+        assert!(verify_directory_observation_certificate_frame(
+            &frame,
+            &frame_sha256,
+            &wrong_observer_policy,
+            1_700_000_702,
+        )
+        .is_err());
+
+        let untrusted_witness_hex = vec![hex::encode(witnesses[0]), "ea".repeat(32)];
+        let untrusted_witness_policy = DirectoryObservationCertificateTrustPolicy::parse(
+            &hex::encode(observer),
+            &untrusted_witness_hex,
+            1,
+        )
+        .unwrap();
+        assert!(verify_directory_observation_certificate_frame(
+            &frame,
+            &frame_sha256,
+            &untrusted_witness_policy,
+            1_700_000_702,
+        )
+        .is_err());
+        assert!(DirectoryObservationCertificateTrustPolicy::parse(
+            &hex::encode(observer),
+            &[hex::encode(witnesses[0]), hex::encode(witnesses[0])],
+            1,
+        )
+        .is_err());
+    }
 
     #[test]
     fn directory_replica_resolution_cli_requires_explicit_cas_fields() {

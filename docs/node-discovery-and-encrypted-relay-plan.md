@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.28.0 - Portable, bounded, offline-verifiable Directory observation certificates.
+Modification Reason: v0.29.0 - Rust-native, bounded, trust-policy-pinned offline verification of exact portable Directory observation-certificate frames.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.28.0 - [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] Added operator-only export of one observer-signed checkpoint plus independently signed current-pin witness receipts.
+Last Modified: v0.29.0 - [PORTABLE-CERTIFICATE-VERIFIER 2026-07-26 by Codex] Added a fail-closed offline verifier command with exact frame SHA-256, canonical-codec, chain, time, pinned observer/witness policy, checkpoint, local threshold, and signature checks.
+Previous: v0.28.0 - [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] Added operator-only export of one observer-signed checkpoint plus independently signed current-pin witness receipts.
 Previous: v0.27.0 - Distinguished mirror convergence from bounded catch-up progress and terminal failure.
 Previous: v0.26.0 - Added capacity-bounded public mirrors that cannot affect checkpoint, witness, or policy authority.
 Previous: v0.25.0 - Added monotonic external policy-head anchors without exporting witness membership or claiming consensus.
@@ -1144,6 +1145,45 @@ Implemented in Portable Observation Certificate V1:
   V1 contract, and call `verify_at` with the production chain id and its own
   current time. Merely decoding or seeing `status=verified` is not a trust
   decision.
+- `aeronyx-server directory-replica verify-observation-certificate` provides
+  that exact offline path in the Rust node binary. It requires the canonical
+  binary frame and the expected SHA-256 published by the transport that
+  supplied it:
+
+  ```bash
+  aeronyx-server directory-replica verify-observation-certificate \
+    --input /var/lib/aeronyx/evidence/observation-certificate.bin \
+    --expected-sha256 <64-lower-or-upper-case-hex-characters> \
+    --expected-observer <trusted-observer-node-id-hex> \
+    --allowed-witness <trusted-witness-a-node-id-hex> \
+    --allowed-witness <trusted-witness-b-node-id-hex> \
+    --minimum-witnesses 2 \
+    --json
+  ```
+
+- The command opens one regular file, enforces the protocol-owned 64 KiB plus
+  magic-byte complete-frame bound before and during the read, checks the exact
+  SHA-256 before decoding, rejects non-canonical re-encoding, uses the
+  production chain id and the verifier's current clock, and verifies the
+  observer checkpoint plus every witness receipt.
+- Cryptographic validity is not treated as identity trust. The command also
+  requires one independently pinned observer, a repeatable 1-16 member witness
+  allowlist, and the verifier's own minimum witness threshold. It rejects an
+  otherwise valid certificate if the observer differs, any included witness
+  falls outside the allowlist, the allowlist is ambiguous, or the local
+  threshold is not met. The certificate's self-declared threshold is reported
+  but never substitutes for the verifier's local policy.
+- Stable JSON output contains only aggregate verification metadata, hashes,
+  checkpoint sequence/time/age, a 12-character observer fingerprint, local
+  trust-policy status, and witness count/threshold. Complete observer and
+  witness identities remain in the
+  caller-supplied certificate because offline Ed25519 verification requires
+  them; the command does not duplicate those identities into logs.
+- A valid command result proves only that the included independent signatures
+  bind one exact observation checkpoint under the certificate's stated
+  threshold. The operator still decides whether the observer and witness set
+  belong to its trust policy. The result is not consensus, finality, fork
+  choice, transaction inclusion, or proof of user content.
 - No SQLite migration or existing Directory Sync frame changed. Nodes without
   this export continue their existing sync, witness, mirror, and recovery paths.
 
