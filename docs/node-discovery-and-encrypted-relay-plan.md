@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.33.0 - Bounded checkpoint-witness carrier recovery.
+Modification Reason: v0.34.0 - Live three-node checkpoint-witness carrier validation.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.33.0 - [WITNESS-CARRIER 2026-07-26 by Codex] Added direct-first, one-hop, bounded checkpoint-witness availability recovery through explicitly advertised operator-pinned carriers without expanding witness authority.
+Last Modified: v0.34.0 - [WITNESS-CARRIER-LIVE 2026-07-27 by Codex] Proved the bounded checkpoint-witness carrier path across three audited live nodes, including automatic direct-path restoration and privacy-safe runtime evidence.
+Previous: v0.33.0 - [WITNESS-CARRIER 2026-07-26 by Codex] Added direct-first, one-hop, bounded checkpoint-witness availability recovery through explicitly advertised operator-pinned carriers without expanding witness authority.
 Previous: v0.32.0 - [WITNESS-CATCHUP 2026-07-26 by Codex] Added bounded multi-checkpoint witness catch-up with strict forward progress, same-sequence retry suppression, and additive backlog telemetry.
 Previous: v0.31.0 - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Added a POST-only pinned-peer certificate route plus an operator pull command that separately verifies transport identity, exact frame bytes, local observer/witness pins, threshold, and checkpoint age before schema-v10 import.
 Previous: v0.30.0 - [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] Added schema v10 and a host-local import command that binds exact foreign certificate bytes and local trust policy into a node-signed, hash-linked, rollback-audited history.
@@ -1357,9 +1358,55 @@ YYYY-MM-DD - Change summary
 - Notes:
 ```
 
-Initial entry:
+Latest entry:
 
 ```text
+<!-- [WITNESS-CARRIER-LIVE 2026-07-27 by Codex] -->
+2026-07-27 - Validated Bounded Observation Witness Carrier Recovery V1 across
+three audited live nodes.
+- Deployment:
+  - The observer and one explicit `DirectoryMirrorCarrier` ran the same
+    `main` commit while the target witness intentionally remained on the
+    compatible prior release.
+  - Both upgraded nodes passed rollback-protected release deployment, local
+    health, zero-active-session restart gates, Directory status, and signed
+    discovery propagation.
+  - A second carrier upgrade was deferred whenever a real privacy-network
+    session became active; no client session was interrupted for rollout.
+- Controlled fault:
+  - Before injection, the observer directly reached both pinned witnesses and
+    its signed snapshot contained four valid peers and two explicit carriers.
+  - The test rejected only observer-to-target TCP/8422 control-plane traffic.
+    Privacy transport, chat relay, user payloads, and the target service were
+    not stopped or modified.
+  - The temporary firewall rule used an exit/signal cleanup guard, was removed
+    immediately after evidence arrived, and direct target access returned 200.
+- Result:
+  - Direct witness transport failed by construction.
+  - The observer selected the only eligible non-target pinned carrier.
+  - The carrier forwarded one fresh exact observer-signed inner request and
+    returned the target witness's independently signed response.
+  - Runtime evidence reported `selections=1`, `attempts=1`, `succeeded=1`,
+    `failed_closed=0`, and no capability, transport, or exhaustion failure.
+  - The checkpoint round remained `2/2 accepted` with zero reported transport
+    failures, proving the carrier transported evidence without becoming the
+    witness authority.
+- Automatic restoration:
+  - After direct connectivity was restored, three subsequent checkpoint rounds
+    remained `2/2 accepted`.
+  - Carrier selections, attempts, and successes remained unchanged at one,
+    proving the scheduler returned to direct-first operation instead of
+    sticking to the recovery path.
+- Privacy verification:
+  - Observer, carrier, and witness journals contained no carrier-event lines
+    with payloads, request ids, signatures, endpoints, frames, checkpoint
+    hashes, node identities, public keys, or user-plane data.
+  - Public status exposed only aggregate process counters and bounded ages.
+- Security boundary:
+  - This validates authenticated availability recovery only. It does not
+    establish validator voting, witness reputation, quorum, fork choice,
+    consensus, governance, transaction inclusion, or global finality.
+
 <!-- [WITNESS-CARRIER 2026-07-26 by Codex] -->
 2026-07-26 - Added Bounded Observation Witness Carrier Recovery V1.
 - Files changed:
