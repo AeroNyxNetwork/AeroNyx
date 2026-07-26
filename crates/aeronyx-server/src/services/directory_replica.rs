@@ -58,12 +58,15 @@
 //!   the latest bounded carrier selection, never peer identities or endpoints.
 //! - Re-verifies one carrier-returned retained mirror anchor without importing
 //!   it, enabling a production smoke test with no authority or storage change.
+//! - Builds operator-scoped portable observation certificates only from the
+//!   latest fully re-verified checkpoint receipt set and current witness pins.
 //!
 //! ## Calling Relationships
 //! - `server.rs` opens this store beside `DirectoryChainStore` at startup.
 //! - `api/directory_replica_sync.rs` verifies and downloads bounded peer pages,
 //!   then calls `import_verified_page` from a blocking worker.
-//! - `api/directory_replica_status.rs` reads only low-cost audited snapshots.
+//! - `api/directory_replica_status.rs` reads low-cost audited snapshots and
+//!   requests one bounded full-audit portable certificate on operator demand.
 //! - `api/directory_chain_peer.rs` serves local history plus audited, registry-
 //!   gated replica recovery evidence; witness and policy routes remain pinned.
 //!
@@ -99,6 +102,9 @@
 //!     re-audit the complete requested producer namespace transactionally.
 //! 15. For operator carrier smoke, audit one retained local anchor, verify the
 //!     carrier frame and all producer/object evidence, then discard the page.
+//! 16. For operator certificate export, re-verify the latest receipt set,
+//!     exact checkpoint, current pins, threshold, and every signature without
+//!     mutating retained evidence.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -138,11 +144,17 @@
 //!   commitment, object, signature, linkage, index, and tip for the target.
 //! - Incident evidence export is read-only. Quarantine resolution requires a
 //!   separately authenticated, audited compare-and-swap command boundary.
+//! - [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] Certificate export
+//!   must re-verify the selected checkpoint and predecessor, receipt signatures,
+//!   current witness membership, canonical order, and threshold on every read.
+//!   It is evidence, never vote, quorum, consensus, fork choice, or finality.
 //! - Never expose [`DirectoryReplicaStore::resolve_quarantine`] through the
 //!   peer or public HTTP routers. It belongs only to the host-local CLI, whose
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.24.0-PortableObservationCertificate - Added current-pin, threshold-gated,
+//! fail-closed portable checkpoint evidence export
 //! v0.23.0-ReadOnlyCarrierSmoke - Added retained-anchor carrier verification
 //! with no replica import, authority mutation, or incident-state mutation
 //! v0.22.0-SignedMirrorCarrierTelemetry - Separated signed carrier capability
@@ -198,12 +210,13 @@ use aeronyx_core::protocol::discovery::{
     directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
     directory_replica_block_range_response_signing_bytes, encode_directory_sync_message,
     DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
-    DirectoryDescriptorCommitmentV1, DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
-    DirectorySyncMessage, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
-    DIRECTORY_POLICY_ANCHOR_CONFLICT_V1, DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1,
-    DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1, MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1,
-    MAX_DIRECTORY_SYNC_BLOCKS_V1,
+    DirectoryDescriptorCommitmentV1, DirectoryObservationCertificateV1,
+    DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
+    DirectoryObservationWitnessReceiptV1, DirectorySyncMessage, SignedNodeDescriptor,
+    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+    DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1, DIRECTORY_POLICY_ANCHOR_CONFLICT_V1,
+    DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1, DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1,
+    MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1, MAX_DIRECTORY_SYNC_BLOCKS_V1,
 };
 use bincode::Options;
 use parking_lot::Mutex;
@@ -1680,6 +1693,7 @@ struct VerifiedObservationWitness {
     checkpoint_hash: [u8; 32],
     observer: [u8; 32],
     response_timestamp: u64,
+    receipt: DirectoryObservationWitnessReceiptV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1709,6 +1723,7 @@ struct ObservationWitnessPolicyAudit {
 struct VerifiedObservationWitnessSet {
     sequence: u64,
     witness_node_ids: Vec<[u8; 32]>,
+    receipts: Vec<DirectoryObservationWitnessReceiptV1>,
 }
 
 #[derive(Debug, Default)]
@@ -3652,6 +3667,82 @@ impl DirectoryReplicaStore {
             DirectoryReplicaStoreError::Integrity(
                 "current pinned observation witness count exceeds u64".to_string(),
             )
+        })
+    }
+
+    /// Exports the latest witnessed checkpoint as a portable certificate when
+    /// the current operator-pinned witness set still satisfies the requested
+    /// threshold.
+    ///
+    /// [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] Every read
+    /// re-verifies the retained checkpoint, canonical response frames, witness
+    /// signatures, checkpoint bindings, current pin membership, and threshold.
+    /// Historical receipts from removed pins remain durable but are excluded.
+    ///
+    /// This evidence package is deliberately not a vote, validator set, quorum
+    /// certificate, fork choice, consensus statement, or finality proof.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when pins or threshold are
+    /// invalid, persisted evidence fails audit, certificate construction fails,
+    /// or `SQLite` cannot complete the bounded read.
+    pub fn latest_observation_certificate_for_pins(
+        &self,
+        eligible_witnesses: &[[u8; 32]],
+        minimum_witnesses: usize,
+        observed_at: u64,
+    ) -> Result<Option<DirectoryObservationCertificateV1>, DirectoryReplicaStoreError> {
+        if minimum_witnesses == 0
+            || minimum_witnesses > MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1
+            || minimum_witnesses > eligible_witnesses.len()
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "portable observation certificate threshold is invalid".to_string(),
+            ));
+        }
+        let eligible_witnesses =
+            Self::validate_observation_witness_eligibility(eligible_witnesses)?;
+        let connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let latest = Self::latest_verified_observation_witness_set(
+            &connection,
+            &self.local_node_id,
+            observed_at,
+        )?;
+        if latest.sequence == 0 {
+            return Ok(None);
+        }
+        let receipts = latest
+            .receipts
+            .into_iter()
+            .filter(|receipt| eligible_witnesses.contains(&receipt.responder))
+            .collect::<Vec<_>>();
+        if receipts.len() < minimum_witnesses {
+            return Ok(None);
+        }
+        let checkpoint = Self::verify_observation_checkpoint_at_sequence(
+            &connection,
+            &self.local_node_id,
+            observed_at,
+            latest.sequence,
+        )?;
+        drop(connection);
+        let minimum_witnesses = u16::try_from(minimum_witnesses).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "portable observation certificate threshold exceeds u16".to_string(),
+            )
+        })?;
+        DirectoryObservationCertificateV1::new_verified(
+            checkpoint,
+            minimum_witnesses,
+            receipts,
+            observed_at,
+        )
+        .map(Some)
+        .map_err(|error| {
+            DirectoryReplicaStoreError::Integrity(format!(
+                "portable observation certificate failed verification: {error}"
+            ))
         })
     }
 
@@ -7206,6 +7297,7 @@ impl DirectoryReplicaStore {
         )?;
         let mut verified_rows = 0usize;
         let mut witness_node_ids = Vec::with_capacity(MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1);
+        let mut receipts = Vec::with_capacity(MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1);
         for row in rows {
             let row = row?;
             let verified =
@@ -7215,6 +7307,7 @@ impl DirectoryReplicaStore {
                 &row.witness_node_id,
                 "latest observation witness node id",
             )?);
+            receipts.push(verified.receipt);
             verified_rows = verified_rows.saturating_add(1);
         }
         drop(statement);
@@ -7232,6 +7325,7 @@ impl DirectoryReplicaStore {
         Ok(VerifiedObservationWitnessSet {
             sequence: latest_sequence,
             witness_node_ids,
+            receipts,
         })
     }
 
@@ -7436,11 +7530,23 @@ impl DirectoryReplicaStore {
                     "observation witness response signature is invalid".to_string(),
                 )
             })?;
+        let receipt = DirectoryObservationWitnessReceiptV1 {
+            chain_id,
+            request_id,
+            observer,
+            checkpoint_sequence,
+            checkpoint_hash,
+            responder,
+            response_timestamp,
+            outcome,
+            signature,
+        };
         Ok(VerifiedObservationWitness {
             sequence: checkpoint_sequence,
             checkpoint_hash,
             observer,
             response_timestamp,
+            receipt,
         })
     }
 
@@ -9792,6 +9898,10 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(store
+            .latest_observation_certificate_for_pins(&eligible_witnesses, 1, NOW + 24)
+            .unwrap()
+            .is_none());
 
         let witness_a_response =
             accepted_observation_witness_response(&observer, &witness_a, &checkpoint, 0xcb);
@@ -9819,6 +9929,10 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert!(store
+            .latest_observation_certificate_for_pins(&eligible_witnesses, 2, NOW + 24)
+            .unwrap()
+            .is_none());
         assert!(store
             .next_audited_mature_observation_checkpoint_below_witness_threshold(
                 NOW + 21,
@@ -9852,6 +9966,24 @@ mod tests {
                 .unwrap(),
             2
         );
+        let certificate = store
+            .latest_observation_certificate_for_pins(&eligible_witnesses, 2, NOW + 24)
+            .unwrap()
+            .unwrap();
+        assert_eq!(certificate.checkpoint, checkpoint);
+        assert_eq!(certificate.minimum_witnesses, 2);
+        assert_eq!(certificate.receipts.len(), 2);
+        assert!(certificate
+            .receipts
+            .iter()
+            .all(|receipt| eligible_witnesses.contains(&receipt.responder)));
+        assert!(certificate
+            .receipts
+            .iter()
+            .all(|receipt| receipt.responder != retired_witness.public_key_bytes()));
+        certificate
+            .verify_at(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID, NOW + 24)
+            .unwrap();
         assert!(store
             .verified_observation_witness_count_for_pins(
                 checkpoint.sequence,
@@ -9900,6 +10032,10 @@ mod tests {
             )
             .unwrap()
             .is_none());
+        assert!(reopened
+            .latest_observation_certificate_for_pins(&eligible_witnesses, 2, NOW + 24)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -10696,6 +10832,12 @@ mod tests {
                 &[witness.public_key_bytes()],
                 NOW + 23,
             )
+            .is_err());
+        // [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] Export is a
+        // fresh audit boundary, so a post-startup database mutation cannot be
+        // wrapped into apparently valid portable evidence.
+        assert!(store
+            .latest_observation_certificate_for_pins(&[witness.public_key_bytes()], 1, NOW + 23,)
             .is_err());
         drop(store);
         assert!(DirectoryReplicaStore::open(&path, observer.public_key_bytes(), NOW + 23).is_err());

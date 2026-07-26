@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.27.0 - Bounded multi-page Full-node Mirror catch-up with truthful convergence status.
+Modification Reason: v0.28.0 - Portable, bounded, offline-verifiable Directory observation certificates.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.27.0 - Distinguished mirror convergence from bounded catch-up progress and terminal failure.
+Last Modified: v0.28.0 - [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] Added operator-only export of one observer-signed checkpoint plus independently signed current-pin witness receipts.
+Previous: v0.27.0 - Distinguished mirror convergence from bounded catch-up progress and terminal failure.
 Previous: v0.26.0 - Added capacity-bounded public mirrors that cannot affect checkpoint, witness, or policy authority.
 Previous: v0.25.0 - Added monotonic external policy-head anchors without exporting witness membership or claiming consensus.
 Previous: v0.24.0 - Distinguished independent multi-node corroboration from one-receipt evidence without claiming consensus.
@@ -1113,9 +1114,43 @@ Implemented in Full-node Mirror Mode V1:
 - Incident export is deliberately read-only. No endpoint can clear quarantine,
   rewind a prefix, choose a fork, or mark evidence resolved.
 
+Implemented in Portable Observation Certificate V1:
+
+- `DirectoryObservationCertificateV1` packages one observer-signed checkpoint
+  with independently signed `accepted` witness receipts. It is a stable
+  transport contract rather than an open-ended runtime enum.
+- The certificate uses a fixed version and chain id, a 64 KiB allocation bound,
+  canonical witness ordering, unique responder identities, an explicit
+  1-16 witness threshold, exact checkpoint hashes, request ids, timestamps, and
+  Ed25519 signatures.
+- The threshold records the exporting operator's current evidence policy. It
+  does not create validator membership, voting weight, a quorum certificate,
+  fork choice, consensus, global finality, transaction inclusion, or proof of
+  user content.
+- `DirectoryReplicaStore::latest_observation_certificate_for_pins` audits the
+  metadata, latest retained receipt set, exact checkpoint, canonical transport
+  frames, signatures, and current configured pin membership on every export.
+  Receipts from retired pins remain durable history but cannot satisfy the
+  current threshold.
+- `GET /api/discovery/directory/observation-certificate` is mounted only on the
+  local/VPN operator listener. Public listeners return `404` because the
+  certificate necessarily contains complete observer and witness public keys.
+- The response includes checkpoint sequence/hash, receipt count, stable
+  certificate id, exact frame SHA-256, and one base64 bounded canonical frame.
+  It contains no endpoints, descriptors, routes, selected hops, client IPs,
+  user message ids, payloads, ciphertext, Memory Chain records, DNS contents,
+  destinations, private keys, wallet traffic, or social graph metadata.
+- An offline verifier must first check the frame SHA-256, decode the bounded
+  V1 contract, and call `verify_at` with the production chain id and its own
+  current time. Merely decoding or seeing `status=verified` is not a trust
+  decision.
+- No SQLite migration or existing Directory Sync frame changed. Nodes without
+  this export continue their existing sync, witness, mirror, and recovery paths.
+
 Still pending before Directory Chain can be described as live:
 
-- Portable co-signature certificate exchange and deterministic fork selection.
+- Network-wide certificate gossip, independently specified co-signature policy,
+  and deterministic fork selection.
 - Independent implementation verification of the convergence root contract.
 
 Files likely changed:
@@ -1187,6 +1222,35 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+<!-- [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] -->
+2026-07-26 - Added Portable Directory Observation Certificate V1.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Contract:
+  - One bounded canonical frame packages an observer-signed checkpoint and
+    independently signed accepted receipts from distinct current pins.
+  - Offline verification checks version, production chain id, checkpoint,
+    threshold, exact receipt bindings, canonical order, timestamps, identities,
+    and every Ed25519 signature.
+- Runtime:
+  - The replica store rebuilds certificates from audited retained evidence and
+    excludes retired pins on every read.
+  - `GET /api/discovery/directory/observation-certificate` exists only on the
+    local/VPN operator listener and fails closed until the current threshold is
+    satisfied.
+- Compatibility and privacy:
+  - Existing Directory Sync frames, SQLite schema, status fields, public
+    listener, and synchronization behavior remain unchanged.
+  - The certificate exposes only public control-plane identities required for
+    signature verification; user-plane and route data remain absent.
+- Security boundary:
+  - This is independently signed observation evidence, not a validator set,
+    vote, quorum certificate, fork choice, consensus, finality, transaction
+    inclusion proof, financial chain, or proof of user content.
+
 <!-- [MIRROR-CATCHUP 2026-07-24 by Codex] -->
 2026-07-24 - Added Bounded Full-node Mirror Catch-up V1.
 - Files changed:

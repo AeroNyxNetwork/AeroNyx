@@ -33,6 +33,9 @@
 //!   complete retained-history audit remains a startup and operator boundary.
 //! - Lists bounded incident summaries and exports one independently re-verified
 //!   signed evidence frame on local/VPN operator listeners only.
+//! - Exports one bounded portable observation certificate on local/VPN
+//!   operator listeners only after re-verifying the observer checkpoint,
+//!   current witness pins, threshold, exact bindings, and every signature.
 //! - Reports signed quarantine-resolution counts while keeping mutation
 //!   strictly outside every HTTP listener.
 //! - Reports aggregate Full-node Mirror capacity and bounded round health while
@@ -64,14 +67,17 @@
 //!    aggregate pins and threshold without returning policy membership.
 //! 9. Serialize aggregate-only or fingerprint-only detail by listener scope.
 //! 10. Re-verify canonical incident evidence before an operator-only export.
-//! 11. Report mirror transport and bounded recovery separately from pinned
+//! 11. Build a canonical portable checkpoint+witness certificate only when the
+//!     current pinned witness threshold remains satisfied.
+//! 12. Report mirror transport and bounded recovery separately from pinned
 //!     authority observations.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
-//! 12-character fingerprints and bounded control-plane counters. One explicitly
-//! requested evidence package includes the complete producer identity required
-//! to verify its Ed25519 signature. No scope exposes endpoints, descriptors,
+//! 12-character fingerprints and bounded control-plane counters. Explicitly
+//! requested evidence packages include complete public node identities and
+//! signatures required for offline verification. No scope exposes endpoints,
+//! descriptors,
 //! routes, selected hops, client metadata, payloads, DNS contents, destinations,
 //! private keys, wallet traffic, or social graph metadata.
 //!
@@ -88,6 +94,10 @@
 //! - Policy epoch status is local operator configuration history, never a
 //!   validator set, vote, governance mechanism, consensus, or finality claim.
 //! - Never mount incident list/export routes on the public listener.
+//! - Never mount the observation-certificate route on the public listener.
+//! - Portable observation certificates are independent signed observations,
+//!   not votes, validator membership, quorum, fork choice, consensus, finality,
+//!   transaction inclusion, or user-content proof.
 //! - Never add quarantine mutation here; recovery needs an authenticated,
 //!   audited compare-and-swap command boundary.
 //! - Mirror health must never be folded into checkpoint, witness, policy, vote,
@@ -95,6 +105,10 @@
 //! - Recovery telemetry is aggregate transport health, never carrier reputation.
 //!
 //! ## Last Modified
+//! `v0.21.0-PortableObservationCertificate` - [PORTABLE-OBSERVATION-CERTIFICATE
+//! 2026-07-26 by Codex] Added a local/VPN operator-only bounded checkpoint and
+//! external-witness certificate export with current-pin and signature
+//! re-verification on every read.
 //! `v0.20.0-SignedMirrorCarrierStatus` - Separated authenticated capability
 //! advertisements from unadvertised compatibility fallback counts and policy.
 //! `v0.19.0-MirrorSourceDiversityStatus` - Added aggregate routeability and
@@ -131,7 +145,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aeronyx_core::protocol::discovery::AERONYX_DIRECTORY_MAINNET_CHAIN_ID;
+use aeronyx_core::protocol::discovery::{
+    encode_directory_observation_certificate, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -139,6 +155,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::api::directory_replica_sync::{
@@ -157,6 +174,7 @@ use crate::services::{
 
 const DEFAULT_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE: usize = 20;
 const DIRECTORY_REPLICA_INCIDENT_PRIVACY_BOUNDARY: &str = "operator-only signed Directory Chain control-plane evidence; no endpoints, descriptors, client IPs, routes, selected hops, message ids, payloads, ciphertext, Memory Chain records, DNS contents, destinations, private keys, wallet traffic, or social graph metadata";
+const DIRECTORY_OBSERVATION_CERTIFICATE_PRIVACY_BOUNDARY: &str = "operator-only public Directory Chain control-plane identities and signatures required for offline verification; no endpoints, descriptors, client IPs, routes, selected hops, message ids, payloads, ciphertext, Memory Chain records, DNS contents, destinations, private keys, wallet traffic, or social graph metadata";
 
 /// Visibility tier for Directory Replica status responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,6 +530,36 @@ struct DirectoryReplicaIncidentErrorResponse {
     privacy_boundary: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct DirectoryObservationCertificateResponse {
+    contract_version: &'static str,
+    generated_at: u64,
+    status: &'static str,
+    chain_id: String,
+    checkpoint_sequence: u64,
+    checkpoint_hash: String,
+    checkpoint_observed_at: u64,
+    minimum_witnesses: u16,
+    witness_receipts: usize,
+    certificate_b64: String,
+    certificate_id: String,
+    certificate_sha256: String,
+    certificate_format: &'static str,
+    verification: &'static str,
+    security_model: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct DirectoryObservationCertificateErrorResponse {
+    contract_version: &'static str,
+    generated_at: u64,
+    status: &'static str,
+    reason: &'static str,
+    security_model: &'static str,
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Default)]
 struct DirectoryReplicaRuntimeSummary {
     synchronized_producers: u64,
@@ -538,8 +586,10 @@ struct DirectoryReplicaRuntimeSnapshots<'a> {
 ///
 /// Public and local listeners intentionally use separate scope values. Status
 /// and incident-list responses omit full identities. A single local evidence
-/// export includes the producer key required for signature verification, but
-/// never endpoints, signed descriptors, route metadata, or user traffic.
+/// export includes the producer key required for signature verification. The
+/// portable certificate includes observer and witness public identities needed
+/// by offline verifiers, but never endpoints, signed descriptors, route
+/// metadata, or user traffic.
 pub fn build_directory_replica_status_router(
     store: Option<Arc<DirectoryReplicaStore>>,
     runtime: Arc<DirectoryReplicaSyncRuntime>,
@@ -575,10 +625,154 @@ pub fn build_directory_replica_status_router(
                 "/api/discovery/directory/incident",
                 get(directory_replica_incident_evidence_handler),
             )
+            .route(
+                "/api/discovery/directory/observation-certificate",
+                get(directory_observation_certificate_handler),
+            )
     } else {
         router
     };
     router.with_state(state)
+}
+
+async fn directory_observation_certificate_handler(
+    State(state): State<DirectoryReplicaStatusState>,
+) -> Response {
+    let generated_at = now_secs();
+    if state.scope != DirectoryReplicaStatusScope::LocalOperator {
+        return observation_certificate_error_response(
+            StatusCode::NOT_FOUND,
+            generated_at,
+            "observation_certificate_route_not_found",
+        );
+    }
+    let Some(store) = state.store.clone() else {
+        return observation_certificate_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            generated_at,
+            "replica_store_disabled",
+        );
+    };
+    let mut eligible_witnesses = state
+        .configured_producers
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    eligible_witnesses.sort_unstable();
+    let minimum_witnesses = state.witness_min_verified;
+    match tokio::task::spawn_blocking(move || {
+        store.latest_observation_certificate_for_pins(
+            &eligible_witnesses,
+            minimum_witnesses,
+            generated_at,
+        )
+    })
+    .await
+    {
+        Ok(Ok(Some(certificate))) => {
+            // [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] The store
+            // already performs a full read audit. Verify once more at the HTTP
+            // boundary before encoding public identities into an export.
+            if let Err(error) =
+                certificate.verify_at(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID, generated_at)
+            {
+                warn!(
+                    error = %error,
+                    "[DIRECTORY_REPLICA] Observation certificate failed boundary verification"
+                );
+                return observation_certificate_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    generated_at,
+                    "observation_certificate_verification_failed",
+                );
+            }
+            let certificate_hash = certificate.hash();
+            let certificate_frame = match encode_directory_observation_certificate(&certificate) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "[DIRECTORY_REPLICA] Observation certificate encoding failed"
+                    );
+                    return observation_certificate_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        generated_at,
+                        "observation_certificate_encoding_failed",
+                    );
+                }
+            };
+            let certificate_frame_sha256 = Sha256::digest(&certificate_frame);
+            Json(DirectoryObservationCertificateResponse {
+                contract_version: "directory_observation_certificate.v1",
+                generated_at,
+                status: "verified",
+                chain_id: hex::encode(certificate.chain_id),
+                checkpoint_sequence: certificate.checkpoint.sequence,
+                checkpoint_hash: hex::encode(certificate.checkpoint.hash()),
+                checkpoint_observed_at: certificate.checkpoint.observed_at,
+                minimum_witnesses: certificate.minimum_witnesses,
+                witness_receipts: certificate.receipts.len(),
+                certificate_b64: BASE64.encode(certificate_frame),
+                certificate_id: hex::encode(certificate_hash),
+                certificate_sha256: hex::encode(certificate_frame_sha256),
+                certificate_format:
+                    "canonical_bounded_directory_observation_certificate_v1_base64",
+                verification:
+                    "checkpoint_and_receipt_bindings_current_pins_threshold_canonical_order_timestamps_identities_and_signatures_reverified_on_read",
+                security_model:
+                    "independent_signed_observation_evidence_not_vote_validator_set_quorum_fork_choice_consensus_or_finality",
+                privacy_boundary: DIRECTORY_OBSERVATION_CERTIFICATE_PRIVACY_BOUNDARY,
+            })
+            .into_response()
+        }
+        Ok(Ok(None)) => observation_certificate_error_response(
+            StatusCode::NOT_FOUND,
+            generated_at,
+            "observation_certificate_not_available",
+        ),
+        Ok(Err(error)) => {
+            warn!(
+                error = %error,
+                "[DIRECTORY_REPLICA] Observation certificate failed persistence verification"
+            );
+            observation_certificate_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                generated_at,
+                "observation_certificate_verification_failed",
+            )
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "[DIRECTORY_REPLICA] Observation certificate worker failed"
+            );
+            observation_certificate_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                generated_at,
+                "observation_certificate_worker_failed",
+            )
+        }
+    }
+}
+
+fn observation_certificate_error_response(
+    status_code: StatusCode,
+    generated_at: u64,
+    reason: &'static str,
+) -> Response {
+    (
+        status_code,
+        Json(DirectoryObservationCertificateErrorResponse {
+            contract_version: "directory_observation_certificate_error.v1",
+            generated_at,
+            status: "unavailable",
+            reason,
+            security_model:
+                "independent_signed_observation_evidence_not_vote_validator_set_quorum_fork_choice_consensus_or_finality",
+            privacy_boundary: DIRECTORY_OBSERVATION_CERTIFICATE_PRIVACY_BOUNDARY,
+        }),
+    )
+        .into_response()
 }
 
 async fn directory_replica_incidents_handler(
@@ -2180,6 +2374,7 @@ mod tests {
         for uri in [
             "/api/discovery/directory/incidents",
             "/api/discovery/directory/incident?digest=0000000000000000000000000000000000000000000000000000000000000000",
+            "/api/discovery/directory/observation-certificate",
         ] {
             let response = public_router
                 .clone()
@@ -2217,6 +2412,35 @@ mod tests {
             list["recovery_policy"].as_str(),
             Some("operator_review_required_automatic_recovery_disabled")
         );
+
+        // [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] The operator
+        // route exists but remains fail-closed until a current pinned witness
+        // threshold has produced independently verified receipts.
+        let certificate_response = local_router
+            .clone()
+            .oneshot(
+                Request::get("/api/discovery/directory/observation-certificate")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(certificate_response.status(), StatusCode::NOT_FOUND);
+        let certificate_body = to_bytes(certificate_response.into_body(), 512 * 1024).await?;
+        let certificate: serde_json::Value = serde_json::from_slice(&certificate_body)?;
+        assert_eq!(
+            certificate["contract_version"].as_str(),
+            Some("directory_observation_certificate_error.v1")
+        );
+        assert_eq!(
+            certificate["reason"].as_str(),
+            Some("observation_certificate_not_available")
+        );
+        assert_eq!(
+            certificate["security_model"].as_str(),
+            Some(
+                "independent_signed_observation_evidence_not_vote_validator_set_quorum_fork_choice_consensus_or_finality"
+            )
+        );
+        assert!(!String::from_utf8_lossy(&certificate_body).contains(&hex::encode(producer)));
 
         for uri in [
             "/api/discovery/directory/incidents?limit=0",
