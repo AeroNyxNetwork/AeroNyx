@@ -9,6 +9,11 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - [BUILD-CACHE-MAINTENANCE 2026-07-26 by Codex] Add read-only Cargo build
+#   cache inventory and an explicitly confirmed prune workflow. The workflow
+#   preserves the stable production binary, current pinned-toolchain cache,
+#   release executables/backups, node identity, configuration, and protocol
+#   data.
 # - Add a guarded OnionMiddle config helper so operators can explicitly enable
 #   or disable no-exit middle-hop advertisement for future two-hop encrypted
 #   relay paths with backup, validation, active-session warning, and optional
@@ -72,8 +77,8 @@
 # Main Functionality:
 # - Offers a guided interactive menu when no command is provided.
 # - Provides command aliases for quickstart, plan, install, upgrade, health,
-#   status, logs, doctor, relay route probing, binary promotion, and network
-#   maintenance.
+#   status, logs, doctor, build-cache inventory/pruning, relay route probing,
+#   binary promotion, and network maintenance.
 # - Passes common options such as --repo-dir, --branch, --registration-code,
 #   --config, and --service to the appropriate lower-level script.
 # - Keeps secret handling safe: registration codes are accepted as arguments or
@@ -106,6 +111,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.21.0-node-entrypoint - Added guarded Cargo build-cache inventory and pruning.
 # v1.20.0-node-entrypoint - Added isolated carrier-assisted cold-bootstrap smoke.
 # v1.19.0-node-entrypoint - Added read-only Directory Mirror carrier-smoke.
 # v1.18.0-node-entrypoint - Made staged-binary promotion model-startup-aware and rollback-safe.
@@ -143,6 +149,7 @@ DEFAULT_SERVICE_NAME="aeronyx-server"
 UPGRADE_STATUS_FILE="/var/lib/aeronyx/upgrade-status.json"
 PROMOTE_HEALTH_RETRIES="${AERONYX_PROMOTE_HEALTH_RETRIES:-90}"
 PROMOTE_HEALTH_DELAY="${AERONYX_PROMOTE_HEALTH_DELAY:-2}"
+BUILD_TARGET_ROOT="${AERONYX_BUILD_TARGET_ROOT:-/var/lib/aeronyx/build-targets}"
 
 COMMAND=""
 REPO_DIR="${AERONYX_REPO_DIR:-${DEFAULT_REPO_DIR}}"
@@ -219,6 +226,8 @@ Commands:
   carrier-cold-bootstrap-smoke Rebuild an isolated replica through a signed carrier.
   refresh-bootstrap Refresh the signed discovery bootstrap snapshot.
   fleet-drift-check Read-only check for seed/snapshot/binary drift.
+  build-cache Show Cargo cache disk usage and the paths protected from pruning.
+  prune-build-cache Remove only regenerable Cargo outputs after explicit confirmation.
   promote-binary Promote a staged aeronyx-server binary with drain checks.
   logs       Show recent systemd logs. Use --follow to tail.
   network    Refresh forwarding/NAT or update the privacy protocol IP pool.
@@ -319,6 +328,16 @@ Command-specific options:
     --json                           Emit JSON result for nodeboard/automation.
     --json-only                      Emit only JSON.
 
+  build-cache:
+    --repo-dir PATH         Repository containing the stable production binary.
+    AERONYX_BUILD_TARGET_ROOT may override /var/lib/aeronyx/build-targets.
+
+  prune-build-cache:
+    --dry-run               List entries that would be removed without changes.
+    --yes                   Required for deletion.
+    --repo-dir PATH         Repository containing the stable production binary.
+    AERONYX_BUILD_TARGET_ROOT may override /var/lib/aeronyx/build-targets.
+
   promote-binary:
     --binary PATH            Staged aeronyx-server binary to promote.
     --expected-sha256 HASH   Optional SHA-256 expected for the staged binary.
@@ -336,6 +355,9 @@ Examples:
   ./deploy/node/aeronyx-node.sh fleet-smoke --endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --two-hop --json
   ./deploy/node/aeronyx-node.sh carrier-smoke --json
   ./deploy/node/aeronyx-node.sh carrier-cold-bootstrap-smoke --json
+  ./deploy/node/aeronyx-node.sh build-cache --repo-dir /root/open/AeroNyx
+  sudo ./deploy/node/aeronyx-node.sh prune-build-cache --repo-dir /root/open/AeroNyx --dry-run
+  sudo ./deploy/node/aeronyx-node.sh prune-build-cache --repo-dir /root/open/AeroNyx --yes
   sudo ./deploy/node/aeronyx-node.sh refresh-bootstrap --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422
   ./deploy/node/aeronyx-node.sh fleet-drift-check --expected-endpoints http://35.253.79.169:8422,http://8.213.146.244:8422,http://149.33.18.44:8422,http://111.68.15.70:8422 --json
   sudo ./deploy/node/aeronyx-node.sh chat-relay --enable-chat-relay --restart
@@ -351,7 +373,7 @@ require_script() {
 
 validate_service_name() {
     case "${SERVICE_NAME}" in
-        ""|-*|*/*)
+        ""|-*|*/*|.|..)
             die "Invalid service name: ${SERVICE_NAME}"
             ;;
     esac
@@ -1037,6 +1059,309 @@ run_network() {
         --network-only \
         --set-vpn-cidr "${SET_VPN_CIDR}" \
         "${EXTRA_ARGS[@]}"
+}
+
+# [BUILD-CACHE-MAINTENANCE 2026-07-26 by Codex] Cache maintenance lives in
+# this unified operator entrypoint so nodes do not accumulate another script.
+# Production executables and rollback artifacts can live inside the legacy
+# Cargo release directory, so pruning removes only known Cargo cache entries.
+path_size_kib() {
+    local path="$1"
+    local size
+    if [ ! -e "${path}" ]; then
+        printf '0\n'
+        return
+    fi
+
+    size="$(du -sk "${path}" 2>/dev/null | awk 'NR == 1 { print $1 + 0 }' || true)"
+    printf '%s\n' "${size:-0}"
+}
+
+path_size_human() {
+    local path="$1"
+    local size
+    if [ ! -e "${path}" ]; then
+        printf 'absent\n'
+        return
+    fi
+
+    size="$(du -sh "${path}" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)"
+    printf '%s\n' "${size:-unavailable}"
+}
+
+sha256_file() {
+    local path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "${path}" | awk '{print $1}'
+        return
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "${path}" | awk '{print $1}'
+        return
+    fi
+    die "sha256sum or shasum is required for protected binary verification."
+}
+
+resolve_cache_layout() {
+    local script_repo_dir
+    local toolchain_file
+    [ -d "${REPO_DIR}" ] || die "Repository directory does not exist: ${REPO_DIR}"
+    REPO_DIR="$(cd "${REPO_DIR}" && pwd -P)"
+
+    [ "${REPO_DIR}" != "/" ] || die "Repository directory cannot be /."
+    case "${BUILD_TARGET_ROOT}" in
+        /*) ;;
+        *) die "AERONYX_BUILD_TARGET_ROOT must be an absolute path: ${BUILD_TARGET_ROOT}" ;;
+    esac
+    if [ -d "${BUILD_TARGET_ROOT}" ]; then
+        BUILD_TARGET_ROOT="$(cd "${BUILD_TARGET_ROOT}" && pwd -P)"
+    fi
+    [ "${BUILD_TARGET_ROOT}" != "/" ] || die "Isolated Cargo build root cannot be /."
+
+    script_repo_dir="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+    toolchain_file="${REPO_DIR}/rust-toolchain.toml"
+    if [ ! -r "${toolchain_file}" ]; then
+        toolchain_file="${script_repo_dir}/rust-toolchain.toml"
+    fi
+    [ -r "${toolchain_file}" ] \
+        || die "Pinned Rust toolchain file is missing from ${REPO_DIR} and ${script_repo_dir}"
+    PINNED_RUST_FILE="${toolchain_file}"
+
+    PINNED_RUST_CHANNEL="$(
+        sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+            "${PINNED_RUST_FILE}" | head -n 1
+    )"
+    [ -n "${PINNED_RUST_CHANNEL}" ] \
+        || die "Unable to resolve pinned Rust channel from ${PINNED_RUST_FILE}"
+
+    LEGACY_TARGET_DIR="${REPO_DIR}/target"
+    LEGACY_RELEASE_DIR="${LEGACY_TARGET_DIR}/release"
+    STABLE_BINARY="${LEGACY_RELEASE_DIR}/aeronyx-server"
+    CURRENT_BUILD_TARGET_DIR="${BUILD_TARGET_ROOT}/rust-${PINNED_RUST_CHANNEL}/${SERVICE_NAME}"
+}
+
+count_stale_service_targets() {
+    local count=0
+    local toolchain_dir
+    local service_target
+
+    if [ ! -d "${BUILD_TARGET_ROOT}" ]; then
+        printf '0\n'
+        return
+    fi
+
+    while IFS= read -r -d '' toolchain_dir; do
+        service_target="${toolchain_dir}/${SERVICE_NAME}"
+        if [ -d "${service_target}" ] && [ "${service_target}" != "${CURRENT_BUILD_TARGET_DIR}" ]; then
+            count=$((count + 1))
+        fi
+    done < <(find "${BUILD_TARGET_ROOT}" -mindepth 1 -maxdepth 1 -type d -name 'rust-*' -print0)
+
+    printf '%s\n' "${count}"
+}
+
+show_build_cache() {
+    validate_service_name
+    [ "${#EXTRA_ARGS[@]}" -eq 0 ] || die "build-cache does not accept: ${EXTRA_ARGS[*]}"
+    resolve_cache_layout
+
+    local stable_size
+    local stable_sha="absent"
+    stable_size="$(path_size_human "${STABLE_BINARY}")"
+    if [ -f "${STABLE_BINARY}" ]; then
+        stable_sha="$(sha256_file "${STABLE_BINARY}")"
+    fi
+
+    log "AeroNyx Cargo build-cache inventory"
+    printf 'repo=%s\n' "${REPO_DIR}"
+    printf 'service=%s\n' "${SERVICE_NAME}"
+    printf 'pinned_rust=%s\n' "${PINNED_RUST_CHANNEL}"
+    printf 'pinned_rust_source=%s\n' "${PINNED_RUST_FILE}"
+    printf 'legacy_target=%s size=%s\n' \
+        "${LEGACY_TARGET_DIR}" "$(path_size_human "${LEGACY_TARGET_DIR}")"
+    printf 'stable_binary=%s size=%s sha256=%s protected=true\n' \
+        "${STABLE_BINARY}" "${stable_size}" "${stable_sha}"
+    printf 'isolated_build_root=%s size=%s\n' \
+        "${BUILD_TARGET_ROOT}" "$(path_size_human "${BUILD_TARGET_ROOT}")"
+    printf 'current_build_target=%s size=%s protected=true\n' \
+        "${CURRENT_BUILD_TARGET_DIR}" "$(path_size_human "${CURRENT_BUILD_TARGET_DIR}")"
+    printf 'stale_same_service_targets=%s\n' "$(count_stale_service_targets)"
+    printf 'release_backups=/var/lib/aeronyx/releases protected=true\n'
+    printf 'node_runtime_state=/var/lib/aeronyx protected=true scope=excluding-build-targets\n'
+    printf 'node_config=/etc/aeronyx protected=true\n'
+
+    if command -v df >/dev/null 2>&1; then
+        df -Pk "${REPO_DIR}" 2>/dev/null \
+            | awk 'NR == 2 {
+                printf "filesystem_kib_total=%s used=%s available=%s used_percent=%s\n",
+                    $2, $3, $4, $5
+            }'
+    fi
+}
+
+validate_running_binary_for_prune() {
+    [ -x "${STABLE_BINARY}" ] \
+        || die "Stable production binary is missing or not executable: ${STABLE_BINARY}"
+    [ ! -L "${LEGACY_TARGET_DIR}" ] \
+        || die "Refusing to prune a symlinked Cargo target: ${LEGACY_TARGET_DIR}"
+    [ ! -L "${LEGACY_RELEASE_DIR}" ] \
+        || die "Refusing to prune a symlinked release directory: ${LEGACY_RELEASE_DIR}"
+
+    if ! command -v systemctl >/dev/null 2>&1 \
+        || ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+        warn "${SERVICE_NAME} is not active; preserving the stable binary without a running-process check."
+        return
+    fi
+
+    local main_pid
+    local running_binary
+    main_pid="$(systemctl show "${SERVICE_NAME}" --property MainPID --value)"
+    case "${main_pid}" in
+        ""|0|*[!0-9]*) die "Unable to resolve ${SERVICE_NAME} MainPID before cache pruning." ;;
+    esac
+
+    running_binary="$(readlink -f "/proc/${main_pid}/exe" 2>/dev/null || true)"
+    [ "${running_binary}" = "${STABLE_BINARY}" ] \
+        || die "Running ${SERVICE_NAME} binary (${running_binary:-unknown}) does not match protected binary ${STABLE_BINARY}."
+    ok "Running binary matches protected stable path: ${STABLE_BINARY}"
+}
+
+acquire_cache_maintenance_lock() {
+    local lock_file="/run/lock/${SERVICE_NAME}.deploy.lock"
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] acquire deployment lock %s\n' "${lock_file}"
+        return
+    fi
+
+    if command -v flock >/dev/null 2>&1; then
+        mkdir -p "$(dirname "${lock_file}")"
+        exec 8>"${lock_file}"
+        flock -n 8 || die "Another ${SERVICE_NAME} install, upgrade, or maintenance run is active."
+        ok "Deployment lock acquired: ${lock_file}"
+        return
+    fi
+
+    CACHE_LOCK_DIR="/tmp/${SERVICE_NAME}.deploy.lock"
+    mkdir "${CACHE_LOCK_DIR}" 2>/dev/null \
+        || die "Another ${SERVICE_NAME} install, upgrade, or maintenance run appears active."
+    trap 'rmdir "${CACHE_LOCK_DIR}" 2>/dev/null || true' EXIT
+    ok "Deployment lock acquired: ${CACHE_LOCK_DIR}"
+}
+
+remove_cache_entry() {
+    local entry="$1"
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] remove regenerable Cargo entry: %s (%s)\n' \
+            "${entry}" "$(path_size_human "${entry}")"
+        return
+    fi
+
+    log "Removing regenerable Cargo entry: ${entry} ($(path_size_human "${entry}"))"
+    rm -rf -- "${entry}"
+}
+
+prune_legacy_target_entries() {
+    local entry
+    local entry_name
+    [ -d "${LEGACY_TARGET_DIR}" ] || {
+        ok "Legacy Cargo target is absent: ${LEGACY_TARGET_DIR}"
+        return
+    }
+
+    while IFS= read -r -d '' entry; do
+        [ "${entry}" = "${LEGACY_RELEASE_DIR}" ] && continue
+        remove_cache_entry "${entry}"
+    done < <(find "${LEGACY_TARGET_DIR}" -mindepth 1 -maxdepth 1 -print0)
+
+    if [ -d "${LEGACY_RELEASE_DIR}" ]; then
+        while IFS= read -r -d '' entry; do
+            entry_name="${entry##*/}"
+            case "${entry_name}" in
+                .cargo-lock|.fingerprint|build|deps|examples|incremental|*.d|*.rlib|*.rmeta)
+                    remove_cache_entry "${entry}"
+                    ;;
+                *)
+                    # Preserve executable tools, staged binaries, and historical
+                    # rollback artifacts even when they are not the active
+                    # aeronyx-server binary.
+                    ;;
+            esac
+        done < <(find "${LEGACY_RELEASE_DIR}" -mindepth 1 -maxdepth 1 -print0)
+    fi
+}
+
+prune_stale_isolated_targets() {
+    local build_root
+    local toolchain_dir
+    local service_target
+    [ -d "${BUILD_TARGET_ROOT}" ] || {
+        ok "Isolated Cargo build root is absent: ${BUILD_TARGET_ROOT}"
+        return
+    }
+
+    build_root="$(cd "${BUILD_TARGET_ROOT}" && pwd -P)"
+    [ "${build_root}" != "/" ] || die "Isolated Cargo build root cannot be /."
+
+    while IFS= read -r -d '' toolchain_dir; do
+        service_target="${toolchain_dir}/${SERVICE_NAME}"
+        [ -d "${service_target}" ] || continue
+        [ "${service_target}" = "${CURRENT_BUILD_TARGET_DIR}" ] && continue
+        case "${service_target}" in
+            "${build_root}"/*) ;;
+            *) die "Refusing to prune target outside build root: ${service_target}" ;;
+        esac
+        remove_cache_entry "${service_target}"
+        if [ "${DRY_RUN}" -eq 0 ]; then
+            rmdir "${toolchain_dir}" 2>/dev/null || true
+        fi
+    done < <(find "${build_root}" -mindepth 1 -maxdepth 1 -type d -name 'rust-*' -print0)
+}
+
+run_prune_build_cache() {
+    validate_service_name
+    [ "${#EXTRA_ARGS[@]}" -eq 0 ] || die "prune-build-cache does not accept: ${EXTRA_ARGS[*]}"
+    resolve_cache_layout
+
+    if [ "${DRY_RUN}" -eq 0 ]; then
+        [ "${YES}" -eq 1 ] \
+            || die "prune-build-cache requires --yes. Preview first with --dry-run."
+        [ "${EUID:-$(id -u)}" -eq 0 ] \
+            || die "prune-build-cache requires root. Re-run with sudo."
+    fi
+
+    validate_running_binary_for_prune
+    acquire_cache_maintenance_lock
+
+    local before_kib
+    local after_kib
+    local stable_sha_before
+    local stable_sha_after
+    before_kib=$(( $(path_size_kib "${LEGACY_TARGET_DIR}") + $(path_size_kib "${BUILD_TARGET_ROOT}") ))
+    stable_sha_before="$(sha256_file "${STABLE_BINARY}")"
+
+    log "Pruning regenerable Cargo outputs; node data, config, identity, and release backups are out of scope."
+    prune_legacy_target_entries
+    prune_stale_isolated_targets
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        ok "Dry run complete; no files were removed."
+        return
+    fi
+
+    stable_sha_after="$(sha256_file "${STABLE_BINARY}")"
+    [ "${stable_sha_after}" = "${stable_sha_before}" ] \
+        || die "Protected production binary hash changed during cache pruning."
+
+    after_kib=$(( $(path_size_kib "${LEGACY_TARGET_DIR}") + $(path_size_kib "${BUILD_TARGET_ROOT}") ))
+    local reclaimed_kib=0
+    if [ "${before_kib}" -gt "${after_kib}" ]; then
+        reclaimed_kib=$((before_kib - after_kib))
+    fi
+
+    ok "Cargo cache pruning complete"
+    printf 'protected_binary_sha256=%s\n' "${stable_sha_after}"
+    printf 'reclaimed_kib=%s\n' "${reclaimed_kib}"
+    show_build_cache
 }
 
 active_sessions_count() {
@@ -3244,11 +3569,12 @@ AeroNyx Node Operator
 8) Refresh network/IP pool
 9) Verify Directory Mirror carrier
 10) Verify carrier-assisted cold bootstrap
-11) Exit
+11) Build-cache inventory
+12) Exit
 MENU
     printf 'Select an action: '
     local choice
-    IFS= read -r choice || choice="11"
+    IFS= read -r choice || choice="12"
 
     case "${choice}" in
         1)
@@ -3290,7 +3616,10 @@ MENU
         10)
             run_carrier_cold_bootstrap_smoke
             ;;
-        11|"")
+        11)
+            show_build_cache
+            ;;
+        12|"")
             ok "No action selected"
             ;;
         *)
@@ -3350,6 +3679,12 @@ main() {
             ;;
         fleet-drift-check)
             run_fleet_drift_check
+            ;;
+        build-cache)
+            show_build_cache
+            ;;
+        prune-build-cache)
+            run_prune_build_cache
             ;;
         promote-binary)
             run_promote_binary

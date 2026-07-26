@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [BUILD-CACHE-MAINTENANCE 2026-07-26 by Codex] Document read-only Cargo cache
+  inventory and explicitly confirmed pruning that preserves the production
+  binary, current pinned build cache, release backups, and all node state.
 - [PINNED-RUST-BUILD 2026-07-26 by Codex] Document exact Rust toolchain
   pinning, isolated build targets, staged validation, and atomic binary
   promotion for reproducible node releases.
@@ -91,6 +94,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.43.0-node-deploy - Documented guarded Cargo build-cache maintenance.
 v1.42.0-node-deploy - Documented pinned Rust builds and atomic promotion from
                      isolated toolchain/service-scoped Cargo targets.
 v1.41.0-node-deploy - Documented bootstrap refresh and fleet drift check commands.
@@ -197,6 +201,59 @@ sudo AERONYX_BUILD_TARGET_ROOT=/var/lib/aeronyx-jp1/build-targets \
 
 An exact toolchain bump is a release change. It requires the full Rust test
 suite, Clippy, a locked release build, and controlled node rollout evidence.
+
+## Cargo Build-Cache Maintenance
+
+Production compilation can consume significant disk space because Cargo keeps
+dependency objects, incremental data, and old toolchain targets. Inspect the
+node without changing the host:
+
+```bash
+./deploy/node/aeronyx-node.sh build-cache \
+  --repo-dir /root/open/AeroNyx
+```
+
+The inventory reports the legacy repository `target/`, the isolated build
+root, the exact pinned-toolchain target, the protected binary SHA-256, and
+filesystem capacity. Preview every removable entry before deletion:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh prune-build-cache \
+  --repo-dir /root/open/AeroNyx \
+  --dry-run
+```
+
+Run the controlled prune only after reviewing that output:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh prune-build-cache \
+  --repo-dir /root/open/AeroNyx \
+  --yes
+```
+
+The prune command takes the same deployment lock used by install and upgrade.
+It verifies that a running systemd service maps to the protected stable binary,
+records that binary's SHA-256 before cleanup, and verifies the hash again
+afterward. It removes only regenerable Cargo entries:
+
+- Legacy repository debug/cross-target directories and known Cargo-generated
+  release caches such as `deps`, `build`, `.fingerprint`, `incremental`,
+  `.rlib`, and `.d`.
+- Older pinned-toolchain targets for the same systemd service.
+
+It deliberately preserves:
+
+- The current pinned-toolchain/service build target.
+- The stable production binary.
+- Other release executables, staged binaries, and historical rollback artifacts
+  found under `<repo>/target/release`.
+- `/var/lib/aeronyx/releases` rollback binaries.
+- `/var/lib/aeronyx` protocol state, ledgers, peer stores, and node data.
+- `/etc/aeronyx` configuration, identity, and key material.
+- Build targets belonging to other AeroNyx services on the same host.
+
+Cache pruning does not restart the service and does not require an active
+session drain. The running binary and all runtime state remain in place.
 
 ## Where `aeronyx-node.sh` Comes From
 
