@@ -161,6 +161,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.26.0-WitnessCarrierServiceTelemetry - Added process-only carrier-side
+//! request outcomes without retaining request, identity, route, or frame data
 //! v0.25.0-BoundedWitnessCarrierTelemetry - Added process-only aggregate
 //! availability-recovery telemetry with no authority or persistence changes
 //! v0.24.0-PortableObservationCertificate - Added current-pin, threshold-gated,
@@ -1262,6 +1264,61 @@ pub struct DirectoryObservationWitnessRecoverySnapshot {
     pub last_failure_at: Option<u64>,
 }
 
+/// Process-lifetime aggregate telemetry for this node acting as a witness carrier.
+///
+/// [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] One authenticated request is
+/// reduced to exactly one terminal outcome before entering this snapshot.
+/// Requester, witness, endpoint, route, descriptor, checkpoint, frame, digest,
+/// signature, and user-plane data are deliberately not accepted by this API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirectoryObservationWitnessCarrierSnapshot {
+    /// Authenticated pinned-requester requests completed by this process.
+    pub requests: u64,
+    /// Requests that returned an independently verified target-witness frame.
+    pub forwarded: u64,
+    /// Authenticated requests rejected because the target was not operator-pinned.
+    pub policy_rejected: u64,
+    /// Authenticated requests whose inner frame failed canonical or signature checks.
+    pub invalid_requests: u64,
+    /// Requests whose pinned target descriptor, endpoint, or transport was unavailable.
+    pub target_unavailable: u64,
+    /// Requests whose target explicitly lacked the witness route.
+    pub target_capability_unavailable: u64,
+    /// Requests explicitly rejected by the target witness.
+    pub target_rejected: u64,
+    /// Requests whose successful target response failed bounds or verification.
+    pub target_invalid_response: u64,
+    /// Requests that could not create the bounded local transport client.
+    pub local_failures: u64,
+    /// Latest authenticated carrier request completion timestamp.
+    pub last_request_at: Option<u64>,
+    /// Latest independently verified target response timestamp.
+    pub last_forwarded_at: Option<u64>,
+    /// Latest non-success carrier request timestamp.
+    pub last_failure_at: Option<u64>,
+}
+
+/// Stable mutually exclusive carrier-side request outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryObservationWitnessCarrierOutcome {
+    /// Exact target-witness response verified and returned.
+    Forwarded,
+    /// Target identity was outside the carrier's operator pins.
+    PolicyRejected,
+    /// Inner observer request failed canonical or signature verification.
+    InvalidRequest,
+    /// Target descriptor, endpoint, body stream, or transport was unavailable.
+    TargetUnavailable,
+    /// Target explicitly did not implement the witness route.
+    TargetCapabilityUnavailable,
+    /// Target rejected the otherwise valid forwarded request.
+    TargetRejected,
+    /// Target returned an oversized, malformed, or wrongly signed success body.
+    TargetInvalidResponse,
+    /// Carrier could not initialize its bounded no-proxy transport client.
+    LocalFailure,
+}
+
 /// Runtime-only synchronization observation for one pinned producer.
 ///
 /// These fields intentionally contain no endpoint, full response, descriptor,
@@ -1415,6 +1472,7 @@ pub struct DirectoryReplicaSyncRuntime {
     observations: Mutex<HashMap<[u8; 32], DirectoryReplicaSyncObservation>>,
     observation_witness: Mutex<DirectoryObservationWitnessOutcomeSnapshot>,
     observation_witness_recovery: Mutex<DirectoryObservationWitnessRecoverySnapshot>,
+    observation_witness_carrier: Mutex<DirectoryObservationWitnessCarrierSnapshot>,
     full_node_mirror: Mutex<DirectoryFullNodeMirrorRuntimeSnapshot>,
 }
 
@@ -1667,6 +1725,67 @@ impl DirectoryReplicaSyncRuntime {
         &self,
     ) -> DirectoryObservationWitnessRecoverySnapshot {
         *self.observation_witness_recovery.lock()
+    }
+
+    /// Records one authenticated carrier request as exactly one aggregate outcome.
+    ///
+    /// The caller must perform pinned requester authentication first. No
+    /// identity-bearing or frame-bearing value crosses this runtime boundary.
+    pub fn record_observation_witness_carrier_outcome(
+        &self,
+        outcome: DirectoryObservationWitnessCarrierOutcome,
+        completed_at: u64,
+    ) {
+        if completed_at == 0 {
+            return;
+        }
+        let mut snapshot = self.observation_witness_carrier.lock();
+        snapshot.requests = snapshot.requests.saturating_add(1);
+        snapshot.last_request_at = Some(completed_at);
+        match outcome {
+            DirectoryObservationWitnessCarrierOutcome::Forwarded => {
+                snapshot.forwarded = snapshot.forwarded.saturating_add(1);
+                snapshot.last_forwarded_at = Some(completed_at);
+            }
+            DirectoryObservationWitnessCarrierOutcome::PolicyRejected => {
+                snapshot.policy_rejected = snapshot.policy_rejected.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryObservationWitnessCarrierOutcome::InvalidRequest => {
+                snapshot.invalid_requests = snapshot.invalid_requests.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryObservationWitnessCarrierOutcome::TargetUnavailable => {
+                snapshot.target_unavailable = snapshot.target_unavailable.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryObservationWitnessCarrierOutcome::TargetCapabilityUnavailable => {
+                snapshot.target_capability_unavailable =
+                    snapshot.target_capability_unavailable.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryObservationWitnessCarrierOutcome::TargetRejected => {
+                snapshot.target_rejected = snapshot.target_rejected.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse => {
+                snapshot.target_invalid_response =
+                    snapshot.target_invalid_response.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryObservationWitnessCarrierOutcome::LocalFailure => {
+                snapshot.local_failures = snapshot.local_failures.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+        }
+    }
+
+    /// Returns process-lifetime aggregate telemetry for this node as a carrier.
+    #[must_use]
+    pub fn observation_witness_carrier_snapshot(
+        &self,
+    ) -> DirectoryObservationWitnessCarrierSnapshot {
+        *self.observation_witness_carrier.lock()
     }
 
     /// Records one aggregate bounded non-authoritative mirror round.
@@ -12185,6 +12304,41 @@ mod tests {
         assert_eq!(snapshot.last_attempt_at, Some(NOW + 5));
         assert_eq!(snapshot.last_success_at, Some(NOW + 3));
         assert_eq!(snapshot.last_failure_at, Some(NOW + 5));
+    }
+
+    #[test]
+    fn witness_carrier_runtime_uses_mutually_exclusive_privacy_safe_outcomes() {
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        let outcomes = [
+            DirectoryObservationWitnessCarrierOutcome::Forwarded,
+            DirectoryObservationWitnessCarrierOutcome::PolicyRejected,
+            DirectoryObservationWitnessCarrierOutcome::InvalidRequest,
+            DirectoryObservationWitnessCarrierOutcome::TargetUnavailable,
+            DirectoryObservationWitnessCarrierOutcome::TargetCapabilityUnavailable,
+            DirectoryObservationWitnessCarrierOutcome::TargetRejected,
+            DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse,
+            DirectoryObservationWitnessCarrierOutcome::LocalFailure,
+        ];
+        for (offset, outcome) in outcomes.into_iter().enumerate() {
+            runtime.record_observation_witness_carrier_outcome(
+                outcome,
+                NOW + u64::try_from(offset).unwrap(),
+            );
+        }
+
+        let snapshot = runtime.observation_witness_carrier_snapshot();
+        assert_eq!(snapshot.requests, 8);
+        assert_eq!(snapshot.forwarded, 1);
+        assert_eq!(snapshot.policy_rejected, 1);
+        assert_eq!(snapshot.invalid_requests, 1);
+        assert_eq!(snapshot.target_unavailable, 1);
+        assert_eq!(snapshot.target_capability_unavailable, 1);
+        assert_eq!(snapshot.target_rejected, 1);
+        assert_eq!(snapshot.target_invalid_response, 1);
+        assert_eq!(snapshot.local_failures, 1);
+        assert_eq!(snapshot.last_request_at, Some(NOW + 7));
+        assert_eq!(snapshot.last_forwarded_at, Some(NOW));
+        assert_eq!(snapshot.last_failure_at, Some(NOW + 7));
     }
 
     #[test]

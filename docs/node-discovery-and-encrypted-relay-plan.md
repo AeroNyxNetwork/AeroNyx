@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.34.0 - Live three-node checkpoint-witness carrier validation.
+Modification Reason: v0.35.0 - Privacy-safe witness carrier service telemetry.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.34.0 - [WITNESS-CARRIER-LIVE 2026-07-27 by Codex] Proved the bounded checkpoint-witness carrier path across three audited live nodes, including automatic direct-path restoration and privacy-safe runtime evidence.
+Last Modified: v0.35.0 - [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Added a separate process-only carrier-side status contract so nodes can prove bounded encrypted-evidence transport participation without retaining identities, routes, frames, or payload data.
+Previous: v0.34.0 - [WITNESS-CARRIER-LIVE 2026-07-27 by Codex] Proved the bounded checkpoint-witness carrier path across three audited live nodes, including automatic direct-path restoration and privacy-safe runtime evidence.
 Previous: v0.33.0 - [WITNESS-CARRIER 2026-07-26 by Codex] Added direct-first, one-hop, bounded checkpoint-witness availability recovery through explicitly advertised operator-pinned carriers without expanding witness authority.
 Previous: v0.32.0 - [WITNESS-CATCHUP 2026-07-26 by Codex] Added bounded multi-checkpoint witness catch-up with strict forward progress, same-sequence retry suppression, and additive backlog telemetry.
 Previous: v0.31.0 - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Added a POST-only pinned-peer certificate route plus an operator pull command that separately verifies transport identity, exact frame bytes, local observer/witness pins, threshold, and checkpoint age before schema-v10 import.
@@ -1361,6 +1362,45 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] -->
+2026-07-27 - Added privacy-safe witness carrier service telemetry.
+- Files changed:
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/directory_replica_status.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Runtime contract:
+  - Observer-side recovery counters continue to answer whether this node used
+    another carrier after a direct pinned-witness availability failure.
+  - The new `observation_witness_carrier` status answers whether this process
+    itself authenticated and transported a bounded witness request.
+  - Every request that passes pinned-requester authentication is reduced to
+    exactly one terminal bucket: forwarded, policy rejected, invalid request,
+    target unavailable, target capability unavailable, target rejected, target
+    invalid response, or local transport initialization failure.
+  - The peer and status routers share the same runtime instance. Route
+    availability comes from the actual mount prerequisites, not from storage
+    inference or historical counters.
+- Privacy and authority boundary:
+  - Only process-lifetime counts and relative ages are reported.
+  - Requester, target witness, endpoint, route, descriptor, request id,
+    checkpoint hash, frame, digest, signature, and user-plane data never cross
+    the telemetry API boundary.
+  - Carrier activity cannot affect witness pins, authority, route ranking,
+    reputation, voting, quorum, fork choice, consensus, or finality.
+- Pre-deployment verification:
+  - `cargo check` passed.
+  - Runtime, peer-handler, and public-status focused tests passed.
+  - All 1,202 `aeronyx-server` library tests passed.
+  - Strict `clippy::all` completed successfully and the release binary built.
+- Required live validation:
+  - Deploy the same commit to one observer and one carrier behind the
+    zero-active-session gate.
+  - Force one bounded direct-witness availability failure, then confirm the
+    observer recovery success and carrier-side forwarded counters each advance
+    exactly once without identity-bearing logs.
+
 <!-- [WITNESS-CARRIER-LIVE 2026-07-27 by Codex] -->
 2026-07-27 - Validated Bounded Observation Witness Carrier Recovery V1 across
 three audited live nodes.

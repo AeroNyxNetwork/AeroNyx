@@ -215,6 +215,9 @@
 //      local receipts before listeners start, without exporting policy members.
 //  90. Mounts a rate-limited local/VPN-only Directory Mirror carrier smoke
 //      route that verifies retained signed evidence without importing it.
+//  91. [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Shares one Directory
+//      runtime between witness-carrier peer routes and status routes, exposing
+//      only mutually exclusive process aggregates and never request identity.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -231,6 +234,8 @@
 //     blind coordinator may pack blocks; all other nodes remain followers.
 //   - Coordinator witness reconciliation is evidence collection only. It must
 //     never mutate the canonical chain, elect a leader, or infer fork choice.
+//   - Witness-carrier counters are transport telemetry only. They must not
+//     become peer reputation, authority weight, route ranking, or consensus.
 //   - New-tip notifications are bounded process-local hints. Reconciliation
 //     must always read and verify the current audited storage tip, and periodic
 //     polling must remain available when notifications are coalesced or closed.
@@ -477,9 +482,9 @@ use crate::api::discovery::{
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
-use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica;
+use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
-    build_directory_replica_status_router, DirectoryReplicaStatusScope,
+    build_directory_replica_status_router_with_witness_carrier, DirectoryReplicaStatusScope,
 };
 use crate::api::directory_replica_sync::{
     run_directory_carrier_cold_bootstrap_smoke, run_directory_mirror_carrier_smoke,
@@ -2858,6 +2863,11 @@ impl Server {
                 ),
                 _ => axum::Router::new(),
             };
+            // [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] The status route
+            // receives the exact same mount decision and runtime as the peer
+            // route, so service activity cannot be inferred from storage alone.
+            let witness_carrier_route_enabled =
+                directory_chain_store.is_some() && directory_replica_store.is_some();
             let app = axum::Router::new()
                 .merge(build_voice_router(Arc::clone(&sessions)))
                 .merge(chat_blob_router)
@@ -3081,14 +3091,15 @@ impl Server {
                     discovery_api_policy,
                     local_capability_status,
                 ))
-                .merge(build_directory_replica_status_router(
+                .merge(build_directory_replica_status_router_with_witness_carrier(
                     directory_replica_store.clone(),
-                    directory_replica_sync_runtime,
+                    Arc::clone(&directory_replica_sync_runtime),
                     directory_chain_sync_peer_ids.clone(),
                     directory_observation_witness_min_verified,
                     directory_observation_witness_maturity_delay_secs,
                     directory_full_node_mirror_enabled,
                     directory_full_node_mirror_max_producers,
+                    witness_carrier_route_enabled,
                     DirectoryReplicaStatusScope::LocalOperator,
                 ));
             let app = if let Some(mpi_state) = mpi_state {
@@ -3097,13 +3108,14 @@ impl Server {
                 app
             };
             let app = if let Some(store) = directory_chain_store {
-                app.merge(build_directory_chain_peer_router_with_replica(
+                app.merge(build_directory_chain_peer_router_with_replica_and_runtime(
                     store,
                     directory_replica_store,
                     Arc::clone(&peer_store),
                     Arc::clone(&node_identity),
                     directory_chain_sync_peer_ids,
                     directory_full_node_mirror_enabled,
+                    directory_replica_sync_runtime,
                 ))
             } else {
                 app
@@ -3219,6 +3231,10 @@ impl Server {
         let block_identity = Arc::clone(&node_identity);
         let directory_peer_store = Arc::clone(&peer_store);
         let directory_identity = Arc::clone(&node_identity);
+        // [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Keep public status
+        // capability truth coupled to the actual peer-route prerequisites.
+        let witness_carrier_route_enabled =
+            directory_chain_store.is_some() && directory_replica_store.is_some();
         let app = build_discovery_router_with_local_status(
             Arc::clone(&peer_store),
             discovery_api_policy,
@@ -3232,24 +3248,26 @@ impl Server {
             Arc::clone(&node_identity),
             peer_http_client,
         ))
-        .merge(build_directory_replica_status_router(
+        .merge(build_directory_replica_status_router_with_witness_carrier(
             directory_replica_store.clone(),
-            directory_replica_sync_runtime,
+            Arc::clone(&directory_replica_sync_runtime),
             directory_chain_sync_peer_ids.clone(),
             directory_observation_witness_min_verified,
             directory_observation_witness_maturity_delay_secs,
             directory_full_node_mirror_enabled,
             directory_full_node_mirror_max_producers,
+            witness_carrier_route_enabled,
             DirectoryReplicaStatusScope::PublicAggregate,
         ));
         let app = if let Some(store) = directory_chain_store {
-            app.merge(build_directory_chain_peer_router_with_replica(
+            app.merge(build_directory_chain_peer_router_with_replica_and_runtime(
                 store,
                 directory_replica_store,
                 directory_peer_store,
                 directory_identity,
                 directory_chain_sync_peer_ids,
                 directory_full_node_mirror_enabled,
+                directory_replica_sync_runtime,
             ))
         } else {
             app

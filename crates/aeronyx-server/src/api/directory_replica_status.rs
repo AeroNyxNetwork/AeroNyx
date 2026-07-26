@@ -50,6 +50,9 @@
 //! - [WITNESS-CARRIER 2026-07-26 by Codex] Reports process-only aggregate
 //!   witness-carrier selection, success, capability, transport, exhaustion, and
 //!   fail-closed counters without retaining witness or carrier identities.
+//! - [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Separately reports this
+//!   process acting as a carrier, using one mutually exclusive aggregate
+//!   outcome per authenticated request and no identity-bearing dimensions.
 //! - Reports aggregate routeable carrier and signed-region-hint diversity
 //!   counts while explicitly rejecting operator/ASN diversity claims.
 //! - Separates signed carrier capability evidence from unadvertised
@@ -119,8 +122,12 @@
 //! - Recovery telemetry is aggregate transport health, never carrier reputation.
 //! - [WITNESS-CARRIER 2026-07-26 by Codex] Never expose the selected carrier,
 //!   target witness, endpoint, request id, checkpoint hash, or exact route.
+//! - Carrier-service telemetry proves only bounded transport activity. It must
+//!   never influence witness authority, routing rank, reputation, or policy.
 //!
 //! ## Last Modified
+//! `v0.25.0-WitnessCarrierServiceStatus` - Added additive process-only
+//! carrier-side outcomes and explicit transport-only authority boundaries.
 //! `v0.24.0-BoundedWitnessCarrierRecoveryStatus` - Added additive process-only
 //! direct-first recovery counters and explicit authority/privacy boundaries.
 //! `v0.23.0-BoundedWitnessCatchUpStatus` - Added additive catch-up budget and
@@ -189,8 +196,8 @@ use crate::api::directory_replica_sync::{
     DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
 };
 use crate::services::directory_replica::{
-    DirectoryFullNodeMirrorRuntimeSnapshot, DirectoryObservationWitnessRecoverySnapshot,
-    MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS,
+    DirectoryFullNodeMirrorRuntimeSnapshot, DirectoryObservationWitnessCarrierSnapshot,
+    DirectoryObservationWitnessRecoverySnapshot, MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS,
 };
 use crate::services::{
     DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaIncidentEvidence,
@@ -222,6 +229,7 @@ struct DirectoryReplicaStatusState {
     witness_maturity_delay_secs: u64,
     full_node_mirror_enabled: bool,
     full_node_mirror_max_producers: usize,
+    witness_carrier_route_enabled: bool,
     scope: DirectoryReplicaStatusScope,
 }
 
@@ -387,6 +395,28 @@ struct DirectoryReplicaObservationWitnessRecoveryStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct DirectoryReplicaObservationWitnessCarrierStatus {
+    source_status: &'static str,
+    status: &'static str,
+    route_available: bool,
+    requests: u64,
+    forwarded: u64,
+    policy_rejected: u64,
+    invalid_requests: u64,
+    target_unavailable: u64,
+    target_capability_unavailable: u64,
+    target_rejected: u64,
+    target_invalid_response: u64,
+    local_failures: u64,
+    last_request_age_seconds: Option<u64>,
+    last_forwarded_age_seconds: Option<u64>,
+    last_failure_age_seconds: Option<u64>,
+    authority_boundary: &'static str,
+    privacy_boundary: &'static str,
+    security_model: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct DirectoryFullNodeMirrorStatus {
     enabled: bool,
     status: &'static str,
@@ -515,6 +545,7 @@ struct DirectoryReplicaStatusResponse {
     observation_witness_pipeline: DirectoryReplicaObservationWitnessPipelineStatus,
     observation_witness_outcomes: DirectoryReplicaObservationWitnessOutcomeStatus,
     observation_witness_recovery: DirectoryReplicaObservationWitnessRecoveryStatus,
+    observation_witness_carrier: DirectoryReplicaObservationWitnessCarrierStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     observation_certificate_imports: Option<DirectoryObservationCertificateImportStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -653,6 +684,7 @@ struct DirectoryReplicaRuntimeSnapshots<'a> {
     producers: &'a [DirectoryReplicaSyncObservation],
     observation_witness: &'a DirectoryObservationWitnessOutcomeSnapshot,
     observation_witness_recovery: &'a DirectoryObservationWitnessRecoverySnapshot,
+    observation_witness_carrier: &'a DirectoryObservationWitnessCarrierSnapshot,
     full_node_mirror: &'a DirectoryFullNodeMirrorRuntimeSnapshot,
 }
 
@@ -674,6 +706,37 @@ pub fn build_directory_replica_status_router(
     full_node_mirror_max_producers: usize,
     scope: DirectoryReplicaStatusScope,
 ) -> Router {
+    build_directory_replica_status_router_with_witness_carrier(
+        store,
+        runtime,
+        configured_producers,
+        witness_min_verified,
+        witness_maturity_delay_secs,
+        full_node_mirror_enabled,
+        full_node_mirror_max_producers,
+        false,
+        scope,
+    )
+}
+
+/// Builds status with the real witness-carrier route availability decision.
+///
+/// [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] The compatibility entry point
+/// above defaults this capability to disabled. Production listeners pass the
+/// actual route mount decision so status never infers availability from replica
+/// storage or from a non-zero historical process counter.
+#[allow(clippy::too_many_arguments)]
+pub fn build_directory_replica_status_router_with_witness_carrier(
+    store: Option<Arc<DirectoryReplicaStore>>,
+    runtime: Arc<DirectoryReplicaSyncRuntime>,
+    configured_producers: Vec<[u8; 32]>,
+    witness_min_verified: usize,
+    witness_maturity_delay_secs: u64,
+    full_node_mirror_enabled: bool,
+    full_node_mirror_max_producers: usize,
+    witness_carrier_route_enabled: bool,
+    scope: DirectoryReplicaStatusScope,
+) -> Router {
     runtime.register_producers(&configured_producers);
     let state = DirectoryReplicaStatusState {
         store,
@@ -683,6 +746,7 @@ pub fn build_directory_replica_status_router(
         witness_maturity_delay_secs,
         full_node_mirror_enabled,
         full_node_mirror_max_producers,
+        witness_carrier_route_enabled,
         scope,
     };
     let router = Router::new().route(
@@ -1200,11 +1264,13 @@ async fn directory_replica_status_handler(
     let observation_witness_runtime = state.runtime.observation_witness_snapshot();
     let observation_witness_recovery_runtime =
         state.runtime.observation_witness_recovery_snapshot();
+    let observation_witness_carrier_runtime = state.runtime.observation_witness_carrier_snapshot();
     let full_node_mirror_runtime = state.runtime.full_node_mirror_snapshot();
     let runtime_snapshots = DirectoryReplicaRuntimeSnapshots {
         producers: &runtime,
         observation_witness: &observation_witness_runtime,
         observation_witness_recovery: &observation_witness_recovery_runtime,
+        observation_witness_carrier: &observation_witness_carrier_runtime,
         full_node_mirror: &full_node_mirror_runtime,
     };
     Json(build_directory_replica_status_response(
@@ -1223,6 +1289,7 @@ async fn directory_replica_status_handler(
         policy_anchor_current_pinned_witnesses,
         state.full_node_mirror_enabled,
         state.full_node_mirror_max_producers,
+        state.witness_carrier_route_enabled,
         state.scope,
     ))
     .into_response()
@@ -1687,6 +1754,58 @@ fn build_observation_witness_recovery_status(
     }
 }
 
+fn build_observation_witness_carrier_status(
+    generated_at: u64,
+    route_available: bool,
+    runtime: &DirectoryObservationWitnessCarrierSnapshot,
+) -> DirectoryReplicaObservationWitnessCarrierStatus {
+    let latest_failure_is_newer = match (runtime.last_failure_at, runtime.last_forwarded_at) {
+        (Some(failure), Some(forwarded)) => failure > forwarded,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let status = if !route_available {
+        "disabled"
+    } else if runtime.requests == 0 {
+        "standby"
+    } else if latest_failure_is_newer {
+        "degraded"
+    } else if runtime.forwarded > 0 {
+        "active"
+    } else {
+        "degraded"
+    };
+    DirectoryReplicaObservationWitnessCarrierStatus {
+        source_status: "process_runtime_aggregate",
+        status,
+        route_available,
+        requests: runtime.requests,
+        forwarded: runtime.forwarded,
+        policy_rejected: runtime.policy_rejected,
+        invalid_requests: runtime.invalid_requests,
+        target_unavailable: runtime.target_unavailable,
+        target_capability_unavailable: runtime.target_capability_unavailable,
+        target_rejected: runtime.target_rejected,
+        target_invalid_response: runtime.target_invalid_response,
+        local_failures: runtime.local_failures,
+        last_request_age_seconds: runtime
+            .last_request_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_forwarded_age_seconds: runtime
+            .last_forwarded_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_failure_age_seconds: runtime
+            .last_failure_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        authority_boundary:
+            "carrier_authenticates_and_transports_exact_frames_only;_observer_and_pinned_target_witness_signatures_remain_required",
+        privacy_boundary:
+            "aggregate process counters and ages only; no requester target endpoint route descriptor request id checkpoint hash frame digest signature or user-plane data",
+        security_model:
+            "carrier_transport_activity_not_authority_reputation_routing_rank_vote_quorum_fork_choice_consensus_or_finality",
+    }
+}
+
 fn build_full_node_mirror_status(
     generated_at: u64,
     store_enabled: bool,
@@ -1806,6 +1925,7 @@ fn build_directory_replica_status_response(
     policy_anchor_current_pinned_witnesses: u64,
     full_node_mirror_enabled: bool,
     full_node_mirror_max_producers: usize,
+    witness_carrier_route_enabled: bool,
     scope: DirectoryReplicaStatusScope,
 ) -> DirectoryReplicaStatusResponse {
     let runtime_by_producer = runtime
@@ -1951,6 +2071,11 @@ fn build_directory_replica_status_response(
             store_enabled,
             runtime.observation_witness_recovery,
         ),
+        observation_witness_carrier: build_observation_witness_carrier_status(
+            generated_at,
+            witness_carrier_route_enabled,
+            runtime.observation_witness_carrier,
+        ),
         observation_certificate_imports,
         producers,
         privacy_invariant:
@@ -2095,13 +2220,17 @@ mod tests {
             false,
             now_secs().saturating_sub(1),
         );
+        runtime.record_observation_witness_carrier_outcome(
+            crate::services::directory_replica::DirectoryObservationWitnessCarrierOutcome::Forwarded,
+            now_secs().saturating_sub(1),
+        );
         Ok((Arc::new(store), runtime, producer_id))
     }
 
     #[tokio::test]
     async fn public_scope_redacts_all_producer_identity() -> TestResult {
         let (store, runtime, producer) = status_fixture()?;
-        let router = build_directory_replica_status_router(
+        let router = build_directory_replica_status_router_with_witness_carrier(
             Some(store),
             runtime,
             vec![producer],
@@ -2109,6 +2238,7 @@ mod tests {
             120,
             false,
             32,
+            true,
             DirectoryReplicaStatusScope::PublicAggregate,
         );
         let response = router
@@ -2314,6 +2444,28 @@ mod tests {
         assert_eq!(
             parsed["observation_witness_recovery"]["succeeded"].as_u64(),
             Some(1)
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["status"].as_str(),
+            Some("active")
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["route_available"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["requests"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["forwarded"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["security_model"].as_str(),
+            Some(
+                "carrier_transport_activity_not_authority_reputation_routing_rank_vote_quorum_fork_choice_consensus_or_finality"
+            )
         );
         assert!(parsed.get("producers").is_none());
         assert!(!body_text.contains(&hex::encode(producer)));
