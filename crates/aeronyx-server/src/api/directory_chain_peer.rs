@@ -1435,10 +1435,10 @@ async fn observation_checkpoint_witness_carrier_handler(
         &witness_response_sha256,
         response_frame_bytes,
     );
-    debug!(
-        checkpoint_sequence = carried_request.checkpoint_sequence,
-        "[DIRECTORY_CHAIN] Transported authenticated checkpoint witness response"
-    );
+    // [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Do not emit a per-request
+    // carrier success event. Even an otherwise public checkpoint sequence plus
+    // log time would create a cross-node correlation handle. The aggregate,
+    // process-only outcome below is the complete operational signal.
     witness_carrier_outcome_response(
         &state,
         DirectoryObservationWitnessCarrierOutcome::Forwarded,
