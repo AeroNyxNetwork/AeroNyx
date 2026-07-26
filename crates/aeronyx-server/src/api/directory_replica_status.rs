@@ -36,6 +36,8 @@
 //! - Exports one bounded portable observation certificate on local/VPN
 //!   operator listeners only after re-verifying the observer checkpoint,
 //!   current witness pins, threshold, exact bindings, and every signature.
+//! - Reports the bounded, node-signed third-party certificate import history
+//!   only on the local/VPN operator listener.
 //! - Reports signed quarantine-resolution counts while keeping mutation
 //!   strictly outside every HTTP listener.
 //! - Reports aggregate Full-node Mirror capacity and bounded round health while
@@ -69,7 +71,9 @@
 //! 10. Re-verify canonical incident evidence before an operator-only export.
 //! 11. Build a canonical portable checkpoint+witness certificate only when the
 //!     current pinned witness threshold remains satisfied.
-//! 12. Report mirror transport and bounded recovery separately from pinned
+//! 12. Report imported-certificate capacity and signed history head only to
+//!     the local/VPN operator scope.
+//! 13. Report mirror transport and bounded recovery separately from pinned
 //!     authority observations.
 //!
 //! ## Privacy Invariant
@@ -95,6 +99,8 @@
 //!   validator set, vote, governance mechanism, consensus, or finality claim.
 //! - Never mount incident list/export routes on the public listener.
 //! - Never mount the observation-certificate route on the public listener.
+//! - Never expose the imported-certificate history head or capacity counters
+//!   on the public listener; they describe local trust-policy operations.
 //! - Portable observation certificates are independent signed observations,
 //!   not votes, validator membership, quorum, fork choice, consensus, finality,
 //!   transaction inclusion, or user-content proof.
@@ -105,6 +111,9 @@
 //! - Recovery telemetry is aggregate transport health, never carrier reputation.
 //!
 //! ## Last Modified
+//! `v0.22.0-ObservationCertificateImportStatus` -
+//! [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] Added local-operator-only
+//! aggregate capacity, sequence, and signed-head visibility for schema v10.
 //! `v0.21.0-PortableObservationCertificate` - [PORTABLE-OBSERVATION-CERTIFICATE
 //! 2026-07-26 by Codex] Added a local/VPN operator-only bounded checkpoint and
 //! external-witness certificate export with current-pin and signature
@@ -163,7 +172,9 @@ use crate::api::directory_replica_sync::{
     DIRECTORY_SYNC_MAX_PAGES_PER_ROUND, DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE,
     DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS, DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
 };
-use crate::services::directory_replica::DirectoryFullNodeMirrorRuntimeSnapshot;
+use crate::services::directory_replica::{
+    DirectoryFullNodeMirrorRuntimeSnapshot, MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS,
+};
 use crate::services::{
     DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaIncidentEvidence,
     DirectoryReplicaIncidentSummary, DirectoryReplicaObservationConvergenceSnapshot,
@@ -411,6 +422,20 @@ struct DirectoryReplicaProducerStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct DirectoryObservationCertificateImportStatus {
+    retained_certificates: u64,
+    import_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signed_head_digest: Option<String>,
+    capacity: u64,
+    remaining_capacity: u64,
+    durability: &'static str,
+    verification: &'static str,
+    privacy_boundary: &'static str,
+    security_model: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct DirectoryReplicaStatusResponse {
     contract_version: &'static str,
     generated_at: u64,
@@ -444,6 +469,8 @@ struct DirectoryReplicaStatusResponse {
     observation_witness_policy: DirectoryReplicaObservationWitnessPolicyStatus,
     observation_witness_pipeline: DirectoryReplicaObservationWitnessPipelineStatus,
     observation_witness_outcomes: DirectoryReplicaObservationWitnessOutcomeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation_certificate_imports: Option<DirectoryObservationCertificateImportStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     producers: Option<Vec<DirectoryReplicaProducerStatus>>,
     privacy_invariant: &'static str,
@@ -1698,6 +1725,28 @@ fn build_directory_replica_status_response(
             configured_producers,
         )
     });
+    let observation_certificate_imports =
+        (scope == DirectoryReplicaStatusScope::LocalOperator).then(|| {
+            let capacity = u64::try_from(MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS)
+                .expect("observation certificate capacity is a bounded constant");
+            DirectoryObservationCertificateImportStatus {
+                retained_certificates: persisted.imported_observation_certificates,
+                import_sequence: persisted.imported_observation_certificate_sequence,
+                signed_head_digest: (persisted.imported_observation_certificates > 0)
+                    .then(|| hex::encode(persisted.imported_observation_certificate_head)),
+                capacity,
+                remaining_capacity: capacity
+                    .saturating_sub(persisted.imported_observation_certificates),
+                durability:
+                    "schema_v10_local_node_signed_hash_chain_with_metadata_head_compare_and_swap",
+                verification:
+                    "complete_bounded_restart_audit_of_exact_frames_pins_signatures_and_links",
+                privacy_boundary:
+                    "local operator aggregate import count capacity sequence and signed head only; no observer or witness identities certificate frames endpoints routes or user-plane data",
+                security_model:
+                    "local_observation_evidence_not_vote_validator_set_quorum_fork_choice_consensus_or_finality",
+            }
+        });
     DirectoryReplicaStatusResponse {
         contract_version: "directory_replica_status.v1",
         generated_at,
@@ -1783,6 +1832,7 @@ fn build_directory_replica_status_response(
             &persisted.observation_witness_outcomes,
             runtime.observation_witness,
         ),
+        observation_certificate_imports,
         producers,
         privacy_invariant:
             "directory_replicas_store_only_public_signed_directory_evidence_in_producer_isolated_namespaces",
@@ -2303,10 +2353,7 @@ mod tests {
         assert_eq!(status.last_recovery_carriers_selected, 2);
         assert_eq!(status.last_recovery_routeable_carriers_selected, 2);
         assert_eq!(status.last_recovery_explicit_capability_selected, 2);
-        assert_eq!(
-            status.last_recovery_unadvertised_compatibility_selected,
-            0
-        );
+        assert_eq!(status.last_recovery_unadvertised_compatibility_selected, 0);
         assert_eq!(status.last_recovery_selected_region_hints, 2);
         assert_eq!(status.last_recovery_distinct_region_hints, 2);
         assert!(status
@@ -2355,6 +2402,17 @@ mod tests {
             Some("catching_up")
         );
         assert!(parsed["producers"][0].get("public_endpoint").is_none());
+        assert_eq!(
+            parsed["observation_certificate_imports"]["retained_certificates"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_certificate_imports"]["capacity"].as_u64(),
+            Some(MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS as u64)
+        );
+        assert!(parsed["observation_certificate_imports"]
+            .get("signed_head_digest")
+            .is_none());
         Ok(())
     }
 
@@ -2544,6 +2602,7 @@ mod tests {
             public["catch_up_policy"]["successful_import_clears_retry_atomically"].as_bool(),
             Some(true)
         );
+        assert!(public.get("observation_certificate_imports").is_none());
         assert!(public.get("producers").is_none());
 
         let local_router = build_directory_replica_status_router(
