@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.29.0 - Rust-native, bounded, trust-policy-pinned offline verification of exact portable Directory observation-certificate frames.
+Modification Reason: v0.30.0 - Durable, bounded, node-signed third-party observation-certificate import with complete restart audit.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.29.0 - [PORTABLE-CERTIFICATE-VERIFIER 2026-07-26 by Codex] Added a fail-closed offline verifier command with exact frame SHA-256, canonical-codec, chain, time, pinned observer/witness policy, checkpoint, local threshold, and signature checks.
+Last Modified: v0.30.0 - [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] Added schema v10 and a host-local import command that binds exact foreign certificate bytes and local trust policy into a node-signed, hash-linked, rollback-audited history.
+Previous: v0.29.0 - [PORTABLE-CERTIFICATE-VERIFIER 2026-07-26 by Codex] Added a fail-closed offline verifier command with exact frame SHA-256, canonical-codec, chain, time, pinned observer/witness policy, checkpoint, local threshold, and signature checks.
 Previous: v0.28.0 - [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] Added operator-only export of one observer-signed checkpoint plus independently signed current-pin witness receipts.
 Previous: v0.27.0 - Distinguished mirror convergence from bounded catch-up progress and terminal failure.
 Previous: v0.26.0 - Added capacity-bounded public mirrors that cannot affect checkpoint, witness, or policy authority.
@@ -1184,8 +1185,54 @@ Implemented in Portable Observation Certificate V1:
   threshold. The operator still decides whether the observer and witness set
   belong to its trust policy. The result is not consensus, finality, fork
   choice, transaction inclusion, or proof of user content.
-- No SQLite migration or existing Directory Sync frame changed. Nodes without
-  this export continue their existing sync, witness, mirror, and recovery paths.
+
+Implemented in Durable Third-Party Certificate Import V1:
+
+- `aeronyx-server directory-replica import-observation-certificate` reuses the
+  same service-layer exact-SHA, canonical-codec, production-chain, current-time,
+  signature, pinned-observer, witness-allowlist, and local-threshold verifier:
+
+  ```bash
+  aeronyx-server directory-replica import-observation-certificate \
+    --input /var/lib/aeronyx/evidence/peer-observation-certificate.bin \
+    --expected-sha256 <exact-frame-sha256> \
+    --expected-observer <trusted-external-observer-node-id-hex> \
+    --allowed-witness <trusted-witness-a-node-id-hex> \
+    --allowed-witness <trusted-witness-b-node-id-hex> \
+    --minimum-witnesses 2 \
+    --config /etc/aeronyx/server.toml \
+    --json
+  ```
+
+- The command is host-local and requires the node configuration, node identity
+  key, exact binary frame, external digest, and explicit pins. There is no
+  network mutation endpoint, so an unauthenticated peer cannot fill or alter
+  the import store.
+- SQLite schema v10 adds a hard 4,096-certificate capacity and one append-only
+  import row per accepted frame. Each row binds the exact frame SHA-256,
+  certificate id, observer checkpoint sequence/hash/time, canonical local trust
+  policy digest, verification time, previous import digest, and importer node
+  identity under the local node's Ed25519 signature.
+- Metadata stores the import sequence and head digest. The row insert and head
+  compare-and-swap share one immediate transaction. Exact frame plus exact
+  policy re-import is idempotent; a policy substitution, same-observer
+  same-sequence conflict, older checkpoint, or capacity overflow fails closed.
+- Startup and explicit operator audit walk the complete bounded history,
+  reconstruct every pinned policy, decode and canonically re-encode every
+  frame, verify every observer/witness/importer signature, check the hash links,
+  enforce per-observer monotonically increasing checkpoints, and compare the
+  final row to the metadata head. Deletion, reordering, content mutation,
+  signature mutation, metadata rollback, or observer rollback prevents startup.
+- Aggregate status exposes only retained count, local import sequence, and local
+  head digest. It does not publish observer/witness identities, certificate
+  frames, endpoints, routes, or user-plane data.
+- Imported evidence cannot enter producer admission, route selection,
+  observation convergence, witness-policy membership, voting, fork choice,
+  consensus, global finality, financial state, or proof of user content.
+- Existing Directory Sync wire frames and older node behavior remain
+  compatible. Schema v9 stores migrate atomically to v10 with an empty import
+  history; no signed block, mirror, witness, incident, or policy evidence is
+  rewritten.
 
 Still pending before Directory Chain can be described as live:
 
@@ -1262,6 +1309,30 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+<!-- [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] -->
+2026-07-26 - Added Durable Third-Party Certificate Import V1.
+- Files changed:
+  - crates/aeronyx-server/src/main.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Architecture:
+  - Moved exact-frame and pinned trust-policy verification from CLI-private
+    code into the reusable Directory Replica service boundary.
+  - Added a host-local import command; no public or peer mutation route exists.
+- Persistence:
+  - Schema v10 retains at most 4,096 foreign certificates in a local-node-signed
+    hash chain with metadata-head compare-and-swap.
+  - Every row commits to exact bytes, certificate/checkpoint identity, local
+    trust policy, verification time, previous row, and importer identity.
+- Verification:
+  - Migration, canonical validation, idempotent re-import, restart recovery,
+    observer rollback, same-sequence conflict, policy substitution, content
+    tamper, and row deletion are covered by Rust tests.
+- Security boundary:
+  - This is durable local observation evidence only. It adds no validator set,
+    vote, quorum, fork choice, consensus, finality, financial transaction, user
+    message, or Memory Chain content proof.
+
 <!-- [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] -->
 2026-07-26 - Added Portable Directory Observation Certificate V1.
 - Files changed:

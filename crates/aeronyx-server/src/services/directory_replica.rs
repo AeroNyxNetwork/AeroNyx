@@ -178,6 +178,9 @@
 //! v0.11.0-DirectoryWitnessCapabilityNegotiation - Clarified peer-unavailable witness semantics for rolling upgrades
 //! v0.10.0-DirectoryWitnessOutcomeTelemetry - Added schema v6 privacy-safe durable and runtime witness outcome buckets
 //! v0.9.0-DirectoryEvidenceCarrier - Added transactional audited producer evidence export and carrier-frame audit
+//! v0.30.0-PortableCertificateImport - Added schema v10 with a bounded,
+//! node-signed, hash-linked import history for third-party observation
+//! certificates and complete restart audit.
 //! v0.8.0-DirectoryObservationWitness - Added schema v5, independent checkpoint recomputation, and receipt audit
 //! v0.7.0-DirectoryObservationCheckpoints - Added schema v4, append-only signed
 //! checkpoints, exact-prefix root recomputation, and startup tamper detection.
@@ -205,18 +208,20 @@ use std::time::Duration;
 
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::discovery::{
-    decode_directory_sync_message, directory_block_range_response_signing_bytes,
+    decode_directory_observation_certificate, decode_directory_sync_message,
+    directory_block_range_response_signing_bytes,
     directory_observation_witness_response_signing_bytes,
     directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
-    directory_replica_block_range_response_signing_bytes, encode_directory_sync_message,
-    DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
+    directory_replica_block_range_response_signing_bytes, encode_directory_observation_certificate,
+    encode_directory_sync_message, DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
     DirectoryDescriptorCommitmentV1, DirectoryObservationCertificateV1,
     DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
     DirectoryObservationWitnessReceiptV1, DirectorySyncMessage, SignedNodeDescriptor,
     AERONYX_DIRECTORY_MAINNET_CHAIN_ID, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
     DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1, DIRECTORY_POLICY_ANCHOR_CONFLICT_V1,
     DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1, DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1,
-    MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1, MAX_DIRECTORY_SYNC_BLOCKS_V1,
+    MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES, MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1,
+    MAX_DIRECTORY_SYNC_BLOCKS_V1,
 };
 use bincode::Options;
 use parking_lot::Mutex;
@@ -226,7 +231,8 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 9;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 10;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V9: i64 = 9;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V8: i64 = 8;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V7: i64 = 7;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V6: i64 = 6;
@@ -248,6 +254,8 @@ const MAX_DIRECTORY_OBSERVATION_CHECKPOINT_BYTES: u64 = 4 * 1024;
 const MAX_DIRECTORY_OBSERVATION_WITNESS_BYTES: usize = 2 * 1024;
 const MAX_DIRECTORY_POLICY_ANCHOR_BYTES: usize = 2 * 1024;
 const MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS: usize = 16;
+const MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS: usize = 4_096;
+const DIRECTORY_OBSERVATION_CERTIFICATE_IMPORT_TIMESTAMP_SKEW_SECS: u64 = 60;
 const DIRECTORY_REPLICA_RESOLUTION_ACTION: &str = "resume_existing_prefix";
 const DIRECTORY_REPLICA_RESOLUTION_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Maximum incident summaries returned by one operator API read.
@@ -322,6 +330,220 @@ pub enum DirectoryReplicaStoreError {
     },
 }
 
+/// Operator-owned trust anchors for one portable observation certificate.
+///
+/// [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] Valid signatures prove
+/// authorship, not authority. Every verifier and importer therefore supplies a
+/// pinned observer, a bounded witness allowlist, and a local minimum. The
+/// certificate's self-declared threshold can never weaken this local policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryObservationCertificateTrustPolicy {
+    expected_observer: [u8; 32],
+    allowed_witnesses: Vec<[u8; 32]>,
+    minimum_witnesses: u16,
+}
+
+impl DirectoryObservationCertificateTrustPolicy {
+    /// Builds one canonical pinned trust policy.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError::Request`] for zero identities,
+    /// duplicate witnesses, observer/witness overlap, or an invalid threshold.
+    pub fn new(
+        expected_observer: [u8; 32],
+        mut allowed_witnesses: Vec<[u8; 32]>,
+        minimum_witnesses: u16,
+    ) -> Result<Self, DirectoryReplicaStoreError> {
+        if expected_observer == [0u8; 32]
+            || allowed_witnesses.is_empty()
+            || allowed_witnesses.len() > MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "portable certificate trust policy identity set is invalid".to_string(),
+            ));
+        }
+        allowed_witnesses.sort_unstable();
+        if allowed_witnesses
+            .iter()
+            .any(|witness| *witness == [0u8; 32] || *witness == expected_observer)
+            || allowed_witnesses
+                .windows(2)
+                .any(|witnesses| witnesses[0] == witnesses[1])
+            || minimum_witnesses == 0
+            || usize::from(minimum_witnesses) > allowed_witnesses.len()
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "portable certificate trust policy is not canonical".to_string(),
+            ));
+        }
+        Ok(Self {
+            expected_observer,
+            allowed_witnesses,
+            minimum_witnesses,
+        })
+    }
+
+    /// Pinned observer node identity.
+    #[must_use]
+    pub const fn expected_observer(&self) -> [u8; 32] {
+        self.expected_observer
+    }
+
+    /// Canonically sorted pinned witness identities.
+    #[must_use]
+    pub fn allowed_witnesses(&self) -> &[[u8; 32]] {
+        &self.allowed_witnesses
+    }
+
+    /// Locally required distinct witness count.
+    #[must_use]
+    pub const fn minimum_witnesses(&self) -> u16 {
+        self.minimum_witnesses
+    }
+
+    fn verify(
+        &self,
+        certificate: &DirectoryObservationCertificateV1,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if certificate.checkpoint.observer != self.expected_observer {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation certificate observer does not match the pinned observer".to_string(),
+            ));
+        }
+        if certificate.receipts.iter().any(|receipt| {
+            self.allowed_witnesses
+                .binary_search(&receipt.responder)
+                .is_err()
+        }) {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation certificate contains a witness outside the allowed set".to_string(),
+            ));
+        }
+        if certificate.receipts.len() < usize::from(self.minimum_witnesses) {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation certificate does not satisfy the local witness threshold".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx-DirectoryObservationCertificateTrustPolicy-v1");
+        hasher.update(AERONYX_DIRECTORY_MAINNET_CHAIN_ID);
+        hasher.update(self.expected_observer);
+        hasher.update(self.minimum_witnesses.to_le_bytes());
+        hasher.update(
+            u64::try_from(self.allowed_witnesses.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for witness in &self.allowed_witnesses {
+            hasher.update(witness);
+        }
+        hasher.finalize().into()
+    }
+}
+
+/// Fully verified portable observation certificate and transport bindings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedDirectoryObservationCertificate {
+    /// Decoded canonical certificate.
+    pub certificate: DirectoryObservationCertificateV1,
+    /// Stable certificate identity over checkpoint and exact receipts.
+    pub certificate_id: [u8; 32],
+    /// SHA-256 of the exact canonical frame supplied by the operator.
+    pub certificate_sha256: [u8; 32],
+    /// Stable digest of the local pinned trust policy.
+    pub policy_digest: [u8; 32],
+    /// Host time used for signature and timestamp validation.
+    pub verified_at: u64,
+}
+
+/// Verifies exact bytes, canonical encoding, signatures, bindings, and pins.
+///
+/// # Errors
+/// Returns [`DirectoryReplicaStoreError::Request`] for a malformed, oversized,
+/// non-canonical, mistimed, incorrectly signed, or locally untrusted frame.
+pub fn verify_directory_observation_certificate_frame(
+    frame: &[u8],
+    expected_sha256: &[u8; 32],
+    trust_policy: &DirectoryObservationCertificateTrustPolicy,
+    verified_at: u64,
+) -> Result<VerifiedDirectoryObservationCertificate, DirectoryReplicaStoreError> {
+    if verified_at == 0
+        || frame.is_empty()
+        || frame.len() > MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES
+    {
+        return Err(DirectoryReplicaStoreError::Request(
+            "observation certificate frame size or verification time is invalid".to_string(),
+        ));
+    }
+    let certificate_sha256: [u8; 32] = Sha256::digest(frame).into();
+    if &certificate_sha256 != expected_sha256 {
+        return Err(DirectoryReplicaStoreError::Request(
+            "observation certificate frame SHA-256 mismatch".to_string(),
+        ));
+    }
+    let certificate = decode_directory_observation_certificate(frame).map_err(|error| {
+        DirectoryReplicaStoreError::Request(format!(
+            "observation certificate decode failed: {error}"
+        ))
+    })?;
+    let canonical_frame =
+        encode_directory_observation_certificate(&certificate).map_err(|error| {
+            DirectoryReplicaStoreError::Request(format!(
+                "observation certificate canonical encoding failed: {error}"
+            ))
+        })?;
+    if canonical_frame != frame {
+        return Err(DirectoryReplicaStoreError::Request(
+            "observation certificate frame is not canonically encoded".to_string(),
+        ));
+    }
+    certificate
+        .verify_at(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID, verified_at)
+        .map_err(|error| {
+            DirectoryReplicaStoreError::Request(format!(
+                "observation certificate signature verification failed: {error}"
+            ))
+        })?;
+    trust_policy.verify(&certificate)?;
+    let certificate_id = certificate.hash();
+    Ok(VerifiedDirectoryObservationCertificate {
+        certificate,
+        certificate_id,
+        certificate_sha256,
+        policy_digest: trust_policy.digest(),
+        verified_at,
+    })
+}
+
+/// Result of one durable host-local certificate import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryObservationCertificateImportReport {
+    /// True only when a new signed import row was appended.
+    pub inserted: bool,
+    /// Local append-only import sequence.
+    pub import_sequence: u64,
+    /// Hash-linked digest of the local signed import row.
+    pub import_digest: [u8; 32],
+    /// Stable identity of the imported portable certificate.
+    pub certificate_id: [u8; 32],
+    /// SHA-256 of the exact imported certificate frame.
+    pub certificate_sha256: [u8; 32],
+    /// External observer represented by this certificate.
+    pub observer: [u8; 32],
+    /// External observer checkpoint sequence.
+    pub checkpoint_sequence: u64,
+    /// External observer checkpoint hash.
+    pub checkpoint_hash: [u8; 32],
+    /// Number of certificates retained after the operation.
+    pub retained_certificates: u64,
+    /// Host time at which the frame and local pins were verified.
+    pub verified_at: u64,
+}
+
 /// Aggregate result of a complete replica startup audit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DirectoryReplicaAudit {
@@ -369,6 +591,12 @@ pub struct DirectoryReplicaAudit {
     pub observation_witness_policy_anchor_receipts: u64,
     /// Opaque foreign policy heads this node retains for independent observers.
     pub observation_witness_remote_policy_anchors: u64,
+    /// Third-party portable observation certificates in the audited import log.
+    pub imported_observation_certificates: u64,
+    /// Latest node-signed certificate-import sequence, or zero when empty.
+    pub imported_observation_certificate_sequence: u64,
+    /// Latest node-signed certificate-import digest, or zero when empty.
+    pub imported_observation_certificate_head: [u8; 32],
     /// Number of audited producer-local retry rows.
     pub retry_states: u64,
 }
@@ -420,6 +648,12 @@ pub struct DirectoryReplicaStoreSnapshot {
     pub observation_witness_policy_anchor_receipts: u64,
     /// Opaque foreign policy heads this node retains for independent observers.
     pub observation_witness_remote_policy_anchors: u64,
+    /// Third-party portable observation certificates retained after audit.
+    pub imported_observation_certificates: u64,
+    /// Latest local certificate-import sequence, or zero when empty.
+    pub imported_observation_certificate_sequence: u64,
+    /// Latest local certificate-import digest, or zero when empty.
+    pub imported_observation_certificate_head: [u8; 32],
     /// Per-producer accepted-prefix summaries for local operator presentation.
     pub producer_snapshots: Vec<DirectoryReplicaProducerSnapshot>,
 }
@@ -1345,10 +1579,7 @@ impl DirectoryReplicaSyncRuntime {
         completed_at: u64,
     ) {
         if completed_at == 0
-            || converged
-                .saturating_add(catching_up)
-                .saturating_add(failed)
-                != selected
+            || converged.saturating_add(catching_up).saturating_add(failed) != selected
         {
             return;
         }
@@ -1363,9 +1594,7 @@ impl DirectoryReplicaSyncRuntime {
         snapshot.last_round_catching_up = u64::try_from(catching_up).unwrap_or(u64::MAX);
         snapshot.last_round_pages_succeeded = pages_succeeded;
         snapshot.last_round_requests_sent = requests_sent;
-        snapshot.pages_succeeded = snapshot
-            .pages_succeeded
-            .saturating_add(pages_succeeded);
+        snapshot.pages_succeeded = snapshot.pages_succeeded.saturating_add(pages_succeeded);
         snapshot.requests_sent = snapshot.requests_sent.saturating_add(requests_sent);
         snapshot.attempts_failed = snapshot
             .attempts_failed
@@ -1425,9 +1654,9 @@ impl DirectoryReplicaSyncRuntime {
         snapshot.last_recovery_explicit_capability_candidates =
             explicit_capability_candidates.min(candidates);
         snapshot.last_recovery_unadvertised_compatibility_candidates =
-            unadvertised_compatibility_candidates.min(candidates.saturating_sub(
-                snapshot.last_recovery_explicit_capability_candidates,
-            ));
+            unadvertised_compatibility_candidates.min(
+                candidates.saturating_sub(snapshot.last_recovery_explicit_capability_candidates),
+            );
         snapshot.last_recovery_capability_cached_unavailable =
             capability_cached_unavailable.min(candidates);
         snapshot.last_recovery_carriers_selected = selected.min(candidates);
@@ -1559,6 +1788,130 @@ struct StoredObservationWitnessPolicyAnchorReceiptRow {
     witness_node_id: Vec<u8>,
     witnessed_at: i64,
     response_blob: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct StoredObservationCertificateImportRow {
+    import_sequence: i64,
+    import_digest: Vec<u8>,
+    previous_import_digest: Vec<u8>,
+    certificate_id: Vec<u8>,
+    observer: Vec<u8>,
+    checkpoint_sequence: i64,
+    checkpoint_hash: Vec<u8>,
+    checkpoint_observed_at: i64,
+    certificate_sha256: Vec<u8>,
+    certificate_frame: Vec<u8>,
+    policy_digest: Vec<u8>,
+    policy_minimum_witnesses: i64,
+    policy_witness_count: i64,
+    policy_witness_node_ids: Vec<u8>,
+    verified_at: i64,
+    importer_node_id: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+/// One local-node-signed link in the imported certificate history.
+///
+/// The signature does not promote foreign evidence into consensus. It proves
+/// only which exact bytes and local trust policy this node accepted, and where
+/// that decision sits in this node's append-only history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryObservationCertificateImportEntry {
+    import_sequence: u64,
+    previous_import_digest: [u8; 32],
+    certificate_id: [u8; 32],
+    observer: [u8; 32],
+    checkpoint_sequence: u64,
+    checkpoint_hash: [u8; 32],
+    checkpoint_observed_at: u64,
+    certificate_sha256: [u8; 32],
+    policy_digest: [u8; 32],
+    verified_at: u64,
+    importer_node_id: [u8; 32],
+    signature: [u8; 64],
+}
+
+impl DirectoryObservationCertificateImportEntry {
+    fn sign(
+        identity: &IdentityKeyPair,
+        import_sequence: u64,
+        previous_import_digest: [u8; 32],
+        verified: &VerifiedDirectoryObservationCertificate,
+    ) -> Result<Self, DirectoryReplicaStoreError> {
+        let checkpoint = &verified.certificate.checkpoint;
+        let mut entry = Self {
+            import_sequence,
+            previous_import_digest,
+            certificate_id: verified.certificate_id,
+            observer: checkpoint.observer,
+            checkpoint_sequence: checkpoint.sequence,
+            checkpoint_hash: checkpoint.hash(),
+            checkpoint_observed_at: checkpoint.observed_at,
+            certificate_sha256: verified.certificate_sha256,
+            policy_digest: verified.policy_digest,
+            verified_at: verified.verified_at,
+            importer_node_id: identity.public_key_bytes(),
+            signature: [0u8; 64],
+        };
+        entry.validate_unsigned_fields()?;
+        entry.signature = identity.sign(&entry.signing_bytes());
+        Ok(entry)
+    }
+
+    fn validate_unsigned_fields(&self) -> Result<(), DirectoryReplicaStoreError> {
+        if self.import_sequence == 0
+            || self.certificate_id == [0u8; 32]
+            || self.observer == [0u8; 32]
+            || self.checkpoint_sequence == 0
+            || self.checkpoint_hash == [0u8; 32]
+            || self.checkpoint_observed_at == 0
+            || self.certificate_sha256 == [0u8; 32]
+            || self.policy_digest == [0u8; 32]
+            || self.verified_at == 0
+            || self.importer_node_id == [0u8; 32]
+            || self.checkpoint_observed_at
+                > self
+                    .verified_at
+                    .saturating_add(DIRECTORY_OBSERVATION_CERTIFICATE_IMPORT_TIMESTAMP_SKEW_SECS)
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation certificate import contains an invalid sentinel".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(360);
+        bytes.extend_from_slice(b"AeroNyx-DirectoryObservationCertificateImport-v1");
+        bytes.extend_from_slice(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID);
+        bytes.extend_from_slice(&self.import_sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.previous_import_digest);
+        bytes.extend_from_slice(&self.certificate_id);
+        bytes.extend_from_slice(&self.observer);
+        bytes.extend_from_slice(&self.checkpoint_sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.checkpoint_hash);
+        bytes.extend_from_slice(&self.checkpoint_observed_at.to_le_bytes());
+        bytes.extend_from_slice(&self.certificate_sha256);
+        bytes.extend_from_slice(&self.policy_digest);
+        bytes.extend_from_slice(&self.verified_at.to_le_bytes());
+        bytes.extend_from_slice(&self.importer_node_id);
+        bytes
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.signing_bytes());
+        hasher.update(self.signature);
+        hasher.finalize().into()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ObservationCertificateImportAudit {
+    imports: u64,
+    head: [u8; 32],
 }
 
 /// One node-identity-signed, hash-linked local witness admission policy.
@@ -2308,9 +2661,7 @@ impl DirectoryReplicaStore {
     ///
     /// Identities are for internal scheduling only and must not be exposed by
     /// public status. Registry membership grants no checkpoint or witness role.
-    pub(crate) fn mirror_producer_ids(
-        &self,
-    ) -> Result<Vec<[u8; 32]>, DirectoryReplicaStoreError> {
+    pub(crate) fn mirror_producer_ids(&self) -> Result<Vec<[u8; 32]>, DirectoryReplicaStoreError> {
         let rows = {
             let connection = self.connection.lock();
             Self::validate_metadata(&connection, &self.local_node_id)?;
@@ -2382,15 +2733,17 @@ impl DirectoryReplicaStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut promoted = 0u64;
         for producer in unique {
-            promoted = promoted.saturating_add(u64::try_from(transaction.execute(
-                "DELETE FROM directory_replica_mirror_producers WHERE producer = ?1",
-                params![producer.as_slice()],
-            )?)
-            .map_err(|_| {
-                DirectoryReplicaStoreError::Integrity(
-                    "directory mirror promotion count exceeds u64".to_string(),
-                )
-            })?);
+            promoted = promoted.saturating_add(
+                u64::try_from(transaction.execute(
+                    "DELETE FROM directory_replica_mirror_producers WHERE producer = ?1",
+                    params![producer.as_slice()],
+                )?)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "directory mirror promotion count exceeds u64".to_string(),
+                    )
+                })?,
+            );
         }
         transaction.commit()?;
         drop(connection);
@@ -2850,6 +3203,35 @@ impl DirectoryReplicaStore {
             )?,
             "remote observation policy anchor count",
         )?;
+        let (import_sequence, import_head, import_count) = connection.query_row(
+            "SELECT m.certificate_import_sequence, m.certificate_import_head,
+                    (SELECT COUNT(*) FROM directory_observation_certificate_imports)
+             FROM directory_replica_meta m WHERE m.singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        snapshot.imported_observation_certificate_sequence =
+            nonnegative_i64_to_u64(import_sequence, "certificate import status sequence")?;
+        snapshot.imported_observation_certificates =
+            nonnegative_i64_to_u64(import_count, "certificate import status count")?;
+        snapshot.imported_observation_certificate_head = import_head
+            .as_deref()
+            .map(|value| bytes32(value, "certificate import status head"))
+            .transpose()?
+            .unwrap_or([0u8; 32]);
+        if snapshot.imported_observation_certificates
+            != snapshot.imported_observation_certificate_sequence
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "certificate import status count does not match metadata".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -3743,6 +4125,263 @@ impl DirectoryReplicaStore {
             DirectoryReplicaStoreError::Integrity(format!(
                 "portable observation certificate failed verification: {error}"
             ))
+        })
+    }
+
+    /// Imports one externally observed certificate into the local signed log.
+    ///
+    /// The operation is host-local, bounded, append-only, and idempotent for
+    /// the exact same certificate and policy. A rollback or conflicting
+    /// checkpoint for the same observer is rejected before any row changes.
+    /// Imported evidence never affects producer selection, fork choice,
+    /// routing, authorization, consensus, or finality.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] when verification or pins fail,
+    /// the observer attempts a rollback/equivocation, capacity is exhausted,
+    /// existing history fails audit, or the metadata compare-and-swap fails.
+    pub fn import_observation_certificate(
+        &self,
+        frame: &[u8],
+        expected_sha256: &[u8; 32],
+        trust_policy: &DirectoryObservationCertificateTrustPolicy,
+        identity: &IdentityKeyPair,
+        verified_at: u64,
+    ) -> Result<DirectoryObservationCertificateImportReport, DirectoryReplicaStoreError> {
+        if identity.public_key_bytes() != self.local_node_id {
+            return Err(DirectoryReplicaStoreError::Request(
+                "certificate importer identity does not match replica metadata".to_string(),
+            ));
+        }
+        let verified = verify_directory_observation_certificate_frame(
+            frame,
+            expected_sha256,
+            trust_policy,
+            verified_at,
+        )?;
+        let checkpoint = &verified.certificate.checkpoint;
+        if checkpoint.observer == self.local_node_id {
+            return Err(DirectoryReplicaStoreError::Request(
+                "local observation certificate cannot be imported as third-party evidence"
+                    .to_string(),
+            ));
+        }
+
+        let mut connection = self.connection.lock();
+        Self::validate_metadata(&connection, &self.local_node_id)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let audited = Self::audit_observation_certificate_imports(
+            &transaction,
+            &self.local_node_id,
+            verified_at,
+        )?;
+
+        let existing = transaction
+            .query_row(
+                "SELECT import_sequence, import_digest, certificate_sha256,
+                        policy_digest, observer, checkpoint_sequence,
+                        checkpoint_hash, verified_at
+                 FROM directory_observation_certificate_imports
+                 WHERE certificate_id = ?1",
+                params![verified.certificate_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((
+            import_sequence,
+            import_digest,
+            certificate_sha256,
+            policy_digest,
+            observer,
+            checkpoint_sequence,
+            checkpoint_hash,
+            existing_verified_at,
+        )) = existing
+        {
+            if bytes32(&certificate_sha256, "imported certificate SHA-256")?
+                != verified.certificate_sha256
+                || bytes32(&observer, "imported certificate observer")? != checkpoint.observer
+                || positive_i64_to_u64(
+                    checkpoint_sequence,
+                    "imported certificate checkpoint sequence",
+                )? != checkpoint.sequence
+                || bytes32(&checkpoint_hash, "imported certificate checkpoint hash")?
+                    != checkpoint.hash()
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "existing observation certificate import conflicts with exact evidence"
+                        .to_string(),
+                ));
+            }
+            if bytes32(&policy_digest, "imported certificate policy digest")?
+                != verified.policy_digest
+            {
+                return Err(DirectoryReplicaStoreError::Request(
+                    "observation certificate was already imported under a different local trust policy"
+                        .to_string(),
+                ));
+            }
+            return Ok(DirectoryObservationCertificateImportReport {
+                inserted: false,
+                import_sequence: positive_i64_to_u64(
+                    import_sequence,
+                    "certificate import sequence",
+                )?,
+                import_digest: bytes32(&import_digest, "certificate import digest")?,
+                certificate_id: verified.certificate_id,
+                certificate_sha256: verified.certificate_sha256,
+                observer: checkpoint.observer,
+                checkpoint_sequence: checkpoint.sequence,
+                checkpoint_hash: checkpoint.hash(),
+                retained_certificates: audited.imports,
+                verified_at: positive_i64_to_u64(
+                    existing_verified_at,
+                    "certificate import verification timestamp",
+                )?,
+            });
+        }
+
+        let latest_for_observer = transaction
+            .query_row(
+                "SELECT checkpoint_sequence, certificate_id
+                 FROM directory_observation_certificate_imports
+                 WHERE observer = ?1
+                 ORDER BY checkpoint_sequence DESC LIMIT 1",
+                params![checkpoint.observer.as_slice()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_sequence, stored_certificate_id)) = latest_for_observer {
+            let stored_sequence =
+                positive_i64_to_u64(stored_sequence, "latest imported checkpoint sequence")?;
+            if checkpoint.sequence < stored_sequence {
+                return Err(DirectoryReplicaStoreError::Request(
+                    "observation certificate checkpoint would roll back this observer".to_string(),
+                ));
+            }
+            if checkpoint.sequence == stored_sequence {
+                let stored_certificate_id =
+                    bytes32(&stored_certificate_id, "latest imported certificate id")?;
+                return Err(DirectoryReplicaStoreError::Request(format!(
+                    "observation certificate conflicts at checkpoint sequence {} ({})",
+                    checkpoint.sequence,
+                    hex::encode(stored_certificate_id)
+                )));
+            }
+        }
+        let retained_imports = usize::try_from(audited.imports).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation certificate import count exceeds platform capacity".to_string(),
+            )
+        })?;
+        if retained_imports >= MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS {
+            return Err(DirectoryReplicaStoreError::Request(
+                "observation certificate import capacity is exhausted".to_string(),
+            ));
+        }
+
+        let import_sequence = audited.imports.checked_add(1).ok_or_else(|| {
+            DirectoryReplicaStoreError::Integrity(
+                "observation certificate import sequence exhausted".to_string(),
+            )
+        })?;
+        let entry = DirectoryObservationCertificateImportEntry::sign(
+            identity,
+            import_sequence,
+            audited.head,
+            &verified,
+        )?;
+        let import_digest = entry.digest();
+        let witness_node_ids = trust_policy
+            .allowed_witnesses()
+            .iter()
+            .flat_map(|node_id| node_id.iter().copied())
+            .collect::<Vec<_>>();
+        transaction.execute(
+            "INSERT INTO directory_observation_certificate_imports
+                (import_sequence, import_digest, previous_import_digest,
+                 certificate_id, observer, checkpoint_sequence, checkpoint_hash,
+                 checkpoint_observed_at, certificate_sha256, certificate_frame,
+                 policy_digest, policy_minimum_witnesses, policy_witness_count,
+                 policy_witness_node_ids, verified_at, importer_node_id, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16, ?17)",
+            params![
+                u64_to_i64(import_sequence, "certificate import sequence")?,
+                import_digest.as_slice(),
+                audited.head.as_slice(),
+                entry.certificate_id.as_slice(),
+                entry.observer.as_slice(),
+                u64_to_i64(
+                    entry.checkpoint_sequence,
+                    "imported certificate checkpoint sequence"
+                )?,
+                entry.checkpoint_hash.as_slice(),
+                u64_to_i64(
+                    entry.checkpoint_observed_at,
+                    "imported certificate checkpoint timestamp"
+                )?,
+                entry.certificate_sha256.as_slice(),
+                frame,
+                entry.policy_digest.as_slice(),
+                i64::from(trust_policy.minimum_witnesses()),
+                i64::try_from(trust_policy.allowed_witnesses().len()).map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "certificate policy witness count exceeds i64".to_string(),
+                    )
+                })?,
+                witness_node_ids,
+                u64_to_i64(
+                    entry.verified_at,
+                    "certificate import verification timestamp"
+                )?,
+                entry.importer_node_id.as_slice(),
+                entry.signature.as_slice(),
+            ],
+        )?;
+        let metadata_changed = transaction.execute(
+            "UPDATE directory_replica_meta
+             SET certificate_import_sequence = ?1, certificate_import_head = ?2
+             WHERE singleton = 1
+               AND certificate_import_sequence = ?3
+               AND ((?3 = 0 AND certificate_import_head IS NULL)
+                    OR (?3 > 0 AND certificate_import_head = ?4))",
+            params![
+                u64_to_i64(import_sequence, "certificate import sequence")?,
+                import_digest.as_slice(),
+                u64_to_i64(audited.imports, "previous certificate import sequence")?,
+                audited.head.as_slice(),
+            ],
+        )?;
+        if metadata_changed != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation certificate import metadata compare-and-swap failed".to_string(),
+            ));
+        }
+        transaction.commit()?;
+
+        Ok(DirectoryObservationCertificateImportReport {
+            inserted: true,
+            import_sequence,
+            import_digest,
+            certificate_id: entry.certificate_id,
+            certificate_sha256: entry.certificate_sha256,
+            observer: entry.observer,
+            checkpoint_sequence: entry.checkpoint_sequence,
+            checkpoint_hash: entry.checkpoint_hash,
+            retained_certificates: import_sequence,
+            verified_at: entry.verified_at,
         })
     }
 
@@ -4661,15 +5300,17 @@ impl DirectoryReplicaStore {
 
         for block in blocks {
             for commitment in &block.commitments {
-                let descriptor = descriptors.get(&commitment.descriptor_hash).ok_or_else(|| {
-                    DirectoryReplicaStoreError::Integrity(
-                        "carrier page is missing an exact descriptor object".to_string(),
-                    )
-                })?;
+                let descriptor = descriptors
+                    .get(&commitment.descriptor_hash)
+                    .ok_or_else(|| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "carrier page is missing an exact descriptor object".to_string(),
+                        )
+                    })?;
                 let derived = DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor)
                     .map_err(|error| {
-                        DirectoryReplicaStoreError::Descriptor(error.to_string())
-                    })?;
+                    DirectoryReplicaStoreError::Descriptor(error.to_string())
+                })?;
                 if derived != *commitment {
                     return Err(DirectoryReplicaStoreError::Integrity(
                         "carrier descriptor object does not match its block commitment".to_string(),
@@ -4733,13 +5374,7 @@ impl DirectoryReplicaStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let producer_existed = Self::producer_row_exists(&transaction, &producer)?;
         Self::ensure_producer_row(&transaction, &producer, observed_at)?;
-        Self::reconcile_import_mode(
-            &transaction,
-            &producer,
-            observed_at,
-            producer_existed,
-            mode,
-        )?;
+        Self::reconcile_import_mode(&transaction, &producer, observed_at, producer_existed, mode)?;
         let mut tip = Self::load_tip(&transaction, &producer)?;
         if tip.quarantined {
             return Err(DirectoryReplicaStoreError::Quarantined(
@@ -5445,6 +6080,236 @@ impl DirectoryReplicaStore {
         Ok(verified)
     }
 
+    fn audit_observation_certificate_imports(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<ObservationCertificateImportAudit, DirectoryReplicaStoreError> {
+        let (metadata_sequence, metadata_head) = connection.query_row(
+            "SELECT certificate_import_sequence, certificate_import_head
+             FROM directory_replica_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+        )?;
+        let metadata_sequence = nonnegative_i64_to_u64(
+            metadata_sequence,
+            "replica metadata certificate import sequence",
+        )?;
+        let metadata_head = metadata_head
+            .as_deref()
+            .map(|value| bytes32(value, "replica metadata certificate import head"))
+            .transpose()?;
+
+        let mut statement = connection.prepare(
+            "SELECT import_sequence, import_digest, previous_import_digest,
+                    certificate_id, observer, checkpoint_sequence, checkpoint_hash,
+                    checkpoint_observed_at, certificate_sha256, certificate_frame,
+                    policy_digest, policy_minimum_witnesses, policy_witness_count,
+                    policy_witness_node_ids, verified_at, importer_node_id, signature
+             FROM directory_observation_certificate_imports
+             ORDER BY import_sequence ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(StoredObservationCertificateImportRow {
+                    import_sequence: row.get(0)?,
+                    import_digest: row.get(1)?,
+                    previous_import_digest: row.get(2)?,
+                    certificate_id: row.get(3)?,
+                    observer: row.get(4)?,
+                    checkpoint_sequence: row.get(5)?,
+                    checkpoint_hash: row.get(6)?,
+                    checkpoint_observed_at: row.get(7)?,
+                    certificate_sha256: row.get(8)?,
+                    certificate_frame: row.get(9)?,
+                    policy_digest: row.get(10)?,
+                    policy_minimum_witnesses: row.get(11)?,
+                    policy_witness_count: row.get(12)?,
+                    policy_witness_node_ids: row.get(13)?,
+                    verified_at: row.get(14)?,
+                    importer_node_id: row.get(15)?,
+                    signature: row.get(16)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if rows.len() > MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "observation certificate import history exceeds capacity".to_string(),
+            ));
+        }
+
+        let mut audit = ObservationCertificateImportAudit::default();
+        let mut latest_by_observer = BTreeMap::<[u8; 32], u64>::new();
+        for row in rows {
+            let import_sequence =
+                positive_i64_to_u64(row.import_sequence, "certificate import sequence")?;
+            let expected_sequence = audit.imports.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "certificate import audit sequence exhausted".to_string(),
+                )
+            })?;
+            let stored_import_digest = bytes32(&row.import_digest, "certificate import digest")?;
+            let previous_import_digest = bytes32(
+                &row.previous_import_digest,
+                "previous certificate import digest",
+            )?;
+            let observer = bytes32(&row.observer, "imported certificate observer")?;
+            let checkpoint_sequence = positive_i64_to_u64(
+                row.checkpoint_sequence,
+                "imported certificate checkpoint sequence",
+            )?;
+            let checkpoint_hash =
+                bytes32(&row.checkpoint_hash, "imported certificate checkpoint hash")?;
+            let checkpoint_observed_at = positive_i64_to_u64(
+                row.checkpoint_observed_at,
+                "imported certificate checkpoint timestamp",
+            )?;
+            let certificate_sha256 =
+                bytes32(&row.certificate_sha256, "imported certificate SHA-256")?;
+            let policy_digest = bytes32(&row.policy_digest, "imported certificate policy digest")?;
+            let minimum_witnesses = u16::try_from(positive_i64_to_u64(
+                row.policy_minimum_witnesses,
+                "imported certificate policy threshold",
+            )?)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "imported certificate policy threshold exceeds u16".to_string(),
+                )
+            })?;
+            let witness_count = usize::try_from(positive_i64_to_u64(
+                row.policy_witness_count,
+                "imported certificate policy witness count",
+            )?)
+            .map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "imported certificate witness count exceeds usize".to_string(),
+                )
+            })?;
+            if witness_count > MAX_DIRECTORY_OBSERVATION_PRODUCERS_V1
+                || row.policy_witness_node_ids.len() != witness_count.saturating_mul(32)
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "imported certificate witness policy blob is malformed".to_string(),
+                ));
+            }
+            let allowed_witnesses = row
+                .policy_witness_node_ids
+                .chunks_exact(32)
+                .map(|node_id| bytes32(node_id, "imported certificate policy witness"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let verified_at =
+                positive_i64_to_u64(row.verified_at, "certificate import verification timestamp")?;
+            if verified_at
+                > observed_at
+                    .saturating_add(DIRECTORY_OBSERVATION_CERTIFICATE_IMPORT_TIMESTAMP_SKEW_SECS)
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "certificate import verification timestamp is in the future".to_string(),
+                ));
+            }
+            let importer_node_id =
+                bytes32(&row.importer_node_id, "certificate importer node identity")?;
+            let signature = bytes64(&row.signature, "certificate import signature")?;
+            let certificate_id = bytes32(&row.certificate_id, "imported certificate identity")?;
+            if import_sequence != expected_sequence
+                || previous_import_digest != audit.head
+                || observer == *local_node_id
+                || importer_node_id != *local_node_id
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "observation certificate import history is not canonical".to_string(),
+                ));
+            }
+            if latest_by_observer
+                .get(&observer)
+                .is_some_and(|previous_sequence| checkpoint_sequence <= *previous_sequence)
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "observation certificate import history rolls back or conflicts".to_string(),
+                ));
+            }
+
+            let trust_policy = DirectoryObservationCertificateTrustPolicy::new(
+                observer,
+                allowed_witnesses,
+                minimum_witnesses,
+            )
+            .map_err(|error| {
+                DirectoryReplicaStoreError::Integrity(format!(
+                    "imported certificate trust policy is invalid: {error}"
+                ))
+            })?;
+            let verified = verify_directory_observation_certificate_frame(
+                &row.certificate_frame,
+                &certificate_sha256,
+                &trust_policy,
+                verified_at,
+            )
+            .map_err(|error| {
+                DirectoryReplicaStoreError::Integrity(format!(
+                    "imported observation certificate failed audit: {error}"
+                ))
+            })?;
+            if verified.certificate_id != certificate_id
+                || verified.policy_digest != policy_digest
+                || verified.certificate.checkpoint.observer != observer
+                || verified.certificate.checkpoint.sequence != checkpoint_sequence
+                || verified.certificate.checkpoint.hash() != checkpoint_hash
+                || verified.certificate.checkpoint.observed_at != checkpoint_observed_at
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "imported observation certificate row does not match its frame".to_string(),
+                ));
+            }
+            let entry = DirectoryObservationCertificateImportEntry {
+                import_sequence,
+                previous_import_digest,
+                certificate_id,
+                observer,
+                checkpoint_sequence,
+                checkpoint_hash,
+                checkpoint_observed_at,
+                certificate_sha256,
+                policy_digest,
+                verified_at,
+                importer_node_id,
+                signature,
+            };
+            entry.validate_unsigned_fields()?;
+            IdentityPublicKey::from_bytes(&entry.importer_node_id)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "certificate importer identity is invalid".to_string(),
+                    )
+                })?
+                .verify(&entry.signing_bytes(), &entry.signature)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "certificate import signature is invalid".to_string(),
+                    )
+                })?;
+            if entry.digest() != stored_import_digest {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "certificate import digest is invalid".to_string(),
+                ));
+            }
+            audit.imports = expected_sequence;
+            audit.head = stored_import_digest;
+            latest_by_observer.insert(observer, checkpoint_sequence);
+        }
+
+        if audit.imports != metadata_sequence
+            || (audit.imports == 0 && metadata_head.is_some())
+            || (audit.imports > 0 && metadata_head != Some(audit.head))
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "certificate import metadata head does not match audited history".to_string(),
+            ));
+        }
+        Ok(audit)
+    }
+
     fn audit_connection(
         connection: &Connection,
         local_node_id: &[u8; 32],
@@ -5466,6 +6331,8 @@ impl DirectoryReplicaStore {
                 "policy anchor receipt count exceeds u64".to_string(),
             )
         })?;
+        let observation_certificate_imports =
+            Self::audit_observation_certificate_imports(connection, local_node_id, observed_at)?;
         let (observation_checkpoints, observation_tip) =
             Self::audit_observation_checkpoints(connection, local_node_id, observed_at)?;
         let observation_witnesses =
@@ -5519,6 +6386,9 @@ impl DirectoryReplicaStore {
                 .unwrap_or(0),
             observation_witness_policy_anchor_receipts,
             observation_witness_remote_policy_anchors,
+            imported_observation_certificates: observation_certificate_imports.imports,
+            imported_observation_certificate_sequence: observation_certificate_imports.imports,
+            imported_observation_certificate_head: observation_certificate_imports.head,
             ..DirectoryReplicaAudit::default()
         };
         for tip in producers {
@@ -5576,10 +6446,8 @@ impl DirectoryReplicaStore {
             let admitted_at = positive_i64_to_u64(*admitted_at, "directory mirror admission")?;
             let last_selected_at =
                 positive_i64_to_u64(*last_selected_at, "directory mirror selection")?;
-            let descriptor_sequence = positive_i64_to_u64(
-                *descriptor_sequence,
-                "directory mirror descriptor sequence",
-            )?;
+            let descriptor_sequence =
+                positive_i64_to_u64(*descriptor_sequence, "directory mirror descriptor sequence")?;
             if producer == [0u8; 32]
                 || producer == *local_node_id
                 || last_selected_at < admitted_at
@@ -5624,8 +6492,17 @@ impl DirectoryReplicaStore {
                      CHECK (witness_policy_epoch >= 0),
                  witness_policy_head BLOB
                      CHECK (witness_policy_head IS NULL OR length(witness_policy_head) = 32),
+                 certificate_import_sequence INTEGER NOT NULL DEFAULT 0
+                     CHECK (certificate_import_sequence >= 0),
+                 certificate_import_head BLOB
+                     CHECK (certificate_import_head IS NULL
+                         OR length(certificate_import_head) = 32),
                  CHECK ((witness_policy_epoch = 0 AND witness_policy_head IS NULL)
-                     OR (witness_policy_epoch > 0 AND witness_policy_head IS NOT NULL))
+                     OR (witness_policy_epoch > 0 AND witness_policy_head IS NOT NULL)),
+                 CHECK ((certificate_import_sequence = 0
+                         AND certificate_import_head IS NULL)
+                     OR (certificate_import_sequence > 0
+                         AND certificate_import_head IS NOT NULL))
              );
              CREATE TABLE IF NOT EXISTS directory_replica_chains (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
@@ -5860,6 +6737,38 @@ impl DirectoryReplicaStore {
                  ON directory_observation_policy_anchor_receipts(
                      policy_epoch, witness_node_id
                  );
+             CREATE TABLE IF NOT EXISTS directory_observation_certificate_imports (
+                 import_sequence INTEGER PRIMARY KEY CHECK (import_sequence > 0),
+                 import_digest BLOB NOT NULL UNIQUE CHECK (length(import_digest) = 32),
+                 previous_import_digest BLOB NOT NULL UNIQUE
+                     CHECK (length(previous_import_digest) = 32),
+                 certificate_id BLOB NOT NULL UNIQUE CHECK (length(certificate_id) = 32),
+                 observer BLOB NOT NULL CHECK (length(observer) = 32),
+                 checkpoint_sequence INTEGER NOT NULL CHECK (checkpoint_sequence > 0),
+                 checkpoint_hash BLOB NOT NULL CHECK (length(checkpoint_hash) = 32),
+                 checkpoint_observed_at INTEGER NOT NULL CHECK (checkpoint_observed_at > 0),
+                 certificate_sha256 BLOB NOT NULL UNIQUE
+                     CHECK (length(certificate_sha256) = 32),
+                 certificate_frame BLOB NOT NULL
+                     CHECK (length(certificate_frame) BETWEEN 1 AND 65537),
+                 policy_digest BLOB NOT NULL CHECK (length(policy_digest) = 32),
+                 policy_minimum_witnesses INTEGER NOT NULL
+                     CHECK (policy_minimum_witnesses BETWEEN 1 AND 16),
+                 policy_witness_count INTEGER NOT NULL
+                     CHECK (policy_witness_count BETWEEN 1 AND 16),
+                 policy_witness_node_ids BLOB NOT NULL
+                     CHECK (length(policy_witness_node_ids) BETWEEN 32 AND 512),
+                 verified_at INTEGER NOT NULL CHECK (verified_at > 0),
+                 importer_node_id BLOB NOT NULL CHECK (length(importer_node_id) = 32),
+                 signature BLOB NOT NULL CHECK (length(signature) = 64),
+                 UNIQUE (observer, checkpoint_sequence),
+                 CHECK (policy_minimum_witnesses <= policy_witness_count),
+                 CHECK (length(policy_witness_node_ids) = policy_witness_count * 32)
+             );
+             CREATE INDEX IF NOT EXISTS directory_observation_certificate_imports_by_observer
+                 ON directory_observation_certificate_imports(
+                     observer, checkpoint_sequence DESC
+                 );
              CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
                  consecutive_failures INTEGER NOT NULL
@@ -5918,6 +6827,16 @@ impl DirectoryReplicaStore {
                         Self::require_resolution_columns(transaction)?;
                         Self::require_witness_policy_metadata_columns(transaction)?;
                         Self::require_mirror_registry_table(transaction)?;
+                        Self::require_certificate_import_metadata_columns(transaction)?;
+                        Self::require_certificate_import_table(transaction)?;
+                    }
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V9 => {
+                        Self::require_resolution_columns(transaction)?;
+                        Self::require_witness_policy_metadata_columns(transaction)?;
+                        Self::require_mirror_registry_table(transaction)?;
+                        Self::add_certificate_import_metadata_columns(transaction)?;
+                        Self::require_certificate_import_table(transaction)?;
+                        Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V8
                     | DIRECTORY_REPLICA_SCHEMA_VERSION_V7
@@ -5928,12 +6847,16 @@ impl DirectoryReplicaStore {
                         Self::require_resolution_columns(transaction)?;
                         Self::add_witness_policy_metadata_columns(transaction)?;
                         Self::require_mirror_registry_table(transaction)?;
+                        Self::add_certificate_import_metadata_columns(transaction)?;
+                        Self::require_certificate_import_table(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V1 | DIRECTORY_REPLICA_SCHEMA_VERSION_V2 => {
                         Self::add_resolution_columns(transaction)?;
                         Self::add_witness_policy_metadata_columns(transaction)?;
                         Self::require_mirror_registry_table(transaction)?;
+                        Self::add_certificate_import_metadata_columns(transaction)?;
+                        Self::require_certificate_import_table(transaction)?;
                         transaction.execute(
                             "UPDATE directory_replica_chains AS c
                              SET active_incident_digest = (
@@ -6075,6 +6998,58 @@ impl DirectoryReplicaStore {
         Ok(())
     }
 
+    fn add_certificate_import_metadata_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::metadata_has_column(transaction, "certificate_import_sequence")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_meta
+                 ADD COLUMN certificate_import_sequence INTEGER NOT NULL DEFAULT 0
+                 CHECK (certificate_import_sequence >= 0);",
+            )?;
+        }
+        if !Self::metadata_has_column(transaction, "certificate_import_head")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_meta
+                 ADD COLUMN certificate_import_head BLOB
+                 CHECK (certificate_import_head IS NULL
+                     OR length(certificate_import_head) = 32);",
+            )?;
+        }
+        Self::require_certificate_import_metadata_columns(transaction)
+    }
+
+    fn require_certificate_import_metadata_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::metadata_has_column(transaction, "certificate_import_sequence")?
+            || !Self::metadata_has_column(transaction, "certificate_import_head")?
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema v10 certificate import metadata is missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_certificate_import_table(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        let present: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table'
+               AND name = 'directory_observation_certificate_imports'",
+            [],
+            |row| row.get(0),
+        )?;
+        if present != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema v10 certificate import table is missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn metadata_has_column(
         transaction: &Transaction<'_>,
         expected: &str,
@@ -6104,7 +7079,8 @@ impl DirectoryReplicaStore {
         let metadata = connection
             .query_row(
                 "SELECT schema_version, chain_id, local_node_id,
-                        witness_policy_epoch, witness_policy_head
+                        witness_policy_epoch, witness_policy_head,
+                        certificate_import_sequence, certificate_import_head
                  FROM directory_replica_meta WHERE singleton = 1",
                 [],
                 |row| {
@@ -6114,6 +7090,8 @@ impl DirectoryReplicaStore {
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
                     ))
                 },
             )
@@ -6143,6 +7121,18 @@ impl DirectoryReplicaStore {
         if (policy_epoch == 0) != policy_head.is_none() {
             return Err(DirectoryReplicaStoreError::Integrity(
                 "directory replica witness policy metadata is inconsistent".to_string(),
+            ));
+        }
+        let certificate_import_sequence =
+            nonnegative_i64_to_u64(metadata.5, "replica metadata certificate import sequence")?;
+        let certificate_import_head = metadata
+            .6
+            .as_deref()
+            .map(|value| bytes32(value, "replica metadata certificate import head"))
+            .transpose()?;
+        if (certificate_import_sequence == 0) != certificate_import_head.is_none() {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica certificate import metadata is inconsistent".to_string(),
             ));
         }
         Ok(())
@@ -8640,6 +9630,92 @@ mod tests {
         }
     }
 
+    fn portable_observation_certificate_fixture(
+        observer: &IdentityKeyPair,
+        witnesses: &[&IdentityKeyPair],
+        checkpoint_sequence: u64,
+        checkpoint_salt: u8,
+        verified_at: u64,
+    ) -> (
+        Vec<u8>,
+        [u8; 32],
+        DirectoryObservationCertificateTrustPolicy,
+    ) {
+        let producer_a = IdentityKeyPair::from_bytes(&[0x41; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x42; 32]).unwrap();
+        let checkpoint = DirectoryObservationCheckpointV1::new_signed(
+            checkpoint_sequence,
+            verified_at - 2,
+            [checkpoint_salt; 32],
+            2,
+            vec![
+                DirectoryObservationTipV1 {
+                    producer: producer_a.public_key_bytes(),
+                    tip_height: checkpoint_sequence + 10,
+                    tip_hash: [checkpoint_salt.wrapping_add(1); 32],
+                },
+                DirectoryObservationTipV1 {
+                    producer: producer_b.public_key_bytes(),
+                    tip_height: checkpoint_sequence + 11,
+                    tip_hash: [checkpoint_salt.wrapping_add(2); 32],
+                },
+            ],
+            [checkpoint_salt.wrapping_add(3); 32],
+            observer,
+        )
+        .unwrap();
+        let receipts = witnesses
+            .iter()
+            .enumerate()
+            .map(|(index, witness)| {
+                let request_seed = u8::try_from(index).unwrap().wrapping_add(0x50);
+                let request_id = [request_seed; 16];
+                let checkpoint_hash = checkpoint.hash();
+                let responder = witness.public_key_bytes();
+                let signing_bytes = directory_observation_witness_response_signing_bytes(
+                    &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                    &request_id,
+                    &observer.public_key_bytes(),
+                    checkpoint.sequence,
+                    &checkpoint_hash,
+                    &responder,
+                    verified_at - 1,
+                    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+                );
+                DirectoryObservationWitnessReceiptV1 {
+                    chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                    request_id,
+                    observer: observer.public_key_bytes(),
+                    checkpoint_sequence: checkpoint.sequence,
+                    checkpoint_hash,
+                    responder,
+                    response_timestamp: verified_at - 1,
+                    outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+                    signature: witness.sign(&signing_bytes),
+                }
+            })
+            .collect::<Vec<_>>();
+        let certificate = DirectoryObservationCertificateV1::new_verified(
+            checkpoint,
+            u16::try_from(witnesses.len()).unwrap(),
+            receipts,
+            verified_at,
+        )
+        .unwrap();
+        let frame = encode_directory_observation_certificate(&certificate).unwrap();
+        let frame_sha256 = Sha256::digest(&frame).into();
+        let trust_policy = DirectoryObservationCertificateTrustPolicy::new(
+            observer.public_key_bytes(),
+            witnesses
+                .iter()
+                .map(|witness| witness.public_key_bytes())
+                .collect(),
+            u16::try_from(witnesses.len()).unwrap(),
+        )
+        .unwrap();
+        (frame, frame_sha256, trust_policy)
+    }
+
     fn policy_anchor_request(
         observer: &IdentityKeyPair,
         anchor: DirectoryObservationWitnessPolicyAnchor,
@@ -8850,7 +9926,10 @@ mod tests {
                 NOW + 20,
             )
             .unwrap();
-        assert_eq!(store.mirror_producer_ids().unwrap(), vec![mirror_a.public_key_bytes()]);
+        assert_eq!(
+            store.mirror_producer_ids().unwrap(),
+            vec![mirror_a.public_key_bytes()]
+        );
         assert_eq!(store.status_snapshot().unwrap().mirror_producers, 1);
         assert!(matches!(
             store.import_verified_mirror_page(
@@ -8866,7 +9945,13 @@ mod tests {
             ),
             Err(DirectoryReplicaStoreError::MirrorCapacity)
         ));
-        assert_eq!(store.producer_tip(&mirror_b.public_key_bytes()).unwrap().tip_height, 0);
+        assert_eq!(
+            store
+                .producer_tip(&mirror_b.public_key_bytes())
+                .unwrap()
+                .tip_height,
+            0
+        );
         store
             .import_verified_mirror_page(
                 mirror_b.public_key_bytes(),
@@ -8914,12 +9999,7 @@ mod tests {
         assert!(store.mirror_producer_ids().unwrap().is_empty());
         assert_eq!(store.audit(NOW + 21).unwrap().mirror_producers, 0);
         assert!(matches!(
-            store.audited_mirror_evidence_page(
-                &mirror_a.public_key_bytes(),
-                1,
-                1,
-                NOW + 21,
-            ),
+            store.audited_mirror_evidence_page(&mirror_a.public_key_bytes(), 1, 1, NOW + 21,),
             Err(DirectoryReplicaStoreError::MirrorNotRetained)
         ));
         assert!(matches!(
@@ -9086,6 +10166,299 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_v9_is_atomically_migrated_to_v10_certificate_import_history() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x08; 32]).unwrap();
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE directory_observation_certificate_imports;
+                 ALTER TABLE directory_replica_meta RENAME TO directory_replica_meta_v10;
+                 CREATE TABLE directory_replica_meta (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL,
+                     chain_id BLOB NOT NULL CHECK (length(chain_id) = 32),
+                     local_node_id BLOB NOT NULL CHECK (length(local_node_id) = 32),
+                     witness_policy_epoch INTEGER NOT NULL DEFAULT 0
+                         CHECK (witness_policy_epoch >= 0),
+                     witness_policy_head BLOB
+                         CHECK (witness_policy_head IS NULL
+                             OR length(witness_policy_head) = 32)
+                 );
+                 INSERT INTO directory_replica_meta
+                     (singleton, schema_version, chain_id, local_node_id,
+                      witness_policy_epoch, witness_policy_head)
+                 SELECT singleton, 9, chain_id, local_node_id,
+                        witness_policy_epoch, witness_policy_head
+                 FROM directory_replica_meta_v10;
+                 DROP TABLE directory_replica_meta_v10;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21).unwrap();
+        assert_eq!(audit.imported_observation_certificates, 0);
+        let connection = store.connection.lock();
+        let (version, import_columns, import_table): (i64, i64, String) = connection
+            .query_row(
+                "SELECT m.schema_version,
+                        (SELECT COUNT(*) FROM pragma_table_info('directory_replica_meta')
+                         WHERE name IN (
+                             'certificate_import_sequence',
+                             'certificate_import_head'
+                         )),
+                        t.name
+                 FROM directory_replica_meta m
+                 JOIN sqlite_master t
+                   ON t.type = 'table'
+                  AND t.name = 'directory_observation_certificate_imports'
+                 WHERE m.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(import_columns, 2);
+        assert_eq!(import_table, "directory_observation_certificate_imports");
+    }
+
+    #[test]
+    fn portable_certificate_import_is_idempotent_and_restart_audited() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x09; 32]).unwrap();
+        let observer = IdentityKeyPair::from_bytes(&[0x0a; 32]).unwrap();
+        let witness_a = IdentityKeyPair::from_bytes(&[0x0b; 32]).unwrap();
+        let witness_b = IdentityKeyPair::from_bytes(&[0x0c; 32]).unwrap();
+        let verified_at = NOW + 50;
+        let (frame, frame_sha256, trust_policy) = portable_observation_certificate_fixture(
+            &observer,
+            &[&witness_a, &witness_b],
+            7,
+            0x0d,
+            verified_at,
+        );
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), verified_at).unwrap();
+        let inserted = store
+            .import_observation_certificate(
+                &frame,
+                &frame_sha256,
+                &trust_policy,
+                &local,
+                verified_at,
+            )
+            .unwrap();
+        assert!(inserted.inserted);
+        assert_eq!(inserted.import_sequence, 1);
+        assert_eq!(inserted.retained_certificates, 1);
+        assert_eq!(inserted.checkpoint_sequence, 7);
+
+        let unchanged = store
+            .import_observation_certificate(
+                &frame,
+                &frame_sha256,
+                &trust_policy,
+                &local,
+                verified_at + 1,
+            )
+            .unwrap();
+        assert!(!unchanged.inserted);
+        assert_eq!(unchanged.import_sequence, inserted.import_sequence);
+        assert_eq!(unchanged.import_digest, inserted.import_digest);
+        assert_eq!(unchanged.verified_at, inserted.verified_at);
+        let snapshot = store.status_snapshot().unwrap();
+        assert_eq!(snapshot.imported_observation_certificates, 1);
+        assert_eq!(snapshot.imported_observation_certificate_sequence, 1);
+        assert_eq!(
+            snapshot.imported_observation_certificate_head,
+            inserted.import_digest
+        );
+        drop(store);
+
+        let (reopened, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), verified_at + 2).unwrap();
+        assert_eq!(audit.imported_observation_certificates, 1);
+        assert_eq!(audit.imported_observation_certificate_sequence, 1);
+        assert_eq!(
+            audit.imported_observation_certificate_head,
+            inserted.import_digest
+        );
+        assert_eq!(
+            reopened
+                .status_snapshot()
+                .unwrap()
+                .imported_observation_certificates,
+            1
+        );
+    }
+
+    #[test]
+    fn portable_certificate_import_rejects_rollback_conflict_and_policy_change() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x0e; 32]).unwrap();
+        let observer = IdentityKeyPair::from_bytes(&[0x0f; 32]).unwrap();
+        let witness_a = IdentityKeyPair::from_bytes(&[0x10; 32]).unwrap();
+        let witness_b = IdentityKeyPair::from_bytes(&[0x11; 32]).unwrap();
+        let verified_at = NOW + 50;
+        let (frame, frame_sha256, trust_policy) = portable_observation_certificate_fixture(
+            &observer,
+            &[&witness_a, &witness_b],
+            7,
+            0x12,
+            verified_at,
+        );
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), verified_at).unwrap();
+        store
+            .import_observation_certificate(
+                &frame,
+                &frame_sha256,
+                &trust_policy,
+                &local,
+                verified_at,
+            )
+            .unwrap();
+
+        let weaker_policy = DirectoryObservationCertificateTrustPolicy::new(
+            observer.public_key_bytes(),
+            vec![witness_a.public_key_bytes(), witness_b.public_key_bytes()],
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.import_observation_certificate(
+                &frame,
+                &frame_sha256,
+                &weaker_policy,
+                &local,
+                verified_at + 1,
+            ),
+            Err(DirectoryReplicaStoreError::Request(_))
+        ));
+
+        let (rollback_frame, rollback_sha256, rollback_policy) =
+            portable_observation_certificate_fixture(
+                &observer,
+                &[&witness_a, &witness_b],
+                6,
+                0x13,
+                verified_at + 1,
+            );
+        assert!(matches!(
+            store.import_observation_certificate(
+                &rollback_frame,
+                &rollback_sha256,
+                &rollback_policy,
+                &local,
+                verified_at + 1,
+            ),
+            Err(DirectoryReplicaStoreError::Request(_))
+        ));
+
+        let (conflict_frame, conflict_sha256, conflict_policy) =
+            portable_observation_certificate_fixture(
+                &observer,
+                &[&witness_a, &witness_b],
+                7,
+                0x14,
+                verified_at + 1,
+            );
+        assert!(matches!(
+            store.import_observation_certificate(
+                &conflict_frame,
+                &conflict_sha256,
+                &conflict_policy,
+                &local,
+                verified_at + 1,
+            ),
+            Err(DirectoryReplicaStoreError::Request(_))
+        ));
+        assert_eq!(
+            store
+                .status_snapshot()
+                .unwrap()
+                .imported_observation_certificates,
+            1
+        );
+    }
+
+    #[test]
+    fn tampered_or_deleted_certificate_import_fails_restart_audit() {
+        let run_case = |delete_row: bool| {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("directory.db");
+            let local = IdentityKeyPair::from_bytes(&[0x15; 32]).unwrap();
+            let observer = IdentityKeyPair::from_bytes(&[0x16; 32]).unwrap();
+            let witness = IdentityKeyPair::from_bytes(&[0x17; 32]).unwrap();
+            let verified_at = NOW + 50;
+            let (frame, frame_sha256, trust_policy) = portable_observation_certificate_fixture(
+                &observer,
+                &[&witness],
+                8,
+                0x18,
+                verified_at,
+            );
+            let (store, _) =
+                DirectoryReplicaStore::open(&path, local.public_key_bytes(), verified_at).unwrap();
+            store
+                .import_observation_certificate(
+                    &frame,
+                    &frame_sha256,
+                    &trust_policy,
+                    &local,
+                    verified_at,
+                )
+                .unwrap();
+            {
+                let connection = store.connection.lock();
+                if delete_row {
+                    connection
+                        .execute(
+                            "DELETE FROM directory_observation_certificate_imports
+                             WHERE import_sequence = 1",
+                            [],
+                        )
+                        .unwrap();
+                } else {
+                    let mut stored_frame: Vec<u8> = connection
+                        .query_row(
+                            "SELECT certificate_frame
+                             FROM directory_observation_certificate_imports
+                             WHERE import_sequence = 1",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let last = stored_frame.len() - 1;
+                    stored_frame[last] ^= 1;
+                    connection
+                        .execute(
+                            "UPDATE directory_observation_certificate_imports
+                             SET certificate_frame = ?1 WHERE import_sequence = 1",
+                            params![stored_frame],
+                        )
+                        .unwrap();
+                }
+            }
+            assert!(store.audit(verified_at + 1).is_err());
+            drop(store);
+            assert!(
+                DirectoryReplicaStore::open(&path, local.public_key_bytes(), verified_at + 1)
+                    .is_err()
+            );
+        };
+        run_case(false);
+        run_case(true);
     }
 
     #[test]
@@ -9273,7 +10646,10 @@ mod tests {
             (1, 1)
         );
         assert_eq!(
-            mirror_destination.producer_tip(&producer.public_key_bytes()).unwrap().tip_height,
+            mirror_destination
+                .producer_tip(&producer.public_key_bytes())
+                .unwrap()
+                .tip_height,
             1
         );
 
