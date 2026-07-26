@@ -7,6 +7,9 @@
 #   nodes without requiring manual git/build/systemd commands.
 #
 # Modification Reason:
+# - [PINNED-RUST-BUILD 2026-07-26 by Codex] Pin release builds to
+#   rust-toolchain.toml, isolate Cargo output from the live binary, validate the
+#   staged result, and promote it atomically.
 # - Write a local, privacy-safe upgrade status snapshot so nodeboard, health
 #   checks, AI assistants, and operators can understand which upgrade stage is
 #   running or failed without scraping shell logs.
@@ -91,8 +94,12 @@
 #   ETXTBSY and can leave the node without a usable rollback.
 # - Keep Cargo.lock tracked for this binary workspace. Dependency updates must
 #   be reviewed in source control, never resolved ad hoc during node upgrade.
+# - Keep rust-toolchain.toml exact and Cargo output outside the stable systemd
+#   binary path until candidate validation succeeds.
 #
 # Last Modified:
+# v1.16.0-node-deploy - Pins the Rust compiler and atomically promotes builds
+#                       from a toolchain/service-scoped target directory.
 # v1.15.0-node-deploy - Requires the tracked Cargo.lock dependency graph for release builds.
 # v1.14.0-node-deploy - Hardened model-aware restart readiness, running-image
 #                       backup, and atomic binary rollback after a reproduced
@@ -135,6 +142,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
 STATE_DIR="/var/lib/aeronyx"
+BUILD_TARGET_ROOT="${AERONYX_BUILD_TARGET_ROOT:-${STATE_DIR}/build-targets}"
 RELEASE_DIR="/var/lib/aeronyx/releases"
 UPGRADE_STATUS_FILE="/var/lib/aeronyx/upgrade-status.json"
 NETWORK_RESTORE_SERVICE="aeronyx-network-restore.service"
@@ -158,6 +166,10 @@ BACKUP_SERVICE_FILE=""
 BACKUP_NETWORK_RESTORE_FILE=""
 CURRENT_UPGRADE_STEP="not_started"
 CURRENT_UPGRADE_MESSAGE="Upgrade workflow has not started."
+PINNED_RUST_CHANNEL=""
+RUSTUP_BIN=""
+BUILD_TARGET_DIR=""
+BUILD_BINARY=""
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -299,8 +311,11 @@ require_root() {
 }
 
 validate_service_name() {
+    # [SERVICE-NAME-PATH-GUARD 2026-07-26 by Codex] The service name also
+    # scopes build and release paths, so reject path aliases in addition to
+    # separators and option-like values.
     case "${SERVICE_NAME}" in
-        ""|-*|*/*)
+        ""|-*|*/*|.|..)
             die "Invalid service name: ${SERVICE_NAME}"
             ;;
     esac
@@ -380,6 +395,67 @@ ensure_cargo_path() {
     die "cargo not found. Install Rust or run deploy/node/install.sh first."
 }
 
+resolve_rustup_bin() {
+    local candidate
+    candidate="$(command -v rustup 2>/dev/null || true)"
+    if [ -z "${candidate}" ] && [ -x "${HOME}/.cargo/bin/rustup" ]; then
+        candidate="${HOME}/.cargo/bin/rustup"
+        export PATH="${HOME}/.cargo/bin:${PATH}"
+    fi
+    printf '%s\n' "${candidate}"
+}
+
+read_pinned_rust_channel() {
+    local toolchain_file="${REPO_DIR}/rust-toolchain.toml"
+    [ -f "${toolchain_file}" ] || die "Missing repository toolchain pin: ${toolchain_file}"
+
+    awk -F'"' '
+        /^[[:space:]]*channel[[:space:]]*=/ {
+            print $2
+            exit
+        }
+    ' "${toolchain_file}"
+}
+
+# [PINNED-RUST-BUILD 2026-07-26 by Codex] Compiler identity and Cargo output
+# location are part of the production release contract, not host-local state.
+configure_pinned_rust_build() {
+    local current_release
+
+    PINNED_RUST_CHANNEL="$(read_pinned_rust_channel)"
+    printf '%s' "${PINNED_RUST_CHANNEL}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+        || die "rust-toolchain.toml must pin an exact X.Y.Z release."
+
+    RUSTUP_BIN="$(resolve_rustup_bin)"
+    if [ -n "${RUSTUP_BIN}" ]; then
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            printf '[DRY-RUN] %s toolchain install %s --profile minimal\n' \
+                "${RUSTUP_BIN}" "${PINNED_RUST_CHANNEL}"
+        elif ! "${RUSTUP_BIN}" run "${PINNED_RUST_CHANNEL}" rustc --version >/dev/null 2>&1; then
+            "${RUSTUP_BIN}" toolchain install "${PINNED_RUST_CHANNEL}" --profile minimal
+        fi
+    else
+        current_release="$(rustc --version 2>/dev/null | awk '{print $2}' || true)"
+        [ "${current_release}" = "${PINNED_RUST_CHANNEL}" ] \
+            || die "Rust ${PINNED_RUST_CHANNEL} is required; found ${current_release:-none}. Run deploy/node/install.sh to install rustup."
+        command -v cargo >/dev/null 2>&1 || die "cargo is unavailable for the pinned system toolchain."
+    fi
+
+    BUILD_TARGET_DIR="${BUILD_TARGET_ROOT}/rust-${PINNED_RUST_CHANNEL}/${SERVICE_NAME}"
+    BUILD_BINARY="${BUILD_TARGET_DIR}/release/aeronyx-server"
+    run mkdir -p "${BUILD_TARGET_DIR}"
+    ok "Pinned Rust toolchain: ${PINNED_RUST_CHANNEL}"
+    ok "Isolated Cargo target: ${BUILD_TARGET_DIR}"
+}
+
+run_pinned_cargo() {
+    if [ -n "${RUSTUP_BIN}" ]; then
+        "${RUSTUP_BIN}" run "${PINNED_RUST_CHANNEL}" cargo "$@"
+    else
+        cargo "$@"
+    fi
+}
+
 active_sessions() {
     if ! command -v curl >/dev/null 2>&1; then
         printf 'unknown'
@@ -450,26 +526,43 @@ build_release() {
 
     log "Building release binary"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s cargo build --locked -p aeronyx-server --release\n' "${REPO_DIR}" "${build_git_commit}"
+        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s CARGO_TARGET_DIR=%s rustup run %s cargo build --locked -p aeronyx-server --release\n' \
+            "${REPO_DIR}" "${build_git_commit}" "${BUILD_TARGET_DIR}" "${PINNED_RUST_CHANNEL}"
     else
-        # [REPRODUCIBLE-RUST-BUILD 2026-07-23 by Codex] Fail before Cargo can
-        # resolve or update dependencies outside the reviewed release graph.
+        # [REPRODUCIBLE-RUST-BUILD 2026-07-26 by Codex] Fail before Cargo can
+        # change the reviewed dependency/compiler graph or write over the live
+        # binary path.
         [ -f "${REPO_DIR}/Cargo.lock" ] \
             || die "Tracked Cargo.lock is required for reproducible node upgrades."
         (
             cd "${REPO_DIR}"
-            AERONYX_GIT_COMMIT="${build_git_commit}" cargo build --locked -p aeronyx-server --release
+            export AERONYX_GIT_COMMIT="${build_git_commit}"
+            export CARGO_TARGET_DIR="${BUILD_TARGET_DIR}"
+            run_pinned_cargo build --locked -p aeronyx-server --release
         )
     fi
 }
 
 validate_config() {
     local binary
-    binary="${REPO_DIR}/target/release/aeronyx-server"
+    binary="${BUILD_BINARY}"
     [ "${DRY_RUN}" -eq 1 ] || [ -x "${binary}" ] || die "Binary not found: ${binary}"
 
     log "Validating config: ${CONFIG_FILE}"
     run "${binary}" validate -c "${CONFIG_FILE}"
+}
+
+promote_built_binary() {
+    local binary staging
+    binary="${REPO_DIR}/target/release/aeronyx-server"
+    staging="${binary}.upgrade.$$"
+
+    # [ATOMIC-BINARY-PROMOTION 2026-07-26 by Codex] The service keeps its
+    # stable ExecStart path, but Cargo never writes that path directly.
+    run mkdir -p "$(dirname "${binary}")"
+    run install -m 0755 "${BUILD_BINARY}" "${staging}"
+    run mv -f "${staging}" "${binary}"
+    ok "Validated release binary promoted atomically: ${binary}"
 }
 
 backup_current_service_unit() {
@@ -815,6 +908,8 @@ main() {
     backup_current_binary
     set_upgrade_step "repository" "Updating AeroNyx source from Git."
     update_source
+    set_upgrade_step "toolchain" "Selecting the repository-pinned Rust toolchain and isolated target."
+    configure_pinned_rust_build
     set_upgrade_step "build" "Building AeroNyx Rust release binary."
     build_release
     set_upgrade_step "validate" "Validating AeroNyx server configuration."
@@ -826,6 +921,10 @@ main() {
         rollback_network_restore_unit
         die "Upgrade failed while syncing network restore unit."
     fi
+    # [ATOMIC-BINARY-PROMOTION 2026-07-26 by Codex] Keep the stable binary
+    # untouched until every non-runtime deployment artifact has been prepared.
+    set_upgrade_step "promote" "Promoting the validated Rust release binary atomically."
+    promote_built_binary
     set_upgrade_step "restart" "Restarting AeroNyx service when restart policy allows it."
     restart_service
     if [ "${NO_RESTART}" -eq 0 ]; then

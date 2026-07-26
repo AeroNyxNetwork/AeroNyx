@@ -32,6 +32,8 @@
 # - Use workspace inheritance for common dependencies
 # - All crates should use the same async runtime (tokio)
 #
+# Last Modified: v0.2.1-PinnedToolchain - Clarified MSRV versus the exact
+# production release compiler declared by rust-toolchain.toml.
 # Last Modified: v0.2.0-BlindIssuer - Added an isolated blind-signing process.
 # Version alignment fix for client compatibility
 # ============================================
@@ -49,6 +51,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# [PINNED-RUST-TOOLCHAIN 2026-07-26 by Codex] This remains the workspace MSRV
+# contract. Production release reproducibility is separately pinned to one
+# exact compiler in rust-toolchain.toml.
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aeronyx/aeronyx-server"

@@ -1,0 +1,31 @@
+# ============================================
+# File: rust-toolchain.toml
+# ============================================
+# Creation Reason:
+# - Pin production node builds to one audited Rust compiler release.
+#
+# Main Functionality:
+# - Makes rustup select the same minimal toolchain on developer, CI, and node
+#   hosts instead of following the moving `stable` channel.
+#
+# Dependencies:
+# - Cargo.toml and the repository-tracked Cargo.lock.
+# - deploy/node/install.sh and deploy/node/upgrade.sh validate this channel.
+#
+# Main Logical Flow:
+# 1. rustup reads this file when a command runs inside the repository.
+# 2. Deployment scripts verify/install this exact channel.
+# 3. Cargo builds the locked dependency graph in a toolchain-scoped target.
+#
+# Important Note for Next Developer:
+# - Do not replace the exact channel with `stable`, `beta`, or `nightly`.
+# - Upgrade this channel only as an audited change with full workspace tests and
+#   at least one production-compatible release build.
+#
+# [PINNED-RUST-TOOLCHAIN 2026-07-26 by Codex]
+# Last Modified: v1.0.0 - Pinned reproducible node builds to Rust 1.97.1.
+# ============================================
+
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"

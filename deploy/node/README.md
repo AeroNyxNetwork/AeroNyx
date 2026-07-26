@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [PINNED-RUST-BUILD 2026-07-26 by Codex] Document exact Rust toolchain
+  pinning, isolated build targets, staged validation, and atomic binary
+  promotion for reproducible node releases.
 - Document the `aeronyx-node.sh refresh-bootstrap` and `fleet-drift-check`
   commands so production nodes can refresh signed discovery bootstrap
   snapshots and audit seed/binary/config drift without exposing user data.
@@ -88,6 +91,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.42.0-node-deploy - Documented pinned Rust builds and atomic promotion from
+                     isolated toolchain/service-scoped Cargo targets.
 v1.41.0-node-deploy - Documented bootstrap refresh and fleet drift check commands.
 v1.40.0-node-deploy - Documented gated relay-probe --two-hop live proof mode.
 v1.39.0-node-deploy - Documented optional onward envelope support for controlled
@@ -150,6 +155,48 @@ v1.0.0-node-deploy - Added production deployment documentation.
 This directory is the production deployment package for AeroNyx Rust privacy
 nodes. It gives node operators a predictable path for first install, upgrade,
 healthcheck, and systemd service management.
+
+## Reproducible Rust Builds
+
+Production node builds are controlled by two repository files:
+
+- `rust-toolchain.toml` pins one exact Rust compiler release. A moving
+  `stable`, `beta`, or `nightly` channel is not accepted for release builds.
+- `Cargo.lock` pins the complete dependency graph and is always consumed with
+  `cargo build --locked`.
+
+`install.sh` and `upgrade.sh` resolve the exact toolchain, install it through
+rustup when permitted, and compile into:
+
+```text
+/var/lib/aeronyx/build-targets/rust-<version>/<service-name>
+```
+
+This path is intentionally separate from the stable systemd binary path:
+
+```text
+<repo>/target/release/aeronyx-server
+```
+
+The scripts first build and validate the isolated candidate. Only then do they
+copy it to a same-filesystem staging path and atomically rename it over the
+stable binary. The currently running process is never used as Cargo output.
+Upgrade rollback continues to use timestamped binaries under:
+
+```text
+/var/lib/aeronyx/releases
+```
+
+Hosts that run a non-default isolated node may override the build root without
+changing source:
+
+```bash
+sudo AERONYX_BUILD_TARGET_ROOT=/var/lib/aeronyx-jp1/build-targets \
+  ./deploy/node/upgrade.sh --service aeronyx-server-jp1
+```
+
+An exact toolchain bump is a release change. It requires the full Rust test
+suite, Clippy, a locked release build, and controlled node rollout evidence.
 
 ## Where `aeronyx-node.sh` Comes From
 

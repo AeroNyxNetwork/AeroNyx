@@ -8,6 +8,10 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - [PINNED-RUST-BUILD 2026-07-26 by Codex] Pin production builds to the
+#   repository-declared Rust toolchain and compile into a
+#   toolchain/service-scoped target directory before atomically promoting the
+#   validated binary to the stable systemd path.
 # - Keep --print-plan entirely side-effect free by skipping nodeboard install
 #   progress reports during read-only plan generation; operators should not see
 #   remote reporting warnings before they approve an install.
@@ -112,8 +116,13 @@
 #   separate maintenance-window service restart.
 # - Keep Cargo.lock tracked for this binary workspace. Do not remove --locked
 #   from production builds or regenerate the lockfile during node deployment.
+# - Keep rust-toolchain.toml exact. Never use a moving stable/beta/nightly
+#   channel for a production node release.
+# - Keep Cargo output outside the live repo target until validation succeeds.
 #
 # Last Modified:
+# v1.26.0-node-deploy - Pins the Rust compiler, isolates build artifacts by
+#                       toolchain/service, and atomically promotes the binary.
 # v1.25.0-node-deploy - Requires the tracked Cargo.lock dependency graph for release builds.
 # v1.24.0-node-deploy - Keeps --print-plan free of remote progress reporting
 #                       side effects and warning noise.
@@ -171,6 +180,7 @@ CONFIG_DIR="/etc/aeronyx"
 CONFIG_FILE="${CONFIG_DIR}/server.toml"
 ENV_FILE="${CONFIG_DIR}/aeronyx.env"
 STATE_DIR="/var/lib/aeronyx"
+BUILD_TARGET_ROOT="${AERONYX_BUILD_TARGET_ROOT:-${STATE_DIR}/build-targets}"
 SERVICE_NAME="aeronyx-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 NETWORK_RESTORE_SERVICE="aeronyx-network-restore.service"
@@ -179,7 +189,7 @@ SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
-SCRIPT_VERSION="v1.23.0-node-deploy"
+SCRIPT_VERSION="v1.26.0-node-deploy"
 
 REPO_URL="${AERONYX_REPO_URL:-${DEFAULT_REPO_URL}}"
 BRANCH="${AERONYX_BRANCH:-${DEFAULT_BRANCH}}"
@@ -201,6 +211,10 @@ PRINT_PLAN=0
 SET_VPN_CIDR=""
 CURRENT_INSTALL_STEP="not_started"
 CURRENT_INSTALL_MESSAGE="Install has not started."
+PINNED_RUST_CHANNEL=""
+RUSTUP_BIN=""
+BUILD_TARGET_DIR=""
+BUILD_BINARY=""
 
 case "${AERONYX_START:-}" in
     1|true|TRUE|yes|YES|on|ON) DO_START=1 ;;
@@ -499,6 +513,8 @@ enable_service=$(bool_word "${DO_ENABLE}")
 start_service=$(bool_word "${DO_START}")
 install_packages=$(bool_word "${INSTALL_PACKAGES}")
 install_rust=$(bool_word "${INSTALL_RUST}")
+rust_toolchain=repository-pinned
+build_target_root=${BUILD_TARGET_ROOT}
 allow_dirty=$(bool_word "${ALLOW_DIRTY}")
 dry_run=$(bool_word "${DRY_RUN}")
 set_vpn_cidr=$([ -n "${SET_VPN_CIDR}" ] && printf '%s' "${SET_VPN_CIDR}" || printf 'none')
@@ -917,11 +933,107 @@ install_rust_if_needed() {
 
     log "Installing Rust toolchain with rustup"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] curl https://sh.rustup.rs -sSf | sh -s -- -y\n'
+        printf '[DRY-RUN] curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain none\n'
     else
-        curl https://sh.rustup.rs -sSf | sh -s -- -y
+        # [PINNED-RUST-BUILD 2026-07-26 by Codex] Install only the rustup
+        # manager here. configure_pinned_rust_build installs the one compiler
+        # reviewed in rust-toolchain.toml, avoiding a second moving toolchain.
+        curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain none
         # shellcheck disable=SC1091
         . "${HOME}/.cargo/env"
+    fi
+}
+
+resolve_rustup_bin() {
+    local candidate
+    candidate="$(command -v rustup 2>/dev/null || true)"
+    if [ -z "${candidate}" ] && [ -x "${HOME}/.cargo/bin/rustup" ]; then
+        candidate="${HOME}/.cargo/bin/rustup"
+        export PATH="${HOME}/.cargo/bin:${PATH}"
+    fi
+    printf '%s\n' "${candidate}"
+}
+
+install_rustup_if_allowed() {
+    [ "${INSTALL_RUST}" -eq 1 ] \
+        || die "The repository-pinned Rust toolchain is unavailable and --skip-rust-install was set."
+    command -v curl >/dev/null 2>&1 || die "curl is required to install rustup."
+
+    log "Installing rustup for the repository-pinned Rust toolchain"
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain none\n'
+        RUSTUP_BIN="${HOME}/.cargo/bin/rustup"
+    else
+        curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain none
+        export PATH="${HOME}/.cargo/bin:${PATH}"
+        RUSTUP_BIN="$(resolve_rustup_bin)"
+        [ -n "${RUSTUP_BIN}" ] || die "rustup installation completed but rustup is unavailable."
+    fi
+}
+
+read_pinned_rust_channel() {
+    local toolchain_file="${REPO_DIR}/rust-toolchain.toml"
+    [ -f "${toolchain_file}" ] || die "Missing repository toolchain pin: ${toolchain_file}"
+
+    awk -F'"' '
+        /^[[:space:]]*channel[[:space:]]*=/ {
+            print $2
+            exit
+        }
+    ' "${toolchain_file}"
+}
+
+# [PINNED-RUST-BUILD 2026-07-26 by Codex] Compiler identity and Cargo output
+# location are part of the production release contract, not host-local state.
+configure_pinned_rust_build() {
+    local current_release
+
+    if [ "${DRY_RUN}" -eq 1 ] && [ ! -f "${REPO_DIR}/rust-toolchain.toml" ]; then
+        PINNED_RUST_CHANNEL="repository-pinned"
+        BUILD_TARGET_DIR="${BUILD_TARGET_ROOT}/rust-${PINNED_RUST_CHANNEL}/${SERVICE_NAME}"
+        BUILD_BINARY="${BUILD_TARGET_DIR}/release/aeronyx-server"
+        printf '[DRY-RUN] resolve exact Rust channel from %s/rust-toolchain.toml\n' "${REPO_DIR}"
+        return
+    fi
+
+    PINNED_RUST_CHANNEL="$(read_pinned_rust_channel)"
+    printf '%s' "${PINNED_RUST_CHANNEL}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+        || die "rust-toolchain.toml must pin an exact X.Y.Z release."
+
+    RUSTUP_BIN="$(resolve_rustup_bin)"
+    if [ -z "${RUSTUP_BIN}" ]; then
+        current_release="$(rustc --version 2>/dev/null | awk '{print $2}' || true)"
+        if [ "${current_release}" != "${PINNED_RUST_CHANNEL}" ]; then
+            install_rustup_if_allowed
+        fi
+    fi
+
+    if [ -n "${RUSTUP_BIN}" ]; then
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            printf '[DRY-RUN] %s toolchain install %s --profile minimal\n' \
+                "${RUSTUP_BIN}" "${PINNED_RUST_CHANNEL}"
+        elif ! "${RUSTUP_BIN}" run "${PINNED_RUST_CHANNEL}" rustc --version >/dev/null 2>&1; then
+            "${RUSTUP_BIN}" toolchain install "${PINNED_RUST_CHANNEL}" --profile minimal
+        fi
+    else
+        current_release="$(rustc --version 2>/dev/null | awk '{print $2}' || true)"
+        [ "${current_release}" = "${PINNED_RUST_CHANNEL}" ] \
+            || die "Rust ${PINNED_RUST_CHANNEL} is required; found ${current_release:-none}."
+        command -v cargo >/dev/null 2>&1 || die "cargo is unavailable for the pinned system toolchain."
+    fi
+
+    BUILD_TARGET_DIR="${BUILD_TARGET_ROOT}/rust-${PINNED_RUST_CHANNEL}/${SERVICE_NAME}"
+    BUILD_BINARY="${BUILD_TARGET_DIR}/release/aeronyx-server"
+    run mkdir -p "${BUILD_TARGET_DIR}"
+    ok "Pinned Rust toolchain: ${PINNED_RUST_CHANNEL}"
+    ok "Isolated Cargo target: ${BUILD_TARGET_DIR}"
+}
+
+run_pinned_cargo() {
+    if [ -n "${RUSTUP_BIN}" ]; then
+        "${RUSTUP_BIN}" run "${PINNED_RUST_CHANNEL}" cargo "$@"
+    else
+        cargo "$@"
     fi
 }
 
@@ -1125,23 +1237,36 @@ resolve_build_git_commit() {
 }
 
 build_binary() {
-    local build_git_commit
+    local build_git_commit stable_binary staging_binary
     [ "${DO_BUILD}" -eq 1 ] || { ok "Build skipped"; return; }
 
     build_git_commit="$(resolve_build_git_commit)"
     log "Building aeronyx-server release binary"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s cargo build --locked -p aeronyx-server --release\n' "${REPO_DIR}" "${build_git_commit}"
+        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s CARGO_TARGET_DIR=%s rustup run %s cargo build --locked -p aeronyx-server --release\n' \
+            "${REPO_DIR}" "${build_git_commit}" "${BUILD_TARGET_DIR}" "${PINNED_RUST_CHANNEL}"
     else
-        # [REPRODUCIBLE-RUST-BUILD 2026-07-23 by Codex] AeroNyx ships binaries,
-        # so every production node must compile the repository-reviewed graph.
+        # [REPRODUCIBLE-RUST-BUILD 2026-07-26 by Codex] Lock the dependency
+        # graph and compiler, then keep Cargo output away from the binary
+        # currently mapped by systemd.
         [ -f "${REPO_DIR}/Cargo.lock" ] \
             || die "Tracked Cargo.lock is required for reproducible node builds."
         (
             cd "${REPO_DIR}"
-            AERONYX_GIT_COMMIT="${build_git_commit}" cargo build --locked -p aeronyx-server --release
+            export AERONYX_GIT_COMMIT="${build_git_commit}"
+            export CARGO_TARGET_DIR="${BUILD_TARGET_DIR}"
+            run_pinned_cargo build --locked -p aeronyx-server --release
         )
+        [ -x "${BUILD_BINARY}" ] || die "Isolated release binary not found: ${BUILD_BINARY}"
+        "${BUILD_BINARY}" validate -c "${CONFIG_FILE}"
     fi
+
+    stable_binary="${REPO_DIR}/target/release/aeronyx-server"
+    staging_binary="${stable_binary}.install.$$"
+    run mkdir -p "$(dirname "${stable_binary}")"
+    run install -m 0755 "${BUILD_BINARY}" "${staging_binary}"
+    run mv -f "${staging_binary}" "${stable_binary}"
+    ok "Validated release binary promoted atomically: ${stable_binary}"
 }
 
 install_service() {
@@ -1238,6 +1363,9 @@ main() {
     prepare_repo
     prepare_directories
     install_config
+    if [ "${DO_BUILD}" -eq 1 ]; then
+        configure_pinned_rust_build
+    fi
 
     if [ "${CONFIG_ONLY}" -eq 1 ]; then
         ok "Config-only install complete."
