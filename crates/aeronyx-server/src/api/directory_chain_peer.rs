@@ -17,6 +17,7 @@
 //! - `POST /api/discovery/peer/directory/replica-descriptor-objects`
 //! - `POST /api/discovery/peer/directory/observation-checkpoint-witness`
 //! - `POST /api/discovery/peer/directory/observation-policy-anchor`
+//! - `POST /api/discovery/peer/directory/observation-certificate`
 //! - Tiered admission: verified public peers may mirror this node's own signed
 //!   producer history and recover retained non-authoritative mirror evidence;
 //!   witness and policy-anchor routes remain restricted to operator-pinned peers.
@@ -25,6 +26,8 @@
 //! - Exact content-addressed descriptor batches; no partial object response.
 //! - Independent checkpoint root recomputation before a signed witness decision.
 //! - Monotonic opaque policy-head retention before a signed anchor decision.
+//! - Pinned-peer-only export of the latest locally verified portable
+//!   observation certificate with exact frame digest binding.
 //! - Audited producer-replica export with a separate carrier signature layer.
 //! - Explicit lagging-carrier responses that let a requester continue to the
 //!   next verified carrier without retrying malformed protocol requests.
@@ -52,6 +55,8 @@
 //!    namespace. The carrier signs transport but never producer history.
 //! 8. Policy-anchor requests disclose only an observer epoch and opaque digest;
 //!    rollback, same-epoch conflict, and non-contiguous progression fail closed.
+//! 9. Certificate export re-audits the latest local certificate against the
+//!    current witness policy and binds the exact frame into a signed response.
 //!
 //! ## Privacy Invariant
 //! This API serves signed public node-directory commitments and the public
@@ -72,8 +77,13 @@
 //! - Never export a non-configured replica unless it remains in the audited
 //!   mirror registry. A carrier signature does not replace any producer block or
 //!   descriptor signature and grants no authority.
+//! - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Observation certificates expose
+//!   public observer/witness identities needed for verification. Keep this
+//!   endpoint POST-only and pinned-peer-only; do not mount a public GET alias.
 //!
 //! ## Last Modified
+//! v0.10.0-AuthenticatedCertificateExchange - Added pinned-peer-only portable
+//! observation-certificate export with exact frame digest binding.
 //! v0.9.1-MirrorCarrierRangeAvailability - Distinguished valid unavailable
 //! replica ranges from malformed requests for bounded carrier failover.
 //! v0.9.0-MirrorRecovery - Added bounded verified-public recovery for audited mirror namespaces.
@@ -100,6 +110,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -109,6 +120,8 @@ use aeronyx_core::protocol::discovery::{
     directory_block_range_response_signing_bytes,
     directory_descriptor_objects_request_signing_bytes,
     directory_descriptor_objects_response_signing_bytes,
+    directory_observation_certificate_request_signing_bytes,
+    directory_observation_certificate_response_signing_bytes,
     directory_observation_witness_request_signing_bytes,
     directory_observation_witness_response_signing_bytes,
     directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
@@ -117,11 +130,13 @@ use aeronyx_core::protocol::discovery::{
     directory_replica_descriptor_objects_request_signing_bytes,
     directory_replica_descriptor_objects_response_signing_bytes,
     directory_tip_request_signing_bytes, directory_tip_response_signing_bytes,
-    encode_directory_sync_message, DirectoryCommitmentBlockV1, DirectoryObservationCheckpointV1,
-    DirectorySyncMessage, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+    encode_directory_observation_certificate, encode_directory_sync_message,
+    DirectoryCommitmentBlockV1, DirectoryObservationCheckpointV1, DirectorySyncMessage,
+    SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
     DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
     DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
-    MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
+    MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES, MAX_DIRECTORY_SYNC_BLOCKS_V1,
+    MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 
 use crate::services::directory_replica::{
@@ -272,6 +287,10 @@ pub fn build_directory_chain_peer_router_with_replica(
             .route(
                 "/api/discovery/peer/directory/observation-policy-anchor",
                 post(observation_policy_anchor_handler),
+            )
+            .route(
+                "/api/discovery/peer/directory/observation-certificate",
+                post(observation_certificate_handler),
             );
     }
     router
@@ -303,10 +322,7 @@ async fn authenticate_request(
         DirectoryPeerAdmission::VerifiedPublicMirror
             | DirectoryPeerAdmission::VerifiedPublicRecovery
     );
-    if permissionless_read
-        && !state.allow_public_mirror_reads
-        && !requester_is_pinned
-    {
+    if permissionless_read && !state.allow_public_mirror_reads && !requester_is_pinned {
         return Err(protocol_error(
             StatusCode::FORBIDDEN,
             "public_mirror_disabled",
@@ -317,13 +333,8 @@ async fn authenticate_request(
     };
     let public_descriptor_required = admission == DirectoryPeerAdmission::VerifiedPublicMirror
         || (admission == DirectoryPeerAdmission::VerifiedPublicRecovery && !requester_is_pinned);
-    if public_descriptor_required
-        && !descriptor.descriptor.policy.public_discovery
-    {
-        return Err(protocol_error(
-            StatusCode::FORBIDDEN,
-            "peer_not_public",
-        ));
+    if public_descriptor_required && !descriptor.descriptor.policy.public_discovery {
+        return Err(protocol_error(StatusCode::FORBIDDEN, "peer_not_public"));
     }
     if IdentityPublicKey::from_bytes(&requester)
         .and_then(|key| key.verify(signing_bytes, signature))
@@ -694,11 +705,7 @@ async fn audited_replica_objects_for_request(
     };
     match tokio::task::spawn_blocking(move || {
         if producer_is_pinned {
-            store.audited_evidence_descriptor_objects(
-                &producer,
-                &descriptor_hashes,
-                observed_at,
-            )
+            store.audited_evidence_descriptor_objects(&producer, &descriptor_hashes, observed_at)
         } else {
             store.audited_mirror_evidence_descriptor_objects(
                 &producer,
@@ -776,18 +783,11 @@ async fn replica_block_range_handler(
     {
         return response;
     }
-    let page = match audited_replica_page_for_request(
-        &state,
-        producer,
-        from_height,
-        limit,
-        now,
-    )
-    .await
-    {
-        Ok(page) => page,
-        Err(response) => return response,
-    };
+    let page =
+        match audited_replica_page_for_request(&state, producer, from_height, limit, now).await {
+            Ok(page) => page,
+            Err(response) => return response,
+        };
     let blocks = bounded_directory_transport_blocks(page.blocks);
     let has_more = blocks
         .last()
@@ -879,17 +879,13 @@ async fn replica_descriptor_objects_handler(
     {
         return response;
     }
-    let objects = match audited_replica_objects_for_request(
-        &state,
-        producer,
-        descriptor_hashes.clone(),
-        now,
-    )
-    .await
-    {
-        Ok(objects) => objects,
-        Err(response) => return response,
-    };
+    let objects =
+        match audited_replica_objects_for_request(&state, producer, descriptor_hashes.clone(), now)
+            .await
+        {
+            Ok(objects) => objects,
+            Err(response) => return response,
+        };
     let carrier = state.identity.public_key_bytes();
     let response_timestamp = now_secs();
     let response_signing_bytes = directory_replica_descriptor_objects_response_signing_bytes(
@@ -1109,6 +1105,137 @@ async fn observation_policy_anchor_handler(
     )
 }
 
+async fn observation_certificate_handler(
+    State(state): State<DirectoryChainPeerState>,
+    body: Bytes,
+) -> Response {
+    let message = match decode_request(&body) {
+        Ok(message) => message,
+        Err(response) => return response,
+    };
+    let DirectorySyncMessage::ObservationCertificateRequestV1 {
+        chain_id,
+        request_id,
+        requester,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || requester == state.identity.public_key_bytes()
+    {
+        return protocol_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_observation_certificate_request",
+        );
+    }
+    let now = now_secs();
+    let signing_bytes = directory_observation_certificate_request_signing_bytes(
+        &chain_id,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    if let Err(response) = authenticate_request(
+        &state,
+        DirectoryPeerAdmission::PinnedAuthority,
+        requester,
+        request_id,
+        request_timestamp,
+        &signing_bytes,
+        &signature,
+        now,
+    )
+    .await
+    {
+        return response;
+    }
+
+    let Some(store) = state.replica_store.as_ref().map(Arc::clone) else {
+        return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_store_disabled");
+    };
+    let mut eligible_witnesses = state.pinned_peers.iter().copied().collect::<Vec<_>>();
+    eligible_witnesses.sort_unstable();
+    let certificate = match tokio::task::spawn_blocking(move || {
+        let snapshot = store.status_snapshot()?;
+        let minimum_witnesses =
+            usize::try_from(snapshot.observation_witness_policy_threshold).unwrap_or(usize::MAX);
+        if minimum_witnesses == 0 || minimum_witnesses > eligible_witnesses.len() {
+            return Ok(None);
+        }
+        store.latest_observation_certificate_for_pins(&eligible_witnesses, minimum_witnesses, now)
+    })
+    .await
+    {
+        Ok(Ok(Some(certificate))) => certificate,
+        Ok(Ok(None)) => {
+            return protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "observation_certificate_unavailable",
+            )
+        }
+        Ok(Err(error)) => return replica_store_error_response(&error),
+        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
+    };
+    let certificate_frame = match encode_directory_observation_certificate(&certificate) {
+        Ok(frame) if frame.len() <= MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES => frame,
+        Ok(_) => {
+            return protocol_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "observation_certificate_oversized",
+            )
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "[DIRECTORY_CHAIN] Failed to encode verified observation certificate"
+            );
+            return protocol_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "observation_certificate_encode_failed",
+            );
+        }
+    };
+    let certificate_sha256: [u8; 32] = Sha256::digest(&certificate_frame).into();
+    let certificate_frame_bytes = match u64::try_from(certificate_frame.len()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return protocol_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "observation_certificate_oversized",
+            )
+        }
+    };
+    let responder = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let response_signing_bytes = directory_observation_certificate_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &requester,
+        &responder,
+        response_timestamp,
+        &certificate_sha256,
+        certificate_frame_bytes,
+    );
+    debug!(
+        certificate_sequence = certificate.checkpoint.sequence,
+        certificate_frame_bytes,
+        "[DIRECTORY_CHAIN] Served authenticated portable observation certificate"
+    );
+    encoded_response(DirectorySyncMessage::ObservationCertificateResponseV1 {
+        chain_id,
+        request_id,
+        requester,
+        responder,
+        response_timestamp,
+        certificate_sha256,
+        certificate_frame,
+        signature: state.identity.sign(&response_signing_bytes),
+    })
+}
+
 async fn independently_evaluate_checkpoint(
     state: &DirectoryChainPeerState,
     checkpoint: &DirectoryObservationCheckpointV1,
@@ -1234,12 +1361,14 @@ mod tests {
 
     use crate::api::directory_replica_sync::{
         verify_block_range_response, verify_descriptor_objects_response,
-        verify_replica_block_range_response, verify_replica_descriptor_objects_response,
+        verify_observation_certificate_response, verify_replica_block_range_response,
+        verify_replica_descriptor_objects_response,
     };
     use aeronyx_core::protocol::discovery::{
-        directory_tip_response_signing_bytes, DirectoryCommitmentBlockV1,
-        DirectoryDescriptorCommitmentV1, DirectoryObservationCheckpointV1,
-        DirectoryObservationTipV1, NodeDescriptor, SignedNodeDescriptor,
+        decode_directory_observation_certificate, directory_tip_response_signing_bytes,
+        DirectoryCommitmentBlockV1, DirectoryDescriptorCommitmentV1,
+        DirectoryObservationCheckpointV1, DirectoryObservationTipV1, NodeDescriptor,
+        SignedNodeDescriptor,
     };
     use tempfile::TempDir;
 
@@ -1325,6 +1454,28 @@ mod tests {
             timestamp,
         );
         encode_directory_sync_message(&DirectorySyncMessage::TipRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            requester: requester_id,
+            request_timestamp: timestamp,
+            signature: requester.sign(&signing_bytes),
+        })
+        .unwrap()
+    }
+
+    fn observation_certificate_request(
+        requester: &IdentityKeyPair,
+        request_id: [u8; 16],
+    ) -> Vec<u8> {
+        let timestamp = now_secs();
+        let requester_id = requester.public_key_bytes();
+        let signing_bytes = directory_observation_certificate_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &requester_id,
+            timestamp,
+        );
+        encode_directory_sync_message(&DirectorySyncMessage::ObservationCertificateRequestV1 {
             chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
             request_id,
             requester: requester_id,
@@ -1428,6 +1579,168 @@ mod tests {
         )
     }
 
+    fn import_certificate_test_producer(
+        store: &DirectoryReplicaStore,
+        producer: &IdentityKeyPair,
+        object: &SignedNodeDescriptor,
+        block: &DirectoryCommitmentBlockV1,
+        request_id: [u8; 16],
+        now: u64,
+    ) {
+        let responder = producer.public_key_bytes();
+        let response_signing = directory_block_range_response_signing_bytes(
+            &request_id,
+            &responder,
+            now,
+            std::slice::from_ref(block),
+            false,
+            1,
+            &block.hash(),
+        );
+        let response_frame =
+            encode_directory_sync_message(&DirectorySyncMessage::BlockRangeResponseV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                request_id,
+                responder,
+                response_timestamp: now,
+                blocks: vec![block.clone()],
+                has_more: false,
+                tip_height: 1,
+                tip_hash: block.hash(),
+                signature: producer.sign(&response_signing),
+            })
+            .unwrap();
+        store
+            .import_verified_page(
+                responder,
+                std::slice::from_ref(block),
+                std::slice::from_ref(object),
+                1,
+                block.hash(),
+                &response_frame,
+                now,
+            )
+            .unwrap();
+    }
+
+    fn positive_certificate_test_router() -> (Router, Arc<IdentityKeyPair>, IdentityKeyPair, u64) {
+        let now = now_secs();
+        let observer = Arc::new(IdentityKeyPair::from_bytes(&[0xcd; 32]).unwrap());
+        let witness_a = IdentityKeyPair::from_bytes(&[0xce; 32]).unwrap();
+        let witness_b = IdentityKeyPair::from_bytes(&[0xcf; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0xd0; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0xd1; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0xd2; 32]).unwrap();
+        let object = signed_descriptor(&subject, now);
+        let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&object).unwrap();
+        let block_a = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            now,
+            [0u8; 32],
+            vec![commitment],
+            &producer_a,
+        )
+        .unwrap();
+        let block_b = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            now,
+            [0u8; 32],
+            vec![commitment],
+            &producer_b,
+        )
+        .unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(
+                signed_descriptor(&witness_a, now),
+                now,
+                "directory_certificate_test",
+            )
+            .unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.keep();
+        let (chain_store, _) = DirectoryChainStore::open(
+            root.join("directory-chain.db"),
+            observer.public_key_bytes(),
+            now,
+        )
+        .unwrap();
+        let (replica_store, _) = DirectoryReplicaStore::open(
+            root.join("directory-replica.db"),
+            observer.public_key_bytes(),
+            now,
+        )
+        .unwrap();
+        import_certificate_test_producer(
+            &replica_store,
+            &producer_a,
+            &object,
+            &block_a,
+            [0xd3; 16],
+            now,
+        );
+        import_certificate_test_producer(
+            &replica_store,
+            &producer_b,
+            &object,
+            &block_b,
+            [0xd4; 16],
+            now,
+        );
+        let producers = [producer_a.public_key_bytes(), producer_b.public_key_bytes()];
+        replica_store
+            .append_observation_checkpoint(&producers, &observer, now)
+            .unwrap();
+        let checkpoint = replica_store
+            .latest_audited_observation_checkpoint(now)
+            .unwrap()
+            .unwrap();
+        let witness_ids = [witness_a.public_key_bytes(), witness_b.public_key_bytes()];
+        replica_store
+            .reconcile_observation_witness_policy(&observer, &witness_ids, 2, now)
+            .unwrap();
+        for (witness, request_id) in [(&witness_a, [0xd5; 16]), (&witness_b, [0xd6; 16])] {
+            let checkpoint_hash = checkpoint.hash();
+            let signing = directory_observation_witness_response_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &request_id,
+                &observer.public_key_bytes(),
+                checkpoint.sequence,
+                &checkpoint_hash,
+                &witness.public_key_bytes(),
+                now,
+                DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+            );
+            let response = DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                request_id,
+                observer: observer.public_key_bytes(),
+                checkpoint_sequence: checkpoint.sequence,
+                checkpoint_hash,
+                responder: witness.public_key_bytes(),
+                response_timestamp: now,
+                outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+                signature: witness.sign(&signing),
+            };
+            assert!(replica_store
+                .persist_observation_checkpoint_witness(&response, now)
+                .unwrap());
+        }
+        (
+            build_directory_chain_peer_router_with_replica(
+                Arc::new(chain_store),
+                Some(Arc::new(replica_store)),
+                peer_store,
+                Arc::clone(&observer),
+                witness_ids.to_vec(),
+                false,
+            ),
+            observer,
+            witness_a,
+            checkpoint.sequence,
+        )
+    }
+
     #[derive(Clone, Copy)]
     enum CarrierTestPolicy {
         PinnedAuthority,
@@ -1437,7 +1750,9 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn carrier_test_router_with_access(policy: CarrierTestPolicy) -> (
+    fn carrier_test_router_with_access(
+        policy: CarrierTestPolicy,
+    ) -> (
         Router,
         Arc<IdentityKeyPair>,
         IdentityKeyPair,
@@ -1490,11 +1805,7 @@ mod tests {
         requester_descriptor =
             SignedNodeDescriptor::sign(requester_descriptor.descriptor, &requester).unwrap();
         peer_store
-            .upsert_verified_from_source(
-                requester_descriptor,
-                now,
-                "directory_carrier_test",
-            )
+            .upsert_verified_from_source(requester_descriptor, now, "directory_carrier_test")
             .unwrap();
         peer_store
             .upsert_verified_from_source(
@@ -2156,5 +2467,72 @@ mod tests {
             .unwrap()
             .verify(&response_signing, &signature)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observation_certificate_route_is_pinned_and_fails_closed_without_evidence() {
+        let (router, _, observer) = witness_test_router();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/observation-certificate")
+                    .body(Body::from(observation_certificate_request(
+                        &observer, [0xca; 16],
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let unpinned = IdentityKeyPair::from_bytes(&[0xcb; 32]).unwrap();
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/observation-certificate")
+                    .body(Body::from(observation_certificate_request(
+                        &unpinned, [0xcc; 16],
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn observation_certificate_route_serves_exact_current_policy_evidence() {
+        let (router, observer, requester, expected_sequence) = positive_certificate_test_router();
+        let request_id = [0xdd; 16];
+        let request_timestamp = now_secs();
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/observation-certificate")
+                    .body(Body::from(observation_certificate_request(
+                        &requester, request_id,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let observed_at = now_secs();
+        let authenticated = verify_observation_certificate_response(
+            &body,
+            &request_id,
+            &requester.public_key_bytes(),
+            &observer.public_key_bytes(),
+            request_timestamp,
+            observed_at,
+        )
+        .unwrap();
+        let certificate = decode_directory_observation_certificate(&authenticated.frame).unwrap();
+        certificate
+            .verify_at(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID, observed_at)
+            .unwrap();
+        assert_eq!(certificate.checkpoint.observer, observer.public_key_bytes());
+        assert_eq!(certificate.checkpoint.sequence, expected_sequence);
+        assert_eq!(certificate.minimum_witnesses, 2);
+        assert_eq!(certificate.receipts.len(), 2);
     }
 }

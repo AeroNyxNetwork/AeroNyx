@@ -55,6 +55,8 @@
 //! - Runs an operator-only cold-bootstrap smoke that replays a bounded
 //!   multi-page producer-signed genesis prefix through rotating explicit
 //!   carriers into a fresh in-memory store.
+//! - Provides an operator-triggered pinned-peer certificate pull primitive
+//!   with redirect-free transport and exact response/certificate verification.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -98,6 +100,9 @@
 //!     multi-page prefix if a later page becomes unavailable. Stop closed on
 //!     cryptographic or import failures, then discard the replica without
 //!     touching the live store.
+//! 17. On explicit operator request, fetch one portable observation certificate
+//!     from an expected pinned identity and verify request binding, responder
+//!     signature, freshness, frame size, and SHA-256 before local policy import.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -125,8 +130,13 @@
 //! - Once at least two pages form an audited producer-signed genesis prefix, a
 //!   later availability failure may end the smoke as a verified partial-prefix
 //!   result. It must never claim the observed remote tip was reached.
+//! - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] A valid transport response is
+//!   not trust by itself. Importers must additionally verify the certificate's
+//!   observer, witness signatures, current local pins, threshold, and age.
 //!
 //! ## Last Modified
+//! `v0.23.0-AuthenticatedCertificateExchange` - Added hardened pinned-source
+//! portable observation-certificate pull and exact response verification.
 //! `v0.22.1-CarrierPartialPrefix` - Preserved and fully audited a verified
 //! multi-page prefix when a later carrier page becomes unavailable.
 //! `v0.22.0-CarrierMultiPageRecovery` - Extended isolated cold bootstrap to a
@@ -183,6 +193,8 @@ use aeronyx_core::protocol::discovery::{
     directory_block_range_response_signing_bytes,
     directory_descriptor_objects_request_signing_bytes,
     directory_descriptor_objects_response_signing_bytes,
+    directory_observation_certificate_request_signing_bytes,
+    directory_observation_certificate_response_signing_bytes,
     directory_observation_witness_request_signing_bytes,
     directory_observation_witness_response_signing_bytes,
     directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
@@ -196,12 +208,14 @@ use aeronyx_core::protocol::discovery::{
     DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1,
     DIRECTORY_POLICY_ANCHOR_CONFLICT_V1, DIRECTORY_POLICY_ANCHOR_HISTORY_GAP_V1,
     DIRECTORY_POLICY_ANCHOR_ROLLBACK_V1, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
-    MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
+    MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES, MAX_DIRECTORY_SYNC_BLOCKS_V1,
+    MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 use futures::{stream, StreamExt};
 use parking_lot::Mutex;
 use rand::RngCore;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -304,6 +318,47 @@ const DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_MAX_PAGES: u32 = 3;
 /// exact range/object requests consumed before a failed carrier is replaced.
 const DIRECTORY_CARRIER_COLD_BOOTSTRAP_SMOKE_REQUEST_BUDGET: u32 =
     DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND;
+
+/// Exact authenticated certificate bytes returned by one pinned source.
+///
+/// [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] This proves only the transport
+/// source and exact bytes. Callers must apply local certificate trust and age
+/// policy before importing the frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedDirectoryObservationCertificate {
+    /// Exact canonical portable certificate frame authenticated by the source.
+    pub frame: Vec<u8>,
+    /// SHA-256 of `frame`, recomputed before the response signature is trusted.
+    pub certificate_sha256: [u8; 32],
+    /// Expected pinned node identity that signed the transport response.
+    pub source: [u8; 32],
+    /// Authenticated response creation time in Unix epoch seconds.
+    pub response_timestamp: u64,
+}
+
+fn build_hardened_directory_http_client() -> Result<reqwest::Client, &'static str> {
+    reqwest::Client::builder()
+        // Direct authenticated node relationships must not inherit a process
+        // proxy that becomes an unreviewed endpoint-metadata observer.
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(
+            DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
+        ))
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(1)
+        .build()
+        .map_err(|_| "directory_sync_http_client_initialization_failed")
+}
+
+/// Builds the redirect-free bounded client used for an explicit certificate
+/// exchange operation.
+///
+/// # Errors
+/// Returns a stable reason when the HTTP client cannot be initialized.
+pub fn build_directory_certificate_exchange_http_client() -> Result<reqwest::Client, String> {
+    build_hardened_directory_http_client().map_err(str::to_string)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryCarrierRecoveryDisposition {
@@ -978,9 +1033,7 @@ impl DirectoryReplicaSyncCoordinator {
         if interval_secs == 0 {
             return Err("directory_sync_interval_invalid");
         }
-        if !peers.is_empty()
-            && (witness_min_verified == 0 || witness_min_verified > peers.len())
-        {
+        if !peers.is_empty() && (witness_min_verified == 0 || witness_min_verified > peers.len()) {
             return Err("directory_observation_witness_threshold_invalid");
         }
         if full_node_mirror_enabled
@@ -1011,18 +1064,10 @@ impl DirectoryReplicaSyncCoordinator {
             .collect::<Vec<_>>();
         runtime.restore_retry_states(&retry_states);
         let restored_retry_states = retry_states.len();
-        let client = reqwest::Client::builder()
-            // [MIRROR-DIVERSITY 2026-07-24 by Codex] Directory Sync endpoints
-            // are authenticated direct node relationships. Inheriting host
-            // HTTP(S)_PROXY settings would add an unreviewed metadata observer
-            // and common failure domain despite the signed frame boundary.
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(1)
-            .build()
-            .map_err(|_| "directory_sync_http_client_initialization_failed")?;
+        // [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Coordinator and manual
+        // certificate exchange share one hardened transport policy so timeout,
+        // redirect, and proxy behavior cannot drift between trust paths.
+        let client = build_hardened_directory_http_client()?;
         Ok(Self {
             peers: peers.into(),
             interval: Duration::from_secs(interval_secs),
@@ -1109,8 +1154,7 @@ impl DirectoryReplicaSyncCoordinator {
             let Ok(Ok(producers)) =
                 tokio::task::spawn_blocking(move || store.mirror_producer_ids()).await
             else {
-                self.runtime
-                    .record_full_node_mirror_round(0, 0, 0, now);
+                self.runtime.record_full_node_mirror_round(0, 0, 0, now);
                 warn!(
                     reason = "directory_mirror_registry_read_failed",
                     "[DIRECTORY_REPLICA] Full-node Mirror round skipped"
@@ -2221,12 +2265,8 @@ async fn pull_directory_chain_mirror_page(
     if local_tip.quarantined {
         return Err("directory_mirror_producer_quarantined".to_string());
     }
-    let (range_url, object_url) = directory_mirror_peer_urls(
-        peer_store,
-        producer,
-        descriptor_sequence,
-        request_timestamp,
-    )?;
+    let (range_url, object_url) =
+        directory_mirror_peer_urls(peer_store, producer, descriptor_sequence, request_timestamp)?;
     let from_height = local_tip
         .tip_height
         .checked_add(1)
@@ -2373,8 +2413,7 @@ pub(crate) async fn run_directory_mirror_carrier_smoke(
                 continue;
             }
         };
-        report.eligible_retained_producers =
-            report.eligible_retained_producers.saturating_add(1);
+        report.eligible_retained_producers = report.eligible_retained_producers.saturating_add(1);
         let selection = directory_mirror_recovery_carriers_with_requirement(
             peer_store,
             &capability_cache,
@@ -2704,12 +2743,7 @@ async fn verify_directory_mirror_carrier_smoke_candidate(
         &page.blocks,
     )
     .await
-    .map_err(|reason| {
-        (
-            directory_mirror_carrier_smoke_failure_bucket(&reason),
-            true,
-        )
-    })?;
+    .map_err(|reason| (directory_mirror_carrier_smoke_failure_bucket(&reason), true))?;
     let DirectoryRangePage {
         blocks,
         has_more: _,
@@ -3116,8 +3150,7 @@ fn directory_mirror_recovery_carriers_with_requirement(
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| {
-        let (routeability_rank, capability_rank, freshness_rank) =
-            candidate.availability_tier();
+        let (routeability_rank, capability_rank, freshness_rank) = candidate.availability_tier();
         (
             routeability_rank,
             capability_rank,
@@ -3754,6 +3787,129 @@ async fn import_directory_mirror_range_page(
     })
 }
 
+/// Fetches one portable observation certificate from an exact pinned source.
+///
+/// The returned value has authenticated transport provenance and exact byte
+/// integrity only. The caller must still decode and verify certificate
+/// observer/witness signatures, local pins, threshold, and checkpoint age.
+///
+/// # Errors
+/// Returns a stable privacy-safe reason for endpoint, transport, canonical
+/// encoding, identity, freshness, digest, size, or signature rejection.
+pub async fn fetch_authenticated_observation_certificate(
+    client: &reqwest::Client,
+    source_endpoint: &str,
+    identity: &IdentityKeyPair,
+    expected_source: &[u8; 32],
+) -> Result<AuthenticatedDirectoryObservationCertificate, String> {
+    if *expected_source == [0u8; 32]
+        || *expected_source == identity.public_key_bytes()
+        || !commitment_peer_endpoint_is_public(source_endpoint)
+    {
+        return Err("observation_certificate_source_invalid".to_string());
+    }
+    let url = commitment_peer_url(
+        source_endpoint,
+        "/api/discovery/peer/directory/observation-certificate",
+    )
+    .map_err(|_| "observation_certificate_source_invalid".to_string())?;
+    let request_timestamp = unix_now_secs();
+    let mut request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    let requester = identity.public_key_bytes();
+    let signing_bytes = directory_observation_certificate_request_signing_bytes(
+        &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    let request = DirectorySyncMessage::ObservationCertificateRequestV1 {
+        chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+        request_id,
+        requester,
+        request_timestamp,
+        signature: identity.sign(&signing_bytes),
+    };
+    let frame = encode_directory_sync_message(&request)
+        .map_err(|_| "observation_certificate_request_encode_failed".to_string())?;
+    let response =
+        post_directory_frame(client, url, frame, "observation_certificate_fetch").await?;
+    verify_observation_certificate_response(
+        &response,
+        &request_id,
+        &requester,
+        expected_source,
+        request_timestamp,
+        unix_now_secs(),
+    )
+}
+
+pub(crate) fn verify_observation_certificate_response(
+    frame: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_requester: &[u8; 32],
+    expected_source: &[u8; 32],
+    request_timestamp: u64,
+    observed_at: u64,
+) -> Result<AuthenticatedDirectoryObservationCertificate, String> {
+    let response = decode_directory_sync_message(frame)
+        .map_err(|_| "observation_certificate_response_decode_failed".to_string())?;
+    let canonical = encode_directory_sync_message(&response)
+        .map_err(|_| "observation_certificate_response_encode_failed".to_string())?;
+    if canonical != frame {
+        return Err("observation_certificate_response_noncanonical".to_string());
+    }
+    let DirectorySyncMessage::ObservationCertificateResponseV1 {
+        chain_id,
+        request_id,
+        requester,
+        responder,
+        response_timestamp,
+        certificate_sha256,
+        certificate_frame,
+        signature,
+    } = response
+    else {
+        return Err("observation_certificate_response_unexpected_message".to_string());
+    };
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || request_id != *expected_request_id
+        || requester != *expected_requester
+        || responder != *expected_source
+        || response_timestamp.abs_diff(observed_at) > DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS
+        || response_timestamp.saturating_add(DIRECTORY_SYNC_RESPONSE_TIMESTAMP_SKEW_SECS)
+            < request_timestamp
+        || certificate_frame.is_empty()
+        || certificate_frame.len() > MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES
+    {
+        return Err("observation_certificate_response_contract_mismatch".to_string());
+    }
+    let computed_sha256: [u8; 32] = Sha256::digest(&certificate_frame).into();
+    if certificate_sha256 != computed_sha256 {
+        return Err("observation_certificate_response_digest_mismatch".to_string());
+    }
+    let certificate_frame_bytes = u64::try_from(certificate_frame.len())
+        .map_err(|_| "observation_certificate_response_contract_mismatch".to_string())?;
+    let signing_bytes = directory_observation_certificate_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &requester,
+        &responder,
+        response_timestamp,
+        &certificate_sha256,
+        certificate_frame_bytes,
+    );
+    IdentityPublicKey::from_bytes(&responder)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .map_err(|_| "observation_certificate_response_invalid_signature".to_string())?;
+    Ok(AuthenticatedDirectoryObservationCertificate {
+        frame: certificate_frame,
+        certificate_sha256,
+        source: responder,
+        response_timestamp,
+    })
+}
+
 async fn post_directory_frame(
     client: &reqwest::Client,
     url: reqwest::Url,
@@ -3783,11 +3939,10 @@ async fn post_directory_frame_typed(
         // an optional route is absent or that this carrier has not retained
         // the requested producer/range yet. Read only the tiny fixed protocol
         // code so temporary lag is never cached as missing software support.
-        let peer_code =
-            read_bounded_http_response(response, MAX_DIRECTORY_SYNC_ERROR_BODY_BYTES)
-                .await
-                .ok()
-                .and_then(|body| DirectoryPeerErrorCode::parse(&body));
+        let peer_code = read_bounded_http_response(response, MAX_DIRECTORY_SYNC_ERROR_BODY_BYTES)
+            .await
+            .ok()
+            .and_then(|body| DirectoryPeerErrorCode::parse(&body));
         return Err(DirectoryFramePostError::HttpStatus { status, peer_code });
     }
     read_bounded_http_response(response, MAX_DIRECTORY_SYNC_RESPONSE_BODY_BYTES)
@@ -4069,16 +4224,13 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aeronyx_core::protocol::discovery::{
-        DirectoryDescriptorCommitmentV1, NodeDescriptor,
-    };
+    use aeronyx_core::protocol::discovery::{DirectoryDescriptorCommitmentV1, NodeDescriptor};
     use axum::{http::StatusCode, routing::post, Router};
     use tempfile::TempDir;
 
     const TEST_NOW: u64 = 1_700_000_000;
 
-    fn carrier_hydration_test_context(
-    ) -> (
+    fn carrier_hydration_test_context() -> (
         IdentityKeyPair,
         IdentityKeyPair,
         IdentityKeyPair,
@@ -4123,9 +4275,7 @@ mod tests {
                 async move { (status, body) }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -4479,12 +4629,10 @@ mod tests {
     #[test]
     fn mirror_recovery_is_bounded_and_rejects_security_failures() {
         assert_eq!(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE, 2);
-        let recovery_carrier_count =
-            u64::try_from(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE)
-                .expect("bounded recovery carrier count fits u64");
+        let recovery_carrier_count = u64::try_from(DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE)
+            .expect("bounded recovery carrier count fits u64");
         assert!(
-            DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS
-                * (1 + recovery_carrier_count)
+            DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS * (1 + recovery_carrier_count)
                 < DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS
         );
         for reason in [
@@ -4538,11 +4686,7 @@ mod tests {
             1,
             true
         ));
-        assert!(!should_continue_directory_mirror_catch_up(
-            1,
-            6,
-            true
-        ));
+        assert!(!should_continue_directory_mirror_catch_up(1, 6, true));
     }
 
     #[test]
@@ -4730,7 +4874,10 @@ mod tests {
         );
         assert_eq!(smoke_selection.candidate_count, 4);
         assert_eq!(smoke_selection.explicitly_advertised_candidate_count, 4);
-        assert_eq!(smoke_selection.unadvertised_compatibility_candidate_count, 0);
+        assert_eq!(
+            smoke_selection.unadvertised_compatibility_candidate_count,
+            0
+        );
         assert_eq!(smoke_selection.selected_explicitly_advertised_count, 2);
         assert_eq!(smoke_selection.selected_unadvertised_compatibility_count, 0);
     }
@@ -5012,6 +5159,87 @@ mod tests {
     }
 
     #[test]
+    fn observation_certificate_response_verification_binds_source_and_exact_frame() {
+        let requester = IdentityKeyPair::from_bytes(&[0xb1; 32]).unwrap();
+        let source = IdentityKeyPair::from_bytes(&[0xb2; 32]).unwrap();
+        let other_source = IdentityKeyPair::from_bytes(&[0xb3; 32]).unwrap();
+        let request_id = [0xb4; 16];
+        let certificate_frame = vec![0xb5; 128];
+        let certificate_sha256: [u8; 32] = Sha256::digest(&certificate_frame).into();
+        let now = unix_now_secs();
+        let signing_bytes = directory_observation_certificate_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &requester.public_key_bytes(),
+            &source.public_key_bytes(),
+            now,
+            &certificate_sha256,
+            u64::try_from(certificate_frame.len()).unwrap(),
+        );
+        let response = DirectorySyncMessage::ObservationCertificateResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            requester: requester.public_key_bytes(),
+            responder: source.public_key_bytes(),
+            response_timestamp: now,
+            certificate_sha256,
+            certificate_frame: certificate_frame.clone(),
+            signature: source.sign(&signing_bytes),
+        };
+        let frame = encode_directory_sync_message(&response).unwrap();
+        assert_eq!(
+            verify_observation_certificate_response(
+                &frame,
+                &request_id,
+                &requester.public_key_bytes(),
+                &source.public_key_bytes(),
+                now,
+                now,
+            )
+            .unwrap(),
+            AuthenticatedDirectoryObservationCertificate {
+                frame: certificate_frame,
+                certificate_sha256,
+                source: source.public_key_bytes(),
+                response_timestamp: now,
+            }
+        );
+        assert_eq!(
+            verify_observation_certificate_response(
+                &frame,
+                &request_id,
+                &requester.public_key_bytes(),
+                &other_source.public_key_bytes(),
+                now,
+                now,
+            )
+            .unwrap_err(),
+            "observation_certificate_response_contract_mismatch"
+        );
+
+        let mut tampered = response;
+        let DirectorySyncMessage::ObservationCertificateResponseV1 {
+            certificate_frame, ..
+        } = &mut tampered
+        else {
+            unreachable!();
+        };
+        certificate_frame[0] ^= 1;
+        assert_eq!(
+            verify_observation_certificate_response(
+                &encode_directory_sync_message(&tampered).unwrap(),
+                &request_id,
+                &requester.public_key_bytes(),
+                &source.public_key_bytes(),
+                now,
+                now,
+            )
+            .unwrap_err(),
+            "observation_certificate_response_digest_mismatch"
+        );
+    }
+
+    #[test]
     fn checkpoint_requires_exact_authenticated_remote_tip() {
         let complete = DirectorySyncPullOutcome {
             import: DirectoryReplicaImportReport {
@@ -5230,13 +5458,8 @@ mod tests {
         )
         .is_ok());
         assert_eq!(
-            directory_mirror_recovery_carrier_urls(
-                &store,
-                &carrier.public_key_bytes(),
-                8,
-                now,
-            )
-            .unwrap_err(),
+            directory_mirror_recovery_carrier_urls(&store, &carrier.public_key_bytes(), 8, now,)
+                .unwrap_err(),
             "directory_mirror_recovery_carrier_descriptor_changed"
         );
     }

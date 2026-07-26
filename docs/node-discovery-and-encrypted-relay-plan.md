@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.30.0 - Durable, bounded, node-signed third-party observation-certificate import with complete restart audit.
+Modification Reason: v0.31.0 - Authenticated pinned-peer observation-certificate exchange and freshness-gated durable import.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.30.0 - [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] Added schema v10 and a host-local import command that binds exact foreign certificate bytes and local trust policy into a node-signed, hash-linked, rollback-audited history.
+Last Modified: v0.31.0 - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Added a POST-only pinned-peer certificate route plus an operator pull command that separately verifies transport identity, exact frame bytes, local observer/witness pins, threshold, and checkpoint age before schema-v10 import.
+Previous: v0.30.0 - [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] Added schema v10 and a host-local import command that binds exact foreign certificate bytes and local trust policy into a node-signed, hash-linked, rollback-audited history.
 Previous: v0.29.0 - [PORTABLE-CERTIFICATE-VERIFIER 2026-07-26 by Codex] Added a fail-closed offline verifier command with exact frame SHA-256, canonical-codec, chain, time, pinned observer/witness policy, checkpoint, local threshold, and signature checks.
 Previous: v0.28.0 - [PORTABLE-OBSERVATION-CERTIFICATE 2026-07-26 by Codex] Added operator-only export of one observer-signed checkpoint plus independently signed current-pin witness receipts.
 Previous: v0.27.0 - Distinguished mirror convergence from bounded catch-up progress and terminal failure.
@@ -1234,10 +1235,58 @@ Implemented in Durable Third-Party Certificate Import V1:
   history; no signed block, mirror, witness, incident, or policy evidence is
   rewritten.
 
+Implemented in Authenticated Certificate Exchange V1:
+
+- `ObservationCertificateRequestV1` and
+  `ObservationCertificateResponseV1` are appended to `DirectorySyncMessage`;
+  no existing bincode discriminant is reordered, so mixed-version peers keep
+  their existing Directory Sync behavior.
+- `POST /api/discovery/peer/directory/observation-certificate` is mounted only
+  when the replica store passed startup audit. It uses the existing 60-second
+  request freshness, request-id replay cache, per-peer/global budgets, current
+  signed descriptor check, Ed25519 authentication, and `PinnedAuthority`
+  admission. There is deliberately no public GET alias.
+- The responder re-reads its current signed witness policy and rebuilds the
+  latest certificate from audited retained evidence. Missing policy, an
+  unsatisfied current threshold, invalid persistence, or absent evidence returns
+  a fixed fail-closed error; the handler never exports a weaker certificate.
+- The response signature binds chain id, request id, requester, responder,
+  response timestamp, SHA-256, and exact certificate-frame length. The pull
+  side independently enforces canonical outer encoding, expected source
+  identity, response freshness, exact digest, frame bound, and signature.
+- `aeronyx-server directory-replica pull-observation-certificate` performs one
+  explicit, redirect-free, proxy-bypassed pull from a public node endpoint:
+
+  ```bash
+  aeronyx-server directory-replica pull-observation-certificate \
+    --source-endpoint https://<pinned-node-host>:8422 \
+    --expected-observer <same-pinned-source-node-id-hex> \
+    --allowed-witness <trusted-witness-a-node-id-hex> \
+    --allowed-witness <trusted-witness-b-node-id-hex> \
+    --minimum-witnesses 2 \
+    --max-age-seconds 900 \
+    --config /etc/aeronyx/server.toml \
+    --json
+  ```
+
+- Authenticated transport is not treated as certificate trust. After response
+  verification, the command independently decodes and verifies the observer
+  checkpoint, every witness receipt, the operator's complete witness allowlist,
+  local threshold, production chain id, canonical bytes, and checkpoint age.
+  The network age gate defaults to 900 seconds and cannot exceed 3,600 seconds.
+- Only after all three gates pass (source authentication, local certificate
+  policy, freshness) does the node append the exact frame to the existing
+  node-signed schema-v10 import history. Source endpoints are neither logged nor
+  persisted. Existing imported-certificate status remains aggregate-only.
+- This exchange carries public control-plane observation evidence. It does not
+  carry user messages, ciphertext, routes, selected hops, Memory Chain records,
+  traffic metadata, DNS contents, destinations, private keys, wallet traffic,
+  financial state, votes, fork choice, consensus, or global finality.
+
 Still pending before Directory Chain can be described as live:
 
-- Network-wide certificate gossip, independently specified co-signature policy,
-  and deterministic fork selection.
+- Policy-driven multi-source certificate scheduling, independently specified
+  co-signature policy, and deterministic fork selection.
 - Independent implementation verification of the convergence root contract.
 
 Files likely changed:
@@ -1309,6 +1358,30 @@ YYYY-MM-DD - Change summary
 Initial entry:
 
 ```text
+<!-- [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] -->
+2026-07-26 - Added Authenticated Certificate Exchange V1.
+- Files changed:
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - crates/aeronyx-server/src/main.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Architecture:
+  - Appended domain-separated signed request/response frames without changing
+    any existing bincode enum index.
+  - Reused pinned-peer admission, live descriptor authentication, replay and
+    rate guards, and the hardened redirect/proxy-free Directory HTTP client.
+  - Kept transport authentication, certificate trust, and freshness as
+    independent fail-closed checks.
+- Operator flow:
+  - Pull one exact frame from an expected observer, verify local witness pins
+    and threshold, reject checkpoints older than the bounded policy, then append
+    through the existing node-signed schema-v10 import path.
+- Security boundary:
+  - This is authenticated exchange of public node-directory observation
+    evidence, not a vote, consensus, finality, financial ledger, user-message
+    proof, or Memory Chain content proof.
+
 <!-- [PORTABLE-CERTIFICATE-IMPORT 2026-07-26 by Codex] -->
 2026-07-26 - Added Durable Third-Party Certificate Import V1.
 - Files changed:

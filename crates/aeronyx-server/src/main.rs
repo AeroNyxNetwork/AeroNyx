@@ -23,6 +23,8 @@
 //!   verifier for exact Directory observation-certificate frames.
 //! - v1.6.0-PortableObservationCertificateImport: add a host-local durable
 //!   import command backed by the signed schema-v10 certificate history.
+//! - v1.7.0-AuthenticatedCertificatePull: add explicit pinned-source network
+//!   retrieval with a strict certificate-age gate before durable import.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -39,6 +41,8 @@
 //! certificate verification with exact frame SHA-256 binding
 //! v1.6.0-PortableObservationCertificateImport - Add bounded, pinned,
 //! hash-linked third-party certificate persistence and restart audit
+//! v1.7.0-AuthenticatedCertificatePull - Add hardened pinned-source certificate
+//! pull, exact response verification, local trust policy, and freshness gate
 
 use std::fs::File;
 use std::io::Read;
@@ -54,6 +58,9 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::discovery::MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES;
 use aeronyx_server::api::auth::ensure_api_secret;
+use aeronyx_server::api::directory_replica_sync::{
+    build_directory_certificate_exchange_http_client, fetch_authenticated_observation_certificate,
+};
 use aeronyx_server::management::models::StoredNodeInfo;
 use aeronyx_server::services::directory_replica::{
     verify_directory_observation_certificate_frame as verify_portable_observation_certificate_frame,
@@ -200,6 +207,37 @@ enum DirectoryReplicaCommands {
         /// Locally required count of distinct trusted witness receipts
         #[arg(long)]
         minimum_witnesses: u16,
+
+        /// Path to the local node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Fetch, verify, and durably import a fresh certificate from a pinned node
+    PullObservationCertificate {
+        /// Public node endpoint serving authenticated Directory peer frames
+        #[arg(long)]
+        source_endpoint: String,
+
+        /// Expected source and certificate-observer identity (64 hex characters)
+        #[arg(long)]
+        expected_observer: String,
+
+        /// Trusted witness node identity; repeat for every allowed witness
+        #[arg(long = "allowed-witness", required = true)]
+        allowed_witnesses: Vec<String>,
+
+        /// Locally required count of distinct trusted witness receipts
+        #[arg(long)]
+        minimum_witnesses: u16,
+
+        /// Maximum accepted checkpoint age for network retrieval
+        #[arg(long, default_value_t = 900)]
+        max_age_seconds: u64,
 
         /// Path to the local node configuration file
         #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
@@ -739,6 +777,26 @@ async fn cmd_directory_replica(command: DirectoryReplicaCommands) -> anyhow::Res
             )
             .await
         }
+        DirectoryReplicaCommands::PullObservationCertificate {
+            source_endpoint,
+            expected_observer,
+            allowed_witnesses,
+            minimum_witnesses,
+            max_age_seconds,
+            config,
+            json,
+        } => {
+            cmd_directory_replica_pull_observation_certificate(
+                &config,
+                &source_endpoint,
+                &expected_observer,
+                &allowed_witnesses,
+                minimum_witnesses,
+                max_age_seconds,
+                json,
+            )
+            .await
+        }
         DirectoryReplicaCommands::CarrierSmoke { config, json } => {
             cmd_directory_replica_carrier_smoke(&config, json).await
         }
@@ -1040,6 +1098,130 @@ async fn cmd_directory_replica_import_observation_certificate(
         println!("  observer_fingerprint: {}", output.observer_fingerprint);
         println!("  checkpoint_sequence: {}", output.checkpoint_sequence);
         println!("  checkpoint_hash: {}", output.checkpoint_hash);
+        println!("  retained_certificates: {}", output.retained_certificates);
+        println!("  security_model: {}", output.security_model);
+        println!("  privacy: {}", output.privacy_boundary);
+    }
+    Ok(())
+}
+
+const MAX_NETWORK_OBSERVATION_CERTIFICATE_AGE_SECONDS: u64 = 3_600;
+
+#[derive(Debug, serde::Serialize)]
+struct DirectoryObservationCertificatePullCliReport {
+    contract_version: &'static str,
+    status: &'static str,
+    source_authenticated: bool,
+    inserted: bool,
+    import_sequence: u64,
+    import_digest: String,
+    certificate_id: String,
+    certificate_sha256: String,
+    observer_fingerprint: String,
+    checkpoint_sequence: u64,
+    checkpoint_age_seconds: u64,
+    max_age_seconds: u64,
+    retained_certificates: u64,
+    verified_at: u64,
+    security_model: &'static str,
+    privacy_boundary: &'static str,
+}
+
+/// Pulls one fresh certificate through the pinned Directory peer protocol.
+///
+/// [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Transport authentication,
+/// certificate trust, and freshness remain three independent gates. A valid
+/// HTTP response can never bypass observer/witness pins or the network replay
+/// age bound before the node signs a durable schema-v10 import row.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_directory_replica_pull_observation_certificate(
+    config_path: &PathBuf,
+    source_endpoint: &str,
+    expected_observer_hex: &str,
+    allowed_witness_hex: &[String],
+    minimum_witnesses: u16,
+    max_age_seconds: u64,
+    emit_json: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=MAX_NETWORK_OBSERVATION_CERTIFICATE_AGE_SECONDS).contains(&max_age_seconds),
+        "--max-age-seconds must be between 1 and {MAX_NETWORK_OBSERVATION_CERTIFICATE_AGE_SECONDS}"
+    );
+    let expected_observer = parse_hex32(expected_observer_hex, "expected observer identity")?;
+    let trust_policy = parse_observation_certificate_trust_policy(
+        expected_observer_hex,
+        allowed_witness_hex,
+        minimum_witnesses,
+    )?;
+    let (store, identity) = open_directory_replica_store(config_path).await?;
+    let client = build_directory_certificate_exchange_http_client().map_err(anyhow::Error::msg)?;
+    let authenticated = fetch_authenticated_observation_certificate(
+        &client,
+        source_endpoint,
+        &identity,
+        &expected_observer,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let verified_at = unix_timestamp_now()?;
+    let verified = verify_portable_observation_certificate_frame(
+        &authenticated.frame,
+        &authenticated.certificate_sha256,
+        &trust_policy,
+        verified_at,
+    )?;
+    let checkpoint_age_seconds =
+        verified_at.saturating_sub(verified.certificate.checkpoint.observed_at);
+    anyhow::ensure!(
+        checkpoint_age_seconds <= max_age_seconds,
+        "observation_certificate_checkpoint_stale"
+    );
+    let report = store.import_observation_certificate(
+        &authenticated.frame,
+        &authenticated.certificate_sha256,
+        &trust_policy,
+        &identity,
+        verified_at,
+    )?;
+    let output = DirectoryObservationCertificatePullCliReport {
+        contract_version: "directory_observation_certificate_pull.v1",
+        status: if report.inserted {
+            "imported"
+        } else {
+            "unchanged"
+        },
+        source_authenticated: true,
+        inserted: report.inserted,
+        import_sequence: report.import_sequence,
+        import_digest: hex::encode(report.import_digest),
+        certificate_id: hex::encode(report.certificate_id),
+        certificate_sha256: hex::encode(report.certificate_sha256),
+        observer_fingerprint: hex::encode(&report.observer[..6]),
+        checkpoint_sequence: report.checkpoint_sequence,
+        checkpoint_age_seconds,
+        max_age_seconds,
+        retained_certificates: report.retained_certificates,
+        verified_at: report.verified_at,
+        security_model: "authenticated pinned source transport plus exact-frame digest, pinned observer, locally pinned witness threshold, bounded checkpoint age, and node-signed append-only import evidence; no voting, fork choice, consensus, or global finality",
+        privacy_boundary: "host-local aggregate Directory evidence only; source endpoint is neither logged nor persisted; no routes, client IPs, message ids, payloads, ciphertext, memory records, DNS contents, destinations, private keys, wallet traffic, or social graph metadata",
+    };
+
+    if emit_json {
+        println!("{}", serde_json::to_string(&output)?);
+    } else {
+        println!("AeroNyx Directory observation certificate pull");
+        println!("  status: {}", output.status);
+        println!("  source_authenticated: {}", output.source_authenticated);
+        println!("  import_sequence: {}", output.import_sequence);
+        println!("  import_digest: {}", output.import_digest);
+        println!("  certificate_id: {}", output.certificate_id);
+        println!("  certificate_sha256: {}", output.certificate_sha256);
+        println!("  observer_fingerprint: {}", output.observer_fingerprint);
+        println!("  checkpoint_sequence: {}", output.checkpoint_sequence);
+        println!(
+            "  checkpoint_age_seconds: {}/{} maximum",
+            output.checkpoint_age_seconds, output.max_age_seconds
+        );
         println!("  retained_certificates: {}", output.retained_certificates);
         println!("  security_model: {}", output.security_model);
         println!("  privacy: {}", output.privacy_boundary);
@@ -1689,6 +1871,50 @@ mod tests {
         assert_eq!(parsed_observer, expected_observer);
         assert_eq!(allowed_witnesses, vec![witness]);
         assert_eq!(minimum_witnesses, 1);
+        assert_eq!(config, PathBuf::from("/tmp/server.toml"));
+        assert!(json);
+    }
+
+    #[test]
+    fn directory_observation_certificate_pull_cli_requires_source_pins_and_age() {
+        let expected_observer = "b8".repeat(32);
+        let witness = "c9".repeat(32);
+        let cli = Cli::try_parse_from([
+            "aeronyx-server",
+            "directory-replica",
+            "pull-observation-certificate",
+            "--source-endpoint",
+            "https://203.0.113.9:8422",
+            "--expected-observer",
+            &expected_observer,
+            "--allowed-witness",
+            &witness,
+            "--minimum-witnesses",
+            "1",
+            "--max-age-seconds",
+            "600",
+            "--config",
+            "/tmp/server.toml",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::DirectoryReplica(DirectoryReplicaCommands::PullObservationCertificate {
+            source_endpoint,
+            expected_observer: parsed_observer,
+            allowed_witnesses,
+            minimum_witnesses,
+            max_age_seconds,
+            config,
+            json,
+        }) = cli.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(source_endpoint, "https://203.0.113.9:8422");
+        assert_eq!(parsed_observer, expected_observer);
+        assert_eq!(allowed_witnesses, vec![witness]);
+        assert_eq!(minimum_witnesses, 1);
+        assert_eq!(max_age_seconds, 600);
         assert_eq!(config, PathBuf::from("/tmp/server.toml"));
         assert!(json);
     }

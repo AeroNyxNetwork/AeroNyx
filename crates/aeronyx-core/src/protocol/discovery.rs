@@ -28,6 +28,8 @@
 //!   independently recomputed observation-checkpoint witness receipts
 //! - Opaque policy-head anchor frames that let independent pinned witnesses
 //!   retain rollback evidence without receiving policy members or endpoints
+//! - Authenticated observation-certificate exchange frames that let pinned
+//!   nodes transport exact portable evidence without making it public
 //! - Replica-carrier frames that transport already audited producer evidence
 //!   without allowing the carrier to replace the producer's signatures
 //! - Shared bounded fixed-integer codec policy for canonical control-plane
@@ -59,6 +61,8 @@
 //!     producer admission is unavailable; receivers still verify both layers
 //! 12. A pinned witness may retain one monotonic opaque policy head per
 //!     observer and return a signed receipt without learning policy members
+//! 13. A pinned node may request the latest portable observation certificate;
+//!     the response binds the exact certificate bytes and SHA-256 digest
 //!
 //! ## Important Note for Next Developer
 //! - Do not put private keys, client IPs, destination metadata, DNS contents,
@@ -79,6 +83,9 @@
 //!   certificate contains public node identities required to verify signatures.
 //!   Keep distribution operator-scoped until an explicit privacy review allows
 //!   broader publication. Never label receipt thresholds as consensus/finality.
+//! - [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Certificate transport is
+//!   restricted to authenticated pinned peers. Append wire variants only;
+//!   changing the existing enum order breaks mixed-version bincode peers.
 //! - A policy-head anchor proves only that one witness retained an opaque
 //!   observer-signed epoch/digest at a time. It is not policy approval, a vote,
 //!   validator membership, consensus, governance, or finality.
@@ -92,6 +99,8 @@
 //!   rejection and the complete-input size preflight in the shared codec.
 //!
 //! ## Last Modified
+//! v0.15.0-AuthenticatedCertificateExchange - Added pinned-peer request and
+//! response frames binding exact portable certificate bytes
 //! v0.14.0-PortableObservationCertificate - Added bounded offline-verifiable
 //! checkpoint and external-recomputation receipt packages
 //! v0.13.0-DirectoryMirrorCarrierCapability - Added a signed, rollout-gated
@@ -1828,6 +1837,49 @@ pub enum DirectorySyncMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+    /// Requests the responder's latest portable observation certificate.
+    ///
+    /// [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] This variant is appended to
+    /// preserve every existing bincode enum index. The server must admit only
+    /// authenticated pinned peers and must never expose this frame publicly.
+    ObservationCertificateRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Ed25519 identity of the requesting pinned peer.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Requester signature over every request field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns one exact portable observation certificate to a pinned peer.
+    ///
+    /// The responder authenticates transport only. Receivers must still verify
+    /// the observer checkpoint, every witness receipt, local witness pins, and
+    /// their own certificate-age policy before importing the evidence.
+    ObservationCertificateResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Requester identity copied from the authenticated request.
+        requester: [u8; 32],
+        /// Pinned responder transporting its locally verified certificate.
+        responder: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// SHA-256 of the exact canonical certificate frame.
+        certificate_sha256: [u8; 32],
+        /// Canonical bounded portable observation-certificate frame.
+        #[serde(with = "serde_bytes")]
+        certificate_frame: Vec<u8>,
+        /// Responder signature binding metadata, digest, and frame length.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn directory_sync_signing_digest<'a>(
@@ -2238,6 +2290,58 @@ pub fn directory_policy_anchor_response_signing_bytes(
             responder.as_slice(),
             response_timestamp.as_slice(),
             outcome.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by an observation-certificate request.
+#[must_use]
+pub fn directory_observation_certificate_request_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> [u8; 32] {
+    let request_timestamp = request_timestamp.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ObservationCertificateRequest-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            request_timestamp.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by an observation-certificate response.
+///
+/// The digest binds both the SHA-256 digest and exact byte length. The caller
+/// must independently recompute the digest from `certificate_frame` before
+/// accepting the responder signature.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_observation_certificate_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    certificate_sha256: &[u8; 32],
+    certificate_frame_bytes: u64,
+) -> [u8; 32] {
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let certificate_frame_bytes = certificate_frame_bytes.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ObservationCertificateResponse-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            responder.as_slice(),
+            response_timestamp.as_slice(),
+            certificate_sha256.as_slice(),
+            certificate_frame_bytes.as_slice(),
         ],
     )
 }
@@ -3644,6 +3748,73 @@ mod tests {
                 &witness.public_key_bytes(),
                 1_700_000_304,
                 DIRECTORY_POLICY_ANCHOR_CONFLICT_V1,
+            )
+        );
+    }
+
+    #[test]
+    fn test_directory_observation_certificate_exchange_frames_are_canonical_and_bound() {
+        let requester = IdentityKeyPair::from_bytes(&[0x7c; 32]).unwrap();
+        let responder = IdentityKeyPair::from_bytes(&[0x7d; 32]).unwrap();
+        let request_id = [0x7e; 16];
+        let request_timestamp = 1_700_000_305;
+        let request_digest = directory_observation_certificate_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &requester.public_key_bytes(),
+            request_timestamp,
+        );
+        let request = DirectorySyncMessage::ObservationCertificateRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp,
+            signature: requester.sign(&request_digest),
+        };
+        let encoded = encode_directory_sync_message(&request).unwrap();
+        assert_eq!(decode_directory_sync_message(&encoded).unwrap(), request);
+
+        let certificate_frame = vec![0xa5; 96];
+        let certificate_sha256: [u8; 32] = Sha256::digest(&certificate_frame).into();
+        let response_timestamp = 1_700_000_306;
+        let frame_bytes = u64::try_from(certificate_frame.len()).unwrap();
+        let response_digest = directory_observation_certificate_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &requester.public_key_bytes(),
+            &responder.public_key_bytes(),
+            response_timestamp,
+            &certificate_sha256,
+            frame_bytes,
+        );
+        let response_signature = responder.sign(&response_digest);
+        let response = DirectorySyncMessage::ObservationCertificateResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            requester: requester.public_key_bytes(),
+            responder: responder.public_key_bytes(),
+            response_timestamp,
+            certificate_sha256,
+            certificate_frame: certificate_frame.clone(),
+            signature: response_signature,
+        };
+        let encoded = encode_directory_sync_message(&response).unwrap();
+        assert_eq!(decode_directory_sync_message(&encoded).unwrap(), response);
+        IdentityPublicKey::from_bytes(&responder.public_key_bytes())
+            .unwrap()
+            .verify(&response_digest, &response_signature)
+            .unwrap();
+
+        assert_ne!(
+            response_digest,
+            directory_observation_certificate_response_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &request_id,
+                &requester.public_key_bytes(),
+                &responder.public_key_bytes(),
+                response_timestamp,
+                &certificate_sha256,
+                frame_bytes + 1,
             )
         );
     }
