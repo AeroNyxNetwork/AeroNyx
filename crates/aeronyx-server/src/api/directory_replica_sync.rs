@@ -66,6 +66,9 @@
 //! - [REPLICA-PROOF-RECOVERY 2026-07-27 by Codex] Fetches an exact descriptor
 //!   inclusion proof direct from its producer first, then tries at most two
 //!   explicitly advertised carriers only for typed availability failures.
+//! - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] Admits a proven descriptor
+//!   into `PeerStore` only after an exact locally retained replica proof matches
+//!   the independently verified network proof.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -121,6 +124,9 @@
 //!     the compact inclusion proof directly, then use bounded carrier recovery
 //!     only when transport or route admission is unavailable. Verify the
 //!     producer proof and carrier envelope independently.
+//! 20. Before proof retrieval, require the exact producer/block/descriptor
+//!     anchor in the audited local replica. After retrieval, re-audit and match
+//!     the deterministic proof byte-for-byte before normal PeerStore admission.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -164,8 +170,13 @@
 //!   `proof_not_found`, noncanonical frame, contract mismatch, bad signature,
 //!   or invalid proof is not retryable. Carrier failover must never conceal
 //!   contradictory evidence or choose the trusted producer/block for a caller.
+//! - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] A transport-authenticated
+//!   proof is not a local trust anchor. Keep both local replica audits around
+//!   the network request, exact-proof equality, and `PeerStore` anti-rollback.
 //!
 //! ## Last Modified
+//! `v0.27.0-DirectoryAuthenticatedPeerAdmission` - Added locally anchored proof
+//! admission into `PeerStore` with preflight/postflight audits and stable errors.
 //! `v0.26.0-ReplicaProofRecovery` - Added direct-first, at-most-two explicit
 //! carrier recovery for exact descriptor inclusion proofs with dual verification.
 //! `v0.25.0-BoundedWitnessCarrierRecovery` - Added direct-first, at-most-two,
@@ -271,7 +282,7 @@ use crate::services::directory_replica::{
 };
 use crate::services::{
     DirectoryObservationWitnessOutcome, DirectoryReplicaImportReport, DirectoryReplicaStore,
-    DirectoryReplicaStoreError, DirectoryReplicaSyncRuntime, PeerStore,
+    DirectoryReplicaStoreError, DirectoryReplicaSyncRuntime, PeerStore, PeerStoreError,
 };
 
 /// Maximum pinned producers synchronized concurrently by one node.
@@ -416,6 +427,23 @@ pub struct AuthenticatedDirectoryDescriptorProof {
     /// Whether a direct producer request was attempted.
     pub direct_attempted: bool,
     /// Number of bounded carriers attempted before success.
+    pub carrier_attempts: u8,
+}
+
+/// Privacy-safe outcome of one locally anchored `PeerStore` admission.
+///
+/// The result deliberately omits node identity, producer identity, hashes,
+/// endpoint, carrier, route, and proof contents. `inserted == false` means the
+/// exact same descriptor sequence was already present and verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryAuthenticatedPeerAdmission {
+    /// Whether `PeerStore` inserted or upgraded the proven descriptor.
+    pub inserted: bool,
+    /// Authenticated transport class used to recover the proof.
+    pub transport: DirectoryDescriptorProofTransport,
+    /// Whether the direct producer transport was attempted.
+    pub direct_attempted: bool,
+    /// Number of bounded replica carriers attempted before success.
     pub carrier_attempts: u8,
 }
 
@@ -567,6 +595,173 @@ pub async fn fetch_directory_descriptor_inclusion_proof_with_recovery(
         }
     }
     Err("directory_descriptor_proof_recovery_exhausted".to_string())
+}
+
+/// Fetches and admits one directory-authenticated node descriptor.
+///
+/// [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] The local replica is audited
+/// before any network request, preventing a caller from probing an unknown
+/// network-selected anchor. After recovery, [`admit_directory_authenticated_descriptor`]
+/// repeats the audit and requires exact deterministic proof equality before the
+/// existing `PeerStore` signature, validity-window, capacity, and anti-rollback
+/// checks run.
+///
+/// # Errors
+/// Returns only stable privacy-safe buckets. It never returns producer,
+/// descriptor, block, carrier, endpoint, request, proof, or database material.
+pub async fn fetch_and_admit_directory_authenticated_descriptor(
+    replica_store: &DirectoryReplicaStore,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    producer: &[u8; 32],
+    block_hash: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    client: &reqwest::Client,
+) -> Result<DirectoryAuthenticatedPeerAdmission, String> {
+    locally_audited_directory_descriptor_proof(
+        replica_store,
+        producer,
+        block_hash,
+        descriptor_hash,
+        unix_now_secs(),
+    )?;
+    let authenticated = fetch_directory_descriptor_inclusion_proof_with_recovery(
+        peer_store,
+        identity,
+        producer,
+        block_hash,
+        descriptor_hash,
+        client,
+    )
+    .await?;
+    admit_directory_authenticated_descriptor(
+        replica_store,
+        peer_store,
+        &authenticated,
+        producer,
+        block_hash,
+        descriptor_hash,
+        unix_now_secs(),
+    )
+}
+
+/// Admits one recovered descriptor only when it exactly matches local replica
+/// evidence under caller-supplied trust anchors.
+///
+/// This function deliberately re-verifies the producer proof even though the
+/// network helper already did so: the authenticated wrapper is a public data
+/// type and must never become an authority token by construction alone.
+///
+/// # Errors
+/// Returns a stable privacy-safe reason when transport metadata is impossible,
+/// proof verification fails, the local anchor is absent/quarantined/corrupt,
+/// deterministic evidence differs, or `PeerStore` rejects the descriptor.
+pub fn admit_directory_authenticated_descriptor(
+    replica_store: &DirectoryReplicaStore,
+    peer_store: &PeerStore,
+    authenticated: &AuthenticatedDirectoryDescriptorProof,
+    producer: &[u8; 32],
+    block_hash: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    observed_at: u64,
+) -> Result<DirectoryAuthenticatedPeerAdmission, String> {
+    if *producer == [0u8; 32]
+        || *block_hash == [0u8; 32]
+        || *descriptor_hash == [0u8; 32]
+        || observed_at == 0
+    {
+        return Err("directory_authenticated_admission_request_invalid".to_string());
+    }
+    if !directory_authenticated_transport_summary_valid(authenticated) {
+        return Err("directory_authenticated_admission_transport_invalid".to_string());
+    }
+    authenticated
+        .proof
+        .verify_at(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer,
+            block_hash,
+            observed_at,
+        )
+        .map_err(|_| "directory_authenticated_admission_proof_invalid".to_string())?;
+    if authenticated.proof.commitment.descriptor_hash != *descriptor_hash {
+        return Err("directory_authenticated_admission_descriptor_mismatch".to_string());
+    }
+
+    let local_proof = locally_audited_directory_descriptor_proof(
+        replica_store,
+        producer,
+        block_hash,
+        descriptor_hash,
+        observed_at,
+    )?;
+    if local_proof != authenticated.proof {
+        return Err("directory_authenticated_admission_local_evidence_mismatch".to_string());
+    }
+
+    let inserted = peer_store
+        .upsert_verified_from_source(
+            authenticated.proof.descriptor.clone(),
+            observed_at,
+            "directory_proof",
+        )
+        .map_err(|error| directory_authenticated_peer_store_error(&error).to_string())?;
+    Ok(DirectoryAuthenticatedPeerAdmission {
+        inserted,
+        transport: authenticated.transport,
+        direct_attempted: authenticated.direct_attempted,
+        carrier_attempts: authenticated.carrier_attempts,
+    })
+}
+
+fn locally_audited_directory_descriptor_proof(
+    replica_store: &DirectoryReplicaStore,
+    producer: &[u8; 32],
+    block_hash: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    observed_at: u64,
+) -> Result<DirectoryDescriptorInclusionProofV1, String> {
+    match replica_store.audited_evidence_descriptor_inclusion_proof(
+        producer,
+        descriptor_hash,
+        block_hash,
+        observed_at,
+    ) {
+        Ok(Some(proof)) => Ok(proof),
+        Ok(None) => Err("directory_authenticated_admission_local_anchor_not_found".to_string()),
+        Err(DirectoryReplicaStoreError::Quarantined(_)) => {
+            Err("directory_authenticated_admission_local_anchor_quarantined".to_string())
+        }
+        Err(_) => Err("directory_authenticated_admission_local_anchor_audit_failed".to_string()),
+    }
+}
+
+#[must_use]
+fn directory_authenticated_transport_summary_valid(
+    authenticated: &AuthenticatedDirectoryDescriptorProof,
+) -> bool {
+    match authenticated.transport {
+        DirectoryDescriptorProofTransport::DirectProducer => {
+            authenticated.direct_attempted && authenticated.carrier_attempts == 0
+        }
+        DirectoryDescriptorProofTransport::ReplicaCarrier => {
+            authenticated.carrier_attempts > 0
+                && usize::from(authenticated.carrier_attempts)
+                    <= DIRECTORY_MIRROR_RECOVERY_MAX_CARRIERS_PER_PAGE
+        }
+    }
+}
+
+const fn directory_authenticated_peer_store_error(error: &PeerStoreError) -> &'static str {
+    match error {
+        PeerStoreError::VerificationFailed => {
+            "directory_authenticated_admission_descriptor_invalid"
+        }
+        PeerStoreError::StaleSequence { .. } => "directory_authenticated_admission_stale_sequence",
+        PeerStoreError::CapacityExceeded { .. } => {
+            "directory_authenticated_admission_peer_capacity_exceeded"
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5358,6 +5553,53 @@ mod tests {
         (producer, carrier, descriptor, block, proof)
     }
 
+    fn descriptor_proof_replica_store(
+        producer: &IdentityKeyPair,
+        descriptor: &SignedNodeDescriptor,
+        block: &DirectoryCommitmentBlockV1,
+        observed_at: u64,
+    ) -> DirectoryReplicaStore {
+        let local = IdentityKeyPair::from_bytes(&[0x74; 32]).unwrap();
+        let request_id = [0x75; 16];
+        let blocks = vec![block.clone()];
+        let block_hash = block.hash();
+        let signing_bytes = directory_block_range_response_signing_bytes(
+            &request_id,
+            &producer.public_key_bytes(),
+            observed_at,
+            &blocks,
+            false,
+            block.header.height,
+            &block_hash,
+        );
+        let response = DirectorySyncMessage::BlockRangeResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            responder: producer.public_key_bytes(),
+            response_timestamp: observed_at,
+            blocks,
+            has_more: false,
+            tip_height: block.header.height,
+            tip_hash: block_hash,
+            signature: producer.sign(&signing_bytes),
+        };
+        let frame = encode_directory_sync_message(&response).unwrap();
+        let (store, _) =
+            DirectoryReplicaStore::open(":memory:", local.public_key_bytes(), observed_at).unwrap();
+        store
+            .import_verified_page(
+                producer.public_key_bytes(),
+                std::slice::from_ref(block),
+                std::slice::from_ref(descriptor),
+                block.header.height,
+                block_hash,
+                &frame,
+                observed_at,
+            )
+            .unwrap();
+        store
+    }
+
     async fn carrier_hydration_test_endpoint(
         status: StatusCode,
         body: Vec<u8>,
@@ -5575,6 +5817,199 @@ mod tests {
             )
             .unwrap_err(),
             "directory_replica_proof_response_invalid_producer_proof"
+        );
+    }
+
+    #[test]
+    fn directory_authenticated_admission_is_locally_anchored_and_idempotent() {
+        let (producer, _, descriptor, block, proof) = descriptor_proof_test_context();
+        let now = unix_now_secs();
+        let replica_store = descriptor_proof_replica_store(&producer, &descriptor, &block, now);
+        let peer_store = PeerStore::new();
+        let authenticated = AuthenticatedDirectoryDescriptorProof {
+            proof,
+            transport: DirectoryDescriptorProofTransport::DirectProducer,
+            direct_attempted: true,
+            carrier_attempts: 0,
+        };
+        let descriptor_hash = authenticated.proof.commitment.descriptor_hash;
+        let block_hash = block.hash();
+
+        let inserted = admit_directory_authenticated_descriptor(
+            &replica_store,
+            &peer_store,
+            &authenticated,
+            &producer.public_key_bytes(),
+            &block_hash,
+            &descriptor_hash,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            inserted,
+            DirectoryAuthenticatedPeerAdmission {
+                inserted: true,
+                transport: DirectoryDescriptorProofTransport::DirectProducer,
+                direct_attempted: true,
+                carrier_attempts: 0,
+            }
+        );
+        assert_eq!(
+            peer_store.get_valid(&descriptor.node_id(), now),
+            Some(descriptor.clone())
+        );
+
+        let unchanged = admit_directory_authenticated_descriptor(
+            &replica_store,
+            &peer_store,
+            &authenticated,
+            &producer.public_key_bytes(),
+            &block_hash,
+            &descriptor_hash,
+            now,
+        )
+        .unwrap();
+        assert!(!unchanged.inserted);
+        assert_eq!(peer_store.len(), 1);
+    }
+
+    #[test]
+    fn directory_authenticated_admission_rejects_unknown_local_anchor() {
+        let (producer, _, descriptor, block, _) = descriptor_proof_test_context();
+        let now = unix_now_secs();
+        let replica_store = descriptor_proof_replica_store(&producer, &descriptor, &block, now);
+        let alternate_block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(1),
+            [0u8; 32],
+            vec![DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap()],
+            &producer,
+        )
+        .unwrap();
+        let alternate_proof =
+            DirectoryDescriptorInclusionProofV1::from_block_at(&alternate_block, &descriptor, now)
+                .unwrap();
+        let descriptor_hash = alternate_proof.commitment.descriptor_hash;
+        let authenticated = AuthenticatedDirectoryDescriptorProof {
+            proof: alternate_proof,
+            transport: DirectoryDescriptorProofTransport::ReplicaCarrier,
+            direct_attempted: false,
+            carrier_attempts: 1,
+        };
+        let peer_store = PeerStore::new();
+
+        assert_eq!(
+            admit_directory_authenticated_descriptor(
+                &replica_store,
+                &peer_store,
+                &authenticated,
+                &producer.public_key_bytes(),
+                &alternate_block.hash(),
+                &descriptor_hash,
+                now,
+            )
+            .unwrap_err(),
+            "directory_authenticated_admission_local_anchor_not_found"
+        );
+        assert_eq!(peer_store.len(), 0);
+    }
+
+    #[test]
+    fn directory_authenticated_admission_reverifies_public_wrapper() {
+        let (producer, _, descriptor, block, mut proof) = descriptor_proof_test_context();
+        let now = unix_now_secs();
+        let replica_store = descriptor_proof_replica_store(&producer, &descriptor, &block, now);
+        let descriptor_hash = proof.commitment.descriptor_hash;
+        proof.producer_signature[0] ^= 1;
+        let peer_store = PeerStore::new();
+        let authenticated = AuthenticatedDirectoryDescriptorProof {
+            proof,
+            transport: DirectoryDescriptorProofTransport::DirectProducer,
+            direct_attempted: true,
+            carrier_attempts: 0,
+        };
+
+        assert_eq!(
+            admit_directory_authenticated_descriptor(
+                &replica_store,
+                &peer_store,
+                &authenticated,
+                &producer.public_key_bytes(),
+                &block.hash(),
+                &descriptor_hash,
+                now,
+            )
+            .unwrap_err(),
+            "directory_authenticated_admission_proof_invalid"
+        );
+        assert_eq!(peer_store.len(), 0);
+
+        let impossible_transport = AuthenticatedDirectoryDescriptorProof {
+            proof: authenticated.proof.clone(),
+            transport: DirectoryDescriptorProofTransport::DirectProducer,
+            direct_attempted: false,
+            carrier_attempts: 1,
+        };
+        assert_eq!(
+            admit_directory_authenticated_descriptor(
+                &replica_store,
+                &peer_store,
+                &impossible_transport,
+                &producer.public_key_bytes(),
+                &block.hash(),
+                &descriptor_hash,
+                now,
+            )
+            .unwrap_err(),
+            "directory_authenticated_admission_transport_invalid"
+        );
+    }
+
+    #[test]
+    fn directory_authenticated_admission_preserves_peer_store_anti_rollback() {
+        let (producer, _, descriptor, block, proof) = descriptor_proof_test_context();
+        let now = unix_now_secs();
+        let replica_store = descriptor_proof_replica_store(&producer, &descriptor, &block, now);
+        let subject = IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap();
+        let newer = SignedNodeDescriptor::sign(
+            NodeDescriptor::new(
+                subject.public_key_bytes(),
+                descriptor.sequence() + 1,
+                now.saturating_sub(1),
+                now + 600,
+                "directory-admission-newer-test",
+            ),
+            &subject,
+        )
+        .unwrap();
+        let peer_store = PeerStore::new();
+        peer_store
+            .upsert_verified_from_source(newer.clone(), now, "test_newer")
+            .unwrap();
+        let descriptor_hash = proof.commitment.descriptor_hash;
+        let authenticated = AuthenticatedDirectoryDescriptorProof {
+            proof,
+            transport: DirectoryDescriptorProofTransport::ReplicaCarrier,
+            direct_attempted: true,
+            carrier_attempts: 1,
+        };
+
+        assert_eq!(
+            admit_directory_authenticated_descriptor(
+                &replica_store,
+                &peer_store,
+                &authenticated,
+                &producer.public_key_bytes(),
+                &block.hash(),
+                &descriptor_hash,
+                now,
+            )
+            .unwrap_err(),
+            "directory_authenticated_admission_stale_sequence"
+        );
+        assert_eq!(
+            peer_store.get_valid(&subject.public_key_bytes(), now),
+            Some(newer)
         );
     }
 

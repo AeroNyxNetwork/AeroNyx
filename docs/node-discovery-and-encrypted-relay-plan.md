@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.38.0 - Direct-first requester descriptor-proof recovery.
+Modification Reason: v0.39.0 - Locally anchored directory-authenticated PeerStore admission.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.38.0 - [REPLICA-PROOF-RECOVERY 2026-07-27 by Codex] Added direct-first requester proof recovery with bounded explicit-carrier failover and independent producer/carrier verification.
+Last Modified: v0.39.0 - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] Added locally anchored, proof-matched PeerStore admission with preflight/postflight replica audits.
+Previous: v0.38.0 - [REPLICA-PROOF-RECOVERY 2026-07-27 by Codex] Added direct-first requester proof recovery with bounded explicit-carrier failover and independent producer/carrier verification.
 Previous: v0.37.0 - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Added audited carrier recovery for exact original producer descriptor inclusion proofs without expanding mirror authority.
 Previous: v0.36.0 - [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] Added compact exact-block descriptor inclusion proofs plus an audit-gated, pinned-peer-only transport contract for light verifiers.
 Previous: v0.35.0 - [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Added a separate process-only carrier-side status contract so nodes can prove bounded encrypted-evidence transport participation without retaining identities, routes, frames, or payload data.
@@ -1131,6 +1132,29 @@ Implemented in Requester Replica Proof Recovery V1:
   canonical producer chain, grant mirror authority, or prove user activity,
   message delivery, payload contents, traffic, or Memory Chain state.
 
+Implemented in Directory-authenticated PeerStore Admission V1:
+
+- `fetch_and_admit_directory_authenticated_descriptor` accepts only a producer,
+  exact block hash, and exact descriptor hash selected by the local caller.
+- Before any outbound request, the node fully audits its retained producer
+  replica and requires that exact tuple to resolve to a valid locally rebuilt
+  inclusion proof. Unknown network-supplied anchors are never probed.
+- After direct or bounded carrier recovery, the node verifies the producer
+  proof again, re-audits the local replica, and requires the deterministic local
+  proof to equal the recovered proof exactly. This closes the public-wrapper
+  construction and concurrent quarantine/change boundaries.
+- Only then does the normal PeerStore path verify the descriptor validity
+  window and signature, enforce capacity, reject sequence rollback/conflict,
+  invalidate changed route-surface evidence, and record the coarse
+  `directory_proof` source bucket.
+- The admission result exposes only inserted/unchanged, direct/carrier class,
+  direct-attempted, and bounded carrier-attempt count. It omits all identities,
+  endpoints, hashes, requests, proof bytes, routes, and user data.
+- A directory-authenticated descriptor means only that one locally selected
+  producer block committed to that exact signed public descriptor. It does not
+  make the descriptor an authority, grant relay permission, prove reachability,
+  defeat Sybil operators, or create voting, fork-choice, consensus, or finality.
+
 Implemented in Directory Sync V1 replica pull:
 
 - Remote blocks never enter the local producer tables. Every producer has an
@@ -1448,6 +1472,26 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] -->
+2026-07-27 - Added Directory-authenticated PeerStore Admission V1.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Runtime flow:
+  - Audits the exact local replica anchor before any proof request.
+  - Uses the existing direct-first, at-most-two-carrier recovery path.
+  - Re-audits after recovery and requires exact deterministic proof equality.
+  - Admits through the existing PeerStore verification and anti-rollback path.
+- Verification:
+  - Covers inserted and idempotent admission, unknown local block rejection,
+    public-wrapper proof re-verification, impossible transport summaries, and
+    preservation of a newer PeerStore descriptor.
+- Privacy and authority:
+  - Returns only coarse transport/admission state and retains no carrier,
+    endpoint, hash, proof, route, message, traffic, or user metadata.
+  - Local replica acceptance is a caller-selected verification anchor, not
+    network consensus, voting weight, fork choice, authority, or finality.
+
 <!-- [REPLICA-PROOF-RECOVERY 2026-07-27 by Codex] -->
 2026-07-27 - Added Requester Replica Proof Recovery V1.
 - Files changed:
