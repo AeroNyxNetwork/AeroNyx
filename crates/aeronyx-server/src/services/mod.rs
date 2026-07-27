@@ -67,6 +67,7 @@ pub use directory_chain::{
     DirectoryChainStoreError,
 };
 pub(crate) use directory_replica::MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE;
+pub(crate) use directory_replica::DirectoryReplicaGossipAnnouncement;
 pub use directory_replica::{
     DirectoryObservationCheckpointAppendReport, DirectoryObservationWitnessDecision,
     DirectoryObservationWitnessOutcome, DirectoryObservationWitnessOutcomeCounters,

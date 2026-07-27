@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.40.0 - Directory-authenticated discovery gossip admission.
+Modification Reason: v0.41.0 - Directory-authenticated outbound gossip publication.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.40.0 - [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Added proof-carrying discovery gossip that must match exact audited local replica evidence before PeerStore import.
+Last Modified: v0.41.0 - [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Added bounded, rotating, replica-audited outbound proof gossip with mandatory legacy self-announcement fallback.
+Previous: v0.40.0 - [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Added proof-carrying discovery gossip that must match exact audited local replica evidence before PeerStore import.
 Previous: v0.39.0 - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] Added locally anchored, proof-matched PeerStore admission with preflight/postflight replica audits.
 Previous: v0.38.0 - [REPLICA-PROOF-RECOVERY 2026-07-27 by Codex] Added direct-first requester proof recovery with bounded explicit-carrier failover and independent producer/carrier verification.
 Previous: v0.37.0 - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Added audited carrier recovery for exact original producer descriptor inclusion proofs without expanding mirror authority.
@@ -1182,13 +1183,43 @@ Implemented in Directory-authenticated Gossip Admission V1:
   aggregate rejection is recorded.
 - Legacy `DescriptorAnnounce` remains available for rolling compatibility. It
   is explicitly signature-only and must not be described as Directory-backed.
-- This milestone implements the receiving/import path. Automatic outbound
-  selection and publication of locally anchored proof announcements remains the
-  next separate rollout step so mixed-version peers can be measured safely.
 - The frame contains only public signed node-directory evidence. It contains no
   user identity, client IP, selected route, message id, payload, ciphertext,
   traffic, DNS content, destination, Memory Chain record, private key, or wallet
   activity.
+
+Implemented in Directory-authenticated Outbound Gossip V1:
+
+- Each gossip round reads at most 64 recent descriptor commitments from
+  non-quarantined, non-local replica namespaces. This cost is bounded
+  independently of retained history and runs on Tokio's blocking pool rather
+  than the async network executor.
+- Candidate objects must decode, reproduce their committed descriptor hash, and
+  retain a valid node signature. Authentic expired descriptors remain durable
+  history but are never re-announced as current routeable state. Within the
+  bounded window, only the highest live sequence per producer and public node
+  is eligible, preventing old-but-valid revisions from crowding out diversity.
+- The cadence epoch rotates across the live candidate set. It deliberately does
+  not use raw Unix seconds modulo the candidate count, which could repeatedly
+  select one descriptor when a fixed gossip interval shares that divisor.
+- The candidate query is only a selector, never a trust shortcut. Before
+  publication, the node fully audits the selected producer namespace and
+  rebuilds/re-verifies the exact compact inclusion proof against the selected
+  producer, block hash, and descriptor hash.
+- A proof-aware exchange sends one optional
+  `DirectoryDescriptorAnnounceV1` first, then always sends the current legacy
+  `DescriptorAnnounce`, followed by `SnapshotRequest`. Proof rejection or an
+  unsupported new enum variant cannot suppress legacy liveness during rollout.
+- Proof transport failure is best effort in this mixed-version phase. The
+  established legacy exchange still determines whether the peer gossip round
+  succeeded. Mandatory proof-only admission requires a future explicit
+  capability/version negotiation and is not inferred from HTTP `422`.
+- Process logs expose only aggregate proof attempted/accepted counts for a
+  completed round. They never add producer, descriptor, block, peer, endpoint,
+  route, message, payload, user, or traffic dimensions.
+- The carrier still gains no producer, witness, mirror, checkpoint, policy,
+  routing, voting, fork-choice, consensus, or finality authority. The proof
+  authenticates one public descriptor commitment only.
 
 Implemented in Directory Sync V1 replica pull:
 

@@ -55,6 +55,9 @@
 //! - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Rebuilds compact descriptor
 //!   inclusion proofs from one fully audited producer namespace and one exact
 //!   selected producer block without granting the carrier authority.
+//! - [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Selects one bounded,
+//!   live public descriptor from retained replica evidence, then rebuilds its
+//!   exact audited inclusion proof for mixed-version outbound gossip.
 //! - Distinguishes a lagging carrier's unavailable range from a malformed
 //!   request so recovery can continue without weakening contract validation.
 //! - Records only aggregate routeability and signed-region-hint diversity for
@@ -118,6 +121,9 @@
 //! 18. For replica descriptor proofs, audit one producer namespace, load the
 //!     exact block and descriptor in the same read transaction, rebuild and
 //!     independently re-verify the original producer-signed proof.
+//! 19. For outbound proof gossip, scan only a bounded recent candidate window,
+//!     retain only currently live authenticated descriptors, rotate selection,
+//!     and run the complete producer audit before returning one announcement.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -172,6 +178,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.32.0-DirectoryProofGossipPublisher - Added bounded live replica
+//! descriptor selection with exact audited inclusion-proof reconstruction.
 //! v0.31.0-ReplicaDescriptorInclusionProof - Added transactionally audited,
 //! exact-block compact proof export for pinned and retained mirror namespaces
 //! v0.27.0-WitnessCarrierAdmissionTelemetry - Added process-only mutually
@@ -294,6 +302,12 @@ pub(crate) const DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES: u64 = 64;
 pub(crate) const DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS: u64 = 30 * 60;
 /// Hard implementation ceiling for durable permissionless mirror namespaces.
 pub(crate) const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
+/// Maximum recent public descriptor rows inspected for one gossip proof.
+///
+/// [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] This ceiling keeps one
+/// periodic selection independent of retained history. The selected producer
+/// is still fully audited before any proof leaves the process.
+const DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryReplicaImportMode {
@@ -1057,6 +1071,31 @@ pub struct DirectoryReplicaEvidencePage {
     pub tip_height: u64,
     /// Audited accepted producer tip hash at export time.
     pub tip_hash: [u8; 32],
+}
+
+/// One producer-authenticated descriptor proof ready for outbound gossip.
+///
+/// This value contains only public node-directory evidence. It deliberately
+/// excludes carrier identity, selected routes, endpoints outside the signed
+/// descriptor, user data, messages, ciphertext, and traffic observations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectoryReplicaGossipAnnouncement {
+    /// Original Directory block producer.
+    pub(crate) producer: [u8; 32],
+    /// Exact producer-signed block selected from the audited local replica.
+    pub(crate) block_hash: [u8; 32],
+    /// Exact authenticated descriptor object hash.
+    pub(crate) descriptor_hash: [u8; 32],
+    /// Compact producer-signed inclusion proof and descriptor object.
+    pub(crate) proof: DirectoryDescriptorInclusionProofV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryReplicaGossipCandidate {
+    producer: [u8; 32],
+    block_hash: [u8; 32],
+    descriptor_hash: [u8; 32],
+    descriptor: SignedNodeDescriptor,
 }
 
 impl DirectoryReplicaTip {
@@ -3296,6 +3335,186 @@ impl DirectoryReplicaStore {
             observed_at,
             DirectoryReplicaEvidenceScope::AnyAudited,
         )
+    }
+
+    /// Selects one live public descriptor and rebuilds its exact audited proof.
+    ///
+    /// Selection reads at most [`DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT`]
+    /// recent descriptor rows from non-quarantined, non-local producer
+    /// namespaces. `selection_seed` rotates the chosen live row so periodic
+    /// gossip does not continuously amplify one descriptor. The lightweight
+    /// candidate read never establishes trust: after selection, the complete
+    /// producer namespace and exact block/object indexes are audited by
+    /// [`Self::audited_evidence_descriptor_inclusion_proof`].
+    ///
+    /// `Ok(None)` means this replica currently has no live descriptor suitable
+    /// for proof gossip. Expired authentic descriptors are retained as history
+    /// but are never announced as routeable state.
+    ///
+    /// [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] The returned proof is
+    /// additive rollout evidence. It does not make the carrier a producer,
+    /// authority, validator, voter, or consensus participant.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] for invalid time, malformed
+    /// persisted candidates, SQLite failure, quarantine races, or any complete
+    /// producer-audit/proof mismatch.
+    pub(crate) fn audited_live_descriptor_gossip_announcement(
+        &self,
+        observed_at: u64,
+        selection_seed: u64,
+    ) -> Result<Option<DirectoryReplicaGossipAnnouncement>, DirectoryReplicaStoreError> {
+        if observed_at == 0 {
+            return Err(DirectoryReplicaStoreError::Request(
+                "gossip proof observation time is invalid".to_string(),
+            ));
+        }
+
+        let persisted_candidates = {
+            let connection = self.connection.lock();
+            let mut statement = connection.prepare(
+                "SELECT commitments.producer,
+                        blocks.block_hash,
+                        commitments.descriptor_hash,
+                        objects.descriptor_blob
+                 FROM directory_replica_commitments AS commitments
+                 INNER JOIN directory_replica_chains AS chains
+                    ON chains.producer = commitments.producer
+                 INNER JOIN directory_replica_blocks AS blocks
+                    ON blocks.producer = commitments.producer
+                   AND blocks.height = commitments.block_height
+                 INNER JOIN directory_replica_descriptor_objects AS objects
+                    ON objects.producer = commitments.producer
+                   AND objects.descriptor_hash = commitments.descriptor_hash
+                 WHERE chains.quarantined = 0
+                   AND commitments.producer != ?1
+                 ORDER BY blocks.produced_at DESC,
+                          commitments.producer ASC,
+                          commitments.descriptor_hash ASC
+                 LIMIT ?2",
+            )?;
+            let candidates = statement
+                .query_map(
+                    params![
+                        self.local_node_id.as_slice(),
+                        i64::try_from(DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT).map_err(
+                            |_| DirectoryReplicaStoreError::Integrity(
+                                "gossip proof candidate limit exceeds SQLite range".to_string()
+                            )
+                        )?
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            candidates
+        };
+
+        let mut latest_live_candidates = BTreeMap::new();
+        for (producer_bytes, block_hash_bytes, descriptor_hash_bytes, descriptor_blob) in
+            persisted_candidates
+        {
+            let producer = bytes32(&producer_bytes, "gossip proof producer")?;
+            let block_hash = bytes32(&block_hash_bytes, "gossip proof block hash")?;
+            let descriptor_hash =
+                bytes32(&descriptor_hash_bytes, "gossip proof descriptor hash")?;
+            let descriptor = decode_descriptor_object(&descriptor_blob)?;
+            descriptor.verify_signature().map_err(|error| {
+                DirectoryReplicaStoreError::Descriptor(format!(
+                    "gossip proof candidate signature is invalid: {error}"
+                ))
+            })?;
+            let derived = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor)
+                .map_err(|error| DirectoryReplicaStoreError::Descriptor(error.to_string()))?;
+            if derived.descriptor_hash != descriptor_hash {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "gossip proof candidate descriptor hash mismatch".to_string(),
+                ));
+            }
+            if descriptor.descriptor.is_valid_at(observed_at) {
+                // [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] One producer
+                // may retain several still-live revisions for the same public
+                // node. Announce only its highest sequence from this bounded
+                // window so old-but-valid history cannot crowd out diversity.
+                let candidate_key = (producer, descriptor.node_id());
+                match latest_live_candidates.entry(candidate_key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(DirectoryReplicaGossipCandidate {
+                            producer,
+                            block_hash,
+                            descriptor_hash,
+                            descriptor,
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let current = entry.get();
+                        if descriptor.sequence() > current.descriptor.sequence() {
+                            entry.insert(DirectoryReplicaGossipCandidate {
+                                producer,
+                                block_hash,
+                                descriptor_hash,
+                                descriptor,
+                            });
+                        } else if descriptor.sequence() == current.descriptor.sequence()
+                            && descriptor_hash != current.descriptor_hash
+                        {
+                            return Err(DirectoryReplicaStoreError::Integrity(
+                                "gossip proof candidates contain descriptor equivocation"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut live_candidates = latest_live_candidates.into_values().collect::<Vec<_>>();
+        if live_candidates.is_empty() {
+            return Ok(None);
+        }
+        let candidate_count = u64::try_from(live_candidates.len()).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "gossip proof live candidate count exceeds u64".to_string(),
+            )
+        })?;
+        let selected_index = usize::try_from(selection_seed % candidate_count).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "gossip proof candidate index exceeds usize".to_string(),
+            )
+        })?;
+        let selected = live_candidates.swap_remove(selected_index);
+        let proof = self
+            .audited_evidence_descriptor_inclusion_proof(
+                &selected.producer,
+                &selected.descriptor_hash,
+                &selected.block_hash,
+                observed_at,
+            )?
+            .ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "selected gossip descriptor proof disappeared during audit".to_string(),
+                )
+            })?;
+        if proof.descriptor != selected.descriptor
+            || proof.commitment.descriptor_hash != selected.descriptor_hash
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "selected gossip descriptor proof does not match candidate".to_string(),
+            ));
+        }
+
+        Ok(Some(DirectoryReplicaGossipAnnouncement {
+            producer: selected.producer,
+            block_hash: selected.block_hash,
+            descriptor_hash: selected.descriptor_hash,
+            proof,
+        }))
     }
 
     fn audited_evidence_descriptor_inclusion_proof_with_scope(
@@ -10941,6 +11160,74 @@ mod tests {
         assert_eq!(reopened.producers, 1);
         assert_eq!(reopened.blocks, 1);
         assert_eq!(reopened.commitments, 1);
+    }
+
+    #[test]
+    fn live_gossip_proof_selection_rotates_and_excludes_expired_descriptors() {
+        let temp = TempDir::new().unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let producer_a = IdentityKeyPair::from_bytes(&[0x72; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap();
+        let subject_a = IdentityKeyPair::from_bytes(&[0x74; 32]).unwrap();
+        let subject_b = IdentityKeyPair::from_bytes(&[0x75; 32]).unwrap();
+        let descriptor_a = descriptor(&subject_a, 1);
+        let descriptor_b = descriptor(&subject_b, 1);
+        let block_a = block(&producer_a, 1, [0u8; 32], &descriptor_a);
+        let block_b = block(&producer_b, 1, [0u8; 32], &descriptor_b);
+        let (store, _) = DirectoryReplicaStore::open(
+            temp.path().join("directory.db"),
+            local.public_key_bytes(),
+            NOW + 20,
+        )
+        .unwrap();
+        import_replica_block(
+            &store,
+            &producer_a,
+            &descriptor_a,
+            &block_a,
+            [0x76; 16],
+        );
+        import_replica_block(
+            &store,
+            &producer_b,
+            &descriptor_b,
+            &block_b,
+            [0x77; 16],
+        );
+
+        // [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Adjacent seeds must
+        // rotate across the bounded live set rather than amplifying one node.
+        let first = store
+            .audited_live_descriptor_gossip_announcement(NOW + 21, 0)
+            .unwrap()
+            .unwrap();
+        let second = store
+            .audited_live_descriptor_gossip_announcement(NOW + 21, 1)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.producer, second.producer);
+        for selected in [&first, &second] {
+            selected
+                .proof
+                .verify_at(
+                    &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                    &selected.producer,
+                    &selected.block_hash,
+                    NOW + 21,
+                )
+                .unwrap();
+            assert_eq!(
+                selected.proof.commitment.descriptor_hash,
+                selected.descriptor_hash
+            );
+        }
+
+        // Authentic historical descriptors remain stored but cannot be
+        // re-announced as current routeable state after expiry.
+        assert!(store
+            .audited_live_descriptor_gossip_announcement(NOW + 3_601, 0)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
