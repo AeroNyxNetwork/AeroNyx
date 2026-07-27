@@ -42,9 +42,12 @@
 //! - Do not weaken startup audit or replace `SQLite` transactions with an
 //!   in-place JSON rewrite.
 //! - Peer transport may export only an audit-gated bounded page or exact
-//!   descriptor object batch. Replica import and fork selection remain separate.
+//!   descriptor object batch or exact descriptor inclusion proof. Replica
+//!   import and fork selection remain separate.
 //!
 //! ## Last Modified
+//! v0.3.0-DirectoryInclusionProof - Added exact-block, audit-gated descriptor
+//! inclusion proof export for authenticated pinned peers.
 //! v0.2.0-DirectorySyncReads - Added audit-gated bounded tip/page/object reads.
 //! v0.1.0-DirectoryChainStore - Initial transactional local block persistence.
 // ============================================================================
@@ -57,9 +60,9 @@ use std::time::Duration;
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::discovery::{
     DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
-    DirectoryDescriptorCommitmentV1, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-    MAX_DIRECTORY_COMMITMENTS_PER_BLOCK, MAX_DIRECTORY_SYNC_BLOCKS_V1,
-    MAX_DIRECTORY_SYNC_OBJECTS_V1,
+    DirectoryDescriptorCommitmentV1, DirectoryDescriptorInclusionProofV1, SignedNodeDescriptor,
+    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
+    MAX_DIRECTORY_SYNC_BLOCKS_V1, MAX_DIRECTORY_SYNC_OBJECTS_V1,
 };
 use bincode::Options;
 use parking_lot::Mutex;
@@ -592,6 +595,83 @@ impl DirectoryChainStore {
             objects.push(object);
         }
         Ok(Some(objects))
+    }
+
+    /// Builds one compact descriptor proof after auditing the complete chain.
+    ///
+    /// The caller must provide an exact independently selected block hash.
+    /// `Ok(None)` means the descriptor is absent or belongs to another block;
+    /// the store never silently substitutes a newer block. The returned proof
+    /// establishes producer-signed inclusion only, not canonical-chain
+    /// selection, consensus, or finality.
+    ///
+    /// [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] This read exports only
+    /// public signed node-directory metadata. Never extend it with user,
+    /// message, route, traffic, or Memory Chain data.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryChainStoreError`] for sentinel request hashes, audit
+    /// failure, malformed persisted data, or inconsistent proof construction.
+    pub fn audited_descriptor_inclusion_proof(
+        &self,
+        descriptor_hash: &[u8; 32],
+        expected_block_hash: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<Option<DirectoryDescriptorInclusionProofV1>, DirectoryChainStoreError> {
+        if descriptor_hash == &[0u8; 32] || expected_block_hash == &[0u8; 32] {
+            return Err(DirectoryChainStoreError::Request(
+                "descriptor and block hashes must not use the zero sentinel".to_string(),
+            ));
+        }
+        self.audit(observed_at)?;
+
+        let connection = self.connection.lock();
+        let block_height = connection
+            .query_row(
+                "SELECT block_height FROM directory_chain_commitments
+                 WHERE descriptor_hash = ?1",
+                params![descriptor_hash.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        drop(connection);
+        let Some(block_height) = block_height else {
+            return Ok(None);
+        };
+        let block_height = positive_i64_to_u64(block_height, "descriptor block height")?;
+        let block = self.block(block_height)?.ok_or_else(|| {
+            DirectoryChainStoreError::Integrity(format!(
+                "audited descriptor block {block_height} disappeared while building a proof"
+            ))
+        })?;
+        if &block.hash() != expected_block_hash {
+            return Ok(None);
+        }
+        let descriptor = self.descriptor_object(descriptor_hash)?.ok_or_else(|| {
+            DirectoryChainStoreError::Integrity(
+                "audited descriptor object disappeared while building a proof".to_string(),
+            )
+        })?;
+        let proof =
+            DirectoryDescriptorInclusionProofV1::from_block_at(&block, &descriptor, observed_at)
+                .map_err(|error| {
+                    DirectoryChainStoreError::Integrity(format!(
+                        "failed to build audited descriptor inclusion proof: {error}"
+                    ))
+                })?;
+        proof
+            .verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &self.producer,
+                expected_block_hash,
+                observed_at,
+            )
+            .map_err(|error| {
+                DirectoryChainStoreError::Integrity(format!(
+                    "failed to re-verify audited descriptor inclusion proof: {error}"
+                ))
+            })?;
+        Ok(Some(proof))
     }
 
     /// Loads one verified block by height for future bounded peer sync.
@@ -1184,6 +1264,54 @@ mod tests {
         assert!(store.audited_block_page(1, 0, NOW + 1).is_err());
         assert!(store
             .audited_descriptor_objects(&[first_hash, first_hash], NOW + 1)
+            .is_err());
+    }
+
+    #[test]
+    fn audited_descriptor_inclusion_proof_requires_exact_selected_block() {
+        let temp = TempDir::new().unwrap();
+        let producer = IdentityKeyPair::from_bytes(&[0x27; 32]).unwrap();
+        let first_peer = IdentityKeyPair::from_bytes(&[0x28; 32]).unwrap();
+        let second_peer = IdentityKeyPair::from_bytes(&[0x29; 32]).unwrap();
+        let first = signed_descriptor(&first_peer, 1, "first-proof.example:8422");
+        let second = signed_descriptor(&second_peer, 1, "second-proof.example:8422");
+        let (store, _) = DirectoryChainStore::open(
+            temp.path().join("directory.db"),
+            producer.public_key_bytes(),
+            NOW,
+        )
+        .unwrap();
+        store
+            .append_descriptors(&[first.clone(), second], NOW, &producer)
+            .unwrap();
+        let block = store.block(1).unwrap().unwrap();
+        let descriptor_hash = DirectoryDescriptorCommitmentV1::from_signed_descriptor(&first)
+            .unwrap()
+            .descriptor_hash;
+
+        let proof = store
+            .audited_descriptor_inclusion_proof(&descriptor_hash, &block.hash(), NOW)
+            .unwrap()
+            .unwrap();
+        proof
+            .verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &producer.public_key_bytes(),
+                &block.hash(),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(proof.descriptor, first);
+        assert!(store
+            .audited_descriptor_inclusion_proof(&descriptor_hash, &[0x41; 32], NOW)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .audited_descriptor_inclusion_proof(&[0x42; 32], &block.hash(), NOW)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .audited_descriptor_inclusion_proof(&[0u8; 32], &block.hash(), NOW)
             .is_err());
     }
 

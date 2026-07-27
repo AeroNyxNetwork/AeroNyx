@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.35.0 - Privacy-safe witness carrier service telemetry.
+Modification Reason: v0.36.0 - Exact Directory descriptor inclusion proofs.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.35.0 - [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Added a separate process-only carrier-side status contract so nodes can prove bounded encrypted-evidence transport participation without retaining identities, routes, frames, or payload data.
+Last Modified: v0.36.0 - [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] Added compact exact-block descriptor inclusion proofs plus an audit-gated, pinned-peer-only transport contract for light verifiers.
+Previous: v0.35.0 - [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Added a separate process-only carrier-side status contract so nodes can prove bounded encrypted-evidence transport participation without retaining identities, routes, frames, or payload data.
 Previous: v0.34.0 - [WITNESS-CARRIER-LIVE 2026-07-27 by Codex] Proved the bounded checkpoint-witness carrier path across three audited live nodes, including automatic direct-path restoration and privacy-safe runtime evidence.
 Previous: v0.33.0 - [WITNESS-CARRIER 2026-07-26 by Codex] Added direct-first, one-hop, bounded checkpoint-witness availability recovery through explicitly advertised operator-pinned carriers without expanding witness authority.
 Previous: v0.32.0 - [WITNESS-CATCHUP 2026-07-26 by Codex] Added bounded multi-checkpoint witness catch-up with strict forward progress, same-sequence retry suppression, and additive backlog telemetry.
@@ -1045,6 +1046,41 @@ Implemented in Directory Sync V1 serving:
 - Every response is gated by a complete persisted-chain audit. Object batches
   are all-or-nothing and preserve the requested hash order.
 
+Implemented in Directory Descriptor Inclusion Proof V1:
+
+- `DirectoryDescriptorInclusionProofV1` packages one exact signed descriptor,
+  its canonical commitment, zero-based block position, at most eight sibling
+  hashes, the signed Directory block header, and the producer signature.
+- Generic Merkle construction and verification support odd-leaf duplication,
+  reject malformed tree positions and path lengths, and are exhaustively tested
+  for every leaf in tree sizes 1 through 33. The signed Directory header binds
+  the exact commitment count; the block contract separately rejects duplicate
+  commitments.
+- Verification requires three independent trust inputs: production chain id,
+  pinned producer identity, and exact selected block hash. A proof cannot choose
+  those inputs for its verifier.
+- `DirectoryChainStore::audited_descriptor_inclusion_proof` performs a complete
+  local chain audit, resolves the exact committed descriptor and block, builds
+  the compact path, then re-verifies the finished proof before returning it.
+  A descriptor committed by another block is never silently substituted.
+- `DescriptorInclusionProofRequestV1` and
+  `DescriptorInclusionProofResponseV1` are appended after all existing
+  `DirectorySyncMessage` variants, preserving every older bincode discriminant.
+- `POST /api/discovery/peer/directory/descriptor-inclusion-proof` requires a
+  current signed peer descriptor, fresh Ed25519 request, unique request id,
+  existing rate budgets, and `PinnedAuthority` admission. Enabling public
+  Full-node Mirror reads does not make this route public.
+- The transport response signature binds the exact request, responder, time,
+  descriptor hash, block hash, and compact proof digest. Receivers must still
+  call `verify_at` with their independently pinned producer and block hash.
+- This proves only that one producer signed one exact Directory block containing
+  one authenticated public node descriptor commitment. It is not canonical
+  chain selection, voting, quorum, consensus, finality, a financial
+  transaction, user activity, message delivery, or Memory Chain content proof.
+- No client identity, IP, selected route, message id, payload, ciphertext,
+  Memory Chain record, DNS content, destination, private key, or wallet traffic
+  enters the proof or API.
+
 Implemented in Directory Sync V1 replica pull:
 
 - Remote blocks never enter the local producer tables. Every producer has an
@@ -1362,6 +1398,40 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] -->
+2026-07-27 - Added Directory Descriptor Inclusion Proof V1.
+- Files changed:
+  - crates/aeronyx-core/src/ledger/merkle.rs
+  - crates/aeronyx-core/src/ledger/mod.rs
+  - crates/aeronyx-core/src/protocol/discovery.rs
+  - crates/aeronyx-server/src/services/directory_chain.rs
+  - crates/aeronyx-server/src/api/directory_chain_peer.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Architecture:
+  - Added bounded canonical Merkle path construction and verification.
+  - Added one compact proof contract requiring an independently pinned
+    producer and exact selected Directory block hash.
+  - Added audit-gated SQLite proof lookup and an append-only signed peer wire
+    request/response pair.
+- Admission and compatibility:
+  - Proof export is POST-only and pinned-peer-only even when public Full-node
+    Mirror reads are enabled.
+  - Existing `DirectorySyncMessage` discriminants remain unchanged; older
+    nodes continue their existing Directory behavior.
+- Security and privacy boundary:
+  - Producer-signed inclusion is not canonical-chain selection, consensus,
+    finality, financial state, user activity, message delivery, or Memory Chain
+    content proof.
+  - The contract contains public node-directory data only and introduces no
+    user, payload, route, DNS, destination, private-key, or wallet data.
+- Verification:
+  - Generic Merkle proof tests cover every leaf for tree sizes 1 through 33,
+    odd-leaf duplication, malformed positions, proof lengths, and tampering.
+  - Core proof tests cover wrong chain, producer, block hash, descriptor
+    substitution, signature/path tampering, absence, and maximum depth.
+  - Store and Axum route tests cover exact-block lookup, signed response
+    verification, complete proof verification, and pinned-only admission.
+
 <!-- [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] -->
 2026-07-27 - Added privacy-safe witness carrier service telemetry.
 - Files changed:

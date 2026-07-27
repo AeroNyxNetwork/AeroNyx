@@ -13,6 +13,7 @@
 //! - `POST /api/discovery/peer/directory/tip`
 //! - `POST /api/discovery/peer/directory/block-range`
 //! - `POST /api/discovery/peer/directory/descriptor-objects`
+//! - `POST /api/discovery/peer/directory/descriptor-inclusion-proof`
 //! - `POST /api/discovery/peer/directory/replica-block-range`
 //! - `POST /api/discovery/peer/directory/replica-descriptor-objects`
 //! - `POST /api/discovery/peer/directory/observation-checkpoint-witness`
@@ -25,6 +26,8 @@
 //! - Ed25519 request/response authentication, timestamp freshness, replay
 //!   rejection, per-peer rate limits, body limits, and audit-gated reads.
 //! - Exact content-addressed descriptor batches; no partial object response.
+//! - Pinned-peer-only, exact-block descriptor inclusion proofs for light
+//!   verifiers that already trust a producer and selected block hash.
 //! - Independent checkpoint root recomputation before a signed witness decision.
 //! - Monotonic opaque policy-head retention before a signed anchor decision.
 //! - Pinned-peer-only export of the latest locally verified portable
@@ -69,6 +72,8 @@
 //!     carrier resolves only a current signed public-IP endpoint, disables HTTP
 //!     proxies and redirects, forwards once, verifies the witness signature,
 //!     and returns a carrier-signed transport envelope.
+//! 11. Inclusion-proof requests bind one exact descriptor and independently
+//!     selected block hash; the server never substitutes another block.
 //!
 //! ## Privacy Invariant
 //! This API serves signed public node-directory commitments and the public
@@ -95,8 +100,13 @@
 //! - [WITNESS-CARRIER 2026-07-26 by Codex] Never allow recursive forwarding,
 //!   caller-supplied URLs, redirects, an unpinned target, or a carrier-generated
 //!   witness outcome. Availability transport must not expand authority.
+//! - [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] Keep proof export
+//!   pinned-peer-only. The proof establishes producer-signed inclusion, not
+//!   canonical-chain selection, consensus, finality, or user activity.
 //!
 //! ## Last Modified
+//! v0.14.0-DirectoryInclusionProof - Added exact-block, audit-gated,
+//! pinned-peer-only descriptor proof export.
 //! v0.13.0-WitnessCarrierAdmission - Added bounded outbound concurrency,
 //! descriptor-bound failure cooldowns, and deterministic recovery coverage.
 //! v0.12.1-WitnessCarrierResultMatrix - Reused one bounded transport client and
@@ -142,6 +152,8 @@ use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::discovery::{
     decode_directory_sync_message, directory_block_range_request_signing_bytes,
     directory_block_range_response_signing_bytes,
+    directory_descriptor_inclusion_proof_request_signing_bytes,
+    directory_descriptor_inclusion_proof_response_signing_bytes,
     directory_descriptor_objects_request_signing_bytes,
     directory_descriptor_objects_response_signing_bytes,
     directory_observation_certificate_request_signing_bytes,
@@ -526,6 +538,10 @@ fn build_directory_chain_peer_router_with_replica_runtime_and_transport(
         .route(
             "/api/discovery/peer/directory/descriptor-objects",
             post(descriptor_objects_handler),
+        )
+        .route(
+            "/api/discovery/peer/directory/descriptor-inclusion-proof",
+            post(descriptor_inclusion_proof_handler),
         );
     if state.replica_store.is_some() {
         router = router
@@ -902,6 +918,102 @@ async fn descriptor_objects_handler(
         response_timestamp,
         descriptor_hashes,
         objects,
+        signature: state.identity.sign(&response_signing_bytes),
+    })
+}
+
+async fn descriptor_inclusion_proof_handler(
+    State(state): State<DirectoryChainPeerState>,
+    body: Bytes,
+) -> Response {
+    let message = match decode_request(&body) {
+        Ok(message) => message,
+        Err(response) => return response,
+    };
+    let DirectorySyncMessage::DescriptorInclusionProofRequestV1 {
+        chain_id,
+        block_hash,
+        descriptor_hash,
+        request_id,
+        requester,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || block_hash == [0u8; 32]
+        || descriptor_hash == [0u8; 32]
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_proof_request");
+    }
+    let now = now_secs();
+    let signing_bytes = directory_descriptor_inclusion_proof_request_signing_bytes(
+        &chain_id,
+        &block_hash,
+        &descriptor_hash,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    if let Err(response) = authenticate_request(
+        &state,
+        DirectoryPeerAdmission::PinnedAuthority,
+        requester,
+        request_id,
+        request_timestamp,
+        &signing_bytes,
+        &signature,
+        now,
+    )
+    .await
+    {
+        return response;
+    }
+
+    let store = Arc::clone(&state.store);
+    let proof = match tokio::task::spawn_blocking(move || {
+        store.audited_descriptor_inclusion_proof(&descriptor_hash, &block_hash, now)
+    })
+    .await
+    {
+        Ok(Ok(Some(proof))) => proof,
+        Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "proof_not_found"),
+        Ok(Err(error)) => return store_error_response(&error),
+        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
+    };
+    let responder = state.identity.public_key_bytes();
+    if proof
+        .verify_at(&chain_id, &responder, &block_hash, now)
+        .is_err()
+        || proof.commitment.descriptor_hash != descriptor_hash
+    {
+        warn!("[DIRECTORY_CHAIN] Refused inconsistent descriptor inclusion proof");
+        return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "proof_not_verified");
+    }
+    let response_timestamp = now_secs();
+    let response_signing_bytes = directory_descriptor_inclusion_proof_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &responder,
+        response_timestamp,
+        &block_hash,
+        &descriptor_hash,
+        &proof,
+    );
+    debug!(
+        block_height = proof.block_header.height,
+        "[DIRECTORY_CHAIN] Served authenticated descriptor inclusion proof"
+    );
+    encoded_response(DirectorySyncMessage::DescriptorInclusionProofResponseV1 {
+        chain_id,
+        request_id,
+        responder,
+        response_timestamp,
+        block_hash,
+        descriptor_hash,
+        proof,
         signature: state.identity.sign(&response_signing_bytes),
     })
 }
@@ -3145,6 +3257,7 @@ mod tests {
             })
             .unwrap();
         let response = router
+            .clone()
             .oneshot(
                 Request::post("/api/discovery/peer/directory/descriptor-objects")
                     .body(Body::from(object_request))
@@ -3173,6 +3286,114 @@ mod tests {
         };
         assert_eq!(descriptor_hashes, vec![descriptor_hash]);
         assert_eq!(objects, vec![expected_descriptor]);
+
+        let proof_id = [0xb5; 16];
+        let block_hash = blocks[0].hash();
+        let proof_signing = directory_descriptor_inclusion_proof_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &block_hash,
+            &descriptor_hash,
+            &proof_id,
+            &requester_id,
+            timestamp,
+        );
+        let proof_request = encode_directory_sync_message(
+            &DirectorySyncMessage::DescriptorInclusionProofRequestV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                block_hash,
+                descriptor_hash,
+                request_id: proof_id,
+                requester: requester_id,
+                request_timestamp: timestamp,
+                signature: requester.sign(&proof_signing),
+            },
+        )
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/descriptor-inclusion-proof")
+                    .body(Body::from(proof_request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let DirectorySyncMessage::DescriptorInclusionProofResponseV1 {
+            chain_id,
+            request_id,
+            responder,
+            response_timestamp,
+            block_hash: response_block_hash,
+            descriptor_hash: response_descriptor_hash,
+            proof,
+            signature,
+        } = decode_directory_sync_message(&body).unwrap()
+        else {
+            panic!("unexpected proof response");
+        };
+        assert_eq!(request_id, proof_id);
+        assert_eq!(response_block_hash, block_hash);
+        assert_eq!(response_descriptor_hash, descriptor_hash);
+        let response_signing = directory_descriptor_inclusion_proof_response_signing_bytes(
+            &chain_id,
+            &request_id,
+            &responder,
+            response_timestamp,
+            &response_block_hash,
+            &response_descriptor_hash,
+            &proof,
+        );
+        IdentityPublicKey::from_bytes(&responder)
+            .unwrap()
+            .verify(&response_signing, &signature)
+            .unwrap();
+        proof
+            .verify_at(&chain_id, &responder, &response_block_hash, now_secs())
+            .unwrap();
+        assert_eq!(proof.commitment.descriptor_hash, response_descriptor_hash);
+    }
+
+    #[tokio::test]
+    async fn descriptor_inclusion_proof_remains_pinned_peer_only() {
+        let (router, _, requester, expected_descriptor) = test_router(false, true, true);
+        let timestamp = now_secs();
+        let request_id = [0xb6; 16];
+        let requester_id = requester.public_key_bytes();
+        let descriptor_hash =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&expected_descriptor)
+                .unwrap()
+                .descriptor_hash;
+        let block_hash = [0x51; 32];
+        let signing_bytes = directory_descriptor_inclusion_proof_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &block_hash,
+            &descriptor_hash,
+            &request_id,
+            &requester_id,
+            timestamp,
+        );
+        let request = encode_directory_sync_message(
+            &DirectorySyncMessage::DescriptorInclusionProofRequestV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                block_hash,
+                descriptor_hash,
+                request_id,
+                requester: requester_id,
+                request_timestamp: timestamp,
+                signature: requester.sign(&signing_bytes),
+            },
+        )
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/descriptor-inclusion-proof")
+                    .body(Body::from(request))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

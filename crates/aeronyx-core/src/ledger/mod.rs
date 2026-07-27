@@ -64,6 +64,8 @@
 //! v0.5.0 - Added block and merkle submodules for Miner
 //! v1.0.0 - 🌟 Added record submodule (MemoryRecord MRS-1)
 //! v2.7.0-BlockSync - Re-exported commitment block contracts and limits.
+//! v2.8.0-InclusionProof - [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex]
+//! Re-exported canonical count-bound Merkle proof construction and verification.
 
 pub mod block;
 pub mod fact;
@@ -83,7 +85,7 @@ pub use block::{
     BLOCK_TYPE_MEMORY, BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH, MAX_RECORD_COMMITMENTS_PER_BLOCK,
     RECORD_COMMITMENT_BLOCK_VERSION_V1,
 };
-pub use merkle::merkle_root;
+pub use merkle::{build_merkle_inclusion_proof, merkle_root, verify_merkle_inclusion_proof};
 
 // Re-export primary types — new (MRS-1)
 pub use record::{MemoryLayer, MemoryRecord, RecordStatus};

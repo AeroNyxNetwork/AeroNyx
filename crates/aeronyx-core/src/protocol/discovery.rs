@@ -19,13 +19,17 @@
 //! - Signature-only descriptor verification for local peer-cache retention
 //! - `DirectoryCommitmentBlockV1`: signed, hash-linked commitments to public
 //!   node descriptor events without embedding endpoint or operator metadata
+//! - `DirectoryDescriptorInclusionProofV1`: a compact producer-signed Merkle
+//!   path proving one exact authenticated descriptor commitment is in one
+//!   independently selected Directory block
 //! - `DirectoryObservationCheckpointV1`: observer-signed, hash-linked evidence
 //!   binding exact producer tips to a recomputable multi-source overlap root
 //! - `DirectoryObservationCertificateV1`: a bounded portable package combining
 //!   one checkpoint with independently signed accepted witness receipts
 //! - `DirectorySyncMessage`: authenticated, bounded node-to-node transport for
 //!   serving one producer's tip, block ranges, descriptor objects, and
-//!   independently recomputed observation-checkpoint witness receipts
+//!   exact descriptor-inclusion proofs plus independently recomputed
+//!   observation-checkpoint witness receipts
 //! - Opaque policy-head anchor frames that let independent pinned witnesses
 //!   retain rollback evidence without receiving policy members or endpoints
 //! - Authenticated observation-certificate exchange frames that let pinned
@@ -67,6 +71,10 @@
 //!     the response binds the exact certificate bytes and SHA-256 digest
 //! 14. A pinned carrier may forward one exact observer-signed witness request
 //!     and return one exact witness-signed response without becoming authority
+//! 15. A light verifier may validate one descriptor inclusion path against an
+//!     independently trusted producer and exact Directory block hash
+//! 16. A pinned peer may request that exact proof without downloading every
+//!     commitment or descriptor object from the producer's chain
 //!
 //! ## Important Note for Next Developer
 //! - Do not put private keys, client IPs, destination metadata, DNS contents,
@@ -79,6 +87,13 @@
 //! - Directory blocks are integrity evidence, not financial consensus. Never
 //!   add user identities, traffic facts, routes, message ids, payloads, memory
 //!   records, or client metadata to a directory commitment.
+//! - [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] Inclusion proofs establish
+//!   only that one producer signed one exact block containing one authenticated
+//!   descriptor commitment. The caller must independently pin the producer and
+//!   exact block hash. A proof is not canonical-chain selection, transaction
+//!   inclusion, quorum, consensus, global finality, or user-activity evidence.
+//!   Its peer wire variants must remain append-only and pinned-peer-only until
+//!   a separate privacy and abuse review explicitly widens admission.
 //! - Observation checkpoints are signed local evidence, not votes, fork choice,
 //!   quorum certificates, global consensus, or finality.
 //! - A checkpoint witness receipt proves one external node independently
@@ -106,6 +121,10 @@
 //!   rejection and the complete-input size preflight in the shared codec.
 //!
 //! ## Last Modified
+//! v0.18.0-DirectoryInclusionProofWire - Added append-only pinned-peer request
+//! and response frames binding one exact descriptor proof to one selected block
+//! v0.17.0-DirectoryDescriptorInclusionProof - Added compact, count-bound
+//! producer-signed Merkle proofs for one authenticated descriptor commitment
 //! v0.16.0-BoundedWitnessCarrier - Added append-only exact-frame carrier
 //! request/response contracts without granting the carrier witness authority
 //! v0.15.0-AuthenticatedCertificateExchange - Added pinned-peer request and
@@ -133,7 +152,7 @@ use sha2::{Digest, Sha256};
 
 use crate::crypto::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
-use crate::ledger::merkle_root;
+use crate::ledger::{build_merkle_inclusion_proof, merkle_root, verify_merkle_inclusion_proof};
 use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
 
 // ============================================
@@ -204,6 +223,16 @@ pub const DIRECTORY_COMMITMENT_BLOCK_VERSION_V1: u16 = 1;
 /// At 72 bytes of canonical commitment data per entry, this keeps the payload
 /// bounded while matching the existing maximum discovery snapshot page size.
 pub const MAX_DIRECTORY_COMMITMENTS_PER_BLOCK: usize = 256;
+
+/// Current compact Directory descriptor-inclusion proof contract version.
+pub const DIRECTORY_DESCRIPTOR_INCLUSION_PROOF_VERSION_V1: u16 = 1;
+
+/// Maximum sibling hashes for a 256-leaf Directory commitment tree.
+///
+/// [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] This is a wire and
+/// allocation bound. The contract test fails if the block limit changes
+/// without a reviewed proof-version update.
+pub const MAX_DIRECTORY_DESCRIPTOR_INCLUSION_SIBLINGS_V1: usize = 8;
 
 /// Maximum producer clock lead accepted by a directory verifier.
 ///
@@ -722,6 +751,220 @@ pub struct DirectoryCommitmentBlockV1 {
     pub producer_signature: [u8; 64],
 }
 
+/// Compact proof that one authenticated descriptor commitment is included in
+/// one exact producer-signed Directory block.
+///
+/// The proof intentionally carries no user, traffic, message, route, Memory
+/// Chain, DNS, destination, or wallet data. It is useful only when the verifier
+/// independently trusts `expected_producer` and `expected_block_hash`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryDescriptorInclusionProofV1 {
+    /// Stable proof contract version.
+    pub proof_version: u16,
+    /// Exact producer-signed block header containing the commitment root.
+    pub block_header: DirectoryCommitmentHeaderV1,
+    /// Producer signature over `block_header.hash()`.
+    #[serde(with = "serde_bytes64")]
+    pub producer_signature: [u8; 64],
+    /// Exact descriptor commitment used as the Merkle leaf.
+    pub commitment: DirectoryDescriptorCommitmentV1,
+    /// Zero-based commitment position in the canonical block payload.
+    pub commitment_index: u32,
+    /// Sibling hashes ordered from the leaf level toward the root.
+    pub sibling_hashes: Vec<[u8; 32]>,
+    /// Exact authenticated descriptor object bound by `commitment`.
+    pub descriptor: SignedNodeDescriptor,
+}
+
+/// Fail-closed validation outcomes for a compact Directory inclusion proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryDescriptorInclusionProofError {
+    /// The inclusion-proof contract version is unsupported.
+    UnsupportedVersion,
+    /// The proof belongs to another Directory chain.
+    WrongChain,
+    /// The producer differs from the verifier's independently pinned producer.
+    WrongProducer,
+    /// The signed block differs from the verifier's independently selected block.
+    WrongBlockHash,
+    /// The signed block header is structurally or cryptographically invalid.
+    InvalidBlock,
+    /// The descriptor object is malformed or has an invalid signature.
+    InvalidDescriptor,
+    /// The commitment does not bind the included descriptor object.
+    DescriptorMismatch,
+    /// The leaf index or declared block commitment count is invalid.
+    InvalidPosition,
+    /// The sibling path exceeds or differs from the exact tree depth.
+    InvalidProofLength,
+    /// The sibling path does not reconstruct the signed commitment root.
+    InvalidMerkleProof,
+}
+
+impl std::fmt::Display for DirectoryDescriptorInclusionProofError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UnsupportedVersion => "unsupported directory inclusion proof version",
+            Self::WrongChain => "directory inclusion proof belongs to another chain",
+            Self::WrongProducer => "directory inclusion proof producer is not trusted",
+            Self::WrongBlockHash => "directory inclusion proof block hash is not selected",
+            Self::InvalidBlock => "directory inclusion proof block is invalid",
+            Self::InvalidDescriptor => "directory inclusion proof descriptor is invalid",
+            Self::DescriptorMismatch => {
+                "directory inclusion proof commitment does not bind descriptor"
+            }
+            Self::InvalidPosition => "directory inclusion proof position is invalid",
+            Self::InvalidProofLength => "directory inclusion proof path length is invalid",
+            Self::InvalidMerkleProof => "directory inclusion proof path is invalid",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for DirectoryDescriptorInclusionProofError {}
+
+impl DirectoryDescriptorInclusionProofV1 {
+    /// Builds a compact proof from one complete, valid Directory block.
+    ///
+    /// The constructor validates the block payload and signature at
+    /// `observed_at`, authenticates `descriptor`, and requires its exact
+    /// commitment to be present. Chain-continuity selection remains the
+    /// caller's responsibility; this constructor cannot choose a canonical
+    /// producer history.
+    ///
+    /// # Errors
+    /// Returns a fail-closed proof error when the block, descriptor,
+    /// commitment lookup, or bounded Merkle path is invalid.
+    pub fn from_block_at(
+        block: &DirectoryCommitmentBlockV1,
+        descriptor: &SignedNodeDescriptor,
+        observed_at: u64,
+    ) -> Result<Self, DirectoryDescriptorInclusionProofError> {
+        block
+            .verify_at(
+                &block.header.chain_id,
+                block.header.height,
+                &block.header.prev_block_hash,
+                0,
+                observed_at,
+            )
+            .map_err(|_| DirectoryDescriptorInclusionProofError::InvalidBlock)?;
+        let commitment = DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor)
+            .map_err(|_| DirectoryDescriptorInclusionProofError::InvalidDescriptor)?;
+        let commitment_index = block
+            .commitments
+            .binary_search(&commitment)
+            .map_err(|_| DirectoryDescriptorInclusionProofError::DescriptorMismatch)?;
+        let commitment_hashes = block
+            .commitments
+            .iter()
+            .map(DirectoryDescriptorCommitmentV1::hash)
+            .collect::<Vec<_>>();
+        let sibling_hashes = build_merkle_inclusion_proof(&commitment_hashes, commitment_index)
+            .ok_or(DirectoryDescriptorInclusionProofError::InvalidPosition)?;
+        if sibling_hashes.len() > MAX_DIRECTORY_DESCRIPTOR_INCLUSION_SIBLINGS_V1 {
+            return Err(DirectoryDescriptorInclusionProofError::InvalidProofLength);
+        }
+        let commitment_index = u32::try_from(commitment_index)
+            .map_err(|_| DirectoryDescriptorInclusionProofError::InvalidPosition)?;
+        let proof = Self {
+            proof_version: DIRECTORY_DESCRIPTOR_INCLUSION_PROOF_VERSION_V1,
+            block_header: block.header.clone(),
+            producer_signature: block.producer_signature,
+            commitment,
+            commitment_index,
+            sibling_hashes,
+            descriptor: descriptor.clone(),
+        };
+        proof.verify_at(
+            &block.header.chain_id,
+            &block.header.producer,
+            &block.hash(),
+            observed_at,
+        )?;
+        Ok(proof)
+    }
+
+    /// Verifies one proof against an independently selected producer and block.
+    ///
+    /// A successful result proves producer-signed inclusion only. It does not
+    /// choose a canonical chain or establish voting, quorum, consensus,
+    /// finality, transaction inclusion, or user activity.
+    ///
+    /// # Errors
+    /// Returns a stable fail-closed proof error when any expected trust anchor,
+    /// block signature, descriptor binding, position, or sibling hash fails.
+    pub fn verify_at(
+        &self,
+        expected_chain_id: &[u8; 32],
+        expected_producer: &[u8; 32],
+        expected_block_hash: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<(), DirectoryDescriptorInclusionProofError> {
+        if self.proof_version != DIRECTORY_DESCRIPTOR_INCLUSION_PROOF_VERSION_V1 {
+            return Err(DirectoryDescriptorInclusionProofError::UnsupportedVersion);
+        }
+        if &self.block_header.chain_id != expected_chain_id {
+            return Err(DirectoryDescriptorInclusionProofError::WrongChain);
+        }
+        if &self.block_header.producer != expected_producer {
+            return Err(DirectoryDescriptorInclusionProofError::WrongProducer);
+        }
+        if &self.block_header.hash() != expected_block_hash {
+            return Err(DirectoryDescriptorInclusionProofError::WrongBlockHash);
+        }
+        verify_directory_inclusion_header_at(
+            &self.block_header,
+            &self.producer_signature,
+            observed_at,
+        )?;
+        let commitment_count = usize::try_from(self.block_header.commitment_count)
+            .map_err(|_| DirectoryDescriptorInclusionProofError::InvalidPosition)?;
+        let commitment_index = usize::try_from(self.commitment_index)
+            .map_err(|_| DirectoryDescriptorInclusionProofError::InvalidPosition)?;
+        if commitment_count == 0
+            || commitment_count > MAX_DIRECTORY_COMMITMENTS_PER_BLOCK
+            || commitment_index >= commitment_count
+        {
+            return Err(DirectoryDescriptorInclusionProofError::InvalidPosition);
+        }
+        let expected_depth = directory_inclusion_proof_depth(commitment_count);
+        if self.sibling_hashes.len() != expected_depth
+            || self.sibling_hashes.len() > MAX_DIRECTORY_DESCRIPTOR_INCLUSION_SIBLINGS_V1
+        {
+            return Err(DirectoryDescriptorInclusionProofError::InvalidProofLength);
+        }
+        if !self.commitment.structurally_valid() {
+            return Err(DirectoryDescriptorInclusionProofError::InvalidDescriptor);
+        }
+        match self.commitment.matches_signed_descriptor(&self.descriptor) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(DirectoryDescriptorInclusionProofError::DescriptorMismatch);
+            }
+            Err(_) => {
+                return Err(DirectoryDescriptorInclusionProofError::InvalidDescriptor);
+            }
+        }
+        if !verify_merkle_inclusion_proof(
+            &self.block_header.commitment_root,
+            &self.commitment.hash(),
+            commitment_index,
+            commitment_count,
+            &self.sibling_hashes,
+        ) {
+            return Err(DirectoryDescriptorInclusionProofError::InvalidMerkleProof);
+        }
+        Ok(())
+    }
+
+    /// Returns the exact producer-signed block identity bound by this proof.
+    #[must_use]
+    pub fn block_hash(&self) -> [u8; 32] {
+        self.block_header.hash()
+    }
+}
+
 /// Validation failures for the V1 Directory Chain contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectoryCommitmentValidationError {
@@ -901,6 +1144,40 @@ impl std::fmt::Display for DirectoryCommitmentBlockV1 {
             &self.header.hash_hex()[..8],
         )
     }
+}
+
+fn verify_directory_inclusion_header_at(
+    header: &DirectoryCommitmentHeaderV1,
+    producer_signature: &[u8; 64],
+    observed_at: u64,
+) -> Result<(), DirectoryDescriptorInclusionProofError> {
+    if header.protocol_version != DIRECTORY_COMMITMENT_BLOCK_VERSION_V1 {
+        return Err(DirectoryDescriptorInclusionProofError::InvalidBlock);
+    }
+    validate_directory_block_position(header.height, header.timestamp, &header.prev_block_hash, 0)
+        .map_err(|_| DirectoryDescriptorInclusionProofError::InvalidBlock)?;
+    if header.timestamp > observed_at.saturating_add(MAX_DIRECTORY_BLOCK_FUTURE_SKEW_SECS) {
+        return Err(DirectoryDescriptorInclusionProofError::InvalidBlock);
+    }
+    let commitment_count = usize::try_from(header.commitment_count)
+        .map_err(|_| DirectoryDescriptorInclusionProofError::InvalidPosition)?;
+    if commitment_count == 0 || commitment_count > MAX_DIRECTORY_COMMITMENTS_PER_BLOCK {
+        return Err(DirectoryDescriptorInclusionProofError::InvalidPosition);
+    }
+    let producer = IdentityPublicKey::from_bytes(&header.producer)
+        .map_err(|_| DirectoryDescriptorInclusionProofError::InvalidBlock)?;
+    producer
+        .verify(&header.hash(), producer_signature)
+        .map_err(|_| DirectoryDescriptorInclusionProofError::InvalidBlock)
+}
+
+fn directory_inclusion_proof_depth(mut commitment_count: usize) -> usize {
+    let mut depth = 0usize;
+    while commitment_count > 1 {
+        commitment_count = commitment_count.saturating_add(1) / 2;
+        depth = depth.saturating_add(1);
+    }
+    depth
 }
 
 fn validate_directory_block_position(
@@ -1944,6 +2221,53 @@ pub enum DirectorySyncMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+    /// Requests one compact proof for a descriptor in one exact selected block.
+    ///
+    /// [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] This variant is
+    /// appended to preserve every existing bincode enum index. Server
+    /// admission remains restricted to authenticated pinned peers.
+    DescriptorInclusionProofRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Independently selected producer-signed block hash.
+        block_hash: [u8; 32],
+        /// Exact content-addressed descriptor requested.
+        descriptor_hash: [u8; 32],
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Ed25519 identity of the requesting pinned node.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Requester signature over every request field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns one producer-signed descriptor inclusion proof.
+    ///
+    /// The responder signature authenticates request/response transport. A
+    /// receiver must separately call
+    /// [`DirectoryDescriptorInclusionProofV1::verify_at`] with its own pinned
+    /// producer and independently selected `block_hash`.
+    DescriptorInclusionProofResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Producer and responder identity for the source block.
+        responder: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// Exact selected producer-signed block hash.
+        block_hash: [u8; 32],
+        /// Exact requested descriptor content hash.
+        descriptor_hash: [u8; 32],
+        /// Compact producer-signed inclusion evidence.
+        proof: DirectoryDescriptorInclusionProofV1,
+        /// Responder signature binding request, proof digest, and response time.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn directory_sync_signing_digest<'a>(
@@ -2118,6 +2442,82 @@ pub fn directory_descriptor_objects_response_signing_bytes(
     ]);
     fields.extend(descriptor_hashes.iter().map(<[u8; 32]>::as_slice));
     directory_sync_signing_digest(b"AeroNyx-DirectorySync-ObjectsResponse-v1", fields)
+}
+
+/// Canonical digest signed by an exact descriptor-inclusion proof request.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_descriptor_inclusion_proof_request_signing_bytes(
+    chain_id: &[u8; 32],
+    block_hash: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> [u8; 32] {
+    let request_timestamp = request_timestamp.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-DescriptorInclusionProofRequest-v1",
+        [
+            chain_id.as_slice(),
+            block_hash.as_slice(),
+            descriptor_hash.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            request_timestamp.as_slice(),
+        ],
+    )
+}
+
+fn directory_descriptor_inclusion_proof_transport_digest(
+    proof: &DirectoryDescriptorInclusionProofV1,
+) -> [u8; 32] {
+    let proof_version = proof.proof_version.to_le_bytes();
+    let block_hash = proof.block_hash();
+    let commitment_hash = proof.commitment.hash();
+    let commitment_index = proof.commitment_index.to_le_bytes();
+    let sibling_count = u64::try_from(proof.sibling_hashes.len())
+        .unwrap_or(u64::MAX)
+        .to_le_bytes();
+    let mut fields = Vec::<&[u8]>::with_capacity(proof.sibling_hashes.len() + 6);
+    fields.extend([
+        proof_version.as_slice(),
+        block_hash.as_slice(),
+        proof.producer_signature.as_slice(),
+        commitment_hash.as_slice(),
+        commitment_index.as_slice(),
+        sibling_count.as_slice(),
+    ]);
+    fields.extend(proof.sibling_hashes.iter().map(<[u8; 32]>::as_slice));
+    directory_sync_signing_digest(b"AeroNyx-DirectorySync-DescriptorInclusionProof-v1", fields)
+}
+
+/// Canonical digest signed by an exact descriptor-inclusion proof response.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_descriptor_inclusion_proof_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    block_hash: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    proof: &DirectoryDescriptorInclusionProofV1,
+) -> [u8; 32] {
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let proof_digest = directory_descriptor_inclusion_proof_transport_digest(proof);
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-DescriptorInclusionProofResponse-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            responder.as_slice(),
+            response_timestamp.as_slice(),
+            block_hash.as_slice(),
+            descriptor_hash.as_slice(),
+            proof_digest.as_slice(),
+        ],
+    )
 }
 
 /// Canonical digest signed by a replica-carrier block-range request.
@@ -3142,6 +3542,187 @@ mod tests {
             .unwrap();
         assert_eq!(decoded, forward);
         assert!(decoded.to_string().contains("height=1"));
+    }
+
+    #[test]
+    fn directory_descriptor_inclusion_proof_roundtrips_odd_tree() {
+        let producer = IdentityKeyPair::generate();
+        let signed_descriptors = (0u64..5)
+            .map(|offset| {
+                let identity = IdentityKeyPair::generate();
+                let mut descriptor = descriptor_for(&identity);
+                descriptor.sequence = descriptor.sequence.saturating_add(offset);
+                SignedNodeDescriptor::sign(descriptor, &identity).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let commitments = signed_descriptors
+            .iter()
+            .map(|descriptor| {
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(descriptor).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let observed_at = 1_700_000_100;
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            observed_at,
+            [0u8; 32],
+            commitments,
+            &producer,
+        )
+        .unwrap();
+        let expected_block_hash = block.hash();
+
+        for descriptor in &signed_descriptors {
+            let proof =
+                DirectoryDescriptorInclusionProofV1::from_block_at(&block, descriptor, observed_at)
+                    .unwrap();
+            assert_eq!(
+                proof.verify_at(
+                    &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                    &producer.public_key_bytes(),
+                    &expected_block_hash,
+                    observed_at,
+                ),
+                Ok(())
+            );
+            assert_eq!(proof.block_hash(), expected_block_hash);
+            assert!(proof.sibling_hashes.len() <= MAX_DIRECTORY_DESCRIPTOR_INCLUSION_SIBLINGS_V1);
+        }
+    }
+
+    #[test]
+    fn directory_descriptor_inclusion_proof_rejects_wrong_trust_anchors_and_tampering() {
+        let producer = IdentityKeyPair::generate();
+        let first_identity = IdentityKeyPair::generate();
+        let second_identity = IdentityKeyPair::generate();
+        let first_signed =
+            SignedNodeDescriptor::sign(descriptor_for(&first_identity), &first_identity).unwrap();
+        let second_signed =
+            SignedNodeDescriptor::sign(descriptor_for(&second_identity), &second_identity).unwrap();
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            vec![
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&first_signed).unwrap(),
+                DirectoryDescriptorCommitmentV1::from_signed_descriptor(&second_signed).unwrap(),
+            ],
+            &producer,
+        )
+        .unwrap();
+        let block_hash = block.hash();
+        let proof = DirectoryDescriptorInclusionProofV1::from_block_at(
+            &block,
+            &first_signed,
+            1_700_000_100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            proof.verify_at(
+                &[0x41; 32],
+                &producer.public_key_bytes(),
+                &block_hash,
+                1_700_000_100,
+            ),
+            Err(DirectoryDescriptorInclusionProofError::WrongChain)
+        );
+        assert_eq!(
+            proof.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &[0x42; 32],
+                &block_hash,
+                1_700_000_100,
+            ),
+            Err(DirectoryDescriptorInclusionProofError::WrongProducer)
+        );
+        assert_eq!(
+            proof.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &producer.public_key_bytes(),
+                &[0x43; 32],
+                1_700_000_100,
+            ),
+            Err(DirectoryDescriptorInclusionProofError::WrongBlockHash)
+        );
+
+        let mut wrong_descriptor = proof.clone();
+        wrong_descriptor.descriptor = second_signed;
+        assert_eq!(
+            wrong_descriptor.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &producer.public_key_bytes(),
+                &block_hash,
+                1_700_000_100,
+            ),
+            Err(DirectoryDescriptorInclusionProofError::DescriptorMismatch)
+        );
+
+        let mut wrong_path = proof.clone();
+        wrong_path.sibling_hashes[0][0] ^= 0x01;
+        assert_eq!(
+            wrong_path.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &producer.public_key_bytes(),
+                &block_hash,
+                1_700_000_100,
+            ),
+            Err(DirectoryDescriptorInclusionProofError::InvalidMerkleProof)
+        );
+
+        let mut wrong_signature = proof.clone();
+        wrong_signature.producer_signature[0] ^= 0x01;
+        assert_eq!(
+            wrong_signature.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &producer.public_key_bytes(),
+                &block_hash,
+                1_700_000_100,
+            ),
+            Err(DirectoryDescriptorInclusionProofError::InvalidBlock)
+        );
+
+        let mut wrong_length = proof;
+        wrong_length.sibling_hashes.clear();
+        assert_eq!(
+            wrong_length.verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &producer.public_key_bytes(),
+                &block_hash,
+                1_700_000_100,
+            ),
+            Err(DirectoryDescriptorInclusionProofError::InvalidProofLength)
+        );
+    }
+
+    #[test]
+    fn directory_descriptor_inclusion_proof_is_bounded_and_requires_membership() {
+        assert_eq!(
+            directory_inclusion_proof_depth(MAX_DIRECTORY_COMMITMENTS_PER_BLOCK),
+            MAX_DIRECTORY_DESCRIPTOR_INCLUSION_SIBLINGS_V1
+        );
+
+        let producer = IdentityKeyPair::generate();
+        let included_identity = IdentityKeyPair::generate();
+        let absent_identity = IdentityKeyPair::generate();
+        let included =
+            SignedNodeDescriptor::sign(descriptor_for(&included_identity), &included_identity)
+                .unwrap();
+        let absent =
+            SignedNodeDescriptor::sign(descriptor_for(&absent_identity), &absent_identity).unwrap();
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            vec![DirectoryDescriptorCommitmentV1::from_signed_descriptor(&included).unwrap()],
+            &producer,
+        )
+        .unwrap();
+
+        assert_eq!(
+            DirectoryDescriptorInclusionProofV1::from_block_at(&block, &absent, 1_700_000_100,),
+            Err(DirectoryDescriptorInclusionProofError::DescriptorMismatch)
+        );
     }
 
     #[test]
