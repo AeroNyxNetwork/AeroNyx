@@ -145,6 +145,8 @@
 //! 5. Verified descriptors become available for future peer selection
 //! 6. Bootstrap snapshots can hydrate the store without trusting unsigned data
 //! 7. Gossip message handlers reuse the same verification and anti-rollback path
+//! 8. Directory-proof gossip is admitted only by a caller that has already
+//!    matched the proof against an audited local replica anchor
 //!
 //! ## Important Note for Next Developer
 //! - This store keeps verified descriptors in memory, while optional peer-cache
@@ -157,6 +159,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.64.0-DirectoryAuthenticatedGossipAdmission - Added a shared single-peer
+//! import report path and fail-closed handling for unverified proof gossip
 //! v0.63.0-DirectoryMirrorCarrierCapability - Added the signed mirror-carrier
 //! role to route-surface fingerprints and privacy-safe capability labels
 //! v0.62.0-VerifiedDeliveryWitnessAdmission - Added fail-closed bilateral requester pins for witness writes
@@ -3110,25 +3114,67 @@ impl PeerStore {
             NodeDiscoveryMessage::SnapshotResponse { snapshot } => {
                 self.load_bootstrap_snapshot_from_source(snapshot, now, "gossip_snapshot")
             }
-            NodeDiscoveryMessage::DescriptorAnnounce { descriptor } => {
-                let mut report = PeerStoreImportReport {
-                    total: 1,
-                    inserted: 0,
-                    unchanged: 0,
-                    stale: 0,
-                    rejected: 0,
-                };
-                match self.upsert_verified_from_source(descriptor.clone(), now, "gossip_announce") {
-                    Ok(true) => report.inserted = 1,
-                    Ok(false) => report.unchanged = 1,
-                    Err(PeerStoreError::StaleSequence { .. }) => report.stale = 1,
-                    Err(PeerStoreError::VerificationFailed)
-                    | Err(PeerStoreError::CapacityExceeded { .. }) => report.rejected = 1,
-                }
-                self.record_import_report(&report, now);
-                report
+            NodeDiscoveryMessage::DescriptorAnnounce { descriptor } => self
+                .apply_verified_descriptor_from_source(
+                    descriptor.clone(),
+                    now,
+                    "gossip_announce",
+                ),
+            // [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] PeerStore has
+            // no Directory replica trust anchor. Direct callers therefore fail
+            // closed; the discovery API may use the dedicated locally anchored
+            // admission function before calling the shared descriptor path.
+            NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => {
+                self.record_rejected_directory_proof_import(now)
             }
         }
+    }
+
+    /// Applies one descriptor through the normal verification, capacity, and
+    /// anti-rollback path while producing the same aggregate import contract as
+    /// snapshot and legacy gossip ingestion.
+    ///
+    /// This is crate-visible for the Directory-authenticated admission boundary.
+    /// Callers must complete their own trust-anchor checks before invoking it.
+    pub(crate) fn apply_verified_descriptor_from_source(
+        &self,
+        descriptor: SignedNodeDescriptor,
+        now: u64,
+        source: &'static str,
+    ) -> PeerStoreImportReport {
+        let mut report = PeerStoreImportReport {
+            total: 1,
+            inserted: 0,
+            unchanged: 0,
+            stale: 0,
+            rejected: 0,
+        };
+        match self.upsert_verified_from_source(descriptor, now, source) {
+            Ok(true) => report.inserted = 1,
+            Ok(false) => report.unchanged = 1,
+            Err(PeerStoreError::StaleSequence { .. }) => report.stale = 1,
+            Err(PeerStoreError::VerificationFailed)
+            | Err(PeerStoreError::CapacityExceeded { .. }) => report.rejected = 1,
+        }
+        self.record_import_report(&report, now);
+        report
+    }
+
+    /// Records one fail-closed proof-gossip rejection without retaining any
+    /// producer, descriptor, block, endpoint, route, or sender identity.
+    pub(crate) fn record_rejected_directory_proof_import(
+        &self,
+        now: u64,
+    ) -> PeerStoreImportReport {
+        let report = PeerStoreImportReport {
+            total: 1,
+            inserted: 0,
+            unchanged: 0,
+            stale: 0,
+            rejected: 1,
+        };
+        self.record_import_report(&report, now);
+        report
     }
 
     fn record_import_report(&self, report: &PeerStoreImportReport, now: u64) {

@@ -478,7 +478,8 @@ use crate::api::chat_peer::{
     PeerChatRelayResponse,
 };
 use crate::api::discovery::{
-    blind_relay_runtime_status_value, build_discovery_router_with_local_status,
+    blind_relay_runtime_status_value,
+    build_discovery_router_with_local_status_and_directory_admission,
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
@@ -3086,10 +3087,14 @@ impl Server {
                         }
                     }),
                 )
-                .merge(build_discovery_router_with_local_status(
+                // [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Both
+                // operator and public gossip surfaces use the same audited
+                // replica trust anchor; absent replicas fail proof gossip closed.
+                .merge(build_discovery_router_with_local_status_and_directory_admission(
                     Arc::clone(&peer_store),
                     discovery_api_policy,
                     local_capability_status,
+                    directory_replica_store.clone(),
                 ))
                 .merge(build_directory_replica_status_router_with_witness_carrier(
                     directory_replica_store.clone(),
@@ -3235,10 +3240,11 @@ impl Server {
         // capability truth coupled to the actual peer-route prerequisites.
         let witness_carrier_route_enabled =
             directory_chain_store.is_some() && directory_replica_store.is_some();
-        let app = build_discovery_router_with_local_status(
+        let app = build_discovery_router_with_local_status_and_directory_admission(
             Arc::clone(&peer_store),
             discovery_api_policy,
             local_capability_status,
+            directory_replica_store.clone(),
         )
         .merge(build_chat_peer_router(
             chat_relay,
@@ -11505,10 +11511,13 @@ mod tests {
                 async move {
                     calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
                     let response = match message {
-                        NodeDiscoveryMessage::DescriptorAnnounce { .. } => GossipResponse {
-                            applied: PeerStoreImportReport::empty(),
-                            response: None,
-                        },
+                        NodeDiscoveryMessage::DescriptorAnnounce { .. }
+                        | NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => {
+                            GossipResponse {
+                                applied: PeerStoreImportReport::empty(),
+                                response: None,
+                            }
+                        }
                         NodeDiscoveryMessage::SnapshotRequest { .. } => GossipResponse {
                             applied: PeerStoreImportReport::empty(),
                             response: Some(snapshot_response),

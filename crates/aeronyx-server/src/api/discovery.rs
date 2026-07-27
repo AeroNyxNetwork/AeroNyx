@@ -12,7 +12,8 @@
 //! - `GET /api/discovery/snapshot`: returns a JSON bootstrap snapshot of
 //!   verified descriptors from the local `PeerStore`
 //! - `POST /api/discovery/gossip`: accepts a JSON `NodeDiscoveryMessage`,
-//!   applies descriptor/snapshot updates, and returns a snapshot response for
+//!   applies descriptor/snapshot updates, verifies proof announcements against
+//!   an audited local Directory replica, and returns a snapshot response for
 //!   request messages
 //! - `GET /api/discovery/status`: returns aggregate peer-store status, local
 //!   capability readiness, and compact discovery readiness for dashboards
@@ -32,7 +33,8 @@
 //! 1. Snapshot requests read valid descriptors from `PeerStore`
 //! 2. Gossip messages are applied through `PeerStore::apply_discovery_message`
 //! 3. Incoming data never bypasses descriptor signature verification
-//! 4. Response reports import counts and optionally includes a snapshot response
+//! 4. Directory-proof gossip additionally requires exact local replica evidence
+//! 5. Response reports import counts and optionally includes a snapshot response
 //!
 //! ## Important Note for Next Developer
 //! - Do not add client public IPs, packet payloads, destinations, DNS contents,
@@ -60,6 +62,8 @@
 //!   Keep `DISCOVERY_REQUEST_BODY_MAX_BYTES` aligned with protocol limits.
 //!
 //! ## Last Modified
+//! v0.31.0-DirectoryAuthenticatedGossipAdmission - Gate proof announcements on
+//! exact audited local Directory replica evidence before PeerStore import
 //! v0.30.0-VerifiedDeliveryPeerGate - Keep public real-relay readiness gated by two currently verified receipt-capable peers
 //! v0.29.0-PublicCardRealRelayEvidence - Prefer verified client delivery receipts over synthetic proof labels
 //! v0.28.0-VerifiedClientRelayEvidence - Expose aggregate terminal-signed App onion delivery readiness
@@ -111,8 +115,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::api::directory_replica_sync::admit_directory_gossip_descriptor;
 use crate::config::DiscoveryConfig;
-use crate::services::{PeerStore, PeerStoreImportReport, PeerStoreStatus};
+use crate::services::{
+    DirectoryReplicaStore, PeerStore, PeerStoreImportReport, PeerStoreStatus,
+};
 
 // ============================================
 // State / Request / Response Types
@@ -140,6 +147,8 @@ const DISCOVERY_PUBLIC_CARD_SOURCE: &str = "rust_discovery_public_card";
 #[derive(Clone)]
 struct DiscoveryApiState {
     peer_store: Arc<PeerStore>,
+    /// Audited local Directory replica used only as an admission trust anchor.
+    directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
     policy: DiscoveryApiPolicy,
     local_capabilities: DiscoveryLocalCapabilityStatus,
     rate_limit: Arc<Mutex<RateLimitState>>,
@@ -177,6 +186,9 @@ impl DiscoveryApiPolicy {
             NodeDiscoveryMessage::SnapshotRequest { .. } => true,
             NodeDiscoveryMessage::DescriptorAnnounce { descriptor } => {
                 self.node_allowed(&descriptor.node_id())
+            }
+            NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { proof, .. } => {
+                self.node_allowed(&proof.descriptor.node_id())
             }
             NodeDiscoveryMessage::SnapshotResponse { snapshot } => snapshot
                 .peers
@@ -1745,8 +1757,29 @@ pub fn build_discovery_router_with_local_status(
     policy: DiscoveryApiPolicy,
     local_capabilities: DiscoveryLocalCapabilityStatus,
 ) -> Router {
+    build_discovery_router_with_local_status_and_directory_admission(
+        peer_store,
+        policy,
+        local_capabilities,
+        None,
+    )
+}
+
+/// Builds the discovery API router with capability status and optional
+/// Directory-authenticated gossip admission.
+///
+/// [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Keeping this as an
+/// additive builder preserves every existing caller while allowing production
+/// nodes to inject their already audited replica store.
+pub fn build_discovery_router_with_local_status_and_directory_admission(
+    peer_store: Arc<PeerStore>,
+    policy: DiscoveryApiPolicy,
+    local_capabilities: DiscoveryLocalCapabilityStatus,
+    directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
+) -> Router {
     let state = DiscoveryApiState {
         peer_store,
+        directory_replica_store,
         policy,
         local_capabilities,
         rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
@@ -2029,8 +2062,18 @@ async fn gossip_handler(
             .into_response();
     }
 
-    let applied = state.peer_store.apply_discovery_message(&message, now);
+    let (admission_status, applied) = apply_gossip_message(&state, &message, now);
     state.peer_store.mark_gossip_at(now);
+    if admission_status != StatusCode::OK {
+        return (
+            admission_status,
+            Json(GossipResponse {
+                applied,
+                response: None,
+            }),
+        )
+            .into_response();
+    }
     let response = match message {
         NodeDiscoveryMessage::SnapshotRequest { limit, .. } => {
             Some(state.peer_store.build_snapshot_response(
@@ -2041,10 +2084,59 @@ async fn gossip_handler(
             ))
         }
         NodeDiscoveryMessage::SnapshotResponse { .. }
-        | NodeDiscoveryMessage::DescriptorAnnounce { .. } => None,
+        | NodeDiscoveryMessage::DescriptorAnnounce { .. }
+        | NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => None,
     };
 
     (StatusCode::OK, Json(GossipResponse { applied, response })).into_response()
+}
+
+fn apply_gossip_message(
+    state: &DiscoveryApiState,
+    message: &NodeDiscoveryMessage,
+    now: u64,
+) -> (StatusCode, PeerStoreImportReport) {
+    let NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 {
+        producer,
+        block_hash,
+        descriptor_hash,
+        proof,
+    } = message
+    else {
+        return (
+            StatusCode::OK,
+            state.peer_store.apply_discovery_message(message, now),
+        );
+    };
+
+    // [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] A node without an
+    // audited replica cannot authenticate this stronger gossip contract. Do
+    // not silently downgrade it to signature-only DescriptorAnnounce.
+    let Some(replica_store) = state.directory_replica_store.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            state
+                .peer_store
+                .record_rejected_directory_proof_import(now),
+        );
+    };
+    match admit_directory_gossip_descriptor(
+        replica_store,
+        &state.peer_store,
+        proof,
+        producer,
+        block_hash,
+        descriptor_hash,
+        now,
+    ) {
+        Ok(report) => (StatusCode::OK, report),
+        Err(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            state
+                .peer_store
+                .record_rejected_directory_proof_import(now),
+        ),
+    }
 }
 
 async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<DiscoveryStatusResponse> {
@@ -2111,6 +2203,12 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::protocol::discovery::{
+        directory_block_range_response_signing_bytes, encode_directory_sync_message,
+        DirectoryCommitmentBlockV1, DirectoryDescriptorCommitmentV1,
+        DirectoryDescriptorInclusionProofV1, DirectorySyncMessage,
+        AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+    };
     use aeronyx_core::protocol::{
         NodeCapability, NodeCapacity, NodeDescriptor, NodePolicy, SignedNodeDescriptor,
     };
@@ -2135,6 +2233,81 @@ mod tests {
             max_pps: None,
         };
         aeronyx_core::protocol::SignedNodeDescriptor::sign(descriptor, &kp).unwrap()
+    }
+
+    fn directory_gossip_fixture(
+        now: u64,
+    ) -> (
+        Arc<DirectoryReplicaStore>,
+        NodeDiscoveryMessage,
+        SignedNodeDescriptor,
+    ) {
+        let producer = IdentityKeyPair::from_bytes(&[0x91; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x92; 32]).unwrap();
+        let local = IdentityKeyPair::from_bytes(&[0x93; 32]).unwrap();
+        let descriptor = SignedNodeDescriptor::sign(
+            NodeDescriptor::new(
+                subject.public_key_bytes(),
+                1,
+                now.saturating_sub(1),
+                now + 600,
+                "directory-gossip-api-test",
+            ),
+            &subject,
+        )
+        .unwrap();
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
+        let block =
+            DirectoryCommitmentBlockV1::new_signed(1, now, [0u8; 32], vec![commitment], &producer)
+                .unwrap();
+        let block_hash = block.hash();
+        let proof =
+            DirectoryDescriptorInclusionProofV1::from_block_at(&block, &descriptor, now).unwrap();
+        let descriptor_hash = proof.commitment.descriptor_hash;
+        let request_id = [0x94; 16];
+        let blocks = vec![block.clone()];
+        let signing_bytes = directory_block_range_response_signing_bytes(
+            &request_id,
+            &producer.public_key_bytes(),
+            now,
+            &blocks,
+            false,
+            block.header.height,
+            &block_hash,
+        );
+        let response = DirectorySyncMessage::BlockRangeResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            responder: producer.public_key_bytes(),
+            response_timestamp: now,
+            blocks,
+            has_more: false,
+            tip_height: block.header.height,
+            tip_hash: block_hash,
+            signature: producer.sign(&signing_bytes),
+        };
+        let frame = encode_directory_sync_message(&response).unwrap();
+        let (replica_store, _) =
+            DirectoryReplicaStore::open(":memory:", local.public_key_bytes(), now).unwrap();
+        replica_store
+            .import_verified_page(
+                producer.public_key_bytes(),
+                std::slice::from_ref(&block),
+                std::slice::from_ref(&descriptor),
+                block.header.height,
+                block_hash,
+                &frame,
+                now,
+            )
+            .unwrap();
+        let message = NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 {
+            producer: producer.public_key_bytes(),
+            block_hash,
+            descriptor_hash,
+            proof,
+        };
+        (Arc::new(replica_store), message, descriptor)
     }
 
     fn signed_routeable_chat_descriptor(
@@ -2557,6 +2730,98 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn directory_gossip_imports_only_against_local_replica_anchor() {
+        let now = now_secs();
+        let (replica_store, message, descriptor) = directory_gossip_fixture(now);
+        let store = Arc::new(PeerStore::new());
+        let app = build_discovery_router_with_local_status_and_directory_admission(
+            Arc::clone(&store),
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::default(),
+            Some(replica_store),
+        );
+        let body = serde_json::to_vec(&message).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/gossip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: GossipResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.applied.inserted, 1);
+        assert_eq!(
+            store.get_valid(&descriptor.node_id(), now),
+            Some(descriptor)
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_gossip_fails_closed_without_local_replica_or_anchor() {
+        let now = now_secs();
+        let (_, message, _) = directory_gossip_fixture(now);
+        let store_without_replica = Arc::new(PeerStore::new());
+        let app_without_replica = build_discovery_router(
+            Arc::clone(&store_without_replica),
+            DiscoveryApiPolicy::default(),
+        );
+        let body = serde_json::to_vec(&message).unwrap();
+        let response = app_without_replica
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/gossip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(store_without_replica.len(), 0);
+
+        let empty_local = IdentityKeyPair::from_bytes(&[0x95; 32]).unwrap();
+        let (empty_replica, _) =
+            DirectoryReplicaStore::open(":memory:", empty_local.public_key_bytes(), now).unwrap();
+        let store_without_anchor = Arc::new(PeerStore::new());
+        let app_without_anchor =
+            build_discovery_router_with_local_status_and_directory_admission(
+                Arc::clone(&store_without_anchor),
+                DiscoveryApiPolicy::default(),
+                DiscoveryLocalCapabilityStatus::default(),
+                Some(Arc::new(empty_replica)),
+            );
+        let response = app_without_anchor
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/gossip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&message).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(store_without_anchor.len(), 0);
+        assert_eq!(
+            store_without_anchor.status(now).runtime.rejected,
+            1,
+            "proof rejection must remain visible as an aggregate only"
+        );
     }
 
     #[tokio::test]

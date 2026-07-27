@@ -69,6 +69,8 @@
 //! - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] Admits a proven descriptor
 //!   into `PeerStore` only after an exact locally retained replica proof matches
 //!   the independently verified network proof.
+//! - [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Applies the same local
+//!   replica anchor to proof-carrying discovery gossip before PeerStore import.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -127,6 +129,8 @@
 //! 20. Before proof retrieval, require the exact producer/block/descriptor
 //!     anchor in the audited local replica. After retrieval, re-audit and match
 //!     the deterministic proof byte-for-byte before normal PeerStore admission.
+//! 21. For proof-carrying discovery gossip, ignore sender authority and admit
+//!     only after the exact deterministic proof matches the local replica.
 //!
 //! ## Privacy Invariant
 //! The coordinator never logs or retains endpoints, full producer identities,
@@ -175,6 +179,8 @@
 //!   the network request, exact-proof equality, and `PeerStore` anti-rollback.
 //!
 //! ## Last Modified
+//! `v0.28.0-DirectoryAuthenticatedGossipAdmission` - Added sender-neutral
+//! proof-gossip admission against exact audited local replica evidence.
 //! `v0.27.0-DirectoryAuthenticatedPeerAdmission` - Added locally anchored proof
 //! admission into `PeerStore` with preflight/postflight audits and stable errors.
 //! `v0.26.0-ReplicaProofRecovery` - Added direct-first, at-most-two explicit
@@ -283,6 +289,7 @@ use crate::services::directory_replica::{
 use crate::services::{
     DirectoryObservationWitnessOutcome, DirectoryReplicaImportReport, DirectoryReplicaStore,
     DirectoryReplicaStoreError, DirectoryReplicaSyncRuntime, PeerStore, PeerStoreError,
+    PeerStoreImportReport,
 };
 
 /// Maximum pinned producers synchronized concurrently by one node.
@@ -675,29 +682,14 @@ pub fn admit_directory_authenticated_descriptor(
     if !directory_authenticated_transport_summary_valid(authenticated) {
         return Err("directory_authenticated_admission_transport_invalid".to_string());
     }
-    authenticated
-        .proof
-        .verify_at(
-            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-            producer,
-            block_hash,
-            observed_at,
-        )
-        .map_err(|_| "directory_authenticated_admission_proof_invalid".to_string())?;
-    if authenticated.proof.commitment.descriptor_hash != *descriptor_hash {
-        return Err("directory_authenticated_admission_descriptor_mismatch".to_string());
-    }
-
-    let local_proof = locally_audited_directory_descriptor_proof(
+    verify_locally_anchored_directory_descriptor_proof(
         replica_store,
+        &authenticated.proof,
         producer,
         block_hash,
         descriptor_hash,
         observed_at,
     )?;
-    if local_proof != authenticated.proof {
-        return Err("directory_authenticated_admission_local_evidence_mismatch".to_string());
-    }
 
     let inserted = peer_store
         .upsert_verified_from_source(
@@ -712,6 +704,81 @@ pub fn admit_directory_authenticated_descriptor(
         direct_attempted: authenticated.direct_attempted,
         carrier_attempts: authenticated.carrier_attempts,
     })
+}
+
+/// Admits one proof-carrying discovery announcement against exact local
+/// Directory replica evidence.
+///
+/// [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] The gossip sender is not
+/// an input because it receives no authority. The original producer signature,
+/// caller-supplied exact block/hash contract, deterministic local proof, and
+/// normal PeerStore anti-rollback checks are the complete admission boundary.
+///
+/// # Errors
+/// Returns only stable privacy-safe buckets when the request contract, producer
+/// proof, local anchor, or deterministic proof equality check fails.
+pub fn admit_directory_gossip_descriptor(
+    replica_store: &DirectoryReplicaStore,
+    peer_store: &PeerStore,
+    proof: &DirectoryDescriptorInclusionProofV1,
+    producer: &[u8; 32],
+    block_hash: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    observed_at: u64,
+) -> Result<PeerStoreImportReport, String> {
+    verify_locally_anchored_directory_descriptor_proof(
+        replica_store,
+        proof,
+        producer,
+        block_hash,
+        descriptor_hash,
+        observed_at,
+    )?;
+    Ok(peer_store.apply_verified_descriptor_from_source(
+        proof.descriptor.clone(),
+        observed_at,
+        "directory_gossip_proof",
+    ))
+}
+
+fn verify_locally_anchored_directory_descriptor_proof(
+    replica_store: &DirectoryReplicaStore,
+    proof: &DirectoryDescriptorInclusionProofV1,
+    producer: &[u8; 32],
+    block_hash: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    observed_at: u64,
+) -> Result<(), String> {
+    if *producer == [0u8; 32]
+        || *block_hash == [0u8; 32]
+        || *descriptor_hash == [0u8; 32]
+        || observed_at == 0
+    {
+        return Err("directory_authenticated_admission_request_invalid".to_string());
+    }
+    proof
+        .verify_at(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer,
+            block_hash,
+            observed_at,
+        )
+        .map_err(|_| "directory_authenticated_admission_proof_invalid".to_string())?;
+    if proof.commitment.descriptor_hash != *descriptor_hash {
+        return Err("directory_authenticated_admission_descriptor_mismatch".to_string());
+    }
+
+    let local_proof = locally_audited_directory_descriptor_proof(
+        replica_store,
+        producer,
+        block_hash,
+        descriptor_hash,
+        observed_at,
+    )?;
+    if local_proof != *proof {
+        return Err("directory_authenticated_admission_local_evidence_mismatch".to_string());
+    }
+    Ok(())
 }
 
 fn locally_audited_directory_descriptor_proof(
@@ -5874,13 +5941,116 @@ mod tests {
     }
 
     #[test]
+    fn directory_gossip_admission_is_locally_anchored_and_idempotent() {
+        let (producer, _, descriptor, block, proof) = descriptor_proof_test_context();
+        let now = unix_now_secs();
+        let replica_store = descriptor_proof_replica_store(&producer, &descriptor, &block, now);
+        let peer_store = PeerStore::new();
+        let descriptor_hash = proof.commitment.descriptor_hash;
+
+        let inserted = admit_directory_gossip_descriptor(
+            &replica_store,
+            &peer_store,
+            &proof,
+            &producer.public_key_bytes(),
+            &block.hash(),
+            &descriptor_hash,
+            now,
+        )
+        .unwrap();
+        assert_eq!(inserted.inserted, 1);
+        assert_eq!(inserted.rejected, 0);
+        assert_eq!(
+            peer_store.get_valid(&descriptor.node_id(), now),
+            Some(descriptor.clone())
+        );
+
+        let unchanged = admit_directory_gossip_descriptor(
+            &replica_store,
+            &peer_store,
+            &proof,
+            &producer.public_key_bytes(),
+            &block.hash(),
+            &descriptor_hash,
+            now,
+        )
+        .unwrap();
+        assert_eq!(unchanged.unchanged, 1);
+        assert_eq!(peer_store.len(), 1);
+    }
+
+    #[test]
+    fn directory_gossip_admission_rejects_unknown_anchor_and_rollback() {
+        let (producer, _, descriptor, block, proof) = descriptor_proof_test_context();
+        let now = unix_now_secs();
+        let empty_local = IdentityKeyPair::from_bytes(&[0x7a; 32]).unwrap();
+        let (empty_replica, _) =
+            DirectoryReplicaStore::open(":memory:", empty_local.public_key_bytes(), now).unwrap();
+        let descriptor_hash = proof.commitment.descriptor_hash;
+        let peer_store = PeerStore::new();
+
+        assert_eq!(
+            admit_directory_gossip_descriptor(
+                &empty_replica,
+                &peer_store,
+                &proof,
+                &producer.public_key_bytes(),
+                &block.hash(),
+                &descriptor_hash,
+                now,
+            )
+            .unwrap_err(),
+            "directory_authenticated_admission_local_anchor_not_found"
+        );
+        assert_eq!(peer_store.len(), 0);
+
+        let replica_store = descriptor_proof_replica_store(&producer, &descriptor, &block, now);
+        let subject = IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap();
+        let newer = SignedNodeDescriptor::sign(
+            NodeDescriptor::new(
+                subject.public_key_bytes(),
+                descriptor.sequence() + 1,
+                now.saturating_sub(1),
+                now + 600,
+                "directory-gossip-newer-test",
+            ),
+            &subject,
+        )
+        .unwrap();
+        peer_store
+            .upsert_verified_from_source(newer.clone(), now, "test_newer")
+            .unwrap();
+
+        let stale = admit_directory_gossip_descriptor(
+            &replica_store,
+            &peer_store,
+            &proof,
+            &producer.public_key_bytes(),
+            &block.hash(),
+            &descriptor_hash,
+            now,
+        )
+        .unwrap();
+        assert_eq!(stale.stale, 1);
+        assert_eq!(stale.inserted, 0);
+        assert_eq!(
+            peer_store.get_valid(&subject.public_key_bytes(), now),
+            Some(newer)
+        );
+    }
+
+    #[test]
     fn directory_authenticated_admission_rejects_unknown_local_anchor() {
         let (producer, _, descriptor, block, _) = descriptor_proof_test_context();
         let now = unix_now_secs();
         let replica_store = descriptor_proof_replica_store(&producer, &descriptor, &block, now);
         let alternate_block = DirectoryCommitmentBlockV1::new_signed(
             1,
-            now.saturating_sub(1),
+            // [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Derive the
+            // alternate timestamp from the retained block. Using a second wall
+            // clock read made this unknown-anchor regression flaky at a
+            // one-second rollover because both blocks could become identical.
+            block.header.timestamp.saturating_sub(1),
             [0u8; 32],
             vec![DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap()],
             &producer,

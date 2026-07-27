@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.39.0 - Locally anchored directory-authenticated PeerStore admission.
+Modification Reason: v0.40.0 - Directory-authenticated discovery gossip admission.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.39.0 - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] Added locally anchored, proof-matched PeerStore admission with preflight/postflight replica audits.
+Last Modified: v0.40.0 - [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Added proof-carrying discovery gossip that must match exact audited local replica evidence before PeerStore import.
+Previous: v0.39.0 - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] Added locally anchored, proof-matched PeerStore admission with preflight/postflight replica audits.
 Previous: v0.38.0 - [REPLICA-PROOF-RECOVERY 2026-07-27 by Codex] Added direct-first requester proof recovery with bounded explicit-carrier failover and independent producer/carrier verification.
 Previous: v0.37.0 - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Added audited carrier recovery for exact original producer descriptor inclusion proofs without expanding mirror authority.
 Previous: v0.36.0 - [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] Added compact exact-block descriptor inclusion proofs plus an audit-gated, pinned-peer-only transport contract for light verifiers.
@@ -1154,6 +1155,40 @@ Implemented in Directory-authenticated PeerStore Admission V1:
   producer block committed to that exact signed public descriptor. It does not
   make the descriptor an authority, grant relay permission, prove reachability,
   defeat Sybil operators, or create voting, fork-choice, consensus, or finality.
+
+Implemented in Directory-authenticated Gossip Admission V1:
+
+- `NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1` is appended after the
+  three established discovery variants. Existing bincode discriminants
+  `0/1/2` remain unchanged; the new proof announcement uses discriminant `3`.
+- The frame carries an original producer, exact producer-signed block hash,
+  exact descriptor commitment hash, and compact inclusion proof. The gossip
+  sender is deliberately absent from the trust decision and gains no producer,
+  mirror, witness, checkpoint, policy, voting, fork-choice, consensus, or
+  finality authority.
+- Both local-operator and public discovery routers receive the already audited
+  `DirectoryReplicaStore`. A node without that store returns service
+  unavailable for the stronger proof contract and never downgrades it to
+  signature-only admission.
+- The receiver re-verifies the producer signature, descriptor binding, Merkle
+  path, chain id, exact block hash, and exact descriptor hash, then reconstructs
+  the same proof from its local audited replica. The network proof must equal
+  local evidence exactly before normal PeerStore processing begins.
+- PeerStore then applies its existing descriptor validity, signature, capacity,
+  sequence anti-rollback, and route-surface invalidation rules. Results retain
+  the existing aggregate `inserted / unchanged / stale / rejected` contract.
+- Invalid proofs, missing anchors, and unavailable replica trust state retain no
+  producer, sender, endpoint, block, hash, proof, or route detail. Only one
+  aggregate rejection is recorded.
+- Legacy `DescriptorAnnounce` remains available for rolling compatibility. It
+  is explicitly signature-only and must not be described as Directory-backed.
+- This milestone implements the receiving/import path. Automatic outbound
+  selection and publication of locally anchored proof announcements remains the
+  next separate rollout step so mixed-version peers can be measured safely.
+- The frame contains only public signed node-directory evidence. It contains no
+  user identity, client IP, selected route, message id, payload, ciphertext,
+  traffic, DNS content, destination, Memory Chain record, private key, or wallet
+  activity.
 
 Implemented in Directory Sync V1 replica pull:
 

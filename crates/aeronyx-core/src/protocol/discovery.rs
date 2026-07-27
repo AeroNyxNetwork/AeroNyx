@@ -79,6 +79,9 @@
 //! 17. A verified recovery peer may request the same proof from an audited
 //!     carrier when the original producer is unavailable; the receiver still
 //!     verifies the original producer signature and its selected block hash
+//! 18. [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] A peer may announce
+//!     one exact descriptor proof, but receivers admit it only against an
+//!     independently retained producer/block anchor
 //!
 //! ## Important Note for Next Developer
 //! - Do not put private keys, client IPs, destination metadata, DNS contents,
@@ -130,6 +133,8 @@
 //!   rejection and the complete-input size preflight in the shared codec.
 //!
 //! ## Last Modified
+//! v0.20.0-DirectoryAuthenticatedGossipWire - Added an append-only compact
+//! descriptor-proof announcement without changing prior wire discriminants
 //! v0.19.0-ReplicaDirectoryInclusionProofWire - Added append-only audited
 //! carrier request/response frames for exact producer descriptor proofs
 //! v0.18.0-DirectoryInclusionProofWire - Added append-only pinned-peer request
@@ -3176,6 +3181,25 @@ pub enum NodeDiscoveryMessage {
         /// Signed descriptor being announced.
         descriptor: SignedNodeDescriptor,
     },
+    /// Announces one descriptor together with exact producer-signed Directory
+    /// inclusion evidence.
+    ///
+    /// [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] This append-only
+    /// variant is transport evidence, not an authority token. Receivers must
+    /// independently retain and audit the exact `producer` / `block_hash`
+    /// anchor before admitting `proof.descriptor`. The duplicated
+    /// `descriptor_hash` is an explicit request/response contract boundary and
+    /// must match the proof commitment.
+    DirectoryDescriptorAnnounceV1 {
+        /// Original Directory block producer selected by the receiver's policy.
+        producer: [u8; 32],
+        /// Exact producer-signed block hash selected by the receiver.
+        block_hash: [u8; 32],
+        /// Exact authenticated descriptor commitment digest.
+        descriptor_hash: [u8; 32],
+        /// Compact producer-signed inclusion proof carrying the descriptor.
+        proof: DirectoryDescriptorInclusionProofV1,
+    },
 }
 
 /// Encodes a discovery gossip message using bounded bincode.
@@ -3482,6 +3506,66 @@ mod tests {
         let decoded = decode_discovery_message(&bytes).unwrap();
 
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn directory_descriptor_announce_is_append_only_and_roundtrips() {
+        // [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] The enum index is
+        // part of the mixed-version bincode contract. Existing variants remain
+        // 0/1/2 and the proof-carrying announcement is appended at index 3.
+        let producer = IdentityKeyPair::from_bytes(&[0x81; 32]).unwrap();
+        let subject = IdentityKeyPair::from_bytes(&[0x82; 32]).unwrap();
+        let descriptor =
+            SignedNodeDescriptor::sign(descriptor_for(&subject), &subject).unwrap();
+        let commitment =
+            DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
+        let block = DirectoryCommitmentBlockV1::new_signed(
+            1,
+            1_700_000_100,
+            [0u8; 32],
+            vec![commitment],
+            &producer,
+        )
+        .unwrap();
+        let block_hash = block.hash();
+        let proof = DirectoryDescriptorInclusionProofV1::from_block_at(
+            &block,
+            &descriptor,
+            1_700_000_100,
+        )
+        .unwrap();
+        let message = NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 {
+            producer: producer.public_key_bytes(),
+            block_hash,
+            descriptor_hash: proof.commitment.descriptor_hash,
+            proof,
+        };
+
+        assert_eq!(
+            &encode_discovery_message(&NodeDiscoveryMessage::SnapshotRequest {
+                requested_at: 1,
+                limit: None,
+            })
+            .unwrap()[..4],
+            &0u32.to_le_bytes()
+        );
+        assert_eq!(
+            &encode_discovery_message(&NodeDiscoveryMessage::SnapshotResponse {
+                snapshot: NodeBootstrapSnapshot::new(1_700_000_100, Vec::new()),
+            })
+            .unwrap()[..4],
+            &1u32.to_le_bytes()
+        );
+        assert_eq!(
+            &encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: descriptor.clone(),
+            })
+            .unwrap()[..4],
+            &2u32.to_le_bytes()
+        );
+        let encoded = encode_discovery_message(&message).unwrap();
+        assert_eq!(&encoded[..4], &3u32.to_le_bytes());
+        assert_eq!(decode_discovery_message(&encoded).unwrap(), message);
     }
 
     #[test]
