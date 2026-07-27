@@ -53,6 +53,8 @@
 //! - [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Separately reports this
 //!   process acting as a carrier, using one mutually exclusive aggregate
 //!   outcome per authenticated request and no identity-bearing dimensions.
+//! - [WITNESS-CARRIER-ADMISSION 2026-07-27 by Codex] Separately reports
+//!   fail-fast local overload and descriptor-bound target cooldown outcomes.
 //! - Reports aggregate routeable carrier and signed-region-hint diversity
 //!   counts while explicitly rejecting operator/ASN diversity claims.
 //! - Separates signed carrier capability evidence from unadvertised
@@ -126,6 +128,8 @@
 //!   never influence witness authority, routing rank, reputation, or policy.
 //!
 //! ## Last Modified
+//! `v0.26.0-WitnessCarrierAdmissionStatus` - Added aggregate cooldown and
+//! overload outcomes without peer, endpoint, route, or frame dimensions.
 //! `v0.25.0-WitnessCarrierServiceStatus` - Added additive process-only
 //! carrier-side outcomes and explicit transport-only authority boundaries.
 //! `v0.24.0-BoundedWitnessCarrierRecoveryStatus` - Added additive process-only
@@ -407,6 +411,10 @@ struct DirectoryReplicaObservationWitnessCarrierStatus {
     target_capability_unavailable: u64,
     target_rejected: u64,
     target_invalid_response: u64,
+    // [WITNESS-CARRIER-ADMISSION 2026-07-27 by Codex] These additive counters
+    // remain aggregate-only and preserve the existing public JSON contract.
+    target_cooling_down: u64,
+    local_overloaded: u64,
     local_failures: u64,
     last_request_age_seconds: Option<u64>,
     last_forwarded_age_seconds: Option<u64>,
@@ -1787,6 +1795,8 @@ fn build_observation_witness_carrier_status(
         target_capability_unavailable: runtime.target_capability_unavailable,
         target_rejected: runtime.target_rejected,
         target_invalid_response: runtime.target_invalid_response,
+        target_cooling_down: runtime.target_cooling_down,
+        local_overloaded: runtime.local_overloaded,
         local_failures: runtime.local_failures,
         last_request_age_seconds: runtime
             .last_request_at
@@ -2460,6 +2470,14 @@ mod tests {
         assert_eq!(
             parsed["observation_witness_carrier"]["forwarded"].as_u64(),
             Some(1)
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["target_cooling_down"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["local_overloaded"].as_u64(),
+            Some(0)
         );
         assert_eq!(
             parsed["observation_witness_carrier"]["security_model"].as_str(),

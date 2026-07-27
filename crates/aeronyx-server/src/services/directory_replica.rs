@@ -59,6 +59,8 @@
 //! - [WITNESS-CARRIER 2026-07-26 by Codex] Retains process-only aggregate
 //!   witness-carrier selection/outcome telemetry without any peer, route,
 //!   endpoint, request, checkpoint, frame, or signature metadata.
+//! - [WITNESS-CARRIER-ADMISSION 2026-07-27 by Codex] Separates target cooldown
+//!   and local overload outcomes without storing identity-bearing dimensions.
 //! - Re-verifies one carrier-returned retained mirror anchor without importing
 //!   it, enabling a production smoke test with no authority or storage change.
 //! - Builds operator-scoped portable observation certificates only from the
@@ -161,6 +163,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.27.0-WitnessCarrierAdmissionTelemetry - Added process-only mutually
+//! exclusive target-cooldown and local-overload outcome counters.
 //! v0.26.0-WitnessCarrierServiceTelemetry - Added process-only carrier-side
 //! request outcomes without retaining request, identity, route, or frame data
 //! v0.25.0-BoundedWitnessCarrierTelemetry - Added process-only aggregate
@@ -1288,6 +1292,12 @@ pub struct DirectoryObservationWitnessCarrierSnapshot {
     pub target_rejected: u64,
     /// Requests whose successful target response failed bounds or verification.
     pub target_invalid_response: u64,
+    /// [WITNESS-CARRIER-ADMISSION 2026-07-27 by Codex] Requests skipped while
+    /// the current target descriptor remained in process-only cooldown.
+    pub target_cooling_down: u64,
+    /// [WITNESS-CARRIER-ADMISSION 2026-07-27 by Codex] Requests rejected
+    /// immediately because all bounded local carrier slots were busy.
+    pub local_overloaded: u64,
     /// Requests that could not create the bounded local transport client.
     pub local_failures: u64,
     /// Latest authenticated carrier request completion timestamp.
@@ -1315,6 +1325,11 @@ pub enum DirectoryObservationWitnessCarrierOutcome {
     TargetRejected,
     /// Target returned an oversized, malformed, or wrongly signed success body.
     TargetInvalidResponse,
+    /// [WITNESS-CARRIER-ADMISSION 2026-07-27 by Codex] Current target
+    /// descriptor remained inside a process-only failure cooldown.
+    TargetCoolingDown,
+    /// Every bounded local outbound carrier slot was already occupied.
+    LocalOverloaded,
     /// Carrier could not initialize its bounded no-proxy transport client.
     LocalFailure,
 }
@@ -1771,6 +1786,14 @@ impl DirectoryReplicaSyncRuntime {
             DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse => {
                 snapshot.target_invalid_response =
                     snapshot.target_invalid_response.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryObservationWitnessCarrierOutcome::TargetCoolingDown => {
+                snapshot.target_cooling_down = snapshot.target_cooling_down.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryObservationWitnessCarrierOutcome::LocalOverloaded => {
+                snapshot.local_overloaded = snapshot.local_overloaded.saturating_add(1);
                 snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryObservationWitnessCarrierOutcome::LocalFailure => {
@@ -12317,6 +12340,8 @@ mod tests {
             DirectoryObservationWitnessCarrierOutcome::TargetCapabilityUnavailable,
             DirectoryObservationWitnessCarrierOutcome::TargetRejected,
             DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse,
+            DirectoryObservationWitnessCarrierOutcome::TargetCoolingDown,
+            DirectoryObservationWitnessCarrierOutcome::LocalOverloaded,
             DirectoryObservationWitnessCarrierOutcome::LocalFailure,
         ];
         for (offset, outcome) in outcomes.into_iter().enumerate() {
@@ -12327,7 +12352,7 @@ mod tests {
         }
 
         let snapshot = runtime.observation_witness_carrier_snapshot();
-        assert_eq!(snapshot.requests, 8);
+        assert_eq!(snapshot.requests, 10);
         assert_eq!(snapshot.forwarded, 1);
         assert_eq!(snapshot.policy_rejected, 1);
         assert_eq!(snapshot.invalid_requests, 1);
@@ -12335,10 +12360,12 @@ mod tests {
         assert_eq!(snapshot.target_capability_unavailable, 1);
         assert_eq!(snapshot.target_rejected, 1);
         assert_eq!(snapshot.target_invalid_response, 1);
+        assert_eq!(snapshot.target_cooling_down, 1);
+        assert_eq!(snapshot.local_overloaded, 1);
         assert_eq!(snapshot.local_failures, 1);
-        assert_eq!(snapshot.last_request_at, Some(NOW + 7));
+        assert_eq!(snapshot.last_request_at, Some(NOW + 9));
         assert_eq!(snapshot.last_forwarded_at, Some(NOW));
-        assert_eq!(snapshot.last_failure_at, Some(NOW + 7));
+        assert_eq!(snapshot.last_failure_at, Some(NOW + 9));
     }
 
     #[test]
