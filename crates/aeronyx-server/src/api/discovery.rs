@@ -19,7 +19,8 @@
 //!   capability readiness, and compact discovery readiness for dashboards
 //! - `GET /api/discovery/summary`: returns a compact public-safe protocol
 //!   foundation summary for app, website, backend aggregation, and AI runbooks,
-//!   including aggregate route-governance readiness without route metadata
+//!   including aggregate route-governance readiness and non-authoritative
+//!   transport feature negotiation without route metadata
 //! - `GET /api/discovery/public-card`: returns the smallest product-facing
 //!   protocol health card for website, Nodeboard first-level views, and apps
 //!
@@ -62,6 +63,8 @@
 //!   Keep `DISCOVERY_REQUEST_BODY_MAX_BYTES` aligned with protocol limits.
 //!
 //! ## Last Modified
+//! v0.32.0-DirectoryGossipNegotiation - Advertise additive public transport
+//! feature hints so mixed-version peers can avoid unsupported proof frames
 //! v0.31.0-DirectoryAuthenticatedGossipAdmission - Gate proof announcements on
 //! exact audited local Directory replica evidence before PeerStore import
 //! v0.30.0-VerifiedDeliveryPeerGate - Keep public real-relay readiness gated by two currently verified receipt-capable peers
@@ -463,6 +466,12 @@ pub struct DiscoverySummaryResponse {
     contract_version: &'static str,
     /// Stable summary source label.
     source: &'static str,
+    /// Non-authoritative transport feature hints for mixed-version peers.
+    ///
+    /// [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] These booleans only
+    /// suppress unsupported optional frames. They must never grant descriptor,
+    /// replica, witness, checkpoint, policy, consensus, or routing authority.
+    protocol_features: serde_json::Value,
     /// Product-facing current protocol status bucket.
     status: String,
     /// Product-facing current protocol stage bucket.
@@ -1529,6 +1538,10 @@ pub fn discovery_summary_response(
         generated_at,
         contract_version: "discovery_summary.v1",
         source: "rust_discovery_summary",
+        protocol_features: serde_json::json!({
+            "legacy_descriptor_gossip_v1": true,
+            "directory_descriptor_proof_gossip_v1": true,
+        }),
         status: status_bucket,
         stage: stage_bucket,
         headline,
@@ -3079,6 +3092,14 @@ mod tests {
         assert_eq!(
             parsed["contract_version"].as_str(),
             Some("discovery_summary.v1")
+        );
+        assert_eq!(
+            parsed["protocol_features"]["legacy_descriptor_gossip_v1"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["protocol_features"]["directory_descriptor_proof_gossip_v1"].as_bool(),
+            Some(true)
         );
         assert_eq!(parsed["local_capability"]["status"].as_str(), Some("ready"));
         assert_eq!(

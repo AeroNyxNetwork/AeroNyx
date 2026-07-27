@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.41.0 - Directory-authenticated outbound gossip publication.
+Modification Reason: v0.42.0 - Mixed-version Directory gossip capability negotiation.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.41.0 - [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Added bounded, rotating, replica-audited outbound proof gossip with mandatory legacy self-announcement fallback.
+Last Modified: v0.42.0 - [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] Added bounded, fail-closed public feature negotiation so optional proof frames are sent only to peers that explicitly advertise support.
+Previous: v0.41.0 - [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Added bounded, rotating, replica-audited outbound proof gossip with mandatory legacy self-announcement fallback.
 Previous: v0.40.0 - [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Added proof-carrying discovery gossip that must match exact audited local replica evidence before PeerStore import.
 Previous: v0.39.0 - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] Added locally anchored, proof-matched PeerStore admission with preflight/postflight replica audits.
 Previous: v0.38.0 - [REPLICA-PROOF-RECOVERY 2026-07-27 by Codex] Added direct-first requester proof recovery with bounded explicit-carrier failover and independent producer/carrier verification.
@@ -1538,6 +1539,45 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] -->
+2026-07-27 - Added Directory Gossip Capability Negotiation V1.
+- Files changed:
+  - crates/aeronyx-server/src/api/discovery.rs
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Runtime flow:
+  - Publishes additive, non-authoritative transport feature booleans through
+    the existing compact `/api/discovery/summary` contract.
+  - Reads the peer summary through the shared bounded HTTP decoder before
+    deciding whether to send `DirectoryDescriptorAnnounceV1`.
+  - Missing routes, non-success responses, oversized bodies, malformed JSON,
+    and absent feature fields all resolve to legacy-only gossip.
+  - A positive feature hint never grants trust. The receiver still verifies
+    the proof against exact audited local replica evidence before PeerStore
+    admission.
+  - The signed `NodeDescriptor` schema and bincode capability discriminants
+    remain unchanged, preserving mixed-version descriptor compatibility.
+  - Aggregate logs distinguish capability checks, capable peers, proof
+    attempts, and accepted proofs without retaining peer or route dimensions.
+- US1 rollout evidence for the preceding publication milestone:
+  - Exact GitHub main commit `f95509c2213367c4dd210733db340a44f644946e`
+    was built and deployed with an atomic binary replacement and timestamped
+    rollback backup.
+  - Startup audits passed for 7,367 persisted local Directory blocks, 18,452
+    replica blocks across three producers, and a two-signature checkpoint
+    certificate at height 33.
+  - Korean1 and Noway1 each reached US1's public discovery API with HTTP 200.
+  - Two consecutive outbound rounds contacted all three selected peers and
+    preserved 3/3 legacy gossip success while old peers rejected the optional
+    proof frame. This proves rolling-upgrade availability, not cross-node proof
+    acceptance; acceptance requires one additional upgraded audited node.
+- Privacy boundary:
+  - Capability negotiation reveals only protocol support booleans.
+  - It never exports node ids, peer endpoints in public status, producer ids,
+    descriptor hashes, block hashes, route ids, message metadata, payloads,
+    client IPs, destinations, DNS contents, Memory Chain plaintext, private
+    keys, wallet-level traffic, or social graph data.
+
 <!-- [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] -->
 2026-07-27 - Added Directory-authenticated PeerStore Admission V1.
 - Files changed:

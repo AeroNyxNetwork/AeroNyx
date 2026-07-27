@@ -221,6 +221,9 @@
 //  92. [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Adds one bounded,
 //      replica-audited descriptor inclusion proof to outbound gossip while
 //      always retaining the legacy self announcement for rolling upgrades.
+//  93. [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] Negotiates the
+//      optional proof frame through a bounded public summary before sending it,
+//      while treating missing/invalid hints as legacy-only rather than failure.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -601,17 +604,40 @@ const PUBLIC_IP_RESPONSE_MAX_BYTES: usize = 256;
 
 /// Gossip is bounded independently from the operator's peer-store capacity.
 const DISCOVERY_GOSSIP_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+/// Capability negotiation reads only the compact public discovery summary.
+const DISCOVERY_NEGOTIATION_SUMMARY_MAX_BYTES: usize = 64 * 1024;
 
 /// Bootstrap/cache snapshots may contain thousands of signed descriptors.
 const DISCOVERY_SNAPSHOT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// Minimal additive fields read from a peer's public discovery summary.
+///
+/// [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] This unsigned document
+/// is only a transport optimization hint. A false positive can at most cause
+/// one optional proof request before mandatory legacy fallback; a false
+/// negative can only suppress that optional request. It never grants trust.
+#[derive(Debug, Default, serde::Deserialize)]
+struct DiscoveryNegotiationSummary {
+    #[serde(default)]
+    protocol_features: DiscoveryNegotiationFeatures,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct DiscoveryNegotiationFeatures {
+    #[serde(default)]
+    directory_descriptor_proof_gossip_v1: bool,
+}
+
 /// Per-peer result for the optional Directory-authenticated gossip frame.
 ///
-/// [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] This is process-local,
-/// aggregate-only rollout telemetry. It must never gain peer, endpoint,
-/// descriptor, producer, block, route, message, or user dimensions.
+/// [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] This is process-local,
+/// aggregate-only rollout telemetry. Capability hints are non-authoritative,
+/// and these fields must never gain peer, endpoint, descriptor, producer,
+/// block, route, message, or user dimensions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DiscoveryPeerGossipOutcome {
+    directory_proof_capability_checked: bool,
+    directory_proof_capable: bool,
     directory_proof_attempted: bool,
     directory_proof_accepted: bool,
 }
@@ -5983,6 +6009,8 @@ impl Server {
 
                 let mut attempted = 0usize;
                 let mut succeeded = 0usize;
+                let mut directory_proof_capability_checked = 0usize;
+                let mut directory_proof_capable = 0usize;
                 let mut directory_proof_attempted = 0usize;
                 let mut directory_proof_accepted = 0usize;
                 let mut last_failure_reason: Option<String> = None;
@@ -6071,13 +6099,21 @@ impl Server {
                     {
                         Ok(outcome) => {
                             succeeded += 1;
+                            directory_proof_capability_checked +=
+                                usize::from(outcome.directory_proof_capability_checked);
+                            directory_proof_capable +=
+                                usize::from(outcome.directory_proof_capable);
                             directory_proof_attempted +=
                                 usize::from(outcome.directory_proof_attempted);
                             directory_proof_accepted +=
                                 usize::from(outcome.directory_proof_accepted);
                         }
                         Err(e) => {
-                            directory_proof_attempted +=
+                            // The negotiation request always runs first when a
+                            // proof candidate exists. Do not claim proof
+                            // support or transmission when a later legacy
+                            // exchange fails and no outcome is available.
+                            directory_proof_capability_checked +=
                                 usize::from(directory_gossip_announcement.is_some());
                             last_failure_reason = Some(e.clone());
                             debug!(
@@ -6092,6 +6128,8 @@ impl Server {
                     info!(
                         attempted,
                         succeeded,
+                        directory_proof_capability_checked,
+                        directory_proof_capable,
                         directory_proof_attempted,
                         directory_proof_accepted,
                         backpressure_active,
@@ -6296,6 +6334,48 @@ impl Server {
         (mixed % span) as i64 - window as i64
     }
 
+    fn discovery_summary_url_from_gossip_url(gossip_url: &str) -> Option<String> {
+        const GOSSIP_SUFFIX: &str = "/api/discovery/gossip";
+        let base = gossip_url.strip_suffix(GOSSIP_SUFFIX)?;
+        if base.is_empty() {
+            return None;
+        }
+        Some(format!("{base}/api/discovery/summary"))
+    }
+
+    /// Returns whether a peer explicitly advertises Directory proof gossip V1.
+    ///
+    /// [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] Failures, oversized
+    /// bodies, malformed JSON, missing fields, and non-success statuses all
+    /// resolve to `false`. The hint is not authenticated and cannot authorize
+    /// admission; receivers still verify exact proof bytes against their
+    /// audited local replica before importing a descriptor.
+    async fn peer_supports_directory_proof_gossip(
+        client: &reqwest::Client,
+        gossip_url: &str,
+    ) -> bool {
+        let Some(summary_url) = Self::discovery_summary_url_from_gossip_url(gossip_url) else {
+            return false;
+        };
+        let Ok(response) = client.get(summary_url).send().await else {
+            return false;
+        };
+        let Ok(response) = response.error_for_status() else {
+            return false;
+        };
+        let Ok(summary) = decode_bounded_json_response::<DiscoveryNegotiationSummary>(
+            response,
+            DISCOVERY_NEGOTIATION_SUMMARY_MAX_BYTES,
+        )
+        .await
+        else {
+            return false;
+        };
+        summary
+            .protocol_features
+            .directory_descriptor_proof_gossip_v1
+    }
+
     async fn gossip_with_peer(
         client: &reqwest::Client,
         peer_store: &PeerStore,
@@ -6307,27 +6387,30 @@ impl Server {
     ) -> std::result::Result<DiscoveryPeerGossipOutcome, String> {
         let mut outcome = DiscoveryPeerGossipOutcome::default();
         if let Some(announcement) = directory_gossip_announcement {
-            outcome.directory_proof_attempted = true;
-            let proof_message = NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 {
-                producer: announcement.producer,
-                block_hash: announcement.block_hash,
-                descriptor_hash: announcement.descriptor_hash,
-                proof: announcement.proof.clone(),
-            };
-            // [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Proof gossip is
-            // intentionally best-effort during the mixed-version phase. Old
-            // peers may reject the append-only enum variant; the current self
-            // descriptor below must still be sent and remains the liveness
-            // source until explicit capability negotiation is deployed.
-            outcome.directory_proof_accepted = match client
-                .post(url)
-                .json(&proof_message)
-                .send()
-                .await
-            {
-                Ok(response) => response.status().is_success(),
-                Err(_) => false,
-            };
+            outcome.directory_proof_capability_checked = true;
+            outcome.directory_proof_capable =
+                Self::peer_supports_directory_proof_gossip(client, url).await;
+            if outcome.directory_proof_capable {
+                outcome.directory_proof_attempted = true;
+                let proof_message = NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 {
+                    producer: announcement.producer,
+                    block_hash: announcement.block_hash,
+                    descriptor_hash: announcement.descriptor_hash,
+                    proof: announcement.proof.clone(),
+                };
+                // Proof gossip remains best-effort. A peer may advertise the
+                // contract and still reject stale/unknown local replica
+                // evidence; the legacy self descriptor below must always run.
+                outcome.directory_proof_accepted = match client
+                    .post(url)
+                    .json(&proof_message)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response.status().is_success(),
+                    Err(_) => false,
+                };
+            }
         }
 
         let announce_response = client
@@ -9568,7 +9651,11 @@ mod tests {
         NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
         SignedNodeDescriptor,
     };
-    use axum::{http::StatusCode, routing::post, Json, Router};
+    use axum::{
+        http::StatusCode,
+        routing::{get, post},
+        Json, Router,
+    };
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
@@ -10960,6 +11047,19 @@ mod tests {
             Some("https://node.example.com/api/discovery/gossip")
         );
         assert_eq!(Server::discovery_gossip_url("   "), None);
+        assert_eq!(
+            Server::discovery_summary_url_from_gossip_url(
+                "https://node.example.com/api/discovery/gossip"
+            )
+            .as_deref(),
+            Some("https://node.example.com/api/discovery/summary")
+        );
+        assert_eq!(
+            Server::discovery_summary_url_from_gossip_url(
+                "https://node.example.com/api/discovery/status"
+            ),
+            None
+        );
     }
 
     #[tokio::test]
@@ -11696,26 +11796,37 @@ mod tests {
         let proof_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_handler = Arc::clone(&calls);
         let proof_calls_for_handler = Arc::clone(&proof_calls);
-        let app = Router::new().route(
-            "/api/discovery/gossip",
-            post(move |Json(message): Json<NodeDiscoveryMessage>| {
-                let calls_for_handler = Arc::clone(&calls_for_handler);
-                let proof_calls_for_handler = Arc::clone(&proof_calls_for_handler);
-                async move {
-                    calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
-                    if matches!(
-                        message,
-                        NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. }
-                    ) {
-                        proof_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+        let app = Router::new()
+            .route(
+                "/api/discovery/summary",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "protocol_features": {
+                            "directory_descriptor_proof_gossip_v1": true
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/api/discovery/gossip",
+                post(move |Json(message): Json<NodeDiscoveryMessage>| {
+                    let calls_for_handler = Arc::clone(&calls_for_handler);
+                    let proof_calls_for_handler = Arc::clone(&proof_calls_for_handler);
+                    async move {
+                        calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                        if matches!(
+                            message,
+                            NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. }
+                        ) {
+                            proof_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                        }
+                        Json(GossipResponse {
+                            applied: PeerStoreImportReport::empty(),
+                            response: None,
+                        })
                     }
-                    Json(GossipResponse {
-                        applied: PeerStoreImportReport::empty(),
-                        response: None,
-                    })
-                }
-            }),
-        );
+                }),
+            );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
             "http://{}/api/discovery/gossip",
@@ -11748,10 +11859,89 @@ mod tests {
         assert_eq!(
             outcome,
             DiscoveryPeerGossipOutcome {
+                directory_proof_capability_checked: true,
+                directory_proof_capable: true,
                 directory_proof_attempted: true,
                 directory_proof_accepted: true,
             }
         );
+        mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn outbound_gossip_skips_directory_proof_without_explicit_peer_support() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let proof_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = Arc::clone(&calls);
+        let proof_calls_for_handler = Arc::clone(&proof_calls);
+        let app = Router::new()
+            .route(
+                "/api/discovery/summary",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "contract_version": "discovery_summary.v1"
+                    }))
+                }),
+            )
+            .route(
+                "/api/discovery/gossip",
+                post(move |Json(message): Json<NodeDiscoveryMessage>| {
+                    let calls_for_handler = Arc::clone(&calls_for_handler);
+                    let proof_calls_for_handler = Arc::clone(&proof_calls_for_handler);
+                    async move {
+                        calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                        if matches!(
+                            message,
+                            NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. }
+                        ) {
+                            proof_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                        }
+                        Json(GossipResponse {
+                            applied: PeerStoreImportReport::empty(),
+                            response: None,
+                        })
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/discovery/gossip",
+            listener.local_addr().unwrap()
+        );
+        let mock_peer = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let now = unix_now_secs();
+        let announcement = directory_gossip_announcement(now);
+        let self_descriptor =
+            signed_chat_relay_peer_descriptor("http://127.0.0.1:1".to_string(), now, now + 300);
+        let client = reqwest::Client::new();
+        let peer_store = PeerStore::new();
+
+        let outcome = Server::gossip_with_peer(
+            &client,
+            &peer_store,
+            &url,
+            self_descriptor,
+            Some(&announcement),
+            now,
+            8,
+        )
+        .await
+        .expect("legacy peer should complete the base gossip exchange");
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(proof_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            outcome,
+            DiscoveryPeerGossipOutcome {
+                directory_proof_capability_checked: true,
+                directory_proof_capable: false,
+                directory_proof_attempted: false,
+                directory_proof_accepted: false,
+            }
+        );
+        assert_eq!(peer_store.status(now + 1).runtime.last_gossip_at, Some(now));
         mock_peer.abort();
     }
 
@@ -11761,34 +11951,45 @@ mod tests {
         let legacy_calls = Arc::new(AtomicUsize::new(0));
         let calls_for_handler = Arc::clone(&calls);
         let legacy_calls_for_handler = Arc::clone(&legacy_calls);
-        let app = Router::new().route(
-            "/api/discovery/gossip",
-            post(move |Json(message): Json<NodeDiscoveryMessage>| {
-                let calls_for_handler = Arc::clone(&calls_for_handler);
-                let legacy_calls_for_handler = Arc::clone(&legacy_calls_for_handler);
-                async move {
-                    calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
-                    let status = match message {
-                        NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => {
-                            StatusCode::UNPROCESSABLE_ENTITY
+        let app = Router::new()
+            .route(
+                "/api/discovery/summary",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "protocol_features": {
+                            "directory_descriptor_proof_gossip_v1": true
                         }
-                        NodeDiscoveryMessage::DescriptorAnnounce { .. }
-                        | NodeDiscoveryMessage::SnapshotRequest { .. } => {
-                            legacy_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
-                            StatusCode::OK
-                        }
-                        NodeDiscoveryMessage::SnapshotResponse { .. } => StatusCode::OK,
-                    };
-                    (
-                        status,
-                        Json(GossipResponse {
-                            applied: PeerStoreImportReport::empty(),
-                            response: None,
-                        }),
-                    )
-                }
-            }),
-        );
+                    }))
+                }),
+            )
+            .route(
+                "/api/discovery/gossip",
+                post(move |Json(message): Json<NodeDiscoveryMessage>| {
+                    let calls_for_handler = Arc::clone(&calls_for_handler);
+                    let legacy_calls_for_handler = Arc::clone(&legacy_calls_for_handler);
+                    async move {
+                        calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                        let status = match message {
+                            NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => {
+                                StatusCode::UNPROCESSABLE_ENTITY
+                            }
+                            NodeDiscoveryMessage::DescriptorAnnounce { .. }
+                            | NodeDiscoveryMessage::SnapshotRequest { .. } => {
+                                legacy_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                                StatusCode::OK
+                            }
+                            NodeDiscoveryMessage::SnapshotResponse { .. } => StatusCode::OK,
+                        };
+                        (
+                            status,
+                            Json(GossipResponse {
+                                applied: PeerStoreImportReport::empty(),
+                                response: None,
+                            }),
+                        )
+                    }
+                }),
+            );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
             "http://{}/api/discovery/gossip",
@@ -11821,6 +12022,8 @@ mod tests {
         assert_eq!(
             outcome,
             DiscoveryPeerGossipOutcome {
+                directory_proof_capability_checked: true,
+                directory_proof_capable: true,
                 directory_proof_attempted: true,
                 directory_proof_accepted: false,
             }
