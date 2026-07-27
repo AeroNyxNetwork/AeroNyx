@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.37.0 - Audited replica-carrier descriptor inclusion proofs.
+Modification Reason: v0.38.0 - Direct-first requester descriptor-proof recovery.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.37.0 - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Added audited carrier recovery for exact original producer descriptor inclusion proofs without expanding mirror authority.
+Last Modified: v0.38.0 - [REPLICA-PROOF-RECOVERY 2026-07-27 by Codex] Added direct-first requester proof recovery with bounded explicit-carrier failover and independent producer/carrier verification.
+Previous: v0.37.0 - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Added audited carrier recovery for exact original producer descriptor inclusion proofs without expanding mirror authority.
 Previous: v0.36.0 - [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] Added compact exact-block descriptor inclusion proofs plus an audit-gated, pinned-peer-only transport contract for light verifiers.
 Previous: v0.35.0 - [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] Added a separate process-only carrier-side status contract so nodes can prove bounded encrypted-evidence transport participation without retaining identities, routes, frames, or payload data.
 Previous: v0.34.0 - [WITNESS-CARRIER-LIVE 2026-07-27 by Codex] Proved the bounded checkpoint-witness carrier path across three audited live nodes, including automatic direct-path restoration and privacy-safe runtime evidence.
@@ -1106,6 +1107,30 @@ Implemented in Replica Descriptor Inclusion Proof V1:
   user identity, IP, route, payload, ciphertext, message, traffic, DNS,
   destination, Memory Chain, private-key, or wallet-level data.
 
+Implemented in Requester Replica Proof Recovery V1:
+
+- `fetch_directory_descriptor_inclusion_proof_with_recovery` requires the
+  caller to supply the original producer, exact selected producer block hash,
+  and exact descriptor hash. The network cannot choose these trust anchors.
+- The requester contacts the original producer route first. Only typed
+  transport, optional-route, overload, or admission unavailability may enter
+  carrier recovery.
+- A semantic producer `proof_not_found`, noncanonical response, contract
+  mismatch, invalid producer signature, wrong block/descriptor binding, or
+  invalid Merkle path stops closed and never falls through to a carrier.
+- Recovery selects at most two current public descriptors that explicitly
+  advertise `DirectoryMirrorCarrier`; endpoint derivation is bound to the exact
+  signed descriptor sequence selected for that attempt.
+- Each carrier receives a fresh signed request id. Carrier route absence or a
+  retained-mirror miss may try the next bounded candidate; malformed or
+  cryptographically invalid carrier evidence stops immediately.
+- Successful carrier recovery independently verifies the carrier envelope and
+  the original producer proof. The returned transport class contains no
+  carrier identity or endpoint metadata.
+- This is availability recovery only. It does not create consensus, select a
+  canonical producer chain, grant mirror authority, or prove user activity,
+  message delivery, payload contents, traffic, or Memory Chain state.
+
 Implemented in Directory Sync V1 replica pull:
 
 - Remote blocks never enter the local producer tables. Every producer has an
@@ -1423,6 +1448,29 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [REPLICA-PROOF-RECOVERY 2026-07-27 by Codex] -->
+2026-07-27 - Added Requester Replica Proof Recovery V1.
+- Files changed:
+  - crates/aeronyx-server/src/api/directory_replica_sync.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Runtime flow:
+  - Requests one exact proof from the original producer first.
+  - Falls back to at most two current explicit mirror carriers only for typed
+    availability or route-admission failure.
+  - Uses fresh signed requests and descriptor-sequence-bound carrier endpoints.
+- Verification:
+  - Direct responses require the producer transport signature and complete
+    producer proof verification.
+  - Carrier responses separately require the carrier envelope signature and
+    original producer proof.
+  - Wrong hashes, noncanonical frames, bad signatures, and invalid proof paths
+    stop closed without trying another source.
+- Privacy and authority:
+  - Returned source telemetry is only `direct_producer` or `replica_carrier`;
+    no carrier identity, endpoint, route, or request data is retained.
+  - Recovery changes availability only and grants no producer, checkpoint,
+    witness, policy, consensus, fork-choice, or finality authority.
+
 <!-- [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] -->
 2026-07-27 - Added Replica Descriptor Inclusion Proof V1.
 - Files changed:
