@@ -16,6 +16,7 @@
 //! - `POST /api/discovery/peer/directory/descriptor-inclusion-proof`
 //! - `POST /api/discovery/peer/directory/replica-block-range`
 //! - `POST /api/discovery/peer/directory/replica-descriptor-objects`
+//! - `POST /api/discovery/peer/directory/replica-descriptor-inclusion-proof`
 //! - `POST /api/discovery/peer/directory/observation-checkpoint-witness`
 //! - `POST /api/discovery/peer/directory/observation-checkpoint-witness-carrier`
 //! - `POST /api/discovery/peer/directory/observation-policy-anchor`
@@ -40,6 +41,9 @@
 //! - [WITNESS-CARRIER-ADMISSION 2026-07-27 by Codex] Fail-fast outbound
 //!   concurrency admission and descriptor-sequence-bound target cooldowns.
 //! - Audited producer-replica export with a separate carrier signature layer.
+//! - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Exact original
+//!   producer-signed descriptor proofs through audited carriers, without
+//!   granting the carrier producer or chain-selection authority.
 //! - Explicit lagging-carrier responses that let a requester continue to the
 //!   next verified carrier without retrying malformed protocol requests.
 //! - Multi-block catch-up pages capped to one block's maximum aggregate
@@ -74,6 +78,9 @@
 //!     and returns a carrier-signed transport envelope.
 //! 11. Inclusion-proof requests bind one exact descriptor and independently
 //!     selected block hash; the server never substitutes another block.
+//! 12. Replica proof recovery audits one producer namespace transactionally,
+//!     preserves the original producer proof, then adds a distinct carrier
+//!     transport signature for independent verification.
 //!
 //! ## Privacy Invariant
 //! This API serves signed public node-directory commitments and the public
@@ -103,8 +110,13 @@
 //! - [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex] Keep proof export
 //!   pinned-peer-only. The proof establishes producer-signed inclusion, not
 //!   canonical-chain selection, consensus, finality, or user activity.
+//! - Replica proof recovery may follow verified-public mirror admission, but
+//!   only for a producer still in the durable mirror registry. Carrier
+//!   availability is never producer, checkpoint, witness, or policy authority.
 //!
 //! ## Last Modified
+//! v0.15.0-ReplicaDescriptorInclusionProof - Added registry-gated carrier
+//! recovery for exact original producer descriptor inclusion proofs.
 //! v0.14.0-DirectoryInclusionProof - Added exact-block, audit-gated,
 //! pinned-peer-only descriptor proof export.
 //! v0.13.0-WitnessCarrierAdmission - Added bounded outbound concurrency,
@@ -165,13 +177,16 @@ use aeronyx_core::protocol::discovery::{
     directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
     directory_replica_block_range_request_signing_bytes,
     directory_replica_block_range_response_signing_bytes,
+    directory_replica_descriptor_inclusion_proof_request_signing_bytes,
+    directory_replica_descriptor_inclusion_proof_response_signing_bytes,
     directory_replica_descriptor_objects_request_signing_bytes,
     directory_replica_descriptor_objects_response_signing_bytes,
     directory_tip_request_signing_bytes, directory_tip_response_signing_bytes,
     encode_directory_observation_certificate, encode_directory_sync_message,
-    DirectoryCommitmentBlockV1, DirectoryObservationCheckpointV1, DirectorySyncMessage,
-    SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-    DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1, DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
+    DirectoryCommitmentBlockV1, DirectoryDescriptorInclusionProofV1,
+    DirectoryObservationCheckpointV1, DirectorySyncMessage, SignedNodeDescriptor,
+    AERONYX_DIRECTORY_MAINNET_CHAIN_ID, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+    DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_CONFLICT_V1,
     DIRECTORY_OBSERVATION_WITNESS_EVIDENCE_UNAVAILABLE_V1, MAX_DIRECTORY_COMMITMENTS_PER_BLOCK,
     MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES, MAX_DIRECTORY_SYNC_BLOCKS_V1,
     MAX_DIRECTORY_SYNC_OBJECTS_V1,
@@ -552,6 +567,10 @@ fn build_directory_chain_peer_router_with_replica_runtime_and_transport(
             .route(
                 "/api/discovery/peer/directory/replica-descriptor-objects",
                 post(replica_descriptor_objects_handler),
+            )
+            .route(
+                "/api/discovery/peer/directory/replica-descriptor-inclusion-proof",
+                post(replica_descriptor_inclusion_proof_handler),
             )
             .route(
                 "/api/discovery/peer/directory/observation-checkpoint-witness",
@@ -1102,6 +1121,58 @@ async fn audited_replica_objects_for_request(
     }
 }
 
+async fn audited_replica_descriptor_proof_for_request(
+    state: &DirectoryChainPeerState,
+    producer: [u8; 32],
+    descriptor_hash: [u8; 32],
+    block_hash: [u8; 32],
+    observed_at: u64,
+) -> Result<DirectoryDescriptorInclusionProofV1, Response> {
+    let producer_is_pinned = state.pinned_peers.contains(&producer);
+    if !producer_is_pinned && !state.allow_public_mirror_reads {
+        return Err(protocol_error(
+            StatusCode::FORBIDDEN,
+            "public_mirror_disabled",
+        ));
+    }
+    let Some(store) = state.replica_store.as_ref().map(Arc::clone) else {
+        return Err(protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "replica_store_disabled",
+        ));
+    };
+    match tokio::task::spawn_blocking(move || {
+        if producer_is_pinned {
+            store.audited_evidence_descriptor_inclusion_proof(
+                &producer,
+                &descriptor_hash,
+                &block_hash,
+                observed_at,
+            )
+        } else {
+            store.audited_mirror_evidence_descriptor_inclusion_proof(
+                &producer,
+                &descriptor_hash,
+                &block_hash,
+                observed_at,
+            )
+        }
+    })
+    .await
+    {
+        Ok(Ok(Some(proof))) => Ok(proof),
+        Ok(Ok(None)) => Err(protocol_error(
+            StatusCode::NOT_FOUND,
+            "replica_descriptor_proof_not_found",
+        )),
+        Ok(Err(error)) => Err(replica_store_error_response(&error)),
+        Err(_) => Err(protocol_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_task_failed",
+        )),
+    }
+}
+
 async fn replica_block_range_handler(
     State(state): State<DirectoryChainPeerState>,
     body: Bytes,
@@ -1283,6 +1354,103 @@ async fn replica_descriptor_objects_handler(
         objects,
         signature: state.identity.sign(&response_signing_bytes),
     })
+}
+
+async fn replica_descriptor_inclusion_proof_handler(
+    State(state): State<DirectoryChainPeerState>,
+    body: Bytes,
+) -> Response {
+    let message = match decode_request(&body) {
+        Ok(message) => message,
+        Err(response) => return response,
+    };
+    let DirectorySyncMessage::ReplicaDescriptorInclusionProofRequestV1 {
+        chain_id,
+        producer,
+        block_hash,
+        descriptor_hash,
+        request_id,
+        requester,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+    if chain_id != AERONYX_DIRECTORY_MAINNET_CHAIN_ID
+        || producer == [0u8; 32]
+        || producer == state.identity.public_key_bytes()
+        || block_hash == [0u8; 32]
+        || descriptor_hash == [0u8; 32]
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_replica_proof_request");
+    }
+    let now = now_secs();
+    let signing_bytes = directory_replica_descriptor_inclusion_proof_request_signing_bytes(
+        &chain_id,
+        &producer,
+        &block_hash,
+        &descriptor_hash,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    if let Err(response) = authenticate_request(
+        &state,
+        DirectoryPeerAdmission::VerifiedPublicRecovery,
+        requester,
+        request_id,
+        request_timestamp,
+        &signing_bytes,
+        &signature,
+        now,
+    )
+    .await
+    {
+        return response;
+    }
+    let proof = match audited_replica_descriptor_proof_for_request(
+        &state,
+        producer,
+        descriptor_hash,
+        block_hash,
+        now,
+    )
+    .await
+    {
+        Ok(proof) => proof,
+        Err(response) => return response,
+    };
+    let carrier = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let response_signing_bytes =
+        directory_replica_descriptor_inclusion_proof_response_signing_bytes(
+            &chain_id,
+            &request_id,
+            &producer,
+            &carrier,
+            response_timestamp,
+            &block_hash,
+            &descriptor_hash,
+            &proof,
+        );
+    debug!(
+        block_height = proof.block_header.height,
+        "[DIRECTORY_CHAIN] Served audited replica descriptor inclusion proof"
+    );
+    encoded_response(
+        DirectorySyncMessage::ReplicaDescriptorInclusionProofResponseV1 {
+            chain_id,
+            request_id,
+            producer,
+            carrier,
+            response_timestamp,
+            block_hash,
+            descriptor_hash,
+            proof,
+            signature: state.identity.sign(&response_signing_bytes),
+        },
+    )
 }
 
 async fn observation_checkpoint_witness_handler(
@@ -2346,6 +2514,87 @@ mod tests {
         .unwrap()
     }
 
+    fn replica_descriptor_proof_request(
+        requester: &IdentityKeyPair,
+        producer: &[u8; 32],
+        block_hash: &[u8; 32],
+        descriptor_hash: &[u8; 32],
+        request_id: [u8; 16],
+    ) -> Vec<u8> {
+        let timestamp = now_secs();
+        let requester_id = requester.public_key_bytes();
+        let signing_bytes = directory_replica_descriptor_inclusion_proof_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer,
+            block_hash,
+            descriptor_hash,
+            &request_id,
+            &requester_id,
+            timestamp,
+        );
+        encode_directory_sync_message(
+            &DirectorySyncMessage::ReplicaDescriptorInclusionProofRequestV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                producer: *producer,
+                block_hash: *block_hash,
+                descriptor_hash: *descriptor_hash,
+                request_id,
+                requester: requester_id,
+                request_timestamp: timestamp,
+                signature: requester.sign(&signing_bytes),
+            },
+        )
+        .unwrap()
+    }
+
+    fn verify_replica_descriptor_proof_response(
+        body: &[u8],
+        expected_request_id: &[u8; 16],
+        expected_producer: &[u8; 32],
+        expected_carrier: &[u8; 32],
+        expected_block_hash: &[u8; 32],
+        expected_descriptor_hash: &[u8; 32],
+    ) -> DirectoryDescriptorInclusionProofV1 {
+        let DirectorySyncMessage::ReplicaDescriptorInclusionProofResponseV1 {
+            chain_id,
+            request_id,
+            producer,
+            carrier,
+            response_timestamp,
+            block_hash,
+            descriptor_hash,
+            proof,
+            signature,
+        } = decode_directory_sync_message(body).unwrap()
+        else {
+            panic!("unexpected replica descriptor proof response");
+        };
+        assert_eq!(&request_id, expected_request_id);
+        assert_eq!(&producer, expected_producer);
+        assert_eq!(&carrier, expected_carrier);
+        assert_eq!(&block_hash, expected_block_hash);
+        assert_eq!(&descriptor_hash, expected_descriptor_hash);
+        let signing_bytes = directory_replica_descriptor_inclusion_proof_response_signing_bytes(
+            &chain_id,
+            &request_id,
+            &producer,
+            &carrier,
+            response_timestamp,
+            &block_hash,
+            &descriptor_hash,
+            &proof,
+        );
+        IdentityPublicKey::from_bytes(&carrier)
+            .unwrap()
+            .verify(&signing_bytes, &signature)
+            .unwrap();
+        proof
+            .verify_at(&chain_id, &producer, &block_hash, now_secs())
+            .unwrap();
+        assert_eq!(proof.commitment.descriptor_hash, descriptor_hash);
+        proof
+    }
+
     #[test]
     fn request_guard_enforces_global_permissionless_budget() {
         let mut guard = DirectoryPeerRequestGuard::default();
@@ -3130,6 +3379,7 @@ mod tests {
     async fn unpinned_public_peer_can_read_signed_local_producer_tip() {
         let (router, _, requester, _) = test_router(false, true, true);
         let response = router
+            .clone()
             .oneshot(
                 Request::post("/api/discovery/peer/directory/tip")
                     .body(Body::from(tip_request(&requester, [0xb2; 16])))
@@ -3426,6 +3676,7 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(!has_more);
         assert_eq!(tip_height, 1);
+        let block_hash = blocks[0].hash();
 
         // [MIRROR-CARRIER 2026-07-24 by Codex] A valid request beyond this
         // carrier's retained producer tip is retryable availability, not a
@@ -3475,6 +3726,7 @@ mod tests {
         )
         .unwrap();
         let response = router
+            .clone()
             .oneshot(
                 Request::post("/api/discovery/peer/directory/replica-descriptor-objects")
                     .body(Body::from(object_request))
@@ -3494,8 +3746,52 @@ mod tests {
                 object_timestamp,
             )
             .unwrap(),
-            vec![expected_object]
+            vec![expected_object.clone()]
         );
+
+        let proof_id = [0xcb; 16];
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-descriptor-inclusion-proof")
+                    .body(Body::from(replica_descriptor_proof_request(
+                        &requester,
+                        &producer_id,
+                        &block_hash,
+                        &descriptor_hash,
+                        proof_id,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let proof = verify_replica_descriptor_proof_response(
+            &body,
+            &proof_id,
+            &producer_id,
+            &carrier.public_key_bytes(),
+            &block_hash,
+            &descriptor_hash,
+        );
+        assert_eq!(proof.descriptor, expected_object);
+
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-descriptor-inclusion-proof")
+                    .body(Body::from(replica_descriptor_proof_request(
+                        &requester,
+                        &producer_id,
+                        &[0x35; 32],
+                        &descriptor_hash,
+                        [0xc8; 16],
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3504,6 +3800,7 @@ mod tests {
             carrier_test_router_with_access(CarrierTestPolicy::PublicWithoutMirror);
         let producer_id = producer.public_key_bytes();
         let response = unregistered_router
+            .clone()
             .oneshot(
                 Request::post("/api/discovery/peer/directory/replica-block-range")
                     .body(Body::from(replica_range_request(
@@ -3516,16 +3813,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = unregistered_router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-descriptor-inclusion-proof")
+                    .body(Body::from(replica_descriptor_proof_request(
+                        &requester,
+                        &producer_id,
+                        &[0x31; 32],
+                        &[0x32; 32],
+                        [0xc9; 16],
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let (disabled_router, _, requester, producer, _) =
             carrier_test_router_with_access(CarrierTestPolicy::PublicMirrorDisabled);
         let response = disabled_router
+            .clone()
             .oneshot(
                 Request::post("/api/discovery/peer/directory/replica-block-range")
                     .body(Body::from(replica_range_request(
                         &requester,
                         &producer.public_key_bytes(),
                         [0xd0; 16],
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = disabled_router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-descriptor-inclusion-proof")
+                    .body(Body::from(replica_descriptor_proof_request(
+                        &requester,
+                        &producer.public_key_bytes(),
+                        &[0x33; 32],
+                        &[0x34; 32],
+                        [0xca; 16],
                     )))
                     .unwrap(),
             )
@@ -3585,6 +3913,7 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(!has_more);
         assert_eq!(tip_height, 1);
+        let block_hash = blocks[0].hash();
         let descriptor_hash = blocks[0].commitments[0].descriptor_hash;
 
         let object_id = [0xd7; 16];
@@ -3609,6 +3938,7 @@ mod tests {
         )
         .unwrap();
         let response = router
+            .clone()
             .oneshot(
                 Request::post("/api/discovery/peer/directory/replica-descriptor-objects")
                     .body(Body::from(object_request))
@@ -3627,7 +3957,34 @@ mod tests {
             timestamp,
         )
         .unwrap();
-        assert_eq!(objects, vec![expected_object]);
+        assert_eq!(objects, vec![expected_object.clone()]);
+
+        let proof_id = [0xd8; 16];
+        let response = router
+            .oneshot(
+                Request::post("/api/discovery/peer/directory/replica-descriptor-inclusion-proof")
+                    .body(Body::from(replica_descriptor_proof_request(
+                        &requester,
+                        &producer_id,
+                        &block_hash,
+                        &descriptor_hash,
+                        proof_id,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 512 * 1024).await.unwrap();
+        let proof = verify_replica_descriptor_proof_response(
+            &body,
+            &proof_id,
+            &producer_id,
+            &carrier.public_key_bytes(),
+            &block_hash,
+            &descriptor_hash,
+        );
+        assert_eq!(proof.descriptor, expected_object);
     }
 
     #[test]

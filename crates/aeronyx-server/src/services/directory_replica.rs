@@ -52,6 +52,9 @@
 //!   without granting those producers checkpoint, witness, or policy authority.
 //! - Gates public carrier recovery reads on that durable mirror registry while
 //!   preserving exact producer signatures, object hashes, and quarantine state.
+//! - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] Rebuilds compact descriptor
+//!   inclusion proofs from one fully audited producer namespace and one exact
+//!   selected producer block without granting the carrier authority.
 //! - Distinguishes a lagging carrier's unavailable range from a malformed
 //!   request so recovery can continue without weakening contract validation.
 //! - Records only aggregate routeability and signed-region-hint diversity for
@@ -112,6 +115,9 @@
 //!     mutating retained evidence.
 //! 17. Record only aggregate witness availability-recovery counters in memory;
 //!     durable witness truth remains the independently signed receipt store.
+//! 18. For replica descriptor proofs, audit one producer namespace, load the
+//!     exact block and descriptor in the same read transaction, rebuild and
+//!     independently re-verify the original producer-signed proof.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -149,6 +155,9 @@
 //!   this store. The receiver must still verify producer and carrier signatures.
 //! - Public carrier reads must call `audited_mirror_evidence_*`; never use the
 //!   general authority reader to bypass durable mirror membership.
+//! - Replica descriptor proofs preserve that same namespace boundary. Mirror
+//!   retention permits transport only and never grants producer or chain
+//!   selection authority.
 //! - Producer-scoped export audits may skip unrelated chain histories, but must
 //!   still verify metadata, mirror admission when required, and every block,
 //!   commitment, object, signature, linkage, index, and tip for the target.
@@ -163,6 +172,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.31.0-ReplicaDescriptorInclusionProof - Added transactionally audited,
+//! exact-block compact proof export for pinned and retained mirror namespaces
 //! v0.27.0-WitnessCarrierAdmissionTelemetry - Added process-only mutually
 //! exclusive target-cooldown and local-overload outcome counters.
 //! v0.26.0-WitnessCarrierServiceTelemetry - Added process-only carrier-side
@@ -230,8 +241,8 @@ use aeronyx_core::protocol::discovery::{
     directory_policy_anchor_request_signing_bytes, directory_policy_anchor_response_signing_bytes,
     directory_replica_block_range_response_signing_bytes, encode_directory_observation_certificate,
     encode_directory_sync_message, DirectoryCommitmentBlockV1, DirectoryCommitmentValidationError,
-    DirectoryDescriptorCommitmentV1, DirectoryObservationCertificateV1,
-    DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
+    DirectoryDescriptorCommitmentV1, DirectoryDescriptorInclusionProofV1,
+    DirectoryObservationCertificateV1, DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
     DirectoryObservationWitnessReceiptV1, DirectorySyncMessage, SignedNodeDescriptor,
     AERONYX_DIRECTORY_MAINNET_CHAIN_ID, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
     DIRECTORY_POLICY_ANCHOR_ACCEPTED_V1, DIRECTORY_POLICY_ANCHOR_CONFLICT_V1,
@@ -3250,6 +3261,143 @@ impl DirectoryReplicaStore {
         self.audited_evidence_descriptor_objects_with_scope(
             producer,
             descriptor_hashes,
+            observed_at,
+            DirectoryReplicaEvidenceScope::RetainedMirror,
+        )
+    }
+
+    /// Builds one exact producer-signed descriptor proof from an audited
+    /// replica namespace.
+    ///
+    /// The complete target producer namespace, commitment indexes, and
+    /// descriptor objects are audited before the exact block and object are
+    /// loaded in the same read transaction. `Ok(None)` means the descriptor is
+    /// absent or belongs to a different selected block; another block is never
+    /// substituted silently.
+    ///
+    /// [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] This returns original
+    /// producer evidence only. A later carrier signature may authenticate
+    /// transport, but cannot rewrite the proof or gain authority.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] for invalid sentinels, quarantine,
+    /// audit failure, malformed persisted data, or inconsistent proof creation.
+    pub fn audited_evidence_descriptor_inclusion_proof(
+        &self,
+        producer: &[u8; 32],
+        descriptor_hash: &[u8; 32],
+        expected_block_hash: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<Option<DirectoryDescriptorInclusionProofV1>, DirectoryReplicaStoreError> {
+        self.audited_evidence_descriptor_inclusion_proof_with_scope(
+            producer,
+            descriptor_hash,
+            expected_block_hash,
+            observed_at,
+            DirectoryReplicaEvidenceScope::AnyAudited,
+        )
+    }
+
+    fn audited_evidence_descriptor_inclusion_proof_with_scope(
+        &self,
+        producer: &[u8; 32],
+        descriptor_hash: &[u8; 32],
+        expected_block_hash: &[u8; 32],
+        observed_at: u64,
+        scope: DirectoryReplicaEvidenceScope,
+    ) -> Result<Option<DirectoryDescriptorInclusionProofV1>, DirectoryReplicaStoreError> {
+        if *producer == [0u8; 32]
+            || *producer == self.local_node_id
+            || *descriptor_hash == [0u8; 32]
+            || *expected_block_hash == [0u8; 32]
+            || observed_at == 0
+        {
+            return Err(DirectoryReplicaStoreError::Request(
+                "replica descriptor proof fields are invalid".to_string(),
+            ));
+        }
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let tip = Self::audit_evidence_producer(
+            &transaction,
+            &self.local_node_id,
+            producer,
+            observed_at,
+            scope,
+        )?;
+        if tip.quarantined {
+            return Err(DirectoryReplicaStoreError::Quarantined(
+                tip.quarantine_kind
+                    .unwrap_or_else(|| "producer_fork".to_string()),
+            ));
+        }
+        let persisted = transaction
+            .query_row(
+                "SELECT blocks.block_blob, objects.descriptor_blob
+                 FROM directory_replica_commitments AS commitments
+                 INNER JOIN directory_replica_blocks AS blocks
+                    ON blocks.producer = commitments.producer
+                   AND blocks.height = commitments.block_height
+                 INNER JOIN directory_replica_descriptor_objects AS objects
+                    ON objects.producer = commitments.producer
+                   AND objects.descriptor_hash = commitments.descriptor_hash
+                 WHERE commitments.producer = ?1
+                   AND commitments.descriptor_hash = ?2",
+                params![producer.as_slice(), descriptor_hash.as_slice()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let Some((block_blob, descriptor_blob)) = persisted else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let block = decode_block(&block_blob)?;
+        if block.hash() != *expected_block_hash {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let descriptor = decode_descriptor_object(&descriptor_blob)?;
+        let proof =
+            DirectoryDescriptorInclusionProofV1::from_block_at(&block, &descriptor, observed_at)
+                .map_err(|error| {
+                    DirectoryReplicaStoreError::Integrity(format!(
+                        "failed to build audited replica descriptor proof: {error}"
+                    ))
+                })?;
+        proof
+            .verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                producer,
+                expected_block_hash,
+                observed_at,
+            )
+            .map_err(|error| {
+                DirectoryReplicaStoreError::Integrity(format!(
+                    "failed to re-verify audited replica descriptor proof: {error}"
+                ))
+            })?;
+        if proof.commitment.descriptor_hash != *descriptor_hash {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "audited replica proof descriptor hash mismatch".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(Some(proof))
+    }
+
+    /// Builds an exact descriptor proof only for a producer retained in the
+    /// durable non-authoritative mirror registry.
+    pub(crate) fn audited_mirror_evidence_descriptor_inclusion_proof(
+        &self,
+        producer: &[u8; 32],
+        descriptor_hash: &[u8; 32],
+        expected_block_hash: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<Option<DirectoryDescriptorInclusionProofV1>, DirectoryReplicaStoreError> {
+        self.audited_evidence_descriptor_inclusion_proof_with_scope(
+            producer,
+            descriptor_hash,
+            expected_block_hash,
             observed_at,
             DirectoryReplicaEvidenceScope::RetainedMirror,
         )
@@ -10847,6 +10995,42 @@ mod tests {
             )
             .unwrap()
             .is_none());
+        let proof = source
+            .audited_evidence_descriptor_inclusion_proof(
+                &producer.public_key_bytes(),
+                &descriptor_hash,
+                &replica_block.hash(),
+                NOW + 21,
+            )
+            .unwrap()
+            .unwrap();
+        proof
+            .verify_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &producer.public_key_bytes(),
+                &replica_block.hash(),
+                NOW + 21,
+            )
+            .unwrap();
+        assert_eq!(proof.commitment.descriptor_hash, descriptor_hash);
+        assert!(source
+            .audited_evidence_descriptor_inclusion_proof(
+                &producer.public_key_bytes(),
+                &descriptor_hash,
+                &[0x17; 32],
+                NOW + 21,
+            )
+            .unwrap()
+            .is_none());
+        assert!(source
+            .audited_evidence_descriptor_inclusion_proof(
+                &producer.public_key_bytes(),
+                &[0x17; 32],
+                &replica_block.hash(),
+                NOW + 21,
+            )
+            .unwrap()
+            .is_none());
 
         let frame = carrier_response_frame(
             &producer,
@@ -10900,6 +11084,16 @@ mod tests {
             mirror_destination.mirror_producer_ids().unwrap(),
             vec![producer.public_key_bytes()]
         );
+        let mirror_proof = mirror_destination
+            .audited_mirror_evidence_descriptor_inclusion_proof(
+                &producer.public_key_bytes(),
+                &descriptor_hash,
+                &replica_block.hash(),
+                NOW + 21,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(mirror_proof, proof);
         assert_eq!(
             mirror_destination
                 .verify_retained_carrier_page(

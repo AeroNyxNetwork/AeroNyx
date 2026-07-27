@@ -37,7 +37,8 @@
 //! - [WITNESS-CARRIER 2026-07-26 by Codex] Bounded witness-carrier frames that
 //!   preserve the exact observer and witness signatures across one transport hop
 //! - Replica-carrier frames that transport already audited producer evidence
-//!   without allowing the carrier to replace the producer's signatures
+//!   without allowing the carrier to replace the producer's signatures,
+//!   including compact exact-block descriptor inclusion proofs
 //! - Shared bounded fixed-integer codec policy for canonical control-plane
 //!   frames and descriptor signing bytes
 //!
@@ -75,6 +76,9 @@
 //!     independently trusted producer and exact Directory block hash
 //! 16. A pinned peer may request that exact proof without downloading every
 //!     commitment or descriptor object from the producer's chain
+//! 17. A verified recovery peer may request the same proof from an audited
+//!     carrier when the original producer is unavailable; the receiver still
+//!     verifies the original producer signature and its selected block hash
 //!
 //! ## Important Note for Next Developer
 //! - Do not put private keys, client IPs, destination metadata, DNS contents,
@@ -113,6 +117,11 @@
 //!   validator membership, consensus, governance, or finality.
 //! - A replica carrier proves transport of its audited copy. It cannot author,
 //!   rewrite, finalize, or select the producer's signed chain.
+//! - [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] A replica proof response
+//!   has two independent signature layers: the original producer-signed block
+//!   inside the proof and the carrier-signed transport envelope. The carrier
+//!   signature grants availability only and must never become producer,
+//!   checkpoint, witness, policy, consensus, fork-choice, or finality authority.
 //! - [MIRROR-CAPABILITY 2026-07-24 by Codex] New capability variants must be
 //!   appended, never reordered. Advertise `DirectoryMirrorCarrier` only after
 //!   the operator has enabled the staged mixed-version rollout gate.
@@ -121,6 +130,8 @@
 //!   rejection and the complete-input size preflight in the shared codec.
 //!
 //! ## Last Modified
+//! v0.19.0-ReplicaDirectoryInclusionProofWire - Added append-only audited
+//! carrier request/response frames for exact producer descriptor proofs
 //! v0.18.0-DirectoryInclusionProofWire - Added append-only pinned-peer request
 //! and response frames binding one exact descriptor proof to one selected block
 //! v0.17.0-DirectoryDescriptorInclusionProof - Added compact, count-bound
@@ -2268,6 +2279,55 @@ pub enum DirectorySyncMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+    /// Requests one exact producer descriptor proof from an audited carrier.
+    ///
+    /// [REPLICA-INCLUSION-PROOF 2026-07-27 by Codex] This variant is appended
+    /// to preserve every existing bincode enum index. `producer` is the
+    /// original block author; the responding carrier never replaces it.
+    ReplicaDescriptorInclusionProofRequestV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Original producer whose signed replica block is selected.
+        producer: [u8; 32],
+        /// Independently selected producer-signed block hash.
+        block_hash: [u8; 32],
+        /// Exact content-addressed descriptor requested.
+        descriptor_hash: [u8; 32],
+        /// Random request identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Ed25519 identity of the authenticated recovery requester.
+        requester: [u8; 32],
+        /// Request creation time in Unix epoch seconds.
+        request_timestamp: u64,
+        /// Requester signature over every request field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+    /// Returns one original producer-signed proof through an audited carrier.
+    ///
+    /// The carrier signature authenticates transport only. Receivers must
+    /// independently verify `proof` against `producer` and `block_hash`.
+    ReplicaDescriptorInclusionProofResponseV1 {
+        /// Production Directory Chain identifier.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the authenticated request.
+        request_id: [u8; 16],
+        /// Original producer whose signed block is represented by `proof`.
+        producer: [u8; 32],
+        /// Independent node transporting its audited replica evidence.
+        carrier: [u8; 32],
+        /// Response creation time in Unix epoch seconds.
+        response_timestamp: u64,
+        /// Exact selected producer-signed block hash.
+        block_hash: [u8; 32],
+        /// Exact requested descriptor content hash.
+        descriptor_hash: [u8; 32],
+        /// Compact original producer-signed inclusion evidence.
+        proof: DirectoryDescriptorInclusionProofV1,
+        /// Carrier signature binding request, producer, proof, and response.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn directory_sync_signing_digest<'a>(
@@ -2512,6 +2572,63 @@ pub fn directory_descriptor_inclusion_proof_response_signing_bytes(
             chain_id.as_slice(),
             request_id.as_slice(),
             responder.as_slice(),
+            response_timestamp.as_slice(),
+            block_hash.as_slice(),
+            descriptor_hash.as_slice(),
+            proof_digest.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by a replica descriptor-proof request.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_replica_descriptor_inclusion_proof_request_signing_bytes(
+    chain_id: &[u8; 32],
+    producer: &[u8; 32],
+    block_hash: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> [u8; 32] {
+    let request_timestamp = request_timestamp.to_le_bytes();
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ReplicaDescriptorInclusionProofRequest-v1",
+        [
+            chain_id.as_slice(),
+            producer.as_slice(),
+            block_hash.as_slice(),
+            descriptor_hash.as_slice(),
+            request_id.as_slice(),
+            requester.as_slice(),
+            request_timestamp.as_slice(),
+        ],
+    )
+}
+
+/// Canonical digest signed by a replica descriptor-proof response carrier.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn directory_replica_descriptor_inclusion_proof_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    producer: &[u8; 32],
+    carrier: &[u8; 32],
+    response_timestamp: u64,
+    block_hash: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    proof: &DirectoryDescriptorInclusionProofV1,
+) -> [u8; 32] {
+    let response_timestamp = response_timestamp.to_le_bytes();
+    let proof_digest = directory_descriptor_inclusion_proof_transport_digest(proof);
+    directory_sync_signing_digest(
+        b"AeroNyx-DirectorySync-ReplicaDescriptorInclusionProofResponse-v1",
+        [
+            chain_id.as_slice(),
+            request_id.as_slice(),
+            producer.as_slice(),
+            carrier.as_slice(),
             response_timestamp.as_slice(),
             block_hash.as_slice(),
             descriptor_hash.as_slice(),
@@ -4732,13 +4849,86 @@ mod tests {
             carrier: carrier.public_key_bytes(),
             response_timestamp: 1_700_000_404,
             descriptor_hashes: hashes,
-            objects: vec![descriptor],
+            objects: vec![descriptor.clone()],
             signature: carrier.sign(&object_response_digest),
         };
         let encoded = encode_directory_sync_message(&object_response).unwrap();
         assert_eq!(
             decode_directory_sync_message(&encoded).unwrap(),
             object_response
+        );
+
+        let proof = DirectoryDescriptorInclusionProofV1::from_block_at(
+            &blocks[0],
+            &descriptor,
+            1_700_000_405,
+        )
+        .unwrap();
+        let proof_request_digest =
+            directory_replica_descriptor_inclusion_proof_request_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &producer.public_key_bytes(),
+                &block_hash,
+                &commitment.descriptor_hash,
+                &request_id,
+                &requester.public_key_bytes(),
+                1_700_000_405,
+            );
+        let proof_request = DirectorySyncMessage::ReplicaDescriptorInclusionProofRequestV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            producer: producer.public_key_bytes(),
+            block_hash,
+            descriptor_hash: commitment.descriptor_hash,
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp: 1_700_000_405,
+            signature: requester.sign(&proof_request_digest),
+        };
+        let encoded = encode_directory_sync_message(&proof_request).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&encoded).unwrap(),
+            proof_request
+        );
+
+        let proof_response_digest =
+            directory_replica_descriptor_inclusion_proof_response_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &request_id,
+                &producer.public_key_bytes(),
+                &carrier.public_key_bytes(),
+                1_700_000_406,
+                &block_hash,
+                &commitment.descriptor_hash,
+                &proof,
+            );
+        let proof_response = DirectorySyncMessage::ReplicaDescriptorInclusionProofResponseV1 {
+            chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            request_id,
+            producer: producer.public_key_bytes(),
+            carrier: carrier.public_key_bytes(),
+            response_timestamp: 1_700_000_406,
+            block_hash,
+            descriptor_hash: commitment.descriptor_hash,
+            proof: proof.clone(),
+            signature: carrier.sign(&proof_response_digest),
+        };
+        let encoded = encode_directory_sync_message(&proof_response).unwrap();
+        assert_eq!(
+            decode_directory_sync_message(&encoded).unwrap(),
+            proof_response
+        );
+        assert_ne!(
+            proof_response_digest,
+            directory_replica_descriptor_inclusion_proof_response_signing_bytes(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &request_id,
+                &producer.public_key_bytes(),
+                &[0x87; 32],
+                1_700_000_406,
+                &block_hash,
+                &commitment.descriptor_hash,
+                &proof,
+            )
         );
     }
 
