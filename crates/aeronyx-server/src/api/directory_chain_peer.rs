@@ -95,6 +95,8 @@
 //!   witness outcome. Availability transport must not expand authority.
 //!
 //! ## Last Modified
+//! v0.12.1-WitnessCarrierResultMatrix - Reused one bounded transport client and
+//! added deterministic handler-level coverage for every terminal outcome.
 //! v0.12.0-WitnessCarrierServiceTelemetry - Added shared privacy-safe carrier
 //! runtime observations for public and local Directory status.
 //! v0.11.0-BoundedWitnessCarrier - Added pinned, single-hop, exact-frame
@@ -183,6 +185,98 @@ const MAX_DIRECTORY_REQUESTS_GLOBAL_PER_MINUTE: u32 = 512;
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Stateful request ids remain rejected for this duration.
 const REPLAY_RETENTION_SECS: u64 = 120;
+
+/// Complete bounded result of one witness-target request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WitnessCarrierTransportResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+/// Transport failures are intentionally coarser than the underlying HTTP error.
+///
+/// This boundary prevents endpoint, route, and lower-level connection details
+/// from entering carrier telemetry or protocol responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WitnessCarrierTransportError {
+    LocalUnavailable,
+    TargetUnavailable,
+    ResponseTooLarge,
+}
+
+/// One-hop witness transport isolated from authority and frame verification.
+#[async_trait::async_trait]
+trait WitnessCarrierTransport: Send + Sync {
+    async fn send(
+        &self,
+        url: reqwest::Url,
+        request_frame: Vec<u8>,
+    ) -> Result<WitnessCarrierTransportResponse, WitnessCarrierTransportError>;
+}
+
+/// Production no-proxy transport shared by all carrier requests in one router.
+struct ReqwestWitnessCarrierTransport {
+    client: Result<reqwest::Client, ()>,
+}
+
+impl ReqwestWitnessCarrierTransport {
+    fn new() -> Self {
+        let client = reqwest::Client::builder()
+            // [WITNESS-CARRIER-MATRIX 2026-07-27 by Codex] Build once per
+            // router while preserving the existing SSRF and timeout boundary.
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(WITNESS_CARRIER_REQUEST_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(WITNESS_CARRIER_REQUEST_TIMEOUT_SECS))
+            .build()
+            .map_err(|_| ());
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl WitnessCarrierTransport for ReqwestWitnessCarrierTransport {
+    async fn send(
+        &self,
+        url: reqwest::Url,
+        request_frame: Vec<u8>,
+    ) -> Result<WitnessCarrierTransportResponse, WitnessCarrierTransportError> {
+        let client = self
+            .client
+            .as_ref()
+            .map_err(|_| WitnessCarrierTransportError::LocalUnavailable)?;
+        let response = client
+            .post(url)
+            .header("content-type", "application/octet-stream")
+            .body(request_frame)
+            .send()
+            .await
+            .map_err(|_| WitnessCarrierTransportError::TargetUnavailable)?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Ok(WitnessCarrierTransportResponse {
+                status,
+                body: Vec::new(),
+            });
+        }
+        if response.content_length().is_some_and(|length| {
+            length > u64::try_from(MAX_WITNESS_CARRIER_RESPONSE_BODY_BYTES).unwrap_or(u64::MAX)
+        }) {
+            return Err(WitnessCarrierTransportError::ResponseTooLarge);
+        }
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| WitnessCarrierTransportError::TargetUnavailable)?;
+            if body.len().saturating_add(chunk.len()) > MAX_WITNESS_CARRIER_RESPONSE_BODY_BYTES {
+                return Err(WitnessCarrierTransportError::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(WitnessCarrierTransportResponse { status, body })
+    }
+}
+
 #[derive(Clone)]
 struct DirectoryChainPeerState {
     store: Arc<DirectoryChainStore>,
@@ -193,6 +287,7 @@ struct DirectoryChainPeerState {
     allow_public_mirror_reads: bool,
     guard: Arc<Mutex<DirectoryPeerRequestGuard>>,
     runtime: Arc<DirectoryReplicaSyncRuntime>,
+    witness_carrier_transport: Arc<dyn WitnessCarrierTransport>,
 }
 
 #[derive(Debug, Default)]
@@ -303,6 +398,29 @@ pub fn build_directory_chain_peer_router_with_replica_and_runtime(
     allow_public_mirror_reads: bool,
     runtime: Arc<DirectoryReplicaSyncRuntime>,
 ) -> Router {
+    build_directory_chain_peer_router_with_replica_runtime_and_transport(
+        store,
+        replica_store,
+        peer_store,
+        identity,
+        pinned_peer_ids,
+        allow_public_mirror_reads,
+        runtime,
+        Arc::new(ReqwestWitnessCarrierTransport::new()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_directory_chain_peer_router_with_replica_runtime_and_transport(
+    store: Arc<DirectoryChainStore>,
+    replica_store: Option<Arc<DirectoryReplicaStore>>,
+    peer_store: Arc<PeerStore>,
+    identity: Arc<IdentityKeyPair>,
+    pinned_peer_ids: Vec<[u8; 32]>,
+    allow_public_mirror_reads: bool,
+    runtime: Arc<DirectoryReplicaSyncRuntime>,
+    witness_carrier_transport: Arc<dyn WitnessCarrierTransport>,
+) -> Router {
     let state = DirectoryChainPeerState {
         store,
         replica_store,
@@ -312,6 +430,7 @@ pub fn build_directory_chain_peer_router_with_replica_and_runtime(
         allow_public_mirror_reads,
         guard: Arc::new(Mutex::new(DirectoryPeerRequestGuard::default())),
         runtime,
+        witness_carrier_transport,
     };
     let mut router = Router::new()
         .route("/api/discovery/peer/directory/tip", post(tip_handler))
@@ -1305,17 +1424,13 @@ async fn observation_checkpoint_witness_carrier_handler(
             ),
         );
     };
-    let client = match reqwest::Client::builder()
-        // [WITNESS-CARRIER 2026-07-26 by Codex] Never let host proxy
-        // environment variables redirect a pinned node-to-node control frame.
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(WITNESS_CARRIER_REQUEST_TIMEOUT_SECS))
-        .timeout(Duration::from_secs(WITNESS_CARRIER_REQUEST_TIMEOUT_SECS))
-        .build()
+    let target_response = match state
+        .witness_carrier_transport
+        .send(url, witness_request_frame)
+        .await
     {
-        Ok(client) => client,
-        Err(_) => {
+        Ok(response) => response,
+        Err(WitnessCarrierTransportError::LocalUnavailable) => {
             return witness_carrier_outcome_response(
                 &state,
                 DirectoryObservationWitnessCarrierOutcome::LocalFailure,
@@ -1325,16 +1440,7 @@ async fn observation_checkpoint_witness_carrier_handler(
                 ),
             );
         }
-    };
-    let target_response = match client
-        .post(url)
-        .header("content-type", "application/octet-stream")
-        .body(witness_request_frame)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(_) => {
+        Err(WitnessCarrierTransportError::TargetUnavailable) => {
             return witness_carrier_outcome_response(
                 &state,
                 DirectoryObservationWitnessCarrierOutcome::TargetUnavailable,
@@ -1344,10 +1450,17 @@ async fn observation_checkpoint_witness_carrier_handler(
                 ),
             );
         }
+        Err(WitnessCarrierTransportError::ResponseTooLarge) => {
+            return witness_carrier_outcome_response(
+                &state,
+                DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse,
+                protocol_error(StatusCode::BAD_GATEWAY, "witness_target_invalid_response"),
+            );
+        }
     };
-    let status = target_response.status();
-    if !status.is_success() {
-        if matches!(status.as_u16(), 404 | 405 | 501) {
+    let status = target_response.status;
+    if !(200..300).contains(&status) {
+        if matches!(status, 404 | 405 | 501) {
             return witness_carrier_outcome_response(
                 &state,
                 DirectoryObservationWitnessCarrierOutcome::TargetCapabilityUnavailable,
@@ -1357,7 +1470,7 @@ async fn observation_checkpoint_witness_carrier_handler(
                 ),
             );
         }
-        if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+        if matches!(status, 408 | 429) || (500..600).contains(&status) {
             return witness_carrier_outcome_response(
                 &state,
                 DirectoryObservationWitnessCarrierOutcome::TargetUnavailable,
@@ -1373,39 +1486,7 @@ async fn observation_checkpoint_witness_carrier_handler(
             protocol_error(StatusCode::BAD_GATEWAY, "witness_target_rejected"),
         );
     }
-    if target_response.content_length().is_some_and(|length| {
-        length > u64::try_from(MAX_WITNESS_CARRIER_RESPONSE_BODY_BYTES).unwrap_or(u64::MAX)
-    }) {
-        return witness_carrier_outcome_response(
-            &state,
-            DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse,
-            protocol_error(StatusCode::BAD_GATEWAY, "witness_target_invalid_response"),
-        );
-    }
-    let mut witness_response_frame = Vec::new();
-    let mut stream = target_response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else {
-            return witness_carrier_outcome_response(
-                &state,
-                DirectoryObservationWitnessCarrierOutcome::TargetUnavailable,
-                protocol_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "witness_target_unavailable",
-                ),
-            );
-        };
-        if witness_response_frame.len().saturating_add(chunk.len())
-            > MAX_WITNESS_CARRIER_RESPONSE_BODY_BYTES
-        {
-            return witness_carrier_outcome_response(
-                &state,
-                DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse,
-                protocol_error(StatusCode::BAD_GATEWAY, "witness_target_invalid_response"),
-            );
-        }
-        witness_response_frame.extend_from_slice(&chunk);
-    }
+    let witness_response_frame = target_response.body;
     if witness_response_frame.is_empty()
         || verify_carried_observation_witness_response(
             &witness_response_frame,
@@ -1820,6 +1901,8 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use tower::ServiceExt;
@@ -2050,6 +2133,264 @@ mod tests {
             observer,
             runtime,
         )
+    }
+
+    #[derive(Clone)]
+    struct FixedWitnessCarrierTransport {
+        result: Result<WitnessCarrierTransportResponse, WitnessCarrierTransportError>,
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl WitnessCarrierTransport for FixedWitnessCarrierTransport {
+        async fn send(
+            &self,
+            _url: reqwest::Url,
+            _request_frame: Vec<u8>,
+        ) -> Result<WitnessCarrierTransportResponse, WitnessCarrierTransportError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.result.clone()
+        }
+    }
+
+    /// Builds a carrier with an independently pinned observer and target.
+    ///
+    /// [WITNESS-CARRIER-MATRIX 2026-07-27 by Codex] The advertised endpoint is
+    /// a syntactically public literal so the production SSRF gate still runs;
+    /// only the outbound transport is replaced by a deterministic test double.
+    fn witness_carrier_test_router(
+        transport_result: Result<WitnessCarrierTransportResponse, WitnessCarrierTransportError>,
+        target_pinned: bool,
+        advertise_target: bool,
+    ) -> (
+        Router,
+        IdentityKeyPair,
+        IdentityKeyPair,
+        Arc<DirectoryReplicaSyncRuntime>,
+        Arc<AtomicU64>,
+    ) {
+        let now = now_secs();
+        let carrier = Arc::new(IdentityKeyPair::from_bytes(&[0xc1; 32]).unwrap());
+        let observer = IdentityKeyPair::from_bytes(&[0xc2; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0xd9; 32]).unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(
+                signed_descriptor(&observer, now),
+                now,
+                "directory_witness_carrier_test",
+            )
+            .unwrap();
+        if advertise_target {
+            let mut descriptor = NodeDescriptor::new(
+                witness.public_key_bytes(),
+                1,
+                now.saturating_sub(1),
+                now + 600,
+                "directory-sync-test",
+            );
+            descriptor.public_endpoint = Some("1.1.1.1:8422".to_string());
+            peer_store
+                .upsert_verified_from_source(
+                    SignedNodeDescriptor::sign(descriptor, &witness).unwrap(),
+                    now,
+                    "directory_witness_carrier_test",
+                )
+                .unwrap();
+        }
+        let temp = TempDir::new().unwrap();
+        let root = temp.keep();
+        let (chain_store, _) = DirectoryChainStore::open(
+            root.join("directory-chain.db"),
+            carrier.public_key_bytes(),
+            now,
+        )
+        .unwrap();
+        let (replica_store, _) = DirectoryReplicaStore::open(
+            root.join("directory-replica.db"),
+            carrier.public_key_bytes(),
+            now,
+        )
+        .unwrap();
+        let runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
+        let calls = Arc::new(AtomicU64::new(0));
+        let transport = Arc::new(FixedWitnessCarrierTransport {
+            result: transport_result,
+            calls: Arc::clone(&calls),
+        });
+        let mut pins = vec![observer.public_key_bytes()];
+        if target_pinned {
+            pins.push(witness.public_key_bytes());
+        }
+        (
+            build_directory_chain_peer_router_with_replica_runtime_and_transport(
+                Arc::new(chain_store),
+                Some(Arc::new(replica_store)),
+                peer_store,
+                carrier,
+                pins,
+                false,
+                Arc::clone(&runtime),
+                transport,
+            ),
+            observer,
+            witness,
+            runtime,
+            calls,
+        )
+    }
+
+    fn witness_carrier_inner_request(observer: &IdentityKeyPair) -> Vec<u8> {
+        let producer_a = IdentityKeyPair::from_bytes(&[0xda; 32]).unwrap();
+        let producer_b = IdentityKeyPair::from_bytes(&[0xdb; 32]).unwrap();
+        let now = now_secs();
+        let checkpoint = DirectoryObservationCheckpointV1::new_signed(
+            1,
+            now,
+            [0u8; 32],
+            2,
+            vec![
+                DirectoryObservationTipV1 {
+                    producer: producer_a.public_key_bytes(),
+                    tip_height: 1,
+                    tip_hash: [0xdc; 32],
+                },
+                DirectoryObservationTipV1 {
+                    producer: producer_b.public_key_bytes(),
+                    tip_height: 1,
+                    tip_hash: [0xdd; 32],
+                },
+            ],
+            [0xde; 32],
+            observer,
+        )
+        .unwrap();
+        let request_id = [0xdf; 16];
+        let checkpoint_hash = checkpoint.hash();
+        let signing_bytes = directory_observation_witness_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            now,
+            &checkpoint_hash,
+        );
+        encode_directory_sync_message(
+            &DirectorySyncMessage::ObservationCheckpointWitnessRequestV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                request_id,
+                requester: observer.public_key_bytes(),
+                request_timestamp: now,
+                checkpoint,
+                signature: observer.sign(&signing_bytes),
+            },
+        )
+        .unwrap()
+    }
+
+    fn witness_carrier_outer_request(
+        observer: &IdentityKeyPair,
+        witness: &IdentityKeyPair,
+        inner_frame: Vec<u8>,
+    ) -> Vec<u8> {
+        let now = now_secs();
+        let request_id = [0xe0; 16];
+        let inner_sha256: [u8; 32] = Sha256::digest(&inner_frame).into();
+        let signing_bytes = directory_observation_witness_carrier_request_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request_id,
+            &observer.public_key_bytes(),
+            now,
+            &witness.public_key_bytes(),
+            &inner_sha256,
+            u64::try_from(inner_frame.len()).unwrap(),
+        );
+        encode_directory_sync_message(
+            &DirectorySyncMessage::ObservationCheckpointWitnessCarrierRequestV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                request_id,
+                requester: observer.public_key_bytes(),
+                request_timestamp: now,
+                witness: witness.public_key_bytes(),
+                witness_request_sha256: inner_sha256,
+                witness_request_frame: inner_frame,
+                signature: observer.sign(&signing_bytes),
+            },
+        )
+        .unwrap()
+    }
+
+    fn witness_carrier_target_response(
+        observer: &IdentityKeyPair,
+        witness: &IdentityKeyPair,
+        inner_frame: &[u8],
+    ) -> Vec<u8> {
+        let now = now_secs();
+        let request = verify_carried_observation_witness_request(
+            inner_frame,
+            &observer.public_key_bytes(),
+            now,
+        )
+        .unwrap();
+        let signing_bytes = directory_observation_witness_response_signing_bytes(
+            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+            &request.request_id,
+            &request.requester,
+            request.checkpoint_sequence,
+            &request.checkpoint_hash,
+            &witness.public_key_bytes(),
+            now,
+            DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+        );
+        encode_directory_sync_message(
+            &DirectorySyncMessage::ObservationCheckpointWitnessResponseV1 {
+                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                request_id: request.request_id,
+                observer: request.requester,
+                checkpoint_sequence: request.checkpoint_sequence,
+                checkpoint_hash: request.checkpoint_hash,
+                responder: witness.public_key_bytes(),
+                response_timestamp: now,
+                outcome: DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+                signature: witness.sign(&signing_bytes),
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_single_witness_carrier_outcome(
+        snapshot: crate::services::directory_replica::DirectoryObservationWitnessCarrierSnapshot,
+        expected: DirectoryObservationWitnessCarrierOutcome,
+    ) {
+        assert_eq!(snapshot.requests, 1);
+        assert_eq!(
+            snapshot.forwarded
+                + snapshot.policy_rejected
+                + snapshot.invalid_requests
+                + snapshot.target_unavailable
+                + snapshot.target_capability_unavailable
+                + snapshot.target_rejected
+                + snapshot.target_invalid_response
+                + snapshot.local_failures,
+            1,
+            "one authenticated request must have exactly one terminal outcome"
+        );
+        let actual = match expected {
+            DirectoryObservationWitnessCarrierOutcome::Forwarded => snapshot.forwarded,
+            DirectoryObservationWitnessCarrierOutcome::PolicyRejected => snapshot.policy_rejected,
+            DirectoryObservationWitnessCarrierOutcome::InvalidRequest => snapshot.invalid_requests,
+            DirectoryObservationWitnessCarrierOutcome::TargetUnavailable => {
+                snapshot.target_unavailable
+            }
+            DirectoryObservationWitnessCarrierOutcome::TargetCapabilityUnavailable => {
+                snapshot.target_capability_unavailable
+            }
+            DirectoryObservationWitnessCarrierOutcome::TargetRejected => snapshot.target_rejected,
+            DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse => {
+                snapshot.target_invalid_response
+            }
+            DirectoryObservationWitnessCarrierOutcome::LocalFailure => snapshot.local_failures,
+        };
+        assert_eq!(actual, 1);
     }
 
     fn import_certificate_test_producer(
@@ -2944,82 +3285,16 @@ mod tests {
 
     #[tokio::test]
     async fn witness_carrier_rejects_unpinned_target_before_transport() {
-        let (router, _, observer, runtime) = witness_test_router();
-        let witness = IdentityKeyPair::from_bytes(&[0xd9; 32]).unwrap();
-        let producer_a = IdentityKeyPair::from_bytes(&[0xda; 32]).unwrap();
-        let producer_b = IdentityKeyPair::from_bytes(&[0xdb; 32]).unwrap();
-        let now = now_secs();
-        let checkpoint = DirectoryObservationCheckpointV1::new_signed(
-            1,
-            now,
-            [0u8; 32],
-            2,
-            vec![
-                DirectoryObservationTipV1 {
-                    producer: producer_a.public_key_bytes(),
-                    tip_height: 1,
-                    tip_hash: [0xdc; 32],
-                },
-                DirectoryObservationTipV1 {
-                    producer: producer_b.public_key_bytes(),
-                    tip_height: 1,
-                    tip_hash: [0xdd; 32],
-                },
-            ],
-            [0xde; 32],
+        let (router, observer, witness, runtime, calls) = witness_carrier_test_router(
+            Err(WitnessCarrierTransportError::TargetUnavailable),
+            false,
+            true,
+        );
+        let request = witness_carrier_outer_request(
             &observer,
-        )
-        .unwrap();
-        let inner_request_id = [0xdf; 16];
-        let checkpoint_hash = checkpoint.hash();
-        let inner_signing = directory_observation_witness_request_signing_bytes(
-            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-            &inner_request_id,
-            &observer.public_key_bytes(),
-            now,
-            &checkpoint_hash,
+            &witness,
+            witness_carrier_inner_request(&observer),
         );
-        let inner_frame = encode_directory_sync_message(
-            &DirectorySyncMessage::ObservationCheckpointWitnessRequestV1 {
-                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-                request_id: inner_request_id,
-                requester: observer.public_key_bytes(),
-                request_timestamp: now,
-                checkpoint,
-                signature: observer.sign(&inner_signing),
-            },
-        )
-        .unwrap();
-        assert!(verify_carried_observation_witness_request(
-            &inner_frame,
-            &observer.public_key_bytes(),
-            now
-        )
-        .is_ok());
-        let outer_request_id = [0xe0; 16];
-        let inner_sha256: [u8; 32] = Sha256::digest(&inner_frame).into();
-        let outer_signing = directory_observation_witness_carrier_request_signing_bytes(
-            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-            &outer_request_id,
-            &observer.public_key_bytes(),
-            now,
-            &witness.public_key_bytes(),
-            &inner_sha256,
-            u64::try_from(inner_frame.len()).unwrap(),
-        );
-        let request = encode_directory_sync_message(
-            &DirectorySyncMessage::ObservationCheckpointWitnessCarrierRequestV1 {
-                chain_id: AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
-                request_id: outer_request_id,
-                requester: observer.public_key_bytes(),
-                request_timestamp: now,
-                witness: witness.public_key_bytes(),
-                witness_request_sha256: inner_sha256,
-                witness_request_frame: inner_frame,
-                signature: observer.sign(&outer_signing),
-            },
-        )
-        .unwrap();
         let response = router
             .oneshot(
                 Request::post(
@@ -3031,10 +3306,166 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let snapshot = runtime.observation_witness_carrier_snapshot();
-        assert_eq!(snapshot.requests, 1);
-        assert_eq!(snapshot.policy_rejected, 1);
-        assert_eq!(snapshot.forwarded, 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_single_witness_carrier_outcome(
+            runtime.observation_witness_carrier_snapshot(),
+            DirectoryObservationWitnessCarrierOutcome::PolicyRejected,
+        );
+    }
+
+    #[tokio::test]
+    async fn witness_carrier_handler_maps_each_transport_result_to_one_terminal_outcome() {
+        let observer = IdentityKeyPair::from_bytes(&[0xc2; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0xd9; 32]).unwrap();
+        let inner_frame = witness_carrier_inner_request(&observer);
+        let valid_response = witness_carrier_target_response(&observer, &witness, &inner_frame);
+        let cases = vec![
+            (
+                "forwarded",
+                Ok(WitnessCarrierTransportResponse {
+                    status: 200,
+                    body: valid_response,
+                }),
+                StatusCode::OK,
+                DirectoryObservationWitnessCarrierOutcome::Forwarded,
+            ),
+            (
+                "route_not_found",
+                Ok(WitnessCarrierTransportResponse {
+                    status: 404,
+                    body: Vec::new(),
+                }),
+                StatusCode::FAILED_DEPENDENCY,
+                DirectoryObservationWitnessCarrierOutcome::TargetCapabilityUnavailable,
+            ),
+            (
+                "target_rate_limited",
+                Ok(WitnessCarrierTransportResponse {
+                    status: 429,
+                    body: Vec::new(),
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+                DirectoryObservationWitnessCarrierOutcome::TargetUnavailable,
+            ),
+            (
+                "target_server_failure",
+                Ok(WitnessCarrierTransportResponse {
+                    status: 503,
+                    body: Vec::new(),
+                }),
+                StatusCode::SERVICE_UNAVAILABLE,
+                DirectoryObservationWitnessCarrierOutcome::TargetUnavailable,
+            ),
+            (
+                "target_rejected",
+                Ok(WitnessCarrierTransportResponse {
+                    status: 403,
+                    body: Vec::new(),
+                }),
+                StatusCode::BAD_GATEWAY,
+                DirectoryObservationWitnessCarrierOutcome::TargetRejected,
+            ),
+            (
+                "malformed_success_body",
+                Ok(WitnessCarrierTransportResponse {
+                    status: 200,
+                    body: vec![0xff],
+                }),
+                StatusCode::BAD_GATEWAY,
+                DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse,
+            ),
+            (
+                "response_body_too_large",
+                Err(WitnessCarrierTransportError::ResponseTooLarge),
+                StatusCode::BAD_GATEWAY,
+                DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse,
+            ),
+            (
+                "target_timeout_or_stream_failure",
+                Err(WitnessCarrierTransportError::TargetUnavailable),
+                StatusCode::SERVICE_UNAVAILABLE,
+                DirectoryObservationWitnessCarrierOutcome::TargetUnavailable,
+            ),
+            (
+                "local_client_unavailable",
+                Err(WitnessCarrierTransportError::LocalUnavailable),
+                StatusCode::SERVICE_UNAVAILABLE,
+                DirectoryObservationWitnessCarrierOutcome::LocalFailure,
+            ),
+        ];
+
+        for (name, transport_result, expected_status, expected_outcome) in cases {
+            let (router, observer, witness, runtime, calls) =
+                witness_carrier_test_router(transport_result, true, true);
+            let request = witness_carrier_outer_request(&observer, &witness, inner_frame.clone());
+            let response = router
+                .oneshot(
+                    Request::post(
+                        "/api/discovery/peer/directory/observation-checkpoint-witness-carrier",
+                    )
+                    .body(Body::from(request))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status, "{name}");
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "{name}");
+            assert_single_witness_carrier_outcome(
+                runtime.observation_witness_carrier_snapshot(),
+                expected_outcome,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn witness_carrier_handler_fails_closed_before_transport_for_inner_and_descriptor_errors()
+    {
+        let cases = [
+            (
+                "invalid_inner_frame",
+                true,
+                vec![0xff],
+                StatusCode::BAD_REQUEST,
+                DirectoryObservationWitnessCarrierOutcome::InvalidRequest,
+            ),
+            (
+                "missing_target_descriptor",
+                false,
+                Vec::new(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                DirectoryObservationWitnessCarrierOutcome::TargetUnavailable,
+            ),
+        ];
+
+        for (name, advertise_target, invalid_inner, expected_status, expected_outcome) in cases {
+            let (router, observer, witness, runtime, calls) = witness_carrier_test_router(
+                Err(WitnessCarrierTransportError::TargetUnavailable),
+                true,
+                advertise_target,
+            );
+            let inner_frame = if invalid_inner.is_empty() {
+                witness_carrier_inner_request(&observer)
+            } else {
+                invalid_inner
+            };
+            let request = witness_carrier_outer_request(&observer, &witness, inner_frame);
+            let response = router
+                .oneshot(
+                    Request::post(
+                        "/api/discovery/peer/directory/observation-checkpoint-witness-carrier",
+                    )
+                    .body(Body::from(request))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status, "{name}");
+            assert_eq!(calls.load(Ordering::Relaxed), 0, "{name}");
+            assert_single_witness_carrier_outcome(
+                runtime.observation_witness_carrier_snapshot(),
+                expected_outcome,
+            );
+        }
     }
 
     #[test]
