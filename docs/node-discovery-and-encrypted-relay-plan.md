@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.42.0 - Mixed-version Directory gossip capability negotiation.
+Modification Reason: v0.43.0 - Bounded Directory proof-gossip convergence and privacy-safe reliability status.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.42.0 - [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] Added bounded, fail-closed public feature negotiation so optional proof frames are sent only to peers that explicitly advertise support.
+Last Modified: v0.43.0 - [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] Added one bounded audited proof fallback plus aggregate convergence and rejection buckets without peer dimensions.
+Previous: v0.42.0 - [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] Added bounded, fail-closed public feature negotiation so optional proof frames are sent only to peers that explicitly advertise support.
 Previous: v0.41.0 - [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Added bounded, rotating, replica-audited outbound proof gossip with mandatory legacy self-announcement fallback.
 Previous: v0.40.0 - [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Added proof-carrying discovery gossip that must match exact audited local replica evidence before PeerStore import.
 Previous: v0.39.0 - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] Added locally anchored, proof-matched PeerStore admission with preflight/postflight replica audits.
@@ -1208,16 +1209,26 @@ Implemented in Directory-authenticated Outbound Gossip V1:
   rebuilds/re-verifies the exact compact inclusion proof against the selected
   producer, block hash, and descriptor hash.
 - A proof-aware exchange sends one optional
-  `DirectoryDescriptorAnnounceV1` first, then always sends the current legacy
-  `DescriptorAnnounce`, followed by `SnapshotRequest`. Proof rejection or an
-  unsupported new enum variant cannot suppress legacy liveness during rollout.
+  `DirectoryDescriptorAnnounceV1` first. Only an HTTP `422` exact-evidence miss
+  may advance to one different, independently audited candidate. The sender
+  stops after success or after two proof frames, then always sends the current
+  legacy `DescriptorAnnounce` followed by `SnapshotRequest`. Replica
+  unavailability, rate limiting, other protocol status, transport failure, or
+  an unsupported new enum variant cannot suppress legacy liveness.
 - Proof transport failure is best effort in this mixed-version phase. The
   established legacy exchange still determines whether the peer gossip round
   succeeded. Mandatory proof-only admission requires a future explicit
   capability/version negotiation and is not inferred from HTTP `422`.
-- Process logs expose only aggregate proof attempted/accepted counts for a
-  completed round. They never add producer, descriptor, block, peer, endpoint,
-  route, message, payload, user, or traffic dimensions.
+- Process logs and `PeerStoreStatus.bootstrap` expose only aggregate capability
+  checks, capable/attempted peers, proof/fallback frames, accepted peers,
+  acceptance percentage, exact-evidence misses, replica unavailability, rate
+  limiting, other protocol rejection, transport failure, and consecutive
+  zero-acceptance rounds. They never add producer, descriptor, block, proof,
+  peer, endpoint, route, message, payload, client, user, or traffic dimensions.
+- Stable convergence buckets are `idle`, `legacy_only`, `converged`, `partial`,
+  `evidence_diverged`, and `degraded`. These are local transport observations,
+  not peer reputation, authority, quorum, voting, fork choice, consensus, or
+  finality.
 - The carrier still gains no producer, witness, mirror, checkpoint, policy,
   routing, voting, fork-choice, consensus, or finality authority. The proof
   authenticates one public descriptor commitment only.
@@ -1539,6 +1550,33 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] -->
+2026-07-28 - Added Directory Proof Gossip Reliability V2.
+- Files changed:
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/services/peer_store.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Runtime flow:
+  - Builds at most two distinct live candidates through the existing complete
+    producer audit and exact inclusion-proof reconstruction path.
+  - Sends the first proof only after explicit V1 feature negotiation.
+  - Retries exactly once, and only when the receiver returns HTTP `422` for an
+    exact-evidence miss. Success, replica unavailability, rate limiting, other
+    protocol status, and transport failure stop optional proof transmission.
+  - Always executes the legacy descriptor and snapshot exchange afterward.
+  - Records aggregate per-round convergence, fallback count, rejection buckets,
+    and consecutive zero-acceptance rounds in PeerStore status and audit events.
+- Compatibility:
+  - No signed descriptor, discovery enum, bincode discriminant, Directory
+    block, inclusion-proof, SQLite, or public feature schema changed.
+  - Mixed-version peers continue through legacy-only gossip.
+- Privacy boundary:
+  - Status and logs contain counts and stable reason buckets only.
+  - They contain no peer ids, endpoints, producers, descriptors, block hashes,
+    proof bytes, routes, messages, payloads, clients, traffic, DNS contents,
+    destinations, Memory Chain plaintext, private keys, wallet-level activity,
+    or social graph metadata.
+
 <!-- [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] -->
 2026-07-27 - Added Directory Gossip Capability Negotiation V1.
 - Files changed:

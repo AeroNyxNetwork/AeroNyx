@@ -29,6 +29,9 @@
 //!   and health bucket for nodeboard capacity and stale-peer visibility
 //! - Gossip scheduler visibility for jitter/backpressure diagnostics without
 //!   exposing seed endpoint values or peer URLs
+//! - Directory proof-gossip convergence status with bounded, mutually
+//!   exclusive rejection buckets and no peer, endpoint, producer, block, or
+//!   descriptor dimensions
 //! - Expired-peer cleanup counters so stale descriptor eviction is observable
 //!   without exposing peer endpoints or user traffic metadata
 //! - Health-ranked route candidates for blind relay preparation, using only
@@ -159,6 +162,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.65.0-DirectoryProofGossipReliability - Added privacy-safe convergence,
+//! fallback, and rejection-bucket status for authenticated descriptor gossip
 //! v0.64.0-DirectoryAuthenticatedGossipAdmission - Added a shared single-peer
 //! import report path and fail-closed handling for unverified proof gossip
 //! v0.63.0-DirectoryMirrorCarrierCapability - Added the signed mirror-carrier
@@ -600,6 +605,36 @@ pub struct PeerStorePeerEvent {
     pub reason: Option<String>,
 }
 
+/// Aggregate result of one outbound Directory proof-gossip round.
+///
+/// [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] This input contract is
+/// deliberately dimensionless. Callers may report only process-wide counts;
+/// peer ids, endpoints, producers, descriptors, blocks, proofs, routes,
+/// messages, payloads, clients, and traffic metadata are forbidden.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerStoreDirectoryProofGossipRound {
+    /// Peer summaries checked for explicit proof-gossip support.
+    pub capability_checked: usize,
+    /// Peers that explicitly advertised proof-gossip support.
+    pub capable: usize,
+    /// Capable peers sent at least one proof frame.
+    pub peers_attempted: usize,
+    /// Total proof frames sent, including bounded fallback frames.
+    pub frames_attempted: usize,
+    /// Peers that accepted at least one audited proof.
+    pub accepted: usize,
+    /// Proof frames rejected because exact local replica evidence was absent.
+    pub evidence_rejected: usize,
+    /// Peers whose audited replica admission service was unavailable.
+    pub replica_unavailable: usize,
+    /// Peers that rate-limited the optional proof frame.
+    pub rate_limited: usize,
+    /// Peers that returned another non-success protocol status.
+    pub protocol_rejected: usize,
+    /// Peers whose optional proof request failed at the transport layer.
+    pub transport_failed: usize,
+}
+
 /// Runtime status for discovery bootstrap, peer-cache persistence, and gossip.
 ///
 /// All fields are aggregate control-plane state. They must not contain client
@@ -786,6 +821,57 @@ pub struct PeerStoreBootstrapStatus {
     /// Admission, endpoint, transport, decoding, or signature failures.
     #[serde(default)]
     pub last_client_delivery_witness_failed: u64,
+    /// Last Directory proof-gossip convergence bucket.
+    ///
+    /// Stable values are `idle`, `legacy_only`, `converged`, `partial`,
+    /// `evidence_diverged`, and `degraded`.
+    #[serde(default)]
+    pub last_directory_proof_gossip_status: Option<String>,
+    /// Peer summaries checked for explicit proof-gossip support.
+    #[serde(default)]
+    pub last_directory_proof_gossip_capability_checked: u64,
+    /// Peers that explicitly advertised proof-gossip support.
+    #[serde(default)]
+    pub last_directory_proof_gossip_capable: u64,
+    /// Capable peers sent at least one proof frame.
+    #[serde(default)]
+    pub last_directory_proof_gossip_peers_attempted: u64,
+    /// Total proof frames sent, including bounded fallback frames.
+    #[serde(default)]
+    pub last_directory_proof_gossip_frames_attempted: u64,
+    /// Bounded fallback proof frames sent after an evidence miss.
+    #[serde(default)]
+    pub last_directory_proof_gossip_fallback_frames_attempted: u64,
+    /// Peers that accepted at least one audited proof.
+    #[serde(default)]
+    pub last_directory_proof_gossip_accepted: u64,
+    /// Percentage of capable peers accepting at least one proof in the round.
+    #[serde(default)]
+    pub last_directory_proof_gossip_acceptance_percent: u64,
+    /// Proof frames rejected because exact local replica evidence was absent.
+    #[serde(default)]
+    pub last_directory_proof_gossip_evidence_rejected: u64,
+    /// Peers whose audited replica admission service was unavailable.
+    #[serde(default)]
+    pub last_directory_proof_gossip_replica_unavailable: u64,
+    /// Peers that rate-limited the optional proof frame.
+    #[serde(default)]
+    pub last_directory_proof_gossip_rate_limited: u64,
+    /// Peers that returned another non-success protocol status.
+    #[serde(default)]
+    pub last_directory_proof_gossip_protocol_rejected: u64,
+    /// Peers whose optional proof request failed at the transport layer.
+    #[serde(default)]
+    pub last_directory_proof_gossip_transport_failed: u64,
+    /// Consecutive capable rounds with no accepted Directory proof.
+    #[serde(default)]
+    pub consecutive_directory_proof_gossip_zero_acceptance_rounds: u64,
+    /// Timestamp of the latest round with at least one accepted proof.
+    #[serde(default)]
+    pub last_directory_proof_gossip_success_at: Option<u64>,
+    /// Timestamp of the latest Directory proof-gossip observation.
+    #[serde(default)]
+    pub last_directory_proof_gossip_round_at: Option<u64>,
     /// Number of peers attempted in the last outbound gossip round.
     pub last_gossip_attempted: u64,
     /// Number of configured seed endpoints attempted in the last gossip round.
@@ -883,6 +969,22 @@ impl Default for PeerStoreBootstrapStatus {
             last_client_delivery_witness_conflicts: 0,
             last_client_delivery_witness_gaps: 0,
             last_client_delivery_witness_failed: 0,
+            last_directory_proof_gossip_status: None,
+            last_directory_proof_gossip_capability_checked: 0,
+            last_directory_proof_gossip_capable: 0,
+            last_directory_proof_gossip_peers_attempted: 0,
+            last_directory_proof_gossip_frames_attempted: 0,
+            last_directory_proof_gossip_fallback_frames_attempted: 0,
+            last_directory_proof_gossip_accepted: 0,
+            last_directory_proof_gossip_acceptance_percent: 0,
+            last_directory_proof_gossip_evidence_rejected: 0,
+            last_directory_proof_gossip_replica_unavailable: 0,
+            last_directory_proof_gossip_rate_limited: 0,
+            last_directory_proof_gossip_protocol_rejected: 0,
+            last_directory_proof_gossip_transport_failed: 0,
+            consecutive_directory_proof_gossip_zero_acceptance_rounds: 0,
+            last_directory_proof_gossip_success_at: None,
+            last_directory_proof_gossip_round_at: None,
             last_gossip_attempted: 0,
             last_gossip_seed_attempted: 0,
             last_gossip_succeeded: 0,
@@ -2701,6 +2803,102 @@ impl PeerStore {
             outcome,
             format!(
                 "attempted={attempted} succeeded={succeeded} failed={failed} seed_attempted={seed_attempted} status={status_bucket} consecutive_failures={consecutive_gossip_failures}{reason_detail}"
+            ),
+        );
+    }
+
+    /// Records one privacy-safe Directory proof-gossip convergence round.
+    ///
+    /// [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] Result buckets are
+    /// aggregate-only. They intentionally distinguish replica convergence
+    /// misses from service, rate-limit, protocol, and transport failures while
+    /// retaining no peer, endpoint, producer, descriptor, block, proof, route,
+    /// message, payload, client, or traffic dimensions.
+    pub fn record_directory_proof_gossip_round(
+        &self,
+        now: u64,
+        round: PeerStoreDirectoryProofGossipRound,
+    ) {
+        let fallback_frames_attempted =
+            round.frames_attempted.saturating_sub(round.peers_attempted);
+        let acceptance_percent = if round.capable == 0 {
+            0
+        } else {
+            round.accepted.saturating_mul(100) / round.capable
+        };
+        let status_bucket = if round.capability_checked == 0 {
+            "idle"
+        } else if round.capable == 0 {
+            "legacy_only"
+        } else if round.accepted >= round.capable {
+            "converged"
+        } else if round.accepted > 0 {
+            "partial"
+        } else if round.evidence_rejected > 0
+            && round.replica_unavailable == 0
+            && round.rate_limited == 0
+            && round.protocol_rejected == 0
+            && round.transport_failed == 0
+        {
+            "evidence_diverged"
+        } else {
+            "degraded"
+        };
+
+        let consecutive_zero_acceptance_rounds;
+        {
+            let mut status = self.bootstrap_status.write();
+            if round.accepted > 0 {
+                status.consecutive_directory_proof_gossip_zero_acceptance_rounds = 0;
+                status.last_directory_proof_gossip_success_at = Some(now);
+            } else if round.capable > 0 {
+                status.consecutive_directory_proof_gossip_zero_acceptance_rounds = status
+                    .consecutive_directory_proof_gossip_zero_acceptance_rounds
+                    .saturating_add(1);
+            }
+            consecutive_zero_acceptance_rounds =
+                status.consecutive_directory_proof_gossip_zero_acceptance_rounds;
+            status.last_directory_proof_gossip_status = Some(status_bucket.to_string());
+            status.last_directory_proof_gossip_capability_checked = round.capability_checked as u64;
+            status.last_directory_proof_gossip_capable = round.capable as u64;
+            status.last_directory_proof_gossip_peers_attempted = round.peers_attempted as u64;
+            status.last_directory_proof_gossip_frames_attempted = round.frames_attempted as u64;
+            status.last_directory_proof_gossip_fallback_frames_attempted =
+                fallback_frames_attempted as u64;
+            status.last_directory_proof_gossip_accepted = round.accepted as u64;
+            status.last_directory_proof_gossip_acceptance_percent = acceptance_percent as u64;
+            status.last_directory_proof_gossip_evidence_rejected = round.evidence_rejected as u64;
+            status.last_directory_proof_gossip_replica_unavailable =
+                round.replica_unavailable as u64;
+            status.last_directory_proof_gossip_rate_limited = round.rate_limited as u64;
+            status.last_directory_proof_gossip_protocol_rejected = round.protocol_rejected as u64;
+            status.last_directory_proof_gossip_transport_failed = round.transport_failed as u64;
+            status.last_directory_proof_gossip_round_at = Some(now);
+        }
+
+        let outcome = match status_bucket {
+            "converged" => "accepted",
+            "idle" | "legacy_only" => "ignored",
+            _ => "warning",
+        };
+        self.record_audit_event(
+            now,
+            "directory_proof_gossip_round",
+            outcome,
+            format!(
+                "status={status_bucket} capability_checked={} capable={} peers_attempted={} frames_attempted={} fallback_frames_attempted={} accepted={} acceptance_percent={} evidence_rejected={} replica_unavailable={} rate_limited={} protocol_rejected={} transport_failed={} consecutive_zero_acceptance_rounds={consecutive_zero_acceptance_rounds}",
+                round.capability_checked,
+                round.capable,
+                round.peers_attempted,
+                round.frames_attempted,
+                fallback_frames_attempted,
+                round.accepted,
+                acceptance_percent,
+                round.evidence_rejected,
+                round.replica_unavailable,
+                round.rate_limited,
+                round.protocol_rejected,
+                round.transport_failed,
             ),
         );
     }
@@ -9160,6 +9358,92 @@ mod tests {
         assert_eq!(status.bootstrap.last_gossip_failure_reason, None);
         assert_eq!(status.bootstrap.consecutive_gossip_failures, 0);
         assert_eq!(status.bootstrap.last_gossip_success_at, Some(1_700_000_050));
+    }
+
+    #[test]
+    fn test_directory_proof_gossip_round_tracks_bounded_convergence() {
+        let store = PeerStore::new();
+
+        // [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] One peer accepts
+        // the primary proof while another accepts only the bounded fallback.
+        store.record_directory_proof_gossip_round(
+            1_700_000_070,
+            PeerStoreDirectoryProofGossipRound {
+                capability_checked: 3,
+                capable: 2,
+                peers_attempted: 2,
+                frames_attempted: 3,
+                accepted: 2,
+                evidence_rejected: 1,
+                replica_unavailable: 0,
+                rate_limited: 0,
+                protocol_rejected: 0,
+                transport_failed: 0,
+            },
+        );
+
+        let status = store.status(1_700_000_080);
+        let bootstrap = &status.bootstrap;
+        assert_eq!(
+            bootstrap.last_directory_proof_gossip_status.as_deref(),
+            Some("converged")
+        );
+        assert_eq!(bootstrap.last_directory_proof_gossip_capability_checked, 3);
+        assert_eq!(bootstrap.last_directory_proof_gossip_capable, 2);
+        assert_eq!(bootstrap.last_directory_proof_gossip_frames_attempted, 3);
+        assert_eq!(
+            bootstrap.last_directory_proof_gossip_fallback_frames_attempted,
+            1
+        );
+        assert_eq!(bootstrap.last_directory_proof_gossip_accepted, 2);
+        assert_eq!(
+            bootstrap.last_directory_proof_gossip_acceptance_percent,
+            100
+        );
+        assert_eq!(bootstrap.last_directory_proof_gossip_evidence_rejected, 1);
+        assert_eq!(
+            bootstrap.consecutive_directory_proof_gossip_zero_acceptance_rounds,
+            0
+        );
+        assert_eq!(
+            bootstrap.last_directory_proof_gossip_success_at,
+            Some(1_700_000_070)
+        );
+        assert!(status.recent_audit_events.iter().any(|event| {
+            event.action == "directory_proof_gossip_round"
+                && event.outcome == "accepted"
+                && !event.detail.contains("http://")
+        }));
+
+        store.record_directory_proof_gossip_round(
+            1_700_000_090,
+            PeerStoreDirectoryProofGossipRound {
+                capability_checked: 3,
+                capable: 2,
+                peers_attempted: 2,
+                frames_attempted: 4,
+                accepted: 0,
+                evidence_rejected: 4,
+                replica_unavailable: 0,
+                rate_limited: 0,
+                protocol_rejected: 0,
+                transport_failed: 0,
+            },
+        );
+        let status = store.status(1_700_000_100);
+        let bootstrap = &status.bootstrap;
+        assert_eq!(
+            bootstrap.last_directory_proof_gossip_status.as_deref(),
+            Some("evidence_diverged")
+        );
+        assert_eq!(
+            bootstrap.consecutive_directory_proof_gossip_zero_acceptance_rounds,
+            1
+        );
+        assert_eq!(
+            bootstrap.last_directory_proof_gossip_success_at,
+            Some(1_700_000_070)
+        );
     }
 
     #[test]
