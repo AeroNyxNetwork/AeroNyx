@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.18.0-DirectoryProofMaturity - Added an automatically safe, operator-
+//! configurable minimum age for outbound Directory gossip proofs
 //! v0.17.0-DiscoveryGossipIsolation - Added bounded outbound gossip concurrency
 //! with a fail-closed operator limit
 //! v0.16.0-DirectoryMirrorCarrierCapability - Added a fail-closed staged
@@ -94,6 +96,7 @@ const MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS: usize = 3;
 const MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS: usize = 64;
 const MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS: usize = 16;
 const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
+const MAX_DIRECTORY_GOSSIP_PROOF_MIN_AGE_SECS: u64 = 48 * 60 * 60;
 const MAX_DISCOVERY_GOSSIP_CONCURRENCY: u16 = 64;
 
 // ── Sub-module re-exports (keep callers' use-paths stable) ────────────────
@@ -166,6 +169,14 @@ pub struct DiscoveryConfig {
     /// normal round remains below the peer API's per-minute request budget.
     #[serde(default = "DiscoveryConfig::default_directory_chain_sync_interval_secs")]
     pub directory_chain_sync_interval_secs: u64,
+    /// Optional minimum age of a Directory block before its proof is gossiped.
+    ///
+    /// [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] `None` derives a safe
+    /// value of two replica-sync intervals. An explicit value must be at least
+    /// that derived floor so proof publication cannot outrun exact-anchor
+    /// convergence on healthy peers. Legacy descriptor gossip is unaffected.
+    #[serde(default)]
+    pub directory_gossip_proof_min_age_secs: Option<u64>,
     /// Enables bounded, non-authoritative mirroring from verified public peers.
     ///
     /// Mirror producers are selected from permissionless signed discovery, but
@@ -329,6 +340,13 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_directory_chain_sync_interval_secs() -> u64 {
         120
+    }
+
+    /// Effective minimum age for outbound Directory gossip proofs.
+    #[must_use]
+    pub fn effective_directory_gossip_proof_min_age_secs(&self) -> u64 {
+        self.directory_gossip_proof_min_age_secs
+            .unwrap_or_else(|| self.directory_chain_sync_interval_secs.saturating_mul(2))
     }
 
     /// Default durable capacity for permissionless non-authoritative mirrors.
@@ -568,6 +586,24 @@ impl DiscoveryConfig {
                 "discovery.directory_chain_sync_interval_secs",
                 "must be between 60 seconds and 24 hours",
             ));
+        }
+
+        if let Some(min_age_secs) = self.directory_gossip_proof_min_age_secs {
+            // [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] An operator may
+            // lengthen convergence time but cannot publish ahead of the safe
+            // two-round floor derived from the configured replica cadence.
+            let convergence_floor = self.directory_chain_sync_interval_secs.saturating_mul(2);
+            if !(convergence_floor..=MAX_DIRECTORY_GOSSIP_PROOF_MIN_AGE_SECS)
+                .contains(&min_age_secs)
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.directory_gossip_proof_min_age_secs",
+                    format!(
+                        "must be between {convergence_floor} seconds and \
+                         {MAX_DIRECTORY_GOSSIP_PROOF_MIN_AGE_SECS} seconds"
+                    ),
+                ));
+            }
         }
 
         if !(1..=MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS)
@@ -943,6 +979,7 @@ impl Default for DiscoveryConfig {
             directory_chain_path: None,
             directory_chain_sync_peer_node_ids: Vec::new(),
             directory_chain_sync_interval_secs: Self::default_directory_chain_sync_interval_secs(),
+            directory_gossip_proof_min_age_secs: None,
             directory_full_node_mirror_enabled: false,
             advertise_directory_mirror_carrier: false,
             directory_full_node_mirror_max_producers:
@@ -1225,6 +1262,16 @@ mod tests {
             config.discovery.directory_chain_sync_interval_secs,
             DiscoveryConfig::default_directory_chain_sync_interval_secs()
         );
+        assert!(config
+            .discovery
+            .directory_gossip_proof_min_age_secs
+            .is_none());
+        assert_eq!(
+            config
+                .discovery
+                .effective_directory_gossip_proof_min_age_secs(),
+            DiscoveryConfig::default_directory_chain_sync_interval_secs() * 2
+        );
         assert!(!config.discovery.directory_full_node_mirror_enabled);
         assert!(!config.discovery.advertise_directory_mirror_carrier);
         assert_eq!(
@@ -1386,6 +1433,7 @@ directory_chain_sync_peer_node_ids = [
   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 ]
 directory_chain_sync_interval_secs = 180
+directory_gossip_proof_min_age_secs = 360
 directory_full_node_mirror_enabled = true
 advertise_directory_mirror_carrier = false
 directory_full_node_mirror_max_producers = 24
@@ -1441,6 +1489,16 @@ advertise_onion_middle = true
             vec![[0xcc; 32]]
         );
         assert_eq!(config.discovery.directory_chain_sync_interval_secs, 180);
+        assert_eq!(
+            config.discovery.directory_gossip_proof_min_age_secs,
+            Some(360)
+        );
+        assert_eq!(
+            config
+                .discovery
+                .effective_directory_gossip_proof_min_age_secs(),
+            360
+        );
         assert!(config.discovery.directory_full_node_mirror_enabled);
         assert!(!config.discovery.advertise_directory_mirror_carrier);
         assert_eq!(
@@ -1846,6 +1904,14 @@ gossip_enabled = true
 gossip_concurrency_limit = 65
 "#;
         assert!(ServerConfig::from_str(excessive_concurrency).is_err());
+
+        let immature_directory_proof = r"
+[discovery]
+enabled = true
+directory_chain_sync_interval_secs = 120
+directory_gossip_proof_min_age_secs = 239
+";
+        assert!(ServerConfig::from_str(immature_directory_proof).is_err());
 
         let excessive_jitter = r#"
 [discovery]

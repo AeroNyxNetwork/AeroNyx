@@ -235,6 +235,9 @@
 //      fan-out and total per-peer work, reserves legacy compatibility time from
 //      optional proof work, and replaces free-form internal failures with
 //      typed privacy-safe buckets.
+//  97. [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Publishes proof gossip
+//      only from audited blocks old enough for independent replica convergence;
+//      exact-anchor admission remains unchanged and fail-closed.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -343,6 +346,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.37-DirectoryProofMaturity - Added a safe proof publication maturity
+//     window without delaying legacy descriptor gossip
 //   v2.8.36-DiscoveryGossipIsolation - Bounded concurrent peer fan-out with
 //     typed failures and compatibility-reserved per-peer deadlines
 //   v2.8.35-DirectoryMirrorCarrierCapability - Added rollout-gated signed
@@ -6358,6 +6363,12 @@ impl Server {
                     }
                 }
 
+                // [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Keep optional
+                // proof publication behind replica convergence while legacy
+                // descriptor and snapshot gossip remain immediate.
+                let directory_proof_min_age_secs = config
+                    .discovery
+                    .effective_directory_gossip_proof_min_age_secs();
                 let directory_gossip_announcements = if gossip_urls.is_empty() {
                     Vec::new()
                 } else if let Some(store) = directory_replica_store.as_ref() {
@@ -6372,6 +6383,7 @@ impl Server {
                         for offset in 0..DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT {
                             let candidate = store.audited_live_descriptor_gossip_announcement(
                                 now,
+                                directory_proof_min_age_secs,
                                 selection_seed.saturating_add(offset as u64),
                             )?;
                             let Some(candidate) = candidate else {
@@ -6460,6 +6472,7 @@ impl Server {
                         directory_proof_rate_limited = proof.rate_limited,
                         directory_proof_protocol_rejected = proof.protocol_rejected,
                         directory_proof_transport_failed = proof.transport_failed,
+                        directory_proof_min_age_secs,
                         concurrency_limit,
                         peer_timeout_secs = config.discovery.fetch_timeout_secs,
                         gossip_elapsed_ms,

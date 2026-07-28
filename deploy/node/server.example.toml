@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - Delay optional Directory proof gossip until exact block anchors have had
+#   two normal replica-sync intervals to converge on healthy peers.
 # - Add bounded concurrent discovery gossip so one slow public peer cannot
 #   serialize and delay the complete peer round.
 # - Document the bounded independent Directory checkpoint witness target. This
@@ -47,6 +49,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.8.0-node-deploy - Added Directory proof gossip maturity guidance.
 # v1.7.0-node-deploy - Added bounded discovery gossip concurrency guidance.
 # v1.6.0-node-deploy - Added Directory checkpoint witness threshold guidance.
 # v1.5.0-node-deploy - Added explicit ChatRelay capability opt-in defaults.
@@ -124,6 +127,12 @@ directory_chain_sync_peer_node_ids = []
 # Pulls at most one producer block per pinned peer each round. Keep this at 60
 # seconds or higher so descriptor-object hydration stays within peer rate limits.
 directory_chain_sync_interval_secs = 120
+# [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Optional override for the
+# minimum signed-block age used by outbound proof gossip. Omit this field to
+# derive two directory_chain_sync_interval_secs automatically. An explicit
+# value cannot be lower than that safe floor. This delays only optional proof
+# publication; legacy descriptor/snapshot gossip remains immediate.
+directory_gossip_proof_min_age_secs = 240
 # Optional Full-node Mirror Mode. Verified public discovery peers may exchange
 # this node's own signed public Directory history and may be mirrored directly.
 # Mirror data is untrusted replicated evidence: it never votes, selects forks,

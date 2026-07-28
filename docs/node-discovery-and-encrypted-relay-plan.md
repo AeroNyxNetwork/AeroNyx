@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.45.0 - Bounded concurrent discovery gossip with typed failures and compatibility-reserved peer deadlines.
+Modification Reason: v0.46.0 - Directory proof publication maturity aligned with exact-anchor replica convergence.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.45.0 - [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] Prevented one slow peer from serially blocking a complete gossip round while preserving deterministic aggregate outcomes.
+Last Modified: v0.46.0 - [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Prevented valid but too-new exact-block proofs from racing ahead of healthy replica synchronization.
+Previous: v0.45.0 - [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] Prevented one slow peer from serially blocking a complete gossip round while preserving deterministic aggregate outcomes.
 Previous: v0.44.0 - [GOSSIP-OUTCOME-INTEGRITY 2026-07-28 by Codex] Separated proof and legacy gossip failure domains so a later compatibility-path failure cannot erase an already observed proof outcome.
 Previous: v0.43.0 - [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] Added one bounded audited proof fallback plus aggregate convergence and rejection buckets without peer dimensions.
 Previous: v0.42.0 - [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] Added bounded, fail-closed public feature negotiation so optional proof frames are sent only to peers that explicitly advertise support.
@@ -1552,6 +1553,37 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] -->
+2026-07-28 - Aligned Directory proof publication with replica convergence.
+- Files changed:
+  - crates/aeronyx-server/src/config.rs
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - deploy/node/server.example.toml
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Root cause:
+  - Production selected valid proofs from blocks only 46-52 seconds old while
+    healthy replicas normally pulled exact anchors every 120 seconds.
+  - Receivers correctly returned evidence-rejected until the same producer
+    block/hash was present in their independently audited local replica.
+- Architecture:
+  - Missing `directory_gossip_proof_min_age_secs` derives two configured
+    Directory sync intervals, preserving backward-compatible configuration.
+  - An explicit override may only increase or preserve that convergence floor.
+  - SQL candidate selection excludes newer blocks before applying its existing
+    bounded window, live-descriptor checks, rotation, and full producer audit.
+  - Runtime logs expose only the effective aggregate maturity policy.
+- Security:
+  - Receiver proof verification, exact block/hash matching, producer signature,
+    Merkle inclusion, local anchor audit, quarantine, and PeerStore rollback
+    checks are unchanged and remain fail-closed.
+  - Legacy descriptor and snapshot gossip stay immediate; maturity applies only
+    to optional stronger proof publication.
+- Privacy:
+  - No peer identity, endpoint, selected producer, block hash, descriptor hash,
+    proof bytes, route, payload, client, traffic, or social graph field was
+    added to logs or public status.
+
 <!-- [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] -->
 2026-07-28 - Added bounded concurrent gossip and per-peer failure isolation.
 - Files changed:

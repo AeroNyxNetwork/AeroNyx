@@ -178,6 +178,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.33.0-DirectoryProofMaturity - Restricted gossip proof selection to
+//! operator-policy-mature audited blocks so publication cannot outrun replicas
 //! v0.32.0-DirectoryProofGossipPublisher - Added bounded live replica
 //! descriptor selection with exact audited inclusion-proof reconstruction.
 //! v0.31.0-ReplicaDescriptorInclusionProof - Added transactionally audited,
@@ -3337,14 +3339,16 @@ impl DirectoryReplicaStore {
         )
     }
 
-    /// Selects one live public descriptor and rebuilds its exact audited proof.
+    /// Selects one mature live public descriptor and rebuilds its exact proof.
     ///
     /// Selection reads at most [`DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT`]
-    /// recent descriptor rows from non-quarantined, non-local producer
-    /// namespaces. `selection_seed` rotates the chosen live row so periodic
-    /// gossip does not continuously amplify one descriptor. The lightweight
-    /// candidate read never establishes trust: after selection, the complete
-    /// producer namespace and exact block/object indexes are audited by
+    /// recent mature descriptor rows from non-quarantined, non-local producer
+    /// namespaces. A block is mature only when its signed `produced_at` is no
+    /// newer than `observed_at - minimum_block_age_secs`. `selection_seed`
+    /// rotates the chosen live row so periodic gossip does not continuously
+    /// amplify one descriptor. The lightweight candidate read never
+    /// establishes trust: after selection, the complete producer namespace and
+    /// exact block/object indexes are audited by
     /// [`Self::audited_evidence_descriptor_inclusion_proof`].
     ///
     /// `Ok(None)` means this replica currently has no live descriptor suitable
@@ -3362,13 +3366,18 @@ impl DirectoryReplicaStore {
     pub(crate) fn audited_live_descriptor_gossip_announcement(
         &self,
         observed_at: u64,
+        minimum_block_age_secs: u64,
         selection_seed: u64,
     ) -> Result<Option<DirectoryReplicaGossipAnnouncement>, DirectoryReplicaStoreError> {
-        if observed_at == 0 {
+        if observed_at == 0 || minimum_block_age_secs == 0 {
             return Err(DirectoryReplicaStoreError::Request(
-                "gossip proof observation time is invalid".to_string(),
+                "gossip proof maturity fields are invalid".to_string(),
             ));
         }
+        // [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Proof validity alone
+        // does not imply peer availability of the exact block anchor. Select
+        // only evidence old enough for independent replica pull rounds.
+        let matured_before = observed_at.saturating_sub(minimum_block_age_secs);
 
         let persisted_candidates = {
             let connection = self.connection.lock();
@@ -3388,20 +3397,26 @@ impl DirectoryReplicaStore {
                    AND objects.descriptor_hash = commitments.descriptor_hash
                  WHERE chains.quarantined = 0
                    AND commitments.producer != ?1
+                   AND blocks.produced_at <= ?2
                  ORDER BY blocks.produced_at DESC,
                           commitments.producer ASC,
                           commitments.descriptor_hash ASC
-                 LIMIT ?2",
+                 LIMIT ?3",
             )?;
             let candidates = statement
                 .query_map(
                     params![
                         self.local_node_id.as_slice(),
-                        i64::try_from(DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT).map_err(
-                            |_| DirectoryReplicaStoreError::Integrity(
-                                "gossip proof candidate limit exceeds SQLite range".to_string()
+                        i64::try_from(matured_before).map_err(|_| {
+                            DirectoryReplicaStoreError::Request(
+                                "gossip proof maturity boundary exceeds SQLite range".to_string(),
                             )
-                        )?
+                        })?,
+                        i64::try_from(DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT).map_err(|_| {
+                            DirectoryReplicaStoreError::Integrity(
+                                "gossip proof candidate limit exceeds SQLite range".to_string(),
+                            )
+                        })?
                     ],
                     |row| {
                         Ok((
@@ -11198,11 +11213,11 @@ mod tests {
         // [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Adjacent seeds must
         // rotate across the bounded live set rather than amplifying one node.
         let first = store
-            .audited_live_descriptor_gossip_announcement(NOW + 21, 0)
+            .audited_live_descriptor_gossip_announcement(NOW + 21, 20, 0)
             .unwrap()
             .unwrap();
         let second = store
-            .audited_live_descriptor_gossip_announcement(NOW + 21, 1)
+            .audited_live_descriptor_gossip_announcement(NOW + 21, 20, 1)
             .unwrap()
             .unwrap();
         assert_ne!(first.producer, second.producer);
@@ -11222,10 +11237,16 @@ mod tests {
             );
         }
 
+        // [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] The exact same
+        // audited blocks are withheld when the configured maturity boundary
+        // has not elapsed. Admission remains exact-anchor based.
+        let immature_result = store.audited_live_descriptor_gossip_announcement(NOW + 21, 21, 0);
+        assert!(matches!(immature_result, Ok(None)));
+
         // Authentic historical descriptors remain stored but cannot be
         // re-announced as current routeable state after expiry.
         assert!(store
-            .audited_live_descriptor_gossip_announcement(NOW + 3_601, 0)
+            .audited_live_descriptor_gossip_announcement(NOW + 3_601, 20, 0)
             .unwrap()
             .is_none());
     }
