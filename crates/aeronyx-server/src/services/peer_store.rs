@@ -32,6 +32,8 @@
 //! - Directory proof-gossip convergence status with bounded, mutually
 //!   exclusive rejection buckets and no peer, endpoint, producer, block, or
 //!   descriptor dimensions
+//! - A side-effect-free internal view of every valid public endpoint identity
+//!   for fail-closed duplicate-endpoint handling during outbound gossip
 //! - Expired-peer cleanup counters so stale descriptor eviction is observable
 //!   without exposing peer endpoints or user traffic metadata
 //! - Health-ranked route candidates for blind relay preparation, using only
@@ -162,6 +164,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.67.0-DiscoveryIdentityAmbiguity - Added a complete, lightweight
+//! valid-public endpoint identity view for fail-closed gossip hint resolution
 //! v0.66.0-DiscoveryGossipIsolation - Distinguish failed proof capability
 //! negotiation from a valid legacy-only peer in aggregate health
 //! v0.65.0-DirectoryProofGossipReliability - Added privacy-safe convergence,
@@ -5483,6 +5487,33 @@ impl PeerStore {
         descriptors
     }
 
+    /// Returns every valid public endpoint with its verified node identity.
+    ///
+    /// [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Outbound gossip uses
+    /// this complete, lightweight view to detect when multiple signed
+    /// descriptors claim one canonical endpoint. The result is bounded by the
+    /// store's configured peer capacity, does not mutate counters or audit
+    /// history, and must remain internal control-plane input only.
+    #[must_use]
+    pub(crate) fn valid_public_endpoint_identities(&self, now: u64) -> Vec<([u8; 32], String)> {
+        let mut identities = self
+            .peers
+            .read()
+            .values()
+            .filter(|descriptor| descriptor.verify_at(now).is_ok())
+            .filter(|descriptor| descriptor.descriptor.policy.public_discovery)
+            .filter_map(|descriptor| {
+                descriptor
+                    .descriptor
+                    .public_endpoint
+                    .as_ref()
+                    .map(|endpoint| (descriptor.node_id(), endpoint.clone()))
+            })
+            .collect::<Vec<_>>();
+        identities.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        identities
+    }
+
     /// Returns valid descriptors that advertise a capability.
     #[must_use]
     pub fn peers_with_capability(
@@ -9098,6 +9129,38 @@ mod tests {
         let selected = store.valid_public_descriptors(1_700_000_100, 1);
         assert_eq!(selected.len(), 1);
         assert!(selected[0].descriptor.policy.public_discovery);
+    }
+
+    #[test]
+    fn test_valid_public_endpoint_identities_is_complete_and_side_effect_free(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+
+        let public_key = IdentityKeyPair::generate();
+        let mut public = signed_descriptor_for(&public_key, 1, 1_700_001_000);
+        public.descriptor.public_endpoint = Some("https://public.example".to_string());
+        public = SignedNodeDescriptor::sign(public.descriptor, &public_key)?;
+        let public_node_id = public.node_id();
+
+        let private_key = IdentityKeyPair::generate();
+        let mut private = signed_descriptor_for(&private_key, 1, 1_700_001_000);
+        private.descriptor.public_endpoint = Some("https://private.example".to_string());
+        private.descriptor.policy.public_discovery = false;
+        private = SignedNodeDescriptor::sign(private.descriptor, &private_key)?;
+
+        let no_endpoint = signed_descriptor(1, 1_700_001_000);
+        for descriptor in [public, private, no_endpoint] {
+            store.upsert_verified(descriptor, now)?;
+        }
+
+        let identities = store.valid_public_endpoint_identities(now);
+
+        assert_eq!(
+            identities,
+            vec![(public_node_id, "https://public.example".to_string())]
+        );
+        Ok(())
     }
 
     #[test]

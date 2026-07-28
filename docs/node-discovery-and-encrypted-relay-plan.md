@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.47.0 - Producer-diverse, verified peer-aware Directory proof fallback.
+Modification Reason: v0.48.0 - Fail-closed duplicate-endpoint identity handling for Directory proof gossip.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.47.0 - [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] Rotated alternate proof gossip across producer namespaces and suppressed known receiver-self anchors.
+Last Modified: v0.48.0 - [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Uses receiver identity hints only for a unique verified canonical endpoint owner.
+Previous: v0.47.0 - [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] Rotated alternate proof gossip across producer namespaces and suppressed known receiver-self anchors.
 Previous: v0.46.0 - [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Prevented valid but too-new exact-block proofs from racing ahead of healthy replica synchronization.
 Previous: v0.45.0 - [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] Prevented one slow peer from serially blocking a complete gossip round while preserving deterministic aggregate outcomes.
 Previous: v0.44.0 - [GOSSIP-OUTCOME-INTEGRITY 2026-07-28 by Codex] Separated proof and legacy gossip failure domains so a later compatibility-path failure cannot erase an already observed proof outcome.
@@ -1554,6 +1555,36 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] -->
+2026-07-28 - Failed closed on duplicate gossip endpoint identity claims.
+- Files changed:
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/services/peer_store.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Root cause:
+  - The receiver-self proof optimization used first-writer-wins when multiple
+    verified descriptors normalized to one gossip URL.
+  - A conflicting descriptor could not gain admission authority, but it could
+    make the sender suppress the wrong producer proof and delay optional
+    Directory evidence convergence.
+  - The round-limited selection snapshot could also omit a conflicting
+    descriptor just beyond the fan-out boundary.
+- Architecture:
+  - `PeerStore::valid_public_endpoint_identities` returns a lightweight,
+    side-effect-free view of all currently valid public endpoint identities;
+    its maximum size remains bounded by PeerStore capacity.
+  - `DiscoveryPeerIdentityHints` records a node id only while one canonical URL
+    maps to exactly one verified identity. A conflicting observation makes the
+    URL ambiguous for the complete hint snapshot.
+  - Ambiguous or unknown receivers use the existing bounded producer-diverse
+    fallback without guessing identity.
+- Security and compatibility:
+  - No wire frame, API schema, configuration, persistence format, admission
+    rule, receiver proof check, or legacy gossip behavior changed.
+  - Identity hints remain local selection inputs only and cannot grant trust.
+  - No endpoint, peer, producer, descriptor, proof, route, payload, client,
+    traffic, wallet, or social-graph telemetry was added.
+
 <!-- [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] -->
 2026-07-28 - Made optional Directory proof fallbacks producer-diverse.
 - Files changed:

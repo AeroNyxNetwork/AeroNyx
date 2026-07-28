@@ -241,6 +241,9 @@
 //  97. [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Publishes proof gossip
 //      only from audited blocks old enough for independent replica convergence;
 //      exact-anchor admission remains unchanged and fail-closed.
+//  99. [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Uses a receiving
+//      producer hint only while one canonical gossip URL maps to exactly one
+//      verified node identity; endpoint collisions fall back without guessing.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -349,6 +352,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.39-DiscoveryIdentityAmbiguity - Failed closed when independently
+//     signed peer descriptors claim the same canonical gossip endpoint
 //   v2.8.38-DirectoryProofDiversity - Added producer-first fallback rotation
 //     and verified peer-aware self-producer suppression
 //   v2.8.37-DirectoryProofMaturity - Added a safe proof publication maturity
@@ -860,6 +865,36 @@ impl std::fmt::Display for DiscoveryGossipFailure {
     }
 }
 
+/// Unique verified node identities observed for canonical gossip URLs.
+///
+/// [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Signed descriptors may
+/// independently claim the same endpoint. Such a collision is not enough to
+/// choose either identity, so the URL remains ambiguous for this hint set and
+/// proof selection uses its bounded identity-agnostic fallback.
+#[derive(Debug, Default)]
+struct DiscoveryPeerIdentityHints {
+    by_url: HashMap<String, Option<[u8; 32]>>,
+}
+
+impl DiscoveryPeerIdentityHints {
+    fn observe_verified(&mut self, url: String, node_id: [u8; 32]) {
+        match self.by_url.entry(url) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(node_id));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&node_id) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+
+    fn unique_node_id(&self, url: &str) -> Option<[u8; 32]> {
+        self.by_url.get(url).copied().flatten()
+    }
+}
+
 /// Immutable dependencies and policy for one outbound gossip round.
 ///
 /// [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] Keeping these values in a
@@ -875,7 +910,7 @@ struct DiscoveryGossipExecution<'a> {
     /// [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] This remains a local
     /// optimization only. Missing or stale hints cannot grant trust; they only
     /// decide whether a receiver's own producer proof is skipped.
-    peer_node_ids_by_url: Option<&'a HashMap<String, [u8; 32]>>,
+    peer_identity_hints: Option<&'a DiscoveryPeerIdentityHints>,
     now: u64,
     snapshot_limit: u16,
     peer_timeout: Duration,
@@ -6323,7 +6358,7 @@ impl Server {
                     .and_then(Self::discovery_gossip_url);
                 let mut seen_urls = HashSet::new();
                 let mut gossip_urls = Vec::new();
-                let mut gossip_peer_node_ids = HashMap::new();
+                let mut gossip_peer_identity_hints = DiscoveryPeerIdentityHints::default();
 
                 for endpoint in &config.discovery.seed_endpoints {
                     let Some(url) = Self::discovery_gossip_url(endpoint) else {
@@ -6345,6 +6380,21 @@ impl Server {
                 let seed_attempted = gossip_urls.len();
 
                 if include_cached_peers {
+                    // [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Build
+                    // identity hints from every valid public descriptor, not
+                    // the round-limited selection snapshot. This ensures a
+                    // colliding descriptor cannot hide just beyond fan-out.
+                    for (peer_node_id, endpoint) in peer_store.valid_public_endpoint_identities(now)
+                    {
+                        let Some(url) = Self::discovery_gossip_url(&endpoint) else {
+                            continue;
+                        };
+                        if self_gossip_url.as_deref() == Some(url.as_str()) {
+                            continue;
+                        }
+                        gossip_peer_identity_hints.observe_verified(url, peer_node_id);
+                    }
+
                     let snapshot = peer_store.export_bootstrap_snapshot(
                         now,
                         now,
@@ -6365,10 +6415,6 @@ impl Server {
                         if self_gossip_url.as_deref() == Some(url.as_str()) {
                             continue;
                         }
-                        let peer_node_id = peer.node_id();
-                        gossip_peer_node_ids
-                            .entry(url.clone())
-                            .or_insert(peer_node_id);
                         if seen_urls.contains(&url) {
                             continue;
                         }
@@ -6446,7 +6492,7 @@ impl Server {
                     client: &client,
                     peer_store: &peer_store,
                     directory_announcements: &directory_gossip_announcements,
-                    peer_node_ids_by_url: Some(&gossip_peer_node_ids),
+                    peer_identity_hints: Some(&gossip_peer_identity_hints),
                     now,
                     snapshot_limit: config.discovery.gossip_peer_limit,
                     peer_timeout,
@@ -6756,9 +6802,8 @@ impl Server {
         let started_at = tokio::time::Instant::now();
         let proof_budget = (execution.peer_timeout / 3).max(Duration::from_millis(1));
         let peer_node_id = execution
-            .peer_node_ids_by_url
-            .and_then(|node_ids| node_ids.get(url))
-            .copied();
+            .peer_identity_hints
+            .and_then(|hints| hints.unique_node_id(url));
         let directory_proof = if execution.directory_announcements.is_empty() {
             DirectoryProofGossipOutcome::default()
         } else {
@@ -10124,7 +10169,7 @@ mod tests {
         DirectoryProofGossipOutcome, DirectoryProofGossipPeerState, DirectoryProofGossipResult,
         DiscoveryGossipExecution, DiscoveryGossipFailure, DiscoveryGossipFailureKind,
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
-        PeerStoreCacheDocument, PeerStoreVerifiedClientDeliveryAnchor,
+        DiscoveryPeerIdentityHints, PeerStoreCacheDocument, PeerStoreVerifiedClientDeliveryAnchor,
         PeerStoreVerifiedClientDeliveryCacheEvidence, Server,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
         BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
@@ -12251,7 +12296,7 @@ mod tests {
             client,
             peer_store,
             directory_announcements,
-            peer_node_ids_by_url: None,
+            peer_identity_hints: None,
             now,
             snapshot_limit: 8,
             peer_timeout,
@@ -12287,6 +12332,27 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (url, task)
+    }
+
+    #[test]
+    fn discovery_peer_identity_hints_fail_closed_on_endpoint_collision() {
+        // [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] A repeated signed
+        // identity is stable, but conflicting identities must never recover
+        // to first- or last-writer wins during one complete hint snapshot.
+        let url = "https://peer.example/api/discovery/gossip".to_string();
+        let first_node_id = [0x41; 32];
+        let second_node_id = [0x42; 32];
+        let mut hints = DiscoveryPeerIdentityHints::default();
+
+        hints.observe_verified(url.clone(), first_node_id);
+        hints.observe_verified(url.clone(), first_node_id);
+        assert_eq!(hints.unique_node_id(&url), Some(first_node_id));
+
+        hints.observe_verified(url.clone(), second_node_id);
+        assert_eq!(hints.unique_node_id(&url), None);
+
+        hints.observe_verified(url.clone(), first_node_id);
+        assert_eq!(hints.unique_node_id(&url), None);
     }
 
     #[tokio::test]
@@ -12713,7 +12779,8 @@ mod tests {
             signed_chat_relay_peer_descriptor("http://127.0.0.1:1".to_string(), now, now + 300);
         let client = reqwest::Client::new();
         let peer_store = PeerStore::new();
-        let peer_node_ids = std::collections::HashMap::from([(url.clone(), receiver_producer)]);
+        let mut peer_identity_hints = DiscoveryPeerIdentityHints::default();
+        peer_identity_hints.observe_verified(url.clone(), receiver_producer);
         let mut execution = gossip_execution(
             &client,
             &peer_store,
@@ -12721,7 +12788,7 @@ mod tests {
             now,
             Duration::from_secs(5),
         );
-        execution.peer_node_ids_by_url = Some(&peer_node_ids);
+        execution.peer_identity_hints = Some(&peer_identity_hints);
 
         let report = Server::gossip_with_peer(execution, &url, self_descriptor).await;
 
