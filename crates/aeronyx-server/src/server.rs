@@ -255,6 +255,9 @@
 //      public API listeners as one required runtime group. Unexpected listener
 //      loss now performs graceful cleanup and exits non-zero for systemd
 //      recovery instead of leaving a false-positive active process.
+// 103. [TASK-SHUTDOWN 2026-07-29 by Codex] Joins long-lived runtime tasks
+//      concurrently under explicit grace periods, aborts timed-out tasks, and
+//      verifies cancellation instead of silently detaching their JoinHandles.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -363,6 +366,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.42-TaskShutdown - Bounded concurrent task joins with explicit abort
+//     confirmation after graceful-shutdown timeout
 //   v2.8.41-RuntimeSupervision - Required API listener-group failures now
 //     trigger graceful process failure and systemd recovery
 //   v2.8.40-StartupReadiness - Pre-bound required API listeners and reported
@@ -2096,6 +2101,25 @@ struct CriticalRuntimeFailure {
     reason: String,
 }
 
+/// Result of bringing one long-lived runtime task to a terminal state.
+///
+/// [TASK-SHUTDOWN 2026-07-29 by Codex] Keep shutdown outcomes typed so timeout
+/// cancellation cannot be confused with a task that completed cooperatively.
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeTaskShutdownOutcome {
+    Completed,
+    JoinFailed(String),
+    CancelledAfterTimeout,
+    CompletedAfterTimeout,
+    CancellationUnconfirmed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RuntimeTaskShutdownReport {
+    name: &'static str,
+    outcome: RuntimeTaskShutdownOutcome,
+}
+
 /// Terminal result from one required API listener.
 #[derive(Debug)]
 struct RequiredApiListenerExit {
@@ -2296,7 +2320,7 @@ impl Server {
         let tun = self.init_tun().await?;
 
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
-        let mut tasks: Vec<(&str, JoinHandle<()>)> = Vec::new();
+        let mut tasks: Vec<(&'static str, JoinHandle<()>)> = Vec::new();
         if let Some(task) = peer_store_persistence_task {
             tasks.push(("peer-cache-persistence", task));
         }
@@ -2892,19 +2916,36 @@ impl Server {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
 
-        for (name, task) in tasks {
-            // The lease task may finish one bounded renewal and one bounded
-            // release round before exit. Other tasks retain the historical
-            // five-second shutdown budget.
-            let shutdown_timeout_secs = if name == "memchain-coordinator-lease" {
-                12
-            } else {
-                5
-            };
-            match tokio::time::timeout(Duration::from_secs(shutdown_timeout_secs), task).await {
-                Ok(Ok(())) => debug!("Task '{}' completed", name),
-                Ok(Err(e)) => warn!("Task '{}' failed: {}", name, e),
-                Err(_) => warn!("Task '{}' timed out", name),
+        // [TASK-SHUTDOWN 2026-07-29 by Codex] Every task received the same
+        // broadcast already, so join them concurrently. This bounds total
+        // shutdown by the longest grace period instead of the sum of all
+        // per-task deadlines.
+        for report in Self::shutdown_runtime_tasks(tasks).await {
+            match report.outcome {
+                RuntimeTaskShutdownOutcome::Completed => {
+                    debug!(task = report.name, "Runtime task completed");
+                }
+                RuntimeTaskShutdownOutcome::JoinFailed(reason) => {
+                    warn!(task = report.name, %reason, "Runtime task join failed");
+                }
+                RuntimeTaskShutdownOutcome::CancelledAfterTimeout => {
+                    warn!(
+                        task = report.name,
+                        "Runtime task exceeded shutdown grace period and was cancelled"
+                    );
+                }
+                RuntimeTaskShutdownOutcome::CompletedAfterTimeout => {
+                    warn!(
+                        task = report.name,
+                        "Runtime task completed while timeout cancellation was being applied"
+                    );
+                }
+                RuntimeTaskShutdownOutcome::CancellationUnconfirmed => {
+                    error!(
+                        task = report.name,
+                        "Runtime task did not confirm cancellation before the abort deadline"
+                    );
+                }
             }
         }
 
@@ -10478,6 +10519,61 @@ impl Server {
     // Shutdown
     // ============================================
 
+    fn runtime_task_shutdown_grace(name: &str) -> Duration {
+        // The coordinator lease task may finish one bounded renewal and one
+        // bounded release round before exit. Other tasks retain the historical
+        // five-second shutdown budget.
+        if name == "memchain-coordinator-lease" {
+            Duration::from_secs(12)
+        } else {
+            Duration::from_secs(5)
+        }
+    }
+
+    async fn join_runtime_task(
+        name: &'static str,
+        mut task: JoinHandle<()>,
+        grace: Duration,
+        abort_confirmation: Duration,
+    ) -> RuntimeTaskShutdownReport {
+        // [TASK-SHUTDOWN 2026-07-29 by Codex] Passing `&mut JoinHandle` keeps
+        // ownership after timeout. Dropping the old timeout future detached the
+        // still-running task; retaining the handle lets us request and verify
+        // cancellation explicitly.
+        let outcome = match tokio::time::timeout(grace, &mut task).await {
+            Ok(Ok(())) => RuntimeTaskShutdownOutcome::Completed,
+            Ok(Err(error)) => RuntimeTaskShutdownOutcome::JoinFailed(error.to_string()),
+            Err(_) => {
+                task.abort();
+                match tokio::time::timeout(abort_confirmation, &mut task).await {
+                    Ok(Ok(())) => RuntimeTaskShutdownOutcome::CompletedAfterTimeout,
+                    Ok(Err(error)) if error.is_cancelled() => {
+                        RuntimeTaskShutdownOutcome::CancelledAfterTimeout
+                    }
+                    Ok(Err(error)) => RuntimeTaskShutdownOutcome::JoinFailed(error.to_string()),
+                    Err(_) => RuntimeTaskShutdownOutcome::CancellationUnconfirmed,
+                }
+            }
+        };
+        RuntimeTaskShutdownReport { name, outcome }
+    }
+
+    async fn shutdown_runtime_tasks(
+        tasks: Vec<(&'static str, JoinHandle<()>)>,
+    ) -> Vec<RuntimeTaskShutdownReport> {
+        // Poll all graceful joins together. `join_all` preserves registration
+        // order in the reports without serializing independent deadlines.
+        futures::future::join_all(tasks.into_iter().map(|(name, task)| {
+            Self::join_runtime_task(
+                name,
+                task,
+                Self::runtime_task_shutdown_grace(name),
+                Duration::from_secs(1),
+            )
+        }))
+        .await
+    }
+
     async fn wait_for_shutdown(
         &self,
         critical_failure_rx: &mut mpsc::Receiver<CriticalRuntimeFailure>,
@@ -10593,7 +10689,8 @@ mod tests {
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
         DiscoveryPeerIdentityHints, PeerHttpClients, PeerStoreCacheDocument,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
-        RequiredApiListenerExit, Server, SystemdNotifier,
+        RequiredApiListenerExit, RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server,
+        SystemdNotifier,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DIRECTORY_OPERATOR_HTTP_PROFILE,
@@ -10810,6 +10907,68 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_task_shutdown_reports_cooperative_completion() {
+        // [TASK-SHUTDOWN 2026-07-29 by Codex] A task that observes graceful
+        // shutdown remains distinguishable from timeout cancellation.
+        let task = tokio::spawn(async {});
+        let report = Server::join_runtime_task(
+            "cooperative-test",
+            task,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            RuntimeTaskShutdownReport {
+                name: "cooperative-test",
+                outcome: RuntimeTaskShutdownOutcome::Completed,
+            }
+        );
+        assert_eq!(
+            Server::runtime_task_shutdown_grace("memchain-coordinator-lease"),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            Server::runtime_task_shutdown_grace("udp"),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_task_shutdown_aborts_after_grace_timeout() {
+        // [TASK-SHUTDOWN 2026-07-29 by Codex] Reproduce the historical leak:
+        // a non-terminating task must reach a cancelled JoinError instead of
+        // continuing after its timeout future is dropped.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            started_rx.await.is_ok(),
+            "stuck test task must start before its shutdown deadline"
+        );
+
+        let report = Server::join_runtime_task(
+            "stuck-test",
+            task,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            RuntimeTaskShutdownReport {
+                name: "stuck-test",
+                outcome: RuntimeTaskShutdownOutcome::CancelledAfterTimeout,
+            }
+        );
     }
 
     #[tokio::test]
