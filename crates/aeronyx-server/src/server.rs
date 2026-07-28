@@ -557,7 +557,8 @@ use crate::api::vpn_health::{
     build_vpn_health_router, collect_node_operator_status_value, collect_vpn_health_value,
 };
 use crate::api::{
-    decode_bounded_json_response, read_bounded_http_response, BoundedHttpResponseError,
+    canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
+    privacy_safe_peer_http_client_builder, read_bounded_http_response, BoundedHttpResponseError,
     PEER_ACK_RESPONSE_MAX_BYTES,
 };
 use crate::config::{
@@ -2310,7 +2311,7 @@ impl Server {
                 blind_vault.clone(),
                 Arc::clone(&udp),
                 commitment_sync_tip_notifier,
-            );
+            )?;
             tasks.push(("node-api", api_task));
             node_api_started = true;
 
@@ -2517,7 +2518,7 @@ impl Server {
                 blind_vault.clone(),
                 Arc::clone(&udp),
                 None,
-            );
+            )?;
             tasks.push(("node-api", api_task));
         }
 
@@ -3138,7 +3139,7 @@ impl Server {
         blind_vault: Option<Arc<BlindVaultService>>,
         udp: Arc<UdpTransport>,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
-    ) -> JoinHandle<()> {
+    ) -> Result<JoinHandle<()>> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
         let mut shutdown_rx_public = self.shutdown_tx.subscribe();
@@ -3154,11 +3155,18 @@ impl Server {
         );
         let public_api_listen_addr = self.config.discovery.public_api_listen_addr;
         let node_identity = Arc::new(self.identity.clone());
+        // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] Every runtime using this
+        // client resolves permissionless descriptors. Fail startup instead of
+        // silently falling back to a redirect/proxy-enabled default client.
         let peer_http_client = Arc::new(
-            reqwest::Client::builder()
+            privacy_safe_peer_http_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .map_err(|error| {
+                    ServerError::startup_failed(format!(
+                        "privacy-safe peer HTTP client initialization failed: {error}"
+                    ))
+                })?,
         );
         let smoke_peer_store = Arc::clone(&peer_store);
         let smoke_node_identity = Arc::clone(&node_identity);
@@ -3231,7 +3239,7 @@ impl Server {
         let public_blind_vault = blind_vault.clone();
         let local_blind_vault = blind_vault.clone();
 
-        tokio::spawn(async move {
+        Ok(tokio::spawn(async move {
             if let Some(public_addr) = public_api_listen_addr {
                 let public_app = Self::build_public_discovery_router(
                     Arc::clone(&peer_store),
@@ -3621,7 +3629,7 @@ impl Server {
                 error!("[API] Server error: {}", e);
             }
             info!("[API] Stopped");
-        })
+        }))
     }
 
     fn build_public_discovery_router(
@@ -4770,10 +4778,9 @@ impl Server {
                 );
             }
         };
-        let client = match reqwest::Client::builder()
+        let client = match privacy_safe_peer_http_client_builder()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
         {
@@ -5334,10 +5341,9 @@ impl Server {
             )));
         }
 
-        let client = reqwest::Client::builder()
+        let client = privacy_safe_peer_http_client_builder()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
             .map_err(|_| {
@@ -5465,10 +5471,9 @@ impl Server {
         while instance_id.iter().all(|byte| *byte == 0) {
             rand::rngs::OsRng.fill_bytes(&mut instance_id);
         }
-        let client = reqwest::Client::builder()
+        let client = privacy_safe_peer_http_client_builder()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
             .map_err(|_| {
@@ -5530,10 +5535,9 @@ impl Server {
         let renewal_interval_secs = (u64::from(requested_ttl_secs) / 3).max(10);
         let identity = self.identity.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let client = match reqwest::Client::builder()
+        let client = match privacy_safe_peer_http_client_builder()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
         {
@@ -5691,10 +5695,9 @@ impl Server {
         const INITIAL_DELAY_SECS: u64 = 15;
         const MIN_INTERVAL_SECS: u64 = 300;
         const MAX_WITNESSES_PER_ROUND: usize = 3;
-        let client = match reqwest::Client::builder()
+        let client = match privacy_safe_peer_http_client_builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
         {
@@ -6033,10 +6036,9 @@ impl Server {
             return None;
         }
 
-        let client = match reqwest::Client::builder()
+        let client = match privacy_safe_peer_http_client_builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(1)
             .build()
         {
@@ -6264,7 +6266,10 @@ impl Server {
         let self_node_id = identity.public_key_bytes();
         let shutdown = Arc::clone(&self.shutdown);
         let mut rx = self.shutdown_tx.subscribe();
-        let client = match reqwest::Client::builder()
+        let client = match privacy_safe_peer_http_client_builder()
+            // [DISCOVERY-ENDPOINT-SSRF 2026-07-28 by Codex] Permissionless
+            // descriptor traffic must not inherit host proxies or follow a
+            // public endpoint redirect into a private/metadata address.
             .timeout(Duration::from_secs(config.discovery.fetch_timeout_secs))
             .pool_max_idle_per_host(8)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -6386,7 +6391,7 @@ impl Server {
                     // colliding descriptor cannot hide just beyond fan-out.
                     for (peer_node_id, endpoint) in peer_store.valid_public_endpoint_identities(now)
                     {
-                        let Some(url) = Self::discovery_gossip_url(&endpoint) else {
+                        let Some(url) = Self::discovered_peer_gossip_url(&endpoint) else {
                             continue;
                         };
                         if self_gossip_url.as_deref() == Some(url.as_str()) {
@@ -6409,7 +6414,7 @@ impl Server {
                         let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
                             continue;
                         };
-                        let Some(url) = Self::discovery_gossip_url(endpoint) else {
+                        let Some(url) = Self::discovered_peer_gossip_url(endpoint) else {
                             continue;
                         };
                         if self_gossip_url.as_deref() == Some(url.as_str()) {
@@ -7701,16 +7706,7 @@ impl Server {
     }
 
     fn blind_relay_probe_url(endpoint: &str) -> Option<String> {
-        let endpoint = endpoint.trim().trim_end_matches('/');
-        if endpoint.is_empty() {
-            return None;
-        }
-        let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-            endpoint.to_string()
-        } else {
-            format!("http://{endpoint}")
-        };
-        Some(format!("{base}/api/chat/peer/blind-relay"))
+        Self::permissionless_peer_transport_url(endpoint, "/api/chat/peer/blind-relay")
     }
 
     fn blind_relay_probe_route_id(
@@ -7818,16 +7814,18 @@ impl Server {
     }
 
     fn discovery_gossip_url(endpoint: &str) -> Option<String> {
-        let endpoint = endpoint.trim().trim_end_matches('/');
-        if endpoint.is_empty() {
-            return None;
-        }
-        let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-            endpoint.to_string()
-        } else {
-            format!("http://{endpoint}")
-        };
-        Some(format!("{base}/api/discovery/gossip"))
+        canonical_peer_http_url(endpoint, "/api/discovery/gossip")
+            .ok()
+            .map(|url| url.to_string())
+    }
+
+    /// Derives a gossip target from a permissionless signed descriptor.
+    ///
+    /// Configured bootstrap seeds remain operator-trusted and may use DNS or
+    /// private addressing. PeerStore descriptors are untrusted network input
+    /// and therefore require a public IP literal before any outbound request.
+    fn discovered_peer_gossip_url(endpoint: &str) -> Option<String> {
+        peer_endpoint_is_public_ip(endpoint).then(|| Self::discovery_gossip_url(endpoint))?
     }
 
     /// Attempts authenticated client traffic over receipt-capable two-hop
@@ -8116,16 +8114,25 @@ impl Server {
     }
 
     fn chat_peer_relay_url(endpoint: &str) -> Option<String> {
-        let endpoint = endpoint.trim().trim_end_matches('/');
-        if endpoint.is_empty() {
+        Self::permissionless_peer_transport_url(endpoint, "/api/chat/peer/relay")
+    }
+
+    /// Derives an outbound route only for a safe permissionless descriptor.
+    fn permissionless_peer_transport_url(endpoint: &str, path: &str) -> Option<String> {
+        // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] Keep real chat movement,
+        // blind probes, and onion forwarding on the same endpoint boundary as
+        // discovery and MemChain. Localhost is a test-only transport seam.
+        if !peer_endpoint_is_public_ip(endpoint) {
+            #[cfg(not(test))]
             return None;
+            #[cfg(test)]
+            if !crate::api::peer_endpoint_is_loopback_ip(endpoint) {
+                return None;
+            }
         }
-        let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-            endpoint.to_string()
-        } else {
-            format!("http://{endpoint}")
-        };
-        Some(format!("{base}/api/chat/peer/relay"))
+        canonical_peer_http_url(endpoint, path)
+            .ok()
+            .map(|url| url.to_string())
     }
 
     async fn save_peer_store_cache_snapshot(
@@ -8929,7 +8936,9 @@ impl Server {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let crypto = DefaultTransportCrypto::new();
-            let chat_peer_client = reqwest::Client::builder()
+            let chat_peer_client = privacy_safe_peer_http_client_builder()
+                // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] UDP-triggered
+                // relay fanout shares the permissionless host boundary.
                 .timeout(Duration::from_secs(5))
                 .build()
                 .ok();
@@ -11594,7 +11603,35 @@ mod tests {
             Server::discovery_gossip_url("https://node.example.com").as_deref(),
             Some("https://node.example.com/api/discovery/gossip")
         );
+        assert_eq!(
+            Server::discovery_gossip_url(
+                " HTTPS://Node.Example.COM:443/untrusted/path?token=secret#fragment "
+            )
+            .as_deref(),
+            Some("https://node.example.com/api/discovery/gossip")
+        );
+        assert_eq!(
+            Server::discovery_gossip_url("https://user@node.example.com"),
+            None
+        );
+        assert_eq!(Server::discovery_gossip_url("ftp://8.8.8.8"), None);
         assert_eq!(Server::discovery_gossip_url("   "), None);
+        assert_eq!(
+            Server::discovered_peer_gossip_url("http://8.8.8.8:8422/path").as_deref(),
+            Some("http://8.8.8.8:8422/api/discovery/gossip")
+        );
+        for endpoint in [
+            "http://127.0.0.1:8422",
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.1:8422",
+            "https://node.example.com",
+        ] {
+            assert_eq!(
+                Server::discovered_peer_gossip_url(endpoint),
+                None,
+                "unexpectedly accepted {endpoint}"
+            );
+        }
         assert_eq!(
             Server::discovery_summary_url_from_gossip_url(
                 "https://node.example.com/api/discovery/gossip"
@@ -11975,9 +12012,12 @@ mod tests {
             axum::serve(receipt_listener, receipt_router).await.unwrap();
         });
 
+        // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] Integration listeners use
+        // an IP-literal loopback seam because production permissionless
+        // descriptors deliberately reject DNS names, including `localhost`.
         let legacy_middle = signed_descriptor(
             &legacy_middle_identity,
-            format!("http://localhost:{}", legacy_address.port()),
+            format!("http://{legacy_address}"),
             NodeCapability::OnionMiddle,
             "legacy-middle",
         );
@@ -12027,13 +12067,26 @@ mod tests {
     #[test]
     fn chat_peer_relay_url_normalizes_endpoint_forms() {
         assert_eq!(
-            Server::chat_peer_relay_url("198.51.100.10:8421").as_deref(),
-            Some("http://198.51.100.10:8421/api/chat/peer/relay")
+            Server::chat_peer_relay_url("8.8.8.8:8421/ignored?secret=no").as_deref(),
+            Some("http://8.8.8.8:8421/api/chat/peer/relay")
         );
         assert_eq!(
-            Server::chat_peer_relay_url("https://node.example.com/").as_deref(),
-            Some("https://node.example.com/api/chat/peer/relay")
+            Server::blind_relay_probe_url("https://[2606:4700:4700::1111]:8421/").as_deref(),
+            Some("https://[2606:4700:4700::1111]:8421/api/chat/peer/blind-relay")
         );
+        assert!(Server::chat_peer_relay_url("http://127.0.0.1:8421").is_some());
+        for endpoint in [
+            "https://node.example.com/",
+            "http://10.0.0.1:8421",
+            "http://169.254.169.254/latest/meta-data",
+            "http://203.0.113.1:8421",
+        ] {
+            assert_eq!(
+                Server::chat_peer_relay_url(endpoint),
+                None,
+                "unexpectedly accepted {endpoint}"
+            );
+        }
         assert_eq!(Server::chat_peer_relay_url("   "), None);
     }
 

@@ -111,6 +111,7 @@
 //!   fields, and intermediates must reject invalid signatures before forwarding.
 //!
 //! ## Last Modified
+//! v0.27.0-PeerEndpointPolicy - Enforce canonical public-IP-only next-hop URLs
 //! v0.26.0-SignedDeliveryReceipt - Sign exact terminal payload acceptance and propagate verified receipts
 //! v0.25.0-DurableQueueCapacity - Classify global pending-store quota exhaustion
 //! v0.24.0-PublicRequestBounds - Bound peer bodies and concurrency before JSON extraction
@@ -172,7 +173,10 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
-use crate::api::{decode_bounded_json_response, InFlightRequestGuard, PEER_ACK_RESPONSE_MAX_BYTES};
+use crate::api::{
+    canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
+    InFlightRequestGuard, PEER_ACK_RESPONSE_MAX_BYTES,
+};
 use crate::services::chat_relay::ChatRelayError;
 use crate::services::peer_store::PeerStore;
 use crate::services::{ChatRelayService, Session, SessionManager};
@@ -1818,16 +1822,20 @@ fn validate_blind_relay_timestamp(timestamp: u64, now: u64) -> Result<(), BlindR
 }
 
 fn blind_peer_relay_url(endpoint: &str) -> Option<String> {
-    let endpoint = endpoint.trim().trim_end_matches('/');
-    if endpoint.is_empty() {
+    // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] A next-hop descriptor is
+    // permissionless input. Its signature cannot authorize localhost, private
+    // networks, metadata services, DNS rebinding, or URL-controlled paths.
+    if !peer_endpoint_is_public_ip(endpoint) {
+        #[cfg(not(test))]
         return None;
+        #[cfg(test)]
+        if !crate::api::peer_endpoint_is_loopback_ip(endpoint) {
+            return None;
+        }
     }
-    let base = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    };
-    Some(format!("{base}/api/chat/peer/blind-relay"))
+    canonical_peer_http_url(endpoint, "/api/chat/peer/blind-relay")
+        .ok()
+        .map(|url| url.to_string())
 }
 
 fn classify_reqwest_error(phase: &str, error: &reqwest::Error) -> String {

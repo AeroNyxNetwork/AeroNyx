@@ -151,7 +151,6 @@
 //! v2.7.0-BlockSync - Initial signed node-blind block range protocol.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -193,6 +192,7 @@ use aeronyx_core::protocol::memchain::{
 use aeronyx_core::protocol::{NodeCapability, SignedNodeDescriptor};
 use sha2::{Digest, Sha256};
 
+use super::{canonical_peer_http_url, peer_endpoint_is_public_ip, PeerEndpointUrlError};
 use crate::services::memchain::storage_ops::{
     RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorLeaseGrantOutcome,
     RecordCoordinatorLeaseReleaseOutcome, VerifiedDeliveryAnchorWitnessOutcome,
@@ -1980,48 +1980,10 @@ where
 /// prevent DNS rebinding; loopback, private, link-local, CGNAT, benchmark,
 /// documentation, multicast, and reserved ranges are also rejected.
 pub(crate) fn commitment_peer_endpoint_is_public(endpoint: &str) -> bool {
-    let Ok(url) = commitment_checkpoint_url(endpoint) else {
-        return false;
-    };
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host);
-    let Ok(address) = host.parse::<IpAddr>() else {
-        return false;
-    };
-    match address {
-        IpAddr::V4(address) => ipv4_is_public_unicast(address),
-        IpAddr::V6(address) => ipv6_is_public_unicast(address),
-    }
-}
-
-fn ipv4_is_public_unicast(address: Ipv4Addr) -> bool {
-    let [a, b, c, _] = address.octets();
-    !(a == 0
-        || a == 10
-        || a == 127
-        || (a == 100 && (64..=127).contains(&b))
-        || (a == 169 && b == 254)
-        || (a == 172 && (16..=31).contains(&b))
-        || (a == 192 && b == 0 && c == 0)
-        || (a == 192 && b == 0 && c == 2)
-        || (a == 192 && b == 168)
-        || (a == 198 && (b == 18 || b == 19))
-        || (a == 198 && b == 51 && c == 100)
-        || (a == 203 && b == 0 && c == 113)
-        || a >= 224)
-}
-
-fn ipv6_is_public_unicast(address: Ipv6Addr) -> bool {
-    if let Some(mapped) = address.to_ipv4() {
-        return ipv4_is_public_unicast(mapped);
-    }
-    let segments = address.segments();
-    (segments[0] & 0xe000) == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+    // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] MemChain and discovery
+    // share one public-host policy so a future range update cannot leave one
+    // permissionless transport less protected than another.
+    peer_endpoint_is_public_ip(endpoint)
 }
 
 const fn checkpoint_relation_priority(relation: CommitmentCheckpointRelation) -> u8 {
@@ -2175,33 +2137,10 @@ fn verified_delivery_anchor_witness_url(endpoint: &str) -> Result<Url, String> {
 }
 
 pub(crate) fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        return Err("pinned_coordinator_missing_endpoint".to_string());
-    }
-    if endpoint.contains("://")
-        && !endpoint.starts_with("http://")
-        && !endpoint.starts_with("https://")
-    {
-        return Err("pinned_coordinator_invalid_endpoint".to_string());
-    }
-    let normalized = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    };
-    let mut url = Url::parse(&normalized).map_err(|_| "pinned_coordinator_invalid_endpoint")?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.host_str().is_none()
-    {
-        return Err("pinned_coordinator_invalid_endpoint".to_string());
-    }
-    url.set_path(path);
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url)
+    canonical_peer_http_url(endpoint, path).map_err(|error| match error {
+        PeerEndpointUrlError::Missing => "pinned_coordinator_missing_endpoint".to_string(),
+        PeerEndpointUrlError::Invalid => "pinned_coordinator_invalid_endpoint".to_string(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

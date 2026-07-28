@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.48.0 - Fail-closed duplicate-endpoint identity handling for Directory proof gossip.
+Modification Reason: v0.49.0 - Canonical peer endpoints and fail-closed SSRF protection across permissionless peer transports.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.48.0 - [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Uses receiver identity hints only for a unique verified canonical endpoint owner.
+Last Modified: v0.49.0 - [DISCOVERY-ENDPOINT-SSRF 2026-07-28 by Codex] Canonicalizes peer targets, rejects unsafe permissionless descriptor endpoints, and disables redirects/proxies across discovery, relay, onion, and MemChain transport.
+Previous: v0.48.0 - [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Uses receiver identity hints only for a unique verified canonical endpoint owner.
 Previous: v0.47.0 - [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] Rotated alternate proof gossip across producer namespaces and suppressed known receiver-self anchors.
 Previous: v0.46.0 - [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Prevented valid but too-new exact-block proofs from racing ahead of healthy replica synchronization.
 Previous: v0.45.0 - [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] Prevented one slow peer from serially blocking a complete gossip round while preserving deterministic aggregate outcomes.
@@ -88,6 +89,17 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.49 Permissionless endpoint security boundary
+
+[DISCOVERY-ENDPOINT-SSRF 2026-07-28 by Codex]
+
+- A valid node signature proves which identity advertised an endpoint; it does not make that endpoint safe for another host to contact.
+- Operator-configured bootstrap seeds remain trusted configuration and may use DNS/private endpoints for closed deployments.
+- Endpoints learned from signed permissionless descriptors must be public IPv4/IPv6 literals. DNS names are rejected to prevent DNS rebinding, and loopback, private, link-local, CGNAT, benchmark, documentation, multicast, and reserved ranges are rejected. This boundary covers discovery gossip, Chat Relay, Blind Relay probes/forwarding, onion next hops, and MemChain peer transport.
+- All outbound peer URLs use one canonical parser that rejects credentials and unsupported schemes, removes untrusted paths/query/fragment, normalizes equivalent URL forms, and pins the protocol route.
+- Permissionless peer clients do not inherit host proxy settings and never follow HTTP redirects. A public peer therefore cannot redirect discovery, chat, blind relay, onion, or MemChain requests into cloud metadata or an internal control-plane service.
+- The wire schema, signed descriptor format, configured seed behavior, public API routes, and PeerStore signature/sequence/expiry admission rules are unchanged.
 - Client-side encrypted communication and privacy connection direction.
 
 The missing protocol foundation is node-to-node autonomy:

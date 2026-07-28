@@ -89,13 +89,135 @@
 //! v2.8.24-DirectorySyncServing - Compile authenticated Directory Chain peer routes.
 //! v2.8.29-DirectoryReplicaCoordinator - Split replica scheduling from server lifecycle.
 //! v1.0.0-BlindVaultApi - Added bounded binary Blind Vault client routes.
+//! v2.8.30-PeerEndpointPolicy - Centralized canonical peer URL parsing and
+//!   public-IP-only SSRF protection for permissionless outbound transports.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 
 use serde::de::DeserializeOwned;
+
+/// Structural failures while deriving a canonical outbound peer URL.
+///
+/// The type intentionally carries no attacker-controlled endpoint text so it
+/// remains safe to map into public health and operator telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerEndpointUrlError {
+    /// The endpoint was empty after trimming.
+    Missing,
+    /// The endpoint was not a credential-free HTTP(S) URL with a host.
+    Invalid,
+}
+
+/// Builds one canonical HTTP(S) URL for an outbound peer protocol route.
+///
+/// [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] Centralizing this parser prevents
+/// discovery, `MemChain`, and future peer transports from disagreeing about
+/// credentials, paths, queries, fragments, host casing, or default ports.
+/// This function validates URL structure only. Permissionless descriptors
+/// must additionally pass [`peer_endpoint_is_public_ip`] before transport.
+pub(crate) fn canonical_peer_http_url(
+    endpoint: &str,
+    path: &str,
+) -> Result<reqwest::Url, PeerEndpointUrlError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(PeerEndpointUrlError::Missing);
+    }
+    let normalized = if endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+    let mut url = reqwest::Url::parse(&normalized).map_err(|_| PeerEndpointUrlError::Invalid)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return Err(PeerEndpointUrlError::Invalid);
+    }
+    url.set_path(path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+/// Starts a fail-closed client builder for permissionless peer transports.
+///
+/// [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] Callers add their own timeout and
+/// pool limits, while this shared base makes proxy inheritance and redirects
+/// impossible to re-enable accidentally on discovery, relay, onion, or
+/// `MemChain` traffic.
+pub(crate) fn privacy_safe_peer_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+/// Accepts only public IP literals for permissionless outbound peer traffic.
+///
+/// A descriptor signature authenticates the advertiser, not the destination's
+/// safety for this host. Domain names are excluded to prevent DNS rebinding;
+/// loopback, private, link-local, CGNAT, benchmark, documentation, multicast,
+/// and reserved ranges are rejected as well.
+pub(crate) fn peer_endpoint_is_public_ip(endpoint: &str) -> bool {
+    let Some(address) = peer_endpoint_ip_literal(endpoint) else {
+        return false;
+    };
+    match address {
+        IpAddr::V4(address) => ipv4_is_public_unicast(address),
+        IpAddr::V6(address) => ipv6_is_public_unicast(address),
+    }
+}
+
+/// Localhost-only seam for integration tests that bind ephemeral listeners.
+///
+/// Production peer transports never call this function. Tests still exercise
+/// the same canonical parser while the public-address policy has independent
+/// regression coverage in [`peer_endpoint_is_public_ip`].
+#[cfg(test)]
+pub(crate) fn peer_endpoint_is_loopback_ip(endpoint: &str) -> bool {
+    peer_endpoint_ip_literal(endpoint).is_some_and(|address| address.is_loopback())
+}
+
+fn peer_endpoint_ip_literal(endpoint: &str) -> Option<IpAddr> {
+    let url = canonical_peer_http_url(endpoint, "/").ok()?;
+    let host = url.host_str()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse().ok()
+}
+
+fn ipv4_is_public_unicast(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn ipv6_is_public_unicast(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4() {
+        return ipv4_is_public_unicast(mapped);
+    }
+    let segments = address.segments();
+    (segments[0] & 0xe000) == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+}
 
 /// One lock-free permit for a bounded class of in-flight public requests.
 ///
@@ -241,6 +363,66 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         assert!(InFlightRequestGuard::try_acquire(&counter, 0).is_none());
         assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn canonical_peer_http_url_strips_untrusted_url_components() -> Result<(), PeerEndpointUrlError>
+    {
+        let url = canonical_peer_http_url(
+            " HTTPS://Node.Example:443/untrusted/path?token=secret#fragment ",
+            "/api/discovery/gossip",
+        )?;
+        assert_eq!(url.as_str(), "https://node.example/api/discovery/gossip");
+        assert_eq!(
+            canonical_peer_http_url("  ", "/api/discovery/gossip"),
+            Err(PeerEndpointUrlError::Missing)
+        );
+        for endpoint in [
+            "ftp://8.8.8.8",
+            "https://user@8.8.8.8",
+            "https://user:password@8.8.8.8",
+            "http://",
+        ] {
+            assert_eq!(
+                canonical_peer_http_url(endpoint, "/api/discovery/gossip"),
+                Err(PeerEndpointUrlError::Invalid),
+                "unexpectedly accepted {endpoint}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn permissionless_peer_endpoint_rejects_ssrf_targets() {
+        assert!(peer_endpoint_is_public_ip("http://8.8.8.8:8422"));
+        assert!(peer_endpoint_is_public_ip(
+            "https://[2606:4700:4700::1111]:8422"
+        ));
+        for endpoint in [
+            "http://127.0.0.1:8422",
+            "http://127.1:8422",
+            "http://2130706433:8422",
+            "http://0x7f000001:8422",
+            "http://017700000001:8422",
+            "http://10.0.0.1:8422",
+            "http://100.64.0.1:8422",
+            "http://169.254.1.1:8422",
+            "http://172.16.0.1:8422",
+            "http://192.168.1.1:8422",
+            "http://198.18.0.1:8422",
+            "http://203.0.113.1:8422",
+            "http://node.example:8422",
+            "http://[::1]:8422",
+            "http://[::ffff:127.0.0.1]:8422",
+            "http://[fc00::1]:8422",
+            "http://[fe80::1]:8422",
+            "http://[2001:db8::1]:8422",
+        ] {
+            assert!(
+                !peer_endpoint_is_public_ip(endpoint),
+                "unexpectedly accepted {endpoint}"
+            );
+        }
     }
 }
 
