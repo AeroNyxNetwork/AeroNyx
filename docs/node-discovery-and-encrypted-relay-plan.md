@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.43.0 - Bounded Directory proof-gossip convergence and privacy-safe reliability status.
+Modification Reason: v0.45.0 - Bounded concurrent discovery gossip with typed failures and compatibility-reserved peer deadlines.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.44.0 - [GOSSIP-OUTCOME-INTEGRITY 2026-07-28 by Codex] Separated proof and legacy gossip failure domains so a later compatibility-path failure cannot erase an already observed proof outcome.
+Last Modified: v0.45.0 - [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] Prevented one slow peer from serially blocking a complete gossip round while preserving deterministic aggregate outcomes.
+Previous: v0.44.0 - [GOSSIP-OUTCOME-INTEGRITY 2026-07-28 by Codex] Separated proof and legacy gossip failure domains so a later compatibility-path failure cannot erase an already observed proof outcome.
 Previous: v0.43.0 - [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] Added one bounded audited proof fallback plus aggregate convergence and rejection buckets without peer dimensions.
 Previous: v0.42.0 - [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] Added bounded, fail-closed public feature negotiation so optional proof frames are sent only to peers that explicitly advertise support.
 Previous: v0.41.0 - [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Added bounded, rotating, replica-audited outbound proof gossip with mandatory legacy self-announcement fallback.
@@ -1551,6 +1552,38 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] -->
+2026-07-28 - Added bounded concurrent gossip and per-peer failure isolation.
+- Files changed:
+  - crates/aeronyx-server/src/config.rs
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/services/peer_store.rs
+  - deploy/node/server.example.toml
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Architecture:
+  - A configurable `gossip_concurrency_limit` defaults to eight and validates
+    within `1..=64`; runtime also caps it by selected peers.
+  - Peer exchanges run through `buffer_unordered`, then return to original
+    selection order before aggregation so status remains deterministic.
+  - One total peer deadline is shared across all work. Optional Directory proof
+    negotiation receives at most the first third; unused time carries forward,
+    while the remainder is reserved for mandatory descriptor/snapshot gossip.
+  - Mandatory failures are typed phase/kind values internally and render into
+    the existing stable privacy-safe string buckets only at status boundaries.
+- Bugs fixed:
+  - Default `32`-peer fan-out with serial multi-request timeouts could exceed
+    several 60-second scheduling periods when public peers stalled.
+  - Invalid or unavailable proof-negotiation responses were previously
+    indistinguishable from valid legacy-only peers.
+- Compatibility:
+  - Missing `gossip_concurrency_limit` uses the backward-compatible default.
+  - No endpoint, discovery frame, signed descriptor, persistence schema,
+    admission authority, proof retry ceiling, or public status field changed.
+- Privacy boundary:
+  - Concurrency reports contain aggregate duration and bounded reason buckets
+    only. They never retain peer ids, URLs, proof bytes, routes, payloads,
+    clients, traffic, or social graph dimensions.
+
 <!-- [GOSSIP-OUTCOME-INTEGRITY 2026-07-28 by Codex] -->
 2026-07-28 - Added outbound gossip outcome integrity and responsibility split.
 - Files changed:

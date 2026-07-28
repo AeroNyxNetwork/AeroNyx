@@ -162,6 +162,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.66.0-DiscoveryGossipIsolation - Distinguish failed proof capability
+//! negotiation from a valid legacy-only peer in aggregate health
 //! v0.65.0-DirectoryProofGossipReliability - Added privacy-safe convergence,
 //! fallback, and rejection-bucket status for authenticated descriptor gossip
 //! v0.64.0-DirectoryAuthenticatedGossipAdmission - Added a shared single-peer
@@ -2826,8 +2828,18 @@ impl PeerStore {
         } else {
             round.accepted.saturating_mul(100) / round.capable
         };
+        let negotiation_failed = round.capable == 0
+            && (round.replica_unavailable > 0
+                || round.rate_limited > 0
+                || round.protocol_rejected > 0
+                || round.transport_failed > 0);
         let status_bucket = if round.capability_checked == 0 {
             "idle"
+        } else if negotiation_failed {
+            // [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] An unavailable
+            // or malformed negotiation surface is not a valid legacy-only
+            // response. Keep this aggregate-only and fail visibly degraded.
+            "degraded"
         } else if round.capable == 0 {
             "legacy_only"
         } else if round.accepted >= round.capable {
@@ -9443,6 +9455,42 @@ mod tests {
         assert_eq!(
             bootstrap.last_directory_proof_gossip_success_at,
             Some(1_700_000_070)
+        );
+    }
+
+    #[test]
+    fn test_directory_proof_gossip_negotiation_failure_is_not_legacy_only() {
+        let store = PeerStore::new();
+
+        store.record_directory_proof_gossip_round(
+            1_700_000_110,
+            PeerStoreDirectoryProofGossipRound {
+                capability_checked: 2,
+                capable: 0,
+                peers_attempted: 0,
+                frames_attempted: 0,
+                accepted: 0,
+                evidence_rejected: 0,
+                replica_unavailable: 0,
+                rate_limited: 0,
+                protocol_rejected: 1,
+                transport_failed: 1,
+            },
+        );
+
+        let status = store.status(1_700_000_120);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_directory_proof_gossip_status
+                .as_deref(),
+            Some("degraded")
+        );
+        assert_eq!(
+            status
+                .bootstrap
+                .last_directory_proof_gossip_transport_failed,
+            1
         );
     }
 

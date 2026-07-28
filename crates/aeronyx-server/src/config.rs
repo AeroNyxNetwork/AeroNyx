@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.17.0-DiscoveryGossipIsolation - Added bounded outbound gossip concurrency
+//! with a fail-closed operator limit
 //! v0.16.0-DirectoryMirrorCarrierCapability - Added a fail-closed staged
 //! advertisement gate for signed Directory Mirror carrier capability
 //! v0.15.0-FullNodeMirror - Added opt-in bounded non-authoritative Directory mirrors
@@ -92,6 +94,7 @@ const MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS: usize = 3;
 const MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS: usize = 64;
 const MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS: usize = 16;
 const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
+const MAX_DISCOVERY_GOSSIP_CONCURRENCY: u16 = 64;
 
 // ── Sub-module re-exports (keep callers' use-paths stable) ────────────────
 pub use crate::config_blind_vault::BlindVaultConfig;
@@ -233,6 +236,14 @@ pub struct DiscoveryConfig {
     /// Maximum number of public peers contacted per gossip round.
     #[serde(default = "DiscoveryConfig::default_gossip_peer_limit")]
     pub gossip_peer_limit: u16,
+    /// Maximum number of peer gossip exchanges polled concurrently.
+    ///
+    /// [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] This bounds outbound
+    /// sockets and memory while preventing one slow peer from serially blocking
+    /// every later peer in the round. Runtime fan-out is additionally capped by
+    /// `gossip_peer_limit` and the number of selected peers.
+    #[serde(default = "DiscoveryConfig::default_gossip_concurrency_limit")]
+    pub gossip_concurrency_limit: u16,
     /// Percent of `gossip_interval_secs` used as per-node scheduling jitter.
     ///
     /// This keeps a fleet of nodes from contacting seeds at the exact same
@@ -348,6 +359,12 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_gossip_peer_limit() -> u16 {
         32
+    }
+
+    /// Default bounded outbound gossip concurrency.
+    #[must_use]
+    pub const fn default_gossip_concurrency_limit() -> u16 {
+        8
     }
 
     /// Default outbound gossip scheduling jitter as a percent of base interval.
@@ -745,6 +762,15 @@ impl DiscoveryConfig {
             ));
         }
 
+        if self.gossip_concurrency_limit == 0
+            || self.gossip_concurrency_limit > MAX_DISCOVERY_GOSSIP_CONCURRENCY
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.gossip_concurrency_limit",
+                "must be between 1 and 64",
+            ));
+        }
+
         if self.gossip_jitter_percent > 50 {
             return Err(ServerError::config_invalid(
                 "discovery.gossip_jitter_percent",
@@ -932,6 +958,7 @@ impl Default for DiscoveryConfig {
             gossip_enabled: false,
             gossip_interval_secs: Self::default_gossip_interval_secs(),
             gossip_peer_limit: Self::default_gossip_peer_limit(),
+            gossip_concurrency_limit: Self::default_gossip_concurrency_limit(),
             gossip_jitter_percent: Self::default_gossip_jitter_percent(),
             gossip_backpressure_failure_threshold:
                 Self::default_gossip_backpressure_failure_threshold(),
@@ -1216,6 +1243,10 @@ mod tests {
         assert_eq!(
             config.discovery.gossip_peer_limit,
             DiscoveryConfig::default_gossip_peer_limit()
+        );
+        assert_eq!(
+            config.discovery.gossip_concurrency_limit,
+            DiscoveryConfig::default_gossip_concurrency_limit()
         );
         assert_eq!(
             config.discovery.gossip_jitter_percent,
@@ -1799,6 +1830,22 @@ gossip_enabled = true
 gossip_peer_limit = 0
 "#;
         assert!(ServerConfig::from_str(zero_limit).is_err());
+
+        let zero_concurrency = r#"
+[discovery]
+enabled = true
+gossip_enabled = true
+gossip_concurrency_limit = 0
+"#;
+        assert!(ServerConfig::from_str(zero_concurrency).is_err());
+
+        let excessive_concurrency = r#"
+[discovery]
+enabled = true
+gossip_enabled = true
+gossip_concurrency_limit = 65
+"#;
+        assert!(ServerConfig::from_str(excessive_concurrency).is_err());
 
         let excessive_jitter = r#"
 [discovery]

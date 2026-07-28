@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - Add bounded concurrent discovery gossip so one slow public peer cannot
+#   serialize and delay the complete peer round.
 # - Document the bounded independent Directory checkpoint witness target. This
 #   is corroboration evidence only, not consensus, fork choice, or finality.
 # - Add an explicit opt-in ChatRelay blind relay capability block so operators
@@ -45,6 +47,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.7.0-node-deploy - Added bounded discovery gossip concurrency guidance.
 # v1.6.0-node-deploy - Added Directory checkpoint witness threshold guidance.
 # v1.5.0-node-deploy - Added explicit ChatRelay capability opt-in defaults.
 # v1.4.0-node-deploy - Added discovery peer-store and onion-middle controls.
@@ -158,6 +161,11 @@ verified_delivery_witness_requester_node_ids = []
 gossip_enabled = true
 gossip_interval_secs = 45
 gossip_peer_limit = 8
+# [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] Poll at most this many
+# selected peers concurrently. Valid range is 1..=64; runtime also caps this by
+# gossip_peer_limit. Eight keeps the default 32-peer round within one cadence
+# while bounding sockets, response bodies, and task memory.
+gossip_concurrency_limit = 8
 gossip_jitter_percent = 15
 gossip_backpressure_failure_threshold = 4
 gossip_failure_backoff_max_secs = 180
