@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.43.0 - [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] Added one bounded audited proof fallback plus aggregate convergence and rejection buckets without peer dimensions.
+Last Modified: v0.44.0 - [GOSSIP-OUTCOME-INTEGRITY 2026-07-28 by Codex] Separated proof and legacy gossip failure domains so a later compatibility-path failure cannot erase an already observed proof outcome.
+Previous: v0.43.0 - [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] Added one bounded audited proof fallback plus aggregate convergence and rejection buckets without peer dimensions.
 Previous: v0.42.0 - [DIRECTORY-GOSSIP-NEGOTIATION 2026-07-27 by Codex] Added bounded, fail-closed public feature negotiation so optional proof frames are sent only to peers that explicitly advertise support.
 Previous: v0.41.0 - [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Added bounded, rotating, replica-audited outbound proof gossip with mandatory legacy self-announcement fallback.
 Previous: v0.40.0 - [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Added proof-carrying discovery gossip that must match exact audited local replica evidence before PeerStore import.
@@ -1550,6 +1551,32 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [GOSSIP-OUTCOME-INTEGRITY 2026-07-28 by Codex] -->
+2026-07-28 - Added outbound gossip outcome integrity and responsibility split.
+- Files changed:
+  - crates/aeronyx-server/src/server.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Architecture:
+  - Optional Directory proof negotiation/transmission is one isolated exchange.
+  - Mandatory legacy descriptor/snapshot synchronization is a second exchange.
+  - A per-peer report preserves both outcomes without changing either wire
+    contract, while a round accumulator owns all aggregate counter fan-in.
+  - Negotiation progress is a typed `NotChecked / LegacyOnly / Attempted`
+    state, preventing contradictory boolean combinations in runtime telemetry.
+- Bug fixed:
+  - A successful or rejected proof was previously returned only when the later
+    legacy exchange also completed. Descriptor/snapshot failure therefore
+    erased valid proof telemetry and understated convergence or rejection.
+  - Proof results are now retained even when the legacy exchange fails; the
+    legacy failure still controls the ordinary gossip success/backoff state.
+- Compatibility:
+  - No endpoint, discovery message, signed descriptor, Directory block,
+    inclusion proof, persistence schema, feature flag, or retry policy changed.
+- Privacy boundary:
+  - Reports and accumulators retain only aggregate counters and bounded phase
+    reason buckets. They contain no peer ids, URLs, producers, hashes, proofs,
+    routes, messages, payloads, clients, traffic, or social graph metadata.
+
 <!-- [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] -->
 2026-07-28 - Added Directory Proof Gossip Reliability V2.
 - Files changed:
