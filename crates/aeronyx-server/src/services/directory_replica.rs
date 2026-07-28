@@ -73,6 +73,9 @@
 //! - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Retains a fixed-size
 //!   outcome-class window so recent instability cannot be hidden by one final
 //!   success, without adding any identity-bearing metric dimension.
+//! - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Owns transport health
+//!   policy and degradation/recovery transitions inside the runtime, while
+//!   keeping all wall-clock diagnostic timestamps monotonic.
 //! - Re-verifies one carrier-returned retained mirror anchor without importing
 //!   it, enabling a production smoke test with no authority or storage change.
 //! - Builds operator-scoped portable observation certificates only from the
@@ -134,6 +137,8 @@
 //!     transport outcome without retaining any peer- or request-level dimension.
 //! 21. Maintain a fixed 32-outcome health window beside lifetime totals so
 //!     status reflects recent behavior rather than only the final completion.
+//! 22. Classify health and record aggregate degradation/recovery transitions
+//!     in the runtime so API presentation cannot drift from service policy.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -170,6 +175,9 @@
 //! - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Keep the recent window
 //!   fixed-size and outcome-only. It must never retain timestamps per request,
 //!   identities, endpoints, operations, frames, hashes, or payload data.
+//! - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Lifecycle timestamps
+//!   are aggregate transition diagnostics only. They are process-local, must
+//!   never open durable security incidents, and must not affect routing.
 //! - Witness policy epochs describe only this operator's local evidence target.
 //!   They are not a validator set, vote, quorum, fork choice, consensus, or
 //!   finality, and public status must never expose their full member identities.
@@ -194,6 +202,9 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.37.0-DirectoryTransportLifecycle - Centralized transport health policy,
+//! tracked bounded aggregate degraded/recovered transitions, and prevented
+//! diagnostic timestamps from regressing after a wall-clock rollback.
 //! v0.36.0-DirectoryTransportWindow - Added a bounded recent-outcome window
 //! so one recovery success cannot erase evidence of current transport churn.
 //! v0.35.0-DirectoryTransportTelemetry - Added process-only, mutually exclusive
@@ -1443,6 +1454,40 @@ pub enum DirectoryReplicaTransportOutcome {
 /// Entries are outcome classes only; no request metadata is retained.
 pub const DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY: usize = 32;
 const DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY_U64: u64 = 32;
+/// Recent failure percentage that marks Directory synchronization degraded.
+pub const DIRECTORY_REPLICA_TRANSPORT_DEGRADED_FAILURE_PERCENT: u64 = 20;
+/// Consecutive recent failures that mark Directory synchronization degraded.
+pub const DIRECTORY_REPLICA_TRANSPORT_DEGRADED_CONSECUTIVE_FAILURES: u64 = 3;
+
+/// Current process-local health of the Directory synchronization transport.
+///
+/// [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] This classification is
+/// diagnostic only. It cannot select peers, change authority, mutate chain
+/// evidence, or create/resolve durable security incidents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryReplicaTransportHealth {
+    /// No completed coordinator-owned request has been observed.
+    Idle,
+    /// Recent aggregate evidence remains below both degradation thresholds.
+    Healthy,
+    /// Recent failure ratio or trailing failure count reached its threshold.
+    Degraded,
+    /// Lifetime, recent-window, or transition invariants do not agree.
+    Inconsistent,
+}
+
+impl DirectoryReplicaTransportHealth {
+    /// Stable public status label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Inconsistent => "inconsistent",
+        }
+    }
+}
 
 /// Process-lifetime aggregate Directory synchronization transport telemetry.
 ///
@@ -1479,6 +1524,16 @@ pub struct DirectoryReplicaTransportSnapshot {
     pub recent_failures: u64,
     /// Trailing non-success outcomes, capped by the recent window capacity.
     pub consecutive_failures: u64,
+    /// Process-lifetime transitions from non-degraded into degraded health.
+    pub degraded_transitions: u64,
+    /// Process-lifetime transitions from degraded back into healthy health.
+    pub recovery_transitions: u64,
+    /// Monotonic wall-clock timestamp at which the current degradation began.
+    pub degraded_since_at: Option<u64>,
+    /// Monotonic wall-clock timestamp of the latest degraded transition.
+    pub last_degraded_at: Option<u64>,
+    /// Monotonic wall-clock timestamp of the latest recovery transition.
+    pub last_recovered_at: Option<u64>,
     /// Latest completed terminal outcome.
     pub last_outcome: Option<DirectoryReplicaTransportOutcome>,
     /// Latest completed request timestamp.
@@ -1506,6 +1561,11 @@ impl Default for DirectoryReplicaTransportSnapshot {
             recent_succeeded: 0,
             recent_failures: 0,
             consecutive_failures: 0,
+            degraded_transitions: 0,
+            recovery_transitions: 0,
+            degraded_since_at: None,
+            last_degraded_at: None,
+            last_recovered_at: None,
             last_outcome: None,
             last_request_at: None,
             last_success_at: None,
@@ -1526,6 +1586,82 @@ impl DirectoryReplicaTransportSnapshot {
             .saturating_add(self.http_status_failures)
             .saturating_add(self.response_too_large)
             .saturating_add(self.response_body_read_failures)
+    }
+
+    /// Returns the failure percentage represented by the bounded recent window.
+    #[must_use]
+    pub const fn recent_failure_percent(&self) -> u64 {
+        if self.recent_requests == 0 {
+            0
+        } else {
+            self.recent_failures.saturating_mul(100) / self.recent_requests
+        }
+    }
+
+    /// Verifies the mutually exclusive process-lifetime outcome counters.
+    #[must_use]
+    pub const fn terminal_outcomes_consistent(&self) -> bool {
+        self.terminal_outcomes() == self.requests
+    }
+
+    /// Verifies bounded recent-window counters independently from lifetime data.
+    #[must_use]
+    pub const fn recent_outcomes_consistent(&self) -> bool {
+        self.recent_succeeded.saturating_add(self.recent_failures) == self.recent_requests
+            && self.recent_window_capacity > 0
+            && self.recent_requests <= self.recent_window_capacity
+            && self.recent_requests <= self.requests
+            && self.consecutive_failures <= self.recent_failures
+            && self.consecutive_failures <= self.recent_window_capacity
+            && (self.requests == 0) == (self.recent_requests == 0)
+    }
+
+    /// Verifies aggregate degradation/recovery transition invariants.
+    #[must_use]
+    pub const fn lifecycle_consistent(&self) -> bool {
+        let currently_degraded = self.recent_window_degraded();
+        let open_degradations = self
+            .degraded_transitions
+            .saturating_sub(self.recovery_transitions);
+        let transition_counts_consistent = self.degraded_transitions >= self.recovery_transitions
+            && open_degradations <= 1
+            && (open_degradations == 1) == currently_degraded;
+        let transition_presence_consistent = self.degraded_since_at.is_some() == currently_degraded
+            && (self.degraded_transitions == 0) == self.last_degraded_at.is_none()
+            && (self.recovery_transitions == 0) == self.last_recovered_at.is_none();
+        let transition_order_consistent = match (self.last_degraded_at, self.last_recovered_at) {
+            (Some(degraded), Some(recovered)) if currently_degraded => degraded >= recovered,
+            (Some(degraded), Some(recovered)) => recovered >= degraded,
+            (Some(_), None) => currently_degraded,
+            (None, None) => !currently_degraded,
+            (None, Some(_)) => false,
+        };
+        transition_counts_consistent
+            && transition_presence_consistent
+            && transition_order_consistent
+    }
+
+    /// Classifies current transport health from one canonical policy.
+    #[must_use]
+    pub const fn health(&self) -> DirectoryReplicaTransportHealth {
+        if !self.terminal_outcomes_consistent()
+            || !self.recent_outcomes_consistent()
+            || !self.lifecycle_consistent()
+        {
+            DirectoryReplicaTransportHealth::Inconsistent
+        } else if self.requests == 0 {
+            DirectoryReplicaTransportHealth::Idle
+        } else if self.recent_window_degraded() {
+            DirectoryReplicaTransportHealth::Degraded
+        } else {
+            DirectoryReplicaTransportHealth::Healthy
+        }
+    }
+
+    const fn recent_window_degraded(&self) -> bool {
+        self.recent_failure_percent() >= DIRECTORY_REPLICA_TRANSPORT_DEGRADED_FAILURE_PERCENT
+            || self.consecutive_failures
+                >= DIRECTORY_REPLICA_TRANSPORT_DEGRADED_CONSECUTIVE_FAILURES
     }
 }
 
@@ -1559,70 +1695,108 @@ impl DirectoryReplicaTransportRuntime {
         self.recent_outcomes.push_back(outcome);
         self.snapshot.requests = self.snapshot.requests.saturating_add(1);
         self.snapshot.last_outcome = Some(outcome);
-        self.snapshot.last_request_at = Some(completed_at);
+        let transition_at = latest_transport_timestamp(self.snapshot.last_request_at, completed_at);
+        self.snapshot.last_request_at = Some(transition_at);
         match outcome {
             DirectoryReplicaTransportOutcome::Succeeded => {
                 self.snapshot.succeeded = self.snapshot.succeeded.saturating_add(1);
-                self.snapshot.last_success_at = Some(completed_at);
+                self.snapshot.last_success_at = Some(latest_transport_timestamp(
+                    self.snapshot.last_success_at,
+                    completed_at,
+                ));
             }
             DirectoryReplicaTransportOutcome::ConnectTimeout => {
                 self.snapshot.connect_timeouts = self.snapshot.connect_timeouts.saturating_add(1);
-                self.snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryReplicaTransportOutcome::RequestTimeout => {
                 self.snapshot.request_timeouts = self.snapshot.request_timeouts.saturating_add(1);
-                self.snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryReplicaTransportOutcome::ConnectFailure => {
                 self.snapshot.connect_failures = self.snapshot.connect_failures.saturating_add(1);
-                self.snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryReplicaTransportOutcome::RequestFailure => {
                 self.snapshot.request_failures = self.snapshot.request_failures.saturating_add(1);
-                self.snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryReplicaTransportOutcome::HttpStatusFailure => {
                 self.snapshot.http_status_failures =
                     self.snapshot.http_status_failures.saturating_add(1);
-                self.snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryReplicaTransportOutcome::ResponseTooLarge => {
                 self.snapshot.response_too_large =
                     self.snapshot.response_too_large.saturating_add(1);
-                self.snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryReplicaTransportOutcome::ResponseBodyReadFailure => {
                 self.snapshot.response_body_read_failures =
                     self.snapshot.response_body_read_failures.saturating_add(1);
-                self.snapshot.last_failure_at = Some(completed_at);
             }
         }
+        if outcome != DirectoryReplicaTransportOutcome::Succeeded {
+            self.snapshot.last_failure_at = Some(latest_transport_timestamp(
+                self.snapshot.last_failure_at,
+                completed_at,
+            ));
+        }
+        self.refresh_recent_window();
+        self.update_lifecycle(transition_at);
     }
 
-    fn snapshot(&self) -> DirectoryReplicaTransportSnapshot {
-        let mut snapshot = self.snapshot;
-        snapshot.recent_requests =
-            u64::try_from(self.recent_outcomes.len()).unwrap_or(snapshot.recent_window_capacity);
-        snapshot.recent_succeeded = u64::try_from(
+    fn refresh_recent_window(&mut self) {
+        self.snapshot.recent_requests = u64::try_from(self.recent_outcomes.len())
+            .unwrap_or(self.snapshot.recent_window_capacity);
+        self.snapshot.recent_succeeded = u64::try_from(
             self.recent_outcomes
                 .iter()
                 .filter(|outcome| **outcome == DirectoryReplicaTransportOutcome::Succeeded)
                 .count(),
         )
-        .unwrap_or(snapshot.recent_window_capacity);
-        snapshot.recent_failures = snapshot
+        .unwrap_or(self.snapshot.recent_window_capacity);
+        self.snapshot.recent_failures = self
+            .snapshot
             .recent_requests
-            .saturating_sub(snapshot.recent_succeeded);
-        snapshot.consecutive_failures = u64::try_from(
+            .saturating_sub(self.snapshot.recent_succeeded);
+        self.snapshot.consecutive_failures = u64::try_from(
             self.recent_outcomes
                 .iter()
                 .rev()
                 .take_while(|outcome| **outcome != DirectoryReplicaTransportOutcome::Succeeded)
                 .count(),
         )
-        .unwrap_or(snapshot.recent_window_capacity);
-        snapshot
+        .unwrap_or(self.snapshot.recent_window_capacity);
     }
+
+    fn update_lifecycle(&mut self, transition_at: u64) {
+        let currently_degraded = self.snapshot.degraded_since_at.is_some();
+        let next_degraded = self.snapshot.recent_window_degraded();
+        match (currently_degraded, next_degraded) {
+            (false, true) => {
+                self.snapshot.degraded_transitions =
+                    self.snapshot.degraded_transitions.saturating_add(1);
+                self.snapshot.degraded_since_at = Some(transition_at);
+                self.snapshot.last_degraded_at = Some(latest_transport_timestamp(
+                    self.snapshot.last_degraded_at,
+                    transition_at,
+                ));
+            }
+            (true, false) => {
+                self.snapshot.recovery_transitions =
+                    self.snapshot.recovery_transitions.saturating_add(1);
+                self.snapshot.degraded_since_at = None;
+                self.snapshot.last_recovered_at = Some(latest_transport_timestamp(
+                    self.snapshot.last_recovered_at,
+                    transition_at,
+                ));
+            }
+            (false, false) | (true, true) => {}
+        }
+    }
+
+    const fn snapshot(&self) -> DirectoryReplicaTransportSnapshot {
+        self.snapshot
+    }
+}
+
+fn latest_transport_timestamp(current: Option<u64>, candidate: u64) -> u64 {
+    current.map_or(candidate, |timestamp| timestamp.max(candidate))
 }
 
 /// Runtime-only synchronization observation for one pinned producer.
@@ -14205,6 +14379,15 @@ mod tests {
         assert_eq!(snapshot.recent_succeeded, 1);
         assert_eq!(snapshot.recent_failures, 7);
         assert_eq!(snapshot.consecutive_failures, 7);
+        assert_eq!(snapshot.degraded_transitions, 1);
+        assert_eq!(snapshot.recovery_transitions, 0);
+        assert_eq!(snapshot.degraded_since_at, Some(NOW + 1));
+        assert_eq!(snapshot.last_degraded_at, Some(NOW + 1));
+        assert_eq!(snapshot.last_recovered_at, None);
+        assert!(snapshot.terminal_outcomes_consistent());
+        assert!(snapshot.recent_outcomes_consistent());
+        assert!(snapshot.lifecycle_consistent());
+        assert_eq!(snapshot.health(), DirectoryReplicaTransportHealth::Degraded);
         assert_eq!(
             snapshot.last_outcome,
             Some(DirectoryReplicaTransportOutcome::ResponseBodyReadFailure)
@@ -14229,6 +14412,10 @@ mod tests {
         assert_eq!(failed.recent_succeeded, 0);
         assert_eq!(failed.recent_failures, 32);
         assert_eq!(failed.consecutive_failures, 32);
+        assert_eq!(failed.degraded_transitions, 1);
+        assert_eq!(failed.recovery_transitions, 0);
+        assert_eq!(failed.degraded_since_at, Some(NOW));
+        assert_eq!(failed.health(), DirectoryReplicaTransportHealth::Degraded);
 
         for _ in 0..DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY {
             runtime.record_directory_sync_transport_outcome(
@@ -14246,6 +14433,67 @@ mod tests {
         assert_eq!(recovered.recent_succeeded, 32);
         assert_eq!(recovered.recent_failures, 0);
         assert_eq!(recovered.consecutive_failures, 0);
+        assert_eq!(recovered.degraded_transitions, 1);
+        assert_eq!(recovered.recovery_transitions, 1);
+        assert_eq!(recovered.degraded_since_at, None);
+        assert_eq!(recovered.last_degraded_at, Some(NOW));
+        assert_eq!(recovered.last_recovered_at, Some(NOW + 1));
+        assert!(recovered.lifecycle_consistent());
+        assert_eq!(recovered.health(), DirectoryReplicaTransportHealth::Healthy);
+    }
+
+    #[test]
+    fn directory_sync_transport_lifecycle_survives_wall_clock_rollback() {
+        // [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] NTP or operator
+        // clock rollback must not regress public ages or duplicate lifecycle
+        // transitions while the bounded health window changes state.
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::Succeeded,
+            NOW + 10,
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::RequestFailure,
+            NOW + 5,
+        );
+
+        let degraded = runtime.directory_sync_transport_snapshot();
+        assert_eq!(degraded.last_request_at, Some(NOW + 10));
+        assert_eq!(degraded.last_success_at, Some(NOW + 10));
+        assert_eq!(degraded.last_failure_at, Some(NOW + 5));
+        assert_eq!(degraded.degraded_transitions, 1);
+        assert_eq!(degraded.degraded_since_at, Some(NOW + 10));
+        assert_eq!(degraded.health(), DirectoryReplicaTransportHealth::Degraded);
+
+        for offset in 11..=15 {
+            runtime.record_directory_sync_transport_outcome(
+                DirectoryReplicaTransportOutcome::Succeeded,
+                NOW + offset,
+            );
+        }
+        let recovered = runtime.directory_sync_transport_snapshot();
+        assert_eq!(recovered.recovery_transitions, 1);
+        assert_eq!(recovered.last_recovered_at, Some(NOW + 14));
+        assert_eq!(recovered.health(), DirectoryReplicaTransportHealth::Healthy);
+
+        for _ in 0..3 {
+            runtime.record_directory_sync_transport_outcome(
+                DirectoryReplicaTransportOutcome::ConnectTimeout,
+                NOW + 2,
+            );
+        }
+        let degraded_again = runtime.directory_sync_transport_snapshot();
+        assert_eq!(degraded_again.last_request_at, Some(NOW + 15));
+        assert_eq!(degraded_again.last_failure_at, Some(NOW + 5));
+        assert_eq!(degraded_again.degraded_transitions, 2);
+        assert_eq!(degraded_again.recovery_transitions, 1);
+        assert_eq!(degraded_again.degraded_since_at, Some(NOW + 15));
+        assert_eq!(degraded_again.last_degraded_at, Some(NOW + 15));
+        assert!(degraded_again.lifecycle_consistent());
+        assert_eq!(
+            degraded_again.health(),
+            DirectoryReplicaTransportHealth::Degraded
+        );
     }
 
     #[test]

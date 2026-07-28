@@ -61,6 +61,9 @@
 //! - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Derives current health
 //!   from a fixed recent outcome window so one final success cannot conceal
 //!   meaningful process-local transport churn.
+//! - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Presents canonical
+//!   service-owned health plus aggregate degraded/recovered transitions without
+//!   conflating transport availability with durable chain incidents.
 //! - Reports aggregate routeable carrier and signed-region-hint diversity
 //!   counts while explicitly rejecting operator/ASN diversity claims.
 //! - Separates signed carrier capability evidence from unadvertised
@@ -98,6 +101,8 @@
 //!     verifying that terminal buckets still sum to completed requests.
 //! 16. Derive transport health from a fixed recent aggregate window and verify
 //!     its bounded counters independently from process-lifetime totals.
+//! 17. Verify the service-owned degradation/recovery lifecycle and expose only
+//!     aggregate transition counts and ages.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -141,8 +146,12 @@
 //!   payload, authority, reputation, routing-rank, or consensus dimensions.
 //! - Recent transport health may expose only fixed-window aggregate counts.
 //!   Never serialize the underlying outcome sequence or per-request timestamp.
+//! - Transport degradation is availability telemetry, not authenticated fork
+//!   evidence. Never insert it into the durable Directory incident ledger.
 //!
 //! ## Last Modified
+//! `v0.29.0-DirectoryTransportLifecycleStatus` - Centralized health policy in
+//! the service runtime and exposed aggregate degraded/recovered transitions.
 //! `v0.28.0-DirectoryTransportWindowStatus` - Replaced last-result-only health
 //! with a bounded recent failure ratio and consecutive-failure gate.
 //! `v0.27.0-DirectoryTransportStatus` - Added additive process-only
@@ -221,7 +230,9 @@ use crate::api::directory_replica_sync::{
 use crate::services::directory_replica::{
     DirectoryFullNodeMirrorRuntimeSnapshot, DirectoryObservationWitnessCarrierSnapshot,
     DirectoryObservationWitnessRecoverySnapshot, DirectoryReplicaTransportOutcome,
-    DirectoryReplicaTransportSnapshot, MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS,
+    DirectoryReplicaTransportSnapshot, DIRECTORY_REPLICA_TRANSPORT_DEGRADED_CONSECUTIVE_FAILURES,
+    DIRECTORY_REPLICA_TRANSPORT_DEGRADED_FAILURE_PERCENT,
+    MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS,
 };
 use crate::services::{
     DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaIncidentEvidence,
@@ -467,14 +478,23 @@ struct DirectoryReplicaTransportStatus {
     consecutive_failures: u64,
     degraded_failure_percent: u64,
     degraded_consecutive_failures: u64,
+    degraded_transitions: u64,
+    recovery_transitions: u64,
+    degraded_since_age_seconds: Option<u64>,
+    last_degraded_age_seconds: Option<u64>,
+    last_recovered_age_seconds: Option<u64>,
     last_outcome: Option<&'static str>,
     last_request_age_seconds: Option<u64>,
     last_success_age_seconds: Option<u64>,
     last_failure_age_seconds: Option<u64>,
     terminal_outcomes_consistent: bool,
     recent_outcomes_consistent: bool,
+    lifecycle_consistent: bool,
     health_basis: &'static str,
+    policy_owner: &'static str,
+    lifecycle_basis: &'static str,
     persistence: &'static str,
+    incident_boundary: &'static str,
     authority_boundary: &'static str,
     privacy_boundary: &'static str,
     security_model: &'static str,
@@ -1880,37 +1900,12 @@ fn build_directory_sync_transport_status(
     generated_at: u64,
     runtime: &DirectoryReplicaTransportSnapshot,
 ) -> DirectoryReplicaTransportStatus {
-    const DEGRADED_FAILURE_PERCENT: u64 = 20;
-    const DEGRADED_CONSECUTIVE_FAILURES: u64 = 3;
-
     let terminal_outcomes = runtime.terminal_outcomes();
-    let terminal_outcomes_consistent = terminal_outcomes == runtime.requests;
-    let recent_outcomes_consistent = runtime
-        .recent_succeeded
-        .saturating_add(runtime.recent_failures)
-        == runtime.recent_requests
-        && runtime.recent_window_capacity > 0
-        && runtime.recent_requests <= runtime.recent_window_capacity
-        && runtime.recent_requests <= runtime.requests
-        && runtime.consecutive_failures <= runtime.recent_failures
-        && runtime.consecutive_failures <= runtime.recent_window_capacity
-        && (runtime.requests == 0) == (runtime.recent_requests == 0);
-    let recent_failure_percent = if runtime.recent_requests == 0 {
-        0
-    } else {
-        runtime.recent_failures.saturating_mul(100) / runtime.recent_requests
-    };
-    let status = if !terminal_outcomes_consistent || !recent_outcomes_consistent {
-        "inconsistent"
-    } else if runtime.requests == 0 {
-        "idle"
-    } else if recent_failure_percent >= DEGRADED_FAILURE_PERCENT
-        || runtime.consecutive_failures >= DEGRADED_CONSECUTIVE_FAILURES
-    {
-        "degraded"
-    } else {
-        "healthy"
-    };
+    let terminal_outcomes_consistent = runtime.terminal_outcomes_consistent();
+    let recent_outcomes_consistent = runtime.recent_outcomes_consistent();
+    let lifecycle_consistent = runtime.lifecycle_consistent();
+    let recent_failure_percent = runtime.recent_failure_percent();
+    let status = runtime.health().as_str();
     let last_outcome = runtime.last_outcome.map(|outcome| match outcome {
         DirectoryReplicaTransportOutcome::Succeeded => "succeeded",
         DirectoryReplicaTransportOutcome::ConnectTimeout => "connect_timeout",
@@ -1941,8 +1936,20 @@ fn build_directory_sync_transport_status(
         recent_failures: runtime.recent_failures,
         recent_failure_percent,
         consecutive_failures: runtime.consecutive_failures,
-        degraded_failure_percent: DEGRADED_FAILURE_PERCENT,
-        degraded_consecutive_failures: DEGRADED_CONSECUTIVE_FAILURES,
+        degraded_failure_percent: DIRECTORY_REPLICA_TRANSPORT_DEGRADED_FAILURE_PERCENT,
+        degraded_consecutive_failures:
+            DIRECTORY_REPLICA_TRANSPORT_DEGRADED_CONSECUTIVE_FAILURES,
+        degraded_transitions: runtime.degraded_transitions,
+        recovery_transitions: runtime.recovery_transitions,
+        degraded_since_age_seconds: runtime
+            .degraded_since_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_degraded_age_seconds: runtime
+            .last_degraded_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_recovered_age_seconds: runtime
+            .last_recovered_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
         last_outcome,
         last_request_age_seconds: runtime
             .last_request_at
@@ -1955,12 +1962,18 @@ fn build_directory_sync_transport_status(
             .map(|timestamp| generated_at.saturating_sub(timestamp)),
         terminal_outcomes_consistent,
         recent_outcomes_consistent,
+        lifecycle_consistent,
         health_basis: "bounded_recent_terminal_outcome_window",
+        policy_owner: "directory_replica_service_runtime",
+        lifecycle_basis:
+            "process_local_aggregate_degraded_and_recovered_transitions_with_monotonic_timestamps",
         persistence: "process_lifetime_only",
+        incident_boundary:
+            "availability_lifecycle_only_not_durable_directory_security_incident_or_resolution",
         authority_boundary:
             "transport_diagnostics_only_not_directory_authority_replica_truth_or_peer_reputation",
         privacy_boundary:
-            "aggregate lifetime and fixed-window outcome counters and ages only; no outcome sequence peer producer carrier endpoint url operation status-code request id frame payload or user-plane data",
+            "aggregate lifetime fixed-window and lifecycle counters and ages only; no outcome sequence peer producer carrier endpoint url operation status-code request id frame payload or user-plane data",
         security_model:
             "transport_health_not_vote_validator_set_quorum_fork_choice_consensus_or_finality",
     }
@@ -2412,6 +2425,9 @@ mod tests {
             recent_succeeded: 29,
             recent_failures: 3,
             consecutive_failures: 3,
+            degraded_transitions: 1,
+            degraded_since_at: Some(100),
+            last_degraded_at: Some(100),
             last_outcome: Some(DirectoryReplicaTransportOutcome::RequestFailure),
             last_request_at: Some(100),
             last_success_at: Some(90),
@@ -2424,11 +2440,23 @@ mod tests {
         assert_eq!(streak_degraded.recent_failure_percent, 9);
         assert!(streak_degraded.terminal_outcomes_consistent);
         assert!(streak_degraded.recent_outcomes_consistent);
+        assert!(streak_degraded.lifecycle_consistent);
 
         runtime.consecutive_failures = 0;
+        runtime.recovery_transitions = 1;
+        runtime.degraded_since_at = None;
+        runtime.last_recovered_at = Some(110);
         let recovered = build_directory_sync_transport_status(110, &runtime);
         assert_eq!(recovered.status, "healthy");
+        assert_eq!(recovered.last_recovered_age_seconds, Some(0));
+        assert!(recovered.lifecycle_consistent);
 
+        runtime.recovery_transitions = 0;
+        let lifecycle_inconsistent = build_directory_sync_transport_status(110, &runtime);
+        assert_eq!(lifecycle_inconsistent.status, "inconsistent");
+        assert!(!lifecycle_inconsistent.lifecycle_consistent);
+
+        runtime.recovery_transitions = 1;
         runtime.recent_requests = 33;
         let inconsistent = build_directory_sync_transport_status(110, &runtime);
         assert_eq!(inconsistent.status, "inconsistent");
@@ -2516,6 +2544,25 @@ mod tests {
             Some(3)
         );
         assert_eq!(
+            parsed["directory_sync_transport"]["degraded_transitions"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["recovery_transitions"].as_u64(),
+            Some(0)
+        );
+        assert!(
+            parsed["directory_sync_transport"]["degraded_since_age_seconds"]
+                .as_u64()
+                .is_some_and(|age| age <= 3)
+        );
+        assert!(
+            parsed["directory_sync_transport"]["last_degraded_age_seconds"]
+                .as_u64()
+                .is_some_and(|age| age <= 3)
+        );
+        assert!(parsed["directory_sync_transport"]["last_recovered_age_seconds"].is_null());
+        assert_eq!(
             parsed["directory_sync_transport"]["last_outcome"].as_str(),
             Some("succeeded")
         );
@@ -2528,8 +2575,22 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            parsed["directory_sync_transport"]["lifecycle_consistent"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
             parsed["directory_sync_transport"]["health_basis"].as_str(),
             Some("bounded_recent_terminal_outcome_window")
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["policy_owner"].as_str(),
+            Some("directory_replica_service_runtime")
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["incident_boundary"].as_str(),
+            Some(
+                "availability_lifecycle_only_not_durable_directory_security_incident_or_resolution"
+            )
         );
         assert_eq!(
             parsed["directory_sync_transport"]["persistence"].as_str(),

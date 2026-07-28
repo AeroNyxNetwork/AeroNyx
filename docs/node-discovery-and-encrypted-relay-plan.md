@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.53.0 - Bounded recent Directory transport health.
+Modification Reason: v0.54.0 - Directory transport degradation/recovery lifecycle.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.53.0 - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Classifies Directory synchronization health from a fixed recent outcome window so one final success cannot conceal meaningful transport churn, without retaining identity-bearing request history.
+Last Modified: v0.54.0 - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Centralizes Directory transport health policy in the service runtime, records aggregate degraded/recovered transitions, and prevents diagnostic timestamps from regressing after wall-clock rollback.
+Previous: v0.53.0 - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Classifies Directory synchronization health from a fixed recent outcome window so one final success cannot conceal meaningful transport churn, without retaining identity-bearing request history.
 Previous: v0.52.0 - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Classifies every completed coordinator-owned Directory HTTP exchange into one mutually exclusive process-only outcome without peer, endpoint, operation, status-code, frame, or payload dimensions.
 Previous: v0.51.0 - [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Restores the Directory replica synchronizer's canonical 10-second failover deadline while retaining a separate 12-second process-lifetime operator diagnostic profile.
 Previous: v0.50.0 - [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Built bounded control, shared Directory, MemChain sync, and gossip transports once before mutable services started, then reused their connection pools across runtime tasks.
@@ -93,6 +94,17 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.54 Directory transport degradation/recovery lifecycle
+
+[DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex]
+
+- Directory transport health policy now belongs to the service runtime rather than the HTTP presentation layer. The API serializes the canonical service-owned classification, thresholds, invariants, and transition evidence instead of independently reimplementing them.
+- The process runtime records aggregate transitions into `degraded` and back into `healthy`, the current degradation age, and the latest degraded/recovered ages. Repeated failures while already degraded and repeated successes while healthy do not create duplicate transitions.
+- Lifecycle invariants fail closed: degraded transitions may exceed recovery transitions by at most one, an open transition must agree with current bounded-window health, transition timestamps must exist exactly when their counters require them, and their ordering must agree with the current state.
+- Transport timestamps are monotonic maxima. If wall-clock time moves backward because of NTP or operator correction, public ages and lifecycle ordering do not regress even though the outcome is still counted.
+- This lifecycle is process-only availability telemetry. It never inserts or resolves a durable Directory security incident, never changes producer quarantine, and never affects authority, peer reputation, routing, fork choice, consensus, or finality.
+- Public status remains aggregate-only: no outcome sequence, per-request timestamp, peer, producer, carrier, endpoint, URL, operation, status code, request id, frame, payload, or user-plane data is retained or serialized.
 
 ### v0.53 Bounded recent Directory transport health
 
