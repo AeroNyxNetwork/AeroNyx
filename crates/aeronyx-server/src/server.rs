@@ -540,6 +540,7 @@ use crate::api::directory_replica_sync::{
     run_directory_carrier_cold_bootstrap_smoke, run_directory_mirror_carrier_smoke,
     DirectoryCarrierColdBootstrapSmokeReport, DirectoryMirrorCarrierSmokeReport,
     DirectoryReplicaSyncCoordinator, DirectoryReplicaSyncPolicy,
+    DirectoryReplicaSyncResources,
 };
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
@@ -1821,6 +1822,77 @@ where
     }
 }
 
+/// Process-lifetime HTTP transports for authenticated node-to-node traffic.
+///
+/// [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Each profile preserves its
+/// historical timeout and pool budget while sharing one connection pool for
+/// the complete server lifetime. Building every profile before mutable
+/// services start prevents a configured protocol capability from disappearing
+/// later because one background task failed to initialize its own client.
+#[derive(Clone)]
+struct PeerHttpClients {
+    /// Short control requests: relay, witnesses, leases, and cache anchors.
+    control: Arc<reqwest::Client>,
+    /// Directory replica and carrier requests with a bounded larger deadline.
+    directory: Arc<reqwest::Client>,
+    /// Long-running MemChain page and checkpoint synchronization requests.
+    sync: Arc<reqwest::Client>,
+    /// Discovery gossip with its operator-configured fetch timeout and pool.
+    gossip: Arc<reqwest::Client>,
+}
+
+impl PeerHttpClients {
+    fn build(config: &ServerConfig) -> Result<Self> {
+        fn finish(
+            profile: &'static str,
+            builder: reqwest::ClientBuilder,
+        ) -> Result<Arc<reqwest::Client>> {
+            builder.build().map(Arc::new).map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "privacy-safe peer HTTP {profile} client initialization failed: {error}"
+                ))
+            })
+        }
+
+        let control = finish(
+            "control",
+            privacy_safe_peer_http_client_builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(5))
+                .pool_max_idle_per_host(1),
+        )?;
+        let directory = finish(
+            "directory",
+            privacy_safe_peer_http_client_builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(12))
+                .pool_max_idle_per_host(1),
+        )?;
+        let sync = finish(
+            "sync",
+            privacy_safe_peer_http_client_builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(15))
+                .pool_max_idle_per_host(1),
+        )?;
+        let gossip = finish(
+            "gossip",
+            privacy_safe_peer_http_client_builder()
+                .timeout(Duration::from_secs(
+                    config.discovery.fetch_timeout_secs,
+                ))
+                .pool_max_idle_per_host(8)
+                .pool_idle_timeout(Duration::from_secs(90)),
+        )?;
+        Ok(Self {
+            control,
+            directory,
+            sync,
+            gossip,
+        })
+    }
+}
+
 pub struct Server {
     config: ServerConfig,
     identity: IdentityKeyPair,
@@ -1847,6 +1919,14 @@ impl Server {
 
     pub async fn run(&self) -> Result<()> {
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
+
+        let peer_http_clients = PeerHttpClients::build(&self.config)?;
+        info!(
+            profiles = 4,
+            proxy = false,
+            redirects = false,
+            "[PEER_HTTP] Process-lifetime privacy-safe transports initialized"
+        );
 
         // Onion routing forward secrecy: initialize the in-memory rotating onion
         // key at startup. It is never persisted, so a restart yields a fresh key
@@ -1920,23 +2000,38 @@ impl Server {
         };
         let chat_relay_runtime_ready = chat_relay.is_some();
 
-        let peer_store = self.init_peer_store(chat_relay_runtime_ready).await;
+        let peer_store = self
+            .init_peer_store(
+                chat_relay_runtime_ready,
+                peer_http_clients.control.as_ref(),
+            )
+            .await;
         let directory_chain_store = self.init_directory_chain(&peer_store).await?;
         let directory_replica_store = self.init_directory_replica().await?;
         let directory_replica_sync_runtime =
             Arc::new(DirectoryReplicaSyncRuntime::default());
         if let Some(ref commitment_storage) = storage {
-            self.verify_memchain_commitment_startup_witnesses(commitment_storage, &peer_store)
-                .await?;
+            self.verify_memchain_commitment_startup_witnesses(
+                commitment_storage,
+                &peer_store,
+                peer_http_clients.control.as_ref(),
+            )
+            .await?;
         }
         let commitment_coordinator_lease_instance = if let Some(ref commitment_storage) = storage {
-            self.acquire_memchain_commitment_coordinator_lease(commitment_storage, &peer_store)
+            self.acquire_memchain_commitment_coordinator_lease(
+                commitment_storage,
+                &peer_store,
+                peer_http_clients.control.as_ref(),
+            )
             .await?
         } else {
             None
         };
-        let peer_store_persistence_task =
-            self.spawn_peer_store_persistence_task(Arc::clone(&peer_store));
+        let peer_store_persistence_task = self.spawn_peer_store_persistence_task(
+            Arc::clone(&peer_store),
+            Arc::clone(&peer_http_clients.control),
+        );
         let directory_chain_persistence_task = self.spawn_directory_chain_persistence_task(
             Arc::clone(&peer_store),
             directory_chain_store.clone(),
@@ -1945,13 +2040,14 @@ impl Server {
             Arc::clone(&peer_store),
             directory_replica_store.clone(),
             Arc::clone(&directory_replica_sync_runtime),
+            Arc::clone(&peer_http_clients.directory),
         );
-        let discovery_gossip_task =
-            self.spawn_discovery_gossip_task(
-                Arc::clone(&peer_store),
-                directory_replica_store.clone(),
-                chat_relay_runtime_ready,
-            );
+        let discovery_gossip_task = self.spawn_discovery_gossip_task(
+            Arc::clone(&peer_store),
+            directory_replica_store.clone(),
+            chat_relay_runtime_ready,
+            Arc::clone(&peer_http_clients.gossip),
+        );
 
         let udp = Arc::new(
             UdpTransport::bind_addr(self.config.listen_addr())
@@ -2062,6 +2158,7 @@ impl Server {
             chat_relay.clone(),
             Arc::clone(&routing),
             Arc::clone(&peer_store),
+            Arc::clone(&peer_http_clients.control),
         );
         tasks.push(("udp", udp_task));
 
@@ -2310,6 +2407,7 @@ impl Server {
                 chat_relay.clone(),
                 blind_vault.clone(),
                 Arc::clone(&udp),
+                &peer_http_clients,
                 commitment_sync_tip_notifier,
             )?;
             tasks.push(("node-api", api_task));
@@ -2319,6 +2417,7 @@ impl Server {
                 Arc::clone(st),
                 Arc::clone(&peer_store),
                 commitment_sync_tip_rx,
+                Arc::clone(&peer_http_clients.sync),
             ) {
                 tasks.push(("memchain-block-sync", sync_task));
             }
@@ -2326,6 +2425,7 @@ impl Server {
                 Arc::clone(st),
                 Arc::clone(&peer_store),
                 commitment_tip_rx,
+                Arc::clone(&peer_http_clients.sync),
             ) {
                 tasks.push(("memchain-checkpoint-witness", reconciliation_task));
             }
@@ -2333,6 +2433,7 @@ impl Server {
                 Arc::clone(st),
                 Arc::clone(&peer_store),
                 commitment_coordinator_lease_instance,
+                Arc::clone(&peer_http_clients.control),
             ) {
                 tasks.push(("memchain-coordinator-lease", lease_task));
             }
@@ -2517,6 +2618,7 @@ impl Server {
                 chat_relay.clone(),
                 blind_vault.clone(),
                 Arc::clone(&udp),
+                &peer_http_clients,
                 None,
             )?;
             tasks.push(("node-api", api_task));
@@ -3138,6 +3240,7 @@ impl Server {
         chat_relay: Option<Arc<ChatRelayService>>,
         blind_vault: Option<Arc<BlindVaultService>>,
         udp: Arc<UdpTransport>,
+        peer_http_clients: &PeerHttpClients,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
     ) -> Result<JoinHandle<()>> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -3155,35 +3258,16 @@ impl Server {
         );
         let public_api_listen_addr = self.config.discovery.public_api_listen_addr;
         let node_identity = Arc::new(self.identity.clone());
-        // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] Every runtime using this
-        // client resolves permissionless descriptors. Fail startup instead of
-        // silently falling back to a redirect/proxy-enabled default client.
-        let peer_http_client = Arc::new(
-            privacy_safe_peer_http_client_builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .map_err(|error| {
-                    ServerError::startup_failed(format!(
-                        "privacy-safe peer HTTP client initialization failed: {error}"
-                    ))
-                })?,
-        );
+        let peer_http_client = Arc::clone(&peer_http_clients.control);
         let smoke_peer_store = Arc::clone(&peer_store);
         let smoke_node_identity = Arc::clone(&node_identity);
         let smoke_peer_http_client = Arc::clone(&peer_http_client);
         let smoke_local_capability_status = local_capability_status.clone();
-        // [MIRROR-CARRIER-SMOKE 2026-07-25 by Codex] Directory evidence
-        // transport never inherits host proxy settings or follows redirects:
-        // either would add an unreviewed metadata observer/identity boundary.
-        let directory_carrier_smoke_http_client = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(12))
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(1)
-            .build()
-            .ok()
-            .map(Arc::new);
+        // [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Operator smokes share
+        // the same process-lifetime directory pool as replica synchronization.
+        // `Some` preserves the existing unavailable-reporting route contract.
+        let directory_carrier_smoke_http_client =
+            Some(Arc::clone(&peer_http_clients.directory));
         let directory_carrier_smoke_store = directory_replica_store.clone();
         let directory_carrier_smoke_peer_store = Arc::clone(&peer_store);
         let directory_carrier_smoke_identity = Arc::clone(&node_identity);
@@ -4273,7 +4357,11 @@ impl Server {
     // Core Services
     // ============================================
 
-    async fn init_peer_store(&self, chat_relay_runtime_ready: bool) -> Arc<PeerStore> {
+    async fn init_peer_store(
+        &self,
+        chat_relay_runtime_ready: bool,
+        control_http_client: &reqwest::Client,
+    ) -> Arc<PeerStore> {
         let peer_store = Arc::new(PeerStore::new());
         peer_store.set_max_peers(Some(self.config.discovery.max_peers));
         peer_store.configure_verified_delivery_witness_requesters(
@@ -4470,6 +4558,7 @@ impl Server {
                     &self.identity,
                     &peer_store,
                     &self.config.discovery,
+                    control_http_client,
                     path,
                     cache_save_at,
                     true,
@@ -4683,6 +4772,7 @@ impl Server {
         identity: &IdentityKeyPair,
         peer_store: &PeerStore,
         discovery: &DiscoveryConfig,
+        client: &reqwest::Client,
         path: &str,
         startup_gate: bool,
     ) -> PeerStoreVerifiedClientDeliveryExternalWitnessDecision {
@@ -4778,39 +4868,10 @@ impl Server {
                 );
             }
         };
-        let client = match privacy_safe_peer_http_client_builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(1)
-            .build()
-        {
-            Ok(client) => client,
-            Err(_) => {
-                let round = PeerStoreVerifiedDeliveryWitnessRound {
-                    configured: witness_node_ids.len() as u64,
-                    failed: witness_node_ids.len() as u64,
-                    ..PeerStoreVerifiedDeliveryWitnessRound::default()
-                };
-                let status = peer_store.record_client_delivery_witness_round(
-                    evaluated_at,
-                    anchor.cache_generation,
-                    discovery.verified_delivery_witness_required_for_restore,
-                    discovery.verified_delivery_witness_min_verified,
-                    round,
-                );
-                if startup_gate && discovery.verified_delivery_witness_required_for_restore {
-                    peer_store.clear_restored_verified_client_delivery_evidence(
-                        evaluated_at,
-                        "external_witness_unavailable",
-                    );
-                }
-                return PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Unprotected(status);
-            }
-        };
         let round = match witness_verified_delivery_anchor(
             peer_store,
             identity,
-            &client,
+            client,
             &witness_node_ids,
             anchor.cache_generation,
             &digest,
@@ -4861,6 +4922,7 @@ impl Server {
         identity: &IdentityKeyPair,
         peer_store: &PeerStore,
         discovery: &DiscoveryConfig,
+        control_http_client: &reqwest::Client,
         path: &str,
         now: u64,
         startup_gate: bool,
@@ -4875,6 +4937,7 @@ impl Server {
                 identity,
                 peer_store,
                 discovery,
+                control_http_client,
                 path,
                 startup_gate,
             )
@@ -4920,6 +4983,7 @@ impl Server {
                 identity,
                 peer_store,
                 discovery,
+                control_http_client,
                 path,
                 startup_gate,
             )
@@ -5079,6 +5143,7 @@ impl Server {
         peer_store: Arc<PeerStore>,
         store: Option<Arc<DirectoryReplicaStore>>,
         runtime: Arc<DirectoryReplicaSyncRuntime>,
+        directory_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
         let peers = self
             .config
@@ -5107,13 +5172,16 @@ impl Server {
             .config
             .discovery
             .directory_observation_witness_min_verified;
-        let coordinator = match DirectoryReplicaSyncCoordinator::new_with_policy(
+        let coordinator = match DirectoryReplicaSyncCoordinator::new_with_policy_and_resources(
             peers,
             interval_secs,
-            store,
-            runtime,
-            peer_store,
-            Arc::new(self.identity.clone()),
+            DirectoryReplicaSyncResources {
+                store,
+                runtime,
+                peer_store,
+                identity: Arc::new(self.identity.clone()),
+                client: directory_http_client.as_ref().clone(),
+            },
             DirectoryReplicaSyncPolicy {
                 witness_min_verified,
                 full_node_mirror_enabled,
@@ -5201,6 +5269,7 @@ impl Server {
     fn spawn_peer_store_persistence_task(
         &self,
         peer_store: Arc<PeerStore>,
+        control_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
         if !self.config.discovery.enabled {
             return None;
@@ -5220,6 +5289,7 @@ impl Server {
             let persist_snapshot = |identity: Arc<IdentityKeyPair>,
                                     peer_store: Arc<PeerStore>,
                                     discovery: Arc<DiscoveryConfig>,
+                                    control_http_client: Arc<reqwest::Client>,
                                     path: String,
                                     reason: &'static str| async move {
                 let now = unix_now_secs();
@@ -5227,6 +5297,7 @@ impl Server {
                     identity.as_ref(),
                     &peer_store,
                     discovery.as_ref(),
+                    control_http_client.as_ref(),
                     &path,
                     now,
                     false,
@@ -5255,17 +5326,41 @@ impl Server {
                 tokio::select! {
                     _ = rx.recv() => {
                         peer_store.take_client_delivery_cache_dirty();
-                        persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), Arc::clone(&discovery), path.clone(), "shutdown").await;
+                        persist_snapshot(
+                            Arc::clone(&identity),
+                            Arc::clone(&peer_store),
+                            Arc::clone(&discovery),
+                            Arc::clone(&control_http_client),
+                            path.clone(),
+                            "shutdown",
+                        )
+                        .await;
                         break;
                     }
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) {
                             peer_store.take_client_delivery_cache_dirty();
-                            persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), Arc::clone(&discovery), path.clone(), "shutdown_flag").await;
+                            persist_snapshot(
+                                Arc::clone(&identity),
+                                Arc::clone(&peer_store),
+                                Arc::clone(&discovery),
+                                Arc::clone(&control_http_client),
+                                path.clone(),
+                                "shutdown_flag",
+                            )
+                            .await;
                             break;
                         }
                         peer_store.take_client_delivery_cache_dirty();
-                        persist_snapshot(Arc::clone(&identity), Arc::clone(&peer_store), Arc::clone(&discovery), path.clone(), "interval").await;
+                        persist_snapshot(
+                            Arc::clone(&identity),
+                            Arc::clone(&peer_store),
+                            Arc::clone(&discovery),
+                            Arc::clone(&control_http_client),
+                            path.clone(),
+                            "interval",
+                        )
+                        .await;
                     }
                     _ = peer_store.wait_for_client_delivery_cache_dirty() => {
                         tokio::time::sleep(Duration::from_millis(
@@ -5276,6 +5371,7 @@ impl Server {
                                 Arc::clone(&identity),
                                 Arc::clone(&peer_store),
                                 Arc::clone(&discovery),
+                                Arc::clone(&control_http_client),
                                 path.clone(),
                                 "client_delivery",
                             ).await;
@@ -5297,6 +5393,7 @@ impl Server {
         &self,
         storage: &MemoryStorage,
         peer_store: &PeerStore,
+        control_http_client: &reqwest::Client,
     ) -> Result<()> {
         if !self.config.memchain.commitment_coordinator_enabled {
             return Ok(());
@@ -5341,21 +5438,11 @@ impl Server {
             )));
         }
 
-        let client = privacy_safe_peer_http_client_builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(1)
-            .build()
-            .map_err(|_| {
-                ServerError::startup_failed(
-                    "MemChain external witness rollback guard: HTTP client init failed",
-                )
-            })?;
         let round = reconcile_record_commitment_pinned_witnesses_with_certificate_threshold(
             storage,
             peer_store,
             &self.identity,
-            &client,
+            control_http_client,
             &witness_node_ids,
             self.config.memchain.commitment_witness_min_verified,
         )
@@ -5457,6 +5544,7 @@ impl Server {
         &self,
         storage: &MemoryStorage,
         peer_store: &PeerStore,
+        control_http_client: &reqwest::Client,
     ) -> Result<Option<[u8; 32]>> {
         if !self.config.memchain.commitment_coordinator_lease_required {
             return Ok(None);
@@ -5471,19 +5559,11 @@ impl Server {
         while instance_id.iter().all(|byte| *byte == 0) {
             rand::rngs::OsRng.fill_bytes(&mut instance_id);
         }
-        let client = privacy_safe_peer_http_client_builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(1)
-            .build()
-            .map_err(|_| {
-                ServerError::startup_failed("MemChain coordinator lease: HTTP client init failed")
-            })?;
         let round = collect_commitment_coordinator_lease_round(
             storage,
             peer_store,
             &self.identity,
-            &client,
+            control_http_client,
             &witness_node_ids,
             &instance_id,
             self.config.memchain.commitment_coordinator_lease_ttl_secs,
@@ -5525,6 +5605,7 @@ impl Server {
         storage: Arc<MemoryStorage>,
         peer_store: Arc<PeerStore>,
         instance_id: Option<[u8; 32]>,
+        control_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
         if !self.config.memchain.commitment_coordinator_lease_required {
             return None;
@@ -5535,19 +5616,6 @@ impl Server {
         let renewal_interval_secs = (u64::from(requested_ttl_secs) / 3).max(10);
         let identity = self.identity.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let client = match privacy_safe_peer_http_client_builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(1)
-            .build()
-        {
-            Ok(client) => client,
-            Err(_) => {
-                storage.record_commitment_coordinator_lease_failure(0);
-                error!("[MEMCHAIN_BLOCK] Coordinator lease renewal unavailable: HTTP client init failed");
-                return None;
-            }
-        };
 
         Some(tokio::spawn(async move {
             info!(
@@ -5572,7 +5640,7 @@ impl Server {
                     &storage,
                     &peer_store,
                     &identity,
-                    &client,
+                    control_http_client.as_ref(),
                     &witness_node_ids,
                     &instance_id,
                     requested_ttl_secs,
@@ -5650,7 +5718,7 @@ impl Server {
             let release_round = collect_commitment_coordinator_lease_release_round(
                 &peer_store,
                 &identity,
-                &client,
+                control_http_client.as_ref(),
                 &witness_node_ids,
                 &instance_id,
             )
@@ -5687,6 +5755,7 @@ impl Server {
         storage: Arc<MemoryStorage>,
         peer_store: Arc<PeerStore>,
         mut commitment_tip_rx: mpsc::Receiver<u64>,
+        sync_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
         if !self.config.memchain.commitment_coordinator_enabled {
             return None;
@@ -5695,20 +5764,6 @@ impl Server {
         const INITIAL_DELAY_SECS: u64 = 15;
         const MIN_INTERVAL_SECS: u64 = 300;
         const MAX_WITNESSES_PER_ROUND: usize = 3;
-        let client = match privacy_safe_peer_http_client_builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .pool_max_idle_per_host(1)
-            .build()
-        {
-            Ok(client) => client,
-            Err(_) => {
-                error!(
-                    "[MEMCHAIN_BLOCK] Coordinator witness reconciliation disabled: HTTP client init failed"
-                );
-                return None;
-            }
-        };
         let identity = self.identity.clone();
         let interval_secs = self
             .config
@@ -5768,7 +5823,7 @@ impl Server {
                                         &storage,
                                         &peer_store,
                                         &identity,
-                                        &client,
+                                        sync_http_client.as_ref(),
                                         &pinned_witness_node_ids,
                                     ),
                                 ) => outcome,
@@ -5853,7 +5908,7 @@ impl Server {
                                 &storage,
                                 &peer_store,
                                 &identity,
-                                &client,
+                                sync_http_client.as_ref(),
                                 MAX_WITNESSES_PER_ROUND,
                             )
                             .await
@@ -5862,7 +5917,7 @@ impl Server {
                                 &storage,
                                 &peer_store,
                                 &identity,
-                                &client,
+                                sync_http_client.as_ref(),
                                 &pinned_witness_node_ids,
                                 certificate_minimum_signers,
                             )
@@ -5912,7 +5967,7 @@ impl Server {
                                 source_node_id,
                                 &pinned_witness_node_ids,
                                 certificate_minimum_signers,
-                                &client,
+                                sync_http_client.as_ref(),
                             ) => result,
                         };
                         match result {
@@ -6004,6 +6059,7 @@ impl Server {
         storage: Arc<MemoryStorage>,
         peer_store: Arc<PeerStore>,
         mut block_announce_rx: mpsc::Receiver<u64>,
+        sync_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
         if !self.config.memchain.commitment_sync_enabled {
             return None;
@@ -6036,27 +6092,6 @@ impl Server {
             return None;
         }
 
-        let client = match privacy_safe_peer_http_client_builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .pool_max_idle_per_host(1)
-            .build()
-        {
-            Ok(client) => client,
-            Err(_) => {
-                let now = unix_now_secs();
-                storage.record_commitment_sync_failure(
-                    now,
-                    "http_client_init_failed",
-                    1,
-                    now.saturating_add(600),
-                );
-                error!(
-                    "[MEMCHAIN_BLOCK] Follower sync disabled at runtime: HTTP client init failed"
-                );
-                return None;
-            }
-        };
         let identity = self.identity.clone();
         let base_interval_secs = self.config.memchain.commitment_sync_interval_secs;
         let max_pages_per_round = self.config.memchain.commitment_sync_max_pages_per_round;
@@ -6125,7 +6160,7 @@ impl Server {
                             &peer_store,
                             &identity,
                             &coordinator_node_id,
-                            &client,
+                            sync_http_client.as_ref(),
                         )
                         .await?;
                         let verified_blocks = outcome
@@ -6147,7 +6182,7 @@ impl Server {
                                 &peer_store,
                                 &identity,
                                 &coordinator_node_id,
-                                &client,
+                                sync_http_client.as_ref(),
                             )
                             .await
                             {
@@ -6256,6 +6291,7 @@ impl Server {
         peer_store: Arc<PeerStore>,
         directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
         chat_relay_runtime_ready: bool,
+        gossip_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
         if !self.config.discovery.enabled || !self.config.discovery.gossip_enabled {
             return None;
@@ -6266,24 +6302,6 @@ impl Server {
         let self_node_id = identity.public_key_bytes();
         let shutdown = Arc::clone(&self.shutdown);
         let mut rx = self.shutdown_tx.subscribe();
-        let client = match privacy_safe_peer_http_client_builder()
-            // [DISCOVERY-ENDPOINT-SSRF 2026-07-28 by Codex] Permissionless
-            // descriptor traffic must not inherit host proxies or follow a
-            // public endpoint redirect into a private/metadata address.
-            .timeout(Duration::from_secs(config.discovery.fetch_timeout_secs))
-            .pool_max_idle_per_host(8)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-        {
-            Ok(client) => client,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "[DISCOVERY] Failed to build outbound gossip HTTP client"
-                );
-                return None;
-            }
-        };
 
         Some(tokio::spawn(async move {
             let mut run_immediately = true;
@@ -6494,7 +6512,7 @@ impl Server {
                 let concurrency_limit = usize::from(config.discovery.gossip_concurrency_limit);
                 let peer_timeout = Duration::from_secs(config.discovery.fetch_timeout_secs);
                 let execution = DiscoveryGossipExecution {
-                    client: &client,
+                    client: gossip_http_client.as_ref(),
                     peer_store: &peer_store,
                     directory_announcements: &directory_gossip_announcements,
                     peer_identity_hints: Some(&gossip_peer_identity_hints),
@@ -6575,7 +6593,7 @@ impl Server {
                             1
                         };
                         let probes_started = Self::probe_blind_relay_candidates(
-                            &client,
+                            gossip_http_client.as_ref(),
                             &peer_store,
                             &identity,
                             &self_node_id,
@@ -6601,7 +6619,7 @@ impl Server {
 
                     if two_hop_probe_due {
                         if Self::probe_two_hop_blind_relay_path(
-                            &client,
+                            gossip_http_client.as_ref(),
                             &peer_store,
                             &identity,
                             &self_node_id,
@@ -8926,6 +8944,7 @@ impl Server {
         chat_relay: Option<Arc<ChatRelayService>>,
         routing: Arc<RoutingService>,
         peer_store: Arc<PeerStore>,
+        control_http_client: Arc<reqwest::Client>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -8936,12 +8955,6 @@ impl Server {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let crypto = DefaultTransportCrypto::new();
-            let chat_peer_client = privacy_safe_peer_http_client_builder()
-                // [PEER-ENDPOINT-SSRF 2026-07-28 by Codex] UDP-triggered
-                // relay fanout shares the permissionless host boundary.
-                .timeout(Duration::from_secs(5))
-                .build()
-                .ok();
 
             loop {
                 tokio::select! {
@@ -9079,7 +9092,7 @@ impl Server {
                                                         &session, &udp_reply, &crypto,
                                                         &sessions, &chat_relay, &peer_store,
                                                         &self_node_id, &node_identity,
-                                                        chat_peer_client.as_ref(),
+                                                        Some(control_http_client.as_ref()),
                                                     ).await;
                                                 }
                                             }
@@ -10179,7 +10192,7 @@ mod tests {
         DiscoveryGossipExecution, DiscoveryGossipFailure, DiscoveryGossipFailureKind,
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
         DiscoveryPeerIdentityHints, PeerStoreCacheDocument, PeerStoreVerifiedClientDeliveryAnchor,
-        PeerStoreVerifiedClientDeliveryCacheEvidence, Server,
+        PeerStoreVerifiedClientDeliveryCacheEvidence, PeerHttpClients, Server,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
         BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
         ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
@@ -10229,6 +10242,56 @@ mod tests {
     use crate::services::{
         DirectoryReplicaGossipAnnouncement, PeerStore, PeerStoreImportReport,
     };
+
+    #[tokio::test]
+    async fn peer_http_profiles_share_redirect_free_transport_policy() -> anyhow::Result<()> {
+        let followed = Arc::new(AtomicUsize::new(0));
+        let followed_handler = Arc::clone(&followed);
+        let router = Router::new()
+            .route(
+                "/redirect",
+                get(|| async {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, "/target")],
+                    )
+                }),
+            )
+            .route(
+                "/target",
+                get(move || {
+                    let followed = Arc::clone(&followed_handler);
+                    async move {
+                        followed.fetch_add(1, AtomicOrdering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let clients = PeerHttpClients::build(&ServerConfig::default())?;
+        let url = format!("http://{address}/redirect");
+
+        for (profile, client) in [
+            ("control", clients.control.as_ref()),
+            ("directory", clients.directory.as_ref()),
+            ("sync", clients.sync.as_ref()),
+            ("gossip", clients.gossip.as_ref()),
+        ] {
+            let response = client.get(&url).send().await?;
+            assert_eq!(
+                response.status().as_u16(),
+                StatusCode::TEMPORARY_REDIRECT.as_u16(),
+                "{profile} profile followed an untrusted redirect"
+            );
+        }
+        assert_eq!(followed.load(AtomicOrdering::SeqCst), 0);
+
+        server.abort();
+        let _ = server.await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn newer_commitment_tip_supersedes_inflight_announcement() {
@@ -14345,7 +14408,10 @@ mod tests {
         let identity = IdentityKeyPair::generate();
         let producer = identity.public_key_bytes();
         let server = Server::new(config, identity, None);
-        let peer_store = server.init_peer_store(false).await;
+        let peer_http_clients = PeerHttpClients::build(&server.config).unwrap();
+        let peer_store = server
+            .init_peer_store(false, peer_http_clients.control.as_ref())
+            .await;
 
         let store = server
             .init_directory_chain(&peer_store)
@@ -14387,7 +14453,10 @@ mod tests {
         config.discovery.public_endpoint = Some("node.example.com:443".to_string());
 
         let server = Server::new(config.clone(), IdentityKeyPair::generate(), None);
-        let peer_store = server.init_peer_store(false).await;
+        let peer_http_clients = PeerHttpClients::build(&server.config).unwrap();
+        let peer_store = server
+            .init_peer_store(false, peer_http_clients.control.as_ref())
+            .await;
         let path = config.discovery.peer_cache_path.unwrap();
 
         let bytes = tokio::fs::read(&path)
@@ -14510,7 +14579,10 @@ mod tests {
         config.discovery.public_endpoint = Some("node.example.com:443".to_string());
 
         let server = Server::new(config, identity, None);
-        let restored_store = server.init_peer_store(false).await;
+        let peer_http_clients = PeerHttpClients::build(&server.config).unwrap();
+        let restored_store = server
+            .init_peer_store(false, peer_http_clients.control.as_ref())
+            .await;
         let status = restored_store.status(now + 1);
 
         assert!(restored_store
@@ -14555,8 +14627,12 @@ mod tests {
         let peer_store = Arc::new(PeerStore::new());
         assert!(peer_store.upsert_verified(signed, now).unwrap());
         let path = config.discovery.peer_cache_path.unwrap();
+        let peer_http_clients = PeerHttpClients::build(&server.config).unwrap();
         let handle = server
-            .spawn_peer_store_persistence_task(Arc::clone(&peer_store))
+            .spawn_peer_store_persistence_task(
+                Arc::clone(&peer_store),
+                Arc::clone(&peer_http_clients.control),
+            )
             .expect("peer cache persistence should be enabled");
 
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -14645,8 +14721,12 @@ mod tests {
         assert!(peer_store.upsert_verified(signed, now).unwrap());
 
         let path = config.discovery.peer_cache_path.unwrap();
+        let peer_http_clients = PeerHttpClients::build(&server.config).unwrap();
         let handle = server
-            .spawn_peer_store_persistence_task(Arc::clone(&peer_store))
+            .spawn_peer_store_persistence_task(
+                Arc::clone(&peer_store),
+                Arc::clone(&peer_http_clients.control),
+            )
             .expect("peer cache persistence should be enabled");
         server
             .shutdown_tx

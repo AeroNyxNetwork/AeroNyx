@@ -71,6 +71,9 @@
 //!   the independently verified network proof.
 //! - [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Applies the same local
 //!   replica anchor to proof-carrying discovery gossip before PeerStore import.
+//! - [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Accepts the server's
+//!   process-lifetime hardened Directory transport while preserving the
+//!   constructor that builds an equivalent client for tests and embedders.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -179,6 +182,8 @@
 //!   the network request, exact-proof equality, and `PeerStore` anti-rollback.
 //!
 //! ## Last Modified
+//! `v0.29.0-ProcessLifetimePeerTransport` - Reused the server-owned Directory
+//! HTTP pool so synchronization cannot silently disappear after startup.
 //! `v0.28.0-DirectoryAuthenticatedGossipAdmission` - Added sender-neutral
 //! proof-gossip admission against exact audited local replica evidence.
 //! `v0.27.0-DirectoryAuthenticatedPeerAdmission` - Added locally anchored proof
@@ -282,7 +287,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::api::memchain_peer::{commitment_peer_endpoint_is_public, commitment_peer_url};
-use crate::api::{read_bounded_http_response, BoundedHttpResponseError};
+use crate::api::{
+    privacy_safe_peer_http_client_builder, read_bounded_http_response,
+    BoundedHttpResponseError,
+};
 use crate::services::directory_replica::{
     DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS, DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES,
 };
@@ -455,15 +463,13 @@ pub struct DirectoryAuthenticatedPeerAdmission {
 }
 
 fn build_hardened_directory_http_client() -> Result<reqwest::Client, &'static str> {
-    reqwest::Client::builder()
+    privacy_safe_peer_http_client_builder()
         // Direct authenticated node relationships must not inherit a process
         // proxy that becomes an unreviewed endpoint-metadata observer.
-        .no_proxy()
         .connect_timeout(Duration::from_secs(DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(
             DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
         ))
-        .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(1)
         .build()
         .map_err(|_| "directory_sync_http_client_initialization_failed")
@@ -1547,6 +1553,24 @@ pub(crate) struct DirectoryReplicaSyncPolicy {
     pub(crate) full_node_mirror_max_producers: usize,
 }
 
+/// Runtime dependencies owned outside one synchronization coordinator.
+///
+/// [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Keeping resources separate
+/// from authority policy makes ownership explicit and prevents constructor
+/// growth whenever another process-lifetime service is injected.
+pub(crate) struct DirectoryReplicaSyncResources {
+    /// Audited local replica store.
+    pub(crate) store: Arc<DirectoryReplicaStore>,
+    /// Shared status and retry runtime.
+    pub(crate) runtime: Arc<DirectoryReplicaSyncRuntime>,
+    /// Verified descriptor and route store.
+    pub(crate) peer_store: Arc<PeerStore>,
+    /// Local signing identity.
+    pub(crate) identity: Arc<IdentityKeyPair>,
+    /// Hardened process-lifetime Directory transport.
+    pub(crate) client: reqwest::Client,
+}
+
 /// Coordinates bounded synchronization for operator-pinned Directory producers.
 pub struct DirectoryReplicaSyncCoordinator {
     peers: Arc<[[u8; 32]]>,
@@ -1607,6 +1631,41 @@ impl DirectoryReplicaSyncCoordinator {
         identity: Arc<IdentityKeyPair>,
         policy: DirectoryReplicaSyncPolicy,
     ) -> Result<Self, &'static str> {
+        // [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Preserve the public
+        // constructor for embedders/tests while production server startup can
+        // inject its process-lifetime directory transport below.
+        let client = build_hardened_directory_http_client()?;
+        Self::new_with_policy_and_resources(
+            peers,
+            interval_secs,
+            DirectoryReplicaSyncResources {
+                store,
+                runtime,
+                peer_store,
+                identity,
+                client,
+            },
+            policy,
+        )
+    }
+
+    /// Builds a coordinator around process-lifetime runtime resources.
+    ///
+    /// Server startup uses this path so one failed transport profile blocks
+    /// startup instead of silently disabling Directory Replica synchronization.
+    pub(crate) fn new_with_policy_and_resources(
+        peers: Vec<[u8; 32]>,
+        interval_secs: u64,
+        resources: DirectoryReplicaSyncResources,
+        policy: DirectoryReplicaSyncPolicy,
+    ) -> Result<Self, &'static str> {
+        let DirectoryReplicaSyncResources {
+            store,
+            runtime,
+            peer_store,
+            identity,
+            client,
+        } = resources;
         let DirectoryReplicaSyncPolicy {
             witness_min_verified,
             full_node_mirror_enabled,
@@ -1649,10 +1708,6 @@ impl DirectoryReplicaSyncCoordinator {
             .collect::<Vec<_>>();
         runtime.restore_retry_states(&retry_states);
         let restored_retry_states = retry_states.len();
-        // [CERTIFICATE-EXCHANGE 2026-07-26 by Codex] Coordinator and manual
-        // certificate exchange share one hardened transport policy so timeout,
-        // redirect, and proxy behavior cannot drift between trust paths.
-        let client = build_hardened_directory_http_client()?;
         Ok(Self {
             peers: peers.into(),
             interval: Duration::from_secs(interval_secs),
