@@ -251,6 +251,10 @@
 // 101. [STARTUP-READINESS 2026-07-29 by Codex] Binds every required node API
 //      listener before startup can succeed and reports READY/STOPPING through
 //      the systemd notify socket without adding a new runtime dependency.
+// 102. [RUNTIME-SUPERVISION 2026-07-29 by Codex] Supervises the node, VPN, and
+//      public API listeners as one required runtime group. Unexpected listener
+//      loss now performs graceful cleanup and exits non-zero for systemd
+//      recovery instead of leaving a false-positive active process.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -359,6 +363,10 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.41-RuntimeSupervision - Required API listener-group failures now
+//     trigger graceful process failure and systemd recovery
+//   v2.8.40-StartupReadiness - Pre-bound required API listeners and reported
+//     listener-backed systemd readiness
 //   v2.8.39-DiscoveryIdentityAmbiguity - Failed closed when independently
 //     signed peer descriptors claim the same canonical gossip endpoint
 //   v2.8.38-DirectoryProofDiversity - Added producer-first fallback rotation
@@ -497,7 +505,7 @@ use nix::sys::socket::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, trace, warn};
 
 use aeronyx_core::protocol::auth::{
@@ -2077,6 +2085,41 @@ impl SystemdNotifier {
     }
 }
 
+/// Failure emitted when a required runtime surface disappears after startup.
+///
+/// [RUNTIME-SUPERVISION 2026-07-29 by Codex] Keep this message local and
+/// operational. It may identify a listener role and bind address, but must
+/// never contain client identities, routes, payloads, or traffic metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CriticalRuntimeFailure {
+    task: &'static str,
+    reason: String,
+}
+
+/// Terminal result from one required API listener.
+#[derive(Debug)]
+struct RequiredApiListenerExit {
+    role: &'static str,
+    address: SocketAddr,
+    result: std::io::Result<()>,
+}
+
+impl RequiredApiListenerExit {
+    fn into_failure(self) -> CriticalRuntimeFailure {
+        let reason = match self.result {
+            Ok(()) => format!(
+                "required listener {} exited unexpectedly without an I/O error",
+                self.address
+            ),
+            Err(error) => format!("required listener {} failed: {error}", self.address),
+        };
+        CriticalRuntimeFailure {
+            task: self.role,
+            reason,
+        }
+    }
+}
+
 pub struct Server {
     config: ServerConfig,
     identity: IdentityKeyPair,
@@ -2105,6 +2148,10 @@ impl Server {
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
         let systemd_notifier = SystemdNotifier::from_environment();
         systemd_notifier.status("Auditing encrypted state and initializing protocol services")?;
+        // [RUNTIME-SUPERVISION 2026-07-29 by Codex] A bounded channel carries
+        // only the first critical runtime failure. The receiver stays in the
+        // main task so required listener loss can terminate the process.
+        let (critical_failure_tx, mut critical_failure_rx) = mpsc::channel(1);
 
         let peer_http_clients = PeerHttpClients::build(&self.config)?;
         info!(
@@ -2599,6 +2646,7 @@ impl Server {
                     Arc::clone(&udp),
                     &peer_http_clients,
                     commitment_sync_tip_notifier,
+                    critical_failure_tx.clone(),
                 )
                 .await?;
             tasks.push(("node-api", api_task));
@@ -2812,15 +2860,31 @@ impl Server {
                     Arc::clone(&udp),
                     &peer_http_clients,
                     None,
+                    critical_failure_tx.clone(),
                 )
                 .await?;
             tasks.push(("node-api", api_task));
         }
 
+        // The API supervisor owns the remaining sender. If it panics or exits
+        // without reporting a failure, receiver closure is itself fatal.
+        drop(critical_failure_tx);
         systemd_notifier.ready("AeroNyx privacy node is ready")?;
         info!("Server started successfully");
-        self.wait_for_shutdown().await;
-        if let Err(error) = systemd_notifier.stopping("AeroNyx privacy node is stopping") {
+        let runtime_failure = self.wait_for_shutdown(&mut critical_failure_rx).await;
+        if let Some(failure) = runtime_failure.as_ref() {
+            error!(
+                task = failure.task,
+                reason = %failure.reason,
+                "[RUNTIME] Required task failed; initiating process recovery"
+            );
+        }
+        let stopping_status = if runtime_failure.is_some() {
+            "AeroNyx privacy node is stopping after a critical runtime failure"
+        } else {
+            "AeroNyx privacy node is stopping"
+        };
+        if let Err(error) = systemd_notifier.stopping(stopping_status) {
             warn!(%error, "[STARTUP] Failed to report systemd stopping state");
         }
         info!("Shutting down server...");
@@ -2857,6 +2921,10 @@ impl Server {
             );
         } else {
             info!("Shutdown complete");
+        }
+
+        if let Some(failure) = runtime_failure {
+            return Err(ServerError::runtime_failed(failure.task, failure.reason));
         }
 
         Ok(())
@@ -3446,10 +3514,13 @@ impl Server {
         udp: Arc<UdpTransport>,
         peer_http_clients: &PeerHttpClients,
         commitment_sync_tip_notifier: Option<mpsc::Sender<u64>>,
+        critical_failure_tx: mpsc::Sender<CriticalRuntimeFailure>,
     ) -> Result<JoinHandle<()>> {
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        let shutdown_rx_vpn = self.shutdown_tx.subscribe();
         let shutdown_rx_public = self.shutdown_tx.subscribe();
+        let shutdown_rx_supervisor = self.shutdown_tx.subscribe();
+        let runtime_shutdown = Arc::clone(&self.shutdown);
         let vpn_listen_addr: std::net::SocketAddr = format!("100.64.0.1:{}", listen_addr.port())
             .parse()
             .unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
@@ -3538,6 +3609,10 @@ impl Server {
         let local_blind_vault = blind_vault.clone();
 
         Ok(tokio::spawn(async move {
+            // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Required listeners
+            // live in one JoinSet. No listener may outlive or disappear behind
+            // a detached task that the process cannot observe.
+            let mut listener_tasks = JoinSet::new();
             if let Some((public_addr, public_listener)) = public_api_listener {
                 let public_app = Self::build_public_discovery_router(
                     Arc::clone(&peer_store),
@@ -3562,14 +3637,14 @@ impl Server {
                     public_blind_vault,
                     blind_vault_public_api_enabled,
                 );
-                tokio::spawn(async move {
+                listener_tasks.spawn(async move {
                     Self::serve_public_discovery_api(
                         public_addr,
                         public_listener,
                         public_app,
                         shutdown_rx_public,
                     )
-                    .await;
+                    .await
                 });
             }
 
@@ -3869,25 +3944,28 @@ impl Server {
                 vpn_listen_addr
             );
             let vpn_app = app.clone();
-            tokio::spawn(async move {
-                let server =
-                    axum::serve(vpn_listener, vpn_app).with_graceful_shutdown(async move {
-                        let _ = shutdown_rx_vpn.recv().await;
-                    });
-                if let Err(error) = server.await {
-                    error!("[API] VPN listener error: {}", error);
-                }
-                info!("[API] VPN listener stopped");
-            });
+            listener_tasks.spawn(Self::serve_required_api_listener(
+                "vpn_client_api",
+                vpn_listen_addr,
+                vpn_listener,
+                vpn_app,
+                shutdown_rx_vpn,
+            ));
+            listener_tasks.spawn(Self::serve_required_api_listener(
+                "node_api",
+                listen_addr,
+                node_listener,
+                app,
+                shutdown_rx,
+            ));
 
-            let server = axum::serve(node_listener, app).with_graceful_shutdown(async move {
-                let _ = shutdown_rx.recv().await;
-                info!("[API] Shutdown signal received");
-            });
-            if let Err(e) = server.await {
-                error!("[API] Server error: {}", e);
-            }
-            info!("[API] Stopped");
+            Self::supervise_required_api_listeners(
+                listener_tasks,
+                runtime_shutdown,
+                shutdown_rx_supervisor,
+                critical_failure_tx,
+            )
+            .await;
         }))
     }
 
@@ -3908,6 +3986,96 @@ impl Server {
                     "required {role} listener {listen_addr} failed to bind: {error}"
                 ))
             })
+    }
+
+    /// Runs one pre-bound API listener until graceful shutdown or failure.
+    async fn serve_required_api_listener(
+        role: &'static str,
+        listen_addr: SocketAddr,
+        listener: tokio::net::TcpListener,
+        app: axum::Router,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> RequiredApiListenerExit {
+        // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Return the terminal result
+        // to the listener group instead of logging and discarding it.
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = shutdown_rx.recv().await;
+        });
+        let result = server.await;
+        match result.as_ref() {
+            Ok(()) => info!(
+                listener_role = role,
+                address = %listen_addr,
+                "[API] Required listener stopped"
+            ),
+            Err(error) => error!(
+                listener_role = role,
+                address = %listen_addr,
+                %error,
+                "[API] Required listener failed"
+            ),
+        }
+        RequiredApiListenerExit {
+            role,
+            address: listen_addr,
+            result,
+        }
+    }
+
+    /// Propagates the first unexpected required-listener exit to `run()`.
+    async fn supervise_required_api_listeners(
+        mut listeners: JoinSet<RequiredApiListenerExit>,
+        shutdown_requested: Arc<AtomicBool>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+        critical_failure_tx: mpsc::Sender<CriticalRuntimeFailure>,
+    ) {
+        // [RUNTIME-SUPERVISION 2026-07-29 by Codex] A required listener is a
+        // process-health boundary. Expected exits happen only after the main
+        // task marks shutdown before broadcasting the stop signal.
+        let first_exit = listeners.join_next().await;
+        if !shutdown_requested.load(Ordering::Acquire) {
+            let failure = match first_exit {
+                Some(Ok(listener_exit)) => listener_exit.into_failure(),
+                Some(Err(error)) => CriticalRuntimeFailure {
+                    task: "required_api_listener_group",
+                    reason: format!("listener task join failed: {error}"),
+                },
+                None => CriticalRuntimeFailure {
+                    task: "required_api_listener_group",
+                    reason: "listener supervisor had no registered tasks".to_string(),
+                },
+            };
+            error!(
+                task = failure.task,
+                reason = %failure.reason,
+                "[RUNTIME] Required API listener exited unexpectedly"
+            );
+            if critical_failure_tx.send(failure).await.is_err() {
+                error!(
+                    "[RUNTIME] Main task dropped the critical failure receiver; aborting listener group"
+                );
+                return;
+            }
+
+            // Let the main task publish STOPPING, mark shutdown, and broadcast
+            // one shared graceful-stop signal. The bound prevents a secondary
+            // control-path failure from pinning this supervisor forever.
+            let _ = tokio::time::timeout(Duration::from_secs(5), shutdown_rx.recv()).await;
+        }
+
+        while let Some(result) = listeners.join_next().await {
+            match result {
+                Ok(listener_exit) => debug!(
+                    listener_role = listener_exit.role,
+                    address = %listener_exit.address,
+                    "[RUNTIME] Required listener joined during shutdown"
+                ),
+                Err(error) => warn!(
+                    %error,
+                    "[RUNTIME] Required listener join failed during shutdown"
+                ),
+            }
+        }
     }
 
     fn build_public_discovery_router(
@@ -4002,21 +4170,20 @@ impl Server {
         listen_addr: SocketAddr,
         listener: tokio::net::TcpListener,
         app: axum::Router,
-        mut shutdown_rx: broadcast::Receiver<()>,
-    ) {
+        shutdown_rx: broadcast::Receiver<()>,
+    ) -> RequiredApiListenerExit {
         info!(
             "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/discovery/peer/directory/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/discovery/peer/verified-delivery-anchor-witness)",
             listen_addr
         );
-
-        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-            let _ = shutdown_rx.recv().await;
-            info!("[DISCOVERY] Public discovery API shutdown signal received");
-        });
-        if let Err(error) = server.await {
-            error!("[DISCOVERY] Public discovery API error: {}", error);
-        }
-        info!("[DISCOVERY] Public discovery API stopped");
+        Self::serve_required_api_listener(
+            "public_node_api",
+            listen_addr,
+            listener,
+            app,
+            shutdown_rx,
+        )
+        .await
     }
 
     // ============================================
@@ -10311,7 +10478,19 @@ impl Server {
     // Shutdown
     // ============================================
 
-    async fn wait_for_shutdown(&self) {
+    async fn wait_for_shutdown(
+        &self,
+        critical_failure_rx: &mut mpsc::Receiver<CriticalRuntimeFailure>,
+    ) -> Option<CriticalRuntimeFailure> {
+        // [RUNTIME-SUPERVISION 2026-07-29 by Codex] `Server::shutdown()` is a
+        // first-class graceful stop source. Subscribe before checking the flag
+        // so a concurrent programmatic shutdown cannot be lost between them.
+        let mut programmatic_shutdown_rx = self.shutdown_tx.subscribe();
+        if self.shutdown.load(Ordering::Acquire) {
+            info!(signal = "PROGRAMMATIC", "Shutdown request already pending");
+            return None;
+        }
+
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -10322,19 +10501,56 @@ impl Server {
                 result = tokio::signal::ctrl_c() => {
                     result.expect("Ctrl+C listener failed");
                     info!(signal = "SIGINT", "Shutdown signal received");
+                    None
                 }
                 _ = terminate.recv() => {
                     info!(signal = "SIGTERM", "Shutdown signal received");
+                    None
+                }
+                _ = programmatic_shutdown_rx.recv() => {
+                    info!(signal = "PROGRAMMATIC", "Shutdown signal received");
+                    None
+                }
+                failure = critical_failure_rx.recv() => {
+                    // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Sender
+                    // disappearance is also fatal: it means the supervisor
+                    // vanished without preserving required service health.
+                    // A concurrent explicit shutdown takes precedence.
+                    if self.shutdown.load(Ordering::Acquire) {
+                        None
+                    } else {
+                        Some(failure.unwrap_or_else(|| CriticalRuntimeFailure {
+                            task: "required_api_listener_group",
+                            reason: "critical runtime supervisor channel closed unexpectedly".to_string(),
+                        }))
+                    }
                 }
             }
         }
 
         #[cfg(not(unix))]
         {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Ctrl+C listener failed");
-            info!(signal = "CTRL_C", "Shutdown signal received");
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    result.expect("Ctrl+C listener failed");
+                    info!(signal = "CTRL_C", "Shutdown signal received");
+                    None
+                }
+                _ = programmatic_shutdown_rx.recv() => {
+                    info!(signal = "PROGRAMMATIC", "Shutdown signal received");
+                    None
+                }
+                failure = critical_failure_rx.recv() => {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        None
+                    } else {
+                        Some(failure.unwrap_or_else(|| CriticalRuntimeFailure {
+                            task: "required_api_listener_group",
+                            reason: "critical runtime supervisor channel closed unexpectedly".to_string(),
+                        }))
+                    }
+                }
+            }
         }
     }
 
@@ -10371,12 +10587,14 @@ mod tests {
         memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs,
         CommitmentCoordinatorLeaseRound, CommitmentTipAnnouncementWaitOutcome,
         CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision, DirectoryChainStore,
+        CriticalRuntimeFailure,
         DirectoryProofGossipOutcome, DirectoryProofGossipPeerState, DirectoryProofGossipResult,
         DiscoveryGossipExecution, DiscoveryGossipFailure, DiscoveryGossipFailureKind,
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
         DiscoveryPeerIdentityHints, PeerHttpClients, PeerStoreCacheDocument,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
-        Server, SystemdNotifier, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
+        RequiredApiListenerExit, Server, SystemdNotifier,
+        BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DIRECTORY_OPERATOR_HTTP_PROFILE,
         DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
@@ -10413,7 +10631,7 @@ mod tests {
         Json, Router,
     };
     use std::net::Ipv4Addr;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
@@ -10485,6 +10703,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rebound.local_addr().unwrap(), address);
+    }
+
+    #[tokio::test]
+    async fn required_api_listener_supervisor_reports_unexpected_failure() {
+        // [RUNTIME-SUPERVISION 2026-07-29 by Codex] A required surface that
+        // disappears without global shutdown must reach the main task.
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let mut listeners = tokio::task::JoinSet::new();
+        let address = "127.0.0.1:8421".parse().unwrap();
+        listeners.spawn(async move {
+            RequiredApiListenerExit {
+                role: "test_api",
+                address,
+                result: Err(std::io::Error::other("forced listener failure")),
+            }
+        });
+
+        let supervisor = tokio::spawn(Server::supervise_required_api_listeners(
+            listeners,
+            Arc::clone(&shutdown_requested),
+            shutdown_tx.subscribe(),
+            failure_tx,
+        ));
+        let failure = tokio::time::timeout(Duration::from_secs(1), failure_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failure,
+            CriticalRuntimeFailure {
+                task: "test_api",
+                reason:
+                    "required listener 127.0.0.1:8421 failed: forced listener failure".to_string(),
+            }
+        );
+
+        shutdown_requested.store(true, std::sync::atomic::Ordering::Release);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_api_listener_supervisor_accepts_global_shutdown() {
+        // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Expected listener exits
+        // after the global stop marker must not cause a restart loop.
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(2);
+        let mut listener_shutdown_rx = shutdown_tx.subscribe();
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let mut listeners = tokio::task::JoinSet::new();
+        listeners.spawn(async move {
+            let _ = listener_shutdown_rx.recv().await;
+            RequiredApiListenerExit {
+                role: "test_api",
+                address: "127.0.0.1:8421".parse().unwrap(),
+                result: Ok(()),
+            }
+        });
+
+        let supervisor = tokio::spawn(Server::supervise_required_api_listeners(
+            listeners,
+            Arc::clone(&shutdown_requested),
+            shutdown_tx.subscribe(),
+            failure_tx,
+        ));
+        shutdown_requested.store(true, std::sync::atomic::Ordering::Release);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), failure_rx.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_shutdown_accepts_programmatic_shutdown() {
+        // [RUNTIME-SUPERVISION 2026-07-29 by Codex] An operator-initiated
+        // in-process stop is graceful even if listener shutdown closes the
+        // critical-failure channel at the same time.
+        let server = Arc::new(Server::new(
+            ServerConfig::default(),
+            IdentityKeyPair::generate(),
+            None,
+        ));
+        let (_failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let waiting_server = Arc::clone(&server);
+        let waiter =
+            tokio::spawn(async move { waiting_server.wait_for_shutdown(&mut failure_rx).await });
+
+        tokio::task::yield_now().await;
+        server.shutdown();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outcome.is_none());
     }
 
     #[tokio::test]

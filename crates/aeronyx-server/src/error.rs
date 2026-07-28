@@ -1,19 +1,23 @@
 // ============================================
 // File: crates/aeronyx-server/src/error.rs
 // ============================================
-// Version: 1.0.0-Membership
+// Version: 1.1.0-RuntimeSupervision
 //
 // Modification Reason:
 //   Added WalletDenied variant for deny list rejection at handshake time.
 //   Called by HandshakeService::process() when a wallet is on the deny list.
 //   Caller (server.rs UDP task) treats this the same as any other handshake
 //   error — sends 0xFF RESET to the client.
+//   [RUNTIME-SUPERVISION 2026-07-29 by Codex] Added an explicit fatal runtime
+//   error so required service loss is distinguishable from startup/config
+//   failure and can terminate the process for systemd recovery.
 //
 // What changed:
 //   - Added WalletDenied { reason: String } variant
 //   - Added is_wallet_denied() helper method
 //
 // Last Modified:
+//   v1.1.0-RuntimeSupervision - Fatal required-task failure classification
 //   v0.1.2               - InvalidPacket source field rename
 //   v1.0.0-Voice+SessionFix - is_session_not_found() helper
 //   v1.0.0-Membership    - WalletDenied variant + is_wallet_denied()
@@ -69,6 +73,19 @@ pub enum ServerError {
 
     #[error("Server failed to start: {reason}")]
     StartupFailed { reason: String },
+
+    /// A required long-running task exited after startup.
+    ///
+    /// [RUNTIME-SUPERVISION 2026-07-29 by Codex] This is intentionally fatal:
+    /// continuing would leave systemd and node operators with a false-positive
+    /// healthy process while a required protocol surface is unavailable.
+    #[error("Required runtime task '{task}' failed: {reason}")]
+    RuntimeFailed {
+        /// Stable privacy-safe runtime role, such as `node_api`.
+        task: String,
+        /// Local operational failure reason without client or traffic data.
+        reason: String,
+    },
 
     #[error("Server is shutting down")]
     ShuttingDown,
@@ -133,6 +150,14 @@ impl ServerError {
 
     pub fn startup_failed(reason: impl Into<String>) -> Self {
         Self::StartupFailed {
+            reason: reason.into(),
+        }
+    }
+
+    /// Builds a fatal error for a required task that exited after startup.
+    pub fn runtime_failed(task: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::RuntimeFailed {
+            task: task.into(),
             reason: reason.into(),
         }
     }
@@ -205,6 +230,7 @@ impl ServerError {
                 | Self::ConfigInvalid { .. }
                 | Self::ConfigMissing { .. }
                 | Self::StartupFailed { .. }
+                | Self::RuntimeFailed { .. }
         )
     }
 
@@ -234,6 +260,13 @@ mod tests {
         let config_err = ServerError::config_invalid("port", "must be > 0");
         assert!(config_err.is_config_error());
         assert!(config_err.is_fatal());
+
+        // [RUNTIME-SUPERVISION 2026-07-29 by Codex] Required task loss must
+        // remain fatal so the process exits into systemd's restart policy.
+        let runtime_err = ServerError::runtime_failed("node_api", "listener exited");
+        assert!(runtime_err.is_fatal());
+        assert!(!runtime_err.is_config_error());
+        assert!(runtime_err.to_string().contains("node_api"));
     }
 
     #[test]
