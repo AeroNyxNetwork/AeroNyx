@@ -235,6 +235,9 @@
 //      fan-out and total per-peer work, reserves legacy compatibility time from
 //      optional proof work, and replaces free-form internal failures with
 //      typed privacy-safe buckets.
+//  98. [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] Generates alternates
+//      across producer namespaces and skips a known receiving producer's own
+//      anchor without exposing peer-specific telemetry.
 //  97. [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Publishes proof gossip
 //      only from audited blocks old enough for independent replica convergence;
 //      exact-anchor admission remains unchanged and fail-closed.
@@ -346,6 +349,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.38-DirectoryProofDiversity - Added producer-first fallback rotation
+//     and verified peer-aware self-producer suppression
 //   v2.8.37-DirectoryProofMaturity - Added a safe proof publication maturity
 //     window without delaying legacy descriptor gossip
 //   v2.8.36-DiscoveryGossipIsolation - Bounded concurrent peer fan-out with
@@ -459,7 +464,7 @@
 //   v0.3.0-DiscoveryBootstrap - PeerStore bootstrap snapshot loading
 // ============================================
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -637,8 +642,8 @@ const PUBLIC_IP_RESPONSE_MAX_BYTES: usize = 256;
 const DISCOVERY_GOSSIP_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 /// Capability negotiation reads only the compact public discovery summary.
 const DISCOVERY_NEGOTIATION_SUMMARY_MAX_BYTES: usize = 64 * 1024;
-/// At most one alternate audited proof follows an exact-evidence miss.
-const DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT: usize = 2;
+/// At most two producer-diverse alternates follow exact-evidence misses.
+const DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT: usize = 3;
 
 /// Bootstrap/cache snapshots may contain thousands of signed descriptors.
 const DISCOVERY_SNAPSHOT_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -865,6 +870,12 @@ struct DiscoveryGossipExecution<'a> {
     client: &'a reqwest::Client,
     peer_store: &'a PeerStore,
     directory_announcements: &'a [DirectoryReplicaGossipAnnouncement],
+    /// Verified `PeerStore` identity hints keyed by canonical gossip URL.
+    ///
+    /// [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] This remains a local
+    /// optimization only. Missing or stale hints cannot grant trust; they only
+    /// decide whether a receiver's own producer proof is skipped.
+    peer_node_ids_by_url: Option<&'a HashMap<String, [u8; 32]>>,
     now: u64,
     snapshot_limit: u16,
     peer_timeout: Duration,
@@ -6312,6 +6323,7 @@ impl Server {
                     .and_then(Self::discovery_gossip_url);
                 let mut seen_urls = HashSet::new();
                 let mut gossip_urls = Vec::new();
+                let mut gossip_peer_node_ids = HashMap::new();
 
                 for endpoint in &config.discovery.seed_endpoints {
                     let Some(url) = Self::discovery_gossip_url(endpoint) else {
@@ -6332,7 +6344,7 @@ impl Server {
 
                 let seed_attempted = gossip_urls.len();
 
-                if include_cached_peers && gossip_urls.len() < round_peer_limit {
+                if include_cached_peers {
                     let snapshot = peer_store.export_bootstrap_snapshot(
                         now,
                         now,
@@ -6341,9 +6353,6 @@ impl Server {
                     );
 
                     for peer in snapshot.peers {
-                        if gossip_urls.len() >= round_peer_limit {
-                            break;
-                        }
                         if peer.node_id() == self_node_id {
                             continue;
                         }
@@ -6356,9 +6365,17 @@ impl Server {
                         if self_gossip_url.as_deref() == Some(url.as_str()) {
                             continue;
                         }
-                        if !seen_urls.insert(url.clone()) {
+                        let peer_node_id = peer.node_id();
+                        gossip_peer_node_ids
+                            .entry(url.clone())
+                            .or_insert(peer_node_id);
+                        if seen_urls.contains(&url) {
                             continue;
                         }
+                        if gossip_urls.len() >= round_peer_limit {
+                            continue;
+                        }
+                        seen_urls.insert(url.clone());
                         gossip_urls.push(url);
                     }
                 }
@@ -6392,8 +6409,6 @@ impl Server {
                             if announcements.iter().any(
                                 |existing: &DirectoryReplicaGossipAnnouncement| {
                                     existing.producer == candidate.producer
-                                        && existing.block_hash == candidate.block_hash
-                                        && existing.descriptor_hash == candidate.descriptor_hash
                                 },
                             ) {
                                 continue;
@@ -6431,6 +6446,7 @@ impl Server {
                     client: &client,
                     peer_store: &peer_store,
                     directory_announcements: &directory_gossip_announcements,
+                    peer_node_ids_by_url: Some(&gossip_peer_node_ids),
                     now,
                     snapshot_limit: config.discovery.gossip_peer_limit,
                     peer_timeout,
@@ -6739,6 +6755,10 @@ impl Server {
         // descriptor/snapshot exchange remains the compatibility-critical path.
         let started_at = tokio::time::Instant::now();
         let proof_budget = (execution.peer_timeout / 3).max(Duration::from_millis(1));
+        let peer_node_id = execution
+            .peer_node_ids_by_url
+            .and_then(|node_ids| node_ids.get(url))
+            .copied();
         let directory_proof = if execution.directory_announcements.is_empty() {
             DirectoryProofGossipOutcome::default()
         } else {
@@ -6748,6 +6768,7 @@ impl Server {
                     execution.client,
                     url,
                     execution.directory_announcements,
+                    peer_node_id,
                 ),
             )
             .await
@@ -6816,6 +6837,7 @@ impl Server {
         client: &reqwest::Client,
         url: &str,
         directory_gossip_announcements: &[DirectoryReplicaGossipAnnouncement],
+        peer_node_id: Option<[u8; 32]>,
     ) -> DirectoryProofGossipOutcome {
         let mut outcome = DirectoryProofGossipOutcome::default();
         if !directory_gossip_announcements.is_empty() {
@@ -6833,6 +6855,7 @@ impl Server {
                     // proof. Other failures stop optional work.
                     for announcement in directory_gossip_announcements
                         .iter()
+                        .filter(|announcement| peer_node_id != Some(announcement.producer))
                         .take(DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT)
                     {
                         outcome.frames_attempted += 1;
@@ -12202,6 +12225,21 @@ mod tests {
         }
     }
 
+    fn directory_gossip_announcements_for_receiver(
+        now: u64,
+        receiver_producer: [u8; 32],
+    ) -> [DirectoryReplicaGossipAnnouncement; 3] {
+        // [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] Keep peer-aware
+        // fallback test fixtures explicit without obscuring the test flow.
+        let mut receiver_announcement = directory_gossip_announcement(now);
+        receiver_announcement.producer = receiver_producer;
+        let mut first_alternate = directory_gossip_announcement(now);
+        first_alternate.producer = [0x92; 32];
+        let mut second_alternate = directory_gossip_announcement(now);
+        second_alternate.producer = [0x93; 32];
+        [receiver_announcement, first_alternate, second_alternate]
+    }
+
     fn gossip_execution<'a>(
         client: &'a reqwest::Client,
         peer_store: &'a PeerStore,
@@ -12213,6 +12251,7 @@ mod tests {
             client,
             peer_store,
             directory_announcements,
+            peer_node_ids_by_url: None,
             now,
             snapshot_limit: 8,
             peer_timeout,
@@ -12599,10 +12638,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_gossip_uses_one_bounded_fallback_after_evidence_miss() {
+    async fn outbound_gossip_skips_receiver_producer_and_uses_bounded_fallback() {
         let calls = Arc::new(AtomicUsize::new(0));
         let proof_calls = Arc::new(AtomicUsize::new(0));
         let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let receiver_producer = [0x91; 32];
         let calls_for_handler = Arc::clone(&calls);
         let proof_calls_for_handler = Arc::clone(&proof_calls);
         let legacy_calls_for_handler = Arc::clone(&legacy_calls);
@@ -12626,7 +12666,14 @@ mod tests {
                     async move {
                         calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
                         let status = match message {
-                            NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 { .. } => {
+                            NodeDiscoveryMessage::DirectoryDescriptorAnnounceV1 {
+                                producer,
+                                ..
+                            } => {
+                                // [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex]
+                                // A verified URL identity hint must suppress the
+                                // receiver's own non-replica anchor.
+                                assert_ne!(producer, receiver_producer);
                                 let proof_index =
                                     proof_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
                                 if proof_index == 0 {
@@ -12661,27 +12708,22 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let now = unix_now_secs();
-        let announcements = [
-            directory_gossip_announcement(now),
-            directory_gossip_announcement(now),
-        ];
+        let announcements = directory_gossip_announcements_for_receiver(now, receiver_producer);
         let self_descriptor =
             signed_chat_relay_peer_descriptor("http://127.0.0.1:1".to_string(), now, now + 300);
         let client = reqwest::Client::new();
         let peer_store = PeerStore::new();
+        let peer_node_ids = std::collections::HashMap::from([(url.clone(), receiver_producer)]);
+        let mut execution = gossip_execution(
+            &client,
+            &peer_store,
+            &announcements,
+            now,
+            Duration::from_secs(5),
+        );
+        execution.peer_node_ids_by_url = Some(&peer_node_ids);
 
-        let report = Server::gossip_with_peer(
-            gossip_execution(
-                &client,
-                &peer_store,
-                &announcements,
-                now,
-                Duration::from_secs(5),
-            ),
-            &url,
-            self_descriptor,
-        )
-        .await;
+        let report = Server::gossip_with_peer(execution, &url, self_descriptor).await;
 
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 4);
         assert_eq!(proof_calls.load(AtomicOrdering::SeqCst), 2);

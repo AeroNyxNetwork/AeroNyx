@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.46.0 - Directory proof publication maturity aligned with exact-anchor replica convergence.
+Modification Reason: v0.47.0 - Producer-diverse, verified peer-aware Directory proof fallback.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.46.0 - [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Prevented valid but too-new exact-block proofs from racing ahead of healthy replica synchronization.
+Last Modified: v0.47.0 - [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] Rotated alternate proof gossip across producer namespaces and suppressed known receiver-self anchors.
+Previous: v0.46.0 - [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] Prevented valid but too-new exact-block proofs from racing ahead of healthy replica synchronization.
 Previous: v0.45.0 - [DISCOVERY-GOSSIP-ISOLATION 2026-07-28 by Codex] Prevented one slow peer from serially blocking a complete gossip round while preserving deterministic aggregate outcomes.
 Previous: v0.44.0 - [GOSSIP-OUTCOME-INTEGRITY 2026-07-28 by Codex] Separated proof and legacy gossip failure domains so a later compatibility-path failure cannot erase an already observed proof outcome.
 Previous: v0.43.0 - [DIRECTORY-GOSSIP-RELIABILITY 2026-07-28 by Codex] Added one bounded audited proof fallback plus aggregate convergence and rejection buckets without peer dimensions.
@@ -1553,6 +1554,32 @@ YYYY-MM-DD - Change summary
 Latest entry:
 
 ```text
+<!-- [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] -->
+2026-07-28 - Made optional Directory proof fallbacks producer-diverse.
+- Files changed:
+  - crates/aeronyx-server/src/server.rs
+  - crates/aeronyx-server/src/services/directory_replica.rs
+  - docs/node-discovery-and-encrypted-relay-plan.md
+- Production evidence:
+  - The maturity window removed the original too-new-anchor race, but later
+    rounds showed that two descriptor-level alternates could still belong to
+    one producer namespace.
+  - A receiver correctly rejects evidence produced by itself when that local
+    chain is not represented as an independently audited replica namespace.
+- Architecture:
+  - Selection now rotates the producer dimension before choosing a live
+    descriptor inside that producer's bounded candidate group.
+  - One outbound round carries at most three distinct producer proofs.
+  - A URL-to-node-id hint derived only from verified PeerStore descriptors
+    suppresses a known receiver's own producer proof. Unknown seed identities
+    continue through the same bounded fallback path.
+- Security and privacy:
+  - The hint is process-local, never serialized, logged, exposed through
+    status, or used for admission.
+  - Receiver exact-anchor verification remains unchanged and fail-closed.
+  - No public node-id, endpoint, producer, descriptor, block, proof, route,
+    payload, client, traffic, wallet, or social-graph telemetry was added.
+
 <!-- [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] -->
 2026-07-28 - Aligned Directory proof publication with replica convergence.
 - Files changed:

@@ -178,6 +178,9 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.34.0-DirectoryProofDiversity - Rotated gossip evidence across producers
+//! before selecting descriptors so alternate proofs cannot repeat one anchor
+//! namespace
 //! v0.33.0-DirectoryProofMaturity - Restricted gossip proof selection to
 //! operator-policy-mature audited blocks so publication cannot outrun replicas
 //! v0.32.0-DirectoryProofGossipPublisher - Added bounded live replica
@@ -3489,21 +3492,52 @@ impl DirectoryReplicaStore {
             }
         }
 
-        let mut live_candidates = latest_live_candidates.into_values().collect::<Vec<_>>();
-        if live_candidates.is_empty() {
+        // [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] A producer can place
+        // several public descriptors in one block. Rotate the outer dimension
+        // by producer first; otherwise adjacent fallback seeds can repeatedly
+        // select evidence anchored by the same namespace.
+        let mut candidates_by_producer =
+            BTreeMap::<[u8; 32], Vec<DirectoryReplicaGossipCandidate>>::new();
+        for candidate in latest_live_candidates.into_values() {
+            candidates_by_producer
+                .entry(candidate.producer)
+                .or_default()
+                .push(candidate);
+        }
+        if candidates_by_producer.is_empty() {
             return Ok(None);
         }
-        let candidate_count = u64::try_from(live_candidates.len()).map_err(|_| {
+        let producer_count = u64::try_from(candidates_by_producer.len()).map_err(|_| {
             DirectoryReplicaStoreError::Integrity(
-                "gossip proof live candidate count exceeds u64".to_string(),
+                "gossip proof producer count exceeds u64".to_string(),
             )
         })?;
-        let selected_index = usize::try_from(selection_seed % candidate_count).map_err(|_| {
+        let selected_producer_index =
+            usize::try_from(selection_seed % producer_count).map_err(|_| {
+                DirectoryReplicaStoreError::Integrity(
+                    "gossip proof producer index exceeds usize".to_string(),
+                )
+            })?;
+        let producer_candidates = candidates_by_producer
+            .values_mut()
+            .nth(selected_producer_index)
+            .ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "selected gossip proof producer disappeared".to_string(),
+                )
+            })?;
+        let candidate_count = u64::try_from(producer_candidates.len()).map_err(|_| {
             DirectoryReplicaStoreError::Integrity(
-                "gossip proof candidate index exceeds usize".to_string(),
+                "gossip proof descriptor count exceeds u64".to_string(),
             )
         })?;
-        let selected = live_candidates.swap_remove(selected_index);
+        let descriptor_seed = selection_seed / producer_count;
+        let selected_index = usize::try_from(descriptor_seed % candidate_count).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "gossip proof descriptor index exceeds usize".to_string(),
+            )
+        })?;
+        let selected = producer_candidates.swap_remove(selected_index);
         let proof = self
             .audited_evidence_descriptor_inclusion_proof(
                 &selected.producer,
@@ -11187,7 +11221,9 @@ mod tests {
         let subject_b = IdentityKeyPair::from_bytes(&[0x75; 32]).unwrap();
         let descriptor_a = descriptor(&subject_a, 1);
         let descriptor_b = descriptor(&subject_b, 1);
+        let descriptor_a_second = descriptor(&local, 1);
         let block_a = block(&producer_a, 1, [0u8; 32], &descriptor_a);
+        let block_a_second = block(&producer_a, 2, block_a.hash(), &descriptor_a_second);
         let block_b = block(&producer_b, 1, [0u8; 32], &descriptor_b);
         let (store, _) = DirectoryReplicaStore::open(
             temp.path().join("directory.db"),
@@ -11195,29 +11231,25 @@ mod tests {
             NOW + 20,
         )
         .unwrap();
+        import_replica_block(&store, &producer_a, &descriptor_a, &block_a, [0x77; 16]);
         import_replica_block(
             &store,
             &producer_a,
-            &descriptor_a,
-            &block_a,
-            [0x76; 16],
+            &descriptor_a_second,
+            &block_a_second,
+            [0x78; 16],
         );
-        import_replica_block(
-            &store,
-            &producer_b,
-            &descriptor_b,
-            &block_b,
-            [0x77; 16],
-        );
+        import_replica_block(&store, &producer_b, &descriptor_b, &block_b, [0x79; 16]);
 
-        // [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Adjacent seeds must
-        // rotate across the bounded live set rather than amplifying one node.
+        // [DIRECTORY-PROOF-DIVERSITY 2026-07-28 by Codex] Adjacent seeds must
+        // rotate producers even when one producer contributes several live
+        // descriptors to the bounded candidate window.
         let first = store
-            .audited_live_descriptor_gossip_announcement(NOW + 21, 20, 0)
+            .audited_live_descriptor_gossip_announcement(NOW + 22, 20, 0)
             .unwrap()
             .unwrap();
         let second = store
-            .audited_live_descriptor_gossip_announcement(NOW + 21, 20, 1)
+            .audited_live_descriptor_gossip_announcement(NOW + 22, 20, 1)
             .unwrap()
             .unwrap();
         assert_ne!(first.producer, second.producer);
@@ -11228,7 +11260,7 @@ mod tests {
                     &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
                     &selected.producer,
                     &selected.block_hash,
-                    NOW + 21,
+                    NOW + 22,
                 )
                 .unwrap();
             assert_eq!(
@@ -11240,7 +11272,7 @@ mod tests {
         // [DIRECTORY-PROOF-MATURITY 2026-07-28 by Codex] The exact same
         // audited blocks are withheld when the configured maturity boundary
         // has not elapsed. Admission remains exact-anchor based.
-        let immature_result = store.audited_live_descriptor_gossip_announcement(NOW + 21, 21, 0);
+        let immature_result = store.audited_live_descriptor_gossip_announcement(NOW + 22, 22, 0);
         assert!(matches!(immature_result, Ok(None)));
 
         // Authentic historical descriptors remain stored but cannot be
