@@ -244,6 +244,10 @@
 //  99. [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Uses a receiving
 //      producer hint only while one canonical gossip URL maps to exactly one
 //      verified node identity; endpoint collisions fall back without guessing.
+// 100. [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Separates Directory
+//      synchronization and operator-smoke HTTP profiles so production replica
+//      failover keeps its historical 10-second request deadline while the
+//      bounded operator diagnostic retains its 12-second budget.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -540,7 +544,8 @@ use crate::api::directory_replica_sync::{
     run_directory_carrier_cold_bootstrap_smoke, run_directory_mirror_carrier_smoke,
     DirectoryCarrierColdBootstrapSmokeReport, DirectoryMirrorCarrierSmokeReport,
     DirectoryReplicaSyncCoordinator, DirectoryReplicaSyncPolicy,
-    DirectoryReplicaSyncResources,
+    DirectoryReplicaSyncResources, DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS,
+    DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
 };
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
@@ -1822,6 +1827,75 @@ where
     }
 }
 
+/// One immutable process-lifetime peer HTTP transport budget.
+///
+/// [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Transport budgets are named
+/// values rather than duplicated builder chains. This keeps production,
+/// tests, startup logs, and standalone Directory constructors on one contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerHttpProfileSpec {
+    name: &'static str,
+    connect_timeout_secs: Option<u64>,
+    request_timeout_secs: u64,
+    pool_max_idle_per_host: usize,
+    pool_idle_timeout_secs: Option<u64>,
+}
+
+impl PeerHttpProfileSpec {
+    fn build(&self) -> Result<Arc<reqwest::Client>> {
+        let mut builder = privacy_safe_peer_http_client_builder()
+            .timeout(Duration::from_secs(self.request_timeout_secs))
+            .pool_max_idle_per_host(self.pool_max_idle_per_host);
+        if let Some(connect_timeout_secs) = self.connect_timeout_secs {
+            builder = builder.connect_timeout(Duration::from_secs(connect_timeout_secs));
+        }
+        if let Some(pool_idle_timeout_secs) = self.pool_idle_timeout_secs {
+            builder = builder.pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs));
+        }
+        builder.build().map(Arc::new).map_err(|error| {
+            ServerError::startup_failed(format!(
+                "privacy-safe peer HTTP {} client initialization failed: {error}",
+                self.name
+            ))
+        })
+    }
+}
+
+const PEER_CONTROL_HTTP_PROFILE: PeerHttpProfileSpec = PeerHttpProfileSpec {
+    name: "control",
+    connect_timeout_secs: Some(3),
+    request_timeout_secs: 5,
+    pool_max_idle_per_host: 1,
+    pool_idle_timeout_secs: None,
+};
+const DIRECTORY_SYNC_HTTP_PROFILE: PeerHttpProfileSpec = PeerHttpProfileSpec {
+    name: "directory_sync",
+    connect_timeout_secs: Some(DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS),
+    request_timeout_secs: DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
+    pool_max_idle_per_host: 1,
+    pool_idle_timeout_secs: None,
+};
+const DIRECTORY_OPERATOR_HTTP_PROFILE: PeerHttpProfileSpec = PeerHttpProfileSpec {
+    name: "directory_operator",
+    connect_timeout_secs: Some(3),
+    request_timeout_secs: 12,
+    pool_max_idle_per_host: 1,
+    pool_idle_timeout_secs: None,
+};
+const MEMCHAIN_SYNC_HTTP_PROFILE: PeerHttpProfileSpec = PeerHttpProfileSpec {
+    name: "memchain_sync",
+    connect_timeout_secs: Some(5),
+    request_timeout_secs: 15,
+    pool_max_idle_per_host: 1,
+    pool_idle_timeout_secs: None,
+};
+// [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Replica availability recovery
+// must fail over before the operator-only diagnostic request budget expires.
+const _: () = assert!(
+    DIRECTORY_SYNC_HTTP_PROFILE.request_timeout_secs
+        < DIRECTORY_OPERATOR_HTTP_PROFILE.request_timeout_secs
+);
+
 /// Process-lifetime HTTP transports for authenticated node-to-node traffic.
 ///
 /// [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Each profile preserves its
@@ -1833,8 +1907,10 @@ where
 struct PeerHttpClients {
     /// Short control requests: relay, witnesses, leases, and cache anchors.
     control: Arc<reqwest::Client>,
-    /// Directory replica and carrier requests with a bounded larger deadline.
-    directory: Arc<reqwest::Client>,
+    /// Directory replica synchronization with its historical failover budget.
+    directory_sync: Arc<reqwest::Client>,
+    /// Operator-only Directory diagnostics with a larger bounded deadline.
+    directory_operator: Arc<reqwest::Client>,
     /// Long-running MemChain page and checkpoint synchronization requests.
     sync: Arc<reqwest::Client>,
     /// Discovery gossip with its operator-configured fetch timeout and pool.
@@ -1843,50 +1919,22 @@ struct PeerHttpClients {
 
 impl PeerHttpClients {
     fn build(config: &ServerConfig) -> Result<Self> {
-        fn finish(
-            profile: &'static str,
-            builder: reqwest::ClientBuilder,
-        ) -> Result<Arc<reqwest::Client>> {
-            builder.build().map(Arc::new).map_err(|error| {
-                ServerError::startup_failed(format!(
-                    "privacy-safe peer HTTP {profile} client initialization failed: {error}"
-                ))
-            })
+        let control = PEER_CONTROL_HTTP_PROFILE.build()?;
+        let directory_sync = DIRECTORY_SYNC_HTTP_PROFILE.build()?;
+        let directory_operator = DIRECTORY_OPERATOR_HTTP_PROFILE.build()?;
+        let sync = MEMCHAIN_SYNC_HTTP_PROFILE.build()?;
+        let gossip = PeerHttpProfileSpec {
+            name: "gossip",
+            connect_timeout_secs: None,
+            request_timeout_secs: config.discovery.fetch_timeout_secs,
+            pool_max_idle_per_host: 8,
+            pool_idle_timeout_secs: Some(90),
         }
-
-        let control = finish(
-            "control",
-            privacy_safe_peer_http_client_builder()
-                .connect_timeout(Duration::from_secs(3))
-                .timeout(Duration::from_secs(5))
-                .pool_max_idle_per_host(1),
-        )?;
-        let directory = finish(
-            "directory",
-            privacy_safe_peer_http_client_builder()
-                .connect_timeout(Duration::from_secs(3))
-                .timeout(Duration::from_secs(12))
-                .pool_max_idle_per_host(1),
-        )?;
-        let sync = finish(
-            "sync",
-            privacy_safe_peer_http_client_builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(15))
-                .pool_max_idle_per_host(1),
-        )?;
-        let gossip = finish(
-            "gossip",
-            privacy_safe_peer_http_client_builder()
-                .timeout(Duration::from_secs(
-                    config.discovery.fetch_timeout_secs,
-                ))
-                .pool_max_idle_per_host(8)
-                .pool_idle_timeout(Duration::from_secs(90)),
-        )?;
+        .build()?;
         Ok(Self {
             control,
-            directory,
+            directory_sync,
+            directory_operator,
             sync,
             gossip,
         })
@@ -1922,9 +1970,12 @@ impl Server {
 
         let peer_http_clients = PeerHttpClients::build(&self.config)?;
         info!(
-            profiles = 4,
+            profiles = 5,
             proxy = false,
             redirects = false,
+            directory_sync_request_timeout_secs = DIRECTORY_SYNC_HTTP_PROFILE.request_timeout_secs,
+            directory_operator_request_timeout_secs =
+                DIRECTORY_OPERATOR_HTTP_PROFILE.request_timeout_secs,
             "[PEER_HTTP] Process-lifetime privacy-safe transports initialized"
         );
 
@@ -2040,7 +2091,7 @@ impl Server {
             Arc::clone(&peer_store),
             directory_replica_store.clone(),
             Arc::clone(&directory_replica_sync_runtime),
-            Arc::clone(&peer_http_clients.directory),
+            Arc::clone(&peer_http_clients.directory_sync),
         );
         let discovery_gossip_task = self.spawn_discovery_gossip_task(
             Arc::clone(&peer_store),
@@ -3263,11 +3314,12 @@ impl Server {
         let smoke_node_identity = Arc::clone(&node_identity);
         let smoke_peer_http_client = Arc::clone(&peer_http_client);
         let smoke_local_capability_status = local_capability_status.clone();
-        // [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Operator smokes share
-        // the same process-lifetime directory pool as replica synchronization.
-        // `Some` preserves the existing unavailable-reporting route contract.
+        // [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Operator smokes retain
+        // their historical 12-second request budget without stretching the
+        // replica synchronizer's 10-second failover deadline. `Some` preserves
+        // the existing unavailable-reporting route contract.
         let directory_carrier_smoke_http_client =
-            Some(Arc::clone(&peer_http_clients.directory));
+            Some(Arc::clone(&peer_http_clients.directory_operator));
         let directory_carrier_smoke_store = directory_replica_store.clone();
         let directory_carrier_smoke_peer_store = Arc::clone(&peer_store);
         let directory_carrier_smoke_identity = Arc::clone(&node_identity);
@@ -10191,11 +10243,14 @@ mod tests {
         DirectoryProofGossipOutcome, DirectoryProofGossipPeerState, DirectoryProofGossipResult,
         DiscoveryGossipExecution, DiscoveryGossipFailure, DiscoveryGossipFailureKind,
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
-        DiscoveryPeerIdentityHints, PeerStoreCacheDocument, PeerStoreVerifiedClientDeliveryAnchor,
-        PeerStoreVerifiedClientDeliveryCacheEvidence, PeerHttpClients, Server,
-        BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
+        DiscoveryPeerIdentityHints, PeerHttpClients, PeerStoreCacheDocument,
+        PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
+        Server, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
         BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
-        ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        DIRECTORY_OPERATOR_HTTP_PROFILE, DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS,
+        DIRECTORY_SYNC_HTTP_PROFILE, DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
+        MEMCHAIN_SYNC_HTTP_PROFILE, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+        TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
     };
@@ -10275,7 +10330,8 @@ mod tests {
 
         for (profile, client) in [
             ("control", clients.control.as_ref()),
-            ("directory", clients.directory.as_ref()),
+            ("directory_sync", clients.directory_sync.as_ref()),
+            ("directory_operator", clients.directory_operator.as_ref()),
             ("sync", clients.sync.as_ref()),
             ("gossip", clients.gossip.as_ref()),
         ] {
@@ -10291,6 +10347,20 @@ mod tests {
         server.abort();
         let _ = server.await;
         Ok(())
+    }
+
+    #[test]
+    fn peer_http_profiles_preserve_role_specific_deadlines() {
+        assert_eq!(
+            DIRECTORY_SYNC_HTTP_PROFILE.connect_timeout_secs,
+            Some(DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            DIRECTORY_SYNC_HTTP_PROFILE.request_timeout_secs,
+            DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS
+        );
+        assert_eq!(DIRECTORY_OPERATOR_HTTP_PROFILE.request_timeout_secs, 12);
+        assert_eq!(MEMCHAIN_SYNC_HTTP_PROFILE.request_timeout_secs, 15);
     }
 
     #[tokio::test]

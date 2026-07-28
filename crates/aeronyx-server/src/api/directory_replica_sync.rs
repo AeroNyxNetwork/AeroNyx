@@ -74,6 +74,9 @@
 //! - [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Accepts the server's
 //!   process-lifetime hardened Directory transport while preserving the
 //!   constructor that builds an equivalent client for tests and embedders.
+//! - [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Exports the canonical
+//!   Directory sync connect/request deadlines so the injected production
+//!   profile cannot drift from standalone constructors and timeout tests.
 //!
 //! ## Calling Relationships
 //! - `server.rs` constructs this coordinator after the replica store is audited.
@@ -182,6 +185,8 @@
 //!   the network request, exact-proof equality, and `PeerStore` anti-rollback.
 //!
 //! ## Last Modified
+//! `v0.30.0-RoleSpecificTransportBudgets` - Restored one canonical 10-second
+//! replica request deadline while preserving the separate operator budget.
 //! `v0.29.0-ProcessLifetimePeerTransport` - Reused the server-owned Directory
 //! HTTP pool so synchronization cannot silently disappear after startup.
 //! `v0.28.0-DirectoryAuthenticatedGossipAdmission` - Added sender-neutral
@@ -305,11 +310,15 @@ pub(crate) const DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS: usize = 4;
 /// Hard wall-clock ceiling for one producer within a synchronization round.
 pub(crate) const DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS: u64 = 45;
 /// TCP establishment remains short so unreachable peers fail over promptly.
-const DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS: u64 = 3;
+///
+/// [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] This crate-visible value is
+/// also consumed by the production process-lifetime transport profile.
+pub(crate) const DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// A verified carrier may audit thousands of retained blocks before exporting
 /// one page. Keep the request bounded but leave enough time for that audit;
 /// the independent producer-round deadline still caps the complete operation.
-const DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
+/// Production and standalone constructors consume this same value.
+pub(crate) const DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// Maximum producer-local retry delay after repeated consecutive failures.
 pub(crate) const DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS: u64 =
     DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS;
