@@ -22,6 +22,8 @@
 #   produce a systemd directory-mode mismatch warning on every restart.
 # - Uses explicit restart limits so transient failures can self-heal without
 #   uncontrolled restart storms.
+# - [STARTUP-READINESS 2026-07-29 by Codex] Waits for the Rust process to bind
+#   every required API listener before systemd reports the service as active.
 #
 # Dependencies:
 # - Installed by deploy/node/install.sh into /etc/systemd/system.
@@ -32,8 +34,9 @@
 # 1. systemd waits for network-online.target.
 # 2. aeronyx-server starts from @REPO_DIR@/target/release.
 # 3. systemd applies runtime hardening that still permits TUN/VPN networking.
-# 4. systemd restarts the service on process failure.
-# 5. systemd applies explicit start-rate limits to avoid uncontrolled loops.
+# 4. Rust sends READY=1 only after required listeners are bound.
+# 5. systemd restarts the service on process failure.
+# 6. systemd applies explicit start-rate limits to avoid uncontrolled loops.
 #
 # Important Note for Next Developer:
 # - Keep ExecStart compatible with crates/aeronyx-server/src/main.rs.
@@ -43,8 +46,13 @@
 #   /dev/net/tun and many current deployments place the repository under /root.
 # - Do not relax ConfigurationDirectoryMode without a secrets migration and
 #   an explicit review of every file written below `/etc/aeronyx`.
+# - Keep Type=notify aligned with `SystemdNotifier` in server.rs. Reverting to
+#   Type=simple makes systemctl report a false-positive active state during
+#   chain audit, model loading, or listener bind failure.
 #
 # Last Modified:
+# v1.3.0-node-deploy - Added listener-backed systemd readiness and a bounded
+#                      five-minute audited startup window.
 # v1.2.1-node-deploy - Pin private configuration directory mode to 0700.
 # v1.2.0-node-deploy - Added explicit start-rate limits and start timeout.
 # v1.1.1-node-deploy - Added systemd-managed state/config/log directories so
@@ -61,7 +69,8 @@ StartLimitIntervalSec=300
 StartLimitBurst=10
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=root
 WorkingDirectory=@REPO_DIR@
 EnvironmentFile=-/etc/aeronyx/aeronyx.env
@@ -69,7 +78,7 @@ ExecStart=@REPO_DIR@/target/release/aeronyx-server start -c @CONFIG_FILE@
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
-TimeoutStartSec=60
+TimeoutStartSec=300
 TimeoutStopSec=30
 LimitNOFILE=1048576
 ConfigurationDirectory=aeronyx

@@ -27,6 +27,8 @@
 # - Expose network restore command paths in JSON for nodeboard automation.
 # - Include network restore unit backups in retention diagnostics.
 # - Add systemd restart-policy diagnostics for production self-healing.
+# - [STARTUP-READINESS 2026-07-29 by Codex] Verify listener-backed systemd
+#   readiness and the bounded audited-startup timeout.
 # - Verify the live systemd unit points at the requested repository and config.
 # - Check NAT and forwarding rules against server.toml instead of hard-coded
 #   deployment defaults.
@@ -75,6 +77,8 @@
 #   a binary workspace; dependency changes must be code-reviewed.
 #
 # Last Modified:
+# v1.23.0-node-deploy - Added Type=notify/NotifyAccess readiness diagnostics
+#                       and aligned TimeoutStartSec with audited node startup.
 # v1.22.0-node-deploy - Supports linked Git worktrees in runtime metadata checks.
 # v1.21.0-node-deploy - Added the tracked Cargo.lock reproducible-build gate.
 # v1.20.0-node-deploy - Keep healthcheck JSON output alive when optional network restore unit is absent.
@@ -507,7 +511,7 @@ check_config_validation() {
 }
 
 check_systemd() {
-    local expected_binary exec_start restart restart_sec start_limit_burst start_limit_interval timeout_start working_directory
+    local expected_binary exec_start service_type notify_access restart restart_sec start_limit_burst start_limit_interval timeout_start working_directory
 
     if ! command -v systemctl >/dev/null 2>&1; then
         warn "systemd checks skipped"
@@ -542,6 +546,16 @@ check_systemd() {
         warn "systemd unit ExecStart mismatch: expected binary=${expected_binary} config=${CONFIG_FILE}"
     fi
 
+    service_type="$(systemd_property Type)"
+    [ "${service_type}" = "notify" ] \
+        && pass "systemd readiness policy Type=notify" \
+        || warn "systemd readiness policy Type is not notify: ${service_type:-unknown}"
+
+    notify_access="$(systemd_property NotifyAccess)"
+    [ "${notify_access}" = "main" ] \
+        && pass "systemd readiness policy NotifyAccess=main" \
+        || warn "systemd readiness policy NotifyAccess is not main: ${notify_access:-unknown}"
+
     restart="$(systemd_property Restart)"
     [ "${restart}" = "on-failure" ] \
         && pass "systemd restart policy Restart=on-failure" \
@@ -565,9 +579,9 @@ check_systemd() {
         || warn "systemd restart policy StartLimitIntervalSec is not 300s: ${start_limit_interval:-unknown}"
 
     timeout_start="$(systemd_property TimeoutStartUSec)"
-    [ "${timeout_start}" = "1min" ] \
-        && pass "systemd restart policy TimeoutStartSec=60" \
-        || warn "systemd restart policy TimeoutStartSec is not 60s: ${timeout_start:-unknown}"
+    [ "${timeout_start}" = "5min" ] \
+        && pass "systemd readiness policy TimeoutStartSec=300" \
+        || warn "systemd readiness policy TimeoutStartSec is not 300s: ${timeout_start:-unknown}"
 }
 
 systemd_property() {
@@ -1126,6 +1140,8 @@ def vpn_config(path):
 
 def systemd_restart_policy(service_name):
     return {
+        "service_type": run(["systemctl", "show", service_name, "-p", "Type", "--value"]),
+        "notify_access": run(["systemctl", "show", service_name, "-p", "NotifyAccess", "--value"]),
         "restart": run(["systemctl", "show", service_name, "-p", "Restart", "--value"]),
         "restart_usec": run(["systemctl", "show", service_name, "-p", "RestartUSec", "--value"]),
         "start_limit_burst": run(["systemctl", "show", service_name, "-p", "StartLimitBurst", "--value"]),

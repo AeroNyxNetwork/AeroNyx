@@ -248,6 +248,9 @@
 //      synchronization and operator-smoke HTTP profiles so production replica
 //      failover keeps its historical 10-second request deadline while the
 //      bounded operator diagnostic retains its 12-second budget.
+// 101. [STARTUP-READINESS 2026-07-29 by Codex] Binds every required node API
+//      listener before startup can succeed and reports READY/STOPPING through
+//      the systemd notify socket without adding a new runtime dependency.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -474,14 +477,24 @@
 // ============================================
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures::StreamExt;
+#[cfg(target_os = "linux")]
+use nix::sys::socket::{
+    sendto, socket, AddressFamily, MsgFlags, SockFlag, SockProtocol, SockType, UnixAddr,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
@@ -1941,6 +1954,129 @@ impl PeerHttpClients {
     }
 }
 
+/// Process-lifetime bridge to systemd's datagram notification protocol.
+///
+/// [STARTUP-READINESS 2026-07-29 by Codex] `Type=notify` must reflect the
+/// actual listener barrier, not process creation. Manual/non-systemd starts
+/// remain backward compatible because an absent `NOTIFY_SOCKET` is a no-op.
+/// The implementation uses the existing `nix` dependency and supports both
+/// filesystem and Linux abstract namespace notify sockets.
+#[derive(Clone, Debug, Default)]
+struct SystemdNotifier {
+    socket: Option<OsString>,
+}
+
+impl SystemdNotifier {
+    fn from_environment() -> Self {
+        Self {
+            socket: std::env::var_os("NOTIFY_SOCKET"),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_socket(socket: Option<OsString>) -> Self {
+        Self { socket }
+    }
+
+    fn status(&self, status: &str) -> Result<bool> {
+        self.send(&format!("STATUS={}", Self::sanitize_status(status)))
+    }
+
+    fn ready(&self, status: &str) -> Result<bool> {
+        self.send(&format!(
+            "READY=1\nSTATUS={}",
+            Self::sanitize_status(status)
+        ))
+    }
+
+    fn stopping(&self, status: &str) -> Result<bool> {
+        self.send(&format!(
+            "STOPPING=1\nSTATUS={}",
+            Self::sanitize_status(status)
+        ))
+    }
+
+    fn sanitize_status(status: &str) -> String {
+        status
+            .chars()
+            .map(|character| match character {
+                '\r' | '\n' => ' ',
+                other => other,
+            })
+            .collect()
+    }
+
+    fn send(&self, payload: &str) -> Result<bool> {
+        let Some(socket_name) = self.socket.as_ref() else {
+            return Ok(false);
+        };
+
+        #[cfg(target_os = "linux")]
+        {
+            let socket_bytes = socket_name.as_os_str().as_bytes();
+            if socket_bytes.is_empty() {
+                return Err(ServerError::startup_failed(
+                    "systemd NOTIFY_SOCKET is empty",
+                ));
+            }
+
+            let address = if let Some(abstract_name) = socket_bytes.strip_prefix(b"@") {
+                if abstract_name.is_empty() {
+                    return Err(ServerError::startup_failed(
+                        "systemd abstract NOTIFY_SOCKET name is empty",
+                    ));
+                }
+                UnixAddr::new_abstract(abstract_name).map_err(|error| {
+                    ServerError::startup_failed(format!(
+                        "invalid systemd abstract NOTIFY_SOCKET: {error}"
+                    ))
+                })?
+            } else {
+                UnixAddr::new(Path::new(socket_name)).map_err(|error| {
+                    ServerError::startup_failed(format!(
+                        "invalid systemd filesystem NOTIFY_SOCKET: {error}"
+                    ))
+                })?
+            };
+            let datagram = socket(
+                AddressFamily::Unix,
+                SockType::Datagram,
+                SockFlag::SOCK_CLOEXEC,
+                None::<SockProtocol>,
+            )
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "failed to create systemd notification socket: {error}"
+                ))
+            })?;
+            let sent = sendto(
+                datagram.as_raw_fd(),
+                payload.as_bytes(),
+                &address,
+                MsgFlags::empty(),
+            )
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "failed to send systemd readiness notification: {error}"
+                ))
+            })?;
+            if sent != payload.len() {
+                return Err(ServerError::startup_failed(format!(
+                    "partial systemd readiness notification: sent {sent} of {} bytes",
+                    payload.len()
+                )));
+            }
+            Ok(true)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = payload;
+            Ok(false)
+        }
+    }
+}
+
 pub struct Server {
     config: ServerConfig,
     identity: IdentityKeyPair,
@@ -1967,6 +2103,8 @@ impl Server {
 
     pub async fn run(&self) -> Result<()> {
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
+        let systemd_notifier = SystemdNotifier::from_environment();
+        systemd_notifier.status("Auditing encrypted state and initializing protocol services")?;
 
         let peer_http_clients = PeerHttpClients::build(&self.config)?;
         info!(
@@ -2442,25 +2580,27 @@ impl Server {
                 .then_some(commitment_sync_tip_tx);
             let (commitment_tip_tx, commitment_tip_rx) = mpsc::channel(1);
 
-            let api_task = self.start_combined_api(
-                self.config.memchain.api_listen_addr,
-                Some(Arc::clone(&mpi_state)),
-                Arc::clone(&ip_pool),
-                Arc::clone(&sessions),
-                Arc::clone(&node_policy),
-                Arc::clone(&voucher_verifier),
-                Arc::clone(&encrypted_message_counter),
-                Arc::clone(&packet_handler),
-                Arc::clone(&peer_store),
-                directory_chain_store.clone(),
-                directory_replica_store.clone(),
-                Arc::clone(&directory_replica_sync_runtime),
-                chat_relay.clone(),
-                blind_vault.clone(),
-                Arc::clone(&udp),
-                &peer_http_clients,
-                commitment_sync_tip_notifier,
-            )?;
+            let api_task = self
+                .start_combined_api(
+                    self.config.memchain.api_listen_addr,
+                    Some(Arc::clone(&mpi_state)),
+                    Arc::clone(&ip_pool),
+                    Arc::clone(&sessions),
+                    Arc::clone(&node_policy),
+                    Arc::clone(&voucher_verifier),
+                    Arc::clone(&encrypted_message_counter),
+                    Arc::clone(&packet_handler),
+                    Arc::clone(&peer_store),
+                    directory_chain_store.clone(),
+                    directory_replica_store.clone(),
+                    Arc::clone(&directory_replica_sync_runtime),
+                    chat_relay.clone(),
+                    blind_vault.clone(),
+                    Arc::clone(&udp),
+                    &peer_http_clients,
+                    commitment_sync_tip_notifier,
+                )
+                .await?;
             tasks.push(("node-api", api_task));
             node_api_started = true;
 
@@ -2653,30 +2793,36 @@ impl Server {
         }
 
         if !node_api_started {
-            let api_task = self.start_combined_api(
-                self.config.memchain.api_listen_addr,
-                None,
-                Arc::clone(&ip_pool),
-                Arc::clone(&sessions),
-                Arc::clone(&node_policy),
-                Arc::clone(&voucher_verifier),
-                Arc::clone(&encrypted_message_counter),
-                Arc::clone(&packet_handler),
-                Arc::clone(&peer_store),
-                directory_chain_store.clone(),
-                directory_replica_store.clone(),
-                Arc::clone(&directory_replica_sync_runtime),
-                chat_relay.clone(),
-                blind_vault.clone(),
-                Arc::clone(&udp),
-                &peer_http_clients,
-                None,
-            )?;
+            let api_task = self
+                .start_combined_api(
+                    self.config.memchain.api_listen_addr,
+                    None,
+                    Arc::clone(&ip_pool),
+                    Arc::clone(&sessions),
+                    Arc::clone(&node_policy),
+                    Arc::clone(&voucher_verifier),
+                    Arc::clone(&encrypted_message_counter),
+                    Arc::clone(&packet_handler),
+                    Arc::clone(&peer_store),
+                    directory_chain_store.clone(),
+                    directory_replica_store.clone(),
+                    Arc::clone(&directory_replica_sync_runtime),
+                    chat_relay.clone(),
+                    blind_vault.clone(),
+                    Arc::clone(&udp),
+                    &peer_http_clients,
+                    None,
+                )
+                .await?;
             tasks.push(("node-api", api_task));
         }
 
+        systemd_notifier.ready("AeroNyx privacy node is ready")?;
         info!("Server started successfully");
         self.wait_for_shutdown().await;
+        if let Err(error) = systemd_notifier.stopping("AeroNyx privacy node is stopping") {
+            warn!(%error, "[STARTUP] Failed to report systemd stopping state");
+        }
         info!("Shutting down server...");
 
         self.shutdown.store(true, Ordering::SeqCst);
@@ -3274,7 +3420,14 @@ impl Server {
     // Combined API Server
     // ============================================
 
-    fn start_combined_api(
+    /// Binds every required API socket before returning a runtime task.
+    ///
+    /// [STARTUP-READINESS 2026-07-29 by Codex] The previous implementation
+    /// performed `bind()` inside a detached task. A bind failure therefore
+    /// logged an error while `Server::run()` still announced successful
+    /// startup. Pre-binding makes listener availability part of the startup
+    /// transaction and gives `Type=notify` a truthful readiness barrier.
+    async fn start_combined_api(
         &self,
         listen_addr: std::net::SocketAddr,
         mpi_state: Option<Arc<MpiState>>,
@@ -3296,10 +3449,20 @@ impl Server {
     ) -> Result<JoinHandle<()>> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let mut shutdown_rx_vpn = self.shutdown_tx.subscribe();
-        let mut shutdown_rx_public = self.shutdown_tx.subscribe();
+        let shutdown_rx_public = self.shutdown_tx.subscribe();
         let vpn_listen_addr: std::net::SocketAddr = format!("100.64.0.1:{}", listen_addr.port())
             .parse()
             .unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
+        let node_listener = Self::bind_required_api_listener("node_api", listen_addr).await?;
+        let vpn_listener =
+            Self::bind_required_api_listener("vpn_client_api", vpn_listen_addr).await?;
+        let public_api_listener = match self.config.discovery.public_api_listen_addr {
+            Some(public_addr) => Some((
+                public_addr,
+                Self::bind_required_api_listener("public_node_api", public_addr).await?,
+            )),
+            None => None,
+        };
         let vpn_health_config = self.config.clone();
         let discovery_api_policy = DiscoveryApiPolicy::from_config(&self.config.discovery);
         let chat_relay_runtime_ready = chat_relay.is_some();
@@ -3307,7 +3470,6 @@ impl Server {
             &vpn_health_config,
             chat_relay_runtime_ready,
         );
-        let public_api_listen_addr = self.config.discovery.public_api_listen_addr;
         let node_identity = Arc::new(self.identity.clone());
         let peer_http_client = Arc::clone(&peer_http_clients.control);
         let smoke_peer_store = Arc::clone(&peer_store);
@@ -3376,7 +3538,7 @@ impl Server {
         let local_blind_vault = blind_vault.clone();
 
         Ok(tokio::spawn(async move {
-            if let Some(public_addr) = public_api_listen_addr {
+            if let Some((public_addr, public_listener)) = public_api_listener {
                 let public_app = Self::build_public_discovery_router(
                     Arc::clone(&peer_store),
                     discovery_api_policy.clone(),
@@ -3401,8 +3563,13 @@ impl Server {
                     blind_vault_public_api_enabled,
                 );
                 tokio::spawn(async move {
-                    Self::serve_public_discovery_api(public_addr, public_app, shutdown_rx_public)
-                        .await;
+                    Self::serve_public_discovery_api(
+                        public_addr,
+                        public_listener,
+                        public_app,
+                        shutdown_rx_public,
+                    )
+                    .await;
                 });
             }
 
@@ -3696,68 +3863,24 @@ impl Server {
                 app
             };
 
-            let listener = match tokio::net::TcpListener::bind(listen_addr).await {
-                Ok(l) => {
-                    info!("[API] Node API on http://{}", listen_addr);
-                    l
-                }
-                Err(e) => {
-                    error!("[API] Bind failed {}: {}", listen_addr, e);
-                    return;
-                }
-            };
-
-            match tokio::net::TcpListener::bind(vpn_listen_addr).await {
-                Ok(vpn_listener) => {
-                    info!(
-                        "[API] Client API also available on http://{} (VPN clients only)",
-                        vpn_listen_addr
-                    );
-                    let app_clone = app.clone();
-                    tokio::spawn(async move {
-                        let server = axum::serve(vpn_listener, app_clone).with_graceful_shutdown(
-                            async move {
-                                let _ = shutdown_rx_vpn.recv().await;
-                            },
-                        );
-                        if let Err(e) = server.await {
-                            error!("[API] VPN listener error: {}", e);
-                        }
-                        info!("[API] VPN listener stopped");
+            info!("[API] Node API on http://{}", listen_addr);
+            info!(
+                "[API] Client API also available on http://{} (VPN clients only)",
+                vpn_listen_addr
+            );
+            let vpn_app = app.clone();
+            tokio::spawn(async move {
+                let server =
+                    axum::serve(vpn_listener, vpn_app).with_graceful_shutdown(async move {
+                        let _ = shutdown_rx_vpn.recv().await;
                     });
+                if let Err(error) = server.await {
+                    error!("[API] VPN listener error: {}", error);
                 }
-                Err(e) => {
-                    warn!(
-                        "[API] VPN listener on {} not ready yet ({}), will retry every 10s",
-                        vpn_listen_addr, e
-                    );
-                    let app_clone = app.clone();
-                    tokio::spawn(async move {
-                        let mut interval =
-                            tokio::time::interval(std::time::Duration::from_secs(10));
-                        interval.tick().await;
-                        loop {
-                            tokio::select! {
-                                _ = shutdown_rx_vpn.recv() => { debug!("[API] VPN listener retry task shutting down"); break; }
-                                _ = interval.tick() => {
-                                    match tokio::net::TcpListener::bind(vpn_listen_addr).await {
-                                        Ok(vpn_listener) => {
-                                            info!("[API] VPN listener bound on {} (TUN is now up)", vpn_listen_addr);
-                                            let server = axum::serve(vpn_listener, app_clone)
-                                                .with_graceful_shutdown(async { std::future::pending::<()>().await });
-                                            if let Err(e) = server.await { error!("[API] VPN listener error: {}", e); }
-                                            break;
-                                        }
-                                        Err(e) => { debug!("[API] VPN listener retry failed ({}): {}", vpn_listen_addr, e); }
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            }
+                info!("[API] VPN listener stopped");
+            });
 
-            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let server = axum::serve(node_listener, app).with_graceful_shutdown(async move {
                 let _ = shutdown_rx.recv().await;
                 info!("[API] Shutdown signal received");
             });
@@ -3766,6 +3889,25 @@ impl Server {
             }
             info!("[API] Stopped");
         }))
+    }
+
+    async fn bind_required_api_listener(
+        role: &'static str,
+        listen_addr: SocketAddr,
+    ) -> Result<tokio::net::TcpListener> {
+        tokio::net::TcpListener::bind(listen_addr)
+            .await
+            .map_err(|error| {
+                error!(
+                    listener_role = role,
+                    address = %listen_addr,
+                    %error,
+                    "[STARTUP] Required API listener bind failed"
+                );
+                ServerError::startup_failed(format!(
+                    "required {role} listener {listen_addr} failed to bind: {error}"
+                ))
+            })
     }
 
     fn build_public_discovery_router(
@@ -3858,25 +4000,14 @@ impl Server {
 
     async fn serve_public_discovery_api(
         listen_addr: SocketAddr,
+        listener: tokio::net::TcpListener,
         app: axum::Router,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
-        let listener = match tokio::net::TcpListener::bind(listen_addr).await {
-            Ok(listener) => {
-                info!(
-                    "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/discovery/peer/directory/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/discovery/peer/verified-delivery-anchor-witness)",
-                    listen_addr
-                );
-                listener
-            }
-            Err(error) => {
-                error!(
-                    "[DISCOVERY] Public discovery API bind failed {}: {}",
-                    listen_addr, error
-                );
-                return;
-            }
-        };
+        info!(
+            "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/discovery/peer/directory/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/discovery/peer/verified-delivery-anchor-witness)",
+            listen_addr
+        );
 
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
             let _ = shutdown_rx.recv().await;
@@ -10245,12 +10376,12 @@ mod tests {
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
         DiscoveryPeerIdentityHints, PeerHttpClients, PeerStoreCacheDocument,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
-        Server, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
-        BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
-        DIRECTORY_OPERATOR_HTTP_PROFILE, DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS,
-        DIRECTORY_SYNC_HTTP_PROFILE, DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
-        MEMCHAIN_SYNC_HTTP_PROFILE, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
-        TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        Server, SystemdNotifier, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
+        BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
+        COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DIRECTORY_OPERATOR_HTTP_PROFILE,
+        DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
+        DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, MEMCHAIN_SYNC_HTTP_PROFILE,
+        ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
     };
@@ -10287,6 +10418,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
 
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixDatagram;
+
     use crate::api::chat_peer::{
         PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
         PeerChatRelayResponse,
@@ -10297,6 +10431,61 @@ mod tests {
     use crate::services::{
         DirectoryReplicaGossipAnnouncement, PeerStore, PeerStoreImportReport,
     };
+
+    #[test]
+    fn systemd_notifier_is_backward_compatible_without_notify_socket() {
+        // [STARTUP-READINESS 2026-07-29 by Codex] CLI and container starts
+        // without systemd must not acquire a new runtime requirement.
+        let notifier = SystemdNotifier::from_socket(None);
+        assert!(!notifier.status("initializing").unwrap());
+        assert!(!notifier.ready("ready").unwrap());
+        assert!(!notifier.stopping("stopping").unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_notifier_sends_sanitized_ready_datagram() {
+        // [STARTUP-READINESS 2026-07-29 by Codex] Exercise the filesystem
+        // namespace used by tests; production systemd commonly uses the
+        // abstract namespace, which shares the same validated send path.
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("notify.sock");
+        let receiver = UnixDatagram::bind(&socket_path).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let notifier =
+            SystemdNotifier::from_socket(Some(socket_path.as_os_str().to_os_string()));
+
+        assert!(notifier.ready("ready\nwithout injection").unwrap());
+
+        let mut buffer = [0_u8; 128];
+        let received = receiver.recv(&mut buffer).unwrap();
+        assert_eq!(
+            &buffer[..received],
+            b"READY=1\nSTATUS=ready without injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_api_listener_bind_fails_closed_on_address_conflict() {
+        // [STARTUP-READINESS 2026-07-29 by Codex] A detached bind failure used
+        // to leave the process active without an API. The startup barrier must
+        // now reject the same conflict and release cleanly afterward.
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied.local_addr().unwrap();
+        let error = Server::bind_required_api_listener("test_api", address)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test_api"));
+        assert!(error.to_string().contains(&address.to_string()));
+
+        drop(occupied);
+        let rebound = Server::bind_required_api_listener("test_api", address)
+            .await
+            .unwrap();
+        assert_eq!(rebound.local_addr().unwrap(), address);
+    }
 
     #[tokio::test]
     async fn peer_http_profiles_share_redirect_free_transport_policy() -> anyhow::Result<()> {

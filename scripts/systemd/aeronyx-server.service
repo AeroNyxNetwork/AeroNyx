@@ -14,6 +14,11 @@
 # This unit manages the Rust process only. It does not collect traffic
 # destinations, DNS contents, packet payloads, domains, URLs, browsing history,
 # voucher secrets, client public IPs, or wallet-level traffic.
+#
+# [STARTUP-READINESS 2026-07-29 by Codex]
+# Keep this fixed-path template aligned with deploy/node/aeronyx-server.service:
+# systemd may report active only after the Rust node has bound all required
+# listeners and emitted READY=1.
 
 [Unit]
 Description=AeroNyx Rust privacy node
@@ -21,13 +26,15 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=root
 WorkingDirectory=/root/open/AeroNyx
 ExecStart=/root/open/AeroNyx/target/release/aeronyx-server start -c /etc/aeronyx/server.toml
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
+TimeoutStartSec=300
 TimeoutStopSec=30
 LimitNOFILE=1048576
 
