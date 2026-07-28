@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.52.0 - Privacy-safe Directory sync transport outcomes.
+Modification Reason: v0.53.0 - Bounded recent Directory transport health.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.52.0 - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Classifies every completed coordinator-owned Directory HTTP exchange into one mutually exclusive process-only outcome without peer, endpoint, operation, status-code, frame, or payload dimensions.
+Last Modified: v0.53.0 - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Classifies Directory synchronization health from a fixed recent outcome window so one final success cannot conceal meaningful transport churn, without retaining identity-bearing request history.
+Previous: v0.52.0 - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Classifies every completed coordinator-owned Directory HTTP exchange into one mutually exclusive process-only outcome without peer, endpoint, operation, status-code, frame, or payload dimensions.
 Previous: v0.51.0 - [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Restores the Directory replica synchronizer's canonical 10-second failover deadline while retaining a separate 12-second process-lifetime operator diagnostic profile.
 Previous: v0.50.0 - [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Built bounded control, shared Directory, MemChain sync, and gossip transports once before mutable services started, then reused their connection pools across runtime tasks.
 Previous: v0.49.0 - [DISCOVERY-ENDPOINT-SSRF 2026-07-28 by Codex] Canonicalizes peer targets, rejects unsafe permissionless descriptor endpoints, and disables redirects/proxies across discovery, relay, onion, and MemChain transport.
@@ -92,6 +93,17 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.53 Bounded recent Directory transport health
+
+[DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex]
+
+- A single successful request must not immediately erase evidence of a recently unstable synchronization transport. The prior latest-outcome classification could report `healthy` after one success even when half of the observed process requests had just failed.
+- The Directory synchronization runtime now retains at most 32 terminal outcome classes in a private `VecDeque`. It continues to expose lifetime counters, but derives current health from recent success/failure totals plus the bounded trailing failure count.
+- `degraded` means that at least 20% of the current recent window failed or at least three consecutive requests failed. `healthy` therefore means the bounded recent evidence is below both published thresholds, not merely that the last request succeeded.
+- Runtime invariants require recent successes plus recent failures to equal recent requests, the window never to exceed its declared capacity or lifetime total, and idle lifetime/recent state to agree. Any violation is reported as `inconsistent`.
+- The public status remains aggregate-only and process-local. It does not expose the outcome sequence, peer, producer, carrier, endpoint, URL, operation, status code, request id, frame, payload, or user-plane metadata.
+- Status strings, protocol frames, retry/failover behavior, persistence schema, authority boundaries, and lifetime telemetry remain backward compatible; the new fields are additive.
 
 ### v0.52 Privacy-safe Directory transport outcomes
 

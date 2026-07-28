@@ -70,6 +70,9 @@
 //! - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Retains mutually
 //!   exclusive process-lifetime Directory synchronization transport outcomes
 //!   without accepting peer, endpoint, request, status-code, or frame data.
+//! - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Retains a fixed-size
+//!   outcome-class window so recent instability cannot be hidden by one final
+//!   success, without adding any identity-bearing metric dimension.
 //! - Re-verifies one carrier-returned retained mirror anchor without importing
 //!   it, enabling a production smoke test with no authority or storage change.
 //! - Builds operator-scoped portable observation certificates only from the
@@ -129,6 +132,8 @@
 //!     and run the complete producer audit before returning one announcement.
 //! 20. Reduce each completed coordinator-owned HTTP exchange to one aggregate
 //!     transport outcome without retaining any peer- or request-level dimension.
+//! 21. Maintain a fixed 32-outcome health window beside lifetime totals so
+//!     status reflects recent behavior rather than only the final completion.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -162,6 +167,9 @@
 //! - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Transport outcomes
 //!   are process diagnostics only. Never add peer, endpoint, producer, carrier,
 //!   URL, status code, frame, payload, or user-plane dimensions to them.
+//! - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Keep the recent window
+//!   fixed-size and outcome-only. It must never retain timestamps per request,
+//!   identities, endpoints, operations, frames, hashes, or payload data.
 //! - Witness policy epochs describe only this operator's local evidence target.
 //!   They are not a validator set, vote, quorum, fork choice, consensus, or
 //!   finality, and public status must never expose their full member identities.
@@ -186,6 +194,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.36.0-DirectoryTransportWindow - Added a bounded recent-outcome window
+//! so one recovery success cannot erase evidence of current transport churn.
 //! v0.35.0-DirectoryTransportTelemetry - Added process-only, mutually exclusive
 //! coordinator transport outcomes with no peer- or request-level dimensions.
 //! v0.34.0-DirectoryProofDiversity - Rotated gossip evidence across producers
@@ -251,7 +261,7 @@
 //! v0.1.0-DirectoryReplicaStore - Initial producer-isolated replica persistence.
 // ============================================================================
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1426,12 +1436,20 @@ pub enum DirectoryReplicaTransportOutcome {
     ResponseBodyReadFailure,
 }
 
+/// Number of terminal Directory transport outcomes retained for recent health.
+///
+/// [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] This bounds both memory
+/// and the amount of process history represented by the health classification.
+/// Entries are outcome classes only; no request metadata is retained.
+pub const DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY: usize = 32;
+const DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY_U64: u64 = 32;
+
 /// Process-lifetime aggregate Directory synchronization transport telemetry.
 ///
 /// Every completed coordinator-owned request contributes to `requests` and
 /// exactly one terminal bucket. The snapshot never accepts identity-bearing or
 /// request-bearing values and is intentionally not persisted across restarts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectoryReplicaTransportSnapshot {
     /// Completed coordinator-owned HTTP requests.
     pub requests: u64,
@@ -1451,6 +1469,16 @@ pub struct DirectoryReplicaTransportSnapshot {
     pub response_too_large: u64,
     /// Interrupted bounded success-body streams.
     pub response_body_read_failures: u64,
+    /// Maximum number of outcome classes represented by the recent window.
+    pub recent_window_capacity: u64,
+    /// Terminal outcomes currently represented by the recent window.
+    pub recent_requests: u64,
+    /// Successful outcomes currently represented by the recent window.
+    pub recent_succeeded: u64,
+    /// Non-success outcomes currently represented by the recent window.
+    pub recent_failures: u64,
+    /// Trailing non-success outcomes, capped by the recent window capacity.
+    pub consecutive_failures: u64,
     /// Latest completed terminal outcome.
     pub last_outcome: Option<DirectoryReplicaTransportOutcome>,
     /// Latest completed request timestamp.
@@ -1459,6 +1487,31 @@ pub struct DirectoryReplicaTransportSnapshot {
     pub last_success_at: Option<u64>,
     /// Latest non-success request timestamp.
     pub last_failure_at: Option<u64>,
+}
+
+impl Default for DirectoryReplicaTransportSnapshot {
+    fn default() -> Self {
+        Self {
+            requests: 0,
+            succeeded: 0,
+            connect_timeouts: 0,
+            request_timeouts: 0,
+            connect_failures: 0,
+            request_failures: 0,
+            http_status_failures: 0,
+            response_too_large: 0,
+            response_body_read_failures: 0,
+            recent_window_capacity: DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY_U64,
+            recent_requests: 0,
+            recent_succeeded: 0,
+            recent_failures: 0,
+            consecutive_failures: 0,
+            last_outcome: None,
+            last_request_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+        }
+    }
 }
 
 impl DirectoryReplicaTransportSnapshot {
@@ -1473,6 +1526,102 @@ impl DirectoryReplicaTransportSnapshot {
             .saturating_add(self.http_status_failures)
             .saturating_add(self.response_too_large)
             .saturating_add(self.response_body_read_failures)
+    }
+}
+
+/// Fixed-memory transport runtime that owns lifetime and recent-window state.
+///
+/// The queue stores only terminal outcome classes. Keeping it private prevents
+/// future status code from accidentally serializing request-level history.
+#[derive(Debug)]
+struct DirectoryReplicaTransportRuntime {
+    snapshot: DirectoryReplicaTransportSnapshot,
+    recent_outcomes: VecDeque<DirectoryReplicaTransportOutcome>,
+}
+
+impl Default for DirectoryReplicaTransportRuntime {
+    fn default() -> Self {
+        Self {
+            snapshot: DirectoryReplicaTransportSnapshot::default(),
+            recent_outcomes: VecDeque::with_capacity(DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY),
+        }
+    }
+}
+
+impl DirectoryReplicaTransportRuntime {
+    fn record(&mut self, outcome: DirectoryReplicaTransportOutcome, completed_at: u64) {
+        if completed_at == 0 {
+            return;
+        }
+        if self.recent_outcomes.len() == DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY {
+            self.recent_outcomes.pop_front();
+        }
+        self.recent_outcomes.push_back(outcome);
+        self.snapshot.requests = self.snapshot.requests.saturating_add(1);
+        self.snapshot.last_outcome = Some(outcome);
+        self.snapshot.last_request_at = Some(completed_at);
+        match outcome {
+            DirectoryReplicaTransportOutcome::Succeeded => {
+                self.snapshot.succeeded = self.snapshot.succeeded.saturating_add(1);
+                self.snapshot.last_success_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::ConnectTimeout => {
+                self.snapshot.connect_timeouts = self.snapshot.connect_timeouts.saturating_add(1);
+                self.snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::RequestTimeout => {
+                self.snapshot.request_timeouts = self.snapshot.request_timeouts.saturating_add(1);
+                self.snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::ConnectFailure => {
+                self.snapshot.connect_failures = self.snapshot.connect_failures.saturating_add(1);
+                self.snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::RequestFailure => {
+                self.snapshot.request_failures = self.snapshot.request_failures.saturating_add(1);
+                self.snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::HttpStatusFailure => {
+                self.snapshot.http_status_failures =
+                    self.snapshot.http_status_failures.saturating_add(1);
+                self.snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::ResponseTooLarge => {
+                self.snapshot.response_too_large =
+                    self.snapshot.response_too_large.saturating_add(1);
+                self.snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::ResponseBodyReadFailure => {
+                self.snapshot.response_body_read_failures =
+                    self.snapshot.response_body_read_failures.saturating_add(1);
+                self.snapshot.last_failure_at = Some(completed_at);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> DirectoryReplicaTransportSnapshot {
+        let mut snapshot = self.snapshot;
+        snapshot.recent_requests =
+            u64::try_from(self.recent_outcomes.len()).unwrap_or(snapshot.recent_window_capacity);
+        snapshot.recent_succeeded = u64::try_from(
+            self.recent_outcomes
+                .iter()
+                .filter(|outcome| **outcome == DirectoryReplicaTransportOutcome::Succeeded)
+                .count(),
+        )
+        .unwrap_or(snapshot.recent_window_capacity);
+        snapshot.recent_failures = snapshot
+            .recent_requests
+            .saturating_sub(snapshot.recent_succeeded);
+        snapshot.consecutive_failures = u64::try_from(
+            self.recent_outcomes
+                .iter()
+                .rev()
+                .take_while(|outcome| **outcome != DirectoryReplicaTransportOutcome::Succeeded)
+                .count(),
+        )
+        .unwrap_or(snapshot.recent_window_capacity);
+        snapshot
     }
 }
 
@@ -1627,7 +1776,7 @@ impl DirectoryReplicaSyncObservation {
 #[derive(Debug, Default)]
 pub struct DirectoryReplicaSyncRuntime {
     observations: Mutex<HashMap<[u8; 32], DirectoryReplicaSyncObservation>>,
-    directory_sync_transport: Mutex<DirectoryReplicaTransportSnapshot>,
+    directory_sync_transport: Mutex<DirectoryReplicaTransportRuntime>,
     observation_witness: Mutex<DirectoryObservationWitnessOutcomeSnapshot>,
     observation_witness_recovery: Mutex<DirectoryObservationWitnessRecoverySnapshot>,
     observation_witness_carrier: Mutex<DirectoryObservationWitnessCarrierSnapshot>,
@@ -1644,54 +1793,15 @@ impl DirectoryReplicaSyncRuntime {
         outcome: DirectoryReplicaTransportOutcome,
         completed_at: u64,
     ) {
-        if completed_at == 0 {
-            return;
-        }
-        let mut snapshot = self.directory_sync_transport.lock();
-        snapshot.requests = snapshot.requests.saturating_add(1);
-        snapshot.last_outcome = Some(outcome);
-        snapshot.last_request_at = Some(completed_at);
-        match outcome {
-            DirectoryReplicaTransportOutcome::Succeeded => {
-                snapshot.succeeded = snapshot.succeeded.saturating_add(1);
-                snapshot.last_success_at = Some(completed_at);
-            }
-            DirectoryReplicaTransportOutcome::ConnectTimeout => {
-                snapshot.connect_timeouts = snapshot.connect_timeouts.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
-            }
-            DirectoryReplicaTransportOutcome::RequestTimeout => {
-                snapshot.request_timeouts = snapshot.request_timeouts.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
-            }
-            DirectoryReplicaTransportOutcome::ConnectFailure => {
-                snapshot.connect_failures = snapshot.connect_failures.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
-            }
-            DirectoryReplicaTransportOutcome::RequestFailure => {
-                snapshot.request_failures = snapshot.request_failures.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
-            }
-            DirectoryReplicaTransportOutcome::HttpStatusFailure => {
-                snapshot.http_status_failures = snapshot.http_status_failures.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
-            }
-            DirectoryReplicaTransportOutcome::ResponseTooLarge => {
-                snapshot.response_too_large = snapshot.response_too_large.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
-            }
-            DirectoryReplicaTransportOutcome::ResponseBodyReadFailure => {
-                snapshot.response_body_read_failures =
-                    snapshot.response_body_read_failures.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
-            }
-        }
+        self.directory_sync_transport
+            .lock()
+            .record(outcome, completed_at);
     }
 
     /// Returns process-lifetime aggregate Directory sync transport telemetry.
     #[must_use]
     pub fn directory_sync_transport_snapshot(&self) -> DirectoryReplicaTransportSnapshot {
-        *self.directory_sync_transport.lock()
+        self.directory_sync_transport.lock().snapshot()
     }
 
     /// Registers configured pins so status reports can distinguish pending from
@@ -3587,8 +3697,7 @@ impl DirectoryReplicaStore {
         {
             let producer = bytes32(&producer_bytes, "gossip proof producer")?;
             let block_hash = bytes32(&block_hash_bytes, "gossip proof block hash")?;
-            let descriptor_hash =
-                bytes32(&descriptor_hash_bytes, "gossip proof descriptor hash")?;
+            let descriptor_hash = bytes32(&descriptor_hash_bytes, "gossip proof descriptor hash")?;
             let descriptor = decode_descriptor_object(&descriptor_blob)?;
             descriptor.verify_signature().map_err(|error| {
                 DirectoryReplicaStoreError::Descriptor(format!(
@@ -14091,6 +14200,11 @@ mod tests {
         assert_eq!(snapshot.http_status_failures, 1);
         assert_eq!(snapshot.response_too_large, 1);
         assert_eq!(snapshot.response_body_read_failures, 1);
+        assert_eq!(snapshot.recent_window_capacity, 32);
+        assert_eq!(snapshot.recent_requests, 8);
+        assert_eq!(snapshot.recent_succeeded, 1);
+        assert_eq!(snapshot.recent_failures, 7);
+        assert_eq!(snapshot.consecutive_failures, 7);
         assert_eq!(
             snapshot.last_outcome,
             Some(DirectoryReplicaTransportOutcome::ResponseBodyReadFailure)
@@ -14098,6 +14212,40 @@ mod tests {
         assert_eq!(snapshot.last_request_at, Some(NOW + 7));
         assert_eq!(snapshot.last_success_at, Some(NOW));
         assert_eq!(snapshot.last_failure_at, Some(NOW + 7));
+    }
+
+    #[test]
+    fn directory_sync_transport_recent_window_evicts_old_failures() {
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        for _ in 0..DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY {
+            runtime.record_directory_sync_transport_outcome(
+                DirectoryReplicaTransportOutcome::RequestFailure,
+                NOW,
+            );
+        }
+        let failed = runtime.directory_sync_transport_snapshot();
+        assert_eq!(failed.requests, 32);
+        assert_eq!(failed.recent_requests, 32);
+        assert_eq!(failed.recent_succeeded, 0);
+        assert_eq!(failed.recent_failures, 32);
+        assert_eq!(failed.consecutive_failures, 32);
+
+        for _ in 0..DIRECTORY_REPLICA_TRANSPORT_WINDOW_CAPACITY {
+            runtime.record_directory_sync_transport_outcome(
+                DirectoryReplicaTransportOutcome::Succeeded,
+                NOW + 1,
+            );
+        }
+        let recovered = runtime.directory_sync_transport_snapshot();
+        assert_eq!(recovered.requests, 64);
+        assert_eq!(recovered.terminal_outcomes(), recovered.requests);
+        assert_eq!(recovered.succeeded, 32);
+        assert_eq!(recovered.request_failures, 32);
+        assert_eq!(recovered.recent_window_capacity, 32);
+        assert_eq!(recovered.recent_requests, 32);
+        assert_eq!(recovered.recent_succeeded, 32);
+        assert_eq!(recovered.recent_failures, 0);
+        assert_eq!(recovered.consecutive_failures, 0);
     }
 
     #[test]
