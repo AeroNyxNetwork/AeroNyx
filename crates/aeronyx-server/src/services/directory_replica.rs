@@ -67,6 +67,9 @@
 //!   endpoint, request, checkpoint, frame, or signature metadata.
 //! - [WITNESS-CARRIER-ADMISSION 2026-07-27 by Codex] Separates target cooldown
 //!   and local overload outcomes without storing identity-bearing dimensions.
+//! - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Retains mutually
+//!   exclusive process-lifetime Directory synchronization transport outcomes
+//!   without accepting peer, endpoint, request, status-code, or frame data.
 //! - Re-verifies one carrier-returned retained mirror anchor without importing
 //!   it, enabling a production smoke test with no authority or storage change.
 //! - Builds operator-scoped portable observation certificates only from the
@@ -124,6 +127,8 @@
 //! 19. For outbound proof gossip, scan only a bounded recent candidate window,
 //!     retain only currently live authenticated descriptors, rotate selection,
 //!     and run the complete producer audit before returning one announcement.
+//! 20. Reduce each completed coordinator-owned HTTP exchange to one aggregate
+//!     transport outcome without retaining any peer- or request-level dimension.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -154,6 +159,9 @@
 //! - [WITNESS-CARRIER 2026-07-26 by Codex] Recovery telemetry must remain
 //!   process-only and aggregate. It is neither durable evidence nor peer
 //!   reputation and must not influence witness policy or checkpoint truth.
+//! - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Transport outcomes
+//!   are process diagnostics only. Never add peer, endpoint, producer, carrier,
+//!   URL, status code, frame, payload, or user-plane dimensions to them.
 //! - Witness policy epochs describe only this operator's local evidence target.
 //!   They are not a validator set, vote, quorum, fork choice, consensus, or
 //!   finality, and public status must never expose their full member identities.
@@ -178,6 +186,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.35.0-DirectoryTransportTelemetry - Added process-only, mutually exclusive
+//! coordinator transport outcomes with no peer- or request-level dimensions.
 //! v0.34.0-DirectoryProofDiversity - Rotated gossip evidence across producers
 //! before selecting descriptors so alternate proofs cannot repeat one anchor
 //! namespace
@@ -1389,6 +1399,83 @@ pub enum DirectoryObservationWitnessCarrierOutcome {
     LocalFailure,
 }
 
+/// Stable mutually exclusive outcomes for one completed Directory coordinator
+/// HTTP exchange.
+///
+/// [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] This enum deliberately
+/// omits operation, peer, endpoint, producer, carrier, URL, status code,
+/// request id, frame, and response data. It is diagnostic evidence only and
+/// must never influence authority, reputation, routing, or chain selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryReplicaTransportOutcome {
+    /// A bounded success body was read completely.
+    Succeeded,
+    /// Connection establishment exceeded its configured deadline.
+    ConnectTimeout,
+    /// The request exceeded its deadline after connection classification.
+    RequestTimeout,
+    /// Connection establishment failed without a timeout.
+    ConnectFailure,
+    /// Another request-layer failure occurred before a response was available.
+    RequestFailure,
+    /// The peer returned a non-success HTTP status.
+    HttpStatusFailure,
+    /// The declared or streamed success body exceeded its protocol ceiling.
+    ResponseTooLarge,
+    /// The bounded success body stream failed before completion.
+    ResponseBodyReadFailure,
+}
+
+/// Process-lifetime aggregate Directory synchronization transport telemetry.
+///
+/// Every completed coordinator-owned request contributes to `requests` and
+/// exactly one terminal bucket. The snapshot never accepts identity-bearing or
+/// request-bearing values and is intentionally not persisted across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirectoryReplicaTransportSnapshot {
+    /// Completed coordinator-owned HTTP requests.
+    pub requests: u64,
+    /// Requests with a completely read bounded success body.
+    pub succeeded: u64,
+    /// Connection-establishment timeouts.
+    pub connect_timeouts: u64,
+    /// Non-connect request timeouts.
+    pub request_timeouts: u64,
+    /// Non-timeout connection failures.
+    pub connect_failures: u64,
+    /// Other request-layer failures.
+    pub request_failures: u64,
+    /// Non-success HTTP responses.
+    pub http_status_failures: u64,
+    /// Oversized declared or streamed success bodies.
+    pub response_too_large: u64,
+    /// Interrupted bounded success-body streams.
+    pub response_body_read_failures: u64,
+    /// Latest completed terminal outcome.
+    pub last_outcome: Option<DirectoryReplicaTransportOutcome>,
+    /// Latest completed request timestamp.
+    pub last_request_at: Option<u64>,
+    /// Latest successful request timestamp.
+    pub last_success_at: Option<u64>,
+    /// Latest non-success request timestamp.
+    pub last_failure_at: Option<u64>,
+}
+
+impl DirectoryReplicaTransportSnapshot {
+    /// Returns the sum of all mutually exclusive terminal buckets.
+    #[must_use]
+    pub const fn terminal_outcomes(self) -> u64 {
+        self.succeeded
+            .saturating_add(self.connect_timeouts)
+            .saturating_add(self.request_timeouts)
+            .saturating_add(self.connect_failures)
+            .saturating_add(self.request_failures)
+            .saturating_add(self.http_status_failures)
+            .saturating_add(self.response_too_large)
+            .saturating_add(self.response_body_read_failures)
+    }
+}
+
 /// Runtime-only synchronization observation for one pinned producer.
 ///
 /// These fields intentionally contain no endpoint, full response, descriptor,
@@ -1540,6 +1627,7 @@ impl DirectoryReplicaSyncObservation {
 #[derive(Debug, Default)]
 pub struct DirectoryReplicaSyncRuntime {
     observations: Mutex<HashMap<[u8; 32], DirectoryReplicaSyncObservation>>,
+    directory_sync_transport: Mutex<DirectoryReplicaTransportSnapshot>,
     observation_witness: Mutex<DirectoryObservationWitnessOutcomeSnapshot>,
     observation_witness_recovery: Mutex<DirectoryObservationWitnessRecoverySnapshot>,
     observation_witness_carrier: Mutex<DirectoryObservationWitnessCarrierSnapshot>,
@@ -1547,6 +1635,65 @@ pub struct DirectoryReplicaSyncRuntime {
 }
 
 impl DirectoryReplicaSyncRuntime {
+    /// Records exactly one completed coordinator-owned transport outcome.
+    ///
+    /// The caller has already reduced the exchange to a privacy-safe class;
+    /// this boundary cannot receive peer, endpoint, request, or payload data.
+    pub fn record_directory_sync_transport_outcome(
+        &self,
+        outcome: DirectoryReplicaTransportOutcome,
+        completed_at: u64,
+    ) {
+        if completed_at == 0 {
+            return;
+        }
+        let mut snapshot = self.directory_sync_transport.lock();
+        snapshot.requests = snapshot.requests.saturating_add(1);
+        snapshot.last_outcome = Some(outcome);
+        snapshot.last_request_at = Some(completed_at);
+        match outcome {
+            DirectoryReplicaTransportOutcome::Succeeded => {
+                snapshot.succeeded = snapshot.succeeded.saturating_add(1);
+                snapshot.last_success_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::ConnectTimeout => {
+                snapshot.connect_timeouts = snapshot.connect_timeouts.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::RequestTimeout => {
+                snapshot.request_timeouts = snapshot.request_timeouts.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::ConnectFailure => {
+                snapshot.connect_failures = snapshot.connect_failures.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::RequestFailure => {
+                snapshot.request_failures = snapshot.request_failures.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::HttpStatusFailure => {
+                snapshot.http_status_failures = snapshot.http_status_failures.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::ResponseTooLarge => {
+                snapshot.response_too_large = snapshot.response_too_large.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+            DirectoryReplicaTransportOutcome::ResponseBodyReadFailure => {
+                snapshot.response_body_read_failures =
+                    snapshot.response_body_read_failures.saturating_add(1);
+                snapshot.last_failure_at = Some(completed_at);
+            }
+        }
+    }
+
+    /// Returns process-lifetime aggregate Directory sync transport telemetry.
+    #[must_use]
+    pub fn directory_sync_transport_snapshot(&self) -> DirectoryReplicaTransportSnapshot {
+        *self.directory_sync_transport.lock()
+    }
+
     /// Registers configured pins so status reports can distinguish pending from
     /// disabled before the first low-frequency synchronization round.
     pub fn register_producers(&self, producers: &[[u8; 32]]) {
@@ -13891,6 +14038,66 @@ mod tests {
         assert_eq!(observation.failed_attempts, 1);
         assert_eq!(observation.backoff_skips, 1);
         assert_eq!(observation.successful_pages, 1);
+    }
+
+    #[test]
+    fn directory_sync_transport_outcomes_are_mutually_exclusive_and_bounded() {
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::Succeeded,
+            NOW,
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::ConnectTimeout,
+            NOW + 1,
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::RequestTimeout,
+            NOW + 2,
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::ConnectFailure,
+            NOW + 3,
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::RequestFailure,
+            NOW + 4,
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::HttpStatusFailure,
+            NOW + 5,
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::ResponseTooLarge,
+            NOW + 6,
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::ResponseBodyReadFailure,
+            NOW + 7,
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::Succeeded,
+            0,
+        );
+
+        let snapshot = runtime.directory_sync_transport_snapshot();
+        assert_eq!(snapshot.requests, 8);
+        assert_eq!(snapshot.terminal_outcomes(), snapshot.requests);
+        assert_eq!(snapshot.succeeded, 1);
+        assert_eq!(snapshot.connect_timeouts, 1);
+        assert_eq!(snapshot.request_timeouts, 1);
+        assert_eq!(snapshot.connect_failures, 1);
+        assert_eq!(snapshot.request_failures, 1);
+        assert_eq!(snapshot.http_status_failures, 1);
+        assert_eq!(snapshot.response_too_large, 1);
+        assert_eq!(snapshot.response_body_read_failures, 1);
+        assert_eq!(
+            snapshot.last_outcome,
+            Some(DirectoryReplicaTransportOutcome::ResponseBodyReadFailure)
+        );
+        assert_eq!(snapshot.last_request_at, Some(NOW + 7));
+        assert_eq!(snapshot.last_success_at, Some(NOW));
+        assert_eq!(snapshot.last_failure_at, Some(NOW + 7));
     }
 
     #[test]

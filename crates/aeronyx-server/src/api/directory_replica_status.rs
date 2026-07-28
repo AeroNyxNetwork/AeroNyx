@@ -55,6 +55,9 @@
 //!   outcome per authenticated request and no identity-bearing dimensions.
 //! - [WITNESS-CARRIER-ADMISSION 2026-07-27 by Codex] Separately reports
 //!   fail-fast local overload and descriptor-bound target cooldown outcomes.
+//! - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Reports one
+//!   aggregate, mutually exclusive outcome per completed coordinator HTTP
+//!   exchange without peer, endpoint, operation, status-code, or frame labels.
 //! - Reports aggregate routeable carrier and signed-region-hint diversity
 //!   counts while explicitly rejecting operator/ASN diversity claims.
 //! - Separates signed carrier capability evidence from unadvertised
@@ -88,6 +91,8 @@
 //!     authority observations.
 //! 14. Report witness availability recovery separately from durable witness
 //!     evidence so carrier success is never presented as authority or consensus.
+//! 15. Report process-only Directory synchronization transport health while
+//!     verifying that terminal buckets still sum to completed requests.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -126,8 +131,13 @@
 //!   target witness, endpoint, request id, checkpoint hash, or exact route.
 //! - Carrier-service telemetry proves only bounded transport activity. It must
 //!   never influence witness authority, routing rank, reputation, or policy.
+//! - Directory transport telemetry is aggregate process health only. Never add
+//!   peer, producer, carrier, endpoint, URL, status-code, request, frame,
+//!   payload, authority, reputation, routing-rank, or consensus dimensions.
 //!
 //! ## Last Modified
+//! `v0.27.0-DirectoryTransportStatus` - Added additive process-only
+//! synchronization transport outcomes and terminal-bucket consistency status.
 //! `v0.26.0-WitnessCarrierAdmissionStatus` - Added aggregate cooldown and
 //! overload outcomes without peer, endpoint, route, or frame dimensions.
 //! `v0.25.0-WitnessCarrierServiceStatus` - Added additive process-only
@@ -201,7 +211,8 @@ use crate::api::directory_replica_sync::{
 };
 use crate::services::directory_replica::{
     DirectoryFullNodeMirrorRuntimeSnapshot, DirectoryObservationWitnessCarrierSnapshot,
-    DirectoryObservationWitnessRecoverySnapshot, MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS,
+    DirectoryObservationWitnessRecoverySnapshot, DirectoryReplicaTransportOutcome,
+    DirectoryReplicaTransportSnapshot, MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS,
 };
 use crate::services::{
     DirectoryObservationWitnessOutcomeSnapshot, DirectoryReplicaIncidentEvidence,
@@ -425,6 +436,32 @@ struct DirectoryReplicaObservationWitnessCarrierStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct DirectoryReplicaTransportStatus {
+    source_status: &'static str,
+    profile: &'static str,
+    status: &'static str,
+    requests: u64,
+    succeeded: u64,
+    failures: u64,
+    connect_timeouts: u64,
+    request_timeouts: u64,
+    connect_failures: u64,
+    request_failures: u64,
+    http_status_failures: u64,
+    response_too_large: u64,
+    response_body_read_failures: u64,
+    last_outcome: Option<&'static str>,
+    last_request_age_seconds: Option<u64>,
+    last_success_age_seconds: Option<u64>,
+    last_failure_age_seconds: Option<u64>,
+    terminal_outcomes_consistent: bool,
+    persistence: &'static str,
+    authority_boundary: &'static str,
+    privacy_boundary: &'static str,
+    security_model: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct DirectoryFullNodeMirrorStatus {
     enabled: bool,
     status: &'static str,
@@ -546,6 +583,7 @@ struct DirectoryReplicaStatusResponse {
     next_retry_at: Option<u64>,
     next_retry_after_seconds: Option<u64>,
     catch_up_policy: DirectoryReplicaCatchUpPolicy,
+    directory_sync_transport: DirectoryReplicaTransportStatus,
     full_node_mirror: DirectoryFullNodeMirrorStatus,
     observation_convergence: DirectoryReplicaObservationConvergenceStatus,
     observation_checkpoint: DirectoryReplicaObservationCheckpointStatus,
@@ -690,6 +728,7 @@ struct DirectoryReplicaRuntimeSummary {
 
 struct DirectoryReplicaRuntimeSnapshots<'a> {
     producers: &'a [DirectoryReplicaSyncObservation],
+    directory_sync_transport: &'a DirectoryReplicaTransportSnapshot,
     observation_witness: &'a DirectoryObservationWitnessOutcomeSnapshot,
     observation_witness_recovery: &'a DirectoryObservationWitnessRecoverySnapshot,
     observation_witness_carrier: &'a DirectoryObservationWitnessCarrierSnapshot,
@@ -1269,6 +1308,7 @@ async fn directory_replica_status_handler(
         )
     };
     let runtime = state.runtime.snapshot();
+    let directory_sync_transport_runtime = state.runtime.directory_sync_transport_snapshot();
     let observation_witness_runtime = state.runtime.observation_witness_snapshot();
     let observation_witness_recovery_runtime =
         state.runtime.observation_witness_recovery_snapshot();
@@ -1276,6 +1316,7 @@ async fn directory_replica_status_handler(
     let full_node_mirror_runtime = state.runtime.full_node_mirror_snapshot();
     let runtime_snapshots = DirectoryReplicaRuntimeSnapshots {
         producers: &runtime,
+        directory_sync_transport: &directory_sync_transport_runtime,
         observation_witness: &observation_witness_runtime,
         observation_witness_recovery: &observation_witness_recovery_runtime,
         observation_witness_carrier: &observation_witness_carrier_runtime,
@@ -1816,6 +1857,66 @@ fn build_observation_witness_carrier_status(
     }
 }
 
+fn build_directory_sync_transport_status(
+    generated_at: u64,
+    runtime: &DirectoryReplicaTransportSnapshot,
+) -> DirectoryReplicaTransportStatus {
+    let terminal_outcomes = runtime.terminal_outcomes();
+    let terminal_outcomes_consistent = terminal_outcomes == runtime.requests;
+    let status = if !terminal_outcomes_consistent {
+        "inconsistent"
+    } else if runtime.requests == 0 {
+        "idle"
+    } else if runtime.last_outcome == Some(DirectoryReplicaTransportOutcome::Succeeded) {
+        "healthy"
+    } else {
+        "degraded"
+    };
+    let last_outcome = runtime.last_outcome.map(|outcome| match outcome {
+        DirectoryReplicaTransportOutcome::Succeeded => "succeeded",
+        DirectoryReplicaTransportOutcome::ConnectTimeout => "connect_timeout",
+        DirectoryReplicaTransportOutcome::RequestTimeout => "request_timeout",
+        DirectoryReplicaTransportOutcome::ConnectFailure => "connect_failure",
+        DirectoryReplicaTransportOutcome::RequestFailure => "request_failure",
+        DirectoryReplicaTransportOutcome::HttpStatusFailure => "http_status_failure",
+        DirectoryReplicaTransportOutcome::ResponseTooLarge => "response_too_large",
+        DirectoryReplicaTransportOutcome::ResponseBodyReadFailure => "response_body_read_failure",
+    });
+    DirectoryReplicaTransportStatus {
+        source_status: "process_runtime_aggregate",
+        profile: "directory_sync",
+        status,
+        requests: runtime.requests,
+        succeeded: runtime.succeeded,
+        failures: terminal_outcomes.saturating_sub(runtime.succeeded),
+        connect_timeouts: runtime.connect_timeouts,
+        request_timeouts: runtime.request_timeouts,
+        connect_failures: runtime.connect_failures,
+        request_failures: runtime.request_failures,
+        http_status_failures: runtime.http_status_failures,
+        response_too_large: runtime.response_too_large,
+        response_body_read_failures: runtime.response_body_read_failures,
+        last_outcome,
+        last_request_age_seconds: runtime
+            .last_request_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_success_age_seconds: runtime
+            .last_success_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_failure_age_seconds: runtime
+            .last_failure_at
+            .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        terminal_outcomes_consistent,
+        persistence: "process_lifetime_only",
+        authority_boundary:
+            "transport_diagnostics_only_not_directory_authority_replica_truth_or_peer_reputation",
+        privacy_boundary:
+            "aggregate outcome counters and ages only; no peer producer carrier endpoint url operation status-code request id frame payload or user-plane data",
+        security_model:
+            "transport_health_not_vote_validator_set_quorum_fork_choice_consensus_or_finality",
+    }
+}
+
 fn build_full_node_mirror_status(
     generated_at: u64,
     store_enabled: bool,
@@ -2034,6 +2135,10 @@ fn build_directory_replica_status_response(
             retry_state_persistence: "audited_sqlite",
             successful_import_clears_retry_atomically: true,
         },
+        directory_sync_transport: build_directory_sync_transport_status(
+            generated_at,
+            runtime.directory_sync_transport,
+        ),
         full_node_mirror: build_full_node_mirror_status(
             generated_at,
             store_enabled,
@@ -2218,6 +2323,14 @@ mod tests {
             4,
             2,
         );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::ConnectTimeout,
+            now_secs().saturating_sub(2),
+        );
+        runtime.record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::Succeeded,
+            now_secs().saturating_sub(1),
+        );
         runtime.record_observation_witness_recovery_selection(
             3,
             2,
@@ -2261,6 +2374,42 @@ mod tests {
         assert_eq!(parsed["status"].as_str(), Some("catching_up"));
         assert_eq!(parsed["configured_producers"].as_u64(), Some(1));
         assert_eq!(parsed["max_lag_blocks"].as_u64(), Some(4));
+        assert_eq!(
+            parsed["directory_sync_transport"]["profile"].as_str(),
+            Some("directory_sync")
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["status"].as_str(),
+            Some("healthy")
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["requests"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["succeeded"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["failures"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["connect_timeouts"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["last_outcome"].as_str(),
+            Some("succeeded")
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["terminal_outcomes_consistent"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["directory_sync_transport"]["persistence"].as_str(),
+            Some("process_lifetime_only")
+        );
         assert_eq!(
             parsed["observation_convergence"]["source_status"].as_str(),
             Some("awaiting_sources")

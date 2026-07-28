@@ -183,8 +183,13 @@
 //! - [DIRECTORY-PEER-ADMISSION 2026-07-27 by Codex] A transport-authenticated
 //!   proof is not a local trust anchor. Keep both local replica audits around
 //!   the network request, exact-proof equality, and `PeerStore` anti-rollback.
+//! - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Coordinator HTTP
+//!   outcomes must remain task-scoped and aggregate. Never attach peer,
+//!   producer, carrier, endpoint, URL, status code, request, or frame labels.
 //!
 //! ## Last Modified
+//! `v0.31.0-DirectoryTransportTelemetry` - Added task-scoped, mutually
+//! exclusive process transport outcomes without changing stable failure codes.
 //! `v0.30.0-RoleSpecificTransportBudgets` - Restored one canonical 10-second
 //! replica request deadline while preserving the separate operator budget.
 //! `v0.29.0-ProcessLifetimePeerTransport` - Reused the server-owned Directory
@@ -293,11 +298,11 @@ use tracing::{debug, info, warn};
 
 use crate::api::memchain_peer::{commitment_peer_endpoint_is_public, commitment_peer_url};
 use crate::api::{
-    privacy_safe_peer_http_client_builder, read_bounded_http_response,
-    BoundedHttpResponseError,
+    privacy_safe_peer_http_client_builder, read_bounded_http_response, BoundedHttpResponseError,
 };
 use crate::services::directory_replica::{
-    DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS, DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES,
+    DirectoryReplicaTransportOutcome, DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS,
+    DIRECTORY_REPLICA_MAX_CONSECUTIVE_FAILURES,
 };
 use crate::services::{
     DirectoryObservationWitnessOutcome, DirectoryReplicaImportReport, DirectoryReplicaStore,
@@ -319,6 +324,14 @@ pub(crate) const DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// the independent producer-round deadline still caps the complete operation.
 /// Production and standalone constructors consume this same value.
 pub(crate) const DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+// [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Only futures polled
+// inside a coordinator synchronization round can update the Directory sync
+// profile counters. Operator smokes and standalone protocol helpers therefore
+// cannot be misclassified as production synchronization traffic.
+tokio::task_local! {
+    static DIRECTORY_SYNC_TRANSPORT_RUNTIME: Arc<DirectoryReplicaSyncRuntime>;
+}
 /// Maximum producer-local retry delay after repeated consecutive failures.
 pub(crate) const DIRECTORY_SYNC_FAILURE_BACKOFF_MAX_SECS: u64 =
     DIRECTORY_REPLICA_FAILURE_BACKOFF_MAX_SECS;
@@ -1434,8 +1447,38 @@ impl DirectoryPeerErrorCode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryTransportFailure {
+    Preflight,
+    ConnectTimeout,
+    RequestTimeout,
+    Connect,
+    Request,
+}
+
+impl DirectoryTransportFailure {
+    fn from_reqwest(error: &reqwest::Error) -> Self {
+        match (error.is_connect(), error.is_timeout()) {
+            (true, true) => Self::ConnectTimeout,
+            (false, true) => Self::RequestTimeout,
+            (true, false) => Self::Connect,
+            (false, false) => Self::Request,
+        }
+    }
+
+    const fn outcome(self) -> Option<DirectoryReplicaTransportOutcome> {
+        match self {
+            Self::Preflight => None,
+            Self::ConnectTimeout => Some(DirectoryReplicaTransportOutcome::ConnectTimeout),
+            Self::RequestTimeout => Some(DirectoryReplicaTransportOutcome::RequestTimeout),
+            Self::Connect => Some(DirectoryReplicaTransportOutcome::ConnectFailure),
+            Self::Request => Some(DirectoryReplicaTransportOutcome::RequestFailure),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryFramePostError {
-    Transport,
+    Transport(DirectoryTransportFailure),
     HttpStatus {
         status: u16,
         peer_code: Option<DirectoryPeerErrorCode>,
@@ -1456,7 +1499,7 @@ impl DirectoryFramePostError {
 
     fn stable_reason(self, operation: &str) -> String {
         match self {
-            Self::Transport => format!("directory_{operation}_transport_failed"),
+            Self::Transport(_) => format!("directory_{operation}_transport_failed"),
             Self::HttpStatus {
                 peer_code: Some(peer_code),
                 ..
@@ -1493,7 +1536,7 @@ const fn directory_descriptor_proof_direct_post_allows_recovery(
     error: DirectoryFramePostError,
 ) -> bool {
     match error {
-        DirectoryFramePostError::Transport => true,
+        DirectoryFramePostError::Transport(_) => true,
         DirectoryFramePostError::HttpStatus {
             peer_code: Some(_), ..
         }
@@ -1509,7 +1552,7 @@ const fn directory_descriptor_proof_carrier_post_allows_next(
     error: DirectoryFramePostError,
 ) -> bool {
     match error {
-        DirectoryFramePostError::Transport
+        DirectoryFramePostError::Transport(_)
         | DirectoryFramePostError::HttpStatus {
             peer_code:
                 Some(
@@ -1777,6 +1820,20 @@ impl DirectoryReplicaSyncCoordinator {
     }
 
     async fn synchronize_round(&self) -> bool {
+        // [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Scope the
+        // recorder around the complete coordinator round. Futures created by
+        // bounded `buffer_unordered` collections are polled inside this task,
+        // so deep transport helpers remain observable without threading an
+        // ambient metrics argument through protocol-verification functions.
+        DIRECTORY_SYNC_TRANSPORT_RUNTIME
+            .scope(
+                Arc::clone(&self.runtime),
+                self.synchronize_round_with_transport_telemetry(),
+            )
+            .await
+    }
+
+    async fn synchronize_round_with_transport_telemetry(&self) -> bool {
         let outcomes = stream::iter(self.peers.iter().copied())
             .map(|producer| async move { self.synchronize_producer(producer).await })
             .buffer_unordered(DIRECTORY_SYNC_MAX_CONCURRENT_PRODUCERS)
@@ -2698,7 +2755,7 @@ async fn request_observation_checkpoint_witness(
                 peer_code: Some(DirectoryPeerErrorCode::WitnessTargetUnavailable),
                 ..
             })
-            | Err(DirectoryFramePostError::Transport) => {
+            | Err(DirectoryFramePostError::Transport(_)) => {
                 runtime.record_observation_witness_recovery_attempt(
                     false,
                     false,
@@ -2798,7 +2855,7 @@ fn build_observation_witness_request(
 
 const fn observation_witness_failure_allows_carrier(error: DirectoryFramePostError) -> bool {
     match error {
-        DirectoryFramePostError::Transport => true,
+        DirectoryFramePostError::Transport(_) => true,
         DirectoryFramePostError::HttpStatus {
             status,
             peer_code: None,
@@ -2825,7 +2882,7 @@ const fn observation_witness_unavailable_recovery_outcome(
 
 const fn observation_witness_carrier_failure_allows_next(error: DirectoryFramePostError) -> bool {
     match error {
-        DirectoryFramePostError::Transport => true,
+        DirectoryFramePostError::Transport(_) => true,
         DirectoryFramePostError::HttpStatus {
             status,
             peer_code: None,
@@ -2848,7 +2905,7 @@ async fn request_observation_witness_via_carrier(
 ) -> Result<Vec<u8>, DirectoryFramePostError> {
     let request_timestamp = unix_now_secs();
     let url = directory_observation_witness_carrier_url(peer_store, &carrier, request_timestamp)
-        .map_err(|_| DirectoryFramePostError::Transport)?;
+        .map_err(|_| DirectoryFramePostError::Transport(DirectoryTransportFailure::Preflight))?;
     let mut carrier_request_id = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut carrier_request_id);
     let request_sha256: [u8; 32] = Sha256::digest(&request.frame).into();
@@ -5176,14 +5233,26 @@ async fn post_directory_frame_typed_with_response_limit(
     frame: Vec<u8>,
     response_body_limit: usize,
 ) -> Result<Vec<u8>, DirectoryFramePostError> {
-    let response = client
+    let response = match client
         .post(url)
         .header("content-type", "application/octet-stream")
         .body(frame)
         .send()
         .await
-        .map_err(|_| DirectoryFramePostError::Transport)?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let failure = DirectoryTransportFailure::from_reqwest(&error);
+            if let Some(outcome) = failure.outcome() {
+                record_directory_sync_transport_outcome(outcome);
+            }
+            return Err(DirectoryFramePostError::Transport(failure));
+        }
+    };
     if !response.status().is_success() {
+        record_directory_sync_transport_outcome(
+            DirectoryReplicaTransportOutcome::HttpStatusFailure,
+        );
         let status = response.status().as_u16();
         // [MIRROR-CAPABILITY 2026-07-24 by Codex] A 404 can mean either that
         // an optional route is absent or that this carrier has not retained
@@ -5195,9 +5264,30 @@ async fn post_directory_frame_typed_with_response_limit(
             .and_then(|body| DirectoryPeerErrorCode::parse(&body));
         return Err(DirectoryFramePostError::HttpStatus { status, peer_code });
     }
-    read_bounded_http_response(response, response_body_limit)
-        .await
-        .map_err(DirectoryFramePostError::Response)
+    match read_bounded_http_response(response, response_body_limit).await {
+        Ok(body) => {
+            record_directory_sync_transport_outcome(DirectoryReplicaTransportOutcome::Succeeded);
+            Ok(body)
+        }
+        Err(error) => {
+            let outcome = match error {
+                BoundedHttpResponseError::TooLarge => {
+                    DirectoryReplicaTransportOutcome::ResponseTooLarge
+                }
+                BoundedHttpResponseError::BodyRead | BoundedHttpResponseError::JsonDecode => {
+                    DirectoryReplicaTransportOutcome::ResponseBodyReadFailure
+                }
+            };
+            record_directory_sync_transport_outcome(outcome);
+            Err(DirectoryFramePostError::Response(error))
+        }
+    }
+}
+
+fn record_directory_sync_transport_outcome(outcome: DirectoryReplicaTransportOutcome) {
+    let _ = DIRECTORY_SYNC_TRANSPORT_RUNTIME.try_with(|runtime| {
+        runtime.record_directory_sync_transport_outcome(outcome, unix_now_secs());
+    });
 }
 
 pub(crate) fn verify_block_range_response(
@@ -5616,6 +5706,8 @@ mod tests {
     use axum::{http::StatusCode, routing::post, Router};
     use tempfile::TempDir;
 
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
     const TEST_NOW: u64 = 1_700_000_000;
 
     fn carrier_hydration_test_context() -> (
@@ -5734,7 +5826,7 @@ mod tests {
     async fn carrier_hydration_test_endpoint(
         status: StatusCode,
         body: Vec<u8>,
-    ) -> (reqwest::Url, JoinHandle<()>) {
+    ) -> TestResult<(reqwest::Url, JoinHandle<std::io::Result<()>>)> {
         let app = Router::new().route(
             "/",
             post(move || {
@@ -5742,15 +5834,93 @@ mod tests {
                 async move { (status, body) }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (
-            reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
-            server,
-        )
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        Ok((reqwest::Url::parse(&format!("http://{address}/"))?, server))
+    }
+
+    #[tokio::test]
+    async fn directory_transport_telemetry_is_task_scoped_and_mutually_exclusive() -> TestResult {
+        let runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
+        let client = build_hardened_directory_http_client().map_err(std::io::Error::other)?;
+
+        let (unscoped_url, unscoped_server) =
+            carrier_hydration_test_endpoint(StatusCode::OK, b"ok".to_vec()).await?;
+        assert_eq!(
+            post_directory_frame_typed_with_response_limit(&client, unscoped_url, Vec::new(), 16,)
+                .await
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?,
+            b"ok"
+        );
+        unscoped_server.abort();
+        assert_eq!(runtime.directory_sync_transport_snapshot().requests, 0);
+
+        let (success_url, success_server) =
+            carrier_hydration_test_endpoint(StatusCode::OK, b"ok".to_vec()).await?;
+        DIRECTORY_SYNC_TRANSPORT_RUNTIME
+            .scope(
+                Arc::clone(&runtime),
+                post_directory_frame_typed_with_response_limit(
+                    &client,
+                    success_url,
+                    Vec::new(),
+                    16,
+                ),
+            )
+            .await
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        success_server.abort();
+
+        let (status_url, status_server) =
+            carrier_hydration_test_endpoint(StatusCode::SERVICE_UNAVAILABLE, Vec::new()).await?;
+        assert!(matches!(
+            DIRECTORY_SYNC_TRANSPORT_RUNTIME
+                .scope(
+                    Arc::clone(&runtime),
+                    post_directory_frame_typed_with_response_limit(
+                        &client,
+                        status_url,
+                        Vec::new(),
+                        16,
+                    ),
+                )
+                .await,
+            Err(DirectoryFramePostError::HttpStatus { status: 503, .. })
+        ));
+        status_server.abort();
+
+        let (oversized_url, oversized_server) =
+            carrier_hydration_test_endpoint(StatusCode::OK, vec![0u8; 17]).await?;
+        assert_eq!(
+            DIRECTORY_SYNC_TRANSPORT_RUNTIME
+                .scope(
+                    Arc::clone(&runtime),
+                    post_directory_frame_typed_with_response_limit(
+                        &client,
+                        oversized_url,
+                        Vec::new(),
+                        16,
+                    ),
+                )
+                .await,
+            Err(DirectoryFramePostError::Response(
+                BoundedHttpResponseError::TooLarge
+            ))
+        );
+        oversized_server.abort();
+
+        let snapshot = runtime.directory_sync_transport_snapshot();
+        assert_eq!(snapshot.requests, 3);
+        assert_eq!(snapshot.terminal_outcomes(), snapshot.requests);
+        assert_eq!(snapshot.succeeded, 1);
+        assert_eq!(snapshot.http_status_failures, 1);
+        assert_eq!(snapshot.response_too_large, 1);
+        assert_eq!(
+            snapshot.last_outcome,
+            Some(DirectoryReplicaTransportOutcome::ResponseTooLarge)
+        );
+        Ok(())
     }
 
     #[test]
@@ -6250,7 +6420,7 @@ mod tests {
     #[test]
     fn descriptor_proof_recovery_is_availability_only() {
         assert!(directory_descriptor_proof_direct_post_allows_recovery(
-            DirectoryFramePostError::Transport
+            DirectoryFramePostError::Transport(DirectoryTransportFailure::Connect)
         ));
         assert!(directory_descriptor_proof_direct_post_allows_recovery(
             DirectoryFramePostError::HttpStatus {
@@ -6559,13 +6729,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn carrier_hydration_availability_failure_preserves_request_count() {
+    async fn carrier_hydration_availability_failure_preserves_request_count() -> TestResult {
         let (requester, producer, carrier, block) = carrier_hydration_test_context();
         let (object_url, server) =
-            carrier_hydration_test_endpoint(StatusCode::SERVICE_UNAVAILABLE, Vec::new()).await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            carrier_hydration_test_endpoint(StatusCode::SERVICE_UNAVAILABLE, Vec::new()).await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
 
-        let failure = hydrate_directory_replica_descriptor_objects_tracked(
+        let Err(failure) = hydrate_directory_replica_descriptor_objects_tracked(
             &requester,
             &producer.public_key_bytes(),
             &carrier.public_key_bytes(),
@@ -6575,7 +6745,9 @@ mod tests {
             &[block],
         )
         .await
-        .unwrap_err();
+        else {
+            return Err(std::io::Error::other("expected carrier availability failure").into());
+        };
         server.abort();
 
         // One already-successful range plus one dispatched object request.
@@ -6584,16 +6756,18 @@ mod tests {
             directory_carrier_recovery_disposition(&failure.reason),
             DirectoryCarrierRecoveryDisposition::RetryAvailabilityFailure
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn carrier_hydration_corruption_stops_closed_without_losing_request_count() {
+    async fn carrier_hydration_corruption_stops_closed_without_losing_request_count() -> TestResult
+    {
         let (requester, producer, carrier, block) = carrier_hydration_test_context();
         let (object_url, server) =
-            carrier_hydration_test_endpoint(StatusCode::OK, b"corrupt-frame".to_vec()).await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            carrier_hydration_test_endpoint(StatusCode::OK, b"corrupt-frame".to_vec()).await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
 
-        let failure = hydrate_directory_replica_descriptor_objects_tracked(
+        let Err(failure) = hydrate_directory_replica_descriptor_objects_tracked(
             &requester,
             &producer.public_key_bytes(),
             &carrier.public_key_bytes(),
@@ -6603,7 +6777,9 @@ mod tests {
             &[block],
         )
         .await
-        .unwrap_err();
+        else {
+            return Err(std::io::Error::other("expected carrier corruption failure").into());
+        };
         server.abort();
 
         assert_eq!(failure.requests_made, 2);
@@ -6611,6 +6787,7 @@ mod tests {
             directory_carrier_recovery_disposition(&failure.reason),
             DirectoryCarrierRecoveryDisposition::StopClosed
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -7565,7 +7742,7 @@ mod tests {
     #[test]
     fn witness_carrier_fallback_is_availability_only() {
         for error in [
-            DirectoryFramePostError::Transport,
+            DirectoryFramePostError::Transport(DirectoryTransportFailure::RequestTimeout),
             DirectoryFramePostError::HttpStatus {
                 status: 408,
                 peer_code: None,

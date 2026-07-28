@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.51.0 - Role-specific Directory sync and operator HTTP budgets.
+Modification Reason: v0.52.0 - Privacy-safe Directory sync transport outcomes.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.51.0 - [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Restores the Directory replica synchronizer's canonical 10-second failover deadline while retaining a separate 12-second process-lifetime operator diagnostic profile.
+Last Modified: v0.52.0 - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Classifies every completed coordinator-owned Directory HTTP exchange into one mutually exclusive process-only outcome without peer, endpoint, operation, status-code, frame, or payload dimensions.
+Previous: v0.51.0 - [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Restores the Directory replica synchronizer's canonical 10-second failover deadline while retaining a separate 12-second process-lifetime operator diagnostic profile.
 Previous: v0.50.0 - [PEER-TRANSPORT-RUNTIME 2026-07-28 by Codex] Built bounded control, shared Directory, MemChain sync, and gossip transports once before mutable services started, then reused their connection pools across runtime tasks.
 Previous: v0.49.0 - [DISCOVERY-ENDPOINT-SSRF 2026-07-28 by Codex] Canonicalizes peer targets, rejects unsafe permissionless descriptor endpoints, and disables redirects/proxies across discovery, relay, onion, and MemChain transport.
 Previous: v0.48.0 - [DISCOVERY-IDENTITY-AMBIGUITY 2026-07-28 by Codex] Uses receiver identity hints only for a unique verified canonical endpoint owner.
@@ -91,6 +92,17 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.52 Privacy-safe Directory transport outcomes
+
+[DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex]
+
+- The Directory synchronization coordinator now scopes one aggregate transport recorder around each complete synchronization round. Deep range, object, witness, policy-anchor, and carrier helpers remain observable without adding metrics parameters to protocol-verification interfaces.
+- Tokio task-local ownership keeps the profile boundary exact: production Directory synchronization is counted, while local/VPN operator smokes and standalone protocol helpers are not misclassified as synchronization traffic.
+- Every completed coordinator-owned HTTP exchange contributes to exactly one terminal bucket: success, connect timeout, request timeout, connect failure, other request failure, non-success HTTP status, oversized success response, or interrupted success-body stream.
+- `/api/discovery/directory/status` exposes only aggregate counts, coarse ages, latest outcome class, and a `terminal_outcomes_consistent` invariant. It never exposes peer, producer, carrier, endpoint, URL, operation, status code, request id, frame, response body, payload, or user-plane metadata.
+- Existing stable `directory_*_transport_failed` reasons, retry/failover behavior, protocol frames, status contract version, authority policy, persistence schema, and privacy boundaries remain backward compatible.
+- Transport health is process diagnostics only. It is not durable evidence, peer reputation, routing rank, authority, voting, fork choice, consensus, or finality.
 
 ### v0.51 Role-specific Directory transport budgets
 
