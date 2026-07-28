@@ -64,6 +64,9 @@
 //! - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Presents canonical
 //!   service-owned health plus aggregate degraded/recovered transitions without
 //!   conflating transport availability with durable chain incidents.
+//! - [WITNESS-TERMINAL-STATE 2026-07-29 by Codex] Presents service-owned
+//!   witness recovery and carrier health from exact terminal event order so
+//!   equal Unix-second timestamps cannot conceal the latest failure.
 //! - Reports aggregate routeable carrier and signed-region-hint diversity
 //!   counts while explicitly rejecting operator/ASN diversity claims.
 //! - Separates signed carrier capability evidence from unadvertised
@@ -103,6 +106,8 @@
 //!     its bounded counters independently from process-lifetime totals.
 //! 17. Verify the service-owned degradation/recovery lifecycle and expose only
 //!     aggregate transition counts and ages.
+//! 18. Serialize service-owned witness availability health and independently
+//!     report mutually exclusive attempt/request counter consistency.
 //!
 //! ## Privacy Invariant
 //! Public output is aggregate-only. Local status and incident lists contain
@@ -148,8 +153,12 @@
 //!   Never serialize the underlying outcome sequence or per-request timestamp.
 //! - Transport degradation is availability telemetry, not authenticated fork
 //!   evidence. Never insert it into the durable Directory incident ledger.
+//! - Witness recovery and carrier health must come from exact service-owned
+//!   terminal event order. Never reconstruct event order from timestamps.
 //!
 //! ## Last Modified
+//! `v0.30.0-WitnessTerminalStateStatus` - Replaced timestamp-order inference
+//! with service-owned terminal outcomes and additive consistency diagnostics.
 //! `v0.29.0-DirectoryTransportLifecycleStatus` - Centralized health policy in
 //! the service runtime and exposed aggregate degraded/recovered transitions.
 //! `v0.28.0-DirectoryTransportWindowStatus` - Replaced last-result-only health
@@ -423,6 +432,10 @@ struct DirectoryReplicaObservationWitnessRecoveryStatus {
     last_attempt_age_seconds: Option<u64>,
     last_success_age_seconds: Option<u64>,
     last_failure_age_seconds: Option<u64>,
+    last_outcome: Option<&'static str>,
+    attempt_outcomes_consistent: bool,
+    health_basis: &'static str,
+    policy_owner: &'static str,
     recovery_policy: &'static str,
     authority_boundary: &'static str,
     privacy_boundary: &'static str,
@@ -450,6 +463,10 @@ struct DirectoryReplicaObservationWitnessCarrierStatus {
     last_request_age_seconds: Option<u64>,
     last_forwarded_age_seconds: Option<u64>,
     last_failure_age_seconds: Option<u64>,
+    last_outcome: Option<&'static str>,
+    terminal_outcomes_consistent: bool,
+    health_basis: &'static str,
+    policy_owner: &'static str,
     authority_boundary: &'static str,
     privacy_boundary: &'static str,
     security_model: &'static str,
@@ -1790,21 +1807,10 @@ fn build_observation_witness_recovery_status(
     store_enabled: bool,
     runtime: &DirectoryObservationWitnessRecoverySnapshot,
 ) -> DirectoryReplicaObservationWitnessRecoveryStatus {
-    let latest_failure_is_newer = match (runtime.last_failure_at, runtime.last_success_at) {
-        (Some(failure), Some(success)) => failure > success,
-        (Some(_), None) => true,
-        _ => false,
-    };
     let status = if !store_enabled {
         "disabled"
-    } else if latest_failure_is_newer && runtime.failed_closed > 0 {
-        "failed_closed"
-    } else if latest_failure_is_newer && runtime.exhausted > 0 {
-        "exhausted"
-    } else if runtime.succeeded > 0 {
-        "recovered"
     } else {
-        "standby"
+        runtime.health().as_str()
     };
     DirectoryReplicaObservationWitnessRecoveryStatus {
         source_status: "process_runtime_aggregate",
@@ -1831,6 +1837,10 @@ fn build_observation_witness_recovery_status(
         last_failure_age_seconds: runtime
             .last_failure_at
             .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_outcome: runtime.last_outcome.map(|outcome| outcome.as_str()),
+        attempt_outcomes_consistent: runtime.attempt_outcomes_consistent(),
+        health_basis: "exact_latest_terminal_outcome_and_mutually_exclusive_attempt_totals",
+        policy_owner: "directory_replica_service_runtime",
         recovery_policy:
             "direct_first_then_at_most_two_explicit_signed_carriers_for_availability_only_failures",
         authority_boundary:
@@ -1847,21 +1857,10 @@ fn build_observation_witness_carrier_status(
     route_available: bool,
     runtime: &DirectoryObservationWitnessCarrierSnapshot,
 ) -> DirectoryReplicaObservationWitnessCarrierStatus {
-    let latest_failure_is_newer = match (runtime.last_failure_at, runtime.last_forwarded_at) {
-        (Some(failure), Some(forwarded)) => failure > forwarded,
-        (Some(_), None) => true,
-        _ => false,
-    };
     let status = if !route_available {
         "disabled"
-    } else if runtime.requests == 0 {
-        "standby"
-    } else if latest_failure_is_newer {
-        "degraded"
-    } else if runtime.forwarded > 0 {
-        "active"
     } else {
-        "degraded"
+        runtime.health().as_str()
     };
     DirectoryReplicaObservationWitnessCarrierStatus {
         source_status: "process_runtime_aggregate",
@@ -1887,6 +1886,10 @@ fn build_observation_witness_carrier_status(
         last_failure_age_seconds: runtime
             .last_failure_at
             .map(|timestamp| generated_at.saturating_sub(timestamp)),
+        last_outcome: runtime.last_outcome.map(|outcome| outcome.as_str()),
+        terminal_outcomes_consistent: runtime.terminal_outcomes_consistent(),
+        health_basis: "exact_latest_terminal_outcome_and_mutually_exclusive_request_totals",
+        policy_owner: "directory_replica_service_runtime",
         authority_boundary:
             "carrier_authenticates_and_transports_exact_frames_only;_observer_and_pinned_target_witness_signatures_remain_required",
         privacy_boundary:
@@ -2791,6 +2794,18 @@ mod tests {
             Some(1)
         );
         assert_eq!(
+            parsed["observation_witness_recovery"]["last_outcome"].as_str(),
+            Some("recovered")
+        );
+        assert_eq!(
+            parsed["observation_witness_recovery"]["attempt_outcomes_consistent"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["observation_witness_recovery"]["policy_owner"].as_str(),
+            Some("directory_replica_service_runtime")
+        );
+        assert_eq!(
             parsed["observation_witness_carrier"]["status"].as_str(),
             Some("active")
         );
@@ -2813,6 +2828,18 @@ mod tests {
         assert_eq!(
             parsed["observation_witness_carrier"]["local_overloaded"].as_u64(),
             Some(0)
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["last_outcome"].as_str(),
+            Some("forwarded")
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["terminal_outcomes_consistent"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["observation_witness_carrier"]["policy_owner"].as_str(),
+            Some("directory_replica_service_runtime")
         );
         assert_eq!(
             parsed["observation_witness_carrier"]["security_model"].as_str(),

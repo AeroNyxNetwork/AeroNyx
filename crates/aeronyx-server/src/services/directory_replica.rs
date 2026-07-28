@@ -76,6 +76,9 @@
 //! - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Owns transport health
 //!   policy and degradation/recovery transitions inside the runtime, while
 //!   keeping all wall-clock diagnostic timestamps monotonic.
+//! - [WITNESS-TERMINAL-STATE 2026-07-29 by Codex] Retains the exact latest
+//!   aggregate terminal outcome for witness recovery and carrier service so
+//!   same-second completions cannot be misordered by status presentation.
 //! - Re-verifies one carrier-returned retained mirror anchor without importing
 //!   it, enabling a production smoke test with no authority or storage change.
 //! - Builds operator-scoped portable observation certificates only from the
@@ -139,6 +142,8 @@
 //!     status reflects recent behavior rather than only the final completion.
 //! 22. Classify health and record aggregate degradation/recovery transitions
 //!     in the runtime so API presentation cannot drift from service policy.
+//! 23. Preserve witness recovery and carrier terminal-event order independently
+//!     from second-granularity timestamps and verify mutually exclusive totals.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -178,6 +183,9 @@
 //! - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Lifecycle timestamps
 //!   are aggregate transition diagnostics only. They are process-local, must
 //!   never open durable security incidents, and must not affect routing.
+//! - [WITNESS-TERMINAL-STATE 2026-07-29 by Codex] Witness availability health
+//!   must use the service-owned latest terminal outcome, never timestamp
+//!   comparison. Multiple completions may legitimately share one Unix second.
 //! - Witness policy epochs describe only this operator's local evidence target.
 //!   They are not a validator set, vote, quorum, fork choice, consensus, or
 //!   finality, and public status must never expose their full member identities.
@@ -202,6 +210,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.38.0-WitnessTerminalState - Made witness recovery and carrier health
+//! service-owned, order-preserving, and independently counter-auditable.
 //! v0.37.0-DirectoryTransportLifecycle - Centralized transport health policy,
 //! tracked bounded aggregate degraded/recovered transitions, and prevented
 //! diagnostic timestamps from regressing after a wall-clock rollback.
@@ -1316,6 +1326,61 @@ pub struct DirectoryReplicaRetryState {
     pub backoff_skips: u64,
 }
 
+/// Terminal result of one bounded witness availability-recovery operation.
+///
+/// [WITNESS-TERMINAL-STATE 2026-07-29 by Codex] Event order is represented by
+/// the last assigned enum, not inferred from second-granularity timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryObservationWitnessRecoveryOutcome {
+    /// An exact carrier envelope was verified before inner witness validation.
+    Recovered,
+    /// Every selected availability route was exhausted.
+    Exhausted,
+    /// A canonical, signature, admission, or target contract check stopped closed.
+    FailedClosed,
+}
+
+impl DirectoryObservationWitnessRecoveryOutcome {
+    /// Stable public outcome label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recovered => "recovered",
+            Self::Exhausted => "exhausted",
+            Self::FailedClosed => "failed_closed",
+        }
+    }
+}
+
+/// Current process-local witness availability-recovery health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryObservationWitnessRecoveryHealth {
+    /// No recovery operation has reached a terminal result.
+    Standby,
+    /// The latest terminal recovery result verified a carrier envelope.
+    Recovered,
+    /// The latest terminal recovery result exhausted every bounded route.
+    Exhausted,
+    /// The latest terminal recovery result stopped closed.
+    FailedClosed,
+    /// Mutually exclusive attempt counters no longer sum to attempts.
+    Inconsistent,
+}
+
+impl DirectoryObservationWitnessRecoveryHealth {
+    /// Stable public status label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standby => "standby",
+            Self::Recovered => "recovered",
+            Self::Exhausted => "exhausted",
+            Self::FailedClosed => "failed_closed",
+            Self::Inconsistent => "inconsistent",
+        }
+    }
+}
+
 /// Process-lifetime aggregate checkpoint-witness carrier telemetry.
 ///
 /// [WITNESS-CARRIER 2026-07-26 by Codex] These counters describe bounded
@@ -1352,6 +1417,46 @@ pub struct DirectoryObservationWitnessRecoverySnapshot {
     pub last_success_at: Option<u64>,
     /// Latest exhausted or fail-closed recovery timestamp.
     pub last_failure_at: Option<u64>,
+    /// Latest terminal recovery result in exact process event order.
+    pub last_outcome: Option<DirectoryObservationWitnessRecoveryOutcome>,
+}
+
+impl DirectoryObservationWitnessRecoverySnapshot {
+    /// Returns the sum of all mutually exclusive carrier-attempt buckets.
+    #[must_use]
+    pub const fn attempt_outcomes(&self) -> u64 {
+        self.succeeded
+            .saturating_add(self.capability_unavailable)
+            .saturating_add(self.transport_failures)
+            .saturating_add(self.failed_closed)
+    }
+
+    /// Verifies that each recorded carrier attempt entered exactly one bucket.
+    #[must_use]
+    pub const fn attempt_outcomes_consistent(&self) -> bool {
+        self.attempt_outcomes() == self.attempts
+    }
+
+    /// Classifies current recovery health from exact terminal event order.
+    #[must_use]
+    pub const fn health(&self) -> DirectoryObservationWitnessRecoveryHealth {
+        if !self.attempt_outcomes_consistent() {
+            DirectoryObservationWitnessRecoveryHealth::Inconsistent
+        } else {
+            match self.last_outcome {
+                None => DirectoryObservationWitnessRecoveryHealth::Standby,
+                Some(DirectoryObservationWitnessRecoveryOutcome::Recovered) => {
+                    DirectoryObservationWitnessRecoveryHealth::Recovered
+                }
+                Some(DirectoryObservationWitnessRecoveryOutcome::Exhausted) => {
+                    DirectoryObservationWitnessRecoveryHealth::Exhausted
+                }
+                Some(DirectoryObservationWitnessRecoveryOutcome::FailedClosed) => {
+                    DirectoryObservationWitnessRecoveryHealth::FailedClosed
+                }
+            }
+        }
+    }
 }
 
 /// Process-lifetime aggregate telemetry for this node acting as a witness carrier.
@@ -1392,6 +1497,8 @@ pub struct DirectoryObservationWitnessCarrierSnapshot {
     pub last_forwarded_at: Option<u64>,
     /// Latest non-success carrier request timestamp.
     pub last_failure_at: Option<u64>,
+    /// Latest request result in exact process event order.
+    pub last_outcome: Option<DirectoryObservationWitnessCarrierOutcome>,
 }
 
 /// Stable mutually exclusive carrier-side request outcomes.
@@ -1418,6 +1525,90 @@ pub enum DirectoryObservationWitnessCarrierOutcome {
     LocalOverloaded,
     /// Carrier could not initialize its bounded no-proxy transport client.
     LocalFailure,
+}
+
+impl DirectoryObservationWitnessCarrierOutcome {
+    /// Stable public outcome label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::PolicyRejected => "policy_rejected",
+            Self::InvalidRequest => "invalid_request",
+            Self::TargetUnavailable => "target_unavailable",
+            Self::TargetCapabilityUnavailable => "target_capability_unavailable",
+            Self::TargetRejected => "target_rejected",
+            Self::TargetInvalidResponse => "target_invalid_response",
+            Self::TargetCoolingDown => "target_cooling_down",
+            Self::LocalOverloaded => "local_overloaded",
+            Self::LocalFailure => "local_failure",
+        }
+    }
+}
+
+/// Current process-local health of this node acting as a witness carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryObservationWitnessCarrierHealth {
+    /// No authenticated carrier request has completed.
+    Standby,
+    /// The latest authenticated request forwarded an exact verified frame.
+    Active,
+    /// The latest authenticated request did not forward a verified frame.
+    Degraded,
+    /// Mutually exclusive request counters no longer sum to requests.
+    Inconsistent,
+}
+
+impl DirectoryObservationWitnessCarrierHealth {
+    /// Stable public status label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standby => "standby",
+            Self::Active => "active",
+            Self::Degraded => "degraded",
+            Self::Inconsistent => "inconsistent",
+        }
+    }
+}
+
+impl DirectoryObservationWitnessCarrierSnapshot {
+    /// Returns the sum of all mutually exclusive request outcome buckets.
+    #[must_use]
+    pub const fn terminal_outcomes(&self) -> u64 {
+        self.forwarded
+            .saturating_add(self.policy_rejected)
+            .saturating_add(self.invalid_requests)
+            .saturating_add(self.target_unavailable)
+            .saturating_add(self.target_capability_unavailable)
+            .saturating_add(self.target_rejected)
+            .saturating_add(self.target_invalid_response)
+            .saturating_add(self.target_cooling_down)
+            .saturating_add(self.local_overloaded)
+            .saturating_add(self.local_failures)
+    }
+
+    /// Verifies that each completed request entered exactly one outcome bucket.
+    #[must_use]
+    pub const fn terminal_outcomes_consistent(&self) -> bool {
+        self.terminal_outcomes() == self.requests
+    }
+
+    /// Classifies carrier health from exact terminal request order.
+    #[must_use]
+    pub const fn health(&self) -> DirectoryObservationWitnessCarrierHealth {
+        if !self.terminal_outcomes_consistent() {
+            DirectoryObservationWitnessCarrierHealth::Inconsistent
+        } else {
+            match self.last_outcome {
+                None => DirectoryObservationWitnessCarrierHealth::Standby,
+                Some(DirectoryObservationWitnessCarrierOutcome::Forwarded) => {
+                    DirectoryObservationWitnessCarrierHealth::Active
+                }
+                Some(_) => DirectoryObservationWitnessCarrierHealth::Degraded,
+            }
+        }
+    }
 }
 
 /// Stable mutually exclusive outcomes for one completed Directory coordinator
@@ -1695,12 +1886,12 @@ impl DirectoryReplicaTransportRuntime {
         self.recent_outcomes.push_back(outcome);
         self.snapshot.requests = self.snapshot.requests.saturating_add(1);
         self.snapshot.last_outcome = Some(outcome);
-        let transition_at = latest_transport_timestamp(self.snapshot.last_request_at, completed_at);
+        let transition_at = latest_runtime_timestamp(self.snapshot.last_request_at, completed_at);
         self.snapshot.last_request_at = Some(transition_at);
         match outcome {
             DirectoryReplicaTransportOutcome::Succeeded => {
                 self.snapshot.succeeded = self.snapshot.succeeded.saturating_add(1);
-                self.snapshot.last_success_at = Some(latest_transport_timestamp(
+                self.snapshot.last_success_at = Some(latest_runtime_timestamp(
                     self.snapshot.last_success_at,
                     completed_at,
                 ));
@@ -1731,7 +1922,7 @@ impl DirectoryReplicaTransportRuntime {
             }
         }
         if outcome != DirectoryReplicaTransportOutcome::Succeeded {
-            self.snapshot.last_failure_at = Some(latest_transport_timestamp(
+            self.snapshot.last_failure_at = Some(latest_runtime_timestamp(
                 self.snapshot.last_failure_at,
                 completed_at,
             ));
@@ -1772,7 +1963,7 @@ impl DirectoryReplicaTransportRuntime {
                 self.snapshot.degraded_transitions =
                     self.snapshot.degraded_transitions.saturating_add(1);
                 self.snapshot.degraded_since_at = Some(transition_at);
-                self.snapshot.last_degraded_at = Some(latest_transport_timestamp(
+                self.snapshot.last_degraded_at = Some(latest_runtime_timestamp(
                     self.snapshot.last_degraded_at,
                     transition_at,
                 ));
@@ -1781,7 +1972,7 @@ impl DirectoryReplicaTransportRuntime {
                 self.snapshot.recovery_transitions =
                     self.snapshot.recovery_transitions.saturating_add(1);
                 self.snapshot.degraded_since_at = None;
-                self.snapshot.last_recovered_at = Some(latest_transport_timestamp(
+                self.snapshot.last_recovered_at = Some(latest_runtime_timestamp(
                     self.snapshot.last_recovered_at,
                     transition_at,
                 ));
@@ -1795,7 +1986,7 @@ impl DirectoryReplicaTransportRuntime {
     }
 }
 
-fn latest_transport_timestamp(current: Option<u64>, candidate: u64) -> u64 {
+fn latest_runtime_timestamp(current: Option<u64>, candidate: u64) -> u64 {
     current.map_or(candidate, |timestamp| timestamp.max(candidate))
 }
 
@@ -2172,7 +2363,10 @@ impl DirectoryReplicaSyncRuntime {
         snapshot.latest_capability_cached_unavailable =
             capability_cached_unavailable.min(candidates);
         snapshot.latest_selected = selected.min(candidates);
-        snapshot.last_attempt_at = Some(attempted_at);
+        snapshot.last_attempt_at = Some(latest_runtime_timestamp(
+            snapshot.last_attempt_at,
+            attempted_at,
+        ));
     }
 
     /// Records one carrier transport attempt using mutually exclusive buckets.
@@ -2187,10 +2381,17 @@ impl DirectoryReplicaSyncRuntime {
         }
         let mut snapshot = self.observation_witness_recovery.lock();
         snapshot.attempts = snapshot.attempts.saturating_add(1);
-        snapshot.last_attempt_at = Some(completed_at);
+        snapshot.last_attempt_at = Some(latest_runtime_timestamp(
+            snapshot.last_attempt_at,
+            completed_at,
+        ));
         if succeeded {
             snapshot.succeeded = snapshot.succeeded.saturating_add(1);
-            snapshot.last_success_at = Some(completed_at);
+            snapshot.last_success_at = Some(latest_runtime_timestamp(
+                snapshot.last_success_at,
+                completed_at,
+            ));
+            snapshot.last_outcome = Some(DirectoryObservationWitnessRecoveryOutcome::Recovered);
         } else if capability_unavailable {
             snapshot.capability_unavailable = snapshot.capability_unavailable.saturating_add(1);
         } else {
@@ -2205,7 +2406,11 @@ impl DirectoryReplicaSyncRuntime {
         }
         let mut snapshot = self.observation_witness_recovery.lock();
         snapshot.exhausted = snapshot.exhausted.saturating_add(1);
-        snapshot.last_failure_at = Some(completed_at);
+        snapshot.last_failure_at = Some(latest_runtime_timestamp(
+            snapshot.last_failure_at,
+            completed_at,
+        ));
+        snapshot.last_outcome = Some(DirectoryObservationWitnessRecoveryOutcome::Exhausted);
     }
 
     /// Records a carrier or target contract failure that stopped closed.
@@ -2216,8 +2421,15 @@ impl DirectoryReplicaSyncRuntime {
         let mut snapshot = self.observation_witness_recovery.lock();
         snapshot.attempts = snapshot.attempts.saturating_add(1);
         snapshot.failed_closed = snapshot.failed_closed.saturating_add(1);
-        snapshot.last_attempt_at = Some(completed_at);
-        snapshot.last_failure_at = Some(completed_at);
+        snapshot.last_attempt_at = Some(latest_runtime_timestamp(
+            snapshot.last_attempt_at,
+            completed_at,
+        ));
+        snapshot.last_failure_at = Some(latest_runtime_timestamp(
+            snapshot.last_failure_at,
+            completed_at,
+        ));
+        snapshot.last_outcome = Some(DirectoryObservationWitnessRecoveryOutcome::FailedClosed);
     }
 
     /// Returns process-lifetime aggregate witness-carrier telemetry.
@@ -2242,50 +2454,54 @@ impl DirectoryReplicaSyncRuntime {
         }
         let mut snapshot = self.observation_witness_carrier.lock();
         snapshot.requests = snapshot.requests.saturating_add(1);
-        snapshot.last_request_at = Some(completed_at);
+        snapshot.last_request_at = Some(latest_runtime_timestamp(
+            snapshot.last_request_at,
+            completed_at,
+        ));
+        snapshot.last_outcome = Some(outcome);
         match outcome {
             DirectoryObservationWitnessCarrierOutcome::Forwarded => {
                 snapshot.forwarded = snapshot.forwarded.saturating_add(1);
-                snapshot.last_forwarded_at = Some(completed_at);
+                snapshot.last_forwarded_at = Some(latest_runtime_timestamp(
+                    snapshot.last_forwarded_at,
+                    completed_at,
+                ));
             }
             DirectoryObservationWitnessCarrierOutcome::PolicyRejected => {
                 snapshot.policy_rejected = snapshot.policy_rejected.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryObservationWitnessCarrierOutcome::InvalidRequest => {
                 snapshot.invalid_requests = snapshot.invalid_requests.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryObservationWitnessCarrierOutcome::TargetUnavailable => {
                 snapshot.target_unavailable = snapshot.target_unavailable.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryObservationWitnessCarrierOutcome::TargetCapabilityUnavailable => {
                 snapshot.target_capability_unavailable =
                     snapshot.target_capability_unavailable.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryObservationWitnessCarrierOutcome::TargetRejected => {
                 snapshot.target_rejected = snapshot.target_rejected.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryObservationWitnessCarrierOutcome::TargetInvalidResponse => {
                 snapshot.target_invalid_response =
                     snapshot.target_invalid_response.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryObservationWitnessCarrierOutcome::TargetCoolingDown => {
                 snapshot.target_cooling_down = snapshot.target_cooling_down.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryObservationWitnessCarrierOutcome::LocalOverloaded => {
                 snapshot.local_overloaded = snapshot.local_overloaded.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
             }
             DirectoryObservationWitnessCarrierOutcome::LocalFailure => {
                 snapshot.local_failures = snapshot.local_failures.saturating_add(1);
-                snapshot.last_failure_at = Some(completed_at);
             }
+        }
+        if outcome != DirectoryObservationWitnessCarrierOutcome::Forwarded {
+            snapshot.last_failure_at = Some(latest_runtime_timestamp(
+                snapshot.last_failure_at,
+                completed_at,
+            ));
         }
     }
 
@@ -13291,6 +13507,15 @@ mod tests {
         assert_eq!(snapshot.last_attempt_at, Some(NOW + 5));
         assert_eq!(snapshot.last_success_at, Some(NOW + 3));
         assert_eq!(snapshot.last_failure_at, Some(NOW + 5));
+        assert_eq!(
+            snapshot.last_outcome,
+            Some(DirectoryObservationWitnessRecoveryOutcome::FailedClosed)
+        );
+        assert!(snapshot.attempt_outcomes_consistent());
+        assert_eq!(
+            snapshot.health(),
+            DirectoryObservationWitnessRecoveryHealth::FailedClosed
+        );
     }
 
     #[test]
@@ -13330,6 +13555,87 @@ mod tests {
         assert_eq!(snapshot.last_request_at, Some(NOW + 9));
         assert_eq!(snapshot.last_forwarded_at, Some(NOW));
         assert_eq!(snapshot.last_failure_at, Some(NOW + 9));
+        assert_eq!(
+            snapshot.last_outcome,
+            Some(DirectoryObservationWitnessCarrierOutcome::LocalFailure)
+        );
+        assert!(snapshot.terminal_outcomes_consistent());
+        assert_eq!(
+            snapshot.health(),
+            DirectoryObservationWitnessCarrierHealth::Degraded
+        );
+    }
+
+    #[test]
+    fn witness_availability_health_preserves_same_second_terminal_order() {
+        // [WITNESS-TERMINAL-STATE 2026-07-29 by Codex] Unix-second equality
+        // cannot reveal call order. The service-owned terminal enum must.
+        let runtime = DirectoryReplicaSyncRuntime::default();
+        runtime.record_observation_witness_recovery_attempt(true, false, NOW);
+        runtime.record_observation_witness_recovery_exhausted(NOW);
+        let exhausted = runtime.observation_witness_recovery_snapshot();
+        assert_eq!(exhausted.last_success_at, Some(NOW));
+        assert_eq!(exhausted.last_failure_at, Some(NOW));
+        assert_eq!(
+            exhausted.health(),
+            DirectoryObservationWitnessRecoveryHealth::Exhausted
+        );
+
+        runtime.record_observation_witness_recovery_attempt(true, false, NOW);
+        assert_eq!(
+            runtime.observation_witness_recovery_snapshot().health(),
+            DirectoryObservationWitnessRecoveryHealth::Recovered
+        );
+
+        runtime.record_observation_witness_carrier_outcome(
+            DirectoryObservationWitnessCarrierOutcome::Forwarded,
+            NOW,
+        );
+        runtime.record_observation_witness_carrier_outcome(
+            DirectoryObservationWitnessCarrierOutcome::TargetUnavailable,
+            NOW,
+        );
+        let degraded = runtime.observation_witness_carrier_snapshot();
+        assert_eq!(degraded.last_forwarded_at, Some(NOW));
+        assert_eq!(degraded.last_failure_at, Some(NOW));
+        assert_eq!(
+            degraded.health(),
+            DirectoryObservationWitnessCarrierHealth::Degraded
+        );
+
+        runtime.record_observation_witness_carrier_outcome(
+            DirectoryObservationWitnessCarrierOutcome::Forwarded,
+            NOW,
+        );
+        assert_eq!(
+            runtime.observation_witness_carrier_snapshot().health(),
+            DirectoryObservationWitnessCarrierHealth::Active
+        );
+    }
+
+    #[test]
+    fn witness_availability_health_fails_closed_on_counter_drift() {
+        // [WITNESS-TERMINAL-STATE 2026-07-29 by Codex] Snapshot integrity is
+        // checked independently from presentation and last-result ordering.
+        let recovery = DirectoryObservationWitnessRecoverySnapshot {
+            attempts: 1,
+            ..DirectoryObservationWitnessRecoverySnapshot::default()
+        };
+        assert!(!recovery.attempt_outcomes_consistent());
+        assert_eq!(
+            recovery.health(),
+            DirectoryObservationWitnessRecoveryHealth::Inconsistent
+        );
+
+        let carrier = DirectoryObservationWitnessCarrierSnapshot {
+            requests: 1,
+            ..DirectoryObservationWitnessCarrierSnapshot::default()
+        };
+        assert!(!carrier.terminal_outcomes_consistent());
+        assert_eq!(
+            carrier.health(),
+            DirectoryObservationWitnessCarrierHealth::Inconsistent
+        );
     }
 
     #[test]
