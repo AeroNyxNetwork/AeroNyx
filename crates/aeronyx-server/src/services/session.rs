@@ -73,6 +73,14 @@
 //! - `get_all_by_wallet` returns a Vec; empty Vec means wallet is offline.
 //! - The two-map update (sessions + wallet_index) is not strictly atomic.
 //!   Chat routing tolerates a brief gap between them.
+//! - [SESSION-LIFECYCLE 2026-07-29 by Codex] Session creation, device
+//!   registration, and removal share `lifecycle_lock`. Keep capacity checks
+//!   inside this lock; a separate `len()` followed by `insert()` can exceed
+//!   `max_sessions` under concurrent handshakes.
+//! - [SESSION-WALLET-BOUND 2026-07-29 by Codex] Device registration is bounded
+//!   per live session and disconnect cleanup scans every registered wallet.
+//!   Wallet identity is deliberately independent from the tunnel handshake
+//!   identity, so cleanup must never assume those public keys are equal.
 //! - Window size of 2048 allows ~100ms of reordering at 20k pps.
 //! - Commercial maintenance drain depends on client liveness, not just local
 //!   server activity. Do not let server→client traffic or keepalive probes keep
@@ -85,6 +93,16 @@
 //!   comparison because any real counter value can be a valid "first packet".
 //!
 //! ## Last Modified
+//! v2.9.0-BoundedWalletRegistration
+//!   - Bounds distinct wallet identities registered by one live session.
+//!   - Removes stale device registrations when a device changes wallet.
+//!   - Cleans every wallet mapped to a disconnected session.
+//!
+//! v2.8.0-AtomicLifecycle
+//!   - Serialized capacity checks, insertion, device registration, and removal.
+//!   - Rejects duplicate session IDs and stale device registration.
+//!   - Uses conditional removal for empty wallet-index entries.
+//!
 //! v2.7.14-RustdocQuality
 //!   - Marked cooldown caller pseudocode as a non-standalone Rustdoc example.
 //!
@@ -130,7 +148,7 @@
 //!     Eliminates repeated hex encoding on every VPN packet in the hot path.
 //!   - `cleanup_expired()` now uses `session.wallet_hex` instead of re-encoding.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -849,6 +867,11 @@ impl std::fmt::Debug for Session {
 /// before any new session can claim it.
 const IP_COOLDOWN_SECS: u64 = 30;
 
+/// Maximum distinct signed wallet identities one live transport session may
+/// register. This keeps the secondary index proportional to `max_sessions`
+/// while preserving a small, intentional multi-account client.
+const MAX_WALLETS_PER_SESSION: usize = 8;
+
 /// Manages all active sessions with multi-device wallet reverse lookup.
 ///
 /// ## v1.2.0-MultiDevice Change
@@ -875,6 +898,9 @@ pub struct SessionManager {
     // Max entries per wallet is bounded by max_sessions (global limit).
     wallet_index: DashMap<[u8; 32], Vec<DeviceEntry>>,
 
+    /// Serializes mutations spanning the primary map and secondary index.
+    lifecycle_lock: Mutex<()>,
+
     max_sessions: usize,
     session_timeout: Duration,
 
@@ -899,6 +925,7 @@ impl SessionManager {
         Self {
             sessions: DashMap::new(),
             wallet_index: DashMap::new(),
+            lifecycle_lock: Mutex::new(()),
             max_sessions,
             session_timeout,
             cooldown_pool: DashMap::new(),
@@ -920,6 +947,12 @@ impl SessionManager {
         virtual_ip: Ipv4Addr,
         client_endpoint: SocketAddr,
     ) -> Result<Arc<Session>> {
+        let _lifecycle_guard = self.lifecycle_lock.lock();
+
+        if self.sessions.contains_key(&session_id) {
+            return Err(ServerError::SessionExists);
+        }
+
         if self.sessions.len() >= self.max_sessions {
             return Err(ServerError::SessionLimitReached {
                 limit: self.max_sessions,
@@ -954,7 +987,47 @@ impl SessionManager {
     /// * `wallet` - The wallet public key bytes (from verified session)
     /// * `device_id` - Stable device identifier from the client
     /// * `session_id` - The current active session for this device
-    pub fn register_device(&self, wallet: &[u8; 32], device_id: DeviceId, session_id: SessionId) {
+    ///
+    /// Returns `false` if the session is inactive or the resulting distinct
+    /// wallet count would exceed `MAX_WALLETS_PER_SESSION`.
+    pub fn register_device(
+        &self,
+        wallet: &[u8; 32],
+        device_id: DeviceId,
+        session_id: SessionId,
+    ) -> bool {
+        let _lifecycle_guard = self.lifecycle_lock.lock();
+        if !self.sessions.contains_key(&session_id) {
+            debug!("Device registration rejected: session is no longer active");
+            return false;
+        }
+
+        let mut wallets_after_registration = HashSet::new();
+        for entry in self.wallet_index.iter() {
+            let remains_after_device_move = entry
+                .value()
+                .iter()
+                .any(|device| device.session_id == session_id && device.device_id != device_id);
+            if remains_after_device_move {
+                wallets_after_registration.insert(*entry.key());
+            }
+        }
+        wallets_after_registration.insert(*wallet);
+        if wallets_after_registration.len() > MAX_WALLETS_PER_SESSION {
+            debug!(
+                limit = MAX_WALLETS_PER_SESSION,
+                "Device registration rejected: session wallet limit reached"
+            );
+            return false;
+        }
+
+        // One physical device belongs to one wallet at a time on a session.
+        // Remove an older account binding before inserting the new one.
+        self.wallet_index.retain(|_, entries| {
+            entries.retain(|entry| entry.session_id != session_id || entry.device_id != device_id);
+            !entries.is_empty()
+        });
+
         let mut entry = self.wallet_index.entry(*wallet).or_default();
 
         // Remove stale entry for the same device_id (reconnect case).
@@ -967,6 +1040,7 @@ impl SessionManager {
         });
 
         debug!(device_count = entry.len(), "Device registered");
+        true
     }
 
     /// Returns the session with the given id, if any.
@@ -1023,11 +1097,12 @@ impl SessionManager {
     /// Calls `remove_device_by_session()` internally to keep
     /// `wallet_index` consistent.
     pub fn remove(&self, id: &SessionId) -> Option<Arc<Session>> {
+        let _lifecycle_guard = self.lifecycle_lock.lock();
         let removed = self.sessions.remove(id).map(|(_, s)| s);
 
         if let Some(ref session) = removed {
             session.set_state(SessionState::Closed);
-            self.remove_device_by_session(id, &session.wallet_bytes());
+            self.remove_device_by_session(id);
 
             let stats = session.stats_snapshot();
             info!(
@@ -1043,29 +1118,22 @@ impl SessionManager {
 
     /// 🌟 v1.2.0-MultiDevice: Remove all wallet_index entries for a session.
     ///
-    /// Scans the wallet's Vec and removes any `DeviceEntry` whose
-    /// `session_id` matches `id`. If the Vec becomes empty, the wallet
-    /// key is removed entirely.
+    /// Scans every wallet Vec and removes any `DeviceEntry` whose `session_id`
+    /// matches `id`. This is required because the signed wallet identity is
+    /// intentionally independent from the tunnel handshake public key.
     ///
     /// Called internally by `remove()` — do NOT call externally.
-    fn remove_device_by_session(&self, id: &SessionId, wallet: &[u8; 32]) {
-        let mut should_remove_wallet = false;
+    fn remove_device_by_session(&self, id: &SessionId) {
+        let mut removed_devices = 0usize;
+        self.wallet_index.retain(|_, entries| {
+            let before = entries.len();
+            entries.retain(|entry| &entry.session_id != id);
+            removed_devices += before - entries.len();
+            !entries.is_empty()
+        });
 
-        if let Some(mut entries) = self.wallet_index.get_mut(wallet) {
-            entries.retain(|e| &e.session_id != id);
-            if entries.is_empty() {
-                should_remove_wallet = true;
-            } else {
-                debug!(
-                    remaining_devices = entries.len(),
-                    "Device unregistered (other devices still active)"
-                );
-            }
-        }
-
-        if should_remove_wallet {
-            self.wallet_index.remove(wallet);
-            debug!("wallet_index entry removed (no more devices)");
+        if removed_devices > 0 {
+            debug!(removed_devices, "Session device registrations removed");
         }
     }
 
@@ -1236,6 +1304,8 @@ impl std::fmt::Debug for SessionManager {
 mod tests {
     use super::*;
     use aeronyx_core::crypto::IdentityKeyPair;
+    use std::sync::Barrier;
+    use std::thread;
 
     // ── ReplayWindow Tests ───────────────────────────────────────────────
 
@@ -1505,6 +1575,36 @@ mod tests {
     }
 
     #[test]
+    fn test_duplicate_session_id_is_rejected_without_replacement() {
+        let manager = make_manager();
+        let identity = IdentityKeyPair::generate();
+        let session_id = SessionId::generate();
+        let original_ip = Ipv4Addr::new(100, 64, 0, 2);
+
+        manager
+            .create(
+                session_id.clone(),
+                identity.public_key(),
+                SessionKey::from_bytes([0x41; 32]),
+                original_ip,
+                "127.0.0.1:12345".parse().unwrap(),
+            )
+            .unwrap();
+
+        let duplicate = manager.create(
+            session_id.clone(),
+            identity.public_key(),
+            SessionKey::from_bytes([0x42; 32]),
+            Ipv4Addr::new(100, 64, 0, 3),
+            "127.0.0.1:12346".parse().unwrap(),
+        );
+
+        assert!(matches!(duplicate, Err(ServerError::SessionExists)));
+        assert_eq!(manager.count(), 1);
+        assert_eq!(manager.get(&session_id).unwrap().virtual_ip, original_ip);
+    }
+
+    #[test]
     fn test_session_manager_limit() {
         let manager = SessionManager::new(2, Duration::from_secs(300));
         let identity = IdentityKeyPair::generate();
@@ -1539,6 +1639,44 @@ mod tests {
             result,
             Err(ServerError::SessionLimitReached { .. })
         ));
+    }
+
+    #[test]
+    fn test_concurrent_session_creation_respects_capacity() {
+        const MAX_SESSIONS: usize = 4;
+        const ATTEMPTS: usize = 24;
+
+        let manager = Arc::new(SessionManager::new(MAX_SESSIONS, Duration::from_secs(300)));
+        let start = Arc::new(Barrier::new(ATTEMPTS + 1));
+        let mut workers = Vec::with_capacity(ATTEMPTS);
+
+        for index in 0..ATTEMPTS {
+            let manager = Arc::clone(&manager);
+            let start = Arc::clone(&start);
+            workers.push(thread::spawn(move || {
+                let identity = IdentityKeyPair::generate();
+                start.wait();
+                manager
+                    .create(
+                        SessionId::generate(),
+                        identity.public_key(),
+                        SessionKey::from_bytes([index as u8; 32]),
+                        Ipv4Addr::new(100, 64, 0, (index + 2) as u8),
+                        SocketAddr::from(([127, 0, 0, 1], 20_000 + index as u16)),
+                    )
+                    .is_ok()
+            }));
+        }
+
+        start.wait();
+        let accepted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|accepted| *accepted)
+            .count();
+
+        assert_eq!(accepted, MAX_SESSIONS);
+        assert_eq!(manager.count(), MAX_SESSIONS);
     }
 
     #[test]
@@ -1601,6 +1739,97 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, sid);
         assert_eq!(manager.wallet_index_count(), 1);
+    }
+
+    #[test]
+    fn test_register_device_rejects_inactive_session() {
+        let manager = make_manager();
+        let identity = IdentityKeyPair::generate();
+        let wallet = identity.public_key_bytes();
+
+        assert!(!manager.register_device(&wallet, make_device_id(0x01), SessionId::generate()));
+
+        assert_eq!(manager.wallet_index_count(), 0);
+        assert_eq!(manager.wallet_count(), 0);
+    }
+
+    #[test]
+    fn test_register_device_bounds_wallets_per_session() {
+        let manager = make_manager();
+        let identity = IdentityKeyPair::generate();
+        let sid = SessionId::generate();
+        manager
+            .create(
+                sid.clone(),
+                identity.public_key(),
+                SessionKey::from_bytes([0x42; 32]),
+                Ipv4Addr::new(100, 64, 0, 2),
+                "127.0.0.1:12345".parse().unwrap(),
+            )
+            .unwrap();
+
+        for index in 0..MAX_WALLETS_PER_SESSION {
+            assert!(manager.register_device(
+                &[index as u8; 32],
+                make_device_id(index as u8),
+                sid.clone(),
+            ));
+        }
+
+        assert!(!manager.register_device(&[0xFE; 32], make_device_id(0xFE), sid));
+        assert_eq!(manager.wallet_count(), MAX_WALLETS_PER_SESSION);
+        assert_eq!(manager.wallet_index_count(), MAX_WALLETS_PER_SESSION);
+    }
+
+    #[test]
+    fn test_device_move_replaces_old_wallet_binding() {
+        let manager = make_manager();
+        let identity = IdentityKeyPair::generate();
+        let sid = SessionId::generate();
+        let old_wallet = [0xAA; 32];
+        let new_wallet = [0xBB; 32];
+        let device_id = make_device_id(0x01);
+        manager
+            .create(
+                sid.clone(),
+                identity.public_key(),
+                SessionKey::from_bytes([0x42; 32]),
+                Ipv4Addr::new(100, 64, 0, 2),
+                "127.0.0.1:12345".parse().unwrap(),
+            )
+            .unwrap();
+
+        assert!(manager.register_device(&old_wallet, device_id, sid.clone()));
+        assert!(manager.register_device(&new_wallet, device_id, sid.clone()));
+
+        assert!(manager.get_by_wallet(&old_wallet).is_none());
+        assert_eq!(manager.get_by_wallet(&new_wallet).unwrap().id, sid);
+        assert_eq!(manager.wallet_count(), 1);
+        assert_eq!(manager.wallet_index_count(), 1);
+    }
+
+    #[test]
+    fn test_remove_cleans_wallet_different_from_handshake_identity() {
+        let manager = make_manager();
+        let transport_identity = IdentityKeyPair::generate();
+        let registered_wallet = IdentityKeyPair::generate().public_key_bytes();
+        let sid = SessionId::generate();
+        manager
+            .create(
+                sid.clone(),
+                transport_identity.public_key(),
+                SessionKey::from_bytes([0x42; 32]),
+                Ipv4Addr::new(100, 64, 0, 2),
+                "127.0.0.1:12345".parse().unwrap(),
+            )
+            .unwrap();
+
+        assert!(manager.register_device(&registered_wallet, make_device_id(0x01), sid.clone()));
+        manager.remove(&sid);
+
+        assert!(manager.get_by_wallet(&registered_wallet).is_none());
+        assert_eq!(manager.wallet_count(), 0);
+        assert_eq!(manager.wallet_index_count(), 0);
     }
 
     #[test]

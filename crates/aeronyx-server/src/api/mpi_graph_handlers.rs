@@ -851,14 +851,14 @@ pub async fn mpi_communities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::mpi::{build_mpi_router, Mode, MpiState};
+    use crate::api::mpi::{build_mpi_router, Mode, MpiState, SessionEmbeddingCache};
     use crate::services::memchain::storage_crypto::derive_rawlog_key;
     use crate::services::memchain::{MemoryStorage, VectorIndex};
     use aeronyx_core::crypto::IdentityKeyPair;
     use axum::body::Body;
     use axum::http::Request;
     use parking_lot::RwLock;
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use tower::ServiceExt;
 
@@ -884,7 +884,7 @@ mod tests {
             user_weights: Arc::new(RwLock::new(HashMap::new())),
             mvf_alpha: 0.0,
             mvf_enabled: false,
-            session_embeddings: RwLock::new(HashMap::new()),
+            session_embeddings: RwLock::new(SessionEmbeddingCache::default()),
             mvf_baseline: RwLock::new(None),
             owner_key,
             api_secret: None,

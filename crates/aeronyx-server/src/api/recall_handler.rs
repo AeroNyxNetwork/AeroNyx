@@ -64,8 +64,10 @@
 //!
 //! ## Last Modified
 //! v2.5.4+BlindRRF - 🔧 blind hybrid recall rank fusion (vector ⊕ keyword)
+//! v2.5.5+SessionBound - [RECALL-SESSION-CACHE 2026-07-29 by Codex]
+//!                         Owner-isolated, bounded session centroid history.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,7 +85,10 @@ use crate::services::memchain::{
     compute_recall_score, cosine_similarity, MemoryStorage, VectorIndex,
 };
 
-use super::mpi::{estimate_tokens, extract_owner, now_secs, parse_layer, MpiState};
+use super::mpi::{
+    estimate_tokens, extract_owner, now_secs, parse_layer, MpiState,
+    MAX_RECALL_EMBEDDING_DIMENSIONS, MAX_RECALL_SESSION_ID_BYTES,
+};
 
 pub use super::mpi_handlers::{
     RecallRequest, RecallResponse, RecalledMemory, SealedMemory, TimeHint, TimeRangeParam,
@@ -204,6 +209,28 @@ pub async fn mpi_recall(
         }
     };
 
+    // [RECALL-SESSION-CACHE 2026-07-29 by Codex] Bound attacker-controlled
+    // labels and retained vectors before either reaches the process-wide
+    // session cache. Existing requests remain wire-compatible.
+    if rb
+        .session_id
+        .as_deref()
+        .is_some_and(|session_id| session_id.len() > MAX_RECALL_SESSION_ID_BYTES)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_id exceeds 256 UTF-8 bytes"})),
+        )
+            .into_response();
+    }
+    if rb.embedding.len() > MAX_RECALL_EMBEDDING_DIMENSIONS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "embedding exceeds 4096 dimensions"})),
+        )
+            .into_response();
+    }
+
     let now = now_secs();
     let layer_filter = rb.layer.as_deref().and_then(parse_layer);
     let top_k = rb.top_k.min(100).max(1);
@@ -229,28 +256,12 @@ pub async fn mpi_recall(
     // ── Session centroid for MVF φ₇ ──
     let session_centroid: Option<Vec<f32>> = if let Some(ref sid) = rb.session_id {
         if !rb.embedding.is_empty() {
-            let mut map = state.session_embeddings.write();
-            let buf = map
-                .entry(sid.clone())
-                .or_insert_with(|| VecDeque::with_capacity(5));
-            if buf.len() >= 5 {
-                buf.pop_front();
-            }
-            buf.push_back(rb.embedding.clone());
-            let dim = buf[0].len();
-            let mut centroid = vec![0.0f32; dim];
-            for emb in buf.iter() {
-                for (i, &v) in emb.iter().enumerate() {
-                    if i < dim {
-                        centroid[i] += v;
-                    }
-                }
-            }
-            let n = buf.len() as f32;
-            for v in centroid.iter_mut() {
-                *v /= n;
-            }
-            Some(centroid)
+            Some(
+                state
+                    .session_embeddings
+                    .write()
+                    .push_and_centroid(&owner, sid, &rb.embedding),
+            )
         } else {
             None
         }

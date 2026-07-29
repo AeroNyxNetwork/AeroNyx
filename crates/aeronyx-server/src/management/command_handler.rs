@@ -845,7 +845,10 @@ impl CommandHandler {
             return;
         };
 
-        deny_list.remove(&wallet_hex);
+        // [DENY-REASON-ISOLATION 2026-07-29 by Codex] An operator unban
+        // removes only the operator decision. Active quota or membership
+        // restrictions remain authoritative.
+        deny_list.remove_reason(&wallet_hex, DenyReason::OperatorBan);
         self.report_status_for_agent_type(
             "vpn",
             &command.id,

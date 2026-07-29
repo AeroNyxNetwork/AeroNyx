@@ -583,7 +583,7 @@ use crate::api::memchain_peer::{
     CommitmentCheckpointRelation, CommitmentReconciliationOutcome,
     VerifiedDeliveryAnchorWitnessRound,
 };
-use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState};
+use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState, SessionEmbeddingCache};
 use crate::api::voice::build_voice_router;
 use crate::api::vpn_health::{
     build_vpn_health_router, collect_node_operator_status_value, collect_vpn_health_value,
@@ -2574,7 +2574,7 @@ impl Server {
                     Arc::clone(&user_weights),
                     self.config.memchain.mvf_alpha,
                     self.config.memchain.mvf_enabled,
-                    parking_lot::RwLock::new(std::collections::HashMap::new()),
+                    parking_lot::RwLock::new(SessionEmbeddingCache::default()),
                     parking_lot::RwLock::new(mvf_baseline),
                     owner_key,
                     api_secret,
@@ -3057,7 +3057,7 @@ impl Server {
             user_weights,
             mvf_alpha: self.config.memchain.mvf_alpha,
             mvf_enabled: self.config.memchain.mvf_enabled,
-            session_embeddings: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            session_embeddings: parking_lot::RwLock::new(SessionEmbeddingCache::default()),
             mvf_baseline: parking_lot::RwLock::new(None),
             owner_key,
             api_secret,
@@ -10044,12 +10044,31 @@ impl Server {
                 let Some(ref relay) = chat_relay else {
                     return;
                 };
-                relay.wallet_routes.announce(
+                // [SESSION-WALLET-BOUND 2026-07-29 by Codex] Keep the
+                // independent online-route and device indexes transactional
+                // from the handler's perspective. A rejected side must not
+                // leave the other side advertising a half-registered wallet.
+                if !relay.wallet_routes.announce(
                     &wallet_pubkey,
                     session.id.clone(),
                     session.client_endpoint,
-                );
-                sessions.register_device(&wallet_pubkey, device_id, session.id.clone());
+                ) {
+                    warn!(
+                        reason = "session_wallet_limit",
+                        "[CHAT_RELAY] DeviceRegister rejected"
+                    );
+                    return;
+                }
+                if !sessions.register_device(&wallet_pubkey, device_id, session.id.clone()) {
+                    relay
+                        .wallet_routes
+                        .remove_route(&wallet_pubkey, &session.id);
+                    warn!(
+                        reason = "session_device_index_rejected",
+                        "[CHAT_RELAY] DeviceRegister rejected"
+                    );
+                    return;
+                }
                 info!("[CHAT_RELAY] Device registered");
                 match relay.pull_pending(&wallet_pubkey, 0, &[0u8; 16], 100) {
                     Ok((messages, _has_more)) if !messages.is_empty() => {

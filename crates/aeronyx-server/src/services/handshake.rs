@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/handshake.rs
 // ============================================
-// Version: 1.0.0-Membership
+// Version: 1.2.0-Admission
 //
 // Modification Reason:
 //   Injected Arc<DenyList> into HandshakeService.
@@ -18,6 +18,11 @@
 //   - Tests: added test_denied_wallet_rejected
 //   - v1.0.1 privacy hardening: handshake logs no longer persist client IPs,
 //     session IDs, wallet prefixes, or virtual IP assignments.
+//   - v1.1.0 cleanup hardening: route/IP release is conditional on session
+//     ownership, making delayed or duplicated cleanup safe after address reuse.
+//   - [POLICY-ADMISSION 2026-07-29 by Codex] Final policy validation and
+//     session resource admission are serialized so concurrent handshakes
+//     cannot exceed the operator's dynamic max_sessions limit.
 //
 // Main Logical Flow:
 //   0. Check deny list → if denied, return WalletDenied immediately
@@ -38,16 +43,22 @@
 //     this is not the hot path.
 //   - ServerError::WalletDenied must be added to error.rs if not present.
 //     Caller (server.rs UDP task) sends 0xFF RESET on any Err.
+//   - [HANDSHAKE-CLEANUP 2026-07-29 by Codex] Never release a virtual IP from
+//     session cleanup unless the route or removed session proves ownership.
+//     Retry-safe cleanup must not tear down a replacement session.
 //
 // Last Modified:
 //   v0.1.0          - Initial handshake service
 //   v1.0.0-Membership - Added DenyList check (Step 0)
 //   v1.0.1-PrivacyLogs - Redacted handshake/session correlation metadata
+//   v1.1.0-OwnershipCleanup - Conditional route removal and IP release
+//   v1.2.0-Admission - Made dynamic policy admission atomic across handshakes
 // ============================================
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use aeronyx_core::crypto::handshake::{DefaultHandshakeCrypto, HandshakeCrypto};
@@ -74,6 +85,11 @@ pub struct HandshakeService {
     deny_list: Arc<DenyList>,
     /// Operator policy from nodeboard Settings.
     policy: Arc<NodePolicyRuntime>,
+    /// Serializes the final policy check with IP/session/route admission.
+    ///
+    /// Signature verification remains outside this lock, so invalid or
+    /// attacker-controlled handshakes cannot monopolize the admission path.
+    admission_lock: Mutex<()>,
 }
 
 impl HandshakeService {
@@ -93,6 +109,7 @@ impl HandshakeService {
             routing,
             deny_list,
             policy,
+            admission_lock: Mutex::new(()),
         }
     }
 
@@ -139,6 +156,19 @@ impl HandshakeService {
         })?;
 
         debug!("ClientHello signature verified");
+
+        // [POLICY-ADMISSION 2026-07-29 by Codex] The earlier validation is a
+        // cheap fast rejection. Re-check while holding the admission lock so
+        // multiple valid handshakes cannot all observe the same free slot and
+        // overshoot nodeboard's dynamic max_sessions policy.
+        let _admission_guard = self.admission_lock.lock();
+        if let Err(reason) = self.policy.validate_new_session(self.sessions.count()) {
+            warn!(
+                reason = reason,
+                "[NODE_POLICY] Handshake admission rejected"
+            );
+            return Err(ServerError::node_policy_rejected(reason));
+        }
 
         // ── Step 2: Allocate virtual IP ───────────────────────────────────
         let virtual_ip = self.ip_pool.allocate().map_err(|e| {
@@ -205,9 +235,23 @@ impl HandshakeService {
     /// Cleans up resources for a failed or closed session.
     pub fn cleanup(&self, session_id: &aeronyx_common::SessionId, virtual_ip: std::net::Ipv4Addr) {
         debug!("Cleaning up session resources");
-        self.routing.remove_route(virtual_ip);
-        self.ip_pool.release(virtual_ip);
-        self.sessions.remove(session_id);
+        let removed_route = self
+            .routing
+            .remove_route_for_session(virtual_ip, session_id)
+            .is_some();
+        let removed_session = self.sessions.remove(session_id);
+        let removed_session_owned_ip = removed_session
+            .as_ref()
+            .is_some_and(|session| session.virtual_ip == virtual_ip);
+
+        // A surviving route proves that the IP now belongs to another session.
+        // When neither source confirms ownership, this is duplicate/stale
+        // cleanup and must be a no-op rather than releasing a reused address.
+        if (removed_route || removed_session_owned_ip) && !self.routing.has_route(virtual_ip) {
+            self.ip_pool.release(virtual_ip);
+        } else {
+            debug!("Session cleanup skipped unowned or replacement virtual IP");
+        }
     }
 
     #[must_use]
@@ -237,6 +281,8 @@ mod tests {
     use aeronyx_core::crypto::EphemeralKeyPair;
     use aeronyx_core::protocol::CURRENT_PROTOCOL_VERSION;
     use std::net::Ipv4Addr;
+    use std::sync::Barrier;
+    use std::thread;
     use std::time::Duration;
 
     fn create_test_services() -> (
@@ -294,6 +340,58 @@ mod tests {
         assert!(ip_pool.is_allocated(result.session.virtual_ip));
         assert!(routing.has_route(result.session.virtual_ip));
         assert_eq!(sessions.count(), 1);
+    }
+
+    #[test]
+    fn test_stale_cleanup_preserves_replacement_session() {
+        let server_identity = IdentityKeyPair::generate();
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let service = HandshakeService::new(
+            server_identity,
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            deny_list,
+            Arc::new(NodePolicyRuntime::default()),
+        );
+        let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let first_identity = IdentityKeyPair::generate();
+        let first_hello = create_client_hello(
+            &first_identity,
+            EphemeralKeyPair::generate().public_key_bytes(),
+            CURRENT_PROTOCOL_VERSION,
+        );
+        let first = service.process(&first_hello, client_addr).unwrap();
+        let old_session_id = first.session.id.clone();
+        let reused_ip = first.session.virtual_ip;
+
+        service.cleanup(&old_session_id, reused_ip);
+        assert!(!ip_pool.is_allocated(reused_ip));
+        assert!(routing.lookup(reused_ip).is_none());
+        assert!(sessions.get(&old_session_id).is_none());
+
+        let replacement_identity = IdentityKeyPair::generate();
+        let replacement_hello = create_client_hello(
+            &replacement_identity,
+            EphemeralKeyPair::generate().public_key_bytes(),
+            CURRENT_PROTOCOL_VERSION,
+        );
+        let replacement = service
+            .process(&replacement_hello, "127.0.0.1:12346".parse().unwrap())
+            .unwrap();
+        assert_eq!(replacement.session.virtual_ip, reused_ip);
+
+        // A delayed retry for the old cleanup must not remove or release the
+        // route now owned by the replacement session.
+        service.cleanup(&old_session_id, reused_ip);
+
+        assert!(ip_pool.is_allocated(reused_ip));
+        assert_eq!(
+            routing.lookup(reused_ip),
+            Some(replacement.session.id.clone())
+        );
+        assert!(sessions.get(&replacement.session.id).is_some());
     }
 
     #[test]
@@ -493,5 +591,59 @@ mod tests {
         }
 
         assert_eq!(sessions.count(), 1);
+    }
+
+    #[test]
+    fn test_concurrent_handshakes_respect_policy_max_sessions() {
+        const ATTEMPTS: usize = 24;
+        const POLICY_LIMIT: u32 = 4;
+
+        let server_identity = IdentityKeyPair::generate();
+        let (ip_pool, sessions, routing, deny_list) = create_test_services();
+        let policy = Arc::new(NodePolicyRuntime::default());
+        policy.update(NodePolicySnapshot {
+            max_sessions: POLICY_LIMIT,
+            ..NodePolicySnapshot::default()
+        });
+        let service = Arc::new(HandshakeService::new(
+            server_identity,
+            Arc::clone(&ip_pool),
+            Arc::clone(&sessions),
+            Arc::clone(&routing),
+            deny_list,
+            policy,
+        ));
+        let start = Arc::new(Barrier::new(ATTEMPTS));
+
+        let handles: Vec<_> = (0..ATTEMPTS)
+            .map(|index| {
+                let service = Arc::clone(&service);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    let client_identity = IdentityKeyPair::generate();
+                    let client_ephemeral = EphemeralKeyPair::generate();
+                    let client_hello = create_client_hello(
+                        &client_identity,
+                        client_ephemeral.public_key_bytes(),
+                        CURRENT_PROTOCOL_VERSION,
+                    );
+                    let port = 20_000u16 + u16::try_from(index).expect("test index fits u16");
+                    let client_addr = SocketAddr::from(([127, 0, 0, 1], port));
+                    start.wait();
+                    service.process(&client_hello, client_addr).is_ok()
+                })
+            })
+            .collect();
+
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("handshake worker must not panic"))
+            .filter(|succeeded| *succeeded)
+            .count();
+
+        assert_eq!(successes, POLICY_LIMIT as usize);
+        assert_eq!(sessions.count(), POLICY_LIMIT as usize);
+        assert_eq!(ip_pool.allocated_count(), POLICY_LIMIT as usize);
+        assert_eq!(routing.count(), POLICY_LIMIT as usize);
     }
 }

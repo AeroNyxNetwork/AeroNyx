@@ -44,10 +44,13 @@
 //! ## ⚠️ Important Note for Next Developer
 //! - Routes must be cleaned up when sessions close
 //! - One virtual IP can only map to one session
+//! - [ROUTE-OWNERSHIP 2026-07-29 by Codex] Session cleanup must use
+//!   `remove_route_for_session`; an IP-only removal can delete a replacement
+//!   route when delayed or duplicated cleanup races address reuse.
 //! - Thread-safe via DashMap
 //!
 //! ## Last Modified
-//! v0.1.0 - Initial routing service
+//! v0.2.0-RouteOwnership - Add compare-and-remove cleanup semantics
 
 use std::net::Ipv4Addr;
 
@@ -103,6 +106,27 @@ impl RoutingService {
         removed
     }
 
+    /// Removes a route only when it still belongs to `expected_session`.
+    ///
+    /// This is the session-cleanup primitive. It is idempotent and protects a
+    /// replacement route from stale cleanup that only knows the reused IP.
+    pub fn remove_route_for_session(
+        &self,
+        virtual_ip: Ipv4Addr,
+        expected_session: &SessionId,
+    ) -> Option<SessionId> {
+        let removed = self
+            .routes
+            .remove_if(&virtual_ip, |_, owner| owner == expected_session)
+            .map(|(_, id)| id);
+
+        if removed.is_some() {
+            debug!(virtual_ip = %virtual_ip, "Owned route removed");
+        }
+
+        removed
+    }
+
     /// Looks up the session for a virtual IP.
     #[must_use]
     pub fn lookup(&self, virtual_ip: Ipv4Addr) -> Option<SessionId> {
@@ -151,23 +175,25 @@ impl RoutingService {
 
     /// Removes all routes for a specific session.
     pub fn remove_session_routes(&self, session_id: &SessionId) -> usize {
-        let to_remove: Vec<Ipv4Addr> = self
+        let candidates: Vec<Ipv4Addr> = self
             .routes
             .iter()
             .filter(|r| r.value() == session_id)
             .map(|r| *r.key())
             .collect();
 
-        let count = to_remove.len();
-        for ip in to_remove {
-            self.routes.remove(&ip);
+        let mut removed = 0usize;
+        for ip in candidates {
+            if self.remove_route_for_session(ip, session_id).is_some() {
+                removed += 1;
+            }
         }
 
-        if count > 0 {
-            debug!(session_id = %session_id, count, "Removed session routes");
+        if removed > 0 {
+            debug!(session_id = %session_id, count = removed, "Removed session routes");
         }
 
-        count
+        removed
     }
 }
 
@@ -224,6 +250,40 @@ mod tests {
         let removed = routing.remove_route(ip);
         assert_eq!(removed, Some(session_id));
         assert_eq!(routing.count(), 0);
+    }
+
+    #[test]
+    fn test_owned_remove_does_not_delete_replacement_route() {
+        let routing = RoutingService::new();
+        let old_session = SessionId::generate();
+        let new_session = SessionId::generate();
+        let ip = Ipv4Addr::new(100, 64, 0, 2);
+
+        routing.add_route(ip, old_session.clone());
+        routing.add_route(ip, new_session.clone());
+
+        assert!(routing.remove_route_for_session(ip, &old_session).is_none());
+        assert_eq!(routing.lookup(ip), Some(new_session.clone()));
+        assert_eq!(
+            routing.remove_route_for_session(ip, &new_session),
+            Some(new_session)
+        );
+    }
+
+    #[test]
+    fn test_remove_session_routes_preserves_other_owners() {
+        let routing = RoutingService::new();
+        let target = SessionId::generate();
+        let other = SessionId::generate();
+        let target_ip = Ipv4Addr::new(100, 64, 0, 2);
+        let other_ip = Ipv4Addr::new(100, 64, 0, 3);
+
+        routing.add_route(target_ip, target.clone());
+        routing.add_route(other_ip, other.clone());
+
+        assert_eq!(routing.remove_session_routes(&target), 1);
+        assert!(routing.lookup(target_ip).is_none());
+        assert_eq!(routing.lookup(other_ip), Some(other));
     }
 
     #[test]

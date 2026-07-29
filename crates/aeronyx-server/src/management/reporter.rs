@@ -676,23 +676,16 @@ impl HeartbeatReporter {
         }
 
         // ── Restore access for wallets whose permissions improved ─────────
-        // Check deny reason independently:
-        //   NoPremiumAccess → remove if can_access_premium_nodes is now true
-        //   QuotaExceeded   → remove if traffic_allowed is now true
-        // Do NOT combine into a single now_ok flag — a wallet can have
-        // NoPremiumAccess cleared (tier upgrade) while still over quota,
-        // or vice versa. Each reason is independent.
+        // [DENY-REASON-ISOLATION 2026-07-29 by Codex] Remove membership
+        // reasons independently. A wallet may simultaneously carry an
+        // operator ban, and a CMS tier/quota refresh must never clear it.
         if let Some(ref dl) = self.deny_list {
             for (wallet, perm) in &permissions {
-                if let Some(reason) = dl.deny_reason(wallet) {
-                    let should_remove = match reason {
-                        DenyReason::NoPremiumAccess => perm.can_access_premium_nodes,
-                        DenyReason::QuotaExceeded => perm.traffic_allowed,
-                        DenyReason::OperatorBan => false,
-                    };
-                    if should_remove {
-                        dl.remove(wallet);
-                    }
+                if perm.can_access_premium_nodes {
+                    dl.remove_reason(wallet, DenyReason::NoPremiumAccess);
+                }
+                if perm.traffic_allowed {
+                    dl.remove_reason(wallet, DenyReason::QuotaExceeded);
                 }
             }
         }
@@ -774,14 +767,14 @@ impl HeartbeatReporter {
             .collect();
 
         for wallet in &desired {
-            if deny_list.deny_reason(wallet) != Some(DenyReason::OperatorBan) {
+            if !deny_list.has_reason(wallet, DenyReason::OperatorBan) {
                 deny_list.add(wallet, DenyReason::OperatorBan);
             }
         }
 
         for wallet in deny_list.wallets_for_reason(DenyReason::OperatorBan) {
             if !desired.contains(&wallet) {
-                deny_list.remove(&wallet);
+                deny_list.remove_reason(&wallet, DenyReason::OperatorBan);
             }
         }
 

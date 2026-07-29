@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/deny_list.rs
 // ============================================
-// Version: 1.0.0-Membership
+// Version: 1.1.0-Membership
 //
 // Modification Reason:
 //   New file. Prevents the 30-second reconnect loop that occurs when a
@@ -19,9 +19,10 @@
 //
 // Main Functionality:
 //   - DenyList: thread-safe in-memory wallet block list
-//   - add(): record a wallet denial with reason and TTL
+//   - add(): record an independent wallet denial reason with its own TTL
 //   - is_denied(): check before allowing handshake
-//   - remove(): explicitly unblock (e.g. on subscription upgrade)
+//   - remove_reason(): clear only the control-plane reason being restored
+//   - remove(): explicitly clear all reasons for backwards compatibility
 //   - cleanup(): evict expired entries (called periodically)
 //
 // Deny Reasons and TTLs:
@@ -49,6 +50,9 @@
 //   - DenyList is in-memory only. Server restart clears all entries.
 //     This is intentional: CMS is the source of truth. After restart,
 //     the first heartbeat will re-populate the deny list if needed.
+//   - [DENY-REASON-ISOLATION 2026-07-29 by Codex] Membership, quota, and
+//     operator-ban reasons are independent. Never clear all reasons when only
+//     one control plane restores access; use remove_reason().
 //   - wallet_hex keys must be lowercase hex (consistent with TrafficTracker).
 //   - NoPremiumAccess TTL is u64::MAX unix seconds (~year 292 billion).
 //     Treat it as "permanent until explicitly removed".
@@ -56,11 +60,12 @@
 //     It only removes QuotaExceeded entries whose month has rolled over.
 //   - is_denied() returns false for unknown wallets (fail-open for handshake).
 //
-// Last Modified: v1.0.0-Membership — initial implementation
+// Last Modified: v1.1.0-Membership — isolate concurrent deny reasons
 // ============================================
 
 use dashmap::DashMap;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 // ============================================
@@ -68,7 +73,7 @@ use tracing::{debug, info};
 // ============================================
 
 /// The reason a wallet is on the deny list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DenyReason {
     /// Wallet's subscription tier cannot access premium nodes.
     /// Permanent until explicitly removed (e.g. on tier upgrade).
@@ -96,15 +101,13 @@ impl std::fmt::Display for DenyReason {
 // ============================================
 
 #[derive(Debug, Clone)]
-struct DenyEntry {
-    reason: DenyReason,
-    denied_at: Instant,
+struct DenyReasonEntry {
     /// Unix timestamp (seconds) after which this entry expires.
     /// u64::MAX = permanent.
     expires_at_unix: u64,
 }
 
-impl DenyEntry {
+impl DenyReasonEntry {
     /// Returns true if this entry is still active (not expired).
     fn is_active(&self) -> bool {
         if self.expires_at_unix == u64::MAX {
@@ -115,6 +118,36 @@ impl DenyEntry {
             .unwrap_or_default()
             .as_secs();
         now < self.expires_at_unix
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DenyEntry {
+    /// Independent reasons keyed by the authority that imposed them.
+    reasons: HashMap<DenyReason, DenyReasonEntry>,
+}
+
+impl DenyEntry {
+    /// Returns the highest-priority active reason for legacy diagnostics.
+    ///
+    /// Operator bans must always win so membership state cannot hide an
+    /// explicit operator action. Callers that restore one authority should
+    /// use `remove_reason()` instead of relying on this aggregate view.
+    fn primary_active_reason(&self) -> Option<DenyReason> {
+        [
+            DenyReason::OperatorBan,
+            DenyReason::QuotaExceeded,
+            DenyReason::NoPremiumAccess,
+        ]
+        .into_iter()
+        .find(|reason| self.has_active_reason(*reason))
+    }
+
+    fn has_active_reason(&self, reason: DenyReason) -> bool {
+        self.reasons
+            .get(&reason)
+            .map(DenyReasonEntry::is_active)
+            .unwrap_or(false)
     }
 }
 
@@ -157,14 +190,15 @@ impl DenyList {
             "[DENY_LIST] Wallet added"
         );
 
-        self.entries.insert(
-            wallet_hex.to_string(),
-            DenyEntry {
-                reason,
-                denied_at: Instant::now(),
-                expires_at_unix,
-            },
-        );
+        // [DENY-REASON-ISOLATION 2026-07-29 by Codex] A wallet can be
+        // independently blocked by operator policy and membership/quota
+        // policy. Replacing the whole wallet entry here allowed a quota update
+        // to erase an operator ban.
+        self.entries
+            .entry(wallet_hex.to_string())
+            .or_default()
+            .reasons
+            .insert(reason, DenyReasonEntry { expires_at_unix });
     }
 
     /// Returns true if the wallet is currently on the deny list and
@@ -175,7 +209,16 @@ impl DenyList {
     pub fn is_denied(&self, wallet_hex: &str) -> bool {
         self.entries
             .get(wallet_hex)
-            .map(|e| e.is_active())
+            .and_then(|entry| entry.primary_active_reason())
+            .is_some()
+    }
+
+    /// Returns true when a specific deny reason is present and active.
+    #[must_use]
+    pub fn has_reason(&self, wallet_hex: &str, reason: DenyReason) -> bool {
+        self.entries
+            .get(wallet_hex)
+            .map(|entry| entry.has_active_reason(reason))
             .unwrap_or(false)
     }
 
@@ -184,8 +227,7 @@ impl DenyList {
     pub fn deny_reason(&self, wallet_hex: &str) -> Option<DenyReason> {
         self.entries
             .get(wallet_hex)
-            .filter(|e| e.is_active())
-            .map(|e| e.reason.clone())
+            .and_then(|entry| entry.primary_active_reason())
     }
 
     /// Returns all active wallets currently denied for a specific reason.
@@ -193,9 +235,39 @@ impl DenyList {
     pub fn wallets_for_reason(&self, reason: DenyReason) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|entry| entry.is_active() && entry.reason == reason)
+            .filter(|entry| entry.has_active_reason(reason))
             .map(|entry| entry.key().clone())
             .collect()
+    }
+
+    /// Removes one authority-specific deny reason without affecting others.
+    ///
+    /// Returns true when the requested active or expired reason existed.
+    pub fn remove_reason(&self, wallet_hex: &str, reason: DenyReason) -> bool {
+        let (removed, became_empty) = match self.entries.get_mut(wallet_hex) {
+            Some(mut entry) => {
+                let removed = entry.reasons.remove(&reason).is_some();
+                (removed, entry.reasons.is_empty())
+            }
+            None => (false, false),
+        };
+
+        if became_empty {
+            // The entry may have gained a reason after the mutable guard was
+            // dropped. `remove_if` keeps that concurrent update intact.
+            self.entries
+                .remove_if(wallet_hex, |_wallet, entry| entry.reasons.is_empty());
+        }
+
+        if removed {
+            info!(
+                wallet = %&wallet_hex[..8.min(wallet_hex.len())],
+                reason = %reason,
+                "[DENY_LIST] Wallet deny reason removed"
+            );
+        }
+
+        removed
     }
 
     /// Explicitly removes a wallet from the deny list.
@@ -221,17 +293,20 @@ impl DenyList {
     pub fn cleanup(&self) -> usize {
         let mut evicted = 0usize;
         self.entries.retain(|wallet, entry| {
-            if entry.is_active() {
-                true
-            } else {
+            let before = entry.reasons.len();
+            entry.reasons.retain(|reason, state| {
+                if state.is_active() {
+                    return true;
+                }
                 debug!(
                     wallet = %&wallet[..8.min(wallet.len())],
-                    reason = %entry.reason,
-                    "[DENY_LIST] Expired entry evicted"
+                    reason = %reason,
+                    "[DENY_LIST] Expired deny reason evicted"
                 );
-                evicted += 1;
                 false
-            }
+            });
+            evicted += before - entry.reasons.len();
+            !entry.reasons.is_empty()
         });
         if evicted > 0 {
             info!(
@@ -357,12 +432,13 @@ mod tests {
 
         // expires_at_unix must be > now (not permanent).
         let entry = dl.entries.get("wallet1").unwrap();
+        let reason = entry.reasons.get(&DenyReason::QuotaExceeded).unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        assert!(entry.expires_at_unix > now);
-        assert!(entry.expires_at_unix != u64::MAX);
+        assert!(reason.expires_at_unix > now);
+        assert!(reason.expires_at_unix != u64::MAX);
     }
 
     #[test]
@@ -371,7 +447,14 @@ mod tests {
         dl.add("wallet2", DenyReason::NoPremiumAccess);
 
         let entry = dl.entries.get("wallet2").unwrap();
-        assert_eq!(entry.expires_at_unix, u64::MAX);
+        assert_eq!(
+            entry
+                .reasons
+                .get(&DenyReason::NoPremiumAccess)
+                .unwrap()
+                .expires_at_unix,
+            u64::MAX
+        );
     }
 
     #[test]
@@ -382,9 +465,12 @@ mod tests {
         dl.entries.insert(
             "expired_wallet".to_string(),
             DenyEntry {
-                reason: DenyReason::QuotaExceeded,
-                denied_at: Instant::now(),
-                expires_at_unix: 1, // Unix timestamp 1 = long expired
+                reasons: HashMap::from([(
+                    DenyReason::QuotaExceeded,
+                    DenyReasonEntry {
+                        expires_at_unix: 1, // Unix timestamp 1 = long expired
+                    },
+                )]),
             },
         );
 
@@ -407,6 +493,53 @@ mod tests {
         assert_eq!(dl.deny_reason("w1"), Some(DenyReason::QuotaExceeded));
         assert_eq!(dl.deny_reason("w2"), Some(DenyReason::NoPremiumAccess));
         assert_eq!(dl.deny_reason("w3"), None);
+    }
+
+    #[test]
+    fn test_operator_ban_and_membership_reason_coexist() {
+        let dl = DenyList::new();
+        dl.add("wallet", DenyReason::OperatorBan);
+        dl.add("wallet", DenyReason::QuotaExceeded);
+
+        assert!(dl.has_reason("wallet", DenyReason::OperatorBan));
+        assert!(dl.has_reason("wallet", DenyReason::QuotaExceeded));
+        assert_eq!(
+            dl.deny_reason("wallet"),
+            Some(DenyReason::OperatorBan),
+            "operator action must remain the primary diagnostic reason"
+        );
+        assert_eq!(dl.len(), 1, "len counts denied wallets, not reasons");
+    }
+
+    #[test]
+    fn test_remove_reason_preserves_other_authorities() {
+        let dl = DenyList::new();
+        dl.add("wallet", DenyReason::OperatorBan);
+        dl.add("wallet", DenyReason::QuotaExceeded);
+
+        assert!(dl.remove_reason("wallet", DenyReason::QuotaExceeded));
+        assert!(dl.is_denied("wallet"));
+        assert!(dl.has_reason("wallet", DenyReason::OperatorBan));
+        assert!(!dl.has_reason("wallet", DenyReason::QuotaExceeded));
+
+        assert!(dl.remove_reason("wallet", DenyReason::OperatorBan));
+        assert!(!dl.is_denied("wallet"));
+        assert!(dl.is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_expired_reason_preserves_permanent_reason() {
+        let dl = DenyList::new();
+        dl.add("wallet", DenyReason::OperatorBan);
+        dl.entries.get_mut("wallet").unwrap().reasons.insert(
+            DenyReason::QuotaExceeded,
+            DenyReasonEntry { expires_at_unix: 1 },
+        );
+
+        assert_eq!(dl.cleanup(), 1);
+        assert!(dl.has_reason("wallet", DenyReason::OperatorBan));
+        assert!(!dl.has_reason("wallet", DenyReason::QuotaExceeded));
+        assert_eq!(dl.len(), 1);
     }
 
     #[test]

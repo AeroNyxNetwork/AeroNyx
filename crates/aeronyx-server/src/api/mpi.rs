@@ -57,8 +57,12 @@
 //!   Never use it directly in SaaS mode — use AuthenticatedOwner from extensions.
 //! - SaaS mode admin routes use api_secret Bearer token (same as local mode),
 //!   NOT the user JWT. Admin is the operator, not an end-user.
+//! - [RECALL-SESSION-CACHE 2026-07-29 by Codex] Session embedding history is
+//!   owner-scoped, content-blind, dimension-bounded, and globally capacity
+//!   bounded. Never key it by a caller-provided session string alone.
 //!
 //! ## Last Modified
+//! v2.6.0+BoundedRecallSessions - Owner-isolated bounded session centroid cache
 //! v2.5.2+Provenance  - +2 routes (patch record, provenance); 29→31
 //! v2.5.3+ArtifactChain - +1 route (/artifacts/search); 31→32
 //! v2.0.0-AuthServerNonce - +2 SaaS-only auth routes; Local mode unchanged
@@ -88,6 +92,21 @@ use crate::services::memchain::LlmRouter;
 use crate::services::memchain::NerEngine;
 use crate::services::memchain::RerankerEngine;
 use crate::services::memchain::{MemoryStorage, VectorIndex};
+
+/// Maximum UTF-8 bytes accepted for a caller-provided recall session ID.
+pub(crate) const MAX_RECALL_SESSION_ID_BYTES: usize = 256;
+
+/// Maximum embedding dimensions retained for a recall session centroid.
+pub(crate) const MAX_RECALL_EMBEDDING_DIMENSIONS: usize = 4_096;
+
+/// Maximum owner/session centroids retained process-wide.
+const SESSION_EMBEDDING_CACHE_CAPACITY: usize = 4_096;
+
+/// Maximum retained embedding scalar values process-wide (about 4 MiB of f32).
+const SESSION_EMBEDDING_CACHE_MAX_VALUES: usize = 1_048_576;
+
+/// Recent embeddings retained per owner/session centroid.
+const SESSION_EMBEDDINGS_PER_KEY: usize = 5;
 // v1.0.0-MultiTenant: SaaS mode pools and infrastructure
 use crate::services::memchain::{StoragePool, SystemDb, VectorIndexPool, VolumeRouter};
 
@@ -188,7 +207,7 @@ pub struct MpiState {
     pub user_weights: Arc<RwLock<HashMap<String, WeightVector>>>,
     pub mvf_alpha: f32,
     pub mvf_enabled: bool,
-    pub session_embeddings: RwLock<HashMap<String, VecDeque<Vec<f32>>>>,
+    pub session_embeddings: RwLock<SessionEmbeddingCache>,
     pub mvf_baseline: RwLock<Option<BaselineSnapshot>>,
     /// Local mode owner public key. In SaaS mode this is [0u8; 32] (placeholder).
     /// ⚠️ Never read this in SaaS mode — use AuthenticatedOwner from extensions.
@@ -242,7 +261,7 @@ impl MpiState {
         user_weights: Arc<RwLock<HashMap<String, WeightVector>>>,
         mvf_alpha: f32,
         mvf_enabled: bool,
-        session_embeddings: RwLock<HashMap<String, VecDeque<Vec<f32>>>>,
+        session_embeddings: RwLock<SessionEmbeddingCache>,
         mvf_baseline: RwLock<Option<BaselineSnapshot>>,
         owner_key: [u8; 32],
         api_secret: Option<String>,
@@ -291,6 +310,241 @@ impl MpiState {
             pool_max_connections: 0,
             pool_idle_timeout_secs: 0,
         }
+    }
+}
+
+#[derive(Debug)]
+struct SessionEmbeddingEntry {
+    samples: VecDeque<Vec<f32>>,
+    last_used_generation: u64,
+}
+
+/// Bounded, owner-isolated in-memory history used to compute recall centroids.
+///
+/// Keys are domain-separated hashes of `(owner, session_id)` so the cache never
+/// retains caller-provided session labels. Values contain embeddings only; no
+/// conversation text, record IDs, wallet strings, or routing metadata.
+#[derive(Debug)]
+pub struct SessionEmbeddingCache {
+    entries: HashMap<[u8; 32], SessionEmbeddingEntry>,
+    generation: u64,
+    capacity: usize,
+    retained_values: usize,
+    max_retained_values: usize,
+}
+
+impl Default for SessionEmbeddingCache {
+    fn default() -> Self {
+        Self::with_limits(
+            SESSION_EMBEDDING_CACHE_CAPACITY,
+            SESSION_EMBEDDING_CACHE_MAX_VALUES,
+        )
+    }
+}
+
+impl SessionEmbeddingCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self::with_limits(capacity, SESSION_EMBEDDING_CACHE_MAX_VALUES)
+    }
+
+    fn with_limits(capacity: usize, max_retained_values: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            generation: 0,
+            capacity: capacity.max(1),
+            retained_values: 0,
+            max_retained_values: max_retained_values.max(MAX_RECALL_EMBEDDING_DIMENSIONS),
+        }
+    }
+
+    /// Adds one embedding and returns the updated centroid.
+    ///
+    /// The caller validates session ID and embedding bounds before invoking
+    /// this method. A dimension change resets the old sample window so vectors
+    /// produced by different embedding models are never averaged together.
+    pub(crate) fn push_and_centroid(
+        &mut self,
+        owner: &[u8; 32],
+        session_id: &str,
+        embedding: &[f32],
+    ) -> Vec<f32> {
+        let key = session_embedding_key(owner, session_id);
+        self.generation = self.generation.saturating_add(1);
+        let generation = self.generation;
+
+        // Remove incompatible history before capacity accounting. Different
+        // dimensions indicate an embedding model change and must not mix.
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if entry
+                .samples
+                .front()
+                .is_some_and(|sample| sample.len() != embedding.len())
+            {
+                self.retained_values = self
+                    .retained_values
+                    .saturating_sub(entry.samples.iter().map(Vec::len).sum::<usize>());
+                entry.samples.clear();
+            }
+            if entry.samples.len() >= SESSION_EMBEDDINGS_PER_KEY {
+                if let Some(removed) = entry.samples.pop_front() {
+                    self.retained_values = self.retained_values.saturating_sub(removed.len());
+                }
+            }
+        }
+
+        // Bound both cardinality and actual retained vector storage. The
+        // current session is never evicted while its centroid is updated.
+        while (!self.entries.contains_key(&key) && self.entries.len() >= self.capacity)
+            || self.retained_values.saturating_add(embedding.len()) > self.max_retained_values
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .filter(|(entry_key, _)| **entry_key != key)
+                .min_by_key(|(_, entry)| entry.last_used_generation)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.retained_values = self
+                    .retained_values
+                    .saturating_sub(removed.samples.iter().map(Vec::len).sum::<usize>());
+            }
+        }
+
+        let entry = self
+            .entries
+            .entry(key)
+            .or_insert_with(|| SessionEmbeddingEntry {
+                samples: VecDeque::with_capacity(SESSION_EMBEDDINGS_PER_KEY),
+                last_used_generation: generation,
+            });
+        entry.last_used_generation = generation;
+        entry.samples.push_back(embedding.to_vec());
+        self.retained_values = self.retained_values.saturating_add(embedding.len());
+
+        let mut centroid = vec![0.0f32; embedding.len()];
+        for sample in &entry.samples {
+            for (total, value) in centroid.iter_mut().zip(sample) {
+                *total += value;
+            }
+        }
+        let sample_count = entry.samples.len() as f32;
+        for value in &mut centroid {
+            *value /= sample_count;
+        }
+        centroid
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn retained_values(&self) -> usize {
+        self.retained_values
+    }
+}
+
+fn session_embedding_key(owner: &[u8; 32], session_id: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"aeronyx-recall-session-centroid-v1\0");
+    digest.update(owner);
+    digest.update((session_id.len() as u64).to_be_bytes());
+    digest.update(session_id.as_bytes());
+    digest.finalize().into()
+}
+
+#[cfg(test)]
+mod session_embedding_cache_tests {
+    use super::*;
+
+    #[test]
+    fn same_session_label_is_isolated_by_owner() {
+        let mut cache = SessionEmbeddingCache::with_capacity(4);
+        let owner_a = [0x11; 32];
+        let owner_b = [0x22; 32];
+
+        assert_eq!(
+            cache.push_and_centroid(&owner_a, "conversation", &[1.0, 3.0]),
+            vec![1.0, 3.0]
+        );
+        assert_eq!(
+            cache.push_and_centroid(&owner_b, "conversation", &[7.0, 9.0]),
+            vec![7.0, 9.0]
+        );
+        assert_eq!(cache.len(), 2);
+        assert_ne!(
+            session_embedding_key(&owner_a, "conversation"),
+            session_embedding_key(&owner_b, "conversation")
+        );
+    }
+
+    #[test]
+    fn retains_only_five_recent_samples_per_owner_session() {
+        let mut cache = SessionEmbeddingCache::with_capacity(2);
+        let owner = [0x33; 32];
+
+        for value in 1..=6 {
+            cache.push_and_centroid(&owner, "bounded", &[value as f32]);
+        }
+
+        // The oldest sample (1) was evicted: mean(2, 3, 4, 5, 6) = 4.
+        assert_eq!(
+            cache.push_and_centroid(&owner, "bounded", &[7.0]),
+            vec![5.0]
+        );
+    }
+
+    #[test]
+    fn embedding_dimension_change_resets_sample_window() {
+        let mut cache = SessionEmbeddingCache::with_capacity(2);
+        let owner = [0x44; 32];
+
+        cache.push_and_centroid(&owner, "model-rotated", &[1.0, 3.0]);
+        assert_eq!(
+            cache.push_and_centroid(&owner, "model-rotated", &[8.0]),
+            vec![8.0]
+        );
+    }
+
+    #[test]
+    fn capacity_evicts_least_recently_used_session() {
+        let mut cache = SessionEmbeddingCache::with_capacity(2);
+        let owner = [0x55; 32];
+        let session_a = session_embedding_key(&owner, "a");
+        let session_b = session_embedding_key(&owner, "b");
+        let session_c = session_embedding_key(&owner, "c");
+
+        cache.push_and_centroid(&owner, "a", &[1.0]);
+        cache.push_and_centroid(&owner, "b", &[2.0]);
+        cache.push_and_centroid(&owner, "a", &[3.0]);
+        cache.push_and_centroid(&owner, "c", &[4.0]);
+
+        assert_eq!(cache.len(), 2);
+        assert!(cache.entries.contains_key(&session_a));
+        assert!(!cache.entries.contains_key(&session_b));
+        assert!(cache.entries.contains_key(&session_c));
+    }
+
+    #[test]
+    fn retained_value_budget_evicts_old_sessions() {
+        let mut cache = SessionEmbeddingCache::with_limits(8, 4_096);
+        let owner = [0x66; 32];
+        let session_a = session_embedding_key(&owner, "a");
+        let session_b = session_embedding_key(&owner, "b");
+        let session_c = session_embedding_key(&owner, "c");
+
+        cache.push_and_centroid(&owner, "a", &vec![1.0; 2_048]);
+        cache.push_and_centroid(&owner, "b", &vec![2.0; 2_048]);
+        cache.push_and_centroid(&owner, "c", &vec![3.0; 2_048]);
+
+        assert_eq!(cache.retained_values(), 4_096);
+        assert!(!cache.entries.contains_key(&session_a));
+        assert!(cache.entries.contains_key(&session_b));
+        assert!(cache.entries.contains_key(&session_c));
     }
 }
 
