@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.63.0 - Added source-blind block-page carrier observability without overstating certificate completion.
+Modification Reason: v0.64.0 - Added round-local multi-page carrier preference and bounded handoff.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.63.0 - [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Reports typed, source-blind block-page retrieval outcomes and bounded carrier attempts without exposing identities or treating transport as certification.
+Last Modified: v0.64.0 - [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Avoids repeating earlier carrier availability failures across one bounded multi-page follower round and hands off safely when the preferred carrier disappears.
+Previous: v0.63.0 - [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Reports typed, source-blind block-page retrieval outcomes and bounded carrier attempts without exposing identities or treating transport as certification.
 Previous: v0.62.0 - [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Lets a follower recover coordinator-authored blocks from bounded operator pins while requiring an exact-tip threshold certificate before reporting recovery.
 Previous: v0.61.0 - [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] Prevents readiness evaluated for an older audited tip from being reported as current after follower advancement.
 Previous: v0.60.0 - [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Reports whether the current audited follower tip satisfies the current local witness policy without exposing identities.
@@ -95,6 +96,38 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.64 Multi-page block-carrier handoff
+
+[MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex]
+
+- The follower now owns one carrier cursor for each bounded multi-page sync
+  round. A pinned carrier that delivers a fully verified page becomes the first
+  carrier attempted for the next page in that same round.
+- The coordinator is still attempted first on every page. Carrier preference
+  changes transport order only after a classified coordinator availability
+  fault; it cannot bypass the producer, change proposer authority, or select a
+  permissionless discovery peer.
+- Availability failures advance cyclically through the same normalized,
+  deduplicated, operator-pinned set. A carrier that disappears between pages
+  hands off directly to the next exact pin instead of retrying earlier failed
+  pins first.
+- Decode, endpoint-policy, identity, signature, proposer, continuity,
+  pagination, rollback, size, and storage failures remain terminal. Tests prove
+  that a malformed preferred carrier stops with `security_stopped` even when a
+  later valid carrier is available.
+- The cursor stores only a bounded array index. It is discarded after the sync
+  round, never persisted or serialized, and never enters status, heartbeat,
+  logs, source selection policy, reputation, certificates, consensus, finality,
+  or fork choice.
+- The public one-page API preserves its original signature and operator-order
+  behavior by creating a fresh default cursor. Only the server's existing
+  multi-page follower loop shares cursor state.
+- A 17-block loopback integration test proves two-page transfer with three
+  exact pins: one unavailable pin, one initially successful carrier that then
+  disappears, and a final carrier that completes the original
+  coordinator-signed chain. The second page avoids recontacting the earlier
+  unavailable pin.
 
 ### v0.63 Privacy-safe block-page carrier telemetry
 

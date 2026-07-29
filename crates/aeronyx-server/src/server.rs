@@ -610,7 +610,7 @@ use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     publish_current_descriptor_to_commitment_witnesses, pull_record_commitment_checkpoint,
     pull_record_commitment_checkpoint_certificate,
-    pull_record_commitment_page_with_carrier_recovery,
+    pull_record_commitment_page_with_carrier_cursor, CommitmentBlockCarrierCursor,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
     request_record_commitment_coordinator_lease,
@@ -6704,8 +6704,13 @@ impl Server {
                 let round_future = async {
                     let mut inserted = 0usize;
                     let mut remote_tip_height = 0u64;
+                    // [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex]
+                    // Preference is scoped to this bounded page round. It is
+                    // discarded before backoff/retry and never enters status,
+                    // persistence, routing policy, or trust decisions.
+                    let mut block_carrier_cursor = CommitmentBlockCarrierCursor::default();
                     for _ in 0..max_pages_per_round {
-                        let page_pull = pull_record_commitment_page_with_carrier_recovery(
+                        let page_pull = pull_record_commitment_page_with_carrier_cursor(
                             &storage,
                             &peer_store,
                             &identity,
@@ -6713,6 +6718,7 @@ impl Server {
                             &certificate_witness_node_ids,
                             certificate_minimum_signers,
                             sync_http_client.as_ref(),
+                            &mut block_carrier_cursor,
                         )
                         .await?;
                         let page_source = page_pull.source;

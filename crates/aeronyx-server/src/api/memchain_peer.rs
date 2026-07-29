@@ -307,6 +307,52 @@ pub struct CommitmentFollowerPagePullOutcome {
     pub carrier_attempts: usize,
 }
 
+/// Round-local preference for bounded commitment-block carriers.
+///
+/// [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] The cursor stores
+/// only an index into the caller's already validated pin order. It is neither
+/// persisted nor reported, cannot name a node, and must be discarded after one
+/// follower synchronization round. Coordinator-first and fail-closed security
+/// behavior remain mandatory for every page.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommitmentBlockCarrierCursor {
+    next_index: usize,
+}
+
+impl CommitmentBlockCarrierCursor {
+    fn reset(&mut self) {
+        self.next_index = 0;
+    }
+
+    fn start_index(&self, carrier_count: usize) -> usize {
+        if carrier_count == 0 {
+            0
+        } else {
+            self.next_index % carrier_count
+        }
+    }
+
+    fn prefer(&mut self, carrier_index: usize, carrier_count: usize) {
+        self.next_index = if carrier_count == 0 {
+            0
+        } else {
+            carrier_index % carrier_count
+        };
+    }
+
+    fn advance_after_availability_failure(
+        &mut self,
+        carrier_index: usize,
+        carrier_count: usize,
+    ) {
+        self.next_index = if carrier_count == 0 {
+            0
+        } else {
+            carrier_index.saturating_add(1) % carrier_count
+        };
+    }
+}
+
 /// One independently verified coordinator lease grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitmentCoordinatorLeaseGrant {
@@ -2526,7 +2572,8 @@ pub async fn pull_record_commitment_page_with_carrier_recovery(
     minimum_required_signers: usize,
     client: &reqwest::Client,
 ) -> Result<CommitmentFollowerPagePullOutcome, String> {
-    pull_record_commitment_page_with_carrier_recovery_and_endpoint_policy(
+    let mut cursor = CommitmentBlockCarrierCursor::default();
+    pull_record_commitment_page_with_carrier_cursor_and_endpoint_policy(
         storage,
         peer_store,
         identity,
@@ -2535,6 +2582,37 @@ pub async fn pull_record_commitment_page_with_carrier_recovery(
         minimum_required_signers,
         client,
         &commitment_peer_endpoint_is_public,
+        &mut cursor,
+    )
+    .await
+}
+
+/// Pulls one page while preserving a successful carrier preference within one
+/// caller-owned multi-page synchronization round.
+///
+/// The cursor never weakens coordinator-first behavior or source validation.
+/// It only avoids retrying earlier availability failures before a carrier that
+/// already delivered a fully verified page in the same round.
+pub(crate) async fn pull_record_commitment_page_with_carrier_cursor(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    coordinator_node_id: &[u8; 32],
+    carrier_node_ids: &[[u8; 32]],
+    minimum_required_signers: usize,
+    client: &reqwest::Client,
+    cursor: &mut CommitmentBlockCarrierCursor,
+) -> Result<CommitmentFollowerPagePullOutcome, String> {
+    pull_record_commitment_page_with_carrier_cursor_and_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        coordinator_node_id,
+        carrier_node_ids,
+        minimum_required_signers,
+        client,
+        &commitment_peer_endpoint_is_public,
+        cursor,
     )
     .await
 }
@@ -2576,6 +2654,61 @@ async fn pull_record_commitment_page_with_carrier_recovery_and_endpoint_policy<F
 where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
 {
+    let mut cursor = CommitmentBlockCarrierCursor::default();
+    pull_record_commitment_page_with_carrier_cursor_and_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        coordinator_node_id,
+        carrier_node_ids,
+        minimum_required_signers,
+        client,
+        endpoint_allowed,
+        &mut cursor,
+    )
+    .await
+}
+
+fn eligible_commitment_block_carriers(
+    local_node_id: [u8; 32],
+    coordinator_node_id: &[u8; 32],
+    carrier_node_ids: &[[u8; 32]],
+) -> Vec<[u8; 32]> {
+    // [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Normalize once
+    // per page from the immutable operator policy. The cursor may change only
+    // the bounded attempt start inside this exact list; it cannot import a
+    // discovery peer or alter membership.
+    let mut carriers = Vec::with_capacity(MAX_PINNED_WITNESSES_PER_ROUND);
+    for carrier in carrier_node_ids {
+        if *carrier == local_node_id
+            || carrier == coordinator_node_id
+            || carriers.contains(carrier)
+        {
+            continue;
+        }
+        carriers.push(*carrier);
+        if carriers.len() == MAX_PINNED_WITNESSES_PER_ROUND {
+            break;
+        }
+    }
+    carriers
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pull_record_commitment_page_with_carrier_cursor_and_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    coordinator_node_id: &[u8; 32],
+    carrier_node_ids: &[[u8; 32]],
+    minimum_required_signers: usize,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+    cursor: &mut CommitmentBlockCarrierCursor,
+) -> Result<CommitmentFollowerPagePullOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
     // [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Every terminal
     // path records one typed aggregate disposition. Recording remains inside
     // this direct-first primitive so future callers cannot omit or reinterpret
@@ -2592,6 +2725,7 @@ where
     .await;
     let direct_error = match direct {
         Ok(page) => {
+            cursor.reset();
             storage.record_commitment_block_page_pull_outcome(
                 now_secs(),
                 RecordCommitmentBlockPagePullDisposition::Coordinator,
@@ -2636,20 +2770,11 @@ where
     // [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Preserve operator order,
     // exclude self/coordinator, deduplicate, and enforce the same hard fan-out
     // cap as witness operations. Discovery never chooses a recovery source.
-    let local_node_id = identity.public_key_bytes();
-    let mut carriers = Vec::with_capacity(MAX_PINNED_WITNESSES_PER_ROUND);
-    for carrier in carrier_node_ids {
-        if *carrier == local_node_id
-            || carrier == coordinator_node_id
-            || carriers.contains(carrier)
-        {
-            continue;
-        }
-        carriers.push(*carrier);
-        if carriers.len() == MAX_PINNED_WITNESSES_PER_ROUND {
-            break;
-        }
-    }
+    let carriers = eligible_commitment_block_carriers(
+        identity.public_key_bytes(),
+        coordinator_node_id,
+        carrier_node_ids,
+    );
     if carriers.len() < minimum_required_signers {
         storage.record_commitment_block_page_pull_outcome(
             now_secs(),
@@ -2660,7 +2785,11 @@ where
     }
 
     let mut carrier_attempts = 0usize;
-    for carrier in carriers {
+    let carrier_count = carriers.len();
+    let start_index = cursor.start_index(carrier_count);
+    for offset in 0..carrier_count {
+        let carrier_index = start_index.saturating_add(offset) % carrier_count;
+        let carrier = carriers[carrier_index];
         carrier_attempts = carrier_attempts.saturating_add(1);
         match pull_record_commitment_page_from_source_with_endpoint_policy(
             storage,
@@ -2674,6 +2803,7 @@ where
         .await
         {
             Ok(page) => {
+                cursor.prefer(carrier_index, carrier_count);
                 storage.record_commitment_block_page_pull_outcome(
                     now_secs(),
                     RecordCommitmentBlockPagePullDisposition::CarrierRecovered,
@@ -2687,7 +2817,10 @@ where
             }
             Err(error)
                 if commitment_block_source_failure_class(&error)
-                    == CommitmentBlockSourceFailureClass::Availability => {}
+                    == CommitmentBlockSourceFailureClass::Availability =>
+            {
+                cursor.advance_after_availability_failure(carrier_index, carrier_count);
+            }
             Err(error) => {
                 storage.record_commitment_block_page_pull_outcome(
                     now_secs(),
@@ -4480,6 +4613,316 @@ mod tests {
             status.last_block_page_pull_result.as_deref(),
             Some("availability_exhausted")
         );
+    }
+
+    #[tokio::test]
+    async fn multi_page_carrier_cursor_prefers_verified_source_and_hands_off() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let unavailable_carrier = IdentityKeyPair::generate();
+        let first_live_carrier = Arc::new(IdentityKeyPair::generate());
+        let second_live_carrier = Arc::new(IdentityKeyPair::generate());
+        let follower = IdentityKeyPair::generate();
+        let source = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+
+        let mut previous_hash = GENESIS_PREV_HASH;
+        for height in 1..=u64::try_from(MAX_BLOCKS_PER_RESPONSE + 1).unwrap() {
+            let marker = u8::try_from(height).unwrap();
+            let block = RecordCommitmentBlockV1::new_signed(
+                height,
+                now.saturating_sub(32).saturating_add(height),
+                previous_hash,
+                vec![[marker; 32]],
+                &coordinator,
+            );
+            previous_hash = block.hash();
+            source
+                .append_record_commitment_block(&block, None)
+                .await
+                .unwrap();
+        }
+        source.audit_record_commitment_chain().await.unwrap();
+
+        let first_peers = Arc::new(PeerStore::new());
+        admit_peer(&first_peers, &follower, None, now);
+        let first_router = build_memchain_peer_router(
+            Arc::clone(&source),
+            first_peers,
+            Arc::clone(&first_live_carrier),
+        );
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let first_address = first_listener.local_addr().unwrap();
+        let first_server = tokio::spawn(async move {
+            axum::serve(first_listener, first_router).await.unwrap();
+        });
+
+        let second_peers = Arc::new(PeerStore::new());
+        admit_peer(&second_peers, &follower, None, now);
+        let second_router = build_memchain_peer_router(
+            Arc::clone(&source),
+            second_peers,
+            Arc::clone(&second_live_carrier),
+        );
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let second_address = second_listener.local_addr().unwrap();
+        let second_server = tokio::spawn(async move {
+            axum::serve(second_listener, second_router).await.unwrap();
+        });
+
+        // Allocate dedicated closed ports after both live endpoints are fixed
+        // so neither unavailable descriptor aliases a live test server.
+        let coordinator_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let coordinator_address = coordinator_listener.local_addr().unwrap();
+        let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let unavailable_address = unavailable_listener.local_addr().unwrap();
+        drop(coordinator_listener);
+        drop(unavailable_listener);
+
+        let destination = MemoryStorage::open(":memory:", None).unwrap();
+        destination.audit_record_commitment_chain().await.unwrap();
+        destination.configure_record_commitment_sync(false, true);
+        destination.configure_record_commitment_certificate_policy(3, 2);
+        let destination_peers = PeerStore::new();
+        admit_peer(
+            &destination_peers,
+            &coordinator,
+            Some(format!("http://{coordinator_address}")),
+            now,
+        );
+        admit_peer(
+            &destination_peers,
+            &unavailable_carrier,
+            Some(format!("http://{unavailable_address}")),
+            now,
+        );
+        admit_peer(
+            &destination_peers,
+            &first_live_carrier,
+            Some(format!("http://{first_address}")),
+            now,
+        );
+        admit_peer(
+            &destination_peers,
+            &second_live_carrier,
+            Some(format!("http://{second_address}")),
+            now,
+        );
+        let carrier_ids = [
+            unavailable_carrier.public_key_bytes(),
+            first_live_carrier.public_key_bytes(),
+            second_live_carrier.public_key_bytes(),
+        ];
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut cursor = CommitmentBlockCarrierCursor::default();
+
+        // [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Page one
+        // bypasses an unavailable first pin and establishes the second pin as
+        // the round-local preferred carrier.
+        let first_page =
+            pull_record_commitment_page_with_carrier_cursor_and_endpoint_policy(
+                &destination,
+                &destination_peers,
+                &follower,
+                &coordinator.public_key_bytes(),
+                &carrier_ids,
+                2,
+                &client,
+                &allow_test_endpoint,
+                &mut cursor,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_page.source, CommitmentSyncPageSource::PinnedCarrier);
+        assert_eq!(first_page.carrier_attempts, 2);
+        assert_eq!(first_page.page.inserted, MAX_BLOCKS_PER_RESPONSE);
+        assert!(first_page.page.has_more);
+        assert_eq!(cursor.next_index, 1);
+
+        first_server.abort();
+        let _ = first_server.await;
+        // Axum may leave an accepted keep-alive connection alive after the
+        // listener task is aborted. A fresh pool models a process/network
+        // outage by requiring a new connection to the now-closed endpoint.
+        let failover_client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // The preferred carrier disappears between pages. The cursor starts
+        // there, then hands off directly to the next exact pin without
+        // retrying the earlier unavailable pin.
+        let second_page =
+            pull_record_commitment_page_with_carrier_cursor_and_endpoint_policy(
+                &destination,
+                &destination_peers,
+                &follower,
+                &coordinator.public_key_bytes(),
+                &carrier_ids,
+                2,
+                &failover_client,
+                &allow_test_endpoint,
+                &mut cursor,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second_page.source,
+            CommitmentSyncPageSource::PinnedCarrier
+        );
+        assert_eq!(second_page.carrier_attempts, 2);
+        assert_eq!(second_page.page.inserted, 1);
+        assert!(!second_page.page.has_more);
+        assert_eq!(cursor.next_index, 2);
+        assert_eq!(
+            destination.record_commitment_chain_tip().await,
+            source.record_commitment_chain_tip().await
+        );
+        destination.audit_record_commitment_chain().await.unwrap();
+
+        let status = destination.record_commitment_sync_status();
+        assert_eq!(status.block_page_pulls_total, 2);
+        assert_eq!(status.block_carrier_attempts_total, 4);
+        assert_eq!(status.block_carrier_recoveries_total, 2);
+        assert_eq!(status.block_page_security_stops_total, 0);
+
+        second_server.abort();
+        let _ = second_server.await;
+    }
+
+    #[tokio::test]
+    async fn carrier_cursor_never_masks_a_security_failure_with_the_next_pin() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let malformed_carrier = IdentityKeyPair::generate();
+        let valid_carrier = Arc::new(IdentityKeyPair::generate());
+        let follower = IdentityKeyPair::generate();
+        let source = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(1),
+            GENESIS_PREV_HASH,
+            vec![[0x73; 32]],
+            &coordinator,
+        );
+        source
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        source.audit_record_commitment_chain().await.unwrap();
+
+        let malformed_router = Router::new().route(
+            "/api/memchain/peer/block-range",
+            post(|| async { (StatusCode::OK, vec![0u8]) }),
+        );
+        let malformed_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let malformed_address = malformed_listener.local_addr().unwrap();
+        let malformed_server = tokio::spawn(async move {
+            axum::serve(malformed_listener, malformed_router)
+                .await
+                .unwrap();
+        });
+
+        let valid_peers = Arc::new(PeerStore::new());
+        admit_peer(&valid_peers, &follower, None, now);
+        let valid_router = build_memchain_peer_router(
+            Arc::clone(&source),
+            valid_peers,
+            Arc::clone(&valid_carrier),
+        );
+        let valid_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let valid_address = valid_listener.local_addr().unwrap();
+        let valid_server = tokio::spawn(async move {
+            axum::serve(valid_listener, valid_router).await.unwrap();
+        });
+
+        let coordinator_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let coordinator_address = coordinator_listener.local_addr().unwrap();
+        drop(coordinator_listener);
+
+        let destination = MemoryStorage::open(":memory:", None).unwrap();
+        destination.audit_record_commitment_chain().await.unwrap();
+        destination.configure_record_commitment_sync(false, true);
+        destination.configure_record_commitment_certificate_policy(2, 2);
+        let destination_peers = PeerStore::new();
+        admit_peer(
+            &destination_peers,
+            &coordinator,
+            Some(format!("http://{coordinator_address}")),
+            now,
+        );
+        admit_peer(
+            &destination_peers,
+            &malformed_carrier,
+            Some(format!("http://{malformed_address}")),
+            now,
+        );
+        admit_peer(
+            &destination_peers,
+            &valid_carrier,
+            Some(format!("http://{valid_address}")),
+            now,
+        );
+        let carrier_ids = [
+            malformed_carrier.public_key_bytes(),
+            valid_carrier.public_key_bytes(),
+        ];
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut cursor = CommitmentBlockCarrierCursor::default();
+
+        // [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Rotation is
+        // availability-only. A malformed preferred carrier must stop before a
+        // valid later pin can hide the security incident.
+        let error = pull_record_commitment_page_with_carrier_cursor_and_endpoint_policy(
+            &destination,
+            &destination_peers,
+            &follower,
+            &coordinator.public_key_bytes(),
+            &carrier_ids,
+            2,
+            &client,
+            &allow_test_endpoint,
+            &mut cursor,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "invalid_response_frame");
+        assert_eq!(
+            destination.record_commitment_chain_tip().await,
+            (0, GENESIS_PREV_HASH)
+        );
+        let status = destination.record_commitment_sync_status();
+        assert_eq!(status.block_page_pulls_total, 1);
+        assert_eq!(status.block_carrier_attempts_total, 1);
+        assert_eq!(status.block_carrier_recoveries_total, 0);
+        assert_eq!(status.block_page_security_stops_total, 1);
+
+        malformed_server.abort();
+        let _ = malformed_server.await;
+        valid_server.abort();
+        let _ = valid_server.await;
     }
 
     #[tokio::test]
