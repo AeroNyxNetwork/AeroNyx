@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.64.0 - Added round-local multi-page carrier preference and bounded handoff.
+Modification Reason: v0.65.0 - Added process-only block-carrier circuit breaking and half-open recovery.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.64.0 - [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Avoids repeating earlier carrier availability failures across one bounded multi-page follower round and hands off safely when the preferred carrier disappears.
+Last Modified: v0.65.0 - [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] Cools repeatedly unavailable fixed carrier slots across follower rounds without retaining identity-bearing health history.
+Previous: v0.64.0 - [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Avoids repeating earlier carrier availability failures across one bounded multi-page follower round and hands off safely when the preferred carrier disappears.
 Previous: v0.63.0 - [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Reports typed, source-blind block-page retrieval outcomes and bounded carrier attempts without exposing identities or treating transport as certification.
 Previous: v0.62.0 - [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Lets a follower recover coordinator-authored blocks from bounded operator pins while requiring an exact-tip threshold certificate before reporting recovery.
 Previous: v0.61.0 - [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] Prevents readiness evaluated for an older audited tip from being reported as current after follower advancement.
@@ -96,6 +97,39 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.65 Block-carrier circuit breaker
+
+[BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex]
+
+- The follower now keeps one process-only availability circuit for the
+  normalized operator-pin positions. Two consecutive classified availability
+  failures put that slot into a 60-second monotonic cooldown across sync rounds.
+- A cooling slot is skipped before any network request. This prevents one
+  repeatedly unavailable carrier from consuming the same connection budget on
+  every follower round while other exact pins remain healthy.
+- The coordinator is still contacted first for every page. The circuit cannot
+  skip the coordinator, import a discovery peer, change the configured pin set,
+  or grant proposer, checkpoint, certificate, consensus, finality, or
+  fork-choice authority.
+- After cooldown, one half-open probe is allowed. A fully verified page closes
+  the slot; another availability failure immediately reopens it for the same
+  bounded interval.
+- Every observed decode, endpoint-policy, responder, signature, proposer,
+  continuity, pagination, rollback, size, or storage error remains terminal.
+  Security failures are never converted into cooldown events and never fall
+  through to a later carrier.
+- Circuit slots contain only a failure count and `Instant` deadline. They hold
+  no node id, endpoint, status code, error text, payload, route, or wall-clock
+  timestamp; they are not persisted, serialized, logged, reported, or included
+  in heartbeat data. A pin-count change clears all slots to prevent positional
+  state from being reassigned silently.
+- Compatibility remains additive: the public one-page recovery API creates a
+  fresh circuit, so its historical direct-first operator-order behavior is
+  unchanged. Only the server follower task retains circuit state across rounds.
+- Tests cover threshold opening, monotonic cooldown, failed half-open reopening,
+  verified recovery, pin-count reset, and a real three-round HTTP path where
+  carrier attempts fall from `2, 2` to `1` without weakening verification.
 
 ### v0.64 Multi-page block-carrier handoff
 

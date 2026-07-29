@@ -57,6 +57,10 @@
 //!   classified coordinator availability failure. The carrier signs only the
 //!   transport envelope; every block must still be signed by the configured
 //!   coordinator and terminal recovery requires the local witness threshold.
+//! - [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] Repeated availability
+//!   failures open a short process-only cooldown for the corresponding fixed
+//!   operator-pin slot. Half-open recovery probes remain coordinator-first,
+//!   bounded, and fail closed on every observed security error.
 //! - Followers report identity-blind current-policy readiness only after exact
 //!   local tip, pin-set, threshold, and durable-certificate validation.
 //! - Last-hop public-IP validation on every outbound commitment request so a
@@ -143,6 +147,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.51-BlockCarrierCircuitBreaker - Added anonymous cross-round carrier cooldown and half-open recovery.
 //! v2.8.50-CertifiedBlockCarrier - Recovered coordinator-signed pages through bounded pinned carriers.
 //! v2.8.49-FollowerCertificateTipBinding - Bound every applicable policy outcome to its audited tip.
 //! v2.8.48-FollowerCertificateReadiness - Reported exact current-policy readiness without witness identities.
@@ -244,6 +249,8 @@ const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 const REPLAY_RETENTION_SECS: u64 = 120;
 const MAX_PINNED_WITNESSES_PER_ROUND: usize = 3;
+const BLOCK_CARRIER_FAILURES_BEFORE_COOLDOWN: u32 = 2;
+const BLOCK_CARRIER_RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_DESCRIPTOR_PREFLIGHT_RESPONSE_BYTES: usize = 16 * 1024;
 const TIP_ANNOUNCEMENT_MAX_ATTEMPTS: usize = 3;
 const TIP_ANNOUNCEMENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -350,6 +357,78 @@ impl CommitmentBlockCarrierCursor {
         } else {
             carrier_index.saturating_add(1) % carrier_count
         };
+    }
+}
+
+/// Process-only availability circuit for fixed operator-pin positions.
+///
+/// [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] Slots intentionally
+/// contain no node id, endpoint, error text, or wall-clock timestamp. Their
+/// position is meaningful only inside the immutable normalized pin order of
+/// this follower process. A pin-count change clears every slot so state cannot
+/// be silently reassigned to a different policy member.
+#[derive(Debug, Default)]
+pub(crate) struct CommitmentBlockCarrierCircuitBreaker {
+    slots: Vec<CommitmentBlockCarrierCircuitSlot>,
+}
+
+#[derive(Debug, Default)]
+struct CommitmentBlockCarrierCircuitSlot {
+    consecutive_availability_failures: u32,
+    retry_after: Option<Instant>,
+}
+
+impl CommitmentBlockCarrierCircuitBreaker {
+    fn align_slots(&mut self, carrier_count: usize) {
+        if self.slots.len() != carrier_count {
+            self.slots.clear();
+            self.slots
+                .resize_with(carrier_count, CommitmentBlockCarrierCircuitSlot::default);
+        }
+    }
+
+    fn should_attempt(&self, carrier_index: usize, now: Instant) -> bool {
+        self.slots
+            .get(carrier_index)
+            .is_some_and(|slot| match slot.retry_after {
+                Some(retry_after) => now >= retry_after,
+                None => true,
+            })
+    }
+
+    fn record_success(&mut self, carrier_index: usize) {
+        if let Some(slot) = self.slots.get_mut(carrier_index) {
+            *slot = CommitmentBlockCarrierCircuitSlot::default();
+        }
+    }
+
+    fn record_availability_failure(&mut self, carrier_index: usize, now: Instant) {
+        let Some(slot) = self.slots.get_mut(carrier_index) else {
+            return;
+        };
+
+        if slot
+            .retry_after
+            .is_some_and(|retry_after| now >= retry_after)
+        {
+            // One failed half-open probe immediately reopens the circuit.
+            slot.consecutive_availability_failures = 0;
+            slot.retry_after = Some(now + BLOCK_CARRIER_RECOVERY_COOLDOWN);
+            return;
+        }
+
+        if slot.retry_after.is_some() {
+            // A cooling slot is never scheduled, but keep this method robust
+            // against an accidental duplicate outcome.
+            return;
+        }
+
+        slot.consecutive_availability_failures =
+            slot.consecutive_availability_failures.saturating_add(1);
+        if slot.consecutive_availability_failures >= BLOCK_CARRIER_FAILURES_BEFORE_COOLDOWN {
+            slot.consecutive_availability_failures = 0;
+            slot.retry_after = Some(now + BLOCK_CARRIER_RECOVERY_COOLDOWN);
+        }
     }
 }
 
@@ -2573,7 +2652,7 @@ pub async fn pull_record_commitment_page_with_carrier_recovery(
     client: &reqwest::Client,
 ) -> Result<CommitmentFollowerPagePullOutcome, String> {
     let mut cursor = CommitmentBlockCarrierCursor::default();
-    pull_record_commitment_page_with_carrier_cursor_and_endpoint_policy(
+    pull_record_commitment_page_with_carrier_cursor(
         storage,
         peer_store,
         identity,
@@ -2581,7 +2660,6 @@ pub async fn pull_record_commitment_page_with_carrier_recovery(
         carrier_node_ids,
         minimum_required_signers,
         client,
-        &commitment_peer_endpoint_is_public,
         &mut cursor,
     )
     .await
@@ -2617,6 +2695,39 @@ pub(crate) async fn pull_record_commitment_page_with_carrier_cursor(
     .await
 }
 
+/// Pulls one page with both round-local ordering and process-local availability
+/// cooldown state.
+///
+/// The circuit breaker can skip only operator-pinned slots that previously
+/// failed with a classified availability error. Coordinator transport remains
+/// first on every call, and any observed security error remains terminal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn pull_record_commitment_page_with_carrier_runtime(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    coordinator_node_id: &[u8; 32],
+    carrier_node_ids: &[[u8; 32]],
+    minimum_required_signers: usize,
+    client: &reqwest::Client,
+    cursor: &mut CommitmentBlockCarrierCursor,
+    circuit_breaker: &mut CommitmentBlockCarrierCircuitBreaker,
+) -> Result<CommitmentFollowerPagePullOutcome, String> {
+    pull_record_commitment_page_with_carrier_runtime_and_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        coordinator_node_id,
+        carrier_node_ids,
+        minimum_required_signers,
+        client,
+        &commitment_peer_endpoint_is_public,
+        cursor,
+        circuit_breaker,
+    )
+    .await
+}
+
 async fn pull_record_commitment_page_with_endpoint_policy<F>(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
@@ -2641,6 +2752,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn pull_record_commitment_page_with_carrier_recovery_and_endpoint_policy<F>(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
@@ -2705,6 +2817,38 @@ async fn pull_record_commitment_page_with_carrier_cursor_and_endpoint_policy<F>(
     client: &reqwest::Client,
     endpoint_allowed: &F,
     cursor: &mut CommitmentBlockCarrierCursor,
+) -> Result<CommitmentFollowerPagePullOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    let mut circuit_breaker = CommitmentBlockCarrierCircuitBreaker::default();
+    pull_record_commitment_page_with_carrier_runtime_and_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        coordinator_node_id,
+        carrier_node_ids,
+        minimum_required_signers,
+        client,
+        endpoint_allowed,
+        cursor,
+        &mut circuit_breaker,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pull_record_commitment_page_with_carrier_runtime_and_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    coordinator_node_id: &[u8; 32],
+    carrier_node_ids: &[[u8; 32]],
+    minimum_required_signers: usize,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+    cursor: &mut CommitmentBlockCarrierCursor,
+    circuit_breaker: &mut CommitmentBlockCarrierCircuitBreaker,
 ) -> Result<CommitmentFollowerPagePullOutcome, String>
 where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
@@ -2786,9 +2930,13 @@ where
 
     let mut carrier_attempts = 0usize;
     let carrier_count = carriers.len();
+    circuit_breaker.align_slots(carrier_count);
     let start_index = cursor.start_index(carrier_count);
     for offset in 0..carrier_count {
         let carrier_index = start_index.saturating_add(offset) % carrier_count;
+        if !circuit_breaker.should_attempt(carrier_index, Instant::now()) {
+            continue;
+        }
         let carrier = carriers[carrier_index];
         carrier_attempts = carrier_attempts.saturating_add(1);
         match pull_record_commitment_page_from_source_with_endpoint_policy(
@@ -2803,6 +2951,7 @@ where
         .await
         {
             Ok(page) => {
+                circuit_breaker.record_success(carrier_index);
                 cursor.prefer(carrier_index, carrier_count);
                 storage.record_commitment_block_page_pull_outcome(
                     now_secs(),
@@ -2819,6 +2968,8 @@ where
                 if commitment_block_source_failure_class(&error)
                     == CommitmentBlockSourceFailureClass::Availability =>
             {
+                circuit_breaker
+                    .record_availability_failure(carrier_index, Instant::now());
                 cursor.advance_after_availability_failure(carrier_index, carrier_count);
             }
             Err(error) => {
@@ -4923,6 +5074,164 @@ mod tests {
         let _ = malformed_server.await;
         valid_server.abort();
         let _ = valid_server.await;
+    }
+
+    #[test]
+    fn carrier_circuit_breaker_uses_half_open_recovery_without_identity_state() {
+        let started_at = Instant::now();
+        let mut circuit_breaker = CommitmentBlockCarrierCircuitBreaker::default();
+        circuit_breaker.align_slots(2);
+
+        // [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] Two consecutive
+        // availability failures open the fixed slot. The first retry after the
+        // monotonic cooldown is half-open; another availability failure
+        // immediately reopens it, while a verified success fully resets it.
+        assert!(circuit_breaker.should_attempt(0, started_at));
+        circuit_breaker.record_availability_failure(0, started_at);
+        assert!(circuit_breaker.should_attempt(0, started_at));
+        circuit_breaker.record_availability_failure(0, started_at);
+        assert!(!circuit_breaker.should_attempt(
+            0,
+            started_at + BLOCK_CARRIER_RECOVERY_COOLDOWN - Duration::from_secs(1)
+        ));
+
+        let half_open_at = started_at + BLOCK_CARRIER_RECOVERY_COOLDOWN;
+        assert!(circuit_breaker.should_attempt(0, half_open_at));
+        circuit_breaker.record_availability_failure(0, half_open_at);
+        assert!(!circuit_breaker.should_attempt(0, half_open_at));
+        assert!(circuit_breaker.should_attempt(
+            0,
+            half_open_at + BLOCK_CARRIER_RECOVERY_COOLDOWN
+        ));
+
+        circuit_breaker.record_success(0);
+        assert!(circuit_breaker.should_attempt(0, half_open_at));
+
+        circuit_breaker.record_availability_failure(0, half_open_at);
+        circuit_breaker.record_availability_failure(0, half_open_at);
+        assert!(!circuit_breaker.should_attempt(0, half_open_at));
+        circuit_breaker.align_slots(1);
+        assert!(circuit_breaker.should_attempt(0, half_open_at));
+    }
+
+    #[tokio::test]
+    async fn carrier_circuit_breaker_skips_repeated_outage_across_sync_rounds() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let unavailable_carrier = IdentityKeyPair::generate();
+        let live_carrier = Arc::new(IdentityKeyPair::generate());
+        let follower = IdentityKeyPair::generate();
+        let source = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(1),
+            GENESIS_PREV_HASH,
+            vec![[0x74; 32]],
+            &coordinator,
+        );
+        source
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        source.audit_record_commitment_chain().await.unwrap();
+
+        let live_peers = Arc::new(PeerStore::new());
+        admit_peer(&live_peers, &follower, None, now);
+        let live_router = build_memchain_peer_router(
+            Arc::clone(&source),
+            live_peers,
+            Arc::clone(&live_carrier),
+        );
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let live_address = live_listener.local_addr().unwrap();
+        let live_server = tokio::spawn(async move {
+            axum::serve(live_listener, live_router).await.unwrap();
+        });
+
+        let coordinator_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let coordinator_address = coordinator_listener.local_addr().unwrap();
+        let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let unavailable_address = unavailable_listener.local_addr().unwrap();
+        drop(coordinator_listener);
+        drop(unavailable_listener);
+
+        let destination = MemoryStorage::open(":memory:", None).unwrap();
+        destination.audit_record_commitment_chain().await.unwrap();
+        destination.configure_record_commitment_sync(false, true);
+        destination.configure_record_commitment_certificate_policy(2, 2);
+        let destination_peers = PeerStore::new();
+        admit_peer(
+            &destination_peers,
+            &coordinator,
+            Some(format!("http://{coordinator_address}")),
+            now,
+        );
+        admit_peer(
+            &destination_peers,
+            &unavailable_carrier,
+            Some(format!("http://{unavailable_address}")),
+            now,
+        );
+        admit_peer(
+            &destination_peers,
+            &live_carrier,
+            Some(format!("http://{live_address}")),
+            now,
+        );
+        let carrier_ids = [
+            unavailable_carrier.public_key_bytes(),
+            live_carrier.public_key_bytes(),
+        ];
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut circuit_breaker = CommitmentBlockCarrierCircuitBreaker::default();
+
+        // Each new cursor models a new follower round. The unavailable first
+        // pin is contacted in rounds one and two, then its process-only slot
+        // cools down while the exact second pin continues verified delivery.
+        for expected_attempts in [2, 2, 1] {
+            let mut cursor = CommitmentBlockCarrierCursor::default();
+            let outcome =
+                pull_record_commitment_page_with_carrier_runtime_and_endpoint_policy(
+                    &destination,
+                    &destination_peers,
+                    &follower,
+                    &coordinator.public_key_bytes(),
+                    &carrier_ids,
+                    2,
+                    &client,
+                    &allow_test_endpoint,
+                    &mut cursor,
+                    &mut circuit_breaker,
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.source, CommitmentSyncPageSource::PinnedCarrier);
+            assert_eq!(outcome.carrier_attempts, expected_attempts);
+            assert_eq!(outcome.page.remote_tip_height, 1);
+            assert!(!outcome.page.has_more);
+        }
+
+        assert!(!circuit_breaker.should_attempt(0, Instant::now()));
+        assert_eq!(destination.record_commitment_chain_tip().await.0, 1);
+        destination.audit_record_commitment_chain().await.unwrap();
+        let status = destination.record_commitment_sync_status();
+        assert_eq!(status.block_page_pulls_total, 3);
+        assert_eq!(status.block_carrier_attempts_total, 5);
+        assert_eq!(status.block_carrier_recoveries_total, 3);
+        assert_eq!(status.block_page_security_stops_total, 0);
+
+        live_server.abort();
+        let _ = live_server.await;
     }
 
     #[tokio::test]

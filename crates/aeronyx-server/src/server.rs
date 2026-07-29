@@ -386,6 +386,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.50-BlockCarrierCircuitBreaker - Added process-only fixed-slot cooldown
+//     and half-open recovery for repeated follower carrier availability faults
 //   v2.8.49-FollowerCertificateTipBinding - Bound readiness heartbeat state to
 //     the exact fully audited local tip
 //   v2.8.48-FollowerCertificateReadiness - Added identity-blind current-policy
@@ -610,7 +612,8 @@ use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     publish_current_descriptor_to_commitment_witnesses, pull_record_commitment_checkpoint,
     pull_record_commitment_checkpoint_certificate,
-    pull_record_commitment_page_with_carrier_cursor, CommitmentBlockCarrierCursor,
+    pull_record_commitment_page_with_carrier_runtime, CommitmentBlockCarrierCircuitBreaker,
+    CommitmentBlockCarrierCursor,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
     request_record_commitment_coordinator_lease,
@@ -6653,6 +6656,11 @@ impl Server {
             let mut consecutive_failures = 0u32;
             let mut next_delay = Duration::from_secs(0);
             let mut announcement_channel_open = true;
+            // [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] This
+            // process-only fixed-slot state survives follower rounds but is
+            // discarded on restart. It contains no identity, endpoint, error,
+            // payload, route, or wall-clock data.
+            let mut block_carrier_circuit = CommitmentBlockCarrierCircuitBreaker::default();
             info!(
                 interval_secs = base_interval_secs,
                 max_pages_per_round,
@@ -6710,7 +6718,7 @@ impl Server {
                     // persistence, routing policy, or trust decisions.
                     let mut block_carrier_cursor = CommitmentBlockCarrierCursor::default();
                     for _ in 0..max_pages_per_round {
-                        let page_pull = pull_record_commitment_page_with_carrier_cursor(
+                        let page_pull = pull_record_commitment_page_with_carrier_runtime(
                             &storage,
                             &peer_store,
                             &identity,
@@ -6719,6 +6727,7 @@ impl Server {
                             certificate_minimum_signers,
                             sync_http_client.as_ref(),
                             &mut block_carrier_cursor,
+                            &mut block_carrier_circuit,
                         )
                         .await?;
                         let page_source = page_pull.source;
