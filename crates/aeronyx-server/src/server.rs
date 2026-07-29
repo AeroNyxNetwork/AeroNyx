@@ -258,6 +258,9 @@
 // 103. [TASK-SHUTDOWN 2026-07-29 by Codex] Joins long-lived runtime tasks
 //      concurrently under explicit grace periods, aborts timed-out tasks, and
 //      verifies cancellation instead of silently detaching their JoinHandles.
+// 104. [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Replicates an audited
+//      checkpoint certificate from the pinned coordinator only after follower
+//      chain convergence, without making evidence availability a chain gate.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -314,6 +317,9 @@
 //     distinct pins. It is not consensus, quorum, finality, or fork choice.
 //   - Certificate exchange is post-startup evidence transport only. Never use
 //     an imported historical bundle to satisfy the live startup witness gate.
+//   - Follower certificate synchronization runs only after signed convergence.
+//     Its source is transport, not authority; local witness pins and threshold
+//     remain mandatory, and mixed-version absence must not undo a verified tip.
 //   - Coordinator leases are a short-lived duplicate-writer safety control,
 //     not consensus, leader election, finality, or fork choice. A partial
 //     witness round must never extend the local production deadline.
@@ -366,6 +372,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.43-FollowerCertificateSync - Replicated current-tip checkpoint
+//     certificates to converged followers under their local witness policy
 //   v2.8.42-TaskShutdown - Bounded concurrent task joins with explicit abort
 //     confirmation after graceful-shutdown timeout
 //   v2.8.41-RuntimeSupervision - Required API listener-group failures now
@@ -579,9 +587,10 @@ use crate::api::memchain_peer::{
     pull_record_commitment_checkpoint_certificate, pull_record_commitment_page,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
-    request_record_commitment_coordinator_lease, witness_verified_delivery_anchor,
-    CommitmentCheckpointRelation, CommitmentReconciliationOutcome,
-    VerifiedDeliveryAnchorWitnessRound,
+    request_record_commitment_coordinator_lease,
+    sync_follower_record_commitment_checkpoint_certificate, witness_verified_delivery_anchor,
+    CommitmentCheckpointRelation, CommitmentFollowerCertificateSyncOutcome,
+    CommitmentReconciliationOutcome, VerifiedDeliveryAnchorWitnessRound,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState, SessionEmbeddingCache};
 use crate::api::voice::build_voice_router;
@@ -6553,6 +6562,8 @@ impl Server {
         let identity = self.identity.clone();
         let base_interval_secs = self.config.memchain.commitment_sync_interval_secs;
         let max_pages_per_round = self.config.memchain.commitment_sync_max_pages_per_round;
+        let certificate_witness_node_ids = self.config.memchain.commitment_witness_node_id_bytes();
+        let certificate_minimum_signers = self.config.memchain.commitment_witness_min_verified;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         Some(tokio::spawn(async move {
@@ -6663,6 +6674,58 @@ impl Server {
                                         checked_at,
                                         checkpoint.remote_tip_height,
                                     );
+                                    // [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex]
+                                    // Certificate availability is additive: a
+                                    // mixed-version coordinator may not serve
+                                    // it yet, but that cannot erase a signed,
+                                    // hash-matched follower convergence.
+                                    match sync_follower_record_commitment_checkpoint_certificate(
+                                        &storage,
+                                        &peer_store,
+                                        &identity,
+                                        &coordinator_node_id,
+                                        &certificate_witness_node_ids,
+                                        certificate_minimum_signers,
+                                        checkpoint.remote_tip_height,
+                                        sync_http_client.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(
+                                            CommitmentFollowerCertificateSyncOutcome::Refreshed(
+                                                outcome,
+                                            ),
+                                        ) if outcome.persisted => {
+                                            info!(
+                                                checkpoint_height = outcome.checkpoint_height,
+                                                signer_count = outcome.signer_count,
+                                                required_signers = outcome.required_signers,
+                                                "[MEMCHAIN_BLOCK] Follower imported audited checkpoint certificate"
+                                            );
+                                        }
+                                        Ok(
+                                            CommitmentFollowerCertificateSyncOutcome::Refreshed(
+                                                outcome,
+                                            ),
+                                        ) => {
+                                            warn!(
+                                                checkpoint_height = outcome.checkpoint_height,
+                                                signer_count = outcome.signer_count,
+                                                required_signers = outcome.required_signers,
+                                                "[MEMCHAIN_BLOCK] Follower certificate did not satisfy durable local policy"
+                                            );
+                                        }
+                                        Ok(
+                                            CommitmentFollowerCertificateSyncOutcome::PolicyDisabled
+                                            | CommitmentFollowerCertificateSyncOutcome::AlreadyCurrent,
+                                        ) => {}
+                                        Err(reason) => {
+                                            debug!(
+                                                reason = %reason,
+                                                "[MEMCHAIN_BLOCK] Follower certificate refresh deferred"
+                                            );
+                                        }
+                                    }
                                     return Ok((inserted, checkpoint.remote_tip_height, false));
                                 }
                                 CommitmentCheckpointRelation::RemoteAhead => {

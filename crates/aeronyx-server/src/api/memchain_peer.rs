@@ -50,6 +50,8 @@
 //!   canonically reverified before the node signs a response.
 //! - Fixed-size certificate exchange between admitted peers. Imported members
 //!   must still belong to the receiver's operator-pinned witness set.
+//! - Followers refresh current-tip checkpoint certificates only after signed
+//!   chain convergence; mixed-version absence never rolls back a verified tip.
 //! - Last-hop public-IP validation on every outbound commitment request so a
 //!   rotated signed descriptor cannot redirect the node into private services.
 //! - Default-off, signed short-lived coordinator leases persisted by followers
@@ -129,6 +131,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.31-FollowerCertificateSync - Refresh audited checkpoint certificates after follower convergence.
 //! v2.8.30-WitnessDescriptorPreflight - Republish the current coordinator descriptor before strict startup gates.
 //! v2.8.29-VerifiedDeliveryWitnessAdmission - Require bilateral requester pinning before witness writes.
 //! v2.8.28-VerifiedDeliveryAnchorWitness - Added authenticated contiguous external cache witnesses.
@@ -394,6 +397,22 @@ pub struct CommitmentCertificateImportOutcome {
     pub required_signers: usize,
     /// Whether storage contains a fully re-audited certificate afterward.
     pub persisted: bool,
+}
+
+/// Result of one policy-bounded follower checkpoint-certificate refresh.
+///
+/// [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] This result intentionally
+/// contains no source identity, endpoint, witness identity, hash, signature,
+/// request id, or frame. A refresh is post-convergence evidence replication;
+/// it grants no startup authority and cannot select or mutate the chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitmentFollowerCertificateSyncOutcome {
+    /// The local operator policy does not require threshold certificates.
+    PolicyDisabled,
+    /// The audited local vault already certifies the exact converged tip.
+    AlreadyCurrent,
+    /// A source response passed local policy and durable re-audit.
+    Refreshed(CommitmentCertificateImportOutcome),
 }
 
 /// Aggregate delivery result for one best-effort commitment tip announcement.
@@ -1684,6 +1703,106 @@ pub async fn pull_record_commitment_checkpoint_certificate(
         &commitment_peer_endpoint_is_public,
     )
     .await
+}
+
+/// Refreshes follower certificate evidence after signed tip convergence.
+///
+/// The follower's configured coordinator is transport only. The response must
+/// still satisfy the receiver's witness allowlist and minimum threshold. A
+/// threshold below two disables certificate replication for backward
+/// compatibility; malformed enabled policy fails closed.
+///
+/// # Errors
+///
+/// Returns a stable privacy-safe code when local policy, peer transport,
+/// certificate verification, or durable storage validation fails.
+pub async fn sync_follower_record_commitment_checkpoint_certificate(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    source_node_id: &[u8; 32],
+    allowed_witnesses: &[[u8; 32]],
+    minimum_required_signers: usize,
+    converged_tip_height: u64,
+    client: &reqwest::Client,
+) -> Result<CommitmentFollowerCertificateSyncOutcome, String> {
+    sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        source_node_id,
+        allowed_witnesses,
+        minimum_required_signers,
+        converged_tip_height,
+        client,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+async fn sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    source_node_id: &[u8; 32],
+    allowed_witnesses: &[[u8; 32]],
+    minimum_required_signers: usize,
+    converged_tip_height: u64,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+) -> Result<CommitmentFollowerCertificateSyncOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    if minimum_required_signers < 2 {
+        return Ok(CommitmentFollowerCertificateSyncOutcome::PolicyDisabled);
+    }
+    if minimum_required_signers > MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1
+        || allowed_witnesses.len() < minimum_required_signers
+    {
+        return Err("certificate_policy_invalid".to_string());
+    }
+    if converged_tip_height == 0 {
+        return Err("certificate_local_tip_unavailable".to_string());
+    }
+    let (_, _, local_tip_height, _) = storage
+        .record_commitment_chain_checkpoint(converged_tip_height)
+        .await?;
+    if local_tip_height != converged_tip_height {
+        return Err("certificate_converged_tip_changed".to_string());
+    }
+    if storage
+        .record_commitment_checkpoint_certificate_satisfies_policy(
+            converged_tip_height,
+            allowed_witnesses,
+            minimum_required_signers,
+        )
+        .await?
+    {
+        return Ok(CommitmentFollowerCertificateSyncOutcome::AlreadyCurrent);
+    }
+
+    // [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Do not convert the
+    // coordinator transport signature into certificate authority. The shared
+    // pull path verifies every historical witness frame against local pins and
+    // persists it only through the fully audited immutable certificate vault.
+    let imported = pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        source_node_id,
+        allowed_witnesses,
+        minimum_required_signers,
+        client,
+        endpoint_allowed,
+    )
+    .await?;
+    if imported.checkpoint_height != converged_tip_height {
+        return Err("certificate_converged_tip_changed".to_string());
+    }
+    Ok(CommitmentFollowerCertificateSyncOutcome::Refreshed(
+        imported,
+    ))
 }
 
 async fn pull_record_commitment_checkpoint_certificate_with_endpoint_policy<F>(
@@ -6618,18 +6737,40 @@ mod tests {
             Some(format!("http://{source_address}")),
             now,
         );
-        let imported = pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
+        let disabled = sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
+            &destination,
+            &destination_peers,
+            &destination_identity,
+            &source_identity.public_key_bytes(),
+            &witness_ids,
+            1,
+            1,
+            &client,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            disabled,
+            CommitmentFollowerCertificateSyncOutcome::PolicyDisabled
+        );
+
+        let imported = sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
             &destination,
             &destination_peers,
             &destination_identity,
             &source_identity.public_key_bytes(),
             &witness_ids,
             2,
+            1,
             &client,
             &allow_test_endpoint,
         )
         .await
         .unwrap();
+        let CommitmentFollowerCertificateSyncOutcome::Refreshed(imported) = imported else {
+            panic!("uncertified converged follower must import current certificate");
+        };
         assert_eq!(imported.checkpoint_height, 1);
         assert_eq!(imported.signer_count, 2);
         assert_eq!(imported.required_signers, 2);
@@ -6639,6 +6780,26 @@ mod tests {
                 .record_commitment_checkpoint_status()
                 .checkpoint_certificates,
             1
+        );
+
+        let replacement_witness = IdentityKeyPair::generate().public_key_bytes();
+        let rotated_policy_error =
+            sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
+                &destination,
+                &destination_peers,
+                &destination_identity,
+                &source_identity.public_key_bytes(),
+                &[witness_ids[0], replacement_witness],
+                2,
+                1,
+                &client,
+                &allow_test_endpoint,
+        )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rotated_policy_error, "certificate_member_not_pinned",
+            "a same-height certificate under retired pins must not be current"
         );
 
         let third_witness = IdentityKeyPair::generate().public_key_bytes();
@@ -6670,13 +6831,12 @@ mod tests {
             .audit_record_commitment_checkpoint_evidence()
             .await
             .unwrap();
-        let alternative_witness = IdentityKeyPair::generate().public_key_bytes();
         let error = pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
             &unpinned_destination,
             &destination_peers,
             &destination_identity,
             &source_identity.public_key_bytes(),
-            &[witness_ids[0], alternative_witness],
+            &[witness_ids[0], replacement_witness],
             2,
             &client,
             &allow_test_endpoint,
@@ -6691,5 +6851,24 @@ mod tests {
         }
         source_server.abort();
         let _ = source_server.await;
+
+        let already_current =
+            sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
+                &destination,
+                &destination_peers,
+                &destination_identity,
+                &source_identity.public_key_bytes(),
+                &witness_ids,
+                2,
+                1,
+                &client,
+                &allow_test_endpoint,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            already_current,
+            CommitmentFollowerCertificateSyncOutcome::AlreadyCurrent
+        );
     }
 }

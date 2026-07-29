@@ -71,6 +71,8 @@
 //!   coverage and lag from the audited local tip without claiming finality
 //! - v2.8.28-VerifiedDeliveryAnchorWitness: atomic, bounded, generation-
 //!   contiguous external high-water decisions for signed delivery-cache anchors
+//! - v2.8.31-FollowerCertificatePolicy: re-audits current-tip certificate
+//!   membership against the follower's current local witness pins
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -162,6 +164,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.31-FollowerCertificatePolicy - Validate retained certificates against current follower pins.
 //! v2.8.18-TipSupersession - Prioritize fresh tips without delivery claims.
 //! v2.8.17-TipRetryQueue - Track retry attempts, recoveries, and exhaustion.
 //! v2.8.15-AnnouncementReceipts - Track exact coordinator tip-delivery outcomes.
@@ -3177,6 +3180,58 @@ impl MemoryStorage {
             .map_err(|error| format!("finish checkpoint certificate export snapshot: {error}"))?;
         self.apply_record_commitment_checkpoint_audit(&report);
         Ok(bundle)
+    }
+
+    /// Checks whether the exact current-tip certificate satisfies local policy.
+    ///
+    /// [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Height alone is not
+    /// enough: an operator may rotate witness pins while retaining the same
+    /// audited chain tip. This path re-audits the complete bounded evidence
+    /// vault, then requires every immutable member to remain in the current
+    /// allowlist and the stored threshold to meet the current local minimum.
+    pub(crate) async fn record_commitment_checkpoint_certificate_satisfies_policy(
+        &self,
+        expected_height: u64,
+        allowed_witnesses: &[[u8; 32]],
+        minimum_required_signers: usize,
+    ) -> Result<bool, String> {
+        if !(2..=MAX_CHECKPOINT_CERTIFICATE_SIGNERS).contains(&minimum_required_signers)
+            || allowed_witnesses.len() < minimum_required_signers
+            || expected_height == 0
+        {
+            return Ok(false);
+        }
+        let (checkpoint_height, checkpoint_hash, tip_height, tip_hash) = self
+            .record_commitment_chain_checkpoint(expected_height)
+            .await?;
+        if checkpoint_height != expected_height
+            || tip_height != expected_height
+            || checkpoint_hash != tip_hash
+        {
+            return Ok(false);
+        }
+        let Some(bundle) = self
+            .record_commitment_checkpoint_certificate_bundle(expected_height, &tip_hash)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if bundle.required_signers < minimum_required_signers
+            || bundle.member_frames.len() < minimum_required_signers
+            || bundle.member_frames.len() > MAX_CHECKPOINT_CERTIFICATE_SIGNERS
+        {
+            return Ok(false);
+        }
+
+        let mut responders = Vec::with_capacity(bundle.member_frames.len());
+        for frame in &bundle.member_frames {
+            let responder = decode_checkpoint_evidence_claims(frame)?.responder;
+            if !allowed_witnesses.contains(&responder) || responders.contains(&responder) {
+                return Ok(false);
+            }
+            responders.push(responder);
+        }
+        Ok(responders.len() == bundle.member_frames.len())
     }
 
     /// Freezes one immutable certificate from a single pinned-witness round.

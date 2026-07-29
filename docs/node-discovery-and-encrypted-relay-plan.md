@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.54.0 - Directory transport degradation/recovery lifecycle.
+Modification Reason: v0.55.0 - Follower checkpoint-certificate replication.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.54.0 - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Centralizes Directory transport health policy in the service runtime, records aggregate degraded/recovered transitions, and prevents diagnostic timestamps from regressing after wall-clock rollback.
+Last Modified: v0.55.0 - [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Replicates audited current-tip checkpoint certificates to converged followers under each follower's current witness policy.
+Previous: v0.54.0 - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Centralizes Directory transport health policy in the service runtime, records aggregate degraded/recovered transitions, and prevents diagnostic timestamps from regressing after wall-clock rollback.
 Previous: v0.53.0 - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Classifies Directory synchronization health from a fixed recent outcome window so one final success cannot conceal meaningful transport churn, without retaining identity-bearing request history.
 Previous: v0.52.0 - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Classifies every completed coordinator-owned Directory HTTP exchange into one mutually exclusive process-only outcome without peer, endpoint, operation, status-code, frame, or payload dimensions.
 Previous: v0.51.0 - [PEER-TRANSPORT-BUDGETS 2026-07-28 by Codex] Restores the Directory replica synchronizer's canonical 10-second failover deadline while retaining a separate 12-second process-lifetime operator diagnostic profile.
@@ -94,6 +95,34 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.55 Follower checkpoint-certificate replication
+
+[FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex]
+
+- A Block Sync follower now requests the coordinator's current-tip checkpoint
+  certificate only after the signed block page and signed checkpoint paths have
+  independently established exact chain convergence.
+- The coordinator is certificate transport, not certificate authority. Every
+  historical member frame is independently verified against the follower's
+  current operator-pinned witness allowlist and minimum signer threshold before
+  the immutable certificate enters local storage.
+- A retained same-height certificate is considered current only after the
+  complete bounded evidence vault is re-audited and all stored members still
+  satisfy the current local witness policy. Rotating witness pins therefore
+  cannot leave a stale policy certificate looking valid.
+- Certificate absence on a mixed-version coordinator is additive evidence
+  unavailability. It does not undo a signature-verified follower tip, trigger
+  fork choice, mutate the canonical chain, or satisfy the live coordinator
+  startup witness gate.
+- Successful replication lets full-node followers preserve independently
+  verifiable confirmation evidence across coordinator outages and restarts.
+  It remains operator-pinned corroboration, not permissionless consensus,
+  global finality, voting, leader election, or financial state.
+- Logs and status remain aggregate-only. No witness identities, endpoints,
+  hashes, signatures, request ids, frames, commitments, owners, ciphertext,
+  payloads, client addresses, routes, DNS contents, or social graph data are
+  exported.
 
 ### v0.54 Directory transport degradation/recovery lifecycle
 
