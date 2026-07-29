@@ -29,6 +29,9 @@
 //!                     role so independent nodes cannot accidentally fork.
 //! v2.8.1-BlockSync  — Made the follower's bounded pages-per-round budget
 //!                     configurable for controlled recovery and low-I/O nodes.
+//! v2.8.46-FollowerCertificateConfig — Allowed a follower to configure the
+//!                     independent witness policy required to verify and
+//!                     recover current-tip checkpoint certificates.
 //!
 //! ## Main Functionality
 //! - `MemChainMode`   — Off / Local / P2p / Saas
@@ -81,15 +84,17 @@
 //!   it at the SQLite database itself.
 //! - commitment_witness_node_ids are explicit operator trust pins. Automatic
 //!   discovery may supply endpoints, but an unpinned permissionless peer must
-//!   never gain authority to block coordinator startup.
+//!   never block coordinator startup or satisfy follower certificate policy.
 //! - commitment_witness_min_verified defaults to one for compatibility. It is
-//!   an operator startup threshold over distinct pinned identities, not network
-//!   consensus, quorum, finality, leader election, or fork choice.
+//!   a coordinator startup threshold or follower certificate threshold over
+//!   distinct pinned identities, not network consensus, quorum, finality,
+//!   leader election, or fork choice.
 //! - commitment_coordinator_lease_required remains default-off. When enabled,
 //!   every configured witness must grant the same short-lived process instance
 //!   before production; deploy the protocol to all pins before activation.
 //!
 //! ## Last Modified
+//! v2.8.46-FollowerCertificateConfig - Made follower certificate witness policy configurable.
 //! v2.8.10-CoordinatorLease - Added strict all-witness lease policy and TTL.
 //! v2.8.1-BlockSync - Added a validated follower pages-per-round budget.
 //! v2.7.16-WitnessThreshold - Added a configurable pinned-witness startup threshold.
@@ -298,17 +303,18 @@ pub struct MemChainConfig {
     #[serde(default)]
     pub commitment_tip_anchor_path: String,
 
-    /// Ed25519 node identities trusted as external startup witnesses.
+    /// Ed25519 node identities trusted as external checkpoint witnesses.
     ///
-    /// Discovery resolves each pinned identity's current signed endpoint. A
-    /// valid `remote_ahead` or `diverged` checkpoint from a pin blocks the
-    /// coordinator before its transport/API listeners start. Empty preserves
-    /// the previous permissionless evidence-only behavior. Pin only audited
-    /// followers of this coordinator; an unrelated chain is not a witness.
+    /// On a coordinator, a valid `remote_ahead` or `diverged` checkpoint from a
+    /// pin blocks startup before transport/API listeners start. On a follower,
+    /// these pins define the only signatures that may satisfy or carry an
+    /// immutable current-tip certificate after signed convergence. Discovery
+    /// resolves transport endpoints only; it never expands this trust set.
+    /// Empty preserves backward-compatible certificate-disabled behavior.
     #[serde(default)]
     pub commitment_witness_node_ids: Vec<String>,
 
-    /// Require at least one pinned witness to return valid signed evidence.
+    /// Coordinator-only gate requiring pinned witnesses to return signed evidence.
     ///
     /// This is default-off for availability and backward compatibility. When
     /// false, positive rollback/divergence evidence still blocks startup, but
@@ -316,11 +322,12 @@ pub struct MemChainConfig {
     #[serde(default)]
     pub commitment_witness_startup_required: bool,
 
-    /// Minimum distinct pinned witnesses required by strict startup.
+    /// Minimum distinct pinned witnesses required by the active role.
     ///
-    /// The default of one preserves existing strict deployments. Operators
-    /// can stage a higher value while strict mode is disabled, verify repeated
-    /// signed responses, and then enable strict startup. This is an explicit
+    /// Coordinators use this as the strict-startup evidence threshold. Followers
+    /// require at least two to enable current-tip certificate verification and
+    /// carrier recovery. The default of one preserves existing deployments and
+    /// leaves follower certificate replication disabled. This is an explicit
     /// trust policy over pinned identities, not a consensus quorum.
     #[serde(default = "default_commitment_witness_min_verified")]
     pub commitment_witness_min_verified: usize,
@@ -768,60 +775,40 @@ impl MemChainConfig {
             ));
         }
 
-        if !self.commitment_witness_node_ids.is_empty()
+        let witness_policy_configured = !self.commitment_witness_node_ids.is_empty()
             || self.commitment_witness_startup_required
             || self.commitment_coordinator_lease_required
-            || self.commitment_witness_min_verified != default_commitment_witness_min_verified()
-        {
-            if !self.commitment_coordinator_enabled {
+            || self.commitment_witness_min_verified != default_commitment_witness_min_verified();
+        let validated_witnesses = if witness_policy_configured {
+            // [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Witness pins
+            // are a shared trust-policy primitive. Coordinator-only startup
+            // and lease gates stay role-scoped, while a follower may use the
+            // same pins only to verify post-convergence immutable evidence.
+            if !self.commitment_coordinator_enabled && !self.commitment_sync_enabled {
                 return Err(ServerError::config_invalid(
                     "memchain.commitment_witness_node_ids",
-                    "requires memchain.commitment_coordinator_enabled = true",
+                    "requires a commitment coordinator or follower sync role",
+                ));
+            }
+            if self.commitment_witness_startup_required && !self.commitment_coordinator_enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_witness_startup_required",
+                    "is available only on the commitment coordinator",
+                ));
+            }
+            if self.commitment_coordinator_lease_required && !self.commitment_coordinator_enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_coordinator_lease_required",
+                    "is available only on the commitment coordinator",
                 ));
             }
             if self.commitment_witness_node_ids.is_empty() {
                 return Err(ServerError::config_invalid(
-                    "memchain.commitment_witness_startup_required",
+                    "memchain.commitment_witness_node_ids",
                     "requires at least one memchain.commitment_witness_node_ids entry",
                 ));
             }
-            if self.commitment_witness_node_ids.len() > MAX_COMMITMENT_WITNESS_NODE_IDS {
-                return Err(ServerError::config_invalid(
-                    "memchain.commitment_witness_node_ids",
-                    format!("supports at most {MAX_COMMITMENT_WITNESS_NODE_IDS} pinned witnesses"),
-                ));
-            }
-
-            let mut validated =
-                Vec::<[u8; 32]>::with_capacity(self.commitment_witness_node_ids.len());
-            for configured in &self.commitment_witness_node_ids {
-                let value = configured.trim();
-                let decoded = hex::decode(value).map_err(|_| {
-                    ServerError::config_invalid(
-                        "memchain.commitment_witness_node_ids",
-                        "each entry must be a 64-character Ed25519 public key in hexadecimal",
-                    )
-                })?;
-                let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
-                    ServerError::config_invalid(
-                        "memchain.commitment_witness_node_ids",
-                        "each entry must decode to exactly 32 bytes",
-                    )
-                })?;
-                if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
-                    return Err(ServerError::config_invalid(
-                        "memchain.commitment_witness_node_ids",
-                        "each entry must be a non-zero 64-character Ed25519 public key",
-                    ));
-                }
-                if validated.contains(&node_id) {
-                    return Err(ServerError::config_invalid(
-                        "memchain.commitment_witness_node_ids",
-                        "duplicate witness identities are not allowed",
-                    ));
-                }
-                validated.push(node_id);
-            }
+            let validated = self.validated_commitment_witness_node_ids()?;
             if self.commitment_witness_min_verified > validated.len() {
                 return Err(ServerError::config_invalid(
                     "memchain.commitment_witness_min_verified",
@@ -842,7 +829,10 @@ impl MemChainConfig {
                     ));
                 }
             }
-        }
+            validated
+        } else {
+            Vec::new()
+        };
 
         // A Block Sync v1 follower has exactly one trust root. It never falls
         // back to an arbitrary discovered peer and never produces blocks.
@@ -880,6 +870,26 @@ impl MemChainConfig {
                     "memchain.commitment_coordinator_node_id",
                     "must be a non-zero 64-character Ed25519 public key in hexadecimal",
                 ));
+            }
+            let coordinator_node_id: [u8; 32] = decoded.try_into().map_err(|_| {
+                ServerError::config_invalid(
+                    "memchain.commitment_coordinator_node_id",
+                    "must decode to exactly 32 bytes",
+                )
+            })?;
+            if !validated_witnesses.is_empty() {
+                if self.commitment_witness_min_verified < 2 {
+                    return Err(ServerError::config_invalid(
+                        "memchain.commitment_witness_min_verified",
+                        "must be at least two when follower certificate witnesses are configured",
+                    ));
+                }
+                if validated_witnesses.contains(&coordinator_node_id) {
+                    return Err(ServerError::config_invalid(
+                        "memchain.commitment_witness_node_ids",
+                        "follower certificate witnesses must not include the pinned coordinator",
+                    ));
+                }
             }
             if !(5..=3_600).contains(&self.commitment_sync_interval_secs) {
                 return Err(ServerError::config_invalid(
@@ -1043,6 +1053,50 @@ impl MemChainConfig {
 // ── Convenience methods ────────────────────────────────────────────────────
 
 impl MemChainConfig {
+    /// Validates and decodes the bounded checkpoint-witness trust policy.
+    ///
+    /// This helper is role-neutral by design. The caller separately enforces
+    /// coordinator startup/lease semantics or follower certificate semantics.
+    fn validated_commitment_witness_node_ids(&self) -> Result<Vec<[u8; 32]>> {
+        if self.commitment_witness_node_ids.len() > MAX_COMMITMENT_WITNESS_NODE_IDS {
+            return Err(ServerError::config_invalid(
+                "memchain.commitment_witness_node_ids",
+                format!("supports at most {MAX_COMMITMENT_WITNESS_NODE_IDS} pinned witnesses"),
+            ));
+        }
+
+        let mut validated = Vec::<[u8; 32]>::with_capacity(self.commitment_witness_node_ids.len());
+        for configured in &self.commitment_witness_node_ids {
+            let value = configured.trim();
+            let decoded = hex::decode(value).map_err(|_| {
+                ServerError::config_invalid(
+                    "memchain.commitment_witness_node_ids",
+                    "each entry must be a 64-character Ed25519 public key in hexadecimal",
+                )
+            })?;
+            let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
+                ServerError::config_invalid(
+                    "memchain.commitment_witness_node_ids",
+                    "each entry must decode to exactly 32 bytes",
+                )
+            })?;
+            if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_witness_node_ids",
+                    "each entry must be a non-zero 64-character Ed25519 public key",
+                ));
+            }
+            if validated.contains(&node_id) {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_witness_node_ids",
+                    "duplicate witness identities are not allowed",
+                ));
+            }
+            validated.push(node_id);
+        }
+        Ok(validated)
+    }
+
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.mode != MemChainMode::Off
@@ -1224,8 +1278,7 @@ impl Default for MemChainConfig {
             commitment_witness_startup_required: false,
             commitment_witness_min_verified: default_commitment_witness_min_verified(),
             commitment_coordinator_lease_required: false,
-            commitment_coordinator_lease_ttl_secs:
-                default_commitment_coordinator_lease_ttl_secs(),
+            commitment_coordinator_lease_ttl_secs: default_commitment_coordinator_lease_ttl_secs(),
             max_remote_owners: default_max_remote_owners(),
             ner_enabled: false,
             ner_model_path: default_ner_model_path(),
@@ -1637,8 +1690,7 @@ mod tests {
 
         for invalid in [
             MemChainConfig {
-                commitment_coordinator_lease_ttl_secs:
-                    MIN_COORDINATOR_LEASE_TTL_SECS_V1 - 1,
+                commitment_coordinator_lease_ttl_secs: MIN_COORDINATOR_LEASE_TTL_SECS_V1 - 1,
                 ..Default::default()
             },
             MemChainConfig {
@@ -1714,6 +1766,78 @@ mod tests {
                 commitment_sync_enabled: true,
                 commitment_coordinator_node_id: "11".repeat(32),
                 commitment_sync_max_pages_per_round: 65,
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn test_commitment_follower_certificate_policy_requires_independent_witnesses() {
+        let coordinator = "51".repeat(32);
+        let first_witness = "52".repeat(32);
+        let second_witness = "53".repeat(32);
+        let valid = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_sync_enabled: true,
+            commitment_coordinator_node_id: coordinator.clone(),
+            commitment_witness_node_ids: vec![first_witness.clone(), second_witness.clone()],
+            commitment_witness_min_verified: 2,
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+        assert_eq!(
+            valid.commitment_witness_node_id_bytes(),
+            vec![[0x52; 32], [0x53; 32]]
+        );
+
+        for invalid in [
+            MemChainConfig {
+                commitment_witness_node_ids: vec![first_witness.clone(), second_witness.clone()],
+                commitment_witness_min_verified: 2,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator.clone(),
+                commitment_witness_node_ids: vec![first_witness.clone(), second_witness.clone()],
+                commitment_witness_min_verified: 1,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator.clone(),
+                commitment_witness_node_ids: vec![first_witness.clone()],
+                commitment_witness_min_verified: 2,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator.clone(),
+                commitment_witness_node_ids: vec![coordinator.clone(), first_witness.clone()],
+                commitment_witness_min_verified: 2,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator.clone(),
+                commitment_witness_node_ids: vec![first_witness.clone(), second_witness.clone()],
+                commitment_witness_startup_required: true,
+                commitment_witness_min_verified: 2,
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator,
+                commitment_witness_node_ids: vec![first_witness, second_witness],
+                commitment_witness_min_verified: 2,
+                commitment_coordinator_lease_required: true,
                 ..Default::default()
             },
         ] {

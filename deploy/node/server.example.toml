@@ -6,6 +6,9 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Document the independent
+#   witness policy that lets a follower verify and recover current-tip
+#   certificates without granting carriers block-production authority.
 # - Delay optional Directory proof gossip until exact block anchors have had
 #   two normal replica-sync intervals to converge on healthy peers.
 # - Add bounded concurrent discovery gossip so one slow public peer cannot
@@ -49,6 +52,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.9.0-node-deploy - Documented follower checkpoint-certificate witness policy.
 # v1.8.0-node-deploy - Added Directory proof gossip maturity guidance.
 # v1.7.0-node-deploy - Added bounded discovery gossip concurrency guidance.
 # v1.6.0-node-deploy - Added Directory checkpoint witness threshold guidance.
@@ -247,6 +251,21 @@ miner_interval_secs = 60
 # embedding models. This keeps encrypted storage, public discovery, and
 # ChatRelay routes available without noisy model-missing warnings.
 embed_enabled = true
+
+# A follower may verify and recover the coordinator's current-tip certificate
+# from independently pinned witnesses after signed block/checkpoint convergence.
+# This remains default-off: enable commitment_sync_enabled, pin one coordinator,
+# then pin 2-3 different audited witnesses and require at least two signatures.
+# Do not enable commitment_witness_startup_required or
+# commitment_coordinator_lease_required on a follower; both are
+# coordinator-only production gates.
+# commitment_sync_enabled = true
+# commitment_coordinator_node_id = "64_HEX_ED25519_COORDINATOR_NODE_ID"
+# commitment_witness_node_ids = [
+#   "64_HEX_ED25519_WITNESS_A_NODE_ID",
+#   "64_HEX_ED25519_WITNESS_B_NODE_ID",
+# ]
+# commitment_witness_min_verified = 2
 
 # Cross-host duplicate-coordinator fencing is intentionally default-off.
 # Before enabling it, upgrade every identity in commitment_witness_node_ids,

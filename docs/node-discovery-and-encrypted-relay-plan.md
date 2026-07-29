@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.57.0 - Privacy-safe follower certificate recovery telemetry.
+Modification Reason: v0.58.0 - Enabled follower certificate witness policy in validated production configuration.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.57.0 - [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] Reports source-blind aggregate outcomes for current-tip certificate retrieval and bounded carrier recovery.
+Last Modified: v0.58.0 - [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Allows validated followers to configure independent witness pins for current-tip certificate verification and carrier recovery.
+Previous: v0.57.0 - [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] Reports source-blind aggregate outcomes for current-tip certificate retrieval and bounded carrier recovery.
 Previous: v0.56.0 - [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] Recovers audited current-tip certificates through bounded operator-pinned witness carriers when coordinator transport is unavailable.
 Previous: v0.55.0 - [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Replicates audited current-tip checkpoint certificates to converged followers under each follower's current witness policy.
 Previous: v0.54.0 - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Centralizes Directory transport health policy in the service runtime, records aggregate degraded/recovered transitions, and prevents diagnostic timestamps from regressing after wall-clock rollback.
@@ -97,6 +98,28 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.58 Follower certificate policy activation
+
+[FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex]
+
+- Fixed a role-validation conflict that previously made the implemented
+  follower certificate path impossible to enable through a valid production
+  configuration: witness pins were accepted only on a coordinator even though
+  a follower is forbidden from also being the coordinator.
+- `commitment_witness_node_ids` and `commitment_witness_min_verified` now form a
+  shared operator-pinned trust-policy primitive. Coordinators use it for
+  startup evidence/certification; followers use it only after signed
+  convergence to verify and recover an immutable current-tip certificate.
+- Coordinator production controls remain coordinator-only:
+  `commitment_witness_startup_required` and
+  `commitment_coordinator_lease_required` are rejected on followers.
+- A follower certificate policy requires at least two distinct witnesses,
+  threshold two or greater, and witnesses different from the pinned
+  coordinator. Defaults remain certificate-disabled and backward compatible.
+- This change adds no automatic trust, discovery-derived membership, vote,
+  quorum, consensus, finality, fork choice, chain mutation, or user-plane
+  metadata. A carrier still transports evidence bytes only.
 
 ### v0.57 Privacy-safe certificate recovery telemetry
 
