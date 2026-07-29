@@ -161,6 +161,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.55-CertificateBackfillTelemetry - Added coordinator-only, source-blind recovery evidence.
 //! v2.8.53-TypedCarrierCircuit - Added isolated certificate-carrier circuit aggregates.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Added source-blind circuit health aggregates.
 //! v2.8.49-FollowerCertificateTipBinding - Bound readiness to the exact audited tip height.
@@ -440,6 +441,32 @@ impl RecordCommitmentCertificateSyncDisposition {
     }
 }
 
+/// One terminal outcome for a coordinator certificate-backfill round.
+///
+/// [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Coordinator backfill
+/// is operationally distinct from follower certificate synchronization. This
+/// classification therefore has a separate contract and deliberately cannot
+/// retain carrier identities, endpoints, witness sets, certificate material,
+/// hashes, signatures, raw errors, or per-source timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordCommitmentCertificateBackfillDisposition {
+    Persisted,
+    VerifiedUnpersisted,
+    AvailabilityExhausted,
+    SecurityStopped,
+}
+
+impl RecordCommitmentCertificateBackfillDisposition {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::VerifiedUnpersisted => "verified_unpersisted",
+            Self::AvailabilityExhausted => "availability_exhausted",
+            Self::SecurityStopped => "security_stopped",
+        }
+    }
+}
+
 /// One terminal outcome for a follower commitment-block page retrieval.
 ///
 /// [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] This process-local
@@ -630,6 +657,28 @@ pub struct RecordCommitmentSyncStatus {
     pub certificate_carrier_cooldown_skips_total: u64,
     /// Certificate-carrier requests started after anonymous cooldown expiry.
     pub certificate_carrier_half_open_attempts_total: u64,
+    /// Most recent coordinator post-startup certificate-backfill round.
+    pub last_coordinator_certificate_backfill_at: Option<u64>,
+    /// Latest source-blind coordinator backfill terminal result.
+    pub last_coordinator_certificate_backfill_result: Option<String>,
+    /// Coordinator certificate-backfill rounds observed since process start.
+    pub coordinator_certificate_backfill_rounds_total: u64,
+    /// Backfill rounds that durably persisted an audited certificate.
+    pub coordinator_certificate_backfill_persisted_total: u64,
+    /// Verified rounds deferred because local state changed before persistence.
+    pub coordinator_certificate_backfill_verified_unpersisted_total: u64,
+    /// Backfill rounds where every bounded carrier was unavailable.
+    pub coordinator_certificate_backfill_availability_exhausted_total: u64,
+    /// Backfill rounds stopped by security or protocol-integrity failures.
+    pub coordinator_certificate_backfill_security_stops_total: u64,
+    /// Bounded carrier requests attempted by coordinator backfill.
+    pub coordinator_certificate_backfill_carrier_attempts_total: u64,
+    /// Anonymous carrier slots cooling at the latest coordinator observation.
+    pub coordinator_certificate_backfill_carrier_cooling_slots: usize,
+    /// Coordinator backfill selections skipped during anonymous cooldown.
+    pub coordinator_certificate_backfill_carrier_cooldown_skips_total: u64,
+    /// Coordinator backfill requests started after anonymous cooldown expiry.
+    pub coordinator_certificate_backfill_carrier_half_open_attempts_total: u64,
     /// Most recent pull attempt time.
     pub last_attempt_at: Option<u64>,
     /// Most recent successfully verified page time.
@@ -874,6 +923,17 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) certificate_carrier_cooling_slots: usize,
     pub(crate) certificate_carrier_cooldown_skips_total: u64,
     pub(crate) certificate_carrier_half_open_attempts_total: u64,
+    pub(crate) last_coordinator_certificate_backfill_at: Option<u64>,
+    pub(crate) last_coordinator_certificate_backfill_result: Option<&'static str>,
+    pub(crate) coordinator_certificate_backfill_rounds_total: u64,
+    pub(crate) coordinator_certificate_backfill_persisted_total: u64,
+    pub(crate) coordinator_certificate_backfill_verified_unpersisted_total: u64,
+    pub(crate) coordinator_certificate_backfill_availability_exhausted_total: u64,
+    pub(crate) coordinator_certificate_backfill_security_stops_total: u64,
+    pub(crate) coordinator_certificate_backfill_carrier_attempts_total: u64,
+    pub(crate) coordinator_certificate_backfill_carrier_cooling_slots: usize,
+    pub(crate) coordinator_certificate_backfill_carrier_cooldown_skips_total: u64,
+    pub(crate) coordinator_certificate_backfill_carrier_half_open_attempts_total: u64,
     pub(crate) last_attempt_at: Option<u64>,
     pub(crate) last_success_at: Option<u64>,
     pub(crate) last_failure_at: Option<u64>,
@@ -947,6 +1007,17 @@ impl Default for RecordCommitmentSyncRuntime {
             certificate_carrier_cooling_slots: 0,
             certificate_carrier_cooldown_skips_total: 0,
             certificate_carrier_half_open_attempts_total: 0,
+            last_coordinator_certificate_backfill_at: None,
+            last_coordinator_certificate_backfill_result: None,
+            coordinator_certificate_backfill_rounds_total: 0,
+            coordinator_certificate_backfill_persisted_total: 0,
+            coordinator_certificate_backfill_verified_unpersisted_total: 0,
+            coordinator_certificate_backfill_availability_exhausted_total: 0,
+            coordinator_certificate_backfill_security_stops_total: 0,
+            coordinator_certificate_backfill_carrier_attempts_total: 0,
+            coordinator_certificate_backfill_carrier_cooling_slots: 0,
+            coordinator_certificate_backfill_carrier_cooldown_skips_total: 0,
+            coordinator_certificate_backfill_carrier_half_open_attempts_total: 0,
             last_attempt_at: None,
             last_success_at: None,
             last_failure_at: None,

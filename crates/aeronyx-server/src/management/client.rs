@@ -59,6 +59,9 @@
 //   - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Block-page and certificate
 //     circuit aggregates are independent domains. Never combine them into
 //     per-peer health, routing reputation, authority, or fork-choice signals.
+//   - [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Coordinator
+//     certificate backfill is role-isolated from follower sync and exposes no
+//     carrier identity, witness set, endpoint, cryptographic frame, or error.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -91,6 +94,7 @@
 //   v2.8.49        - Bound certificate readiness to the exact audited tip
 //   v2.8.52        - Added source-blind block-carrier circuit health aggregates
 //   v2.8.53        - Added isolated certificate-carrier circuit health aggregates
+//   v2.8.55        - Added coordinator-only certificate-backfill aggregates
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -321,6 +325,29 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub certificate_carrier_cooldown_skips_total: u64,
     /// Anonymous certificate-carrier requests attempted after cooldown.
     pub certificate_carrier_half_open_attempts_total: u64,
+    /// [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Most recent
+    /// coordinator-only post-startup certificate-backfill round.
+    pub last_coordinator_certificate_backfill_at: Option<u64>,
+    /// Latest source-blind coordinator backfill terminal result.
+    pub last_coordinator_certificate_backfill_result: Option<String>,
+    /// Coordinator certificate-backfill rounds since process start.
+    pub coordinator_certificate_backfill_rounds_total: u64,
+    /// Backfill rounds that durably persisted an audited certificate.
+    pub coordinator_certificate_backfill_persisted_total: u64,
+    /// Verified rounds deferred after a concurrent local state change.
+    pub coordinator_certificate_backfill_verified_unpersisted_total: u64,
+    /// Backfill rounds where every bounded carrier was unavailable.
+    pub coordinator_certificate_backfill_availability_exhausted_total: u64,
+    /// Backfill rounds stopped by security or protocol-integrity failures.
+    pub coordinator_certificate_backfill_security_stops_total: u64,
+    /// Bounded coordinator backfill carrier requests attempted.
+    pub coordinator_certificate_backfill_carrier_attempts_total: u64,
+    /// Anonymous carrier slots cooling at the latest coordinator observation.
+    pub coordinator_certificate_backfill_carrier_cooling_slots: usize,
+    /// Coordinator backfill selections skipped during anonymous cooldown.
+    pub coordinator_certificate_backfill_carrier_cooldown_skips_total: u64,
+    /// Coordinator backfill requests attempted after cooldown expiry.
+    pub coordinator_certificate_backfill_carrier_half_open_attempts_total: u64,
     /// Most recent follower pull attempt.
     pub last_attempt_at: Option<u64>,
     /// Most recent successful verified response page.
@@ -1022,6 +1049,19 @@ mod tests {
                 certificate_carrier_cooling_slots: 2,
                 certificate_carrier_cooldown_skips_total: 5,
                 certificate_carrier_half_open_attempts_total: 3,
+                last_coordinator_certificate_backfill_at: Some(114),
+                last_coordinator_certificate_backfill_result: Some(
+                    "verified_unpersisted".to_string(),
+                ),
+                coordinator_certificate_backfill_rounds_total: 6,
+                coordinator_certificate_backfill_persisted_total: 3,
+                coordinator_certificate_backfill_verified_unpersisted_total: 1,
+                coordinator_certificate_backfill_availability_exhausted_total: 1,
+                coordinator_certificate_backfill_security_stops_total: 1,
+                coordinator_certificate_backfill_carrier_attempts_total: 8,
+                coordinator_certificate_backfill_carrier_cooling_slots: 2,
+                coordinator_certificate_backfill_carrier_cooldown_skips_total: 4,
+                coordinator_certificate_backfill_carrier_half_open_attempts_total: 2,
                 last_attempt_at: Some(99),
                 last_success_at: Some(100),
                 last_failure_at: Some(110),
@@ -1176,6 +1216,41 @@ mod tests {
         assert_eq!(sync["certificate_carrier_cooling_slots"], 2);
         assert_eq!(sync["certificate_carrier_cooldown_skips_total"], 5);
         assert_eq!(sync["certificate_carrier_half_open_attempts_total"], 3);
+        assert_eq!(sync["last_coordinator_certificate_backfill_at"], 114);
+        assert_eq!(
+            sync["last_coordinator_certificate_backfill_result"],
+            "verified_unpersisted"
+        );
+        assert_eq!(sync["coordinator_certificate_backfill_rounds_total"], 6);
+        assert_eq!(sync["coordinator_certificate_backfill_persisted_total"], 3);
+        assert_eq!(
+            sync["coordinator_certificate_backfill_verified_unpersisted_total"],
+            1
+        );
+        assert_eq!(
+            sync["coordinator_certificate_backfill_availability_exhausted_total"],
+            1
+        );
+        assert_eq!(
+            sync["coordinator_certificate_backfill_security_stops_total"],
+            1
+        );
+        assert_eq!(
+            sync["coordinator_certificate_backfill_carrier_attempts_total"],
+            8
+        );
+        assert_eq!(
+            sync["coordinator_certificate_backfill_carrier_cooling_slots"],
+            2
+        );
+        assert_eq!(
+            sync["coordinator_certificate_backfill_carrier_cooldown_skips_total"],
+            4
+        );
+        assert_eq!(
+            sync["coordinator_certificate_backfill_carrier_half_open_attempts_total"],
+            2
+        );
         assert_eq!(sync["last_attempt_at"], 99);
         assert_eq!(sync["last_error_code"], "request_timeout");
         let checkpoint = &value["record_commitment_checkpoint"];

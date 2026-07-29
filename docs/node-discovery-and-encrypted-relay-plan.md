@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.68.0 - Unified fail-closed coordinator and follower checkpoint-certificate carrier recovery.
+Modification Reason: v0.69.0 - Added role-isolated, source-blind coordinator certificate-backfill telemetry.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.68.0 - [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Prevents later certificate carriers from masking security failures and cools repeated coordinator-backfill outages.
+Last Modified: v0.69.0 - [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Reports coordinator certificate backfill without exposing carrier identity or mixing follower state.
+Previous: v0.68.0 - [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Prevents later certificate carriers from masking security failures and cools repeated coordinator-backfill outages.
 Previous: v0.67.0 - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Reuses one circuit algorithm while compile-time domains and runtime ownership isolate block-page and certificate carrier health.
 Previous: v0.66.0 - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Reports only anonymous cooling-slot, skipped-selection, and half-open-probe aggregates.
 Previous: v0.65.0 - [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] Cools repeatedly unavailable fixed carrier slots across follower rounds without retaining identity-bearing health history.
@@ -100,6 +101,32 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.69 Privacy-safe coordinator certificate-backfill telemetry
+
+[CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex]
+
+- Coordinator post-startup certificate backfill now has its own local status
+  and signed management-heartbeat contract. It is deliberately separate from
+  follower certificate synchronization, because the two roles have different
+  lifecycle, policy, and operational meanings.
+- Every completed coordinator backfill round records exactly one terminal
+  disposition: `persisted`, `verified_unpersisted`,
+  `availability_exhausted`, or `security_stopped`. The round counter equals
+  the sum of those four mutually exclusive outcome counters.
+- The same atomic storage update records bounded carrier attempts, the
+  anonymous cooling-slot gauge at that observation, cumulative cooldown
+  skips, and cumulative half-open attempts. Cancellation or later logging
+  cannot leave an outcome published without the matching scheduler evidence.
+- The last-observed timestamp is monotonic within the process even if the wall
+  clock moves backwards. Counters are saturating and reset with the configured
+  runtime role; follower calls and disabled verifier calls are no-ops.
+- The API accepts no source identity, endpoint, witness set, certificate frame,
+  hash, signature, raw error, block, record, owner, payload, route, or client
+  metadata. Heartbeat serialization tests continue to reject those fields.
+- These values are operations evidence only. They do not select carriers,
+  change certificate policy, mutate the commitment chain, grant production
+  authority, rank peers, establish consensus, claim finality, or choose forks.
 
 ### v0.68 Fail-closed certificate carrier recovery
 

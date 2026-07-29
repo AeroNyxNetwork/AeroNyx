@@ -386,6 +386,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.55-CertificateBackfillTelemetry - Published role-isolated,
+//     source-blind coordinator certificate recovery evidence
 //   v2.8.54-CertificateCarrierRecovery - Unified coordinator and follower
 //     carrier recovery so security faults cannot be masked by later sources
 //   v2.8.53-TypedCarrierCircuit - Retained independent process-lifetime block
@@ -664,7 +666,9 @@ use crate::services::memchain::{
 };
 #[allow(deprecated)]
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
-use crate::services::memchain::{LlmRouter, TaskWorker};
+use crate::services::memchain::{
+    LlmRouter, RecordCommitmentCertificateBackfillDisposition, TaskWorker,
+};
 use crate::services::peer_store::{
     PeerStoreDirectoryProofGossipRound, PeerStoreRouteabilityCacheEvidence,
     PeerStoreTwoHopPathProofEvent,
@@ -4494,6 +4498,32 @@ impl Server {
                                 .certificate_carrier_cooldown_skips_total,
                             certificate_carrier_half_open_attempts_total: status
                                 .certificate_carrier_half_open_attempts_total,
+                            // [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex]
+                            // Coordinator recovery remains a separate,
+                            // source-blind domain from follower certificate sync.
+                            last_coordinator_certificate_backfill_at: status
+                                .last_coordinator_certificate_backfill_at,
+                            last_coordinator_certificate_backfill_result: status
+                                .last_coordinator_certificate_backfill_result,
+                            coordinator_certificate_backfill_rounds_total: status
+                                .coordinator_certificate_backfill_rounds_total,
+                            coordinator_certificate_backfill_persisted_total: status
+                                .coordinator_certificate_backfill_persisted_total,
+                            coordinator_certificate_backfill_verified_unpersisted_total: status
+                                .coordinator_certificate_backfill_verified_unpersisted_total,
+                            coordinator_certificate_backfill_availability_exhausted_total: status
+                                .coordinator_certificate_backfill_availability_exhausted_total,
+                            coordinator_certificate_backfill_security_stops_total: status
+                                .coordinator_certificate_backfill_security_stops_total,
+                            coordinator_certificate_backfill_carrier_attempts_total: status
+                                .coordinator_certificate_backfill_carrier_attempts_total,
+                            coordinator_certificate_backfill_carrier_cooling_slots: status
+                                .coordinator_certificate_backfill_carrier_cooling_slots,
+                            coordinator_certificate_backfill_carrier_cooldown_skips_total: status
+                                .coordinator_certificate_backfill_carrier_cooldown_skips_total,
+                            coordinator_certificate_backfill_carrier_half_open_attempts_total:
+                                status
+                                    .coordinator_certificate_backfill_carrier_half_open_attempts_total,
                             last_attempt_at: status.last_attempt_at,
                             last_success_at: status.last_success_at,
                             last_failure_at: status.last_failure_at,
@@ -6543,6 +6573,32 @@ impl Server {
                                 &mut certificate_carrier_circuit_breaker,
                             ) => recovery,
                     };
+                    let telemetry_disposition = match recovery.disposition {
+                        CommitmentCertificateCarrierRecoveryDisposition::Persisted => {
+                            RecordCommitmentCertificateBackfillDisposition::Persisted
+                        }
+                        CommitmentCertificateCarrierRecoveryDisposition::VerifiedUnpersisted => {
+                            RecordCommitmentCertificateBackfillDisposition::VerifiedUnpersisted
+                        }
+                        CommitmentCertificateCarrierRecoveryDisposition::AvailabilityExhausted => {
+                            RecordCommitmentCertificateBackfillDisposition::AvailabilityExhausted
+                        }
+                        CommitmentCertificateCarrierRecoveryDisposition::SecurityStopped => {
+                            RecordCommitmentCertificateBackfillDisposition::SecurityStopped
+                        }
+                    };
+                    // [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex]
+                    // Publish the terminal result and its anonymous circuit
+                    // observation atomically before logging or later control
+                    // flow can return from this round.
+                    storage.record_commitment_certificate_backfill_outcome(
+                        unix_now_secs(),
+                        telemetry_disposition,
+                        recovery.carrier_attempts,
+                        recovery.cooling_slots,
+                        recovery.cooldown_skips,
+                        recovery.half_open_attempts,
+                    );
                     match recovery.disposition {
                         CommitmentCertificateCarrierRecoveryDisposition::Persisted => {
                             debug!(

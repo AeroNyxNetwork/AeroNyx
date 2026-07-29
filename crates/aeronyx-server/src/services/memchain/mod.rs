@@ -49,6 +49,7 @@
 //!   replication and owner recovery must remain separate and authorised.
 //!
 //! ## Last Modified
+//! v2.8.55-CertificateBackfillTelemetry - Re-exported the coordinator backfill outcome.
 //! v2.8.49-FollowerCertificateTipBinding - Preserved typed tip-bound certificate readiness.
 //! v2.8.48-FollowerCertificateReadiness - Re-exported typed certificate policy readiness.
 //! v2.8.45-FollowerCertificateTelemetry - Re-exported internal certificate recovery outcomes.
@@ -139,9 +140,11 @@ pub use storage::{
     RecordCommitmentCheckpointStatus, RecordCommitmentSyncEvent, RecordCommitmentSyncStatus,
     StorageStats,
 };
+// [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Keep the coordinator
+// outcome internal while allowing the runtime orchestrator to record it.
 pub(crate) use storage::{
-    RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificatePolicyReadiness,
-    RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificateBackfillDisposition,
+    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{

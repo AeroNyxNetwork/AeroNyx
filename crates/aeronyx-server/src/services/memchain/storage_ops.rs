@@ -167,6 +167,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.55-CertificateBackfillTelemetry - Record atomic coordinator-only recovery aggregates.
 //! v2.8.53-TypedCarrierCircuit - Kept block and certificate circuit telemetry independent.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Report anonymous cooling, skip, and half-open state.
 //! v2.8.49-FollowerCertificateTipBinding - Prevent stale readiness after the audited tip advances.
@@ -223,7 +224,8 @@ use aeronyx_core::protocol::memchain::{
 use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
     RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificatePolicyReadiness,
-    RecordCommitmentCertificateSyncDisposition, RecordCommitmentCheckpointCertificateAnchorConfig,
+    RecordCommitmentCertificateBackfillDisposition, RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentCheckpointCertificateAnchorConfig,
     RecordCommitmentCheckpointCertificateAnchorRuntime,
     RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
     RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
@@ -5102,6 +5104,74 @@ impl MemoryStorage {
         }
     }
 
+    /// Atomically records one coordinator certificate-backfill outcome.
+    ///
+    /// [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Outcome and
+    /// circuit aggregates share one coordinator-only write so cancellation
+    /// cannot publish a terminal result without its matching scheduler
+    /// evidence. The method accepts no identity-bearing or cryptographic
+    /// material, and these process-local counters never influence source
+    /// selection, certificate policy, chain state, or production authority.
+    pub(crate) fn record_commitment_certificate_backfill_outcome(
+        &self,
+        now: u64,
+        disposition: RecordCommitmentCertificateBackfillDisposition,
+        carrier_attempts: usize,
+        cooling_slots: usize,
+        cooldown_skips: usize,
+        half_open_attempts: usize,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if runtime.role != "coordinator" {
+            return;
+        }
+        let observed_at = runtime
+            .last_coordinator_certificate_backfill_at
+            .map_or(now, |previous| previous.max(now));
+        let carrier_attempts = u64::try_from(carrier_attempts).unwrap_or(u64::MAX);
+        let cooldown_skips = u64::try_from(cooldown_skips).unwrap_or(u64::MAX);
+        let half_open_attempts = u64::try_from(half_open_attempts).unwrap_or(u64::MAX);
+
+        runtime.last_coordinator_certificate_backfill_at = Some(observed_at);
+        runtime.last_coordinator_certificate_backfill_result = Some(disposition.as_str());
+        runtime.coordinator_certificate_backfill_rounds_total = runtime
+            .coordinator_certificate_backfill_rounds_total
+            .saturating_add(1);
+        runtime.coordinator_certificate_backfill_carrier_attempts_total = runtime
+            .coordinator_certificate_backfill_carrier_attempts_total
+            .saturating_add(carrier_attempts);
+        runtime.coordinator_certificate_backfill_carrier_cooling_slots = cooling_slots;
+        runtime.coordinator_certificate_backfill_carrier_cooldown_skips_total = runtime
+            .coordinator_certificate_backfill_carrier_cooldown_skips_total
+            .saturating_add(cooldown_skips);
+        runtime.coordinator_certificate_backfill_carrier_half_open_attempts_total = runtime
+            .coordinator_certificate_backfill_carrier_half_open_attempts_total
+            .saturating_add(half_open_attempts);
+
+        match disposition {
+            RecordCommitmentCertificateBackfillDisposition::Persisted => {
+                runtime.coordinator_certificate_backfill_persisted_total = runtime
+                    .coordinator_certificate_backfill_persisted_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentCertificateBackfillDisposition::VerifiedUnpersisted => {
+                runtime.coordinator_certificate_backfill_verified_unpersisted_total = runtime
+                    .coordinator_certificate_backfill_verified_unpersisted_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentCertificateBackfillDisposition::AvailabilityExhausted => {
+                runtime.coordinator_certificate_backfill_availability_exhausted_total = runtime
+                    .coordinator_certificate_backfill_availability_exhausted_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentCertificateBackfillDisposition::SecurityStopped => {
+                runtime.coordinator_certificate_backfill_security_stops_total = runtime
+                    .coordinator_certificate_backfill_security_stops_total
+                    .saturating_add(1);
+            }
+        }
+    }
+
     /// Records one exact local follower certificate-policy evaluation.
     ///
     /// This is separate from transport outcome counters: an already-current
@@ -5278,6 +5348,29 @@ impl MemoryStorage {
                 .certificate_carrier_cooldown_skips_total,
             certificate_carrier_half_open_attempts_total: runtime
                 .certificate_carrier_half_open_attempts_total,
+            last_coordinator_certificate_backfill_at: runtime
+                .last_coordinator_certificate_backfill_at,
+            last_coordinator_certificate_backfill_result: runtime
+                .last_coordinator_certificate_backfill_result
+                .map(str::to_string),
+            coordinator_certificate_backfill_rounds_total: runtime
+                .coordinator_certificate_backfill_rounds_total,
+            coordinator_certificate_backfill_persisted_total: runtime
+                .coordinator_certificate_backfill_persisted_total,
+            coordinator_certificate_backfill_verified_unpersisted_total: runtime
+                .coordinator_certificate_backfill_verified_unpersisted_total,
+            coordinator_certificate_backfill_availability_exhausted_total: runtime
+                .coordinator_certificate_backfill_availability_exhausted_total,
+            coordinator_certificate_backfill_security_stops_total: runtime
+                .coordinator_certificate_backfill_security_stops_total,
+            coordinator_certificate_backfill_carrier_attempts_total: runtime
+                .coordinator_certificate_backfill_carrier_attempts_total,
+            coordinator_certificate_backfill_carrier_cooling_slots: runtime
+                .coordinator_certificate_backfill_carrier_cooling_slots,
+            coordinator_certificate_backfill_carrier_cooldown_skips_total: runtime
+                .coordinator_certificate_backfill_carrier_cooldown_skips_total,
+            coordinator_certificate_backfill_carrier_half_open_attempts_total: runtime
+                .coordinator_certificate_backfill_carrier_half_open_attempts_total,
             last_attempt_at: runtime.last_attempt_at,
             last_success_at: runtime.last_success_at,
             last_failure_at: runtime.last_failure_at,
@@ -5292,7 +5385,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; block-page and certificate recovery expose source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, and monotonic process-local timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; these counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
+                "aggregate runtime only; follower block-page/certificate recovery and coordinator certificate backfill expose role-isolated, source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, and monotonic process-local timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; these counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
         }
     }
 
@@ -9039,6 +9132,127 @@ mod tests {
                 .certificate_sync_rounds_total,
             0
         );
+    }
+
+    #[test]
+    fn test_certificate_backfill_runtime_is_atomic_monotonic_and_coordinator_only() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+
+        storage.record_commitment_certificate_backfill_outcome(
+            90,
+            RecordCommitmentCertificateBackfillDisposition::Persisted,
+            1,
+            1,
+            2,
+            1,
+        );
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .coordinator_certificate_backfill_rounds_total,
+            0
+        );
+
+        // [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Follower
+        // retrieval and coordinator backfill are deliberately disjoint even
+        // when they observe equivalent transport outcomes.
+        storage.configure_record_commitment_sync(false, true);
+        storage.record_commitment_certificate_backfill_outcome(
+            95,
+            RecordCommitmentCertificateBackfillDisposition::SecurityStopped,
+            1,
+            1,
+            1,
+            1,
+        );
+        let follower = storage.record_commitment_sync_status();
+        assert_eq!(follower.coordinator_certificate_backfill_rounds_total, 0);
+        assert_eq!(follower.certificate_sync_rounds_total, 0);
+
+        storage.configure_record_commitment_sync(true, false);
+        storage.record_commitment_certificate_backfill_outcome(
+            100,
+            RecordCommitmentCertificateBackfillDisposition::Persisted,
+            1,
+            0,
+            0,
+            0,
+        );
+        storage.record_commitment_certificate_backfill_outcome(
+            110,
+            RecordCommitmentCertificateBackfillDisposition::VerifiedUnpersisted,
+            2,
+            1,
+            3,
+            1,
+        );
+        storage.record_commitment_certificate_backfill_outcome(
+            105,
+            RecordCommitmentCertificateBackfillDisposition::AvailabilityExhausted,
+            3,
+            2,
+            4,
+            2,
+        );
+        storage.record_commitment_certificate_backfill_outcome(
+            120,
+            RecordCommitmentCertificateBackfillDisposition::SecurityStopped,
+            1,
+            1,
+            5,
+            3,
+        );
+
+        let status = storage.record_commitment_sync_status();
+        assert_eq!(status.last_coordinator_certificate_backfill_at, Some(120));
+        assert_eq!(
+            status
+                .last_coordinator_certificate_backfill_result
+                .as_deref(),
+            Some("security_stopped")
+        );
+        assert_eq!(status.coordinator_certificate_backfill_rounds_total, 4);
+        assert_eq!(status.coordinator_certificate_backfill_persisted_total, 1);
+        assert_eq!(
+            status.coordinator_certificate_backfill_verified_unpersisted_total,
+            1
+        );
+        assert_eq!(
+            status.coordinator_certificate_backfill_availability_exhausted_total,
+            1
+        );
+        assert_eq!(
+            status.coordinator_certificate_backfill_security_stops_total,
+            1
+        );
+        assert_eq!(
+            status.coordinator_certificate_backfill_carrier_attempts_total,
+            7
+        );
+        assert_eq!(
+            status.coordinator_certificate_backfill_carrier_cooling_slots,
+            1
+        );
+        assert_eq!(
+            status.coordinator_certificate_backfill_carrier_cooldown_skips_total,
+            12
+        );
+        assert_eq!(
+            status.coordinator_certificate_backfill_carrier_half_open_attempts_total,
+            6
+        );
+        assert_eq!(
+            status.coordinator_certificate_backfill_rounds_total,
+            status
+                .coordinator_certificate_backfill_persisted_total
+                .saturating_add(status.coordinator_certificate_backfill_verified_unpersisted_total)
+                .saturating_add(
+                    status.coordinator_certificate_backfill_availability_exhausted_total
+                )
+                .saturating_add(status.coordinator_certificate_backfill_security_stops_total)
+        );
+        assert_eq!(status.certificate_sync_rounds_total, 0);
+        assert_eq!(status.certificate_carrier_attempts_total, 0);
     }
 
     #[tokio::test]
