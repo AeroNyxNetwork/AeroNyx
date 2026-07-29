@@ -49,6 +49,9 @@
 //   - Certificate recovery telemetry is source-blind and process-local. Never
 //     add coordinator/carrier identities, witness sets, endpoints, frames,
 //     hashes, signatures, raw errors, or per-source timing.
+//   - [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Policy readiness
+//     exposes only state, boolean readiness, witness count, threshold, and
+//     aggregate evaluation time after exact local cryptographic validation.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -73,6 +76,7 @@
 //   v2.8.12        - Added fail-closed lease window and recovery evidence
 //   v2.8.13        - Added witness-certificate block confirmation coverage
 //   v2.8.14        - Added privacy-safe event-driven follower telemetry
+//   v2.8.48        - Added identity-blind follower certificate policy readiness
 //   v2.8.15        - Added exact coordinator announcement receipt telemetry
 //   v2.8.17        - Added bounded announcement retry outcome telemetry
 //   v2.8.18        - Added aggregate superseded announcement telemetry
@@ -243,6 +247,16 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub outbound_announcement_retries_succeeded_total: u64,
     /// Peers still transiently failing after the bounded retry budget.
     pub outbound_announcement_retries_exhausted_total: u64,
+    /// Current exact local certificate-policy state.
+    pub certificate_policy_state: String,
+    /// Whether the current audited tip satisfies current local policy.
+    pub certificate_policy_ready: bool,
+    /// Most recent exact local policy evaluation time.
+    pub certificate_policy_last_evaluated_at: Option<u64>,
+    /// Configured external witness count; identities are excluded.
+    pub certificate_witnesses_configured: usize,
+    /// Minimum distinct signatures required by local policy.
+    pub certificate_minimum_signers: usize,
     /// Most recent completed checkpoint-certificate retrieval round.
     pub last_certificate_sync_at: Option<u64>,
     /// Latest source-blind terminal retrieval result.
@@ -932,6 +946,11 @@ mod tests {
                 outbound_announcement_retries_attempted_total: 4,
                 outbound_announcement_retries_succeeded_total: 2,
                 outbound_announcement_retries_exhausted_total: 1,
+                certificate_policy_state: "ready".to_string(),
+                certificate_policy_ready: true,
+                certificate_policy_last_evaluated_at: Some(111),
+                certificate_witnesses_configured: 3,
+                certificate_minimum_signers: 2,
                 last_certificate_sync_at: Some(112),
                 last_certificate_sync_result: Some("carrier_recovered".to_string()),
                 last_certificate_carrier_recovered_at: Some(112),
@@ -1065,6 +1084,11 @@ mod tests {
         assert_eq!(sync["outbound_announcement_retries_attempted_total"], 4);
         assert_eq!(sync["outbound_announcement_retries_succeeded_total"], 2);
         assert_eq!(sync["outbound_announcement_retries_exhausted_total"], 1);
+        assert_eq!(sync["certificate_policy_state"], "ready");
+        assert_eq!(sync["certificate_policy_ready"], true);
+        assert_eq!(sync["certificate_policy_last_evaluated_at"], 111);
+        assert_eq!(sync["certificate_witnesses_configured"], 3);
+        assert_eq!(sync["certificate_minimum_signers"], 2);
         assert_eq!(sync["last_certificate_sync_at"], 112);
         assert_eq!(sync["last_certificate_sync_result"], "carrier_recovered");
         assert_eq!(sync["last_certificate_carrier_recovered_at"], 112);

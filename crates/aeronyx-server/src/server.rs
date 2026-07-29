@@ -264,6 +264,9 @@
 // 105. [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Fails startup before any
 //      mutable service or listener when a coordinator/follower trust policy
 //      treats the node's own identity as an external authority.
+// 106. [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Publishes exact
+//      current-policy readiness after cryptographic validation without
+//      exposing witness identities or certificate material.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -324,6 +327,8 @@
 //   - Follower certificate synchronization runs only after signed convergence.
 //     Its source is transport, not authority; local witness pins and threshold
 //     remain mandatory, and mixed-version absence must not undo a verified tip.
+//   - Follower certificate readiness may become `ready` only after the exact
+//     current tip, current pins, and current threshold pass local validation.
 //   - Coordinator leases are a short-lived duplicate-writer safety control,
 //     not consensus, leader election, finality, or fork choice. A partial
 //     witness round must never extend the local production deadline.
@@ -376,6 +381,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.48-FollowerCertificateReadiness - Added identity-blind current-policy
+//     readiness to local status and management heartbeat
 //   v2.8.47-RuntimeIdentityPolicy - Rejected self-referential coordinator and
 //     witness trust pins before mutable runtime initialization
 //   v2.8.45-FollowerCertificateTelemetry - Reported source-blind aggregate
@@ -2238,6 +2245,10 @@ impl Server {
             commitment_storage.configure_record_commitment_sync(
                 self.config.memchain.commitment_coordinator_enabled,
                 self.config.memchain.commitment_sync_enabled,
+            );
+            commitment_storage.configure_record_commitment_certificate_policy(
+                self.config.memchain.commitment_witness_node_ids.len(),
+                self.config.memchain.commitment_witness_min_verified,
             );
             commitment_storage.configure_record_commitment_coordinator_lease(
                 self.config.memchain.commitment_coordinator_lease_required,
@@ -4411,6 +4422,13 @@ impl Server {
                                 .outbound_announcement_retries_succeeded_total,
                             outbound_announcement_retries_exhausted_total: status
                                 .outbound_announcement_retries_exhausted_total,
+                            certificate_policy_state: status.certificate_policy_state,
+                            certificate_policy_ready: status.certificate_policy_ready,
+                            certificate_policy_last_evaluated_at: status
+                                .certificate_policy_last_evaluated_at,
+                            certificate_witnesses_configured: status
+                                .certificate_witnesses_configured,
+                            certificate_minimum_signers: status.certificate_minimum_signers,
                             last_certificate_sync_at: status.last_certificate_sync_at,
                             last_certificate_sync_result: status.last_certificate_sync_result,
                             last_certificate_carrier_recovered_at: status

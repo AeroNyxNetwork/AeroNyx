@@ -49,6 +49,7 @@
 //!   replication and owner recovery must remain separate and authorised.
 //!
 //! ## Last Modified
+//! v2.8.48-FollowerCertificateReadiness - Re-exported typed certificate policy readiness.
 //! v2.8.45-FollowerCertificateTelemetry - Re-exported internal certificate recovery outcomes.
 //! v2.8.14-SyncObservability - Re-export follower announcement disposition telemetry.
 //! v0.2.0 - Initial MemChain storage engine
@@ -132,11 +133,13 @@ pub mod mempool;
 // ============================================
 
 // ── Storage core ──
-pub(crate) use storage::RecordCommitmentCertificateSyncDisposition;
 pub use storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
     RecordCommitmentCheckpointStatus, RecordCommitmentSyncEvent, RecordCommitmentSyncStatus,
     StorageStats,
+};
+pub(crate) use storage::{
+    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{

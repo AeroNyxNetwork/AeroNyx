@@ -158,6 +158,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.48-FollowerCertificateReadiness - Added identity-blind current-policy readiness evidence.
 //! v2.8.18-TipSupersession - Added aggregate superseded announcement evidence.
 //! v2.8.17-TipRetryQueue - Added aggregate bounded announcement retry evidence.
 //! v2.8.15-AnnouncementReceipts - Added coordinator-side aggregate delivery evidence.
@@ -433,6 +434,41 @@ impl RecordCommitmentCertificateSyncDisposition {
     }
 }
 
+/// Current follower certificate-policy readiness after exact local validation.
+///
+/// [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] These states are
+/// process-local and identity-blind. They describe whether the current audited
+/// tip satisfies the follower's current pins and threshold; they never expose
+/// certificate members, hashes, signatures, endpoints, or raw failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordCommitmentCertificatePolicyReadiness {
+    Disabled,
+    Ready,
+    WaitingForConvergence,
+    WaitingForCertificate,
+    SourceUnavailable,
+    SecurityStopped,
+    ConfigurationError,
+}
+
+impl RecordCommitmentCertificatePolicyReadiness {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Ready => "ready",
+            Self::WaitingForConvergence => "waiting_for_convergence",
+            Self::WaitingForCertificate => "waiting_for_certificate",
+            Self::SourceUnavailable => "source_unavailable",
+            Self::SecurityStopped => "security_stopped",
+            Self::ConfigurationError => "configuration_error",
+        }
+    }
+
+    pub(crate) const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
 /// Privacy-safe runtime status for commitment block replication.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecordCommitmentSyncStatus {
@@ -489,6 +525,16 @@ pub struct RecordCommitmentSyncStatus {
     pub outbound_announcement_retries_succeeded_total: u64,
     /// Peers still transiently failing after the retry budget.
     pub outbound_announcement_retries_exhausted_total: u64,
+    /// Current certificate policy state without witness identities.
+    pub certificate_policy_state: String,
+    /// Whether the exact current audited tip satisfies current local policy.
+    pub certificate_policy_ready: bool,
+    /// Most recent exact local policy evaluation time.
+    pub certificate_policy_last_evaluated_at: Option<u64>,
+    /// Count of configured external witnesses; identities are never exposed.
+    pub certificate_witnesses_configured: usize,
+    /// Minimum distinct signatures required by local follower policy.
+    pub certificate_minimum_signers: usize,
     /// Most recent completed checkpoint-certificate retrieval round.
     pub last_certificate_sync_at: Option<u64>,
     /// Latest aggregate terminal result. No source identity is retained.
@@ -721,6 +767,11 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) outbound_announcement_retries_attempted_total: u64,
     pub(crate) outbound_announcement_retries_succeeded_total: u64,
     pub(crate) outbound_announcement_retries_exhausted_total: u64,
+    pub(crate) certificate_policy_state: &'static str,
+    pub(crate) certificate_policy_ready: bool,
+    pub(crate) certificate_policy_last_evaluated_at: Option<u64>,
+    pub(crate) certificate_witnesses_configured: usize,
+    pub(crate) certificate_minimum_signers: usize,
     pub(crate) last_certificate_sync_at: Option<u64>,
     pub(crate) last_certificate_sync_result: Option<&'static str>,
     pub(crate) last_certificate_carrier_recovered_at: Option<u64>,
@@ -773,6 +824,11 @@ impl Default for RecordCommitmentSyncRuntime {
             outbound_announcement_retries_attempted_total: 0,
             outbound_announcement_retries_succeeded_total: 0,
             outbound_announcement_retries_exhausted_total: 0,
+            certificate_policy_state: "not_applicable",
+            certificate_policy_ready: false,
+            certificate_policy_last_evaluated_at: None,
+            certificate_witnesses_configured: 0,
+            certificate_minimum_signers: 0,
             last_certificate_sync_at: None,
             last_certificate_sync_result: None,
             last_certificate_carrier_recovered_at: None,

@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.59.0 - Enforced runtime identity separation for coordinator and witness trust pins.
+Modification Reason: v0.60.0 - Added identity-blind follower checkpoint-certificate policy readiness.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.59.0 - [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Rejects self-referential coordinator and witness trust pins before node startup.
+Last Modified: v0.60.0 - [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Reports whether the current audited follower tip satisfies the current local witness policy without exposing identities.
+Previous: v0.59.0 - [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Rejects self-referential coordinator and witness trust pins before node startup.
 Previous: v0.58.0 - [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Allows validated followers to configure independent witness pins for current-tip certificate verification and carrier recovery.
 Previous: v0.57.0 - [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] Reports source-blind aggregate outcomes for current-tip certificate retrieval and bounded carrier recovery.
 Previous: v0.56.0 - [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] Recovers audited current-tip certificates through bounded operator-pinned witness carriers when coordinator transport is unavailable.
@@ -99,6 +100,28 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.60 Follower checkpoint-certificate policy readiness
+
+[FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex]
+
+- A follower now reports whether its current fully audited local commitment tip
+  satisfies its current operator-pinned witness set and signature threshold.
+- `ready` is set only by the exact local cryptographic policy verifier. A
+  successful HTTP response, a signer count, or a previous certificate under
+  retired pins cannot manufacture readiness.
+- Runtime state distinguishes `disabled`, `waiting_for_convergence`,
+  `waiting_for_certificate`, `ready`, `source_unavailable`,
+  `security_stopped`, and `configuration_error`.
+- Restart and policy reconfiguration reset readiness before reevaluation.
+  Existing durable evidence may restore `ready` without a network transfer,
+  but only when it matches the current tip, pins, and threshold.
+- Public/management status exposes only state, readiness, evaluation time,
+  configured witness count, and minimum signer count. Witness identities,
+  endpoints, certificate bytes, hashes, signatures, and raw errors remain
+  outside the status contract.
+- This is process-local operational readiness. It is not consensus, global
+  finality, authority, reputation, leader election, or fork choice.
 
 ### v0.59 Runtime identity separation
 

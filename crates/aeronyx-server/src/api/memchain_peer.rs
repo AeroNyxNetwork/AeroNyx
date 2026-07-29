@@ -52,6 +52,8 @@
 //!   must still belong to the receiver's operator-pinned witness set.
 //! - Followers refresh current-tip checkpoint certificates only after signed
 //!   chain convergence; mixed-version absence never rolls back a verified tip.
+//! - Followers report identity-blind current-policy readiness only after exact
+//!   local tip, pin-set, threshold, and durable-certificate validation.
 //! - Last-hop public-IP validation on every outbound commitment request so a
 //!   rotated signed descriptor cannot redirect the node into private services.
 //! - Default-off, signed short-lived coordinator leases persisted by followers
@@ -120,6 +122,9 @@
 //!   missing/stale process audit baseline.
 //! - Imported certificates are post-startup evidence only. Never let a replayed
 //!   bundle satisfy the live startup witness threshold.
+//! - Certificate-policy readiness is a local operations signal, not consensus
+//!   or finality. `ready` requires the current audited tip to satisfy the
+//!   current local pin set and threshold; transport success alone is not enough.
 //! - Revalidate the resolved signed endpoint inside every pull helper. Candidate
 //!   filtering alone is vulnerable to concurrent descriptor replacement.
 //! - Coordinator leases require every configured witness grant. Do not describe
@@ -131,6 +136,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.48-FollowerCertificateReadiness - Reported exact current-policy readiness without witness identities.
 //! v2.8.45-FollowerCertificateTelemetry - Reported source-blind certificate recovery outcomes.
 //! v2.8.32-FollowerCertificateCarrier - Recover audited certificates from pinned witness carriers.
 //! v2.8.31-FollowerCertificateSync - Refresh audited checkpoint certificates after follower convergence.
@@ -216,7 +222,7 @@ use crate::services::memchain::storage_ops::{
 };
 use crate::services::memchain::{
     MemoryStorage, RecordCommitmentAnnouncementDisposition,
-    RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
 };
 use crate::services::PeerStore;
 
@@ -1762,30 +1768,70 @@ where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
 {
     if minimum_required_signers < 2 {
+        storage.record_commitment_certificate_policy_evaluation(
+            now_secs(),
+            RecordCommitmentCertificatePolicyReadiness::Disabled,
+        );
         return Ok(CommitmentFollowerCertificateSyncOutcome::PolicyDisabled);
     }
     if minimum_required_signers > MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1
         || allowed_witnesses.len() < minimum_required_signers
     {
+        storage.record_commitment_certificate_policy_evaluation(
+            now_secs(),
+            RecordCommitmentCertificatePolicyReadiness::ConfigurationError,
+        );
         return Err("certificate_policy_invalid".to_string());
     }
     if converged_tip_height == 0 {
+        storage.record_commitment_certificate_policy_evaluation(
+            now_secs(),
+            RecordCommitmentCertificatePolicyReadiness::WaitingForConvergence,
+        );
         return Err("certificate_local_tip_unavailable".to_string());
     }
-    let (_, _, local_tip_height, _) = storage
+    let (_, _, local_tip_height, _) = match storage
         .record_commitment_chain_checkpoint(converged_tip_height)
-        .await?;
+        .await
+    {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            storage.record_commitment_certificate_policy_evaluation(
+                now_secs(),
+                RecordCommitmentCertificatePolicyReadiness::SecurityStopped,
+            );
+            return Err(error);
+        }
+    };
     if local_tip_height != converged_tip_height {
+        storage.record_commitment_certificate_policy_evaluation(
+            now_secs(),
+            RecordCommitmentCertificatePolicyReadiness::WaitingForConvergence,
+        );
         return Err("certificate_converged_tip_changed".to_string());
     }
-    if storage
+    let certificate_already_current = match storage
         .record_commitment_checkpoint_certificate_satisfies_policy(
             converged_tip_height,
             allowed_witnesses,
             minimum_required_signers,
         )
-        .await?
+        .await
     {
+        Ok(current) => current,
+        Err(error) => {
+            storage.record_commitment_certificate_policy_evaluation(
+                now_secs(),
+                RecordCommitmentCertificatePolicyReadiness::SecurityStopped,
+            );
+            return Err(error);
+        }
+    };
+    if certificate_already_current {
+        storage.record_commitment_certificate_policy_evaluation(
+            now_secs(),
+            RecordCommitmentCertificatePolicyReadiness::Ready,
+        );
         return Ok(CommitmentFollowerCertificateSyncOutcome::AlreadyCurrent);
     }
 
@@ -1829,6 +1875,10 @@ where
                         RecordCommitmentCertificateSyncDisposition::SecurityStopped,
                         index,
                     );
+                    storage.record_commitment_certificate_policy_evaluation(
+                        now_secs(),
+                        RecordCommitmentCertificatePolicyReadiness::SecurityStopped,
+                    );
                     return Err("certificate_converged_tip_changed".to_string());
                 }
                 let disposition = if index == 0 {
@@ -1837,6 +1887,12 @@ where
                     RecordCommitmentCertificateSyncDisposition::CarrierRecovered
                 };
                 storage.record_commitment_certificate_sync_outcome(now_secs(), disposition, index);
+                let readiness = if imported.persisted {
+                    RecordCommitmentCertificatePolicyReadiness::Ready
+                } else {
+                    RecordCommitmentCertificatePolicyReadiness::WaitingForCertificate
+                };
+                storage.record_commitment_certificate_policy_evaluation(now_secs(), readiness);
                 return Ok(CommitmentFollowerCertificateSyncOutcome::Refreshed(
                     imported,
                 ));
@@ -1855,6 +1911,10 @@ where
                     RecordCommitmentCertificateSyncDisposition::SecurityStopped,
                     index,
                 );
+                storage.record_commitment_certificate_policy_evaluation(
+                    now_secs(),
+                    RecordCommitmentCertificatePolicyReadiness::SecurityStopped,
+                );
                 return Err(error);
             }
         }
@@ -1866,6 +1926,10 @@ where
         now_secs(),
         RecordCommitmentCertificateSyncDisposition::AvailabilityExhausted,
         sources.len().saturating_sub(1),
+    );
+    storage.record_commitment_certificate_policy_evaluation(
+        now_secs(),
+        RecordCommitmentCertificatePolicyReadiness::SourceUnavailable,
     );
     Err(coordinator_availability_failure
         .unwrap_or_else(|| "certificate_source_unavailable".to_string()))
@@ -6860,6 +6924,8 @@ mod tests {
             .audit_record_commitment_checkpoint_evidence()
             .await
             .unwrap();
+        destination.configure_record_commitment_sync(false, true);
+        destination.configure_record_commitment_certificate_policy(0, 1);
 
         let source_identity = Arc::new(coordinator);
         let source_peers = Arc::new(PeerStore::new());
@@ -6899,7 +6965,14 @@ mod tests {
             disabled,
             CommitmentFollowerCertificateSyncOutcome::PolicyDisabled
         );
+        let disabled_status = destination.record_commitment_sync_status();
+        assert_eq!(disabled_status.certificate_policy_state, "disabled");
+        assert!(!disabled_status.certificate_policy_ready);
+        assert!(disabled_status
+            .certificate_policy_last_evaluated_at
+            .is_some());
 
+        destination.configure_record_commitment_certificate_policy(2, 2);
         let imported = sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
             &destination,
             &destination_peers,
@@ -6926,8 +6999,17 @@ mod tests {
                 .checkpoint_certificates,
             1
         );
+        let imported_status = destination.record_commitment_sync_status();
+        assert_eq!(imported_status.certificate_policy_state, "ready");
+        assert!(imported_status.certificate_policy_ready);
+        assert_eq!(imported_status.certificate_witnesses_configured, 2);
+        assert_eq!(imported_status.certificate_minimum_signers, 2);
+        assert!(imported_status
+            .certificate_policy_last_evaluated_at
+            .is_some());
 
         let replacement_witness = IdentityKeyPair::generate().public_key_bytes();
+        destination.configure_record_commitment_certificate_policy(2, 2);
         let rotated_policy_error =
             sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
                 &destination,
@@ -6946,6 +7028,9 @@ mod tests {
             rotated_policy_error, "certificate_member_not_pinned",
             "a same-height certificate under retired pins must not be current"
         );
+        let rotated_status = destination.record_commitment_sync_status();
+        assert_eq!(rotated_status.certificate_policy_state, "security_stopped");
+        assert!(!rotated_status.certificate_policy_ready);
 
         let third_witness = IdentityKeyPair::generate().public_key_bytes();
         let strict_witness_ids = [witness_ids[0], witness_ids[1], third_witness];
@@ -7035,6 +7120,7 @@ mod tests {
             .await
             .unwrap();
         carrier_destination.configure_record_commitment_sync(false, true);
+        carrier_destination.configure_record_commitment_certificate_policy(2, 2);
         let carrier_destination_peers = PeerStore::new();
         let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable_address = unavailable_listener.local_addr().unwrap();
@@ -7085,6 +7171,8 @@ mod tests {
         assert!(carrier_status
             .last_certificate_carrier_recovered_at
             .is_some());
+        assert_eq!(carrier_status.certificate_policy_state, "ready");
+        assert!(carrier_status.certificate_policy_ready);
 
         // A malformed primary response is a security failure, not an
         // availability event. The valid carrier must not mask it.
@@ -7113,6 +7201,7 @@ mod tests {
             .await
             .unwrap();
         guarded_destination.configure_record_commitment_sync(false, true);
+        guarded_destination.configure_record_commitment_certificate_policy(2, 2);
         let guarded_destination_peers = PeerStore::new();
         admit_peer(
             &guarded_destination_peers,
@@ -7150,12 +7239,15 @@ mod tests {
             guarded_status.last_certificate_sync_result.as_deref(),
             Some("security_stopped")
         );
+        assert_eq!(guarded_status.certificate_policy_state, "security_stopped");
+        assert!(!guarded_status.certificate_policy_ready);
 
         malformed_server.abort();
         let _ = malformed_server.await;
         carrier_server.abort();
         let _ = carrier_server.await;
 
+        destination.configure_record_commitment_certificate_policy(2, 2);
         let already_current =
             sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
                 &destination,
@@ -7174,5 +7266,8 @@ mod tests {
             already_current,
             CommitmentFollowerCertificateSyncOutcome::AlreadyCurrent
         );
+        let already_current_status = destination.record_commitment_sync_status();
+        assert_eq!(already_current_status.certificate_policy_state, "ready");
+        assert!(already_current_status.certificate_policy_ready);
     }
 }

@@ -165,6 +165,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.48-FollowerCertificateReadiness - Track exact follower certificate-policy readiness.
 //! v2.8.31-FollowerCertificatePolicy - Validate retained certificates against current follower pins.
 //! v2.8.18-TipSupersession - Prioritize fresh tips without delivery claims.
 //! v2.8.17-TipRetryQueue - Track retry attempts, recoveries, and exhaustion.
@@ -216,7 +217,8 @@ use aeronyx_core::protocol::memchain::{
 
 use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
-    RecordCommitmentCertificateSyncDisposition, RecordCommitmentCheckpointCertificateAnchorConfig,
+    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentCheckpointCertificateAnchorConfig,
     RecordCommitmentCheckpointCertificateAnchorRuntime,
     RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
     RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
@@ -4052,6 +4054,7 @@ impl MemoryStorage {
                 runtime.role = "follower";
                 runtime.state = "starting";
                 runtime.enabled = true;
+                runtime.certificate_policy_state = "disabled";
             }
             (false, false) => {}
             (true, true) => {
@@ -4059,6 +4062,41 @@ impl MemoryStorage {
                 runtime.last_error_code = Some("role_conflict".to_string());
             }
         }
+    }
+
+    /// Configures identity-blind follower certificate-policy readiness.
+    ///
+    /// [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Only aggregate
+    /// count and threshold enter runtime status. The caller has already
+    /// validated every identity and must never pass pins into this surface.
+    pub fn configure_record_commitment_certificate_policy(
+        &self,
+        witnesses_configured: usize,
+        minimum_signers: usize,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled || runtime.role != "follower" {
+            runtime.certificate_policy_state = "not_applicable";
+            runtime.certificate_policy_ready = false;
+            runtime.certificate_policy_last_evaluated_at = None;
+            runtime.certificate_witnesses_configured = 0;
+            runtime.certificate_minimum_signers = 0;
+            return;
+        }
+
+        runtime.certificate_witnesses_configured = witnesses_configured;
+        runtime.certificate_minimum_signers = minimum_signers;
+        runtime.certificate_policy_ready = false;
+        runtime.certificate_policy_last_evaluated_at = None;
+        runtime.certificate_policy_state = if minimum_signers < 2 {
+            "disabled"
+        } else if witnesses_configured < minimum_signers
+            || minimum_signers > MAX_CHECKPOINT_CERTIFICATE_SIGNERS
+        {
+            "configuration_error"
+        } else {
+            "waiting_for_convergence"
+        };
     }
 
     /// Configures and verifies `SQLite` commit durability before chain audit.
@@ -4924,6 +4962,31 @@ impl MemoryStorage {
         }
     }
 
+    /// Records one exact local follower certificate-policy evaluation.
+    ///
+    /// This is separate from transport outcome counters: an already-current
+    /// durable certificate can become `ready` without any network request,
+    /// while a successful response is ready only after durable local policy
+    /// validation succeeds.
+    ///
+    /// [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex]
+    pub(crate) fn record_commitment_certificate_policy_evaluation(
+        &self,
+        now: u64,
+        readiness: RecordCommitmentCertificatePolicyReadiness,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled || runtime.role != "follower" {
+            return;
+        }
+        let observed_at = runtime
+            .certificate_policy_last_evaluated_at
+            .map_or(now, |previous| previous.max(now));
+        runtime.certificate_policy_last_evaluated_at = Some(observed_at);
+        runtime.certificate_policy_state = readiness.as_str();
+        runtime.certificate_policy_ready = readiness.is_ready();
+    }
+
     /// Records a fail-closed follower error using only a stable allow-listed
     /// code. Free text, URLs, identities, and endpoints are never retained.
     pub fn record_commitment_sync_failure(
@@ -5008,6 +5071,12 @@ impl MemoryStorage {
                 .outbound_announcement_retries_succeeded_total,
             outbound_announcement_retries_exhausted_total: runtime
                 .outbound_announcement_retries_exhausted_total,
+            certificate_policy_state: runtime.certificate_policy_state.to_string(),
+            certificate_policy_ready: runtime.certificate_policy_ready,
+            certificate_policy_last_evaluated_at: runtime
+                .certificate_policy_last_evaluated_at,
+            certificate_witnesses_configured: runtime.certificate_witnesses_configured,
+            certificate_minimum_signers: runtime.certificate_minimum_signers,
             last_certificate_sync_at: runtime.last_certificate_sync_at,
             last_certificate_sync_result: runtime
                 .last_certificate_sync_result
@@ -5035,7 +5104,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; no coordinator or carrier identity, witness set, endpoint, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; certificate recovery counters are process-local operations evidence, not authority, reputation, consensus, or fork choice",
+                "aggregate runtime only; certificate policy exposes state, readiness, witness count, threshold, and evaluation time but no coordinator or carrier identity, witness set, endpoint, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; certificate recovery counters are process-local operations evidence, not authority, reputation, consensus, or fork choice",
         }
     }
 
@@ -8453,8 +8522,16 @@ mod tests {
         assert!(!initial.enabled);
         assert_eq!(initial.last_trigger, "none");
         assert_eq!(initial.announcements_accepted_total, 0);
+        assert_eq!(initial.certificate_policy_state, "not_applicable");
+        assert!(!initial.certificate_policy_ready);
 
         storage.configure_record_commitment_sync(false, true);
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .certificate_policy_state,
+            "disabled"
+        );
         storage.record_commitment_sync_attempt(100);
         storage.record_commitment_sync_failure(
             101,
@@ -8621,6 +8698,64 @@ mod tests {
                 .certificate_sync_rounds_total,
             0
         );
+    }
+
+    #[test]
+    fn test_certificate_policy_readiness_requires_exact_local_validation() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.configure_record_commitment_sync(false, true);
+
+        storage.configure_record_commitment_certificate_policy(0, 1);
+        let disabled = storage.record_commitment_sync_status();
+        assert_eq!(disabled.certificate_policy_state, "disabled");
+        assert!(!disabled.certificate_policy_ready);
+        assert_eq!(disabled.certificate_witnesses_configured, 0);
+        assert_eq!(disabled.certificate_minimum_signers, 1);
+
+        storage.configure_record_commitment_certificate_policy(2, 2);
+        let waiting = storage.record_commitment_sync_status();
+        assert_eq!(waiting.certificate_policy_state, "waiting_for_convergence");
+        assert!(!waiting.certificate_policy_ready);
+        assert_eq!(waiting.certificate_witnesses_configured, 2);
+        assert_eq!(waiting.certificate_minimum_signers, 2);
+
+        storage.record_commitment_certificate_policy_evaluation(
+            100,
+            RecordCommitmentCertificatePolicyReadiness::Ready,
+        );
+        let ready = storage.record_commitment_sync_status();
+        assert_eq!(ready.certificate_policy_state, "ready");
+        assert!(ready.certificate_policy_ready);
+        assert_eq!(ready.certificate_policy_last_evaluated_at, Some(100));
+
+        storage.record_commitment_certificate_policy_evaluation(
+            90,
+            RecordCommitmentCertificatePolicyReadiness::WaitingForCertificate,
+        );
+        let invalidated = storage.record_commitment_sync_status();
+        assert_eq!(
+            invalidated.certificate_policy_state,
+            "waiting_for_certificate"
+        );
+        assert!(!invalidated.certificate_policy_ready);
+        assert_eq!(
+            invalidated.certificate_policy_last_evaluated_at,
+            Some(100),
+            "wall-clock rollback must not regress the diagnostic timestamp"
+        );
+
+        storage.configure_record_commitment_certificate_policy(1, 2);
+        let invalid = storage.record_commitment_sync_status();
+        assert_eq!(invalid.certificate_policy_state, "configuration_error");
+        assert!(!invalid.certificate_policy_ready);
+
+        storage.configure_record_commitment_sync(true, false);
+        storage.configure_record_commitment_certificate_policy(3, 2);
+        let coordinator = storage.record_commitment_sync_status();
+        assert_eq!(coordinator.certificate_policy_state, "not_applicable");
+        assert!(!coordinator.certificate_policy_ready);
+        assert_eq!(coordinator.certificate_witnesses_configured, 0);
+        assert_eq!(coordinator.certificate_minimum_signers, 0);
     }
 
     #[test]
