@@ -161,6 +161,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.57-CertificatePersistenceTruth - Separated verified-unpersisted follower outcomes.
 //! v2.8.56-StickySecurityEvidence - Retained role-isolated security-stop times across later success.
 //! v2.8.55-CertificateBackfillTelemetry - Added coordinator-only, source-blind recovery evidence.
 //! v2.8.53-TypedCarrierCircuit - Added isolated certificate-carrier circuit aggregates.
@@ -427,6 +428,7 @@ pub struct RecordCommitmentSyncEvent {
 pub(crate) enum RecordCommitmentCertificateSyncDisposition {
     Coordinator,
     CarrierRecovered,
+    VerifiedUnpersisted,
     AvailabilityExhausted,
     SecurityStopped,
 }
@@ -436,6 +438,7 @@ impl RecordCommitmentCertificateSyncDisposition {
         match self {
             Self::Coordinator => "coordinator",
             Self::CarrierRecovered => "carrier_recovered",
+            Self::VerifiedUnpersisted => "verified_unpersisted",
             Self::AvailabilityExhausted => "availability_exhausted",
             Self::SecurityStopped => "security_stopped",
         }
@@ -650,6 +653,8 @@ pub struct RecordCommitmentSyncStatus {
     pub certificate_carrier_attempts_total: u64,
     /// Rounds recovered through one already-pinned certificate carrier.
     pub certificate_carrier_recoveries_total: u64,
+    /// Verified rounds deferred because local state changed before persistence.
+    pub certificate_verified_unpersisted_total: u64,
     /// Rounds where the coordinator and every bounded carrier were unavailable.
     pub certificate_availability_exhausted_total: u64,
     /// Rounds stopped by a security or protocol-integrity failure.
@@ -926,6 +931,7 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) certificate_coordinator_success_total: u64,
     pub(crate) certificate_carrier_attempts_total: u64,
     pub(crate) certificate_carrier_recoveries_total: u64,
+    pub(crate) certificate_verified_unpersisted_total: u64,
     pub(crate) certificate_availability_exhausted_total: u64,
     pub(crate) certificate_security_stops_total: u64,
     pub(crate) last_certificate_security_stop_at: Option<u64>,
@@ -1013,6 +1019,7 @@ impl Default for RecordCommitmentSyncRuntime {
             certificate_coordinator_success_total: 0,
             certificate_carrier_attempts_total: 0,
             certificate_carrier_recoveries_total: 0,
+            certificate_verified_unpersisted_total: 0,
             certificate_availability_exhausted_total: 0,
             certificate_security_stops_total: 0,
             last_certificate_security_stop_at: None,

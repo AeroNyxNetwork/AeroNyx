@@ -158,6 +158,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.57-CertificatePersistenceTruth - Report verified-but-unpersisted follower evidence honestly.
 //! v2.8.54-CertificateCarrierRecovery - Unified fail-closed certificate carrier recovery.
 //! v2.8.53-TypedCarrierCircuit - Isolated block and certificate circuit domains.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Added source-blind circuit health aggregates.
@@ -671,6 +672,34 @@ pub struct CommitmentCertificateImportOutcome {
     pub required_signers: usize,
     /// Whether storage contains a fully re-audited certificate afterward.
     pub persisted: bool,
+}
+
+/// Transport class used only to classify a verified follower certificate result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitmentFollowerCertificateSource {
+    Coordinator,
+    PinnedCarrier,
+}
+
+/// Maps certificate source and durable outcome into one telemetry disposition.
+///
+/// [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] Verification proves that
+/// a response is authentic; it does not prove recovery until the exact current
+/// policy certificate is durable locally. Keeping this mapping in one pure
+/// function prevents direct and carrier paths from drifting apart.
+const fn follower_certificate_sync_disposition(
+    source: CommitmentFollowerCertificateSource,
+    persisted: bool,
+) -> RecordCommitmentCertificateSyncDisposition {
+    match (source, persisted) {
+        (CommitmentFollowerCertificateSource::Coordinator, true) => {
+            RecordCommitmentCertificateSyncDisposition::Coordinator
+        }
+        (CommitmentFollowerCertificateSource::PinnedCarrier, true) => {
+            RecordCommitmentCertificateSyncDisposition::CarrierRecovered
+        }
+        (_, false) => RecordCommitmentCertificateSyncDisposition::VerifiedUnpersisted,
+    }
 }
 
 /// Source-blind terminal state of one coordinator certificate recovery round.
@@ -2519,7 +2548,10 @@ where
                 );
                 storage.record_commitment_certificate_sync_outcome(
                     now_secs(),
-                    RecordCommitmentCertificateSyncDisposition::Coordinator,
+                    follower_certificate_sync_disposition(
+                        CommitmentFollowerCertificateSource::Coordinator,
+                        imported.persisted,
+                    ),
                     0,
                 );
                 let readiness = if imported.persisted {
@@ -2597,7 +2629,10 @@ where
             }
             storage.record_commitment_certificate_sync_outcome(
                 now_secs(),
-                RecordCommitmentCertificateSyncDisposition::CarrierRecovered,
+                follower_certificate_sync_disposition(
+                    CommitmentFollowerCertificateSource::PinnedCarrier,
+                    imported.persisted,
+                ),
                 carrier_round.carrier_attempts,
             );
             let readiness = if imported.persisted {
@@ -5223,6 +5258,36 @@ mod tests {
 
     fn allow_test_endpoint(_endpoint: &str) -> bool {
         true
+    }
+
+    #[test]
+    fn follower_certificate_telemetry_requires_durable_persistence_for_success() {
+        // [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] Both transport
+        // paths must report an authenticated-but-deferred import identically;
+        // only durable persistence may count as direct or carrier recovery.
+        assert_eq!(
+            follower_certificate_sync_disposition(
+                CommitmentFollowerCertificateSource::Coordinator,
+                true,
+            ),
+            RecordCommitmentCertificateSyncDisposition::Coordinator
+        );
+        assert_eq!(
+            follower_certificate_sync_disposition(
+                CommitmentFollowerCertificateSource::PinnedCarrier,
+                true,
+            ),
+            RecordCommitmentCertificateSyncDisposition::CarrierRecovered
+        );
+        for source in [
+            CommitmentFollowerCertificateSource::Coordinator,
+            CommitmentFollowerCertificateSource::PinnedCarrier,
+        ] {
+            assert_eq!(
+                follower_certificate_sync_disposition(source, false),
+                RecordCommitmentCertificateSyncDisposition::VerifiedUnpersisted
+            );
+        }
     }
 
     #[test]
@@ -9110,6 +9175,12 @@ mod tests {
         assert!(imported_status.certificate_policy_ready);
         assert_eq!(imported_status.certificate_witnesses_configured, 2);
         assert_eq!(imported_status.certificate_minimum_signers, 2);
+        assert_eq!(imported_status.certificate_sync_rounds_total, 1);
+        assert_eq!(imported_status.certificate_coordinator_success_total, 1);
+        assert_eq!(
+            imported_status.certificate_verified_unpersisted_total,
+            0
+        );
         assert_eq!(
             imported_status.certificate_policy_evaluated_tip_height,
             Some(1)
@@ -9317,6 +9388,7 @@ mod tests {
         assert_eq!(carrier_status.certificate_coordinator_success_total, 0);
         assert_eq!(carrier_status.certificate_carrier_attempts_total, 1);
         assert_eq!(carrier_status.certificate_carrier_recoveries_total, 1);
+        assert_eq!(carrier_status.certificate_verified_unpersisted_total, 0);
         assert_eq!(carrier_status.certificate_availability_exhausted_total, 0);
         assert_eq!(carrier_status.certificate_security_stops_total, 0);
         assert_eq!(
@@ -9393,6 +9465,7 @@ mod tests {
         assert_eq!(guarded_status.certificate_sync_rounds_total, 1);
         assert_eq!(guarded_status.certificate_carrier_attempts_total, 0);
         assert_eq!(guarded_status.certificate_carrier_recoveries_total, 0);
+        assert_eq!(guarded_status.certificate_verified_unpersisted_total, 0);
         assert_eq!(guarded_status.certificate_security_stops_total, 1);
         assert_eq!(
             guarded_status.last_certificate_sync_result.as_deref(),

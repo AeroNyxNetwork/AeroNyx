@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.70.0 - Preserved role-isolated security-stop evidence after later recovery.
+Modification Reason: v0.71.0 - Separated verified certificate transport from durable follower recovery.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.70.0 - [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] Preserves source-blind security-stop times when later retrievals succeed.
+Last Modified: v0.71.0 - [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] Reports authenticated-but-unpersisted follower certificates without claiming durable recovery.
+Previous: v0.70.0 - [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] Preserves source-blind security-stop times when later retrievals succeed.
 Previous: v0.69.0 - [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Reports coordinator certificate backfill without exposing carrier identity or mixing follower state.
 Previous: v0.68.0 - [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Prevents later certificate carriers from masking security failures and cools repeated coordinator-backfill outages.
 Previous: v0.67.0 - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Reuses one circuit algorithm while compile-time domains and runtime ownership isolate block-page and certificate carrier health.
@@ -102,6 +103,33 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.71 Verified transport is not durable certificate recovery
+
+[CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex]
+
+- Follower certificate synchronization now reports `verified_unpersisted` when
+  the response passes identity, signature, canonicalization, membership,
+  threshold, and exact-tip checks but a concurrent local tip or policy change
+  prevents durable persistence.
+- Direct coordinator retrieval counts as `coordinator` only after the exact
+  current-policy certificate is durable. Pinned-carrier retrieval counts as
+  `carrier_recovered` only under the same durable condition; an unpersisted
+  result cannot advance either success counter or the last carrier-recovery
+  timestamp.
+- One pure source-by-persistence classifier is shared by both branches, so a
+  future transport change cannot silently restore the old semantic mismatch.
+- Every completed follower certificate round has exactly one terminal outcome:
+  `coordinator`, `carrier_recovered`, `verified_unpersisted`,
+  `availability_exhausted`, or `security_stopped`. The round counter equals the
+  sum of those five mutually exclusive counters.
+- Local status and signed management heartbeat expose the new aggregate counter
+  only. They still exclude coordinator/carrier identity, endpoint, witness set,
+  certificate frame, hash, signature, raw error, record, payload, route, and
+  client metadata.
+- A verified-but-unpersisted result waits for the next bounded reconciliation.
+  It grants no production authority, mutates no commitment block, ranks no peer,
+  and establishes neither consensus, finality, nor fork choice.
 
 ### v0.70 Sticky, role-isolated security evidence
 

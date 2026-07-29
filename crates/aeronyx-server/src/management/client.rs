@@ -64,6 +64,9 @@
 //     carrier identity, witness set, endpoint, cryptographic frame, or error.
 //   - [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] Security-stop timestamps
 //     remain source-blind and survive later successful recovery observations.
+//   - [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] A verified response
+//     that loses a current-tip/policy persistence race is reported separately
+//     and never counted as coordinator success or carrier recovery.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -98,6 +101,7 @@
 //   v2.8.53        - Added isolated certificate-carrier circuit health aggregates
 //   v2.8.55        - Added coordinator-only certificate-backfill aggregates
 //   v2.8.56        - Added role-isolated sticky security-stop timestamps
+//   v2.8.57        - Added verified-unpersisted follower certificate outcomes
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -320,6 +324,8 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub certificate_carrier_attempts_total: u64,
     /// Rounds recovered through one already-pinned carrier.
     pub certificate_carrier_recoveries_total: u64,
+    /// Verified rounds deferred before durable current-policy persistence.
+    pub certificate_verified_unpersisted_total: u64,
     /// Rounds where all bounded certificate sources were unavailable.
     pub certificate_availability_exhausted_total: u64,
     /// Rounds stopped by security or protocol-integrity failures.
@@ -1050,10 +1056,11 @@ mod tests {
                 last_certificate_sync_at: Some(112),
                 last_certificate_sync_result: Some("carrier_recovered".to_string()),
                 last_certificate_carrier_recovered_at: Some(112),
-                certificate_sync_rounds_total: 5,
+                certificate_sync_rounds_total: 6,
                 certificate_coordinator_success_total: 2,
                 certificate_carrier_attempts_total: 4,
                 certificate_carrier_recoveries_total: 1,
+                certificate_verified_unpersisted_total: 1,
                 certificate_availability_exhausted_total: 1,
                 certificate_security_stops_total: 1,
                 last_certificate_security_stop_at: Some(110),
@@ -1220,10 +1227,11 @@ mod tests {
         assert_eq!(sync["last_certificate_sync_at"], 112);
         assert_eq!(sync["last_certificate_sync_result"], "carrier_recovered");
         assert_eq!(sync["last_certificate_carrier_recovered_at"], 112);
-        assert_eq!(sync["certificate_sync_rounds_total"], 5);
+        assert_eq!(sync["certificate_sync_rounds_total"], 6);
         assert_eq!(sync["certificate_coordinator_success_total"], 2);
         assert_eq!(sync["certificate_carrier_attempts_total"], 4);
         assert_eq!(sync["certificate_carrier_recoveries_total"], 1);
+        assert_eq!(sync["certificate_verified_unpersisted_total"], 1);
         assert_eq!(sync["certificate_availability_exhausted_total"], 1);
         assert_eq!(sync["certificate_security_stops_total"], 1);
         assert_eq!(sync["last_certificate_security_stop_at"], 110);
@@ -1349,6 +1357,7 @@ mod tests {
                 "signature",
                 "block_page_security_stop_reason",
                 "certificate_security_stop_reason",
+                "certificate_unpersisted_source",
                 "coordinator_certificate_backfill_security_stop_reason",
             ] {
                 assert!(

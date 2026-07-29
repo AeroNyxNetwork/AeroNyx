@@ -167,6 +167,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.57-CertificatePersistenceTruth - Distinguish verified-unpersisted follower outcomes.
 //! v2.8.56-StickySecurityEvidence - Retain source-blind security-stop times across later success.
 //! v2.8.55-CertificateBackfillTelemetry - Record atomic coordinator-only recovery aggregates.
 //! v2.8.53-TypedCarrierCircuit - Kept block and certificate circuit telemetry independent.
@@ -5105,6 +5106,14 @@ impl MemoryStorage {
                     .certificate_carrier_recoveries_total
                     .saturating_add(1);
             }
+            RecordCommitmentCertificateSyncDisposition::VerifiedUnpersisted => {
+                // [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] A
+                // cryptographically valid response is not a recovery until the
+                // exact current-policy certificate is durable locally.
+                runtime.certificate_verified_unpersisted_total = runtime
+                    .certificate_verified_unpersisted_total
+                    .saturating_add(1);
+            }
             RecordCommitmentCertificateSyncDisposition::AvailabilityExhausted => {
                 runtime.certificate_availability_exhausted_total = runtime
                     .certificate_availability_exhausted_total
@@ -5357,6 +5366,8 @@ impl MemoryStorage {
             certificate_coordinator_success_total: runtime.certificate_coordinator_success_total,
             certificate_carrier_attempts_total: runtime.certificate_carrier_attempts_total,
             certificate_carrier_recoveries_total: runtime.certificate_carrier_recoveries_total,
+            certificate_verified_unpersisted_total: runtime
+                .certificate_verified_unpersisted_total,
             certificate_availability_exhausted_total: runtime
                 .certificate_availability_exhausted_total,
             certificate_security_stops_total: runtime.certificate_security_stops_total,
@@ -9137,6 +9148,11 @@ mod tests {
             1,
         );
         storage.record_commitment_certificate_sync_outcome(
+            115,
+            RecordCommitmentCertificateSyncDisposition::VerifiedUnpersisted,
+            2,
+        );
+        storage.record_commitment_certificate_sync_outcome(
             120,
             RecordCommitmentCertificateSyncDisposition::SecurityStopped,
             1,
@@ -9155,10 +9171,11 @@ mod tests {
         );
         assert_eq!(status.last_certificate_carrier_recovered_at, Some(110));
         assert_eq!(status.last_certificate_security_stop_at, Some(120));
-        assert_eq!(status.certificate_sync_rounds_total, 5);
+        assert_eq!(status.certificate_sync_rounds_total, 6);
         assert_eq!(status.certificate_coordinator_success_total, 2);
-        assert_eq!(status.certificate_carrier_attempts_total, 4);
+        assert_eq!(status.certificate_carrier_attempts_total, 6);
         assert_eq!(status.certificate_carrier_recoveries_total, 1);
+        assert_eq!(status.certificate_verified_unpersisted_total, 1);
         assert_eq!(status.certificate_availability_exhausted_total, 1);
         assert_eq!(status.certificate_security_stops_total, 1);
         assert_eq!(
@@ -9166,6 +9183,7 @@ mod tests {
             status
                 .certificate_coordinator_success_total
                 .saturating_add(status.certificate_carrier_recoveries_total)
+                .saturating_add(status.certificate_verified_unpersisted_total)
                 .saturating_add(status.certificate_availability_exhausted_total)
                 .saturating_add(status.certificate_security_stops_total)
         );

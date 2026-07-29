@@ -386,6 +386,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.57-CertificatePersistenceTruth - Kept verified-but-unpersisted follower
+//     evidence separate from durable coordinator/carrier recovery.
 //   v2.8.56-StickySecurityEvidence - Preserved role-isolated security-stop times
 //   v2.8.55-CertificateBackfillTelemetry - Published role-isolated,
 //     source-blind coordinator certificate recovery evidence
@@ -4491,6 +4493,8 @@ impl Server {
                                 .certificate_carrier_attempts_total,
                             certificate_carrier_recoveries_total: status
                                 .certificate_carrier_recoveries_total,
+                            certificate_verified_unpersisted_total: status
+                                .certificate_verified_unpersisted_total,
                             certificate_availability_exhausted_total: status
                                 .certificate_availability_exhausted_total,
                             certificate_security_stops_total: status
