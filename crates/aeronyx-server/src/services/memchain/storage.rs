@@ -161,6 +161,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.53-TypedCarrierCircuit - Added isolated certificate-carrier circuit aggregates.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Added source-blind circuit health aggregates.
 //! v2.8.49-FollowerCertificateTipBinding - Bound readiness to the exact audited tip height.
 //! v2.8.48-FollowerCertificateReadiness - Added identity-blind current-policy readiness evidence.
@@ -623,6 +624,12 @@ pub struct RecordCommitmentSyncStatus {
     pub certificate_availability_exhausted_total: u64,
     /// Rounds stopped by a security or protocol-integrity failure.
     pub certificate_security_stops_total: u64,
+    /// Fixed certificate-carrier slots cooling at the latest observation.
+    pub certificate_carrier_cooling_slots: usize,
+    /// Certificate-carrier selections skipped during anonymous cooldown.
+    pub certificate_carrier_cooldown_skips_total: u64,
+    /// Certificate-carrier requests started after anonymous cooldown expiry.
+    pub certificate_carrier_half_open_attempts_total: u64,
     /// Most recent pull attempt time.
     pub last_attempt_at: Option<u64>,
     /// Most recent successfully verified page time.
@@ -864,6 +871,9 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) certificate_carrier_recoveries_total: u64,
     pub(crate) certificate_availability_exhausted_total: u64,
     pub(crate) certificate_security_stops_total: u64,
+    pub(crate) certificate_carrier_cooling_slots: usize,
+    pub(crate) certificate_carrier_cooldown_skips_total: u64,
+    pub(crate) certificate_carrier_half_open_attempts_total: u64,
     pub(crate) last_attempt_at: Option<u64>,
     pub(crate) last_success_at: Option<u64>,
     pub(crate) last_failure_at: Option<u64>,
@@ -934,6 +944,9 @@ impl Default for RecordCommitmentSyncRuntime {
             certificate_carrier_recoveries_total: 0,
             certificate_availability_exhausted_total: 0,
             certificate_security_stops_total: 0,
+            certificate_carrier_cooling_slots: 0,
+            certificate_carrier_cooldown_skips_total: 0,
+            certificate_carrier_half_open_attempts_total: 0,
             last_attempt_at: None,
             last_success_at: None,
             last_failure_at: None,

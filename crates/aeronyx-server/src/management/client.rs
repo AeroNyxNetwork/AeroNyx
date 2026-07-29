@@ -56,6 +56,9 @@
 //   - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Circuit health
 //     exposes only anonymous cooling-slot, skip, and half-open totals. Never
 //     add slot order, peer identity, endpoint, error, or timing dimensions.
+//   - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Block-page and certificate
+//     circuit aggregates are independent domains. Never combine them into
+//     per-peer health, routing reputation, authority, or fork-choice signals.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -87,6 +90,7 @@
 //   v2.8.48        - Added identity-blind follower certificate policy readiness
 //   v2.8.49        - Bound certificate readiness to the exact audited tip
 //   v2.8.52        - Added source-blind block-carrier circuit health aggregates
+//   v2.8.53        - Added isolated certificate-carrier circuit health aggregates
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -311,6 +315,12 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub certificate_availability_exhausted_total: u64,
     /// Rounds stopped by security or protocol-integrity failures.
     pub certificate_security_stops_total: u64,
+    /// Fixed certificate-carrier slots cooling at the latest observation.
+    pub certificate_carrier_cooling_slots: usize,
+    /// Anonymous certificate-carrier selections skipped during cooldown.
+    pub certificate_carrier_cooldown_skips_total: u64,
+    /// Anonymous certificate-carrier requests attempted after cooldown.
+    pub certificate_carrier_half_open_attempts_total: u64,
     /// Most recent follower pull attempt.
     pub last_attempt_at: Option<u64>,
     /// Most recent successful verified response page.
@@ -1009,6 +1019,9 @@ mod tests {
                 certificate_carrier_recoveries_total: 1,
                 certificate_availability_exhausted_total: 1,
                 certificate_security_stops_total: 1,
+                certificate_carrier_cooling_slots: 2,
+                certificate_carrier_cooldown_skips_total: 5,
+                certificate_carrier_half_open_attempts_total: 3,
                 last_attempt_at: Some(99),
                 last_success_at: Some(100),
                 last_failure_at: Some(110),
@@ -1160,6 +1173,9 @@ mod tests {
         assert_eq!(sync["certificate_carrier_recoveries_total"], 1);
         assert_eq!(sync["certificate_availability_exhausted_total"], 1);
         assert_eq!(sync["certificate_security_stops_total"], 1);
+        assert_eq!(sync["certificate_carrier_cooling_slots"], 2);
+        assert_eq!(sync["certificate_carrier_cooldown_skips_total"], 5);
+        assert_eq!(sync["certificate_carrier_half_open_attempts_total"], 3);
         assert_eq!(sync["last_attempt_at"], 99);
         assert_eq!(sync["last_error_code"], "request_timeout");
         let checkpoint = &value["record_commitment_checkpoint"];

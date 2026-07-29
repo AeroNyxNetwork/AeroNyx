@@ -130,6 +130,7 @@
 //!   routes, message identifiers, payloads, endpoints, or user identities.
 //!
 //! ## Modification History
+//! v2.8.53-TypedCarrierCircuit - Added isolated certificate-carrier circuit scheduling counters.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Added anonymous carrier circuit scheduling counters.
 //! v2.8.45-FollowerCertificateTelemetry - Added source-blind recovery outcome counters.
 //! v2.8.18-TipSupersession - Added aggregate superseded announcement rounds.
@@ -166,6 +167,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.53-TypedCarrierCircuit - Kept block and certificate circuit telemetry independent.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Report anonymous cooling, skip, and half-open state.
 //! v2.8.49-FollowerCertificateTipBinding - Prevent stale readiness after the audited tip advances.
 //! v2.8.48-FollowerCertificateReadiness - Track exact follower certificate-policy readiness.
@@ -5017,6 +5019,35 @@ impl MemoryStorage {
             .saturating_add(half_open_attempts);
     }
 
+    /// Records one identity-blind certificate-carrier circuit observation.
+    ///
+    /// [CERTIFICATE-CARRIER-CIRCUIT 2026-07-29 by Codex] This state is
+    /// intentionally separate from block-page carrier health. It stores only a
+    /// current anonymous cooling-slot gauge and saturating process counters;
+    /// no source identity, slot order, endpoint, timing, error, certificate, or
+    /// chain material can enter the runtime contract.
+    pub(crate) fn record_commitment_certificate_carrier_circuit_observation(
+        &self,
+        cooling_slots: usize,
+        cooldown_skips: usize,
+        half_open_attempts: usize,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled || runtime.role != "follower" {
+            return;
+        }
+        let cooldown_skips = u64::try_from(cooldown_skips).unwrap_or(u64::MAX);
+        let half_open_attempts = u64::try_from(half_open_attempts).unwrap_or(u64::MAX);
+
+        runtime.certificate_carrier_cooling_slots = cooling_slots;
+        runtime.certificate_carrier_cooldown_skips_total = runtime
+            .certificate_carrier_cooldown_skips_total
+            .saturating_add(cooldown_skips);
+        runtime.certificate_carrier_half_open_attempts_total = runtime
+            .certificate_carrier_half_open_attempts_total
+            .saturating_add(half_open_attempts);
+    }
+
     /// Records one terminal checkpoint-certificate retrieval outcome.
     ///
     /// [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] This method keeps
@@ -5242,6 +5273,11 @@ impl MemoryStorage {
             certificate_availability_exhausted_total: runtime
                 .certificate_availability_exhausted_total,
             certificate_security_stops_total: runtime.certificate_security_stops_total,
+            certificate_carrier_cooling_slots: runtime.certificate_carrier_cooling_slots,
+            certificate_carrier_cooldown_skips_total: runtime
+                .certificate_carrier_cooldown_skips_total,
+            certificate_carrier_half_open_attempts_total: runtime
+                .certificate_carrier_half_open_attempts_total,
             last_attempt_at: runtime.last_attempt_at,
             last_success_at: runtime.last_success_at,
             last_failure_at: runtime.last_failure_at,
@@ -5256,7 +5292,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; block-page and certificate recovery expose source-blind terminal results, bounded attempt counts, anonymous circuit cooling/skip/half-open aggregates, and monotonic process-local timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; these counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
+                "aggregate runtime only; block-page and certificate recovery expose source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, and monotonic process-local timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; these counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
         }
     }
 
@@ -8893,6 +8929,42 @@ mod tests {
         assert_eq!(coordinator.block_carrier_cooling_slots, 0);
         assert_eq!(coordinator.block_carrier_cooldown_skips_total, 0);
         assert_eq!(coordinator.block_carrier_half_open_attempts_total, 0);
+    }
+
+    #[test]
+    fn test_certificate_carrier_circuit_runtime_is_isolated_and_follower_only() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+
+        storage.record_commitment_certificate_carrier_circuit_observation(2, 3, 1);
+        let disabled = storage.record_commitment_sync_status();
+        assert_eq!(disabled.certificate_carrier_cooling_slots, 0);
+        assert_eq!(disabled.certificate_carrier_cooldown_skips_total, 0);
+        assert_eq!(disabled.certificate_carrier_half_open_attempts_total, 0);
+
+        // [CERTIFICATE-CARRIER-CIRCUIT 2026-07-29 by Codex] Certificate
+        // scheduling aggregates are additive but remain independent from the
+        // block-page circuit's gauge and counters.
+        storage.configure_record_commitment_sync(false, true);
+        storage.record_commitment_block_carrier_circuit_observation(1, 2, 1);
+        storage.record_commitment_certificate_carrier_circuit_observation(2, 3, 1);
+        storage.record_commitment_certificate_carrier_circuit_observation(1, 4, 2);
+        let follower = storage.record_commitment_sync_status();
+        assert_eq!(follower.block_carrier_cooling_slots, 1);
+        assert_eq!(follower.block_carrier_cooldown_skips_total, 2);
+        assert_eq!(follower.block_carrier_half_open_attempts_total, 1);
+        assert_eq!(follower.certificate_carrier_cooling_slots, 1);
+        assert_eq!(follower.certificate_carrier_cooldown_skips_total, 7);
+        assert_eq!(follower.certificate_carrier_half_open_attempts_total, 3);
+
+        storage.configure_record_commitment_sync(true, false);
+        storage.record_commitment_certificate_carrier_circuit_observation(3, 8, 5);
+        let coordinator = storage.record_commitment_sync_status();
+        assert_eq!(coordinator.certificate_carrier_cooling_slots, 0);
+        assert_eq!(coordinator.certificate_carrier_cooldown_skips_total, 0);
+        assert_eq!(
+            coordinator.certificate_carrier_half_open_attempts_total,
+            0
+        );
     }
 
     #[test]

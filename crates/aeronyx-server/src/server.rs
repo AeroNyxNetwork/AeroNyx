@@ -386,6 +386,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.53-TypedCarrierCircuit - Retained independent process-lifetime block
+//     and certificate carrier circuits in the follower runtime
 //   v2.8.52-BlockCarrierCircuitTelemetry - Forwarded anonymous carrier circuit
 //     cooling, skip, and half-open aggregates into signed heartbeat status
 //   v2.8.50-BlockCarrierCircuitBreaker - Added process-only fixed-slot cooldown
@@ -615,13 +617,14 @@ use crate::api::memchain_peer::{
     publish_current_descriptor_to_commitment_witnesses, pull_record_commitment_checkpoint,
     pull_record_commitment_checkpoint_certificate,
     pull_record_commitment_page_with_carrier_runtime, CommitmentBlockCarrierCircuitBreaker,
-    CommitmentBlockCarrierCursor,
+    CommitmentBlockCarrierCursor, CommitmentCertificateCarrierCircuitBreaker,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
     request_record_commitment_coordinator_lease,
-    sync_follower_record_commitment_checkpoint_certificate, witness_verified_delivery_anchor,
-    CommitmentCheckpointRelation, CommitmentFollowerCertificateSyncOutcome,
-    CommitmentReconciliationOutcome, CommitmentSyncPageSource, VerifiedDeliveryAnchorWitnessRound,
+    sync_follower_record_commitment_checkpoint_certificate_with_carrier_runtime,
+    witness_verified_delivery_anchor, CommitmentCheckpointRelation,
+    CommitmentFollowerCertificateSyncOutcome, CommitmentReconciliationOutcome,
+    CommitmentSyncPageSource, VerifiedDeliveryAnchorWitnessRound,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState, SessionEmbeddingCache};
 use crate::api::voice::build_voice_router;
@@ -4481,6 +4484,12 @@ impl Server {
                                 .certificate_availability_exhausted_total,
                             certificate_security_stops_total: status
                                 .certificate_security_stops_total,
+                            certificate_carrier_cooling_slots: status
+                                .certificate_carrier_cooling_slots,
+                            certificate_carrier_cooldown_skips_total: status
+                                .certificate_carrier_cooldown_skips_total,
+                            certificate_carrier_half_open_attempts_total: status
+                                .certificate_carrier_half_open_attempts_total,
                             last_attempt_at: status.last_attempt_at,
                             last_success_at: status.last_success_at,
                             last_failure_at: status.last_failure_at,
@@ -6668,6 +6677,11 @@ impl Server {
             // discarded on restart. It contains no identity, endpoint, error,
             // payload, route, or wall-clock data.
             let mut block_carrier_circuit = CommitmentBlockCarrierCircuitBreaker::default();
+            // [CERTIFICATE-CARRIER-CIRCUIT 2026-07-29 by Codex] Certificate
+            // transport has an independent typed circuit. A block-page outage
+            // cannot suppress certificate evidence recovery, or vice versa.
+            let mut certificate_carrier_circuit =
+                CommitmentCertificateCarrierCircuitBreaker::default();
             info!(
                 interval_secs = base_interval_secs,
                 max_pages_per_round,
@@ -6760,7 +6774,7 @@ impl Server {
                                 // become operationally recovered only when the
                                 // exact local tip satisfies the configured
                                 // immutable witness certificate threshold.
-                                match sync_follower_record_commitment_checkpoint_certificate(
+                                match sync_follower_record_commitment_checkpoint_certificate_with_carrier_runtime(
                                     &storage,
                                     &peer_store,
                                     &identity,
@@ -6769,6 +6783,7 @@ impl Server {
                                     certificate_minimum_signers,
                                     outcome.remote_tip_height,
                                     sync_http_client.as_ref(),
+                                    &mut certificate_carrier_circuit,
                                 )
                                 .await
                                 {
@@ -6851,7 +6866,7 @@ impl Server {
                                     // fallback to an exact configured witness.
                                     // Verification failures stop immediately,
                                     // and no result can erase convergence.
-                                    match sync_follower_record_commitment_checkpoint_certificate(
+                                    match sync_follower_record_commitment_checkpoint_certificate_with_carrier_runtime(
                                         &storage,
                                         &peer_store,
                                         &identity,
@@ -6860,6 +6875,7 @@ impl Server {
                                         certificate_minimum_signers,
                                         checkpoint.remote_tip_height,
                                         sync_http_client.as_ref(),
+                                        &mut certificate_carrier_circuit,
                                     )
                                     .await
                                     {

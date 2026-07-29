@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.66.0 - Added privacy-safe block-carrier circuit health telemetry.
+Modification Reason: v0.67.0 - Added typed, independently scoped block and certificate carrier circuits.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.66.0 - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Reports only anonymous cooling-slot, skipped-selection, and half-open-probe aggregates.
+Last Modified: v0.67.0 - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Reuses one circuit algorithm while compile-time domains and runtime ownership isolate block-page and certificate carrier health.
+Previous: v0.66.0 - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Reports only anonymous cooling-slot, skipped-selection, and half-open-probe aggregates.
 Previous: v0.65.0 - [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] Cools repeatedly unavailable fixed carrier slots across follower rounds without retaining identity-bearing health history.
 Previous: v0.64.0 - [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Avoids repeating earlier carrier availability failures across one bounded multi-page follower round and hands off safely when the preferred carrier disappears.
 Previous: v0.63.0 - [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Reports typed, source-blind block-page retrieval outcomes and bounded carrier attempts without exposing identities or treating transport as certification.
@@ -98,6 +99,38 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.67 Typed and isolated carrier circuits
+
+[TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex]
+
+- Block-page and checkpoint-certificate carrier recovery now use one generic
+  fixed-slot circuit implementation. Rust domain markers make their circuit
+  types distinct at compile time, so a caller cannot accidentally pass mutable
+  block availability state into certificate recovery or the reverse.
+- The follower owns one process-lifetime instance per domain. Repeated
+  classified certificate-carrier availability failures now open the same
+  bounded 60-second monotonic cooldown already proven for block pages, while
+  the configured coordinator remains mandatory and is attempted every round.
+- Certificate and block circuits never share failures, cooldowns, gauges, or
+  counters. A block carrier outage therefore cannot suppress retrieval of
+  independently signed certificate evidence, and a certificate endpoint outage
+  cannot alter block-page scheduling.
+- Only the narrow availability allowlist advances or opens a circuit. Decode,
+  endpoint-policy, authentication, responder, signature, canonicalization, tip,
+  member, threshold, digest, persistence, and other integrity failures remain
+  terminal and are never hidden by trying another carrier.
+- Local status and signed heartbeat add certificate-specific anonymous cooling
+  slots, cumulative cooldown skips, and cumulative half-open attempts. These
+  values contain no identities, endpoints, slot order, errors, deadlines,
+  timing by source, certificate bytes, hashes, signatures, blocks, records,
+  owners, payloads, routes, or client metadata.
+- Compatibility remains additive. The existing public certificate sync helper
+  creates a fresh circuit exactly as before; only the long-running server
+  follower passes retained typed state across rounds.
+- Tests prove block/certificate telemetry isolation, follower-only accounting,
+  exact heartbeat serialization, and a three-round certificate outage where
+  real carrier attempts fall from two to zero after both anonymous slots cool.
 
 ### v0.66 Privacy-safe block-carrier circuit telemetry
 
