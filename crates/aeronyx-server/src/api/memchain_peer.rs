@@ -41,6 +41,9 @@
 //! - Strict startup witness reconciliation may contact an operator-pinned
 //!   identity through an authentic expired cache descriptor, preventing an
 //!   outage/TTL boot loop while retaining signed-response verification.
+//! - Coordinator startup republishes its current signed discovery descriptor
+//!   to operator-pinned witnesses before strict checkpoint and lease gates,
+//!   allowing endpoint rotation to recover older compatible witness nodes.
 //! - Direction-isolated checkpoint telemetry: serving a requester updates only
 //!   service counters and cannot manufacture local convergence or divergence.
 //! - Audit-gated block pages assembled from one SQLite snapshot and
@@ -103,6 +106,10 @@
 //! - Expired descriptors are never live peers. Their endpoints may be used
 //!   only as transport hints for operator-pinned witness reconciliation, where
 //!   the response is independently bound to the pinned Ed25519 identity.
+//! - Descriptor preflight sends only this node's already-public signed
+//!   descriptor to exact operator pins. A successful POST is not authority:
+//!   the subsequent signed checkpoint and all-witness lease gates remain the
+//!   only paths that permit coordinator production.
 //! - A trusted divergent-prefix incident must not be converted into a generic
 //!   transport failure: callers need the verified divergence to fail closed.
 //! - Never derive outbound checkpoint state from an inbound request. The peer
@@ -122,6 +129,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.30-WitnessDescriptorPreflight - Republish the current coordinator descriptor before strict startup gates.
 //! v2.8.29-VerifiedDeliveryWitnessAdmission - Require bilateral requester pinning before witness writes.
 //! v2.8.28-VerifiedDeliveryAnchorWitness - Added authenticated contiguous external cache witnesses.
 //! v2.8.19-TipSupersessionIntegration - Added a test-only real HTTP delivery seam.
@@ -189,10 +197,14 @@ use aeronyx_core::protocol::memchain::{
     VERIFIED_DELIVERY_WITNESS_GAP_V1, VERIFIED_DELIVERY_WITNESS_IDEMPOTENT_V1,
     VERIFIED_DELIVERY_WITNESS_STALE_V1,
 };
-use aeronyx_core::protocol::{NodeCapability, SignedNodeDescriptor};
+use aeronyx_core::protocol::{NodeCapability, NodeDiscoveryMessage, SignedNodeDescriptor};
 use sha2::{Digest, Sha256};
 
-use super::{canonical_peer_http_url, peer_endpoint_is_public_ip, PeerEndpointUrlError};
+use super::{
+    canonical_peer_http_url, peer_endpoint_is_public_ip, read_bounded_http_response,
+    PeerEndpointUrlError,
+};
+use crate::api::discovery::GossipResponse;
 use crate::services::memchain::storage_ops::{
     RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorLeaseGrantOutcome,
     RecordCoordinatorLeaseReleaseOutcome, VerifiedDeliveryAnchorWitnessOutcome,
@@ -208,8 +220,27 @@ const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 const REPLAY_RETENTION_SECS: u64 = 120;
 const MAX_PINNED_WITNESSES_PER_ROUND: usize = 3;
+const MAX_DESCRIPTOR_PREFLIGHT_RESPONSE_BYTES: usize = 16 * 1024;
 const TIP_ANNOUNCEMENT_MAX_ATTEMPTS: usize = 3;
 const TIP_ANNOUNCEMENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+
+/// Aggregate result of one bounded coordinator-descriptor preflight.
+///
+/// [WITNESS-DESCRIPTOR-PREFLIGHT 2026-07-29 by Codex] The report deliberately
+/// excludes witness identities, endpoints, HTTP statuses, and descriptor
+/// fields. It is safe for startup logs and cannot be interpreted as lease,
+/// checkpoint, quorum, or consensus evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitmentWitnessDescriptorPublishRound {
+    /// Distinct operator-pinned identities considered under the hard cap.
+    pub configured: usize,
+    /// Requests sent after a signed endpoint passed transport policy.
+    pub attempted: usize,
+    /// Witness discovery endpoints that accepted the signed descriptor.
+    pub accepted: usize,
+    /// Missing, unsafe, unreachable, or rejecting witness endpoints.
+    pub failed: usize,
+}
 
 /// Aggregate result of one bounded follower pull.
 ///
@@ -982,6 +1013,124 @@ fn commitment_peer_descriptor(
             .then(|| peer_store.get_signature_verified_cached(node_id))
             .flatten()
     })
+}
+
+/// Republishes this coordinator's current signed descriptor to pinned witnesses.
+///
+/// This bounded compatibility preflight runs before strict startup checkpoint
+/// and coordinator-lease gates. It may use an authentic expired descriptor as
+/// a transport hint for an exact operator-pinned witness, but it sends only the
+/// coordinator's public signed discovery descriptor. Witness acceptance grants
+/// no authority and cannot bypass the subsequent signed protocol gates.
+pub async fn publish_current_descriptor_to_commitment_witnesses(
+    peer_store: &PeerStore,
+    self_descriptor: &SignedNodeDescriptor,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+) -> CommitmentWitnessDescriptorPublishRound {
+    publish_current_descriptor_to_commitment_witnesses_with_endpoint_policy(
+        peer_store,
+        self_descriptor,
+        client,
+        witness_node_ids,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+async fn publish_current_descriptor_to_commitment_witnesses_with_endpoint_policy<F>(
+    peer_store: &PeerStore,
+    self_descriptor: &SignedNodeDescriptor,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+    endpoint_allowed: &F,
+) -> CommitmentWitnessDescriptorPublishRound
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    // [WITNESS-DESCRIPTOR-PREFLIGHT 2026-07-29 by Codex] Preserve first-seen
+    // operator order while deduplicating and enforcing the existing protocol
+    // fan-out cap. A malformed configuration cannot amplify startup traffic.
+    let mut distinct_witnesses = Vec::with_capacity(MAX_PINNED_WITNESSES_PER_ROUND);
+    let mut seen = HashSet::with_capacity(MAX_PINNED_WITNESSES_PER_ROUND);
+    let self_node_id = self_descriptor.node_id();
+    for witness in witness_node_ids {
+        if *witness == self_node_id || !seen.insert(*witness) {
+            continue;
+        }
+        distinct_witnesses.push(*witness);
+        if distinct_witnesses.len() == MAX_PINNED_WITNESSES_PER_ROUND {
+            break;
+        }
+    }
+
+    let now = now_secs();
+    let configured = distinct_witnesses.len();
+    let mut urls = Vec::with_capacity(configured);
+    for witness in distinct_witnesses {
+        let Some(descriptor) = commitment_peer_descriptor(
+            peer_store,
+            &witness,
+            now,
+            CommitmentPeerDescriptorPolicy::AllowExpiredForPinnedWitness,
+        ) else {
+            continue;
+        };
+        let Some(endpoint) = descriptor.descriptor.public_endpoint.as_deref() else {
+            continue;
+        };
+        if !endpoint_allowed(endpoint) {
+            continue;
+        }
+        let Ok(url) = canonical_peer_http_url(endpoint, "/api/discovery/gossip") else {
+            continue;
+        };
+        urls.push(url);
+    }
+
+    let attempted = urls.len();
+    let accepted = futures::stream::iter(urls)
+        .map(|url| {
+            let message = NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: self_descriptor.clone(),
+            };
+            async move {
+                let Ok(response) = client.post(url).json(&message).send().await else {
+                    return false;
+                };
+                if !response.status().is_success() {
+                    return false;
+                }
+                let Ok(body) =
+                    read_bounded_http_response(response, MAX_DESCRIPTOR_PREFLIGHT_RESPONSE_BYTES)
+                        .await
+                else {
+                    return false;
+                };
+                let Ok(receipt) = serde_json::from_slice::<GossipResponse>(&body) else {
+                    return false;
+                };
+                receipt.applied.total == 1
+                    && receipt.applied.stale == 0
+                    && receipt.applied.rejected == 0
+                    && receipt
+                        .applied
+                        .inserted
+                        .saturating_add(receipt.applied.unchanged)
+                        == 1
+            }
+        })
+        .buffer_unordered(MAX_PINNED_WITNESSES_PER_ROUND)
+        .filter(|accepted| std::future::ready(*accepted))
+        .count()
+        .await;
+
+    CommitmentWitnessDescriptorPublishRound {
+        configured,
+        attempted,
+        accepted,
+        failed: configured.saturating_sub(accepted),
+    }
 }
 
 /// Obtains and verifies one signed chain-checkpoint comparison from the pinned
@@ -6028,6 +6177,185 @@ mod tests {
     // acquisition run before gossip can refresh either side after a long
     // reboot. Expired descriptors are transport/admission hints only; every
     // request and response still verifies against the exact pinned keys.
+    #[tokio::test]
+    async fn descriptor_preflight_refreshes_legacy_witness_before_strict_gate() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let witness = IdentityKeyPair::generate();
+
+        let witness_peers = Arc::new(PeerStore::new());
+        let expired_coordinator = NodeDescriptor::new(
+            coordinator.public_key_bytes(),
+            1,
+            now.saturating_sub(1_200),
+            now.saturating_sub(600),
+            "expired-coordinator-before-preflight",
+        );
+        let expired_coordinator =
+            SignedNodeDescriptor::sign(expired_coordinator, &coordinator).unwrap();
+        let imported = witness_peers.load_peer_cache_snapshot_from_source(
+            &NodeBootstrapSnapshot::new(now, vec![expired_coordinator]),
+            now,
+            "test_expired_coordinator_cache",
+        );
+        assert_eq!(imported.inserted, 1);
+        assert!(witness_peers
+            .get_valid(&coordinator.public_key_bytes(), now)
+            .is_none());
+
+        let router = crate::api::discovery::build_discovery_router(
+            Arc::clone(&witness_peers),
+            crate::api::discovery::DiscoveryApiPolicy::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut expired_witness = NodeDescriptor::new(
+            witness.public_key_bytes(),
+            1,
+            now.saturating_sub(1_200),
+            now.saturating_sub(600),
+            "expired-witness-endpoint-hint",
+        );
+        expired_witness.public_endpoint = Some(format!("http://{address}"));
+        let expired_witness = SignedNodeDescriptor::sign(expired_witness, &witness).unwrap();
+        let coordinator_peers = PeerStore::new();
+        let imported = coordinator_peers.load_peer_cache_snapshot_from_source(
+            &NodeBootstrapSnapshot::new(now, vec![expired_witness]),
+            now,
+            "test_expired_witness_cache",
+        );
+        assert_eq!(imported.inserted, 1);
+
+        let mut current_coordinator = NodeDescriptor::new(
+            coordinator.public_key_bytes(),
+            2,
+            now,
+            now.saturating_add(600),
+            "current-coordinator-after-endpoint-rotation",
+        );
+        current_coordinator.public_endpoint = Some("http://8.8.8.8:8422".to_string());
+        let current_coordinator =
+            SignedNodeDescriptor::sign(current_coordinator, &coordinator).unwrap();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let round = publish_current_descriptor_to_commitment_witnesses_with_endpoint_policy(
+            &coordinator_peers,
+            &current_coordinator,
+            &client,
+            &[
+                witness.public_key_bytes(),
+                witness.public_key_bytes(),
+                coordinator.public_key_bytes(),
+            ],
+            &allow_test_endpoint,
+        )
+        .await;
+
+        assert_eq!(
+            round,
+            CommitmentWitnessDescriptorPublishRound {
+                configured: 1,
+                attempted: 1,
+                accepted: 1,
+                failed: 0,
+            }
+        );
+        let refreshed = witness_peers
+            .get_valid(&coordinator.public_key_bytes(), now)
+            .unwrap();
+        assert_eq!(refreshed.descriptor.sequence, 2);
+        assert_eq!(
+            refreshed.descriptor.public_endpoint.as_deref(),
+            Some("http://8.8.8.8:8422")
+        );
+
+        // [WITNESS-DESCRIPTOR-PREFLIGHT 2026-07-29 by Codex] The discovery API
+        // intentionally returns a structured 200 response for stale sequence
+        // input. Preflight must parse that receipt instead of misreporting the
+        // transport-level success as a descriptor refresh.
+        let stale_coordinator = SignedNodeDescriptor::sign(
+            NodeDescriptor::new(
+                coordinator.public_key_bytes(),
+                1,
+                now,
+                now.saturating_add(600),
+                "stale-coordinator-after-endpoint-rotation",
+            ),
+            &coordinator,
+        )
+        .unwrap();
+        let stale_round = publish_current_descriptor_to_commitment_witnesses_with_endpoint_policy(
+            &coordinator_peers,
+            &stale_coordinator,
+            &client,
+            &[witness.public_key_bytes()],
+            &allow_test_endpoint,
+        )
+        .await;
+        assert_eq!(stale_round.attempted, 1);
+        assert_eq!(stale_round.accepted, 0);
+        assert_eq!(stale_round.failed, 1);
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn descriptor_preflight_rejects_unsafe_witness_endpoint_without_request() {
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let witness = IdentityKeyPair::generate();
+        let coordinator_peers = PeerStore::new();
+        admit_peer(
+            &coordinator_peers,
+            &witness,
+            Some("http://127.0.0.1:8422".to_string()),
+            now,
+        );
+        let current_coordinator = SignedNodeDescriptor::sign(
+            NodeDescriptor::new(
+                coordinator.public_key_bytes(),
+                1,
+                now,
+                now.saturating_add(600),
+                "unsafe-preflight-target-test",
+            ),
+            &coordinator,
+        )
+        .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let round = publish_current_descriptor_to_commitment_witnesses(
+            &coordinator_peers,
+            &current_coordinator,
+            &client,
+            &[witness.public_key_bytes()],
+        )
+        .await;
+
+        assert_eq!(
+            round,
+            CommitmentWitnessDescriptorPublishRound {
+                configured: 1,
+                attempted: 0,
+                accepted: 0,
+                failed: 1,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn pinned_witness_round_recovers_through_authentic_expired_cache_descriptor() {
         let now = now_secs();

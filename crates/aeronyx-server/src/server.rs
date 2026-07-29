@@ -575,8 +575,8 @@ use crate::api::directory_replica_sync::{
 };
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
-    pull_record_commitment_checkpoint, pull_record_commitment_checkpoint_certificate,
-    pull_record_commitment_page,
+    publish_current_descriptor_to_commitment_witnesses, pull_record_commitment_checkpoint,
+    pull_record_commitment_checkpoint_certificate, pull_record_commitment_page,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
     request_record_commitment_coordinator_lease, witness_verified_delivery_anchor,
@@ -2266,6 +2266,11 @@ impl Server {
                 peer_http_clients.control.as_ref(),
             )
             .await;
+        self.publish_memchain_commitment_descriptor_preflight(
+            &peer_store,
+            peer_http_clients.control.as_ref(),
+        )
+        .await;
         let directory_chain_store = self.init_directory_chain(&peer_store).await?;
         let directory_replica_store = self.init_directory_replica().await?;
         let directory_replica_sync_runtime =
@@ -5771,6 +5776,68 @@ impl Server {
                 }
             }
         }))
+    }
+
+    /// Publishes the current coordinator descriptor before strict witness gates.
+    ///
+    /// [WITNESS-DESCRIPTOR-PREFLIGHT 2026-07-29 by Codex] Background gossip is
+    /// intentionally started only after startup integrity checks. This bounded
+    /// preflight closes the endpoint-rotation deadlock without moving authority:
+    /// it sends only the already-public signed descriptor, and checkpoint plus
+    /// all-witness lease verification still decide whether production starts.
+    async fn publish_memchain_commitment_descriptor_preflight(
+        &self,
+        peer_store: &PeerStore,
+        control_http_client: &reqwest::Client,
+    ) {
+        let memchain = &self.config.memchain;
+        let strict_gate_enabled = memchain.commitment_witness_startup_required
+            || memchain.commitment_coordinator_lease_required;
+        if !memchain.commitment_coordinator_enabled
+            || !strict_gate_enabled
+            || !self.config.discovery.enabled
+            || !self.config.discovery.advertise_self
+        {
+            return;
+        }
+
+        let witness_node_ids = memchain.commitment_witness_node_id_bytes();
+        if witness_node_ids.is_empty() {
+            return;
+        }
+        let now = unix_now_secs();
+        let self_node_id = self.identity.public_key_bytes();
+        let Some(self_descriptor) = peer_store.get_valid(&self_node_id, now) else {
+            warn!(
+                configured = witness_node_ids.len(),
+                "[MEMCHAIN_BLOCK] Coordinator descriptor preflight unavailable; strict witness gates remain authoritative"
+            );
+            return;
+        };
+
+        let round = publish_current_descriptor_to_commitment_witnesses(
+            peer_store,
+            &self_descriptor,
+            control_http_client,
+            &witness_node_ids,
+        )
+        .await;
+        if round.accepted == round.configured && round.configured > 0 {
+            info!(
+                configured = round.configured,
+                attempted = round.attempted,
+                accepted = round.accepted,
+                "[MEMCHAIN_BLOCK] Coordinator descriptor preflight completed"
+            );
+        } else {
+            warn!(
+                configured = round.configured,
+                attempted = round.attempted,
+                accepted = round.accepted,
+                failed = round.failed,
+                "[MEMCHAIN_BLOCK] Coordinator descriptor preflight incomplete; strict witness gates remain authoritative"
+            );
+        }
     }
 
     /// Verifies operator-pinned external checkpoint evidence before listeners.
