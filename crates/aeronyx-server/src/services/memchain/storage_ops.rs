@@ -167,6 +167,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.56-StickySecurityEvidence - Retain source-blind security-stop times across later success.
 //! v2.8.55-CertificateBackfillTelemetry - Record atomic coordinator-only recovery aggregates.
 //! v2.8.53-TypedCarrierCircuit - Kept block and certificate circuit telemetry independent.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Report anonymous cooling, skip, and half-open state.
@@ -238,6 +239,18 @@ use super::storage::{
 use super::storage_crypto::{
     decrypt_rawlog_content, decrypt_record_content, encrypt_rawlog_content, encrypt_record_content,
 };
+
+/// Advances an event timestamp without allowing a backwards wall-clock step to
+/// make process-local operational evidence regress.
+///
+/// [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] Source-recovery domains use
+/// one helper so latest-result and sticky security timestamps share exactly the
+/// same monotonic policy. This helper carries no identity or protocol material.
+fn record_monotonic_observation(last_observed_at: &mut Option<u64>, now: u64) -> u64 {
+    let observed_at = last_observed_at.map_or(now, |previous| previous.max(now));
+    *last_observed_at = Some(observed_at);
+    observed_at
+}
 
 // ============================================
 // Overview Types (v2.2.0)
@@ -4957,12 +4970,10 @@ impl MemoryStorage {
         if !runtime.enabled || runtime.role != "follower" {
             return;
         }
-        let observed_at = runtime
-            .last_block_page_pull_at
-            .map_or(now, |previous| previous.max(now));
+        let observed_at =
+            record_monotonic_observation(&mut runtime.last_block_page_pull_at, now);
         let carrier_attempts = u64::try_from(carrier_attempts).unwrap_or(u64::MAX);
 
-        runtime.last_block_page_pull_at = Some(observed_at);
         runtime.last_block_page_pull_result = Some(disposition.as_str());
         runtime.block_page_pulls_total = runtime.block_page_pulls_total.saturating_add(1);
         runtime.block_carrier_attempts_total = runtime
@@ -4986,6 +4997,10 @@ impl MemoryStorage {
                     .saturating_add(1);
             }
             RecordCommitmentBlockPagePullDisposition::SecurityStopped => {
+                // [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] A later
+                // successful source may replace the latest result, but must
+                // not erase when this fail-closed event was last observed.
+                runtime.last_block_page_security_stop_at = Some(observed_at);
                 runtime.block_page_security_stops_total =
                     runtime.block_page_security_stops_total.saturating_add(1);
             }
@@ -5067,12 +5082,10 @@ impl MemoryStorage {
         if !runtime.enabled || runtime.role != "follower" {
             return;
         }
-        let observed_at = runtime
-            .last_certificate_sync_at
-            .map_or(now, |previous| previous.max(now));
+        let observed_at =
+            record_monotonic_observation(&mut runtime.last_certificate_sync_at, now);
         let carrier_attempts = u64::try_from(carrier_attempts).unwrap_or(u64::MAX);
 
-        runtime.last_certificate_sync_at = Some(observed_at);
         runtime.last_certificate_sync_result = Some(disposition.as_str());
         runtime.certificate_sync_rounds_total =
             runtime.certificate_sync_rounds_total.saturating_add(1);
@@ -5098,6 +5111,7 @@ impl MemoryStorage {
                     .saturating_add(1);
             }
             RecordCommitmentCertificateSyncDisposition::SecurityStopped => {
+                runtime.last_certificate_security_stop_at = Some(observed_at);
                 runtime.certificate_security_stops_total =
                     runtime.certificate_security_stops_total.saturating_add(1);
             }
@@ -5125,14 +5139,14 @@ impl MemoryStorage {
         if runtime.role != "coordinator" {
             return;
         }
-        let observed_at = runtime
-            .last_coordinator_certificate_backfill_at
-            .map_or(now, |previous| previous.max(now));
+        let observed_at = record_monotonic_observation(
+            &mut runtime.last_coordinator_certificate_backfill_at,
+            now,
+        );
         let carrier_attempts = u64::try_from(carrier_attempts).unwrap_or(u64::MAX);
         let cooldown_skips = u64::try_from(cooldown_skips).unwrap_or(u64::MAX);
         let half_open_attempts = u64::try_from(half_open_attempts).unwrap_or(u64::MAX);
 
-        runtime.last_coordinator_certificate_backfill_at = Some(observed_at);
         runtime.last_coordinator_certificate_backfill_result = Some(disposition.as_str());
         runtime.coordinator_certificate_backfill_rounds_total = runtime
             .coordinator_certificate_backfill_rounds_total
@@ -5165,6 +5179,8 @@ impl MemoryStorage {
                     .saturating_add(1);
             }
             RecordCommitmentCertificateBackfillDisposition::SecurityStopped => {
+                runtime.last_coordinator_certificate_backfill_security_stop_at =
+                    Some(observed_at);
                 runtime.coordinator_certificate_backfill_security_stops_total = runtime
                     .coordinator_certificate_backfill_security_stops_total
                     .saturating_add(1);
@@ -5317,6 +5333,7 @@ impl MemoryStorage {
             block_page_availability_exhausted_total: runtime
                 .block_page_availability_exhausted_total,
             block_page_security_stops_total: runtime.block_page_security_stops_total,
+            last_block_page_security_stop_at: runtime.last_block_page_security_stop_at,
             block_carrier_cooling_slots: runtime.block_carrier_cooling_slots,
             block_carrier_cooldown_skips_total: runtime.block_carrier_cooldown_skips_total,
             block_carrier_half_open_attempts_total: runtime
@@ -5343,6 +5360,7 @@ impl MemoryStorage {
             certificate_availability_exhausted_total: runtime
                 .certificate_availability_exhausted_total,
             certificate_security_stops_total: runtime.certificate_security_stops_total,
+            last_certificate_security_stop_at: runtime.last_certificate_security_stop_at,
             certificate_carrier_cooling_slots: runtime.certificate_carrier_cooling_slots,
             certificate_carrier_cooldown_skips_total: runtime
                 .certificate_carrier_cooldown_skips_total,
@@ -5363,6 +5381,8 @@ impl MemoryStorage {
                 .coordinator_certificate_backfill_availability_exhausted_total,
             coordinator_certificate_backfill_security_stops_total: runtime
                 .coordinator_certificate_backfill_security_stops_total,
+            last_coordinator_certificate_backfill_security_stop_at: runtime
+                .last_coordinator_certificate_backfill_security_stop_at,
             coordinator_certificate_backfill_carrier_attempts_total: runtime
                 .coordinator_certificate_backfill_carrier_attempts_total,
             coordinator_certificate_backfill_carrier_cooling_slots: runtime
@@ -5385,7 +5405,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; follower block-page/certificate recovery and coordinator certificate backfill expose role-isolated, source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, and monotonic process-local timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; these counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
+                "aggregate runtime only; follower block-page/certificate recovery and coordinator certificate backfill expose role-isolated, source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, monotonic latest-observation timestamps, and sticky security-stop timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, security reason, raw error, record commitment, owner, payload, route, or client metadata; these counters and times are operations evidence, not authority, reputation, consensus, finality, or fork choice",
         }
     }
 
@@ -8933,7 +8953,12 @@ mod tests {
                 .block_page_pulls_total,
             0
         );
-
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .last_block_page_security_stop_at,
+            None
+        );
         // [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Exercise all
         // mutually exclusive terminal dispositions, timestamp clamping, and
         // actual carrier-attempt accounting without retaining source details.
@@ -8958,16 +8983,24 @@ mod tests {
             RecordCommitmentBlockPagePullDisposition::SecurityStopped,
             1,
         );
+        storage.record_commitment_block_page_pull_outcome(
+            130,
+            RecordCommitmentBlockPagePullDisposition::Coordinator,
+            0,
+        );
 
         let status = storage.record_commitment_sync_status();
-        assert_eq!(status.last_block_page_pull_at, Some(120));
+        assert_eq!(status.last_block_page_pull_at, Some(130));
         assert_eq!(
             status.last_block_page_pull_result.as_deref(),
-            Some("security_stopped")
+            Some("coordinator")
         );
         assert_eq!(status.last_block_carrier_recovered_at, Some(110));
-        assert_eq!(status.block_page_pulls_total, 4);
-        assert_eq!(status.block_page_coordinator_success_total, 1);
+        // [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] A later successful
+        // retrieval updates the latest result without erasing incident time.
+        assert_eq!(status.last_block_page_security_stop_at, Some(120));
+        assert_eq!(status.block_page_pulls_total, 5);
+        assert_eq!(status.block_page_coordinator_success_total, 2);
         assert_eq!(status.block_carrier_attempts_total, 4);
         assert_eq!(status.block_carrier_recoveries_total, 1);
         assert_eq!(status.block_page_availability_exhausted_total, 1);
@@ -8992,6 +9025,12 @@ mod tests {
                 .record_commitment_sync_status()
                 .block_page_pulls_total,
             0
+        );
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .last_block_page_security_stop_at,
+            None
         );
     }
 
@@ -9075,7 +9114,12 @@ mod tests {
                 .certificate_sync_rounds_total,
             0
         );
-
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .last_certificate_security_stop_at,
+            None
+        );
         storage.configure_record_commitment_sync(false, true);
         storage.record_commitment_certificate_sync_outcome(
             100,
@@ -9097,16 +9141,22 @@ mod tests {
             RecordCommitmentCertificateSyncDisposition::SecurityStopped,
             1,
         );
+        storage.record_commitment_certificate_sync_outcome(
+            130,
+            RecordCommitmentCertificateSyncDisposition::Coordinator,
+            0,
+        );
 
         let status = storage.record_commitment_sync_status();
-        assert_eq!(status.last_certificate_sync_at, Some(120));
+        assert_eq!(status.last_certificate_sync_at, Some(130));
         assert_eq!(
             status.last_certificate_sync_result.as_deref(),
-            Some("security_stopped")
+            Some("coordinator")
         );
         assert_eq!(status.last_certificate_carrier_recovered_at, Some(110));
-        assert_eq!(status.certificate_sync_rounds_total, 4);
-        assert_eq!(status.certificate_coordinator_success_total, 1);
+        assert_eq!(status.last_certificate_security_stop_at, Some(120));
+        assert_eq!(status.certificate_sync_rounds_total, 5);
+        assert_eq!(status.certificate_coordinator_success_total, 2);
         assert_eq!(status.certificate_carrier_attempts_total, 4);
         assert_eq!(status.certificate_carrier_recoveries_total, 1);
         assert_eq!(status.certificate_availability_exhausted_total, 1);
@@ -9131,6 +9181,12 @@ mod tests {
                 .record_commitment_sync_status()
                 .certificate_sync_rounds_total,
             0
+        );
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .last_certificate_security_stop_at,
+            None
         );
     }
 
@@ -9202,17 +9258,29 @@ mod tests {
             5,
             3,
         );
+        storage.record_commitment_certificate_backfill_outcome(
+            130,
+            RecordCommitmentCertificateBackfillDisposition::Persisted,
+            0,
+            0,
+            0,
+            0,
+        );
 
         let status = storage.record_commitment_sync_status();
-        assert_eq!(status.last_coordinator_certificate_backfill_at, Some(120));
+        assert_eq!(status.last_coordinator_certificate_backfill_at, Some(130));
         assert_eq!(
             status
                 .last_coordinator_certificate_backfill_result
                 .as_deref(),
-            Some("security_stopped")
+            Some("persisted")
         );
-        assert_eq!(status.coordinator_certificate_backfill_rounds_total, 4);
-        assert_eq!(status.coordinator_certificate_backfill_persisted_total, 1);
+        assert_eq!(
+            status.last_coordinator_certificate_backfill_security_stop_at,
+            Some(120)
+        );
+        assert_eq!(status.coordinator_certificate_backfill_rounds_total, 5);
+        assert_eq!(status.coordinator_certificate_backfill_persisted_total, 2);
         assert_eq!(
             status.coordinator_certificate_backfill_verified_unpersisted_total,
             1
@@ -9231,7 +9299,7 @@ mod tests {
         );
         assert_eq!(
             status.coordinator_certificate_backfill_carrier_cooling_slots,
-            1
+            0
         );
         assert_eq!(
             status.coordinator_certificate_backfill_carrier_cooldown_skips_total,
@@ -9253,6 +9321,14 @@ mod tests {
         );
         assert_eq!(status.certificate_sync_rounds_total, 0);
         assert_eq!(status.certificate_carrier_attempts_total, 0);
+
+        storage.configure_record_commitment_sync(false, true);
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .last_coordinator_certificate_backfill_security_stop_at,
+            None
+        );
     }
 
     #[tokio::test]

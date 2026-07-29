@@ -161,6 +161,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.56-StickySecurityEvidence - Retained role-isolated security-stop times across later success.
 //! v2.8.55-CertificateBackfillTelemetry - Added coordinator-only, source-blind recovery evidence.
 //! v2.8.53-TypedCarrierCircuit - Added isolated certificate-carrier circuit aggregates.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Added source-blind circuit health aggregates.
@@ -615,6 +616,8 @@ pub struct RecordCommitmentSyncStatus {
     pub block_page_availability_exhausted_total: u64,
     /// Page retrievals stopped by security or protocol-integrity failures.
     pub block_page_security_stops_total: u64,
+    /// Most recent fail-closed block-page security stop in this process.
+    pub last_block_page_security_stop_at: Option<u64>,
     /// Fixed operator-pin slots cooling at the latest follower observation.
     pub block_carrier_cooling_slots: usize,
     /// Carrier selections skipped while their anonymous slot was cooling.
@@ -651,6 +654,8 @@ pub struct RecordCommitmentSyncStatus {
     pub certificate_availability_exhausted_total: u64,
     /// Rounds stopped by a security or protocol-integrity failure.
     pub certificate_security_stops_total: u64,
+    /// Most recent fail-closed follower certificate security stop.
+    pub last_certificate_security_stop_at: Option<u64>,
     /// Fixed certificate-carrier slots cooling at the latest observation.
     pub certificate_carrier_cooling_slots: usize,
     /// Certificate-carrier selections skipped during anonymous cooldown.
@@ -671,6 +676,8 @@ pub struct RecordCommitmentSyncStatus {
     pub coordinator_certificate_backfill_availability_exhausted_total: u64,
     /// Backfill rounds stopped by security or protocol-integrity failures.
     pub coordinator_certificate_backfill_security_stops_total: u64,
+    /// Most recent fail-closed coordinator certificate-backfill security stop.
+    pub last_coordinator_certificate_backfill_security_stop_at: Option<u64>,
     /// Bounded carrier requests attempted by coordinator backfill.
     pub coordinator_certificate_backfill_carrier_attempts_total: u64,
     /// Anonymous carrier slots cooling at the latest coordinator observation.
@@ -902,6 +909,7 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) block_carrier_recoveries_total: u64,
     pub(crate) block_page_availability_exhausted_total: u64,
     pub(crate) block_page_security_stops_total: u64,
+    pub(crate) last_block_page_security_stop_at: Option<u64>,
     pub(crate) block_carrier_cooling_slots: usize,
     pub(crate) block_carrier_cooldown_skips_total: u64,
     pub(crate) block_carrier_half_open_attempts_total: u64,
@@ -920,6 +928,7 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) certificate_carrier_recoveries_total: u64,
     pub(crate) certificate_availability_exhausted_total: u64,
     pub(crate) certificate_security_stops_total: u64,
+    pub(crate) last_certificate_security_stop_at: Option<u64>,
     pub(crate) certificate_carrier_cooling_slots: usize,
     pub(crate) certificate_carrier_cooldown_skips_total: u64,
     pub(crate) certificate_carrier_half_open_attempts_total: u64,
@@ -930,6 +939,7 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) coordinator_certificate_backfill_verified_unpersisted_total: u64,
     pub(crate) coordinator_certificate_backfill_availability_exhausted_total: u64,
     pub(crate) coordinator_certificate_backfill_security_stops_total: u64,
+    pub(crate) last_coordinator_certificate_backfill_security_stop_at: Option<u64>,
     pub(crate) coordinator_certificate_backfill_carrier_attempts_total: u64,
     pub(crate) coordinator_certificate_backfill_carrier_cooling_slots: usize,
     pub(crate) coordinator_certificate_backfill_carrier_cooldown_skips_total: u64,
@@ -986,6 +996,7 @@ impl Default for RecordCommitmentSyncRuntime {
             block_carrier_recoveries_total: 0,
             block_page_availability_exhausted_total: 0,
             block_page_security_stops_total: 0,
+            last_block_page_security_stop_at: None,
             block_carrier_cooling_slots: 0,
             block_carrier_cooldown_skips_total: 0,
             block_carrier_half_open_attempts_total: 0,
@@ -1004,6 +1015,7 @@ impl Default for RecordCommitmentSyncRuntime {
             certificate_carrier_recoveries_total: 0,
             certificate_availability_exhausted_total: 0,
             certificate_security_stops_total: 0,
+            last_certificate_security_stop_at: None,
             certificate_carrier_cooling_slots: 0,
             certificate_carrier_cooldown_skips_total: 0,
             certificate_carrier_half_open_attempts_total: 0,
@@ -1014,6 +1026,7 @@ impl Default for RecordCommitmentSyncRuntime {
             coordinator_certificate_backfill_verified_unpersisted_total: 0,
             coordinator_certificate_backfill_availability_exhausted_total: 0,
             coordinator_certificate_backfill_security_stops_total: 0,
+            last_coordinator_certificate_backfill_security_stop_at: None,
             coordinator_certificate_backfill_carrier_attempts_total: 0,
             coordinator_certificate_backfill_carrier_cooling_slots: 0,
             coordinator_certificate_backfill_carrier_cooldown_skips_total: 0,

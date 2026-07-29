@@ -62,6 +62,8 @@
 //   - [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Coordinator
 //     certificate backfill is role-isolated from follower sync and exposes no
 //     carrier identity, witness set, endpoint, cryptographic frame, or error.
+//   - [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] Security-stop timestamps
+//     remain source-blind and survive later successful recovery observations.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -95,6 +97,7 @@
 //   v2.8.52        - Added source-blind block-carrier circuit health aggregates
 //   v2.8.53        - Added isolated certificate-carrier circuit health aggregates
 //   v2.8.55        - Added coordinator-only certificate-backfill aggregates
+//   v2.8.56        - Added role-isolated sticky security-stop timestamps
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -283,6 +286,8 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub block_page_availability_exhausted_total: u64,
     /// Page retrievals stopped by security or protocol-integrity failures.
     pub block_page_security_stops_total: u64,
+    /// Most recent fail-closed block-page security stop in this process.
+    pub last_block_page_security_stop_at: Option<u64>,
     /// Fixed carrier slots cooling at the latest follower observation.
     pub block_carrier_cooling_slots: usize,
     /// Anonymous carrier selections skipped during process-local cooldown.
@@ -319,6 +324,8 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub certificate_availability_exhausted_total: u64,
     /// Rounds stopped by security or protocol-integrity failures.
     pub certificate_security_stops_total: u64,
+    /// Most recent fail-closed follower certificate security stop.
+    pub last_certificate_security_stop_at: Option<u64>,
     /// Fixed certificate-carrier slots cooling at the latest observation.
     pub certificate_carrier_cooling_slots: usize,
     /// Anonymous certificate-carrier selections skipped during cooldown.
@@ -340,6 +347,8 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub coordinator_certificate_backfill_availability_exhausted_total: u64,
     /// Backfill rounds stopped by security or protocol-integrity failures.
     pub coordinator_certificate_backfill_security_stops_total: u64,
+    /// Most recent fail-closed coordinator backfill security stop.
+    pub last_coordinator_certificate_backfill_security_stop_at: Option<u64>,
     /// Bounded coordinator backfill carrier requests attempted.
     pub coordinator_certificate_backfill_carrier_attempts_total: u64,
     /// Anonymous carrier slots cooling at the latest coordinator observation.
@@ -1028,6 +1037,7 @@ mod tests {
                 block_carrier_recoveries_total: 1,
                 block_page_availability_exhausted_total: 1,
                 block_page_security_stops_total: 1,
+                last_block_page_security_stop_at: Some(109),
                 block_carrier_cooling_slots: 1,
                 block_carrier_cooldown_skips_total: 3,
                 block_carrier_half_open_attempts_total: 2,
@@ -1046,6 +1056,7 @@ mod tests {
                 certificate_carrier_recoveries_total: 1,
                 certificate_availability_exhausted_total: 1,
                 certificate_security_stops_total: 1,
+                last_certificate_security_stop_at: Some(110),
                 certificate_carrier_cooling_slots: 2,
                 certificate_carrier_cooldown_skips_total: 5,
                 certificate_carrier_half_open_attempts_total: 3,
@@ -1058,6 +1069,7 @@ mod tests {
                 coordinator_certificate_backfill_verified_unpersisted_total: 1,
                 coordinator_certificate_backfill_availability_exhausted_total: 1,
                 coordinator_certificate_backfill_security_stops_total: 1,
+                last_coordinator_certificate_backfill_security_stop_at: Some(113),
                 coordinator_certificate_backfill_carrier_attempts_total: 8,
                 coordinator_certificate_backfill_carrier_cooling_slots: 2,
                 coordinator_certificate_backfill_carrier_cooldown_skips_total: 4,
@@ -1195,6 +1207,7 @@ mod tests {
         assert_eq!(sync["block_carrier_recoveries_total"], 1);
         assert_eq!(sync["block_page_availability_exhausted_total"], 1);
         assert_eq!(sync["block_page_security_stops_total"], 1);
+        assert_eq!(sync["last_block_page_security_stop_at"], 109);
         assert_eq!(sync["block_carrier_cooling_slots"], 1);
         assert_eq!(sync["block_carrier_cooldown_skips_total"], 3);
         assert_eq!(sync["block_carrier_half_open_attempts_total"], 2);
@@ -1213,6 +1226,7 @@ mod tests {
         assert_eq!(sync["certificate_carrier_recoveries_total"], 1);
         assert_eq!(sync["certificate_availability_exhausted_total"], 1);
         assert_eq!(sync["certificate_security_stops_total"], 1);
+        assert_eq!(sync["last_certificate_security_stop_at"], 110);
         assert_eq!(sync["certificate_carrier_cooling_slots"], 2);
         assert_eq!(sync["certificate_carrier_cooldown_skips_total"], 5);
         assert_eq!(sync["certificate_carrier_half_open_attempts_total"], 3);
@@ -1234,6 +1248,10 @@ mod tests {
         assert_eq!(
             sync["coordinator_certificate_backfill_security_stops_total"],
             1
+        );
+        assert_eq!(
+            sync["last_coordinator_certificate_backfill_security_stop_at"],
+            113
         );
         assert_eq!(
             sync["coordinator_certificate_backfill_carrier_attempts_total"],
@@ -1329,6 +1347,9 @@ mod tests {
                 "evidence_digest",
                 "request_id",
                 "signature",
+                "block_page_security_stop_reason",
+                "certificate_security_stop_reason",
+                "coordinator_certificate_backfill_security_stop_reason",
             ] {
                 assert!(
                     section.get(forbidden).is_none(),

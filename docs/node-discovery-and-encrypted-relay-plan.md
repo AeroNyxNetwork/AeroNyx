@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.69.0 - Added role-isolated, source-blind coordinator certificate-backfill telemetry.
+Modification Reason: v0.70.0 - Preserved role-isolated security-stop evidence after later recovery.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.69.0 - [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Reports coordinator certificate backfill without exposing carrier identity or mixing follower state.
+Last Modified: v0.70.0 - [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] Preserves source-blind security-stop times when later retrievals succeed.
+Previous: v0.69.0 - [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Reports coordinator certificate backfill without exposing carrier identity or mixing follower state.
 Previous: v0.68.0 - [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Prevents later certificate carriers from masking security failures and cools repeated coordinator-backfill outages.
 Previous: v0.67.0 - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Reuses one circuit algorithm while compile-time domains and runtime ownership isolate block-page and certificate carrier health.
 Previous: v0.66.0 - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Reports only anonymous cooling-slot, skipped-selection, and half-open-probe aggregates.
@@ -101,6 +102,27 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.70 Sticky, role-isolated security evidence
+
+[STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex]
+
+- Block-page recovery, follower certificate retrieval, and coordinator
+  certificate backfill now each retain the timestamp of their most recent
+  fail-closed security or protocol-integrity stop.
+- A later successful source may update the latest terminal result, but it
+  cannot erase that process-lifetime incident time. Operators can therefore
+  distinguish “currently recovered after a security stop” from “no security
+  stop observed” without receiving source identity or cryptographic material.
+- The three timestamps remain role- and domain-isolated, reset only when the
+  runtime role is configured for a new process lifecycle, and share one
+  monotonic wall-clock clamp so clock rollback cannot regress evidence.
+- Local status and signed management heartbeat expose only Unix time. They
+  still exclude source identity, endpoint, slot order, witness set, frame,
+  hash, signature, raw error, record, payload, route, and client metadata.
+- These timestamps are operational evidence only. They do not blacklist or
+  rank peers, change source selection, mutate the commitment chain, grant
+  authority, establish consensus or finality, or choose a fork.
 
 ### v0.69 Privacy-safe coordinator certificate-backfill telemetry
 

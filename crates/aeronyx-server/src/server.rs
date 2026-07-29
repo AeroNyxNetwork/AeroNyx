@@ -386,6 +386,7 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.56-StickySecurityEvidence - Preserved role-isolated security-stop times
 //   v2.8.55-CertificateBackfillTelemetry - Published role-isolated,
 //     source-blind coordinator certificate recovery evidence
 //   v2.8.54-CertificateCarrierRecovery - Unified coordinator and follower
@@ -4463,6 +4464,8 @@ impl Server {
                                 .block_page_availability_exhausted_total,
                             block_page_security_stops_total: status
                                 .block_page_security_stops_total,
+                            last_block_page_security_stop_at: status
+                                .last_block_page_security_stop_at,
                             block_carrier_cooling_slots: status.block_carrier_cooling_slots,
                             block_carrier_cooldown_skips_total: status
                                 .block_carrier_cooldown_skips_total,
@@ -4492,6 +4495,8 @@ impl Server {
                                 .certificate_availability_exhausted_total,
                             certificate_security_stops_total: status
                                 .certificate_security_stops_total,
+                            last_certificate_security_stop_at: status
+                                .last_certificate_security_stop_at,
                             certificate_carrier_cooling_slots: status
                                 .certificate_carrier_cooling_slots,
                             certificate_carrier_cooldown_skips_total: status
@@ -4515,6 +4520,8 @@ impl Server {
                                 .coordinator_certificate_backfill_availability_exhausted_total,
                             coordinator_certificate_backfill_security_stops_total: status
                                 .coordinator_certificate_backfill_security_stops_total,
+                            last_coordinator_certificate_backfill_security_stop_at: status
+                                .last_coordinator_certificate_backfill_security_stop_at,
                             coordinator_certificate_backfill_carrier_attempts_total: status
                                 .coordinator_certificate_backfill_carrier_attempts_total,
                             coordinator_certificate_backfill_carrier_cooling_slots: status
