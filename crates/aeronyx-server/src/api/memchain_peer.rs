@@ -231,7 +231,8 @@ use crate::services::memchain::storage_ops::{
 };
 use crate::services::memchain::{
     MemoryStorage, RecordCommitmentAnnouncementDisposition,
-    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificatePolicyReadiness,
+    RecordCommitmentCertificateSyncDisposition,
 };
 use crate::services::PeerStore;
 
@@ -2575,6 +2576,10 @@ async fn pull_record_commitment_page_with_carrier_recovery_and_endpoint_policy<F
 where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
 {
+    // [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Every terminal
+    // path records one typed aggregate disposition. Recording remains inside
+    // this direct-first primitive so future callers cannot omit or reinterpret
+    // the source budget; the storage contract discards all source details.
     let direct = pull_record_commitment_page_from_source_with_endpoint_policy(
         storage,
         peer_store,
@@ -2587,6 +2592,11 @@ where
     .await;
     let direct_error = match direct {
         Ok(page) => {
+            storage.record_commitment_block_page_pull_outcome(
+                now_secs(),
+                RecordCommitmentBlockPagePullDisposition::Coordinator,
+                0,
+            );
             return Ok(CommitmentFollowerPagePullOutcome {
                 page,
                 source: CommitmentSyncPageSource::Coordinator,
@@ -2599,12 +2609,27 @@ where
     if commitment_block_source_failure_class(&direct_error)
         == CommitmentBlockSourceFailureClass::Security
     {
+        storage.record_commitment_block_page_pull_outcome(
+            now_secs(),
+            RecordCommitmentBlockPagePullDisposition::SecurityStopped,
+            0,
+        );
         return Err(direct_error);
     }
     if minimum_required_signers < 2 {
+        storage.record_commitment_block_page_pull_outcome(
+            now_secs(),
+            RecordCommitmentBlockPagePullDisposition::AvailabilityExhausted,
+            0,
+        );
         return Err(direct_error);
     }
     if minimum_required_signers > MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1 {
+        storage.record_commitment_block_page_pull_outcome(
+            now_secs(),
+            RecordCommitmentBlockPagePullDisposition::SecurityStopped,
+            0,
+        );
         return Err("block_carrier_policy_invalid".to_string());
     }
 
@@ -2626,6 +2651,11 @@ where
         }
     }
     if carriers.len() < minimum_required_signers {
+        storage.record_commitment_block_page_pull_outcome(
+            now_secs(),
+            RecordCommitmentBlockPagePullDisposition::SecurityStopped,
+            0,
+        );
         return Err("block_carrier_policy_invalid".to_string());
     }
 
@@ -2644,6 +2674,11 @@ where
         .await
         {
             Ok(page) => {
+                storage.record_commitment_block_page_pull_outcome(
+                    now_secs(),
+                    RecordCommitmentBlockPagePullDisposition::CarrierRecovered,
+                    carrier_attempts,
+                );
                 return Ok(CommitmentFollowerPagePullOutcome {
                     page,
                     source: CommitmentSyncPageSource::PinnedCarrier,
@@ -2653,12 +2688,24 @@ where
             Err(error)
                 if commitment_block_source_failure_class(&error)
                     == CommitmentBlockSourceFailureClass::Availability => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                storage.record_commitment_block_page_pull_outcome(
+                    now_secs(),
+                    RecordCommitmentBlockPagePullDisposition::SecurityStopped,
+                    carrier_attempts,
+                );
+                return Err(error);
+            }
         }
     }
 
     // Preserve the coordinator's established privacy-safe code so existing
     // operations and alerting remain backward compatible.
+    storage.record_commitment_block_page_pull_outcome(
+        now_secs(),
+        RecordCommitmentBlockPagePullDisposition::AvailabilityExhausted,
+        carrier_attempts,
+    );
     Err(direct_error)
 }
 
@@ -4380,6 +4427,7 @@ mod tests {
     async fn block_carrier_policy_requires_distinct_external_pins() {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
         storage.audit_record_commitment_chain().await.unwrap();
+        storage.configure_record_commitment_sync(false, true);
         let peers = PeerStore::new();
         let follower = IdentityKeyPair::generate();
         let coordinator = IdentityKeyPair::generate().public_key_bytes();
@@ -4421,6 +4469,17 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error, "pinned_coordinator_unavailable");
+        let status = storage.record_commitment_sync_status();
+        assert_eq!(status.block_page_pulls_total, 2);
+        assert_eq!(status.block_page_coordinator_success_total, 0);
+        assert_eq!(status.block_carrier_attempts_total, 0);
+        assert_eq!(status.block_carrier_recoveries_total, 0);
+        assert_eq!(status.block_page_availability_exhausted_total, 1);
+        assert_eq!(status.block_page_security_stops_total, 1);
+        assert_eq!(
+            status.last_block_page_pull_result.as_deref(),
+            Some("availability_exhausted")
+        );
     }
 
     #[tokio::test]
@@ -7547,6 +7606,26 @@ mod tests {
             carrier_destination.record_commitment_chain_tip().await,
             local.record_commitment_chain_tip().await
         );
+        let block_carrier_status = carrier_destination.record_commitment_sync_status();
+        assert_eq!(block_carrier_status.block_page_pulls_total, 1);
+        assert_eq!(
+            block_carrier_status.block_page_coordinator_success_total,
+            0
+        );
+        assert_eq!(block_carrier_status.block_carrier_attempts_total, 1);
+        assert_eq!(block_carrier_status.block_carrier_recoveries_total, 1);
+        assert_eq!(
+            block_carrier_status.block_page_availability_exhausted_total,
+            0
+        );
+        assert_eq!(block_carrier_status.block_page_security_stops_total, 0);
+        assert_eq!(
+            block_carrier_status.last_block_page_pull_result.as_deref(),
+            Some("carrier_recovered")
+        );
+        assert!(block_carrier_status
+            .last_block_carrier_recovered_at
+            .is_some());
         let recovered =
             sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
                 &carrier_destination,

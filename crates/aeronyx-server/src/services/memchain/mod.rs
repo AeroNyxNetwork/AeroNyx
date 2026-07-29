@@ -140,7 +140,8 @@ pub use storage::{
     StorageStats,
 };
 pub(crate) use storage::{
-    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificatePolicyReadiness,
+    RecordCommitmentCertificateSyncDisposition,
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{

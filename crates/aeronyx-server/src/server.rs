@@ -4430,6 +4430,23 @@ impl Server {
                                 .outbound_announcement_retries_succeeded_total,
                             outbound_announcement_retries_exhausted_total: status
                                 .outbound_announcement_retries_exhausted_total,
+                            // [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex]
+                            // Forward only the storage layer's source-blind
+                            // aggregate contract into the signed heartbeat.
+                            last_block_page_pull_at: status.last_block_page_pull_at,
+                            last_block_page_pull_result: status.last_block_page_pull_result,
+                            last_block_carrier_recovered_at: status
+                                .last_block_carrier_recovered_at,
+                            block_page_pulls_total: status.block_page_pulls_total,
+                            block_page_coordinator_success_total: status
+                                .block_page_coordinator_success_total,
+                            block_carrier_attempts_total: status.block_carrier_attempts_total,
+                            block_carrier_recoveries_total: status
+                                .block_carrier_recoveries_total,
+                            block_page_availability_exhausted_total: status
+                                .block_page_availability_exhausted_total,
+                            block_page_security_stops_total: status
+                                .block_page_security_stops_total,
                             certificate_policy_state: status.certificate_policy_state,
                             certificate_policy_ready: status.certificate_policy_ready,
                             certificate_policy_last_evaluated_at: status

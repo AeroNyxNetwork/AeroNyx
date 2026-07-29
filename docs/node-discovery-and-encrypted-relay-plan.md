@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.62.0 - Added threshold-certified block recovery through bounded pinned carriers.
+Modification Reason: v0.63.0 - Added source-blind block-page carrier observability without overstating certificate completion.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.62.0 - [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Lets a follower recover coordinator-authored blocks from bounded operator pins while requiring an exact-tip threshold certificate before reporting recovery.
+Last Modified: v0.63.0 - [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Reports typed, source-blind block-page retrieval outcomes and bounded carrier attempts without exposing identities or treating transport as certification.
+Previous: v0.62.0 - [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Lets a follower recover coordinator-authored blocks from bounded operator pins while requiring an exact-tip threshold certificate before reporting recovery.
 Previous: v0.61.0 - [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] Prevents readiness evaluated for an older audited tip from being reported as current after follower advancement.
 Previous: v0.60.0 - [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Reports whether the current audited follower tip satisfies the current local witness policy without exposing identities.
 Previous: v0.59.0 - [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Rejects self-referential coordinator and witness trust pins before node startup.
@@ -94,6 +95,37 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.63 Privacy-safe block-page carrier telemetry
+
+[FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex]
+
+- Every follower commitment-block page retrieval now records exactly one typed
+  terminal disposition: `coordinator`, `carrier_recovered`,
+  `availability_exhausted`, or `security_stopped`.
+- Process-local totals separately count terminal page pulls, direct coordinator
+  successes, actual bounded carrier requests, carrier page recoveries, exhausted
+  source availability, and fail-closed security stops. Timestamps remain
+  monotonic if the wall clock moves backward.
+- `carrier_recovered` means only that a pinned carrier delivered an
+  authenticated page whose blocks remain signed by the configured coordinator.
+  It does not claim checkpoint certification. A terminal carrier page must
+  still pass the separate exact-tip certificate gate before runtime may report
+  `certified_recovered`.
+- A direct-only follower can report `availability_exhausted` with zero carrier
+  attempts. This means its configured eligible source budget was exhausted; it
+  never implies that another node was contacted.
+- Local status and signed heartbeat expose the same additive fields. They
+  contain no coordinator or carrier identity, witness set, endpoint, block,
+  certificate frame, hash, signature, commitment, raw error, owner, payload,
+  route, request identifier, or client metadata.
+- These values are process-lifetime operational evidence only. They do not
+  persist as ledger state and cannot influence source selection, production
+  authority, certificate policy, reputation, consensus, finality, or fork
+  choice.
+- Tests enforce mutually exclusive accounting, follower-only updates,
+  monotonic timestamps, invalid-policy security stops, direct-only exhaustion,
+  and a real pinned-carrier page recovery through loopback HTTP.
 
 ### v0.62 Certified block-carrier recovery
 

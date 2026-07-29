@@ -218,8 +218,8 @@ use aeronyx_core::protocol::memchain::{
 
 use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
-    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
-    RecordCommitmentCheckpointCertificateAnchorConfig,
+    RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificatePolicyReadiness,
+    RecordCommitmentCertificateSyncDisposition, RecordCommitmentCheckpointCertificateAnchorConfig,
     RecordCommitmentCheckpointCertificateAnchorRuntime,
     RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
     RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
@@ -4934,6 +4934,58 @@ impl MemoryStorage {
         runtime.last_error_code = None;
     }
 
+    /// Records one terminal commitment-block page retrieval outcome.
+    ///
+    /// [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] The counters are
+    /// mutually exclusive per page retrieval, process-local, and follower-only.
+    /// `carrier_attempts` counts actual bounded carrier requests, excluding the
+    /// direct coordinator request. No source identity, endpoint, block, route,
+    /// certificate, hash, signature, or raw failure can enter this state.
+    pub(crate) fn record_commitment_block_page_pull_outcome(
+        &self,
+        now: u64,
+        disposition: RecordCommitmentBlockPagePullDisposition,
+        carrier_attempts: usize,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled || runtime.role != "follower" {
+            return;
+        }
+        let observed_at = runtime
+            .last_block_page_pull_at
+            .map_or(now, |previous| previous.max(now));
+        let carrier_attempts = u64::try_from(carrier_attempts).unwrap_or(u64::MAX);
+
+        runtime.last_block_page_pull_at = Some(observed_at);
+        runtime.last_block_page_pull_result = Some(disposition.as_str());
+        runtime.block_page_pulls_total = runtime.block_page_pulls_total.saturating_add(1);
+        runtime.block_carrier_attempts_total = runtime
+            .block_carrier_attempts_total
+            .saturating_add(carrier_attempts);
+
+        match disposition {
+            RecordCommitmentBlockPagePullDisposition::Coordinator => {
+                runtime.block_page_coordinator_success_total = runtime
+                    .block_page_coordinator_success_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentBlockPagePullDisposition::CarrierRecovered => {
+                runtime.last_block_carrier_recovered_at = Some(observed_at);
+                runtime.block_carrier_recoveries_total =
+                    runtime.block_carrier_recoveries_total.saturating_add(1);
+            }
+            RecordCommitmentBlockPagePullDisposition::AvailabilityExhausted => {
+                runtime.block_page_availability_exhausted_total = runtime
+                    .block_page_availability_exhausted_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentBlockPagePullDisposition::SecurityStopped => {
+                runtime.block_page_security_stops_total =
+                    runtime.block_page_security_stops_total.saturating_add(1);
+            }
+        }
+    }
+
     /// Records one terminal checkpoint-certificate retrieval outcome.
     ///
     /// [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] This method keeps
@@ -5120,6 +5172,19 @@ impl MemoryStorage {
                 .outbound_announcement_retries_succeeded_total,
             outbound_announcement_retries_exhausted_total: runtime
                 .outbound_announcement_retries_exhausted_total,
+            last_block_page_pull_at: runtime.last_block_page_pull_at,
+            last_block_page_pull_result: runtime
+                .last_block_page_pull_result
+                .map(str::to_string),
+            last_block_carrier_recovered_at: runtime.last_block_carrier_recovered_at,
+            block_page_pulls_total: runtime.block_page_pulls_total,
+            block_page_coordinator_success_total: runtime
+                .block_page_coordinator_success_total,
+            block_carrier_attempts_total: runtime.block_carrier_attempts_total,
+            block_carrier_recoveries_total: runtime.block_carrier_recoveries_total,
+            block_page_availability_exhausted_total: runtime
+                .block_page_availability_exhausted_total,
+            block_page_security_stops_total: runtime.block_page_security_stops_total,
             certificate_policy_state: certificate_policy_state.to_string(),
             certificate_policy_ready: runtime.certificate_policy_ready
                 && !certificate_policy_evaluation_is_stale,
@@ -5156,7 +5221,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; certificate policy exposes state, readiness, evaluated tip height, witness count, threshold, and evaluation time but no coordinator or carrier identity, witness set, endpoint, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; certificate recovery counters are process-local operations evidence, not authority, reputation, consensus, or fork choice",
+                "aggregate runtime only; block-page and certificate recovery expose source-blind terminal results, bounded attempt counts, and monotonic process-local timestamps but no coordinator or carrier identity, witness set, endpoint, block, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; these counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
         }
     }
 
@@ -8687,6 +8752,83 @@ mod tests {
 
         storage.stop_record_commitment_sync();
         assert_eq!(storage.record_commitment_sync_status().state, "stopped");
+    }
+
+    #[test]
+    fn test_block_page_pull_runtime_is_aggregate_monotonic_and_follower_only() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+
+        storage.record_commitment_block_page_pull_outcome(
+            90,
+            RecordCommitmentBlockPagePullDisposition::Coordinator,
+            0,
+        );
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .block_page_pulls_total,
+            0
+        );
+
+        // [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Exercise all
+        // mutually exclusive terminal dispositions, timestamp clamping, and
+        // actual carrier-attempt accounting without retaining source details.
+        storage.configure_record_commitment_sync(false, true);
+        storage.record_commitment_block_page_pull_outcome(
+            100,
+            RecordCommitmentBlockPagePullDisposition::Coordinator,
+            0,
+        );
+        storage.record_commitment_block_page_pull_outcome(
+            110,
+            RecordCommitmentBlockPagePullDisposition::CarrierRecovered,
+            2,
+        );
+        storage.record_commitment_block_page_pull_outcome(
+            105,
+            RecordCommitmentBlockPagePullDisposition::AvailabilityExhausted,
+            1,
+        );
+        storage.record_commitment_block_page_pull_outcome(
+            120,
+            RecordCommitmentBlockPagePullDisposition::SecurityStopped,
+            1,
+        );
+
+        let status = storage.record_commitment_sync_status();
+        assert_eq!(status.last_block_page_pull_at, Some(120));
+        assert_eq!(
+            status.last_block_page_pull_result.as_deref(),
+            Some("security_stopped")
+        );
+        assert_eq!(status.last_block_carrier_recovered_at, Some(110));
+        assert_eq!(status.block_page_pulls_total, 4);
+        assert_eq!(status.block_page_coordinator_success_total, 1);
+        assert_eq!(status.block_carrier_attempts_total, 4);
+        assert_eq!(status.block_carrier_recoveries_total, 1);
+        assert_eq!(status.block_page_availability_exhausted_total, 1);
+        assert_eq!(status.block_page_security_stops_total, 1);
+        assert_eq!(
+            status.block_page_pulls_total,
+            status
+                .block_page_coordinator_success_total
+                .saturating_add(status.block_carrier_recoveries_total)
+                .saturating_add(status.block_page_availability_exhausted_total)
+                .saturating_add(status.block_page_security_stops_total)
+        );
+
+        storage.configure_record_commitment_sync(true, false);
+        storage.record_commitment_block_page_pull_outcome(
+            130,
+            RecordCommitmentBlockPagePullDisposition::Coordinator,
+            0,
+        );
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .block_page_pulls_total,
+            0
+        );
     }
 
     #[test]

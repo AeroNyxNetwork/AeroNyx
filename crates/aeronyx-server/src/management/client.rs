@@ -251,6 +251,26 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub outbound_announcement_retries_succeeded_total: u64,
     /// Peers still transiently failing after the bounded retry budget.
     pub outbound_announcement_retries_exhausted_total: u64,
+    /// [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] The following
+    /// page-level fields are additive, process-local, and source-blind.
+    /// Most recent terminal commitment-block page retrieval.
+    pub last_block_page_pull_at: Option<u64>,
+    /// Latest source-blind block-page retrieval result.
+    pub last_block_page_pull_result: Option<String>,
+    /// Most recent successful page recovery through a pinned carrier.
+    pub last_block_carrier_recovered_at: Option<u64>,
+    /// Terminal block-page retrievals since process start.
+    pub block_page_pulls_total: u64,
+    /// Pages retrieved directly from the configured coordinator.
+    pub block_page_coordinator_success_total: u64,
+    /// Bounded pinned-carrier page requests actually attempted.
+    pub block_carrier_attempts_total: u64,
+    /// Pages recovered through an already-pinned carrier.
+    pub block_carrier_recoveries_total: u64,
+    /// Page retrievals where every eligible source was unavailable.
+    pub block_page_availability_exhausted_total: u64,
+    /// Page retrievals stopped by security or protocol-integrity failures.
+    pub block_page_security_stops_total: u64,
     /// Current exact local certificate-policy state.
     pub certificate_policy_state: String,
     /// Whether the current audited tip satisfies current local policy.
@@ -952,6 +972,15 @@ mod tests {
                 outbound_announcement_retries_attempted_total: 4,
                 outbound_announcement_retries_succeeded_total: 2,
                 outbound_announcement_retries_exhausted_total: 1,
+                last_block_page_pull_at: Some(113),
+                last_block_page_pull_result: Some("carrier_recovered".to_string()),
+                last_block_carrier_recovered_at: Some(113),
+                block_page_pulls_total: 8,
+                block_page_coordinator_success_total: 5,
+                block_carrier_attempts_total: 4,
+                block_carrier_recoveries_total: 1,
+                block_page_availability_exhausted_total: 1,
+                block_page_security_stops_total: 1,
                 certificate_policy_state: "ready".to_string(),
                 certificate_policy_ready: true,
                 certificate_policy_last_evaluated_at: Some(111),
@@ -1091,6 +1120,15 @@ mod tests {
         assert_eq!(sync["outbound_announcement_retries_attempted_total"], 4);
         assert_eq!(sync["outbound_announcement_retries_succeeded_total"], 2);
         assert_eq!(sync["outbound_announcement_retries_exhausted_total"], 1);
+        assert_eq!(sync["last_block_page_pull_at"], 113);
+        assert_eq!(sync["last_block_page_pull_result"], "carrier_recovered");
+        assert_eq!(sync["last_block_carrier_recovered_at"], 113);
+        assert_eq!(sync["block_page_pulls_total"], 8);
+        assert_eq!(sync["block_page_coordinator_success_total"], 5);
+        assert_eq!(sync["block_carrier_attempts_total"], 4);
+        assert_eq!(sync["block_carrier_recoveries_total"], 1);
+        assert_eq!(sync["block_page_availability_exhausted_total"], 1);
+        assert_eq!(sync["block_page_security_stops_total"], 1);
         assert_eq!(sync["certificate_policy_state"], "ready");
         assert_eq!(sync["certificate_policy_ready"], true);
         assert_eq!(sync["certificate_policy_last_evaluated_at"], 111);
@@ -1146,9 +1184,14 @@ mod tests {
         for section in [integrity, sync, checkpoint] {
             for forbidden in [
                 "coordinator_node_id",
+                "carrier_node_id",
+                "source_node_id",
                 "endpoint",
+                "carrier_endpoint",
+                "source_endpoint",
                 "tip_hash",
                 "block_hash",
+                "block_bytes",
                 "proposer",
                 "commitment_ids",
                 "record_ids",

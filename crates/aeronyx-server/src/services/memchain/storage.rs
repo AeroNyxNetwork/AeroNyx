@@ -435,6 +435,32 @@ impl RecordCommitmentCertificateSyncDisposition {
     }
 }
 
+/// One terminal outcome for a follower commitment-block page retrieval.
+///
+/// [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] This process-local
+/// classification is source-blind: it can distinguish direct success,
+/// pinned-carrier page recovery, exhausted availability, and fail-closed
+/// security stops without retaining any node identity, endpoint, block
+/// material, route, or raw failure. It never participates in chain decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordCommitmentBlockPagePullDisposition {
+    Coordinator,
+    CarrierRecovered,
+    AvailabilityExhausted,
+    SecurityStopped,
+}
+
+impl RecordCommitmentBlockPagePullDisposition {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Coordinator => "coordinator",
+            Self::CarrierRecovered => "carrier_recovered",
+            Self::AvailabilityExhausted => "availability_exhausted",
+            Self::SecurityStopped => "security_stopped",
+        }
+    }
+}
+
 /// Current follower certificate-policy readiness after exact local validation.
 ///
 /// [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] These states are
@@ -539,6 +565,24 @@ pub struct RecordCommitmentSyncStatus {
     pub outbound_announcement_retries_succeeded_total: u64,
     /// Peers still transiently failing after the retry budget.
     pub outbound_announcement_retries_exhausted_total: u64,
+    /// Most recent terminal commitment-block page retrieval.
+    pub last_block_page_pull_at: Option<u64>,
+    /// Latest source-blind page retrieval result.
+    pub last_block_page_pull_result: Option<String>,
+    /// Most recent page recovered through an already-pinned carrier.
+    pub last_block_carrier_recovered_at: Option<u64>,
+    /// Terminal block-page retrievals observed since process start.
+    pub block_page_pulls_total: u64,
+    /// Pages retrieved directly from the configured coordinator.
+    pub block_page_coordinator_success_total: u64,
+    /// Pinned carrier requests attempted after coordinator availability faults.
+    pub block_carrier_attempts_total: u64,
+    /// Pages recovered through an already-pinned carrier.
+    pub block_carrier_recoveries_total: u64,
+    /// Page retrievals where every eligible bounded source was unavailable.
+    pub block_page_availability_exhausted_total: u64,
+    /// Page retrievals stopped by security or protocol-integrity failures.
+    pub block_page_security_stops_total: u64,
     /// Current certificate policy state without witness identities.
     pub certificate_policy_state: String,
     /// Whether the exact current audited tip satisfies current local policy.
@@ -783,6 +827,15 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) outbound_announcement_retries_attempted_total: u64,
     pub(crate) outbound_announcement_retries_succeeded_total: u64,
     pub(crate) outbound_announcement_retries_exhausted_total: u64,
+    pub(crate) last_block_page_pull_at: Option<u64>,
+    pub(crate) last_block_page_pull_result: Option<&'static str>,
+    pub(crate) last_block_carrier_recovered_at: Option<u64>,
+    pub(crate) block_page_pulls_total: u64,
+    pub(crate) block_page_coordinator_success_total: u64,
+    pub(crate) block_carrier_attempts_total: u64,
+    pub(crate) block_carrier_recoveries_total: u64,
+    pub(crate) block_page_availability_exhausted_total: u64,
+    pub(crate) block_page_security_stops_total: u64,
     pub(crate) certificate_policy_state: &'static str,
     pub(crate) certificate_policy_ready: bool,
     pub(crate) certificate_policy_last_evaluated_at: Option<u64>,
@@ -841,6 +894,15 @@ impl Default for RecordCommitmentSyncRuntime {
             outbound_announcement_retries_attempted_total: 0,
             outbound_announcement_retries_succeeded_total: 0,
             outbound_announcement_retries_exhausted_total: 0,
+            last_block_page_pull_at: None,
+            last_block_page_pull_result: None,
+            last_block_carrier_recovered_at: None,
+            block_page_pulls_total: 0,
+            block_page_coordinator_success_total: 0,
+            block_carrier_attempts_total: 0,
+            block_carrier_recoveries_total: 0,
+            block_page_availability_exhausted_total: 0,
+            block_page_security_stops_total: 0,
             certificate_policy_state: "not_applicable",
             certificate_policy_ready: false,
             certificate_policy_last_evaluated_at: None,
