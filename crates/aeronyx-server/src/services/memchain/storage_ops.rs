@@ -4911,6 +4911,29 @@ impl MemoryStorage {
         }
     }
 
+    /// Marks a follower restored to an exact threshold-certified local tip.
+    ///
+    /// [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] This is intentionally
+    /// distinct from `current`: while the producer is unavailable, a carrier
+    /// and immutable witness certificate can prove the recovered prefix but
+    /// cannot prove that no later producer block exists. The state contains no
+    /// carrier identity, endpoint, route, hash, signature, or user metadata.
+    pub fn record_commitment_sync_certified_recovery_success(
+        &self,
+        now: u64,
+        certified_tip_height: u64,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled {
+            return;
+        }
+        runtime.state = "certified_recovered";
+        runtime.last_success_at = Some(now);
+        runtime.remote_tip_height = Some(certified_tip_height);
+        runtime.consecutive_failures = 0;
+        runtime.last_error_code = None;
+    }
+
     /// Records one terminal checkpoint-certificate retrieval outcome.
     ///
     /// [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] This method keeps
@@ -8602,6 +8625,17 @@ mod tests {
         assert_eq!(recovered.recovery_events_total, 1);
         assert_eq!(recovered.recent_events.len(), 2);
         assert_eq!(recovered.recent_events[1].kind, "recovered");
+
+        // [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] A threshold-certified
+        // prefix recovered without the producer remains distinct from a live
+        // equal-tip coordinator checkpoint.
+        storage.record_commitment_sync_attempt(135);
+        storage.record_commitment_sync_certified_recovery_success(136, 9);
+        let certified = storage.record_commitment_sync_status();
+        assert_eq!(certified.state, "certified_recovered");
+        assert_eq!(certified.last_success_at, Some(136));
+        assert_eq!(certified.remote_tip_height, Some(9));
+        assert_eq!(certified.consecutive_failures, 0);
 
         storage.record_commitment_sync_announcement(
             140,

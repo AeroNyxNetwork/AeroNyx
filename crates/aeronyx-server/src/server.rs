@@ -609,13 +609,14 @@ use crate::api::directory_replica_sync::{
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     publish_current_descriptor_to_commitment_witnesses, pull_record_commitment_checkpoint,
-    pull_record_commitment_checkpoint_certificate, pull_record_commitment_page,
+    pull_record_commitment_checkpoint_certificate,
+    pull_record_commitment_page_with_carrier_recovery,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
     request_record_commitment_coordinator_lease,
     sync_follower_record_commitment_checkpoint_certificate, witness_verified_delivery_anchor,
     CommitmentCheckpointRelation, CommitmentFollowerCertificateSyncOutcome,
-    CommitmentReconciliationOutcome, VerifiedDeliveryAnchorWitnessRound,
+    CommitmentReconciliationOutcome, CommitmentSyncPageSource, VerifiedDeliveryAnchorWitnessRound,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState, SessionEmbeddingCache};
 use crate::api::voice::build_voice_router;
@@ -6579,8 +6580,11 @@ impl Server {
     /// The configured coordinator identity is the sole trust root. Discovery
     /// resolves only that identity's signed endpoint, while the pull helper
     /// verifies the response signer, every block proposer, and full chain
-    /// continuity before SQLite is changed. There is deliberately no peer
-    /// fallback or longest-chain selection in this pre-consensus phase.
+    /// continuity before SQLite is changed. [CERTIFIED-BLOCK-CARRIER
+    /// 2026-07-29 by Codex] Availability-only failure may use a bounded
+    /// operator-pinned witness as a read-only carrier, but terminal recovery
+    /// requires the configured threshold certificate. There is no arbitrary
+    /// discovery fallback, longest-chain selection, or carrier authority.
     fn spawn_memchain_commitment_sync_task(
         &self,
         storage: Arc<MemoryStorage>,
@@ -6684,14 +6688,18 @@ impl Server {
                     let mut inserted = 0usize;
                     let mut remote_tip_height = 0u64;
                     for _ in 0..max_pages_per_round {
-                        let outcome = pull_record_commitment_page(
+                        let page_pull = pull_record_commitment_page_with_carrier_recovery(
                             &storage,
                             &peer_store,
                             &identity,
                             &coordinator_node_id,
+                            &certificate_witness_node_ids,
+                            certificate_minimum_signers,
                             sync_http_client.as_ref(),
                         )
                         .await?;
+                        let page_source = page_pull.source;
+                        let outcome = page_pull.page;
                         let verified_blocks = outcome
                             .inserted
                             .saturating_add(outcome.already_present)
@@ -6706,6 +6714,69 @@ impl Server {
                         inserted = inserted.saturating_add(outcome.inserted);
                         remote_tip_height = outcome.remote_tip_height;
                         if !outcome.has_more {
+                            if page_source == CommitmentSyncPageSource::PinnedCarrier {
+                                // [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex]
+                                // A terminal carrier page proves only an
+                                // authenticated producer-signed prefix. It may
+                                // become operationally recovered only when the
+                                // exact local tip satisfies the configured
+                                // immutable witness certificate threshold.
+                                match sync_follower_record_commitment_checkpoint_certificate(
+                                    &storage,
+                                    &peer_store,
+                                    &identity,
+                                    &coordinator_node_id,
+                                    &certificate_witness_node_ids,
+                                    certificate_minimum_signers,
+                                    outcome.remote_tip_height,
+                                    sync_http_client.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(
+                                        CommitmentFollowerCertificateSyncOutcome::AlreadyCurrent,
+                                    ) => {}
+                                    Ok(
+                                        CommitmentFollowerCertificateSyncOutcome::Refreshed(
+                                            certificate,
+                                        ),
+                                    ) if certificate.persisted => {
+                                        info!(
+                                            checkpoint_height = certificate.checkpoint_height,
+                                            signer_count = certificate.signer_count,
+                                            required_signers = certificate.required_signers,
+                                            carrier_attempts = page_pull.carrier_attempts,
+                                            "[MEMCHAIN_BLOCK] Follower completed certified carrier recovery"
+                                        );
+                                    }
+                                    Ok(
+                                        CommitmentFollowerCertificateSyncOutcome::PolicyDisabled,
+                                    ) => {
+                                        return Err(
+                                            "block_carrier_certificate_required".to_string()
+                                        );
+                                    }
+                                    Ok(
+                                        CommitmentFollowerCertificateSyncOutcome::Refreshed(_),
+                                    ) => {
+                                        return Err(
+                                            "block_carrier_certificate_policy_unsatisfied"
+                                                .to_string(),
+                                        );
+                                    }
+                                    Err(reason) => return Err(reason),
+                                }
+                                storage.record_commitment_sync_certified_recovery_success(
+                                    unix_now_secs(),
+                                    outcome.remote_tip_height,
+                                );
+                                return Ok((
+                                    inserted,
+                                    outcome.remote_tip_height,
+                                    false,
+                                    true,
+                                ));
+                            }
                             let checkpoint = match pull_record_commitment_checkpoint(
                                 &storage,
                                 &peer_store,
@@ -6788,7 +6859,12 @@ impl Server {
                                             );
                                         }
                                     }
-                                    return Ok((inserted, checkpoint.remote_tip_height, false));
+                                    return Ok((
+                                        inserted,
+                                        checkpoint.remote_tip_height,
+                                        false,
+                                        false,
+                                    ));
                                 }
                                 CommitmentCheckpointRelation::RemoteAhead => {
                                     remote_tip_height = checkpoint.remote_tip_height;
@@ -6803,28 +6879,35 @@ impl Server {
                             }
                         }
                     }
-                    Ok((inserted, remote_tip_height, true))
+                    Ok((inserted, remote_tip_height, true, false))
                 };
-                let round: std::result::Result<(usize, u64, bool), String> = tokio::select! {
+                let round: std::result::Result<(usize, u64, bool, bool), String> = tokio::select! {
                     _ = shutdown_rx.recv() => break 'sync_loop,
                     result = round_future => result,
                 };
 
                 match round {
-                    Ok((inserted, remote_tip_height, backlog_remaining)) => {
+                    Ok((
+                        inserted,
+                        remote_tip_height,
+                        backlog_remaining,
+                        certified_recovered,
+                    )) => {
                         consecutive_failures = 0;
                         if inserted > 0 {
                             info!(
                                 blocks = inserted,
                                 tip_height = remote_tip_height,
                                 backlog_remaining,
+                                certified_recovered,
                                 "[MEMCHAIN_BLOCK] Follower catch-up advanced"
                             );
                         } else {
                             debug!(
                                 tip_height = remote_tip_height,
                                 trigger,
-                                "[MEMCHAIN_BLOCK] Follower is current"
+                                certified_recovered,
+                                "[MEMCHAIN_BLOCK] Follower completed verified sync round"
                             );
                         }
                         // Keep each round bounded but drain a verified backlog

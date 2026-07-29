@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.61.0 - Bound follower certificate readiness to the exact audited local tip.
+Modification Reason: v0.62.0 - Added threshold-certified block recovery through bounded pinned carriers.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.61.0 - [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] Prevents readiness evaluated for an older audited tip from being reported as current after follower advancement.
+Last Modified: v0.62.0 - [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Lets a follower recover coordinator-authored blocks from bounded operator pins while requiring an exact-tip threshold certificate before reporting recovery.
+Previous: v0.61.0 - [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] Prevents readiness evaluated for an older audited tip from being reported as current after follower advancement.
 Previous: v0.60.0 - [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Reports whether the current audited follower tip satisfies the current local witness policy without exposing identities.
 Previous: v0.59.0 - [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Rejects self-referential coordinator and witness trust pins before node startup.
 Previous: v0.58.0 - [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Allows validated followers to configure independent witness pins for current-tip certificate verification and carrier recovery.
@@ -93,6 +94,48 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.62 Certified block-carrier recovery
+
+[CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex]
+
+This milestone proves that a follower can restore an original coordinator-signed
+Memory Chain prefix while the producer is temporarily unavailable:
+
+- The configured coordinator is always attempted first.
+- Fallback is disabled unless local policy requires at least two independent
+  checkpoint witnesses and the configured pin set can satisfy that threshold.
+- At most three distinct operator-pinned witnesses may be tried, in operator
+  order. Permissionless discovery never chooses a block source.
+- Fallback is allowed only for admission/availability failures. Unsafe
+  endpoints, malformed frames, wrong responder identity, invalid signatures,
+  wrong proposer identity, broken continuity, rollback, pagination mismatch,
+  oversized responses, and storage failures stop immediately.
+- The carrier signs only the page envelope. Every contained block must still
+  verify under the configured coordinator identity and exact local continuity.
+- A terminal carrier page is not enough to report `current`. The follower must
+  import or already hold an immutable checkpoint certificate for that exact
+  local tip satisfying its current witness pins and threshold.
+- Successful outage recovery reports `certified_recovered`, not `current`,
+  because a carrier can prove a certified prefix but cannot prove that the
+  unavailable producer has not authored a later block.
+- When the coordinator returns, the ordinary signed equal-tip checkpoint path
+  restores the stronger `current` state automatically.
+
+Authority boundary:
+
+```text
+carrier envelope signature = authenticated transport
+coordinator block signature = block authorship
+threshold checkpoint certificate = certified recovered prefix
+live coordinator checkpoint = current-tip convergence
+```
+
+This remains authenticated replication, not global consensus, longest-chain
+selection, economic finality, or permissionless fork choice. Public status and
+heartbeat retain only aggregate state and heights; carrier identities,
+endpoints, routes, block hashes, signatures, commitments, and user data remain
+local or absent.
 
 AeroNyx currently has several important building blocks:
 

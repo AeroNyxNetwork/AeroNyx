@@ -203,7 +203,9 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub contract_version: &'static str,
     /// `coordinator`, `follower`, or `verifier`.
     pub role: String,
-    /// Current runtime state.
+    /// Current runtime state. `certified_recovered` proves an exact certified
+    /// prefix while the producer is unavailable; it does not claim the latest
+    /// producer tip. [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex]
     pub state: String,
     /// Whether active follower polling is configured.
     pub enabled: bool,

@@ -489,7 +489,8 @@ pub struct RecordCommitmentSyncStatus {
     pub contract_version: &'static str,
     /// Node role: `coordinator`, `follower`, or `verifier`.
     pub role: String,
-    /// Runtime state such as `current`, `catching_up`, or `backoff`.
+    /// Runtime state such as `current`, `certified_recovered`, `catching_up`,
+    /// or `backoff`. [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex]
     pub state: String,
     /// Whether active follower polling is configured.
     pub enabled: bool,

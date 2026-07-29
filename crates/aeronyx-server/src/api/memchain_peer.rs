@@ -52,6 +52,11 @@
 //!   must still belong to the receiver's operator-pinned witness set.
 //! - Followers refresh current-tip checkpoint certificates only after signed
 //!   chain convergence; mixed-version absence never rolls back a verified tip.
+//! - [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Followers may recover
+//!   coordinator-signed pages from bounded operator-pinned carriers after a
+//!   classified coordinator availability failure. The carrier signs only the
+//!   transport envelope; every block must still be signed by the configured
+//!   coordinator and terminal recovery requires the local witness threshold.
 //! - Followers report identity-blind current-policy readiness only after exact
 //!   local tip, pin-set, threshold, and durable-certificate validation.
 //! - Last-hop public-IP validation on every outbound commitment request so a
@@ -88,7 +93,9 @@
 //! - Do not increase body/page limits without memory and abuse testing.
 //! - Sealed payload replication requires a separate owner-authorised protocol.
 //! - Never fall back from the pinned coordinator to an arbitrary discovered
-//!   peer. Block Sync v1 is authenticated replication, not consensus.
+//!   peer. A block carrier must be an explicit witness pin, is bounded to the
+//!   existing witness fan-out limit, and gains no proposer, checkpoint,
+//!   consensus, finality, or fork-choice authority.
 //! - A block announcement is an untrusted scheduling hint even after its
 //!   signature is verified. It must never bypass page/checkpoint validation,
 //!   failure backoff, rollback protection, or the pinned coordinator policy.
@@ -136,6 +143,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.50-CertifiedBlockCarrier - Recovered coordinator-signed pages through bounded pinned carriers.
 //! v2.8.49-FollowerCertificateTipBinding - Bound every applicable policy outcome to its audited tip.
 //! v2.8.48-FollowerCertificateReadiness - Reported exact current-policy readiness without witness identities.
 //! v2.8.45-FollowerCertificateTelemetry - Reported source-blind certificate recovery outcomes.
@@ -271,6 +279,31 @@ pub struct CommitmentSyncPageOutcome {
     pub has_more: bool,
     /// Privacy-safe height of the coordinator's signed chain tip.
     pub remote_tip_height: u64,
+}
+
+/// Privacy-safe transport class for one verified commitment page.
+///
+/// [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] This enum deliberately does
+/// not retain the responding identity, endpoint, route, request id, block
+/// hashes, or certificate material. It describes availability only and must
+/// never be used as proposer authority, reputation, consensus, or fork choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitmentSyncPageSource {
+    /// The configured coordinator signed both the envelope and every block.
+    Coordinator,
+    /// An operator-pinned witness signed the envelope around coordinator blocks.
+    PinnedCarrier,
+}
+
+/// Result of one direct-first, bounded page retrieval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitmentFollowerPagePullOutcome {
+    /// Fully verified and atomically appended page result.
+    pub page: CommitmentSyncPageOutcome,
+    /// Identity-blind transport class.
+    pub source: CommitmentSyncPageSource,
+    /// Number of pinned carriers contacted after the direct availability fault.
+    pub carrier_attempts: usize,
 }
 
 /// One independently verified coordinator lease grant.
@@ -2469,6 +2502,42 @@ pub async fn pull_record_commitment_page(
     .await
 }
 
+/// Pulls one coordinator-authored page with bounded pinned-carrier recovery.
+///
+/// The coordinator is always attempted first. Carrier recovery is enabled only
+/// when the local follower requires at least two witness signatures and has
+/// enough configured witness pins to satisfy that policy. A carrier signs the
+/// page envelope but every block must remain signed by `coordinator_node_id`.
+/// Only classified availability failures may advance to another source.
+///
+/// # Errors
+///
+/// Returns the coordinator's stable availability code when every bounded
+/// source is unavailable. Any endpoint-policy, decoding, identity, signature,
+/// proposer, continuity, rollback, pagination, or storage failure stops closed
+/// before another source can mask the incident.
+pub async fn pull_record_commitment_page_with_carrier_recovery(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    coordinator_node_id: &[u8; 32],
+    carrier_node_ids: &[[u8; 32]],
+    minimum_required_signers: usize,
+    client: &reqwest::Client,
+) -> Result<CommitmentFollowerPagePullOutcome, String> {
+    pull_record_commitment_page_with_carrier_recovery_and_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        coordinator_node_id,
+        carrier_node_ids,
+        minimum_required_signers,
+        client,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
 async fn pull_record_commitment_page_with_endpoint_policy<F>(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
@@ -2480,11 +2549,173 @@ async fn pull_record_commitment_page_with_endpoint_policy<F>(
 where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
 {
+    pull_record_commitment_page_from_source_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        coordinator_node_id,
+        coordinator_node_id,
+        client,
+        endpoint_allowed,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pull_record_commitment_page_with_carrier_recovery_and_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    coordinator_node_id: &[u8; 32],
+    carrier_node_ids: &[[u8; 32]],
+    minimum_required_signers: usize,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+) -> Result<CommitmentFollowerPagePullOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    let direct = pull_record_commitment_page_from_source_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        coordinator_node_id,
+        coordinator_node_id,
+        client,
+        endpoint_allowed,
+    )
+    .await;
+    let direct_error = match direct {
+        Ok(page) => {
+            return Ok(CommitmentFollowerPagePullOutcome {
+                page,
+                source: CommitmentSyncPageSource::Coordinator,
+                carrier_attempts: 0,
+            });
+        }
+        Err(error) => error,
+    };
+
+    if commitment_block_source_failure_class(&direct_error)
+        == CommitmentBlockSourceFailureClass::Security
+    {
+        return Err(direct_error);
+    }
+    if minimum_required_signers < 2 {
+        return Err(direct_error);
+    }
+    if minimum_required_signers > MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1 {
+        return Err("block_carrier_policy_invalid".to_string());
+    }
+
+    // [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Preserve operator order,
+    // exclude self/coordinator, deduplicate, and enforce the same hard fan-out
+    // cap as witness operations. Discovery never chooses a recovery source.
+    let local_node_id = identity.public_key_bytes();
+    let mut carriers = Vec::with_capacity(MAX_PINNED_WITNESSES_PER_ROUND);
+    for carrier in carrier_node_ids {
+        if *carrier == local_node_id
+            || carrier == coordinator_node_id
+            || carriers.contains(carrier)
+        {
+            continue;
+        }
+        carriers.push(*carrier);
+        if carriers.len() == MAX_PINNED_WITNESSES_PER_ROUND {
+            break;
+        }
+    }
+    if carriers.len() < minimum_required_signers {
+        return Err("block_carrier_policy_invalid".to_string());
+    }
+
+    let mut carrier_attempts = 0usize;
+    for carrier in carriers {
+        carrier_attempts = carrier_attempts.saturating_add(1);
+        match pull_record_commitment_page_from_source_with_endpoint_policy(
+            storage,
+            peer_store,
+            identity,
+            &carrier,
+            coordinator_node_id,
+            client,
+            endpoint_allowed,
+        )
+        .await
+        {
+            Ok(page) => {
+                return Ok(CommitmentFollowerPagePullOutcome {
+                    page,
+                    source: CommitmentSyncPageSource::PinnedCarrier,
+                    carrier_attempts,
+                });
+            }
+            Err(error)
+                if commitment_block_source_failure_class(&error)
+                    == CommitmentBlockSourceFailureClass::Availability => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    // Preserve the coordinator's established privacy-safe code so existing
+    // operations and alerting remain backward compatible.
+    Err(direct_error)
+}
+
+/// Narrow retry policy for alternate pinned block carriers.
+///
+/// Decode, signature, responder, proposer, continuity, pagination, size,
+/// endpoint-policy, and storage failures are always security failures. A stale
+/// carrier tip is availability-only because it cannot mutate local state and a
+/// later exact pin may hold a newer verified prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitmentBlockSourceFailureClass {
+    Availability,
+    Security,
+}
+
+fn commitment_block_source_failure_class(error: &str) -> CommitmentBlockSourceFailureClass {
+    let retryable_status = error
+        .strip_prefix("http_status_")
+        .and_then(|status| status.parse::<u16>().ok())
+        .is_some_and(|status| matches!(status, 403 | 404 | 408 | 429 | 500 | 502 | 503 | 504));
+    if retryable_status
+        || matches!(
+            error,
+            "pinned_coordinator_unavailable"
+                | "pinned_coordinator_missing_endpoint"
+                | "request_timeout"
+                | "request_connect"
+                | "response_body_timeout"
+                | "response_body_connect"
+                | "response_body_body"
+                | "carrier_tip_behind"
+        )
+    {
+        CommitmentBlockSourceFailureClass::Availability
+    } else {
+        CommitmentBlockSourceFailureClass::Security
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pull_record_commitment_page_from_source_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    response_signer_node_id: &[u8; 32],
+    expected_proposer_node_id: &[u8; 32],
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+) -> Result<CommitmentSyncPageOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
     let request_timestamp = now_secs();
-    let coordinator = peer_store
-        .get_valid(coordinator_node_id, request_timestamp)
+    let source = peer_store
+        .get_valid(response_signer_node_id, request_timestamp)
         .ok_or_else(|| "pinned_coordinator_unavailable".to_string())?;
-    let endpoint = coordinator
+    let endpoint = source
         .descriptor
         .public_endpoint
         .as_deref()
@@ -2532,13 +2763,14 @@ where
     let page = verify_record_commitment_page(
         &body,
         &request_id,
-        coordinator_node_id,
+        response_signer_node_id,
+        expected_proposer_node_id,
         local_tip,
         now_secs(),
     )?;
 
     let append = storage
-        .append_record_commitment_blocks_atomic(&page.blocks, Some(coordinator_node_id))
+        .append_record_commitment_blocks_atomic(&page.blocks, Some(expected_proposer_node_id))
         .await
         .map_err(|_| "storage_append_rejected".to_string())?;
 
@@ -3094,6 +3326,7 @@ fn verify_record_commitment_page(
     body: &[u8],
     expected_request_id: &[u8; 16],
     expected_responder: &[u8; 32],
+    expected_proposer: &[u8; 32],
     local_tip: (u64, [u8; 32]),
     now: u64,
 ) -> Result<VerifiedCommitmentPage, String> {
@@ -3145,7 +3378,12 @@ fn verify_record_commitment_page(
         return Err("invalid_local_genesis".to_string());
     }
     if tip_height < local_height {
-        return Err("coordinator_rollback_detected".to_string());
+        return Err(if expected_responder == expected_proposer {
+            "coordinator_rollback_detected"
+        } else {
+            "carrier_tip_behind"
+        }
+        .to_string());
     }
     if blocks.is_empty() {
         if has_more || tip_height != local_height || tip_hash != local_hash {
@@ -3164,7 +3402,7 @@ fn verify_record_commitment_page(
     let mut expected_height = local_height.saturating_add(1);
     let mut expected_prev_hash = local_hash;
     for block in &blocks {
-        if block.header.proposer != *expected_responder {
+        if block.header.proposer != *expected_proposer {
             return Err("unexpected_block_proposer".to_string());
         }
         block
@@ -4094,6 +4332,95 @@ mod tests {
                 "{error} must stop before any fallback"
             );
         }
+    }
+
+    #[test]
+    fn block_carrier_fallback_classifies_only_availability_failures() {
+        // [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Only source absence,
+        // transient transport/status failure, or a safely ignored stale
+        // carrier may advance to another exact pin. Evidence failures stop.
+        for error in [
+            "pinned_coordinator_unavailable",
+            "pinned_coordinator_missing_endpoint",
+            "request_timeout",
+            "request_connect",
+            "response_body_body",
+            "http_status_403",
+            "http_status_404",
+            "http_status_429",
+            "http_status_503",
+            "carrier_tip_behind",
+        ] {
+            assert_eq!(
+                commitment_block_source_failure_class(error),
+                CommitmentBlockSourceFailureClass::Availability,
+                "{error} must permit only bounded pinned-carrier recovery"
+            );
+        }
+        for error in [
+            "pinned_coordinator_unsafe_endpoint",
+            "http_status_400",
+            "http_status_401",
+            "invalid_response_frame",
+            "invalid_response_signature",
+            "response_responder_mismatch",
+            "unexpected_block_proposer",
+            "commitment_chain_verification_failed",
+            "storage_append_rejected",
+        ] {
+            assert_eq!(
+                commitment_block_source_failure_class(error),
+                CommitmentBlockSourceFailureClass::Security,
+                "{error} must stop before another carrier"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn block_carrier_policy_requires_distinct_external_pins() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let peers = PeerStore::new();
+        let follower = IdentityKeyPair::generate();
+        let coordinator = IdentityKeyPair::generate().public_key_bytes();
+        let witness = IdentityKeyPair::generate().public_key_bytes();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Repeating one pin or
+        // including self cannot satisfy a two-witness recovery policy.
+        let error = pull_record_commitment_page_with_carrier_recovery_and_endpoint_policy(
+            &storage,
+            &peers,
+            &follower,
+            &coordinator,
+            &[witness, witness, follower.public_key_bytes()],
+            2,
+            &client,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "block_carrier_policy_invalid");
+
+        // Backward-compatible policy keeps the historical direct-only failure
+        // instead of silently enabling carrier transport.
+        let error = pull_record_commitment_page_with_carrier_recovery_and_endpoint_policy(
+            &storage,
+            &peers,
+            &follower,
+            &coordinator,
+            &[witness],
+            1,
+            &client,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "pinned_coordinator_unavailable");
     }
 
     #[tokio::test]
@@ -5658,6 +5985,31 @@ mod tests {
             &frame,
             &request_id,
             &responder,
+            &responder,
+            (0, GENESIS_PREV_HASH),
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(error, "unexpected_block_proposer");
+
+        // [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] A valid carrier
+        // envelope cannot promote carrier-authored blocks into the configured
+        // coordinator namespace.
+        let carrier = other_writer.public_key_bytes();
+        let carrier_frame = signed_block_page_frame(
+            &other_writer,
+            request_id,
+            now,
+            vec![block.clone()],
+            false,
+            1,
+            block.hash(),
+        );
+        let error = verify_record_commitment_page(
+            &carrier_frame,
+            &request_id,
+            &carrier,
+            &responder,
             (0, GENESIS_PREV_HASH),
             now,
         )
@@ -5698,6 +6050,7 @@ mod tests {
                 &rollback_frame,
                 &request_id,
                 &responder,
+                &responder,
                 local_tip,
                 now,
             )
@@ -5729,8 +6082,15 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            verify_record_commitment_page(&fork_frame, &request_id, &responder, local_tip, now,)
-                .unwrap_err(),
+            verify_record_commitment_page(
+                &fork_frame,
+                &request_id,
+                &responder,
+                &responder,
+                local_tip,
+                now,
+            )
+            .unwrap_err(),
             "commitment_chain_verification_failed"
         );
     }
@@ -5757,8 +6117,15 @@ mod tests {
             1,
             block.hash(),
         );
-        verify_record_commitment_page(&valid, &request_id, &responder, (0, GENESIS_PREV_HASH), now)
-            .unwrap();
+        verify_record_commitment_page(
+            &valid,
+            &request_id,
+            &responder,
+            &responder,
+            (0, GENESIS_PREV_HASH),
+            now,
+        )
+        .unwrap();
 
         let invalid_signature_bytes = record_block_range_response_signing_bytes(
             &request_id,
@@ -5788,6 +6155,7 @@ mod tests {
                 &invalid_signature_frame,
                 &request_id,
                 &responder,
+                &responder,
                 (0, GENESIS_PREV_HASH),
                 now,
             )
@@ -5799,6 +6167,7 @@ mod tests {
                 &valid,
                 &[0x83; 16],
                 &responder,
+                &responder,
                 (0, GENESIS_PREV_HASH),
                 now,
             )
@@ -5809,6 +6178,7 @@ mod tests {
             verify_record_commitment_page(
                 &valid,
                 &request_id,
+                &responder,
                 &responder,
                 (0, GENESIS_PREV_HASH),
                 now.saturating_add(REQUEST_TIMESTAMP_SKEW_SECS + 1),
@@ -5831,6 +6201,7 @@ mod tests {
                 &inconsistent_tip,
                 &request_id,
                 &responder,
+                &responder,
                 (0, GENESIS_PREV_HASH),
                 now,
             )
@@ -5851,6 +6222,7 @@ mod tests {
             verify_record_commitment_page(
                 &inconsistent_pagination,
                 &request_id,
+                &responder,
                 &responder,
                 (0, GENESIS_PREV_HASH),
                 now,
@@ -7121,10 +7493,6 @@ mod tests {
 
         let carrier_destination = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
         carrier_destination
-            .append_record_commitment_block(&block, None)
-            .await
-            .unwrap();
-        carrier_destination
             .audit_record_commitment_chain()
             .await
             .unwrap();
@@ -7149,6 +7517,35 @@ mod tests {
             &carrier_identity,
             Some(format!("http://{carrier_address}")),
             now,
+        );
+        // [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] The coordinator is
+        // unreachable and the destination starts at genesis. The pinned
+        // witness signs only the page envelope; the imported block must retain
+        // the unavailable coordinator as proposer.
+        let recovered_page =
+            pull_record_commitment_page_with_carrier_recovery_and_endpoint_policy(
+                &carrier_destination,
+                &carrier_destination_peers,
+                &carrier_destination_identity,
+                &source_identity.public_key_bytes(),
+                &witness_ids,
+                2,
+                &client,
+                &allow_test_endpoint,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered_page.source,
+            CommitmentSyncPageSource::PinnedCarrier
+        );
+        assert_eq!(recovered_page.carrier_attempts, 1);
+        assert_eq!(recovered_page.page.inserted, 1);
+        assert!(!recovered_page.page.has_more);
+        assert_eq!(recovered_page.page.remote_tip_height, 1);
+        assert_eq!(
+            carrier_destination.record_commitment_chain_tip().await,
+            local.record_commitment_chain_tip().await
         );
         let recovered =
             sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
