@@ -7,6 +7,9 @@
 #   nodes after install, upgrade, or incident response.
 #
 # Modification Reason:
+# - [COMMIT-PINNED-SOURCE 2026-07-29 by Codex] Distinguish the runtime
+#   repository HEAD from the Git commit embedded in the running Rust binary,
+#   and expose privacy-safe commit-pinned upgrade provenance.
 # - [GIT-WORKTREE-COMPAT 2026-07-26 by Codex] Audit tracked changes in regular
 #   clones and linked Git worktrees without relying on `.git` directory shape.
 # - Add privacy-safe discovery readiness JSON for ChatRelay capability and
@@ -77,6 +80,7 @@
 #   a binary workspace; dependency changes must be code-reviewed.
 #
 # Last Modified:
+# v1.24.0-node-deploy - Added commit-pinned source and binary provenance.
 # v1.23.0-node-deploy - Added Type=notify/NotifyAccess readiness diagnostics
 #                       and aligned TimeoutStartSec with audited node startup.
 # v1.22.0-node-deploy - Supports linked Git worktrees in runtime metadata checks.
@@ -1085,6 +1089,10 @@ def upgrade_status_payload(path):
             "config": data.get("config"),
             "no_restart": data.get("no_restart"),
             "force": data.get("force"),
+            "source_mode": data.get("source_mode"),
+            "requested_commit": data.get("requested_commit"),
+            "build_git_commit": data.get("build_git_commit"),
+            "build_binary_sha256": data.get("build_binary_sha256"),
             "updated_at": data.get("updated_at"),
             "privacy_boundary": data.get("privacy_boundary") or (
                 "upgrade workflow metadata only; no registration codes, "
@@ -1284,6 +1292,16 @@ runtime = {
     "release_backups": release_backups,
 }
 local_health = local_health_payload(health_json_path)
+# [BINARY-PROVENANCE-COMPAT 2026-07-29 by Codex] Older or malformed node
+# responses must not make the host healthcheck itself fail. Provenance remains
+# nullable until a compatible release binary reports a runtime object.
+binary_runtime = local_health.get("runtime")
+if not isinstance(binary_runtime, dict):
+    binary_runtime = {}
+runtime["binary_git_commit"] = binary_runtime.get("git_commit")
+runtime["binary_version"] = binary_runtime.get("version")
+runtime["binary_build_profile"] = binary_runtime.get("build_profile")
+runtime["binary_build_target"] = binary_runtime.get("build_target")
 discovery_readiness = discovery_readiness_payload(discovery_json_path, local_health)
 upgrade_status = upgrade_status_payload(upgrade_status_path)
 operator_action = operator_action_payload(checks, fail_count, warn_count, local_health, upgrade_status, runtime)

@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [COMMIT-PINNED-SOURCE 2026-07-29 by Codex] Document exact commit-pinned
+  isolated upgrades for production nodes whose runtime checkout is dirty or
+  intentionally diverged from the reviewed GitHub release.
 - [BUILD-CACHE-MAINTENANCE 2026-07-26 by Codex] Document read-only Cargo cache
   inventory and explicitly confirmed pruning that preserves the production
   binary, current pinned build cache, release backups, and all node state.
@@ -94,6 +97,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.44.0-node-deploy - Documented exact commit-pinned isolated source upgrades.
 v1.43.0-node-deploy - Documented guarded Cargo build-cache maintenance.
 v1.42.0-node-deploy - Documented pinned Rust builds and atomic promotion from
                      isolated toolchain/service-scoped Cargo targets.
@@ -700,6 +704,51 @@ sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx
 `upgrade.sh` checks active VPN sessions before restart. If users are connected,
 the script stops unless the operator explicitly passes `--force`.
 
+### Commit-pinned isolated upgrade
+
+Production nodes with local diagnostics, unfinished development, or other
+tracked changes should not reset or clean that runtime checkout merely to
+deploy a reviewed release. Pin the complete Git commit instead:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh upgrade \
+  --repo-dir /root/open/AeroNyx \
+  --branch main \
+  --commit c400afec6cd6337da3f62ef56f28f55f723f07ac
+```
+
+The commit must be the full 40-hex object ID and must be reachable from the
+selected `origin/main`. The workflow:
+
+1. Leaves the runtime repository, its index, staged files, untracked files, and
+   current branch untouched.
+2. Clones `origin/main` into a process-scoped checkout under
+   `/var/lib/aeronyx/source-checkouts`.
+3. Verifies ancestry and checks out the exact commit in detached mode.
+4. Reads `rust-toolchain.toml`, `Cargo.lock`, the systemd template, and the
+   healthcheck from that isolated source.
+5. Builds with the exact Rust toolchain and `cargo build --locked` into the
+   service-scoped Cargo target.
+6. Records the embedded Git commit and candidate SHA-256, validates config,
+   backs up the running image, and uses the existing atomic promotion,
+   active-session gate, health polling, and rollback flow.
+7. Removes only the process-scoped source checkout when the command exits.
+
+Preview the complete operation without creating a checkout or changing the
+host:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh upgrade \
+  --repo-dir /root/open/AeroNyx \
+  --branch main \
+  --commit c400afec6cd6337da3f62ef56f28f55f723f07ac \
+  --dry-run
+```
+
+`--commit` cannot be mixed with `--skip-pull`, `--allow-dirty`, or unit-only
+maintenance modes. Those options describe worktree-based upgrades, while
+commit-pinned mode deliberately makes the runtime worktree irrelevant.
+
 Only one install or upgrade can run on the same node at a time. The script takes
 the shared node-local deployment lock before pulling, building, replacing the
 systemd unit, or restarting the service.
@@ -722,12 +771,19 @@ recovery improvements without a full reinstall.
 ```
 
 The file contains only operator workflow metadata: status, step, message,
-repo path, branch, service name, config path, `--no-restart`, `--force`, and
-`updated_at`. It intentionally excludes registration codes, private keys,
-client public IPs, DNS contents, destinations, packet payloads, chat plaintext,
-voucher secrets, and wallet-level traffic. `aeronyx-node.sh status` displays a
-short summary of this file, and `healthcheck.sh --json-only` exposes it as
-top-level `upgrade_status` for nodeboard or AI maintenance automation.
+repo path, branch, source mode, requested/build commit, candidate binary
+SHA-256, service name, config path, `--no-restart`, `--force`, and `updated_at`.
+It intentionally excludes registration codes, private keys, client public IPs,
+DNS contents, destinations, packet payloads, chat plaintext, voucher secrets,
+and wallet-level traffic. `aeronyx-node.sh status` displays a short summary of
+this file, and `healthcheck.sh --json-only` exposes it as top-level
+`upgrade_status` for nodeboard or AI maintenance automation. Healthcheck also
+reports `runtime.binary_git_commit` from the running process separately from
+the runtime repository HEAD, so a deliberately dirty checkout cannot make
+binary provenance ambiguous. Nodes built before embedded provenance support may
+report `runtime.binary_git_commit` as `unknown`; commit-pinned status fields may
+be `null` until the first upgrade using this workflow. These compatibility
+values are not health failures.
 
 `aeronyx-node.sh status` also runs the read-only healthcheck JSON path and
 prints the privacy-safe `operator_action` summary:
@@ -745,7 +801,8 @@ and the next action in one place without exposing client public IPs,
 destinations, DNS contents, packet payloads, chat plaintext, registration
 codes, private keys, voucher secrets, or wallet-level traffic.
 
-Build and validate without restarting:
+Build, validate, and atomically stage the next binary without restarting the
+current process:
 
 ```bash
 sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx --no-restart

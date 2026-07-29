@@ -9,6 +9,8 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - [COMMIT-PINNED-SOURCE 2026-07-29 by Codex] Forward an exact release commit
+#   to the isolated Rust upgrade workflow without exposing lower-level scripts.
 # - [BUILD-CACHE-MAINTENANCE 2026-07-26 by Codex] Add read-only Cargo build
 #   cache inventory and an explicitly confirmed prune workflow. The workflow
 #   preserves the stable production binary, current pinned-toolchain cache,
@@ -111,6 +113,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.22.0-node-entrypoint - Added exact commit-pinned isolated source upgrades.
 # v1.21.0-node-entrypoint - Added guarded Cargo build-cache inventory and pruning.
 # v1.20.0-node-entrypoint - Added isolated carrier-assisted cold-bootstrap smoke.
 # v1.19.0-node-entrypoint - Added read-only Directory Mirror carrier-smoke.
@@ -154,6 +157,7 @@ BUILD_TARGET_ROOT="${AERONYX_BUILD_TARGET_ROOT:-/var/lib/aeronyx/build-targets}"
 COMMAND=""
 REPO_DIR="${AERONYX_REPO_DIR:-${DEFAULT_REPO_DIR}}"
 BRANCH="${AERONYX_BRANCH:-${DEFAULT_BRANCH}}"
+SOURCE_COMMIT="${AERONYX_COMMIT:-}"
 CONFIG_FILE="${AERONYX_CONFIG_FILE:-${DEFAULT_CONFIG_FILE}}"
 SERVICE_NAME="${AERONYX_SERVICE_NAME:-${DEFAULT_SERVICE_NAME}}"
 REGISTRATION_CODE="${AERONYX_REGISTRATION_CODE:-}"
@@ -237,6 +241,7 @@ Commands:
 Common options:
   --repo-dir PATH          Repository path. Default: /opt/aeronyx/AeroNyx
   --branch NAME            Git branch/ref. Default: main
+  --commit SHA             Upgrade from this exact 40-hex commit in isolation.
   --config PATH            Config path for upgrade/health/status.
   --service NAME           systemd service name. Default: aeronyx-server
   --registration-code CODE Registration code for install.
@@ -254,8 +259,9 @@ Command-specific options:
     --allow-dirty          Allow tracked Git changes during install update.
 
   upgrade:
+    --commit SHA           Build exact commit without modifying a dirty runtime checkout.
     --force                Restart even when active sessions exist.
-    --no-restart           Build and validate only; do not restart.
+    --no-restart           Build, validate, and stage; do not restart.
     --skip-pull            Build currently checked-out source.
     --allow-dirty          Allow tracked Git changes during source upgrade.
 
@@ -416,6 +422,7 @@ parse_args() {
         case "$1" in
             --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
             --branch) BRANCH="${2:?missing value}"; shift 2 ;;
+            --commit) SOURCE_COMMIT="${2:?missing value}"; shift 2 ;;
             --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
             --service) SERVICE_NAME="${2:?missing value}"; shift 2 ;;
             --registration-code) REGISTRATION_CODE="${2:?missing value}"; shift 2 ;;
@@ -565,6 +572,9 @@ run_upgrade() {
     fi
     if [ "${DRY_RUN}" -eq 1 ]; then
         EXTRA_ARGS+=("--dry-run")
+    fi
+    if [ -n "${SOURCE_COMMIT}" ]; then
+        EXTRA_ARGS+=("--commit" "${SOURCE_COMMIT}")
     fi
 
     "${UPGRADE_SCRIPT}" \

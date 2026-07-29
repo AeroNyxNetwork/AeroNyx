@@ -12,6 +12,9 @@
 # - [PINNED-RUST-BUILD 2026-07-26 by Codex] Pin release builds to
 #   rust-toolchain.toml, isolate Cargo output from the live binary, validate the
 #   staged result, and promote it atomically.
+# - [COMMIT-PINNED-SOURCE 2026-07-29 by Codex] Build an operator-selected,
+#   full Git commit from a temporary isolated checkout so a dirty or diverged
+#   runtime repository cannot contaminate production release input.
 # - Write a local, privacy-safe upgrade status snapshot so nodeboard, health
 #   checks, AI assistants, and operators can understand which upgrade stage is
 #   running or failed without scraping shell logs.
@@ -65,7 +68,7 @@
 # Main Logical Flow:
 # 1. Acquire the node-local upgrade lock.
 # 2. Optionally repair only the main or network restore systemd unit and exit.
-# 3. Update repo from Git.
+# 3. Update the normal worktree or prepare an exact isolated commit checkout.
 # 4. Build and validate the release binary.
 # 5. Restart only when no active sessions are present, unless --force is used.
 # 6. Sync and verify the systemd unit template and network restore unit.
@@ -98,8 +101,13 @@
 #   be reviewed in source control, never resolved ad hoc during node upgrade.
 # - Keep rust-toolchain.toml exact and Cargo output outside the stable systemd
 #   binary path until candidate validation succeeds.
+# - Commit-pinned mode must never checkout, reset, stash, clean, or otherwise
+#   mutate the runtime repository. The isolated checkout is build input only;
+#   stable binary, config, identity, protocol state, and rollback paths remain
+#   owned by the existing node installation.
 #
 # Last Modified:
+# v1.18.0-node-deploy - Added exact commit-pinned isolated source builds.
 # v1.17.0-node-deploy - Supports linked Git worktrees in the upgrade path.
 # v1.16.0-node-deploy - Pins the Rust compiler and atomically promotes builds
 #                       from a toolchain/service-scoped target directory.
@@ -146,6 +154,7 @@ LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
 STATE_DIR="/var/lib/aeronyx"
 BUILD_TARGET_ROOT="${AERONYX_BUILD_TARGET_ROOT:-${STATE_DIR}/build-targets}"
+SOURCE_ROOT="${AERONYX_SOURCE_ROOT:-${STATE_DIR}/source-checkouts}"
 RELEASE_DIR="/var/lib/aeronyx/releases"
 UPGRADE_STATUS_FILE="/var/lib/aeronyx/upgrade-status.json"
 NETWORK_RESTORE_SERVICE="aeronyx-network-restore.service"
@@ -161,6 +170,10 @@ NETWORK_RESTORE_ONLY=0
 SERVICE_UNIT_ONLY=0
 ALLOW_DIRTY=0
 NO_RESTART=0
+SOURCE_COMMIT=""
+SOURCE_DIR=""
+SOURCE_MODE="worktree"
+ISOLATED_SOURCE_DIR=""
 KEEP_RELEASES=10
 HEALTH_RETRIES=90
 HEALTH_DELAY=2
@@ -173,6 +186,8 @@ PINNED_RUST_CHANNEL=""
 RUSTUP_BIN=""
 BUILD_TARGET_DIR=""
 BUILD_BINARY=""
+BUILD_GIT_COMMIT=""
+BUILD_BINARY_SHA256=""
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -193,10 +208,12 @@ Usage:
 Options:
   --repo-dir PATH     Repository path. Default: /opt/aeronyx/AeroNyx
   --branch NAME       Branch/ref to pull. Default: main
+  --commit SHA        Build this exact 40-hex commit from an isolated checkout.
+                      The commit must be reachable from origin/--branch.
   --config PATH       Config path. Default: /etc/aeronyx/server.toml
   --service NAME      systemd service name. Default: aeronyx-server
   --force             Restart even when active VPN sessions exist.
-  --no-restart        Build and validate only; do not restart the service.
+  --no-restart        Build, validate, and stage; do not restart the service.
   --skip-pull         Build the currently checked out source.
   --skip-unit-update  Do not render/install deploy/node/aeronyx-server.service.
   --skip-network-restore-update
@@ -232,6 +249,10 @@ write_upgrade_status() {
     SERVICE_NAME_VALUE="${SERVICE_NAME}" \
     NO_RESTART_VALUE="${NO_RESTART}" \
     FORCE_VALUE="${FORCE}" \
+    SOURCE_MODE_VALUE="${SOURCE_MODE}" \
+    SOURCE_COMMIT_VALUE="${SOURCE_COMMIT}" \
+    BUILD_GIT_COMMIT_VALUE="${BUILD_GIT_COMMIT}" \
+    BUILD_BINARY_SHA256_VALUE="${BUILD_BINARY_SHA256}" \
     python3 - "${UPGRADE_STATUS_FILE}" <<'PY' || true
 import json
 import os
@@ -249,6 +270,10 @@ payload = {
     "service": os.environ.get("SERVICE_NAME_VALUE", ""),
     "no_restart": os.environ.get("NO_RESTART_VALUE", "0") == "1",
     "force": os.environ.get("FORCE_VALUE", "0") == "1",
+    "source_mode": os.environ.get("SOURCE_MODE_VALUE", "worktree"),
+    "requested_commit": os.environ.get("SOURCE_COMMIT_VALUE") or None,
+    "build_git_commit": os.environ.get("BUILD_GIT_COMMIT_VALUE") or None,
+    "build_binary_sha256": os.environ.get("BUILD_BINARY_SHA256_VALUE") or None,
     "privacy_boundary": (
         "upgrade workflow metadata only; no registration codes, private keys, "
         "client public IPs, destinations, DNS contents, packet payloads, chat "
@@ -282,6 +307,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
         --branch) BRANCH="${2:?missing value}"; shift 2 ;;
+        --commit) SOURCE_COMMIT="${2:?missing value}"; shift 2 ;;
         --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
         --service) SERVICE_NAME="${2:?missing value}"; SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"; LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"; shift 2 ;;
         --force) FORCE=1; shift ;;
@@ -339,6 +365,16 @@ validate_health_polling() {
         || die "--health-delay must be a positive integer."
 }
 
+validate_source_commit() {
+    [ -n "${SOURCE_COMMIT}" ] || return
+    printf '%s' "${SOURCE_COMMIT}" | grep -Eq '^[0-9A-Fa-f]{40}$' \
+        || die "--commit must be one full 40-hex Git commit."
+    git check-ref-format --branch "${BRANCH}" >/dev/null 2>&1 \
+        || die "--branch is not a valid Git branch name: ${BRANCH}"
+    SOURCE_COMMIT="$(printf '%s' "${SOURCE_COMMIT}" | tr 'A-F' 'a-f')"
+    SOURCE_MODE="commit_pinned"
+}
+
 validate_option_combinations() {
     if [ "${SERVICE_UNIT_ONLY}" -eq 1 ] && [ "${NETWORK_RESTORE_ONLY}" -eq 1 ]; then
         die "--service-unit-only and --network-restore-only are mutually exclusive."
@@ -348,6 +384,16 @@ validate_option_combinations() {
     fi
     if [ "${NETWORK_RESTORE_ONLY}" -eq 1 ] && [ "${SKIP_NETWORK_RESTORE_UPDATE}" -eq 1 ]; then
         die "--network-restore-only cannot be combined with --skip-network-restore-update."
+    fi
+    if [ -n "${SOURCE_COMMIT}" ] && [ "${SKIP_PULL}" -eq 1 ]; then
+        die "--commit cannot be combined with --skip-pull."
+    fi
+    if [ -n "${SOURCE_COMMIT}" ] && [ "${ALLOW_DIRTY}" -eq 1 ]; then
+        die "--commit already isolates source and cannot be combined with --allow-dirty."
+    fi
+    if [ -n "${SOURCE_COMMIT}" ] \
+        && { [ "${SERVICE_UNIT_ONLY}" -eq 1 ] || [ "${NETWORK_RESTORE_ONLY}" -eq 1 ]; }; then
+        die "--commit is available only for complete build/upgrade workflows."
     fi
 }
 
@@ -363,6 +409,27 @@ release_lock() {
     if [ -n "${LOCK_DIR}" ] && [ -d "${LOCK_DIR}" ]; then
         rmdir "${LOCK_DIR}" 2>/dev/null || true
     fi
+}
+
+cleanup_isolated_source() {
+    [ -n "${ISOLATED_SOURCE_DIR}" ] || return
+    case "${ISOLATED_SOURCE_DIR}" in
+        "${SOURCE_ROOT}/${SERVICE_NAME}.${SOURCE_COMMIT}."*)
+            if [ "${DRY_RUN}" -eq 1 ]; then
+                printf '[DRY-RUN] remove isolated source checkout %s\n' "${ISOLATED_SOURCE_DIR}"
+            else
+                rm -rf -- "${ISOLATED_SOURCE_DIR}"
+            fi
+            ;;
+        *)
+            warn "Refusing to remove unexpected isolated source path: ${ISOLATED_SOURCE_DIR}"
+            ;;
+    esac
+}
+
+cleanup_upgrade() {
+    cleanup_isolated_source
+    release_lock
 }
 
 acquire_lock() {
@@ -381,7 +448,6 @@ acquire_lock() {
 
     LOCK_DIR="/tmp/${SERVICE_NAME}.deploy.lock"
     mkdir "${LOCK_DIR}" 2>/dev/null || die "Another ${SERVICE_NAME} install or upgrade appears to be running: ${LOCK_DIR}"
-    trap release_lock EXIT
     ok "Deployment lock acquired: ${LOCK_DIR}"
 }
 
@@ -409,7 +475,7 @@ resolve_rustup_bin() {
 }
 
 read_pinned_rust_channel() {
-    local toolchain_file="${REPO_DIR}/rust-toolchain.toml"
+    local toolchain_file="${SOURCE_DIR}/rust-toolchain.toml"
     [ -f "${toolchain_file}" ] || die "Missing repository toolchain pin: ${toolchain_file}"
 
     awk -F'"' '
@@ -424,6 +490,24 @@ read_pinned_rust_channel() {
 # location are part of the production release contract, not host-local state.
 configure_pinned_rust_build() {
     local current_release
+
+    # [COMMIT-PINNED-DRY-RUN 2026-07-29 by Codex] A dry-run deliberately does
+    # not create the isolated checkout. Keep its plan honest: defer the exact
+    # channel lookup to execution instead of reading an unrelated runtime tree
+    # or pretending that an unverified compiler version was selected.
+    if [ "${DRY_RUN}" -eq 1 ] \
+        && [ -n "${SOURCE_COMMIT}" ] \
+        && [ ! -f "${SOURCE_DIR}/rust-toolchain.toml" ]; then
+        PINNED_RUST_CHANNEL="<from-isolated-rust-toolchain.toml>"
+        BUILD_TARGET_DIR="${BUILD_TARGET_ROOT}/rust-<pinned>/${SERVICE_NAME}"
+        BUILD_BINARY="${BUILD_TARGET_DIR}/release/aeronyx-server"
+        printf '[DRY-RUN] read exact Rust channel from %s/rust-toolchain.toml after checkout verification\n' \
+            "${SOURCE_DIR}"
+        run mkdir -p "${BUILD_TARGET_DIR}"
+        ok "Pinned Rust toolchain will be verified from commit ${SOURCE_COMMIT}"
+        ok "Isolated Cargo target will be derived from the verified channel"
+        return
+    fi
 
     PINNED_RUST_CHANNEL="$(read_pinned_rust_channel)"
     printf '%s' "${PINNED_RUST_CHANNEL}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
@@ -471,6 +555,8 @@ active_sessions() {
 }
 
 ensure_tracked_worktree_clean() {
+    [ -z "${SOURCE_COMMIT}" ] \
+        || { ok "Runtime worktree cleanliness does not affect commit-pinned isolated source"; return; }
     [ "${SKIP_PULL}" -eq 0 ] || { ok "Tracked worktree check skipped with --skip-pull"; return; }
     [ "${ALLOW_DIRTY}" -eq 0 ] || { warn "Tracked worktree check skipped by --allow-dirty"; return; }
 
@@ -518,36 +604,86 @@ backup_current_binary() {
 update_source() {
     [ "${SKIP_PULL}" -eq 0 ] || { ok "Git pull skipped"; return; }
 
+    if [ -n "${SOURCE_COMMIT}" ]; then
+        prepare_isolated_source
+        return
+    fi
+
     log "Updating source from origin/${BRANCH}"
     run git -C "${REPO_DIR}" fetch origin "${BRANCH}"
     run git -C "${REPO_DIR}" checkout "${BRANCH}"
     run git -C "${REPO_DIR}" pull --ff-only origin "${BRANCH}"
+    SOURCE_DIR="${REPO_DIR}"
+}
+
+prepare_isolated_source() {
+    local actual_commit source_remote
+
+    source_remote="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null)" \
+        || die "Cannot resolve origin remote from runtime repository: ${REPO_DIR}"
+    [ -n "${source_remote}" ] || die "Runtime repository origin remote is empty."
+
+    ISOLATED_SOURCE_DIR="${SOURCE_ROOT}/${SERVICE_NAME}.${SOURCE_COMMIT}.$$"
+    SOURCE_DIR="${ISOLATED_SOURCE_DIR}"
+    log "Preparing isolated source for ${SOURCE_COMMIT} from origin/${BRANCH}"
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] clone origin/%s into %s and detach exact commit %s\n' \
+            "${BRANCH}" "${ISOLATED_SOURCE_DIR}" "${SOURCE_COMMIT}"
+        BUILD_GIT_COMMIT="${SOURCE_COMMIT:0:12}"
+        return
+    fi
+
+    mkdir -p "${SOURCE_ROOT}"
+    git clone --filter=blob:none --no-checkout --single-branch \
+        --branch "${BRANCH}" -- "${source_remote}" "${ISOLATED_SOURCE_DIR}"
+    git -C "${ISOLATED_SOURCE_DIR}" merge-base --is-ancestor \
+        "${SOURCE_COMMIT}" "refs/remotes/origin/${BRANCH}" \
+        || die "Requested commit is not reachable from origin/${BRANCH}: ${SOURCE_COMMIT}"
+    git -C "${ISOLATED_SOURCE_DIR}" checkout --detach "${SOURCE_COMMIT}"
+    actual_commit="$(git -C "${ISOLATED_SOURCE_DIR}" rev-parse HEAD)"
+    [ "${actual_commit}" = "${SOURCE_COMMIT}" ] \
+        || die "Isolated checkout mismatch: expected ${SOURCE_COMMIT}, found ${actual_commit}"
+    git -C "${ISOLATED_SOURCE_DIR}" diff --quiet --ignore-submodules -- \
+        || die "Isolated source unexpectedly contains unstaged tracked changes."
+    git -C "${ISOLATED_SOURCE_DIR}" diff --cached --quiet --ignore-submodules -- \
+        || die "Isolated source unexpectedly contains staged tracked changes."
+    ok "Isolated source verified at ${SOURCE_COMMIT}"
 }
 
 resolve_build_git_commit() {
-    git -C "${REPO_DIR}" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown'
+    if [ -n "${SOURCE_COMMIT}" ]; then
+        printf '%s\n' "${SOURCE_COMMIT:0:12}"
+        return
+    fi
+    git -C "${SOURCE_DIR}" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown'
 }
 
 build_release() {
     local build_git_commit
     build_git_commit="$(resolve_build_git_commit)"
+    BUILD_GIT_COMMIT="${build_git_commit}"
 
     log "Building release binary"
     if [ "${DRY_RUN}" -eq 1 ]; then
         printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s CARGO_TARGET_DIR=%s rustup run %s cargo build --locked -p aeronyx-server --release\n' \
-            "${REPO_DIR}" "${build_git_commit}" "${BUILD_TARGET_DIR}" "${PINNED_RUST_CHANNEL}"
+            "${SOURCE_DIR}" "${build_git_commit}" "${BUILD_TARGET_DIR}" "${PINNED_RUST_CHANNEL}"
     else
         # [REPRODUCIBLE-RUST-BUILD 2026-07-26 by Codex] Fail before Cargo can
         # change the reviewed dependency/compiler graph or write over the live
         # binary path.
-        [ -f "${REPO_DIR}/Cargo.lock" ] \
+        [ -f "${SOURCE_DIR}/Cargo.lock" ] \
             || die "Tracked Cargo.lock is required for reproducible node upgrades."
         (
-            cd "${REPO_DIR}"
+            cd "${SOURCE_DIR}"
             export AERONYX_GIT_COMMIT="${build_git_commit}"
             export CARGO_TARGET_DIR="${BUILD_TARGET_DIR}"
             run_pinned_cargo build --locked -p aeronyx-server --release
         )
+        BUILD_BINARY_SHA256="$(sha256sum "${BUILD_BINARY}" | awk '{print $1}')"
+        printf '%s' "${BUILD_BINARY_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
+            || die "Built binary SHA-256 could not be established."
+        ok "Candidate binary SHA-256: ${BUILD_BINARY_SHA256}"
     fi
 }
 
@@ -589,10 +725,11 @@ render_service_unit() {
     [ "${SKIP_UNIT_UPDATE}" -eq 0 ] || { ok "Systemd unit update skipped"; return; }
     [ "${NO_RESTART}" -eq 0 ] || [ "${SERVICE_UNIT_ONLY}" -eq 1 ] || { ok "Systemd unit update skipped by --no-restart"; return; }
 
-    template="${REPO_DIR}/deploy/node/aeronyx-server.service"
+    template="${SOURCE_DIR}/deploy/node/aeronyx-server.service"
     rendered="/tmp/${SERVICE_NAME}.upgrade.service"
 
-    if [ ! -f "${template}" ]; then
+    if [ ! -f "${template}" ] \
+        && { [ "${DRY_RUN}" -eq 0 ] || [ -z "${SOURCE_COMMIT}" ]; }; then
         warn "Systemd unit template missing; leaving installed unit unchanged: ${template}"
         return
     fi
@@ -823,7 +960,12 @@ restart_service() {
 }
 
 run_healthcheck() {
-    local checker="${REPO_DIR}/deploy/node/healthcheck.sh"
+    local checker="${SOURCE_DIR}/deploy/node/healthcheck.sh"
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] %s --repo-dir %s --config %s --service %s\n' \
+            "${checker}" "${REPO_DIR}" "${CONFIG_FILE}" "${SERVICE_NAME}"
+        return
+    fi
     if [ -x "${checker}" ]; then
         run "${checker}" --repo-dir "${REPO_DIR}" --config "${CONFIG_FILE}" --service "${SERVICE_NAME}"
     else
@@ -875,11 +1017,14 @@ main() {
     validate_service_name
     validate_keep_releases
     validate_health_polling
+    validate_source_commit
+    SOURCE_DIR="${REPO_DIR}"
     validate_option_combinations
     require_root
     trap 'handle_upgrade_error $?' ERR
     set_upgrade_step "preflight" "Acquiring deployment lock and validating upgrade options."
     acquire_lock
+    trap cleanup_upgrade EXIT
     if [ "${SERVICE_UNIT_ONLY}" -eq 1 ]; then
         set_upgrade_step "service_unit" "Syncing AeroNyx systemd service unit only."
         if ! render_service_unit; then
@@ -916,7 +1061,7 @@ main() {
     ensure_tracked_worktree_clean
     set_upgrade_step "backup" "Backing up current release binary before upgrade."
     backup_current_binary
-    set_upgrade_step "repository" "Updating AeroNyx source from Git."
+    set_upgrade_step "repository" "Preparing verified AeroNyx source from Git."
     update_source
     set_upgrade_step "toolchain" "Selecting the repository-pinned Rust toolchain and isolated target."
     configure_pinned_rust_build
