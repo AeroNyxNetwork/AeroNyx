@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.58.0 - Enabled follower certificate witness policy in validated production configuration.
+Modification Reason: v0.59.0 - Enforced runtime identity separation for coordinator and witness trust pins.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.58.0 - [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Allows validated followers to configure independent witness pins for current-tip certificate verification and carrier recovery.
+Last Modified: v0.59.0 - [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Rejects self-referential coordinator and witness trust pins before node startup.
+Previous: v0.58.0 - [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Allows validated followers to configure independent witness pins for current-tip certificate verification and carrier recovery.
 Previous: v0.57.0 - [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] Reports source-blind aggregate outcomes for current-tip certificate retrieval and bounded carrier recovery.
 Previous: v0.56.0 - [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] Recovers audited current-tip certificates through bounded operator-pinned witness carriers when coordinator transport is unavailable.
 Previous: v0.55.0 - [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Replicates audited current-tip checkpoint certificates to converged followers under each follower's current witness policy.
@@ -98,6 +99,26 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.59 Runtime identity separation
+
+[RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex]
+
+- Static TOML validation cannot know the Ed25519 public identity derived from a
+  node's private key. The server now performs an identity-aware trust-policy
+  check before initializing transports, storage, listeners, or background
+  tasks.
+- A follower fails startup when its pinned coordinator is itself.
+- Coordinators and followers fail startup when any external checkpoint witness
+  pin is the local node identity. This prevents a nominal 2-of-N policy from
+  silently counting local authority as independent corroboration.
+- Disabled MemChain configurations remain backward compatible and do not parse
+  inactive trust fields.
+- The existing runtime guard remains as defense in depth, but a production
+  process can no longer become API-healthy while follower synchronization was
+  silently disabled by a self-reference.
+- This is local fail-closed configuration validation. It adds no vote, quorum,
+  consensus, finality, fork choice, discovery trust, or user-plane metadata.
 
 ### v0.58 Follower certificate policy activation
 

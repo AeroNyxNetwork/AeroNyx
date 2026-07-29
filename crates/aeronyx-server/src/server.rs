@@ -261,6 +261,9 @@
 // 104. [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Replicates an audited
 //      checkpoint certificate from the pinned coordinator only after follower
 //      chain convergence, without making evidence availability a chain gate.
+// 105. [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Fails startup before any
+//      mutable service or listener when a coordinator/follower trust policy
+//      treats the node's own identity as an external authority.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -310,6 +313,7 @@
 //     must run after the full evidence-vault audit and before networking.
 //   - External startup witnesses are explicit identity trust pins. Discovery
 //     may rotate their signed endpoints, but unpinned peers stay evidence-only.
+//     A witness pin must never equal the local runtime identity.
 //   - Delivery-cache witnesses are not Memory Chain checkpoint witnesses. They
 //     retain one aggregate-only opaque high-water row per node and must never
 //     become consensus, finality, routing authority, or user traffic telemetry.
@@ -372,6 +376,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.47-RuntimeIdentityPolicy - Rejected self-referential coordinator and
+//     witness trust pins before mutable runtime initialization
 //   v2.8.45-FollowerCertificateTelemetry - Reported source-blind aggregate
 //     checkpoint-certificate retrieval and carrier-recovery outcomes
 //   v2.8.44-FollowerCertificateCarrier - Recovered current-tip certificates
@@ -2184,6 +2190,13 @@ impl Server {
 
     pub async fn run(&self) -> Result<()> {
         info!("Starting AeroNyx server v{}", env!("CARGO_PKG_VERSION"));
+        // [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Static config parsing
+        // cannot compare trust pins with the public key derived from the
+        // server key. Fail before transports, storage, listeners, or
+        // background tasks make a self-referential node look operational.
+        self.config
+            .memchain
+            .validate_runtime_identity(&self.identity.public_key_bytes())?;
         let systemd_notifier = SystemdNotifier::from_environment();
         systemd_notifier.status("Auditing encrypted state and initializing protocol services")?;
         // [RUNTIME-SUPERVISION 2026-07-29 by Codex] A bounded channel carries

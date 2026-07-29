@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Clarify that every pinned
+#   coordinator/witness identity must be external to the configured node.
 # - [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Document the independent
 #   witness policy that lets a follower verify and recover current-tip
 #   certificates without granting carriers block-production authority.
@@ -52,6 +54,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.10.0-node-deploy - Documented runtime identity separation for trust pins.
 # v1.9.0-node-deploy - Documented follower checkpoint-certificate witness policy.
 # v1.8.0-node-deploy - Added Directory proof gossip maturity guidance.
 # v1.7.0-node-deploy - Added bounded discovery gossip concurrency guidance.
@@ -255,7 +258,9 @@ embed_enabled = true
 # A follower may verify and recover the coordinator's current-tip certificate
 # from independently pinned witnesses after signed block/checkpoint convergence.
 # This remains default-off: enable commitment_sync_enabled, pin one coordinator,
-# then pin 2-3 different audited witnesses and require at least two signatures.
+# then pin 2-3 audited external witnesses and require at least two signatures.
+# The coordinator and every witness must differ from this node's own public key;
+# startup fails closed when any trust pin is self-referential.
 # Do not enable commitment_witness_startup_required or
 # commitment_coordinator_lease_required on a follower; both are
 # coordinator-only production gates.

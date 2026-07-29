@@ -32,6 +32,8 @@
 //! v2.8.46-FollowerCertificateConfig — Allowed a follower to configure the
 //!                     independent witness policy required to verify and
 //!                     recover current-tip checkpoint certificates.
+//! v2.8.47-RuntimeIdentityPolicy — Rejects coordinator and witness trust pins
+//!                     that resolve to the node's own runtime identity.
 //!
 //! ## Main Functionality
 //! - `MemChainMode`   — Off / Local / P2p / Saas
@@ -85,6 +87,7 @@
 //! - commitment_witness_node_ids are explicit operator trust pins. Automatic
 //!   discovery may supply endpoints, but an unpinned permissionless peer must
 //!   never block coordinator startup or satisfy follower certificate policy.
+//!   Every pin must also differ from the node's runtime identity.
 //! - commitment_witness_min_verified defaults to one for compatibility. It is
 //!   a coordinator startup threshold or follower certificate threshold over
 //!   distinct pinned identities, not network consensus, quorum, finality,
@@ -94,6 +97,7 @@
 //!   before production; deploy the protocol to all pins before activation.
 //!
 //! ## Last Modified
+//! v2.8.47-RuntimeIdentityPolicy - Rejected self-referential coordinator and witness pins.
 //! v2.8.46-FollowerCertificateConfig - Made follower certificate witness policy configurable.
 //! v2.8.10-CoordinatorLease - Added strict all-witness lease policy and TTL.
 //! v2.8.1-BlockSync - Added a validated follower pages-per-round budget.
@@ -1097,6 +1101,45 @@ impl MemChainConfig {
         Ok(validated)
     }
 
+    /// Validates trust relationships that depend on the loaded node identity.
+    ///
+    /// Static TOML validation cannot know the public key derived from the
+    /// server's private key. Startup must call this method before opening any
+    /// listener so a follower cannot follow itself and no coordinator or
+    /// follower can count itself as an independent external witness.
+    ///
+    /// [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex]
+    pub fn validate_runtime_identity(&self, local_node_id: &[u8; 32]) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
+        let witness_node_ids = self.validated_commitment_witness_node_ids()?;
+        if witness_node_ids.contains(local_node_id) {
+            return Err(ServerError::config_invalid(
+                "memchain.commitment_witness_node_ids",
+                "external checkpoint witnesses must not include this node's runtime identity",
+            ));
+        }
+
+        if self.commitment_sync_enabled {
+            let coordinator_node_id =
+                self.commitment_sync_coordinator_node_id().ok_or_else(|| {
+                    ServerError::config_invalid(
+                        "memchain.commitment_coordinator_node_id",
+                        "must resolve to a valid external coordinator identity",
+                    )
+                })?;
+            if coordinator_node_id == *local_node_id {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_coordinator_node_id",
+                    "a follower must not use its own runtime identity as coordinator",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.mode != MemChainMode::Off
@@ -1843,6 +1886,43 @@ mod tests {
         ] {
             assert!(invalid.validate().is_err());
         }
+    }
+
+    #[test]
+    fn test_commitment_runtime_identity_rejects_self_referential_trust() {
+        let follower = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_sync_enabled: true,
+            commitment_coordinator_node_id: "51".repeat(32),
+            commitment_witness_node_ids: vec!["52".repeat(32), "53".repeat(32)],
+            commitment_witness_min_verified: 2,
+            ..Default::default()
+        };
+        assert!(follower.validate().is_ok());
+        assert!(follower.validate_runtime_identity(&[0x54; 32]).is_ok());
+        for self_referential_identity in [[0x51; 32], [0x52; 32], [0x53; 32]] {
+            assert!(follower
+                .validate_runtime_identity(&self_referential_identity)
+                .is_err());
+        }
+
+        let coordinator = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_coordinator_enabled: true,
+            commitment_witness_node_ids: vec!["61".repeat(32), "62".repeat(32)],
+            commitment_witness_min_verified: 2,
+            ..Default::default()
+        };
+        assert!(coordinator.validate().is_ok());
+        assert!(coordinator.validate_runtime_identity(&[0x63; 32]).is_ok());
+        assert!(coordinator.validate_runtime_identity(&[0x61; 32]).is_err());
+
+        let disabled = MemChainConfig {
+            mode: MemChainMode::Off,
+            commitment_witness_node_ids: vec!["not-active".to_string()],
+            ..Default::default()
+        };
+        assert!(disabled.validate_runtime_identity(&[0x64; 32]).is_ok());
     }
 
     // ── NER ───────────────────────────────────────────────────────────────
