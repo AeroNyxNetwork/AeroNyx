@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.60.0 - Added identity-blind follower checkpoint-certificate policy readiness.
+Modification Reason: v0.61.0 - Bound follower certificate readiness to the exact audited local tip.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.60.0 - [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Reports whether the current audited follower tip satisfies the current local witness policy without exposing identities.
+Last Modified: v0.61.0 - [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] Prevents readiness evaluated for an older audited tip from being reported as current after follower advancement.
+Previous: v0.60.0 - [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Reports whether the current audited follower tip satisfies the current local witness policy without exposing identities.
 Previous: v0.59.0 - [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Rejects self-referential coordinator and witness trust pins before node startup.
 Previous: v0.58.0 - [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Allows validated followers to configure independent witness pins for current-tip certificate verification and carrier recovery.
 Previous: v0.57.0 - [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] Reports source-blind aggregate outcomes for current-tip certificate retrieval and bounded carrier recovery.
@@ -100,6 +101,24 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.61 Follower certificate readiness is tip-bound
+
+[FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex]
+
+- Every applicable follower certificate-policy result is now bound to the
+  exact fully audited local tip height evaluated by the cryptographic verifier.
+- Status compares that height with the latest complete process integrity
+  baseline. If the chain advances before certificate refresh, an old `ready`
+  result is immediately projected as `waiting_for_certificate`.
+- If the complete integrity baseline disappears during re-audit or after a
+  fail-closed append condition, the old result is projected as
+  `waiting_for_convergence`.
+- The evaluated height is aggregate chain progress already available in
+  integrity status. No witness identity, endpoint, block hash, certificate
+  member, signature, payload, owner, route, or client metadata is exposed.
+- This closes an observability overclaim window only. It does not change chain
+  selection, evidence authority, consensus, finality, or certificate storage.
 
 ### v0.60 Follower checkpoint-certificate policy readiness
 

@@ -267,6 +267,9 @@
 // 106. [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Publishes exact
 //      current-policy readiness after cryptographic validation without
 //      exposing witness identities or certificate material.
+// 107. [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] Prevents a
+//      certificate evaluated for an older audited tip from remaining ready
+//      while follower synchronization advances the local chain.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -329,6 +332,8 @@
 //     remain mandatory, and mixed-version absence must not undo a verified tip.
 //   - Follower certificate readiness may become `ready` only after the exact
 //     current tip, current pins, and current threshold pass local validation.
+//     The management projection must preserve the evaluated tip height so
+//     operators can distinguish current coverage from scheduler lag.
 //   - Coordinator leases are a short-lived duplicate-writer safety control,
 //     not consensus, leader election, finality, or fork choice. A partial
 //     witness round must never extend the local production deadline.
@@ -381,6 +386,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.49-FollowerCertificateTipBinding - Bound readiness heartbeat state to
+//     the exact fully audited local tip
 //   v2.8.48-FollowerCertificateReadiness - Added identity-blind current-policy
 //     readiness to local status and management heartbeat
 //   v2.8.47-RuntimeIdentityPolicy - Rejected self-referential coordinator and
@@ -4426,6 +4433,8 @@ impl Server {
                             certificate_policy_ready: status.certificate_policy_ready,
                             certificate_policy_last_evaluated_at: status
                                 .certificate_policy_last_evaluated_at,
+                            certificate_policy_evaluated_tip_height: status
+                                .certificate_policy_evaluated_tip_height,
                             certificate_witnesses_configured: status
                                 .certificate_witnesses_configured,
                             certificate_minimum_signers: status.certificate_minimum_signers,

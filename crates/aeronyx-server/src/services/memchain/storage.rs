@@ -158,6 +158,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.49-FollowerCertificateTipBinding - Bound readiness to the exact audited tip height.
 //! v2.8.48-FollowerCertificateReadiness - Added identity-blind current-policy readiness evidence.
 //! v2.8.18-TipSupersession - Added aggregate superseded announcement evidence.
 //! v2.8.17-TipRetryQueue - Added aggregate bounded announcement retry evidence.
@@ -443,10 +444,10 @@ impl RecordCommitmentCertificateSyncDisposition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordCommitmentCertificatePolicyReadiness {
     Disabled,
-    Ready,
+    Ready { tip_height: u64 },
     WaitingForConvergence,
-    WaitingForCertificate,
-    SourceUnavailable,
+    WaitingForCertificate { tip_height: u64 },
+    SourceUnavailable { tip_height: u64 },
     SecurityStopped,
     ConfigurationError,
 }
@@ -455,17 +456,29 @@ impl RecordCommitmentCertificatePolicyReadiness {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::Ready => "ready",
+            Self::Ready { .. } => "ready",
             Self::WaitingForConvergence => "waiting_for_convergence",
-            Self::WaitingForCertificate => "waiting_for_certificate",
-            Self::SourceUnavailable => "source_unavailable",
+            Self::WaitingForCertificate { .. } => "waiting_for_certificate",
+            Self::SourceUnavailable { .. } => "source_unavailable",
             Self::SecurityStopped => "security_stopped",
             Self::ConfigurationError => "configuration_error",
         }
     }
 
     pub(crate) const fn is_ready(self) -> bool {
-        matches!(self, Self::Ready)
+        matches!(self, Self::Ready { .. })
+    }
+
+    pub(crate) const fn evaluated_tip_height(self) -> Option<u64> {
+        match self {
+            Self::Ready { tip_height }
+            | Self::WaitingForCertificate { tip_height }
+            | Self::SourceUnavailable { tip_height } => Some(tip_height),
+            Self::Disabled
+            | Self::WaitingForConvergence
+            | Self::SecurityStopped
+            | Self::ConfigurationError => None,
+        }
     }
 }
 
@@ -531,6 +544,8 @@ pub struct RecordCommitmentSyncStatus {
     pub certificate_policy_ready: bool,
     /// Most recent exact local policy evaluation time.
     pub certificate_policy_last_evaluated_at: Option<u64>,
+    /// Audited local tip height covered by the latest applicable evaluation.
+    pub certificate_policy_evaluated_tip_height: Option<u64>,
     /// Count of configured external witnesses; identities are never exposed.
     pub certificate_witnesses_configured: usize,
     /// Minimum distinct signatures required by local follower policy.
@@ -770,6 +785,7 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) certificate_policy_state: &'static str,
     pub(crate) certificate_policy_ready: bool,
     pub(crate) certificate_policy_last_evaluated_at: Option<u64>,
+    pub(crate) certificate_policy_evaluated_tip_height: Option<u64>,
     pub(crate) certificate_witnesses_configured: usize,
     pub(crate) certificate_minimum_signers: usize,
     pub(crate) last_certificate_sync_at: Option<u64>,
@@ -827,6 +843,7 @@ impl Default for RecordCommitmentSyncRuntime {
             certificate_policy_state: "not_applicable",
             certificate_policy_ready: false,
             certificate_policy_last_evaluated_at: None,
+            certificate_policy_evaluated_tip_height: None,
             certificate_witnesses_configured: 0,
             certificate_minimum_signers: 0,
             last_certificate_sync_at: None,

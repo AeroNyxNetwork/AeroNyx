@@ -136,6 +136,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.49-FollowerCertificateTipBinding - Bound every applicable policy outcome to its audited tip.
 //! v2.8.48-FollowerCertificateReadiness - Reported exact current-policy readiness without witness identities.
 //! v2.8.45-FollowerCertificateTelemetry - Reported source-blind certificate recovery outcomes.
 //! v2.8.32-FollowerCertificateCarrier - Recover audited certificates from pinned witness carriers.
@@ -1830,7 +1831,9 @@ where
     if certificate_already_current {
         storage.record_commitment_certificate_policy_evaluation(
             now_secs(),
-            RecordCommitmentCertificatePolicyReadiness::Ready,
+            RecordCommitmentCertificatePolicyReadiness::Ready {
+                tip_height: converged_tip_height,
+            },
         );
         return Ok(CommitmentFollowerCertificateSyncOutcome::AlreadyCurrent);
     }
@@ -1888,9 +1891,13 @@ where
                 };
                 storage.record_commitment_certificate_sync_outcome(now_secs(), disposition, index);
                 let readiness = if imported.persisted {
-                    RecordCommitmentCertificatePolicyReadiness::Ready
+                    RecordCommitmentCertificatePolicyReadiness::Ready {
+                        tip_height: converged_tip_height,
+                    }
                 } else {
-                    RecordCommitmentCertificatePolicyReadiness::WaitingForCertificate
+                    RecordCommitmentCertificatePolicyReadiness::WaitingForCertificate {
+                        tip_height: converged_tip_height,
+                    }
                 };
                 storage.record_commitment_certificate_policy_evaluation(now_secs(), readiness);
                 return Ok(CommitmentFollowerCertificateSyncOutcome::Refreshed(
@@ -1929,7 +1936,9 @@ where
     );
     storage.record_commitment_certificate_policy_evaluation(
         now_secs(),
-        RecordCommitmentCertificatePolicyReadiness::SourceUnavailable,
+        RecordCommitmentCertificatePolicyReadiness::SourceUnavailable {
+            tip_height: converged_tip_height,
+        },
     );
     Err(coordinator_availability_failure
         .unwrap_or_else(|| "certificate_source_unavailable".to_string()))
@@ -7004,6 +7013,10 @@ mod tests {
         assert!(imported_status.certificate_policy_ready);
         assert_eq!(imported_status.certificate_witnesses_configured, 2);
         assert_eq!(imported_status.certificate_minimum_signers, 2);
+        assert_eq!(
+            imported_status.certificate_policy_evaluated_tip_height,
+            Some(1)
+        );
         assert!(imported_status
             .certificate_policy_last_evaluated_at
             .is_some());
@@ -7173,6 +7186,10 @@ mod tests {
             .is_some());
         assert_eq!(carrier_status.certificate_policy_state, "ready");
         assert!(carrier_status.certificate_policy_ready);
+        assert_eq!(
+            carrier_status.certificate_policy_evaluated_tip_height,
+            Some(1)
+        );
 
         // A malformed primary response is a security failure, not an
         // availability event. The valid carrier must not mask it.
@@ -7269,5 +7286,9 @@ mod tests {
         let already_current_status = destination.record_commitment_sync_status();
         assert_eq!(already_current_status.certificate_policy_state, "ready");
         assert!(already_current_status.certificate_policy_ready);
+        assert_eq!(
+            already_current_status.certificate_policy_evaluated_tip_height,
+            Some(1)
+        );
     }
 }

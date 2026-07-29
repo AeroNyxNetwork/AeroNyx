@@ -49,6 +49,7 @@
 //!   replication and owner recovery must remain separate and authorised.
 //!
 //! ## Last Modified
+//! v2.8.49-FollowerCertificateTipBinding - Preserved typed tip-bound certificate readiness.
 //! v2.8.48-FollowerCertificateReadiness - Re-exported typed certificate policy readiness.
 //! v2.8.45-FollowerCertificateTelemetry - Re-exported internal certificate recovery outcomes.
 //! v2.8.14-SyncObservability - Re-export follower announcement disposition telemetry.

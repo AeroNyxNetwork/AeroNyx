@@ -165,6 +165,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.49-FollowerCertificateTipBinding - Prevent stale readiness after the audited tip advances.
 //! v2.8.48-FollowerCertificateReadiness - Track exact follower certificate-policy readiness.
 //! v2.8.31-FollowerCertificatePolicy - Validate retained certificates against current follower pins.
 //! v2.8.18-TipSupersession - Prioritize fresh tips without delivery claims.
@@ -4079,6 +4080,7 @@ impl MemoryStorage {
             runtime.certificate_policy_state = "not_applicable";
             runtime.certificate_policy_ready = false;
             runtime.certificate_policy_last_evaluated_at = None;
+            runtime.certificate_policy_evaluated_tip_height = None;
             runtime.certificate_witnesses_configured = 0;
             runtime.certificate_minimum_signers = 0;
             return;
@@ -4088,6 +4090,7 @@ impl MemoryStorage {
         runtime.certificate_minimum_signers = minimum_signers;
         runtime.certificate_policy_ready = false;
         runtime.certificate_policy_last_evaluated_at = None;
+        runtime.certificate_policy_evaluated_tip_height = None;
         runtime.certificate_policy_state = if minimum_signers < 2 {
             "disabled"
         } else if witnesses_configured < minimum_signers
@@ -4985,6 +4988,7 @@ impl MemoryStorage {
         runtime.certificate_policy_last_evaluated_at = Some(observed_at);
         runtime.certificate_policy_state = readiness.as_str();
         runtime.certificate_policy_ready = readiness.is_ready();
+        runtime.certificate_policy_evaluated_tip_height = readiness.evaluated_tip_height();
     }
 
     /// Records a fail-closed follower error using only a stable allow-listed
@@ -5035,7 +5039,29 @@ impl MemoryStorage {
 
     /// Returns a privacy-safe snapshot for local APIs and heartbeat reporting.
     pub fn record_commitment_sync_status(&self) -> RecordCommitmentSyncStatus {
+        // [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] A certificate
+        // decision is valid only for the audited tip it evaluated. Derive the
+        // externally visible state against the latest complete integrity
+        // baseline so scheduler delay cannot leave an old tip reported ready.
+        let audited_tip_height = self
+            .commitment_integrity
+            .read()
+            .as_ref()
+            .map(|integrity| integrity.verified_tip_height);
         let runtime = self.commitment_sync.read();
+        let certificate_policy_evaluation_is_stale = runtime
+            .certificate_policy_evaluated_tip_height
+            .is_some()
+            && runtime.certificate_policy_evaluated_tip_height != audited_tip_height;
+        let certificate_policy_state = if certificate_policy_evaluation_is_stale {
+            if audited_tip_height.is_some() {
+                "waiting_for_certificate"
+            } else {
+                "waiting_for_convergence"
+            }
+        } else {
+            runtime.certificate_policy_state
+        };
         RecordCommitmentSyncStatus {
             contract_version: "record_commitment_sync.v1",
             role: runtime.role.to_string(),
@@ -5071,10 +5097,13 @@ impl MemoryStorage {
                 .outbound_announcement_retries_succeeded_total,
             outbound_announcement_retries_exhausted_total: runtime
                 .outbound_announcement_retries_exhausted_total,
-            certificate_policy_state: runtime.certificate_policy_state.to_string(),
-            certificate_policy_ready: runtime.certificate_policy_ready,
+            certificate_policy_state: certificate_policy_state.to_string(),
+            certificate_policy_ready: runtime.certificate_policy_ready
+                && !certificate_policy_evaluation_is_stale,
             certificate_policy_last_evaluated_at: runtime
                 .certificate_policy_last_evaluated_at,
+            certificate_policy_evaluated_tip_height: runtime
+                .certificate_policy_evaluated_tip_height,
             certificate_witnesses_configured: runtime.certificate_witnesses_configured,
             certificate_minimum_signers: runtime.certificate_minimum_signers,
             last_certificate_sync_at: runtime.last_certificate_sync_at,
@@ -5104,7 +5133,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; certificate policy exposes state, readiness, witness count, threshold, and evaluation time but no coordinator or carrier identity, witness set, endpoint, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; certificate recovery counters are process-local operations evidence, not authority, reputation, consensus, or fork choice",
+                "aggregate runtime only; certificate policy exposes state, readiness, evaluated tip height, witness count, threshold, and evaluation time but no coordinator or carrier identity, witness set, endpoint, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; certificate recovery counters are process-local operations evidence, not authority, reputation, consensus, or fork choice",
         }
     }
 
@@ -8700,9 +8729,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_certificate_policy_readiness_requires_exact_local_validation() {
+    #[tokio::test]
+    async fn test_certificate_policy_readiness_requires_exact_local_validation() {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let producer = IdentityKeyPair::generate();
+        let producer_id = producer.public_key_bytes();
+        let first = signed_commitment_block(1, GENESIS_PREV_HASH, 0x81, &producer);
+        storage
+            .append_record_commitment_block(&first, Some(&producer_id))
+            .await
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
         storage.configure_record_commitment_sync(false, true);
 
         storage.configure_record_commitment_certificate_policy(0, 1);
@@ -8721,16 +8758,39 @@ mod tests {
 
         storage.record_commitment_certificate_policy_evaluation(
             100,
-            RecordCommitmentCertificatePolicyReadiness::Ready,
+            RecordCommitmentCertificatePolicyReadiness::Ready { tip_height: 1 },
         );
         let ready = storage.record_commitment_sync_status();
         assert_eq!(ready.certificate_policy_state, "ready");
         assert!(ready.certificate_policy_ready);
         assert_eq!(ready.certificate_policy_last_evaluated_at, Some(100));
+        assert_eq!(ready.certificate_policy_evaluated_tip_height, Some(1));
+
+        let second = signed_commitment_block(2, first.hash(), 0x82, &producer);
+        storage
+            .append_record_commitment_block(&second, Some(&producer_id))
+            .await
+            .unwrap();
+        let stale = storage.record_commitment_sync_status();
+        assert_eq!(stale.certificate_policy_state, "waiting_for_certificate");
+        assert!(!stale.certificate_policy_ready);
+        assert_eq!(stale.certificate_policy_evaluated_tip_height, Some(1));
+
+        storage.record_commitment_certificate_policy_evaluation(
+            110,
+            RecordCommitmentCertificatePolicyReadiness::Ready { tip_height: 2 },
+        );
+        let refreshed = storage.record_commitment_sync_status();
+        assert_eq!(refreshed.certificate_policy_state, "ready");
+        assert!(refreshed.certificate_policy_ready);
+        assert_eq!(
+            refreshed.certificate_policy_evaluated_tip_height,
+            Some(2)
+        );
 
         storage.record_commitment_certificate_policy_evaluation(
             90,
-            RecordCommitmentCertificatePolicyReadiness::WaitingForCertificate,
+            RecordCommitmentCertificatePolicyReadiness::WaitingForCertificate { tip_height: 2 },
         );
         let invalidated = storage.record_commitment_sync_status();
         assert_eq!(
@@ -8740,8 +8800,24 @@ mod tests {
         assert!(!invalidated.certificate_policy_ready);
         assert_eq!(
             invalidated.certificate_policy_last_evaluated_at,
-            Some(100),
+            Some(110),
             "wall-clock rollback must not regress the diagnostic timestamp"
+        );
+
+        storage.record_commitment_certificate_policy_evaluation(
+            120,
+            RecordCommitmentCertificatePolicyReadiness::SourceUnavailable { tip_height: 1 },
+        );
+        let stale_unavailable = storage.record_commitment_sync_status();
+        assert_eq!(
+            stale_unavailable.certificate_policy_state,
+            "waiting_for_certificate",
+            "a transport result for an older tip must not describe current policy state"
+        );
+        assert!(!stale_unavailable.certificate_policy_ready);
+        assert_eq!(
+            stale_unavailable.certificate_policy_evaluated_tip_height,
+            Some(1)
         );
 
         storage.configure_record_commitment_certificate_policy(1, 2);
