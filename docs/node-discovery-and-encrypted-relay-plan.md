@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.56.0 - Follower checkpoint-certificate carrier recovery.
+Modification Reason: v0.57.0 - Privacy-safe follower certificate recovery telemetry.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.56.0 - [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] Recovers audited current-tip certificates through bounded operator-pinned witness carriers when coordinator transport is unavailable.
+Last Modified: v0.57.0 - [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] Reports source-blind aggregate outcomes for current-tip certificate retrieval and bounded carrier recovery.
+Previous: v0.56.0 - [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] Recovers audited current-tip certificates through bounded operator-pinned witness carriers when coordinator transport is unavailable.
 Previous: v0.55.0 - [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Replicates audited current-tip checkpoint certificates to converged followers under each follower's current witness policy.
 Previous: v0.54.0 - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Centralizes Directory transport health policy in the service runtime, records aggregate degraded/recovered transitions, and prevents diagnostic timestamps from regressing after wall-clock rollback.
 Previous: v0.53.0 - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Classifies Directory synchronization health from a fixed recent outcome window so one final success cannot conceal meaningful transport churn, without retaining identity-bearing request history.
@@ -96,6 +97,33 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.57 Privacy-safe certificate recovery telemetry
+
+[FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex]
+
+- The follower runtime now reports one mutually exclusive terminal result for
+  each real checkpoint-certificate transport round: `coordinator`,
+  `carrier_recovered`, `availability_exhausted`, or `security_stopped`.
+- Process-local totals separately count completed rounds, direct coordinator
+  success, bounded carrier attempts, carrier recoveries, exhausted availability,
+  and fail-closed security stops. The latest completion and latest carrier
+  recovery timestamps are monotonic within one process lifetime.
+- Local status and signed heartbeat use the same additive contract. Existing
+  consumers remain compatible, while backend/nodeboard can prove that carrier
+  recovery is actually exercised instead of inferring it from generic sync
+  failures.
+- Telemetry retains no coordinator or carrier identity, witness set, endpoint,
+  certificate frame, hash, signature, raw error, request identifier, payload,
+  owner, route, or client metadata. It cannot reconstruct which source was
+  contacted or what certificate was transported.
+- These counters are operational evidence only. They do not change canonical
+  chain state, witness policy, production authority, startup gates, reputation,
+  consensus, finality, or fork choice.
+- Unit and integration tests enforce the exact accounting invariant, ignore
+  non-follower roles, clamp timestamps against clock rollback, record real
+  carrier recovery, and prove that a malformed coordinator response records a
+  security stop without trying a valid carrier.
 
 ### v0.56 Follower checkpoint-certificate carrier recovery
 

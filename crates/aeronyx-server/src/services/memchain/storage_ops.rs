@@ -130,6 +130,7 @@
 //!   routes, message identifiers, payloads, endpoints, or user identities.
 //!
 //! ## Modification History
+//! v2.8.45-FollowerCertificateTelemetry - Added source-blind recovery outcome counters.
 //! v2.8.18-TipSupersession - Added aggregate superseded announcement rounds.
 //! v2.8.17-TipRetryQueue - Added bounded announcement retry outcome counters.
 //! v2.2.0               - 🌟 Extracted from storage.rs; added get_embedding_model, get_overview
@@ -215,7 +216,7 @@ use aeronyx_core::protocol::memchain::{
 
 use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
-    RecordCommitmentCheckpointCertificateAnchorConfig,
+    RecordCommitmentCertificateSyncDisposition, RecordCommitmentCheckpointCertificateAnchorConfig,
     RecordCommitmentCheckpointCertificateAnchorRuntime,
     RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
     RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
@@ -4869,6 +4870,60 @@ impl MemoryStorage {
         }
     }
 
+    /// Records one terminal checkpoint-certificate retrieval outcome.
+    ///
+    /// [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] This method keeps
+    /// only mutually exclusive aggregate outcomes and the number of bounded
+    /// carrier requests. It deliberately cannot retain a source identity,
+    /// endpoint, certificate frame, hash, signature, or raw error. The
+    /// counters are process-local observability and never affect chain state.
+    pub(crate) fn record_commitment_certificate_sync_outcome(
+        &self,
+        now: u64,
+        disposition: RecordCommitmentCertificateSyncDisposition,
+        carrier_attempts: usize,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled || runtime.role != "follower" {
+            return;
+        }
+        let observed_at = runtime
+            .last_certificate_sync_at
+            .map_or(now, |previous| previous.max(now));
+        let carrier_attempts = u64::try_from(carrier_attempts).unwrap_or(u64::MAX);
+
+        runtime.last_certificate_sync_at = Some(observed_at);
+        runtime.last_certificate_sync_result = Some(disposition.as_str());
+        runtime.certificate_sync_rounds_total =
+            runtime.certificate_sync_rounds_total.saturating_add(1);
+        runtime.certificate_carrier_attempts_total = runtime
+            .certificate_carrier_attempts_total
+            .saturating_add(carrier_attempts);
+
+        match disposition {
+            RecordCommitmentCertificateSyncDisposition::Coordinator => {
+                runtime.certificate_coordinator_success_total = runtime
+                    .certificate_coordinator_success_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentCertificateSyncDisposition::CarrierRecovered => {
+                runtime.last_certificate_carrier_recovered_at = Some(observed_at);
+                runtime.certificate_carrier_recoveries_total = runtime
+                    .certificate_carrier_recoveries_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentCertificateSyncDisposition::AvailabilityExhausted => {
+                runtime.certificate_availability_exhausted_total = runtime
+                    .certificate_availability_exhausted_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentCertificateSyncDisposition::SecurityStopped => {
+                runtime.certificate_security_stops_total =
+                    runtime.certificate_security_stops_total.saturating_add(1);
+            }
+        }
+    }
+
     /// Records a fail-closed follower error using only a stable allow-listed
     /// code. Free text, URLs, identities, and endpoints are never retained.
     pub fn record_commitment_sync_failure(
@@ -4953,6 +5008,19 @@ impl MemoryStorage {
                 .outbound_announcement_retries_succeeded_total,
             outbound_announcement_retries_exhausted_total: runtime
                 .outbound_announcement_retries_exhausted_total,
+            last_certificate_sync_at: runtime.last_certificate_sync_at,
+            last_certificate_sync_result: runtime
+                .last_certificate_sync_result
+                .map(str::to_string),
+            last_certificate_carrier_recovered_at: runtime
+                .last_certificate_carrier_recovered_at,
+            certificate_sync_rounds_total: runtime.certificate_sync_rounds_total,
+            certificate_coordinator_success_total: runtime.certificate_coordinator_success_total,
+            certificate_carrier_attempts_total: runtime.certificate_carrier_attempts_total,
+            certificate_carrier_recoveries_total: runtime.certificate_carrier_recoveries_total,
+            certificate_availability_exhausted_total: runtime
+                .certificate_availability_exhausted_total,
+            certificate_security_stops_total: runtime.certificate_security_stops_total,
             last_attempt_at: runtime.last_attempt_at,
             last_success_at: runtime.last_success_at,
             last_failure_at: runtime.last_failure_at,
@@ -4967,7 +5035,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; no coordinator identity, endpoint, block hash, record commitment, owner, payload, route, or client metadata",
+                "aggregate runtime only; no coordinator or carrier identity, witness set, endpoint, certificate frame, hash, signature, raw error, record commitment, owner, payload, route, or client metadata; certificate recovery counters are process-local operations evidence, not authority, reputation, consensus, or fork choice",
         }
     }
 
@@ -8479,6 +8547,80 @@ mod tests {
 
         storage.stop_record_commitment_sync();
         assert_eq!(storage.record_commitment_sync_status().state, "stopped");
+    }
+
+    #[test]
+    fn test_certificate_sync_runtime_is_aggregate_monotonic_and_follower_only() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+
+        storage.record_commitment_certificate_sync_outcome(
+            90,
+            RecordCommitmentCertificateSyncDisposition::Coordinator,
+            0,
+        );
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .certificate_sync_rounds_total,
+            0
+        );
+
+        storage.configure_record_commitment_sync(false, true);
+        storage.record_commitment_certificate_sync_outcome(
+            100,
+            RecordCommitmentCertificateSyncDisposition::Coordinator,
+            0,
+        );
+        storage.record_commitment_certificate_sync_outcome(
+            110,
+            RecordCommitmentCertificateSyncDisposition::CarrierRecovered,
+            2,
+        );
+        storage.record_commitment_certificate_sync_outcome(
+            105,
+            RecordCommitmentCertificateSyncDisposition::AvailabilityExhausted,
+            1,
+        );
+        storage.record_commitment_certificate_sync_outcome(
+            120,
+            RecordCommitmentCertificateSyncDisposition::SecurityStopped,
+            1,
+        );
+
+        let status = storage.record_commitment_sync_status();
+        assert_eq!(status.last_certificate_sync_at, Some(120));
+        assert_eq!(
+            status.last_certificate_sync_result.as_deref(),
+            Some("security_stopped")
+        );
+        assert_eq!(status.last_certificate_carrier_recovered_at, Some(110));
+        assert_eq!(status.certificate_sync_rounds_total, 4);
+        assert_eq!(status.certificate_coordinator_success_total, 1);
+        assert_eq!(status.certificate_carrier_attempts_total, 4);
+        assert_eq!(status.certificate_carrier_recoveries_total, 1);
+        assert_eq!(status.certificate_availability_exhausted_total, 1);
+        assert_eq!(status.certificate_security_stops_total, 1);
+        assert_eq!(
+            status.certificate_sync_rounds_total,
+            status
+                .certificate_coordinator_success_total
+                .saturating_add(status.certificate_carrier_recoveries_total)
+                .saturating_add(status.certificate_availability_exhausted_total)
+                .saturating_add(status.certificate_security_stops_total)
+        );
+
+        storage.configure_record_commitment_sync(true, false);
+        storage.record_commitment_certificate_sync_outcome(
+            130,
+            RecordCommitmentCertificateSyncDisposition::Coordinator,
+            0,
+        );
+        assert_eq!(
+            storage
+                .record_commitment_sync_status()
+                .certificate_sync_rounds_total,
+            0
+        );
     }
 
     #[test]

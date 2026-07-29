@@ -131,6 +131,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.45-FollowerCertificateTelemetry - Reported source-blind certificate recovery outcomes.
 //! v2.8.32-FollowerCertificateCarrier - Recover audited certificates from pinned witness carriers.
 //! v2.8.31-FollowerCertificateSync - Refresh audited checkpoint certificates after follower convergence.
 //! v2.8.30-WitnessDescriptorPreflight - Republish the current coordinator descriptor before strict startup gates.
@@ -213,7 +214,10 @@ use crate::services::memchain::storage_ops::{
     RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorLeaseGrantOutcome,
     RecordCoordinatorLeaseReleaseOutcome, VerifiedDeliveryAnchorWitnessOutcome,
 };
-use crate::services::memchain::{MemoryStorage, RecordCommitmentAnnouncementDisposition};
+use crate::services::memchain::{
+    MemoryStorage, RecordCommitmentAnnouncementDisposition,
+    RecordCommitmentCertificateSyncDisposition,
+};
 use crate::services::PeerStore;
 
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
@@ -1820,8 +1824,19 @@ where
         {
             Ok(imported) => {
                 if imported.checkpoint_height != converged_tip_height {
+                    storage.record_commitment_certificate_sync_outcome(
+                        now_secs(),
+                        RecordCommitmentCertificateSyncDisposition::SecurityStopped,
+                        index,
+                    );
                     return Err("certificate_converged_tip_changed".to_string());
                 }
+                let disposition = if index == 0 {
+                    RecordCommitmentCertificateSyncDisposition::Coordinator
+                } else {
+                    RecordCommitmentCertificateSyncDisposition::CarrierRecovered
+                };
+                storage.record_commitment_certificate_sync_outcome(now_secs(), disposition, index);
                 return Ok(CommitmentFollowerCertificateSyncOutcome::Refreshed(
                     imported,
                 ));
@@ -1834,12 +1849,24 @@ where
                     coordinator_availability_failure = Some(error);
                 }
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                storage.record_commitment_certificate_sync_outcome(
+                    now_secs(),
+                    RecordCommitmentCertificateSyncDisposition::SecurityStopped,
+                    index,
+                );
+                return Err(error);
+            }
         }
     }
 
     // Preserve the coordinator's established privacy-safe failure code when no
     // carrier is reachable, keeping existing operations and alerting stable.
+    storage.record_commitment_certificate_sync_outcome(
+        now_secs(),
+        RecordCommitmentCertificateSyncDisposition::AvailabilityExhausted,
+        sources.len().saturating_sub(1),
+    );
     Err(coordinator_availability_failure
         .unwrap_or_else(|| "certificate_source_unavailable".to_string()))
 }
@@ -7007,6 +7034,7 @@ mod tests {
             .audit_record_commitment_checkpoint_evidence()
             .await
             .unwrap();
+        carrier_destination.configure_record_commitment_sync(false, true);
         let carrier_destination_peers = PeerStore::new();
         let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable_address = unavailable_listener.local_addr().unwrap();
@@ -7043,6 +7071,20 @@ mod tests {
         assert!(recovered.persisted);
         assert_eq!(recovered.checkpoint_height, 1);
         assert_eq!(recovered.signer_count, 2);
+        let carrier_status = carrier_destination.record_commitment_sync_status();
+        assert_eq!(carrier_status.certificate_sync_rounds_total, 1);
+        assert_eq!(carrier_status.certificate_coordinator_success_total, 0);
+        assert_eq!(carrier_status.certificate_carrier_attempts_total, 1);
+        assert_eq!(carrier_status.certificate_carrier_recoveries_total, 1);
+        assert_eq!(carrier_status.certificate_availability_exhausted_total, 0);
+        assert_eq!(carrier_status.certificate_security_stops_total, 0);
+        assert_eq!(
+            carrier_status.last_certificate_sync_result.as_deref(),
+            Some("carrier_recovered")
+        );
+        assert!(carrier_status
+            .last_certificate_carrier_recovered_at
+            .is_some());
 
         // A malformed primary response is a security failure, not an
         // availability event. The valid carrier must not mask it.
@@ -7070,6 +7112,7 @@ mod tests {
             .audit_record_commitment_checkpoint_evidence()
             .await
             .unwrap();
+        guarded_destination.configure_record_commitment_sync(false, true);
         let guarded_destination_peers = PeerStore::new();
         admit_peer(
             &guarded_destination_peers,
@@ -7098,6 +7141,15 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(guarded_error, "invalid_certificate_frame");
+        let guarded_status = guarded_destination.record_commitment_sync_status();
+        assert_eq!(guarded_status.certificate_sync_rounds_total, 1);
+        assert_eq!(guarded_status.certificate_carrier_attempts_total, 0);
+        assert_eq!(guarded_status.certificate_carrier_recoveries_total, 0);
+        assert_eq!(guarded_status.certificate_security_stops_total, 1);
+        assert_eq!(
+            guarded_status.last_certificate_sync_result.as_deref(),
+            Some("security_stopped")
+        );
 
         malformed_server.abort();
         let _ = malformed_server.await;

@@ -46,6 +46,9 @@
 //     endpoints, HTTP bodies, block hashes, or per-peer retry timing.
 //   - Announcement supersession is process-local aggregate scheduling evidence.
 //     Never infer delivery, replication, consensus, or finality from it.
+//   - Certificate recovery telemetry is source-blind and process-local. Never
+//     add coordinator/carrier identities, witness sets, endpoints, frames,
+//     hashes, signatures, raw errors, or per-source timing.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -73,6 +76,7 @@
 //   v2.8.15        - Added exact coordinator announcement receipt telemetry
 //   v2.8.17        - Added bounded announcement retry outcome telemetry
 //   v2.8.18        - Added aggregate superseded announcement telemetry
+//   v2.8.45        - Added source-blind certificate recovery telemetry
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -239,6 +243,24 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub outbound_announcement_retries_succeeded_total: u64,
     /// Peers still transiently failing after the bounded retry budget.
     pub outbound_announcement_retries_exhausted_total: u64,
+    /// Most recent completed checkpoint-certificate retrieval round.
+    pub last_certificate_sync_at: Option<u64>,
+    /// Latest source-blind terminal retrieval result.
+    pub last_certificate_sync_result: Option<String>,
+    /// Most recent successful recovery through an already-pinned carrier.
+    pub last_certificate_carrier_recovered_at: Option<u64>,
+    /// Completed certificate retrieval rounds since process start.
+    pub certificate_sync_rounds_total: u64,
+    /// Rounds completed directly through the configured coordinator.
+    pub certificate_coordinator_success_total: u64,
+    /// Bounded pinned-carrier requests attempted after availability faults.
+    pub certificate_carrier_attempts_total: u64,
+    /// Rounds recovered through one already-pinned carrier.
+    pub certificate_carrier_recoveries_total: u64,
+    /// Rounds where all bounded certificate sources were unavailable.
+    pub certificate_availability_exhausted_total: u64,
+    /// Rounds stopped by security or protocol-integrity failures.
+    pub certificate_security_stops_total: u64,
     /// Most recent follower pull attempt.
     pub last_attempt_at: Option<u64>,
     /// Most recent successful verified response page.
@@ -910,6 +932,15 @@ mod tests {
                 outbound_announcement_retries_attempted_total: 4,
                 outbound_announcement_retries_succeeded_total: 2,
                 outbound_announcement_retries_exhausted_total: 1,
+                last_certificate_sync_at: Some(112),
+                last_certificate_sync_result: Some("carrier_recovered".to_string()),
+                last_certificate_carrier_recovered_at: Some(112),
+                certificate_sync_rounds_total: 5,
+                certificate_coordinator_success_total: 2,
+                certificate_carrier_attempts_total: 4,
+                certificate_carrier_recoveries_total: 1,
+                certificate_availability_exhausted_total: 1,
+                certificate_security_stops_total: 1,
                 last_attempt_at: Some(99),
                 last_success_at: Some(100),
                 last_failure_at: Some(110),
@@ -1034,6 +1065,15 @@ mod tests {
         assert_eq!(sync["outbound_announcement_retries_attempted_total"], 4);
         assert_eq!(sync["outbound_announcement_retries_succeeded_total"], 2);
         assert_eq!(sync["outbound_announcement_retries_exhausted_total"], 1);
+        assert_eq!(sync["last_certificate_sync_at"], 112);
+        assert_eq!(sync["last_certificate_sync_result"], "carrier_recovered");
+        assert_eq!(sync["last_certificate_carrier_recovered_at"], 112);
+        assert_eq!(sync["certificate_sync_rounds_total"], 5);
+        assert_eq!(sync["certificate_coordinator_success_total"], 2);
+        assert_eq!(sync["certificate_carrier_attempts_total"], 4);
+        assert_eq!(sync["certificate_carrier_recoveries_total"], 1);
+        assert_eq!(sync["certificate_availability_exhausted_total"], 1);
+        assert_eq!(sync["certificate_security_stops_total"], 1);
         assert_eq!(sync["last_attempt_at"], 99);
         assert_eq!(sync["last_error_code"], "request_timeout");
         let checkpoint = &value["record_commitment_checkpoint"];

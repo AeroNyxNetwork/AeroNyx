@@ -408,6 +408,31 @@ pub struct RecordCommitmentSyncEvent {
     pub next_poll_at: Option<u64>,
 }
 
+/// One terminal outcome for a follower checkpoint-certificate retrieval round.
+///
+/// [FOLLOWER-CERTIFICATE-TELEMETRY 2026-07-29 by Codex] This process-local
+/// classification deliberately excludes source identities, endpoints,
+/// certificate material, hashes, signatures, and raw errors. It is operational
+/// evidence only and must never become authority, reputation, or fork choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordCommitmentCertificateSyncDisposition {
+    Coordinator,
+    CarrierRecovered,
+    AvailabilityExhausted,
+    SecurityStopped,
+}
+
+impl RecordCommitmentCertificateSyncDisposition {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Coordinator => "coordinator",
+            Self::CarrierRecovered => "carrier_recovered",
+            Self::AvailabilityExhausted => "availability_exhausted",
+            Self::SecurityStopped => "security_stopped",
+        }
+    }
+}
+
 /// Privacy-safe runtime status for commitment block replication.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecordCommitmentSyncStatus {
@@ -464,6 +489,24 @@ pub struct RecordCommitmentSyncStatus {
     pub outbound_announcement_retries_succeeded_total: u64,
     /// Peers still transiently failing after the retry budget.
     pub outbound_announcement_retries_exhausted_total: u64,
+    /// Most recent completed checkpoint-certificate retrieval round.
+    pub last_certificate_sync_at: Option<u64>,
+    /// Latest aggregate terminal result. No source identity is retained.
+    pub last_certificate_sync_result: Option<String>,
+    /// Most recent round recovered through an already-pinned carrier.
+    pub last_certificate_carrier_recovered_at: Option<u64>,
+    /// Completed certificate retrieval rounds observed since process start.
+    pub certificate_sync_rounds_total: u64,
+    /// Rounds completed directly through the configured coordinator.
+    pub certificate_coordinator_success_total: u64,
+    /// Pinned carrier requests attempted after coordinator availability faults.
+    pub certificate_carrier_attempts_total: u64,
+    /// Rounds recovered through one already-pinned certificate carrier.
+    pub certificate_carrier_recoveries_total: u64,
+    /// Rounds where the coordinator and every bounded carrier were unavailable.
+    pub certificate_availability_exhausted_total: u64,
+    /// Rounds stopped by a security or protocol-integrity failure.
+    pub certificate_security_stops_total: u64,
     /// Most recent pull attempt time.
     pub last_attempt_at: Option<u64>,
     /// Most recent successfully verified page time.
@@ -678,6 +721,15 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) outbound_announcement_retries_attempted_total: u64,
     pub(crate) outbound_announcement_retries_succeeded_total: u64,
     pub(crate) outbound_announcement_retries_exhausted_total: u64,
+    pub(crate) last_certificate_sync_at: Option<u64>,
+    pub(crate) last_certificate_sync_result: Option<&'static str>,
+    pub(crate) last_certificate_carrier_recovered_at: Option<u64>,
+    pub(crate) certificate_sync_rounds_total: u64,
+    pub(crate) certificate_coordinator_success_total: u64,
+    pub(crate) certificate_carrier_attempts_total: u64,
+    pub(crate) certificate_carrier_recoveries_total: u64,
+    pub(crate) certificate_availability_exhausted_total: u64,
+    pub(crate) certificate_security_stops_total: u64,
     pub(crate) last_attempt_at: Option<u64>,
     pub(crate) last_success_at: Option<u64>,
     pub(crate) last_failure_at: Option<u64>,
@@ -721,6 +773,15 @@ impl Default for RecordCommitmentSyncRuntime {
             outbound_announcement_retries_attempted_total: 0,
             outbound_announcement_retries_succeeded_total: 0,
             outbound_announcement_retries_exhausted_total: 0,
+            last_certificate_sync_at: None,
+            last_certificate_sync_result: None,
+            last_certificate_carrier_recovered_at: None,
+            certificate_sync_rounds_total: 0,
+            certificate_coordinator_success_total: 0,
+            certificate_carrier_attempts_total: 0,
+            certificate_carrier_recoveries_total: 0,
+            certificate_availability_exhausted_total: 0,
+            certificate_security_stops_total: 0,
             last_attempt_at: None,
             last_success_at: None,
             last_failure_at: None,

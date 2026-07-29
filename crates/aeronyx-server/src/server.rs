@@ -372,6 +372,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.45-FollowerCertificateTelemetry - Reported source-blind aggregate
+//     checkpoint-certificate retrieval and carrier-recovery outcomes
 //   v2.8.44-FollowerCertificateCarrier - Recovered current-tip certificates
 //     through exact operator-pinned witness carriers when the coordinator
 //     transport is unavailable, without granting carrier chain authority
@@ -4396,6 +4398,21 @@ impl Server {
                                 .outbound_announcement_retries_succeeded_total,
                             outbound_announcement_retries_exhausted_total: status
                                 .outbound_announcement_retries_exhausted_total,
+                            last_certificate_sync_at: status.last_certificate_sync_at,
+                            last_certificate_sync_result: status.last_certificate_sync_result,
+                            last_certificate_carrier_recovered_at: status
+                                .last_certificate_carrier_recovered_at,
+                            certificate_sync_rounds_total: status.certificate_sync_rounds_total,
+                            certificate_coordinator_success_total: status
+                                .certificate_coordinator_success_total,
+                            certificate_carrier_attempts_total: status
+                                .certificate_carrier_attempts_total,
+                            certificate_carrier_recoveries_total: status
+                                .certificate_carrier_recoveries_total,
+                            certificate_availability_exhausted_total: status
+                                .certificate_availability_exhausted_total,
+                            certificate_security_stops_total: status
+                                .certificate_security_stops_total,
                             last_attempt_at: status.last_attempt_at,
                             last_success_at: status.last_success_at,
                             last_failure_at: status.last_failure_at,
