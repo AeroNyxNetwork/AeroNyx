@@ -386,6 +386,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.54-CertificateCarrierRecovery - Unified coordinator and follower
+//     carrier recovery so security faults cannot be masked by later sources
 //   v2.8.53-TypedCarrierCircuit - Retained independent process-lifetime block
 //     and certificate carrier circuits in the follower runtime
 //   v2.8.52-BlockCarrierCircuitTelemetry - Forwarded anonymous carrier circuit
@@ -615,9 +617,11 @@ use crate::api::directory_replica_sync::{
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     publish_current_descriptor_to_commitment_witnesses, pull_record_commitment_checkpoint,
-    pull_record_commitment_checkpoint_certificate,
-    pull_record_commitment_page_with_carrier_runtime, CommitmentBlockCarrierCircuitBreaker,
+    pull_record_commitment_page_with_carrier_runtime,
+    recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime,
+    CommitmentBlockCarrierCircuitBreaker,
     CommitmentBlockCarrierCursor, CommitmentCertificateCarrierCircuitBreaker,
+    CommitmentCertificateCarrierRecoveryDisposition,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
     request_record_commitment_coordinator_lease,
@@ -6346,6 +6350,11 @@ impl Server {
         Some(tokio::spawn(async move {
             let mut next_delay = Duration::from_secs(INITIAL_DELAY_SECS);
             let mut consecutive_unverified_rounds = 0u32;
+            // [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] This circuit
+            // belongs only to coordinator post-startup certificate backfill.
+            // It never shares follower state and retains no source identity.
+            let mut certificate_carrier_circuit_breaker =
+                CommitmentCertificateCarrierCircuitBreaker::default();
             info!(
                 interval_secs,
                 max_witnesses = MAX_WITNESSES_PER_ROUND,
@@ -6514,40 +6523,69 @@ impl Server {
                     && !round.certificate_persisted
                     && !round.certificate_persistence_failed
                 {
-                    // Certificate exchange is deliberately post-startup. It
-                    // supplements durable audit evidence but can never satisfy
-                    // the live startup witness threshold or choose a chain.
-                    let mut imported = 0usize;
-                    let mut rejected = 0usize;
-                    for source_node_id in
-                        pinned_witness_node_ids.iter().take(MAX_WITNESSES_PER_ROUND)
-                    {
-                        let result = tokio::select! {
-                            _ = shutdown_rx.recv() => break 'witness_loop,
-                            result = pull_record_commitment_checkpoint_certificate(
+                    // [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex]
+                    // Certificate exchange is post-startup evidence only. One
+                    // fail-closed primitive now owns source ordering, circuit
+                    // state, and error classification: only availability may
+                    // advance, and a verified non-persisted result stops this
+                    // round so a local tip/policy race cannot fan out.
+                    let recovery = tokio::select! {
+                        _ = shutdown_rx.recv() => break 'witness_loop,
+                        recovery =
+                            recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime(
                                 &storage,
                                 &peer_store,
                                 &identity,
-                                source_node_id,
                                 &pinned_witness_node_ids,
                                 certificate_minimum_signers,
+                                MAX_WITNESSES_PER_ROUND,
                                 sync_http_client.as_ref(),
-                            ) => result,
-                        };
-                        match result {
-                            Ok(outcome) if outcome.persisted => {
-                                imported = imported.saturating_add(1);
-                                break;
-                            }
-                            Ok(_) | Err(_) => rejected = rejected.saturating_add(1),
+                                &mut certificate_carrier_circuit_breaker,
+                            ) => recovery,
+                    };
+                    match recovery.disposition {
+                        CommitmentCertificateCarrierRecoveryDisposition::Persisted => {
+                            debug!(
+                                checkpoint_height = recovery.checkpoint_height,
+                                certificate_signers = recovery.signer_count,
+                                certificate_required_signers = recovery.required_signers,
+                                carrier_attempts = recovery.carrier_attempts,
+                                carrier_cooldown_skips = recovery.cooldown_skips,
+                                carrier_half_open_attempts = recovery.half_open_attempts,
+                                carrier_cooling_slots = recovery.cooling_slots,
+                                "[MEMCHAIN_BLOCK] Imported audited checkpoint certificate evidence"
+                            );
                         }
-                    }
-                    if imported > 0 {
-                        debug!(
-                            imported,
-                            rejected,
-                            "[MEMCHAIN_BLOCK] Imported audited checkpoint certificate evidence"
-                        );
+                        CommitmentCertificateCarrierRecoveryDisposition::VerifiedUnpersisted => {
+                            debug!(
+                                checkpoint_height = recovery.checkpoint_height,
+                                certificate_signers = recovery.signer_count,
+                                certificate_required_signers = recovery.required_signers,
+                                carrier_attempts = recovery.carrier_attempts,
+                                carrier_cooldown_skips = recovery.cooldown_skips,
+                                carrier_half_open_attempts = recovery.half_open_attempts,
+                                carrier_cooling_slots = recovery.cooling_slots,
+                                "[MEMCHAIN_BLOCK] Verified checkpoint certificate deferred after local state changed"
+                            );
+                        }
+                        CommitmentCertificateCarrierRecoveryDisposition::AvailabilityExhausted => {
+                            debug!(
+                                carrier_attempts = recovery.carrier_attempts,
+                                carrier_cooldown_skips = recovery.cooldown_skips,
+                                carrier_half_open_attempts = recovery.half_open_attempts,
+                                carrier_cooling_slots = recovery.cooling_slots,
+                                "[MEMCHAIN_BLOCK] Checkpoint certificate carriers unavailable"
+                            );
+                        }
+                        CommitmentCertificateCarrierRecoveryDisposition::SecurityStopped => {
+                            warn!(
+                                carrier_attempts = recovery.carrier_attempts,
+                                carrier_cooldown_skips = recovery.cooldown_skips,
+                                carrier_half_open_attempts = recovery.half_open_attempts,
+                                carrier_cooling_slots = recovery.cooling_slots,
+                                "[MEMCHAIN_BLOCK] Checkpoint certificate carrier recovery stopped on a security failure"
+                            );
+                        }
                     }
                     if storage.record_commitment_production_halted() {
                         error!(

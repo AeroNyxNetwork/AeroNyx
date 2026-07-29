@@ -68,6 +68,10 @@
 //!   recovery share one zero-cost generic circuit implementation while domain
 //!   markers prevent either path from receiving the other's mutable state.
 //!   Certificate carriers now retain an independent cross-round cooldown.
+//! - [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Follower and
+//!   coordinator certificate recovery share one fail-closed carrier primitive:
+//!   only availability faults advance, every verified response stops the
+//!   round, and security faults cannot be hidden by a later source.
 //! - Followers report identity-blind current-policy readiness only after exact
 //!   local tip, pin-set, threshold, and durable-certificate validation.
 //! - Last-hop public-IP validation on every outbound commitment request so a
@@ -154,6 +158,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.54-CertificateCarrierRecovery - Unified fail-closed certificate carrier recovery.
 //! v2.8.53-TypedCarrierCircuit - Isolated block and certificate circuit domains.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Added source-blind circuit health aggregates.
 //! v2.8.51-BlockCarrierCircuitBreaker - Added anonymous cross-round carrier cooldown and half-open recovery.
@@ -666,6 +671,46 @@ pub struct CommitmentCertificateImportOutcome {
     pub required_signers: usize,
     /// Whether storage contains a fully re-audited certificate afterward.
     pub persisted: bool,
+}
+
+/// Source-blind terminal state of one coordinator certificate recovery round.
+///
+/// [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] This contract exposes
+/// only bounded aggregate control state to the server runtime. A caller cannot
+/// log or persist source identity, endpoint, signature material, request ids,
+/// response bytes, or the underlying security error through this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitmentCertificateCarrierRecoveryDisposition {
+    /// A fully verified certificate is now durable under current local policy.
+    Persisted,
+    /// The response verified, but a concurrent local state change deferred
+    /// persistence.
+    VerifiedUnpersisted,
+    /// Every eligible non-cooling carrier ended in an availability failure.
+    AvailabilityExhausted,
+    /// Policy, authentication, canonicalization, or evidence validation failed.
+    SecurityStopped,
+}
+
+/// Privacy-safe aggregate result of one coordinator certificate recovery round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitmentCertificateCarrierRecoveryRound {
+    /// Terminal source-blind disposition.
+    pub disposition: CommitmentCertificateCarrierRecoveryDisposition,
+    /// Verified certificate height, or zero when no response verified.
+    pub checkpoint_height: u64,
+    /// Verified distinct signer count, or zero when no response verified.
+    pub signer_count: usize,
+    /// Receiver-enforced signer threshold, or zero when no response verified.
+    pub required_signers: usize,
+    /// Carrier HTTP requests actually started after circuit filtering.
+    pub carrier_attempts: usize,
+    /// Cooling carrier slots skipped without transport.
+    pub cooldown_skips: usize,
+    /// Expired-cooldown carrier probes attempted in this round.
+    pub half_open_attempts: usize,
+    /// Anonymous carrier slots still cooling after this round.
+    pub cooling_slots: usize,
 }
 
 /// Result of one policy-bounded follower checkpoint-certificate refresh.
@@ -1974,6 +2019,255 @@ pub async fn pull_record_commitment_checkpoint_certificate(
     .await
 }
 
+#[derive(Debug)]
+enum CommitmentCertificateCarrierPullTerminal {
+    Imported(CommitmentCertificateImportOutcome),
+    AvailabilityExhausted,
+    SecurityStopped(String),
+}
+
+#[derive(Debug)]
+struct CommitmentCertificateCarrierPullRound {
+    terminal: CommitmentCertificateCarrierPullTerminal,
+    carrier_attempts: usize,
+    cooldown_skips: usize,
+    half_open_attempts: usize,
+}
+
+fn normalized_commitment_certificate_carriers(
+    local_node_id: &[u8; 32],
+    excluded_primary: Option<&[u8; 32]>,
+    allowed_witnesses: &[[u8; 32]],
+    max_carriers: usize,
+) -> Vec<[u8; 32]> {
+    let carrier_limit = max_carriers.min(MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1);
+    let mut carriers = Vec::with_capacity(carrier_limit);
+    for witness in allowed_witnesses
+        .iter()
+        .take(MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1)
+    {
+        if carriers.len() >= carrier_limit {
+            break;
+        }
+        if witness == local_node_id
+            || excluded_primary.is_some_and(|excluded| witness == excluded)
+            || carriers.contains(witness)
+        {
+            continue;
+        }
+        carriers.push(*witness);
+    }
+    carriers
+}
+
+/// Runs one bounded, fail-closed certificate carrier sequence.
+///
+/// Availability is the only failure class that may advance to another exact
+/// operator pin. Any verified response, including one made non-durable by a
+/// concurrent local state change, stops the round. Security failures retain
+/// their private stable code only long enough for the follower adapter to
+/// preserve its existing API; the coordinator adapter collapses them before
+/// returning to runtime logging.
+///
+/// [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex]
+#[allow(clippy::too_many_arguments)]
+async fn pull_record_commitment_checkpoint_certificate_from_carriers_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    carriers: &[[u8; 32]],
+    allowed_witnesses: &[[u8; 32]],
+    minimum_required_signers: usize,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+    circuit_breaker: &mut CommitmentCertificateCarrierCircuitBreaker,
+) -> CommitmentCertificateCarrierPullRound
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    circuit_breaker.align_slots(carriers.len());
+    let mut carrier_attempts = 0usize;
+    let mut cooldown_skips = 0usize;
+    let mut half_open_attempts = 0usize;
+
+    if !(2..=MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1).contains(&minimum_required_signers)
+        || allowed_witnesses.len() < minimum_required_signers
+    {
+        return CommitmentCertificateCarrierPullRound {
+            terminal: CommitmentCertificateCarrierPullTerminal::SecurityStopped(
+                "certificate_policy_invalid".to_string(),
+            ),
+            carrier_attempts,
+            cooldown_skips,
+            half_open_attempts,
+        };
+    }
+
+    for (carrier_index, candidate) in carriers.iter().enumerate() {
+        match circuit_breaker.decision(carrier_index, Instant::now()) {
+            CommitmentCarrierCircuitDecision::Closed => {}
+            CommitmentCarrierCircuitDecision::Cooling => {
+                cooldown_skips = cooldown_skips.saturating_add(1);
+                continue;
+            }
+            CommitmentCarrierCircuitDecision::HalfOpen => {
+                half_open_attempts = half_open_attempts.saturating_add(1);
+            }
+        }
+        carrier_attempts = carrier_attempts.saturating_add(1);
+
+        match pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
+            storage,
+            peer_store,
+            identity,
+            candidate,
+            allowed_witnesses,
+            minimum_required_signers,
+            client,
+            endpoint_allowed,
+        )
+        .await
+        {
+            Ok(imported) => {
+                circuit_breaker.record_success(carrier_index);
+                return CommitmentCertificateCarrierPullRound {
+                    terminal: CommitmentCertificateCarrierPullTerminal::Imported(imported),
+                    carrier_attempts,
+                    cooldown_skips,
+                    half_open_attempts,
+                };
+            }
+            Err(error)
+                if commitment_certificate_source_failure_class(&error)
+                    == CommitmentCertificateSourceFailureClass::Availability =>
+            {
+                circuit_breaker.record_availability_failure(carrier_index, Instant::now());
+            }
+            Err(error) => {
+                return CommitmentCertificateCarrierPullRound {
+                    terminal: CommitmentCertificateCarrierPullTerminal::SecurityStopped(error),
+                    carrier_attempts,
+                    cooldown_skips,
+                    half_open_attempts,
+                };
+            }
+        }
+    }
+
+    CommitmentCertificateCarrierPullRound {
+        terminal: CommitmentCertificateCarrierPullTerminal::AvailabilityExhausted,
+        carrier_attempts,
+        cooldown_skips,
+        half_open_attempts,
+    }
+}
+
+/// Recovers post-startup certificate evidence from exact operator pins.
+///
+/// This coordinator-side path never grants startup authority, selects a chain,
+/// or treats peer count as consensus. It returns only source-blind aggregates
+/// suitable for runtime logs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    allowed_witnesses: &[[u8; 32]],
+    minimum_required_signers: usize,
+    max_carriers: usize,
+    client: &reqwest::Client,
+    circuit_breaker: &mut CommitmentCertificateCarrierCircuitBreaker,
+) -> CommitmentCertificateCarrierRecoveryRound {
+    recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime_and_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        allowed_witnesses,
+        minimum_required_signers,
+        max_carriers,
+        client,
+        &commitment_peer_endpoint_is_public,
+        circuit_breaker,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime_and_endpoint_policy<
+    F,
+>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    allowed_witnesses: &[[u8; 32]],
+    minimum_required_signers: usize,
+    max_carriers: usize,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+    circuit_breaker: &mut CommitmentCertificateCarrierCircuitBreaker,
+) -> CommitmentCertificateCarrierRecoveryRound
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    let carriers = normalized_commitment_certificate_carriers(
+        &identity.public_key_bytes(),
+        None,
+        allowed_witnesses,
+        max_carriers,
+    );
+    let pull_round =
+        pull_record_commitment_checkpoint_certificate_from_carriers_with_endpoint_policy(
+            storage,
+            peer_store,
+            identity,
+            &carriers,
+            allowed_witnesses,
+            minimum_required_signers,
+            client,
+            endpoint_allowed,
+            circuit_breaker,
+        )
+        .await;
+    let (disposition, checkpoint_height, signer_count, required_signers) =
+        match pull_round.terminal {
+            CommitmentCertificateCarrierPullTerminal::Imported(imported) if imported.persisted => (
+                CommitmentCertificateCarrierRecoveryDisposition::Persisted,
+                imported.checkpoint_height,
+                imported.signer_count,
+                imported.required_signers,
+            ),
+            CommitmentCertificateCarrierPullTerminal::Imported(imported) => (
+                CommitmentCertificateCarrierRecoveryDisposition::VerifiedUnpersisted,
+                imported.checkpoint_height,
+                imported.signer_count,
+                imported.required_signers,
+            ),
+            CommitmentCertificateCarrierPullTerminal::AvailabilityExhausted => (
+                CommitmentCertificateCarrierRecoveryDisposition::AvailabilityExhausted,
+                0,
+                0,
+                0,
+            ),
+            CommitmentCertificateCarrierPullTerminal::SecurityStopped(_) => (
+                CommitmentCertificateCarrierRecoveryDisposition::SecurityStopped,
+                0,
+                0,
+                0,
+            ),
+        };
+
+    CommitmentCertificateCarrierRecoveryRound {
+        disposition,
+        checkpoint_height,
+        signer_count,
+        required_signers,
+        carrier_attempts: pull_round.carrier_attempts,
+        cooldown_skips: pull_round.cooldown_skips,
+        half_open_attempts: pull_round.half_open_attempts,
+        cooling_slots: circuit_breaker.cooling_slots(Instant::now()),
+    }
+}
+
 /// Refreshes follower certificate evidence after signed tip convergence.
 ///
 /// The follower's configured coordinator is transport only. The response must
@@ -2137,23 +2431,17 @@ where
         return Err("certificate_converged_tip_changed".to_string());
     }
 
-    // [CERTIFICATE-CARRIER-CIRCUIT 2026-07-29 by Codex] Normalize and align
-    // before the already-current check. This clears positional state after a
-    // pin-count change and refreshes an expired cooling gauge without issuing a
-    // carrier request or exposing source details.
     let local_node_id = identity.public_key_bytes();
-    let mut sources =
-        Vec::with_capacity(1usize.saturating_add(MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1));
-    sources.push(*source_node_id);
-    for witness in allowed_witnesses
-        .iter()
-        .take(MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1)
-    {
-        if witness != source_node_id && *witness != local_node_id && !sources.contains(witness) {
-            sources.push(*witness);
-        }
-    }
-    circuit_breaker.align_slots(sources.len().saturating_sub(1));
+    let carriers = normalized_commitment_certificate_carriers(
+        &local_node_id,
+        Some(source_node_id),
+        allowed_witnesses,
+        MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1,
+    );
+    // [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Align before the
+    // already-current check so a pin-count change cannot retain positional
+    // circuit state even when no transport request is needed.
+    circuit_breaker.align_slots(carriers.len());
 
     let certificate_already_current = match storage
         .record_commitment_checkpoint_certificate_satisfies_policy(
@@ -2188,36 +2476,15 @@ where
         return Ok(CommitmentFollowerCertificateSyncOutcome::AlreadyCurrent);
     }
 
-    // [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] The coordinator stays
-    // first and authoritative only as the configured chain-sync source. A
-    // pinned witness may transport the exact same certificate only after a
-    // classified availability failure. Any malformed, mismatched, unpinned, or
-    // otherwise unauthenticated response stops immediately so fallback cannot
-    // hide a security incident.
-    let mut coordinator_availability_failure = None;
-    let mut carrier_attempts = 0usize;
-    let mut cooldown_skips = 0usize;
-    let mut half_open_attempts = 0usize;
-    for (index, candidate) in sources.iter().enumerate() {
-        let carrier_index = index.checked_sub(1);
-        if let Some(carrier_index) = carrier_index {
-            match circuit_breaker.decision(carrier_index, Instant::now()) {
-                CommitmentCarrierCircuitDecision::Closed => {}
-                CommitmentCarrierCircuitDecision::Cooling => {
-                    cooldown_skips = cooldown_skips.saturating_add(1);
-                    continue;
-                }
-                CommitmentCarrierCircuitDecision::HalfOpen => {
-                    half_open_attempts = half_open_attempts.saturating_add(1);
-                }
-            }
-            carrier_attempts = carrier_attempts.saturating_add(1);
-        }
+    // [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Coordinator transport
+    // remains first. Only its narrow availability class may enter the shared
+    // carrier primitive; every other coordinator error stops immediately.
+    let coordinator_availability_failure =
         match pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
             storage,
             peer_store,
             identity,
-            candidate,
+            source_node_id,
             allowed_witnesses,
             minimum_required_signers,
             client,
@@ -2230,13 +2497,13 @@ where
                     record_commitment_certificate_carrier_circuit_telemetry(
                         storage,
                         circuit_breaker,
-                        cooldown_skips,
-                        half_open_attempts,
+                        0,
+                        0,
                     );
                     storage.record_commitment_certificate_sync_outcome(
                         now_secs(),
                         RecordCommitmentCertificateSyncDisposition::SecurityStopped,
-                        carrier_attempts,
+                        0,
                     );
                     storage.record_commitment_certificate_policy_evaluation(
                         now_secs(),
@@ -2244,24 +2511,16 @@ where
                     );
                     return Err("certificate_converged_tip_changed".to_string());
                 }
-                if let Some(carrier_index) = carrier_index {
-                    circuit_breaker.record_success(carrier_index);
-                }
-                let disposition = if index == 0 {
-                    RecordCommitmentCertificateSyncDisposition::Coordinator
-                } else {
-                    RecordCommitmentCertificateSyncDisposition::CarrierRecovered
-                };
                 record_commitment_certificate_carrier_circuit_telemetry(
                     storage,
                     circuit_breaker,
-                    cooldown_skips,
-                    half_open_attempts,
+                    0,
+                    0,
                 );
                 storage.record_commitment_certificate_sync_outcome(
                     now_secs(),
-                    disposition,
-                    carrier_attempts,
+                    RecordCommitmentCertificateSyncDisposition::Coordinator,
+                    0,
                 );
                 let readiness = if imported.persisted {
                     RecordCommitmentCertificatePolicyReadiness::Ready {
@@ -2281,24 +2540,19 @@ where
                 if commitment_certificate_source_failure_class(&error)
                     == CommitmentCertificateSourceFailureClass::Availability =>
             {
-                if index == 0 {
-                    coordinator_availability_failure = Some(error);
-                } else if let Some(carrier_index) = carrier_index {
-                    circuit_breaker
-                        .record_availability_failure(carrier_index, Instant::now());
-                }
+                error
             }
             Err(error) => {
                 record_commitment_certificate_carrier_circuit_telemetry(
                     storage,
                     circuit_breaker,
-                    cooldown_skips,
-                    half_open_attempts,
+                    0,
+                    0,
                 );
                 storage.record_commitment_certificate_sync_outcome(
                     now_secs(),
                     RecordCommitmentCertificateSyncDisposition::SecurityStopped,
-                    carrier_attempts,
+                    0,
                 );
                 storage.record_commitment_certificate_policy_evaluation(
                     now_secs(),
@@ -2306,30 +2560,87 @@ where
                 );
                 return Err(error);
             }
-        }
-    }
+        };
 
-    // Preserve the coordinator's established privacy-safe failure code when no
-    // carrier is reachable, keeping existing operations and alerting stable.
+    let carrier_round =
+        pull_record_commitment_checkpoint_certificate_from_carriers_with_endpoint_policy(
+            storage,
+            peer_store,
+            identity,
+            &carriers,
+            allowed_witnesses,
+            minimum_required_signers,
+            client,
+            endpoint_allowed,
+            circuit_breaker,
+        )
+        .await;
     record_commitment_certificate_carrier_circuit_telemetry(
         storage,
         circuit_breaker,
-        cooldown_skips,
-        half_open_attempts,
+        carrier_round.cooldown_skips,
+        carrier_round.half_open_attempts,
     );
-    storage.record_commitment_certificate_sync_outcome(
-        now_secs(),
-        RecordCommitmentCertificateSyncDisposition::AvailabilityExhausted,
-        carrier_attempts,
-    );
-    storage.record_commitment_certificate_policy_evaluation(
-        now_secs(),
-        RecordCommitmentCertificatePolicyReadiness::SourceUnavailable {
-            tip_height: converged_tip_height,
-        },
-    );
-    Err(coordinator_availability_failure
-        .unwrap_or_else(|| "certificate_source_unavailable".to_string()))
+    match carrier_round.terminal {
+        CommitmentCertificateCarrierPullTerminal::Imported(imported) => {
+            if imported.checkpoint_height != converged_tip_height {
+                storage.record_commitment_certificate_sync_outcome(
+                    now_secs(),
+                    RecordCommitmentCertificateSyncDisposition::SecurityStopped,
+                    carrier_round.carrier_attempts,
+                );
+                storage.record_commitment_certificate_policy_evaluation(
+                    now_secs(),
+                    RecordCommitmentCertificatePolicyReadiness::SecurityStopped,
+                );
+                return Err("certificate_converged_tip_changed".to_string());
+            }
+            storage.record_commitment_certificate_sync_outcome(
+                now_secs(),
+                RecordCommitmentCertificateSyncDisposition::CarrierRecovered,
+                carrier_round.carrier_attempts,
+            );
+            let readiness = if imported.persisted {
+                RecordCommitmentCertificatePolicyReadiness::Ready {
+                    tip_height: converged_tip_height,
+                }
+            } else {
+                RecordCommitmentCertificatePolicyReadiness::WaitingForCertificate {
+                    tip_height: converged_tip_height,
+                }
+            };
+            storage.record_commitment_certificate_policy_evaluation(now_secs(), readiness);
+            Ok(CommitmentFollowerCertificateSyncOutcome::Refreshed(
+                imported,
+            ))
+        }
+        CommitmentCertificateCarrierPullTerminal::AvailabilityExhausted => {
+            storage.record_commitment_certificate_sync_outcome(
+                now_secs(),
+                RecordCommitmentCertificateSyncDisposition::AvailabilityExhausted,
+                carrier_round.carrier_attempts,
+            );
+            storage.record_commitment_certificate_policy_evaluation(
+                now_secs(),
+                RecordCommitmentCertificatePolicyReadiness::SourceUnavailable {
+                    tip_height: converged_tip_height,
+                },
+            );
+            Err(coordinator_availability_failure)
+        }
+        CommitmentCertificateCarrierPullTerminal::SecurityStopped(error) => {
+            storage.record_commitment_certificate_sync_outcome(
+                now_secs(),
+                RecordCommitmentCertificateSyncDisposition::SecurityStopped,
+                carrier_round.carrier_attempts,
+            );
+            storage.record_commitment_certificate_policy_evaluation(
+                now_secs(),
+                RecordCommitmentCertificatePolicyReadiness::SecurityStopped,
+            );
+            Err(error)
+        }
+    }
 }
 
 /// Determines whether trying another already-pinned evidence carrier is safe.
@@ -5501,6 +5812,185 @@ mod tests {
         assert_eq!(status.certificate_carrier_cooling_slots, 2);
         assert_eq!(status.certificate_carrier_cooldown_skips_total, 2);
         assert_eq!(status.certificate_carrier_half_open_attempts_total, 0);
+    }
+
+    #[tokio::test]
+    async fn coordinator_certificate_recovery_stops_before_later_carrier_on_security_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let malformed_carrier = IdentityKeyPair::generate();
+        let later_carrier = IdentityKeyPair::generate();
+        let destination = MemoryStorage::open(":memory:", None).unwrap();
+        let block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(1),
+            GENESIS_PREV_HASH,
+            vec![[0x76; 32]],
+            &coordinator,
+        );
+        destination
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        destination.audit_record_commitment_chain().await.unwrap();
+        destination.configure_record_commitment_certificate_policy(2, 2);
+
+        let malformed_router = Router::new().route(
+            "/api/memchain/peer/checkpoint-certificate",
+            post(|| async { (StatusCode::OK, vec![0u8]) }),
+        );
+        let malformed_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let malformed_address = malformed_listener.local_addr().unwrap();
+        let malformed_server = tokio::spawn(async move {
+            axum::serve(malformed_listener, malformed_router)
+                .await
+                .unwrap();
+        });
+
+        let later_hits = Arc::new(AtomicUsize::new(0));
+        let handler_hits = Arc::clone(&later_hits);
+        let later_router = Router::new().route(
+            "/api/memchain/peer/checkpoint-certificate",
+            post(move || {
+                let hits = Arc::clone(&handler_hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let later_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let later_address = later_listener.local_addr().unwrap();
+        let later_server = tokio::spawn(async move {
+            axum::serve(later_listener, later_router).await.unwrap();
+        });
+
+        let peer_store = PeerStore::new();
+        admit_peer(
+            &peer_store,
+            &malformed_carrier,
+            Some(format!("http://{malformed_address}")),
+            now,
+        );
+        admit_peer(
+            &peer_store,
+            &later_carrier,
+            Some(format!("http://{later_address}")),
+            now,
+        );
+        let carrier_ids = [
+            malformed_carrier.public_key_bytes(),
+            later_carrier.public_key_bytes(),
+        ];
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("test client");
+        let mut circuit_breaker = CommitmentCertificateCarrierCircuitBreaker::default();
+
+        // [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] A later healthy
+        // or merely responsive carrier must never hide an earlier malformed
+        // signed-protocol response from an exact operator pin.
+        let recovery =
+            recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime_and_endpoint_policy(
+                &destination,
+                &peer_store,
+                &coordinator,
+                &carrier_ids,
+                2,
+                2,
+                &client,
+                &allow_test_endpoint,
+                &mut circuit_breaker,
+            )
+            .await;
+        assert_eq!(
+            recovery.disposition,
+            CommitmentCertificateCarrierRecoveryDisposition::SecurityStopped
+        );
+        assert_eq!(recovery.carrier_attempts, 1);
+        assert_eq!(recovery.cooldown_skips, 0);
+        assert_eq!(recovery.half_open_attempts, 0);
+        assert_eq!(recovery.cooling_slots, 0);
+        assert_eq!(later_hits.load(Ordering::SeqCst), 0);
+
+        malformed_server.abort();
+        let _ = malformed_server.await;
+        later_server.abort();
+        let _ = later_server.await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_certificate_recovery_cools_repeatedly_unavailable_carriers() {
+        let coordinator = IdentityKeyPair::generate();
+        let first_carrier = IdentityKeyPair::generate();
+        let second_carrier = IdentityKeyPair::generate();
+        let destination = MemoryStorage::open(":memory:", None).unwrap();
+        let peer_store = PeerStore::new();
+        let carrier_ids = [
+            first_carrier.public_key_bytes(),
+            second_carrier.public_key_bytes(),
+        ];
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
+        let mut circuit_breaker = CommitmentCertificateCarrierCircuitBreaker::default();
+
+        // [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Coordinator
+        // backfill retains only anonymous slot health. Two failed rounds open
+        // both circuits; the third performs no transport attempt.
+        for expected_attempts in [2, 2, 0] {
+            let recovery =
+                recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime_and_endpoint_policy(
+                    &destination,
+                    &peer_store,
+                    &coordinator,
+                    &carrier_ids,
+                    2,
+                    2,
+                    &client,
+                    &allow_test_endpoint,
+                    &mut circuit_breaker,
+                )
+                .await;
+            assert_eq!(
+                recovery.disposition,
+                CommitmentCertificateCarrierRecoveryDisposition::AvailabilityExhausted
+            );
+            assert_eq!(recovery.carrier_attempts, expected_attempts);
+        }
+        assert_eq!(
+            circuit_breaker.decision(0, Instant::now()),
+            CommitmentCarrierCircuitDecision::Cooling
+        );
+        assert_eq!(
+            circuit_breaker.decision(1, Instant::now()),
+            CommitmentCarrierCircuitDecision::Cooling
+        );
+        let final_round =
+            recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime_and_endpoint_policy(
+                &destination,
+                &peer_store,
+                &coordinator,
+                &carrier_ids,
+                2,
+                2,
+                &client,
+                &allow_test_endpoint,
+                &mut circuit_breaker,
+            )
+            .await;
+        assert_eq!(final_round.carrier_attempts, 0);
+        assert_eq!(final_round.cooldown_skips, 2);
+        assert_eq!(final_round.cooling_slots, 2);
     }
 
     #[tokio::test]

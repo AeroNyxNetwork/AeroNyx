@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.67.0 - Added typed, independently scoped block and certificate carrier circuits.
+Modification Reason: v0.68.0 - Unified fail-closed coordinator and follower checkpoint-certificate carrier recovery.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.67.0 - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Reuses one circuit algorithm while compile-time domains and runtime ownership isolate block-page and certificate carrier health.
+Last Modified: v0.68.0 - [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Prevents later certificate carriers from masking security failures and cools repeated coordinator-backfill outages.
+Previous: v0.67.0 - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Reuses one circuit algorithm while compile-time domains and runtime ownership isolate block-page and certificate carrier health.
 Previous: v0.66.0 - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Reports only anonymous cooling-slot, skipped-selection, and half-open-probe aggregates.
 Previous: v0.65.0 - [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] Cools repeatedly unavailable fixed carrier slots across follower rounds without retaining identity-bearing health history.
 Previous: v0.64.0 - [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Avoids repeating earlier carrier availability failures across one bounded multi-page follower round and hands off safely when the preferred carrier disappears.
@@ -99,6 +100,42 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.68 Fail-closed certificate carrier recovery
+
+[CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex]
+
+- Follower certificate refresh and coordinator post-startup certificate
+  backfill now share one bounded carrier primitive for candidate
+  normalization, typed circuit decisions, transport attempts, and failure
+  classification. This removes two implementations of the same trust rule.
+- Only a classified availability fault may advance to the next exact
+  operator-pinned carrier. Decode, endpoint-policy, authentication, responder,
+  signature, canonicalization, tip, membership, threshold, digest, and durable
+  evidence failures stop immediately; a later source cannot hide them by
+  returning a valid-looking certificate.
+- Any fully verified response ends the carrier round. If certificate
+  persistence returns `false` because the local audited tip or policy changed
+  concurrently, the runtime reports an anonymous `verified_unpersisted`
+  disposition and waits for the next reconciliation instead of requesting
+  additional sources.
+- Coordinator backfill now retains its own process-lifetime certificate
+  circuit. Two consecutive availability failures place the corresponding
+  anonymous fixed slot into a 60-second monotonic cooldown, with bounded
+  half-open recovery after expiry. This state is separate from follower and
+  block-page circuits.
+- Runtime logs contain only disposition, checkpoint height, signer/threshold
+  counts, attempts, cooldown skips, half-open attempts, and cooling-slot count.
+  They never include source identities, endpoints, slot order, errors,
+  signatures, certificate bytes, hashes, records, payloads, routes, or client
+  metadata.
+- The coordinator retains the existing maximum of three carrier attempts per
+  reconciliation round. Certificate exchange remains post-startup evidence:
+  it cannot satisfy the live startup witness threshold, select a chain, vote,
+  establish consensus, or grant finality.
+- Regression tests prove that a malformed first carrier prevents contacting a
+  later carrier and that repeated unavailable coordinator-backfill sources
+  cool across rounds until no transport request is issued.
 
 ### v0.67 Typed and isolated carrier circuits
 
