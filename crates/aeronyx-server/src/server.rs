@@ -372,6 +372,9 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.44-FollowerCertificateCarrier - Recovered current-tip certificates
+//     through exact operator-pinned witness carriers when the coordinator
+//     transport is unavailable, without granting carrier chain authority
 //   v2.8.43-FollowerCertificateSync - Replicated current-tip checkpoint
 //     certificates to converged followers under their local witness policy
 //   v2.8.42-TaskShutdown - Bounded concurrent task joins with explicit abort
@@ -6674,11 +6677,13 @@ impl Server {
                                         checked_at,
                                         checkpoint.remote_tip_height,
                                     );
-                                    // [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex]
-                                    // Certificate availability is additive: a
-                                    // mixed-version coordinator may not serve
-                                    // it yet, but that cannot erase a signed,
-                                    // hash-matched follower convergence.
+                                    // [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex]
+                                    // Certificate availability is additive.
+                                    // The coordinator is tried first; only a
+                                    // transport/compatibility outage permits
+                                    // fallback to an exact configured witness.
+                                    // Verification failures stop immediately,
+                                    // and no result can erase convergence.
                                     match sync_follower_record_commitment_checkpoint_certificate(
                                         &storage,
                                         &peer_store,

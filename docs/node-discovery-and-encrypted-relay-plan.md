@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.55.0 - Follower checkpoint-certificate replication.
+Modification Reason: v0.56.0 - Follower checkpoint-certificate carrier recovery.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.55.0 - [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Replicates audited current-tip checkpoint certificates to converged followers under each follower's current witness policy.
+Last Modified: v0.56.0 - [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] Recovers audited current-tip certificates through bounded operator-pinned witness carriers when coordinator transport is unavailable.
+Previous: v0.55.0 - [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Replicates audited current-tip checkpoint certificates to converged followers under each follower's current witness policy.
 Previous: v0.54.0 - [DIRECTORY-TRANSPORT-LIFECYCLE 2026-07-29 by Codex] Centralizes Directory transport health policy in the service runtime, records aggregate degraded/recovered transitions, and prevents diagnostic timestamps from regressing after wall-clock rollback.
 Previous: v0.53.0 - [DIRECTORY-TRANSPORT-WINDOW 2026-07-28 by Codex] Classifies Directory synchronization health from a fixed recent outcome window so one final success cannot conceal meaningful transport churn, without retaining identity-bearing request history.
 Previous: v0.52.0 - [DIRECTORY-TRANSPORT-TELEMETRY 2026-07-28 by Codex] Classifies every completed coordinator-owned Directory HTTP exchange into one mutually exclusive process-only outcome without peer, endpoint, operation, status-code, frame, or payload dimensions.
@@ -95,6 +96,37 @@ AeroNyx currently has several important building blocks:
 - `nodeboard` for node registration, health review, capacity decision, and incident closure.
 - Memory Chain primitives and append-only ledger structures.
 - Chat relay and wallet route cache concepts.
+
+### v0.56 Follower checkpoint-certificate carrier recovery
+
+[FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex]
+
+- A converged follower still requests its fixed coordinator first. Only a
+  narrow, explicit availability class permits fallback: missing/expired
+  discovery state, missing endpoint, connect/timeout/interrupted-body failure,
+  or HTTP `403`, `404`, `408`, `429`, `500`, `502`, `503`, or `504`. On this
+  endpoint, `403` means requester admission has not converged; `401` remains a
+  terminal authentication failure.
+- Carrier candidates are limited to the operator's existing checkpoint-witness
+  pins, preserve configured order, exclude the local node and coordinator, and
+  are capped by the protocol's three-member certificate bound. Permissionless
+  discovery peers can never become evidence carriers through peer count.
+- A carrier transports bytes only. The follower independently verifies the
+  carrier response signature, exact local tip, canonical frame, certificate
+  digest, every embedded historical witness signature, distinct membership,
+  current witness pins, local signer threshold, timestamps, and durable
+  evidence-vault invariants before accepting the certificate.
+- Any decode, canonicalization, size, signature, responder, chain, request,
+  timestamp, tip, policy, member, digest, or persistence failure stops the
+  round immediately. A later carrier must never hide a security anomaly from
+  the coordinator or an earlier pinned source.
+- Exhausting all carriers preserves the coordinator's original privacy-safe
+  availability code for backward-compatible operations. Certificate failure
+  remains additive and cannot mutate the canonical chain, choose a fork,
+  authorize production, satisfy startup witness gates, or create consensus.
+- Integration tests cover a dead coordinator followed by successful recovery
+  from a witness carrier, plus a malformed coordinator response that must fail
+  closed even while a valid carrier is online.
 
 ### v0.55 Follower checkpoint-certificate replication
 

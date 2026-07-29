@@ -131,6 +131,7 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.32-FollowerCertificateCarrier - Recover audited certificates from pinned witness carriers.
 //! v2.8.31-FollowerCertificateSync - Refresh audited checkpoint certificates after follower convergence.
 //! v2.8.30-WitnessDescriptorPreflight - Republish the current coordinator descriptor before strict startup gates.
 //! v2.8.29-VerifiedDeliveryWitnessAdmission - Require bilateral requester pinning before witness writes.
@@ -1710,7 +1711,9 @@ pub async fn pull_record_commitment_checkpoint_certificate(
 /// The follower's configured coordinator is transport only. The response must
 /// still satisfy the receiver's witness allowlist and minimum threshold. A
 /// threshold below two disables certificate replication for backward
-/// compatibility; malformed enabled policy fails closed.
+/// compatibility; malformed enabled policy fails closed. If the coordinator is
+/// unavailable, exact operator-pinned witnesses may carry the same immutable
+/// certificate. They gain no authority over chain state or certificate policy.
 ///
 /// # Errors
 ///
@@ -1782,27 +1785,101 @@ where
         return Ok(CommitmentFollowerCertificateSyncOutcome::AlreadyCurrent);
     }
 
-    // [FOLLOWER-CERTIFICATE-SYNC 2026-07-29 by Codex] Do not convert the
-    // coordinator transport signature into certificate authority. The shared
-    // pull path verifies every historical witness frame against local pins and
-    // persists it only through the fully audited immutable certificate vault.
-    let imported = pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
-        storage,
-        peer_store,
-        identity,
-        source_node_id,
-        allowed_witnesses,
-        minimum_required_signers,
-        client,
-        endpoint_allowed,
-    )
-    .await?;
-    if imported.checkpoint_height != converged_tip_height {
-        return Err("certificate_converged_tip_changed".to_string());
+    // [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] The coordinator stays
+    // first and authoritative only as the configured chain-sync source. A
+    // pinned witness may transport the exact same certificate only after a
+    // classified availability failure. Any malformed, mismatched, unpinned, or
+    // otherwise unauthenticated response stops immediately so fallback cannot
+    // hide a security incident.
+    let local_node_id = identity.public_key_bytes();
+    let mut sources =
+        Vec::with_capacity(1usize.saturating_add(MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1));
+    sources.push(*source_node_id);
+    for witness in allowed_witnesses
+        .iter()
+        .take(MAX_CHECKPOINT_CERTIFICATE_MEMBERS_V1)
+    {
+        if witness != source_node_id && *witness != local_node_id && !sources.contains(witness) {
+            sources.push(*witness);
+        }
     }
-    Ok(CommitmentFollowerCertificateSyncOutcome::Refreshed(
-        imported,
-    ))
+
+    let mut coordinator_availability_failure = None;
+    for (index, candidate) in sources.iter().enumerate() {
+        match pull_record_commitment_checkpoint_certificate_with_endpoint_policy(
+            storage,
+            peer_store,
+            identity,
+            candidate,
+            allowed_witnesses,
+            minimum_required_signers,
+            client,
+            endpoint_allowed,
+        )
+        .await
+        {
+            Ok(imported) => {
+                if imported.checkpoint_height != converged_tip_height {
+                    return Err("certificate_converged_tip_changed".to_string());
+                }
+                return Ok(CommitmentFollowerCertificateSyncOutcome::Refreshed(
+                    imported,
+                ));
+            }
+            Err(error)
+                if commitment_certificate_source_failure_class(&error)
+                    == CommitmentCertificateSourceFailureClass::Availability =>
+            {
+                if index == 0 {
+                    coordinator_availability_failure = Some(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    // Preserve the coordinator's established privacy-safe failure code when no
+    // carrier is reachable, keeping existing operations and alerting stable.
+    Err(coordinator_availability_failure
+        .unwrap_or_else(|| "certificate_source_unavailable".to_string()))
+}
+
+/// Determines whether trying another already-pinned evidence carrier is safe.
+///
+/// This allowlist is intentionally narrow. Decode, signature, identity,
+/// policy, tip, canonicalization, size, and persistence failures are security
+/// failures even when another source might return a valid-looking response.
+///
+/// [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitmentCertificateSourceFailureClass {
+    Availability,
+    Security,
+}
+
+fn commitment_certificate_source_failure_class(
+    error: &str,
+) -> CommitmentCertificateSourceFailureClass {
+    let retryable_status = error
+        .strip_prefix("certificate_http_status_")
+        .and_then(|status| status.parse::<u16>().ok())
+        .is_some_and(|status| matches!(status, 403 | 404 | 408 | 429 | 500 | 502 | 503 | 504));
+    if retryable_status
+        || matches!(
+            error,
+            "certificate_source_unavailable"
+                | "certificate_source_missing_endpoint"
+                | "certificate_request_timeout"
+                | "certificate_request_connect"
+                | "response_body_timeout"
+                | "response_body_connect"
+                | "response_body_body"
+        )
+    {
+        CommitmentCertificateSourceFailureClass::Availability
+    } else {
+        CommitmentCertificateSourceFailureClass::Security
+    }
 }
 
 async fn pull_record_commitment_checkpoint_certificate_with_endpoint_policy<F>(
@@ -3876,6 +3953,47 @@ mod tests {
 
     fn allow_test_endpoint(_endpoint: &str) -> bool {
         true
+    }
+
+    #[test]
+    fn certificate_carrier_fallback_classifies_only_availability_failures() {
+        // [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] Admission and
+        // transport outages may advance to the next exact operator pin.
+        // Authentication and evidence-integrity failures must remain terminal.
+        for error in [
+            "certificate_source_unavailable",
+            "certificate_source_missing_endpoint",
+            "certificate_request_timeout",
+            "certificate_request_connect",
+            "response_body_body",
+            "certificate_http_status_403",
+            "certificate_http_status_404",
+            "certificate_http_status_429",
+            "certificate_http_status_503",
+        ] {
+            assert_eq!(
+                commitment_certificate_source_failure_class(error),
+                CommitmentCertificateSourceFailureClass::Availability,
+                "{error} must permit only bounded pinned-carrier recovery"
+            );
+        }
+        for error in [
+            "certificate_source_unsafe_endpoint",
+            "certificate_http_status_400",
+            "certificate_http_status_401",
+            "invalid_certificate_frame",
+            "invalid_certificate_response_signature",
+            "certificate_local_tip_mismatch",
+            "certificate_member_not_pinned",
+            "certificate_digest_mismatch",
+            "certificate_persist_failed",
+        ] {
+            assert_eq!(
+                commitment_certificate_source_failure_class(error),
+                CommitmentCertificateSourceFailureClass::Security,
+                "{error} must stop before any fallback"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6794,7 +6912,7 @@ mod tests {
                 1,
                 &client,
                 &allow_test_endpoint,
-        )
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -6851,6 +6969,140 @@ mod tests {
         }
         source_server.abort();
         let _ = source_server.await;
+
+        // [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex] A witness serves
+        // only as a read-only carrier for an already audited certificate. The
+        // receiver still validates the embedded coordinator checkpoint,
+        // distinct witness frames, local pins, threshold, and exact local tip.
+        let carrier_destination_identity = IdentityKeyPair::generate();
+        let guarded_destination_identity = IdentityKeyPair::generate();
+        let carrier_identity = Arc::clone(&witnesses[0]);
+        let carrier_peers = Arc::new(PeerStore::new());
+        admit_peer(&carrier_peers, &carrier_destination_identity, None, now);
+        admit_peer(&carrier_peers, &guarded_destination_identity, None, now);
+        assert!(carrier_peers
+            .get_valid(&carrier_destination_identity.public_key_bytes(), now_secs())
+            .is_some());
+        let carrier_router = build_memchain_peer_router(
+            Arc::clone(&local),
+            Arc::clone(&carrier_peers),
+            Arc::clone(&carrier_identity),
+        );
+        let carrier_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let carrier_address = carrier_listener.local_addr().unwrap();
+        let carrier_server = tokio::spawn(async move {
+            axum::serve(carrier_listener, carrier_router).await.unwrap();
+        });
+
+        let carrier_destination = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        carrier_destination
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        carrier_destination
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+        carrier_destination
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        let carrier_destination_peers = PeerStore::new();
+        let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+        admit_peer(
+            &carrier_destination_peers,
+            &source_identity,
+            Some(format!("http://{unavailable_address}")),
+            now,
+        );
+        admit_peer(
+            &carrier_destination_peers,
+            &carrier_identity,
+            Some(format!("http://{carrier_address}")),
+            now,
+        );
+        let recovered =
+            sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
+                &carrier_destination,
+                &carrier_destination_peers,
+                &carrier_destination_identity,
+                &source_identity.public_key_bytes(),
+                &witness_ids,
+                2,
+                1,
+                &client,
+                &allow_test_endpoint,
+            )
+            .await
+            .unwrap();
+        let CommitmentFollowerCertificateSyncOutcome::Refreshed(recovered) = recovered else {
+            panic!("pinned witness carrier must recover coordinator certificate availability");
+        };
+        assert!(recovered.persisted);
+        assert_eq!(recovered.checkpoint_height, 1);
+        assert_eq!(recovered.signer_count, 2);
+
+        // A malformed primary response is a security failure, not an
+        // availability event. The valid carrier must not mask it.
+        let malformed_router = Router::new().route(
+            "/api/memchain/peer/checkpoint-certificate",
+            post(|| async { (StatusCode::OK, vec![0u8]) }),
+        );
+        let malformed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let malformed_address = malformed_listener.local_addr().unwrap();
+        let malformed_server = tokio::spawn(async move {
+            axum::serve(malformed_listener, malformed_router)
+                .await
+                .unwrap();
+        });
+        let guarded_destination = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        guarded_destination
+            .append_record_commitment_block(&block, None)
+            .await
+            .unwrap();
+        guarded_destination
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+        guarded_destination
+            .audit_record_commitment_checkpoint_evidence()
+            .await
+            .unwrap();
+        let guarded_destination_peers = PeerStore::new();
+        admit_peer(
+            &guarded_destination_peers,
+            &source_identity,
+            Some(format!("http://{malformed_address}")),
+            now,
+        );
+        admit_peer(
+            &guarded_destination_peers,
+            &carrier_identity,
+            Some(format!("http://{carrier_address}")),
+            now,
+        );
+        let guarded_error =
+            sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
+                &guarded_destination,
+                &guarded_destination_peers,
+                &guarded_destination_identity,
+                &source_identity.public_key_bytes(),
+                &witness_ids,
+                2,
+                1,
+                &client,
+                &allow_test_endpoint,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(guarded_error, "invalid_certificate_frame");
+
+        malformed_server.abort();
+        let _ = malformed_server.await;
+        carrier_server.abort();
+        let _ = carrier_server.await;
 
         let already_current =
             sync_follower_record_commitment_checkpoint_certificate_with_endpoint_policy(
