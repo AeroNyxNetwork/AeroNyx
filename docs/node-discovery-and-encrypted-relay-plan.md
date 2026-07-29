@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.65.0 - Added process-only block-carrier circuit breaking and half-open recovery.
+Modification Reason: v0.66.0 - Added privacy-safe block-carrier circuit health telemetry.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.65.0 - [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] Cools repeatedly unavailable fixed carrier slots across follower rounds without retaining identity-bearing health history.
+Last Modified: v0.66.0 - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Reports only anonymous cooling-slot, skipped-selection, and half-open-probe aggregates.
+Previous: v0.65.0 - [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] Cools repeatedly unavailable fixed carrier slots across follower rounds without retaining identity-bearing health history.
 Previous: v0.64.0 - [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Avoids repeating earlier carrier availability failures across one bounded multi-page follower round and hands off safely when the preferred carrier disappears.
 Previous: v0.63.0 - [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] Reports typed, source-blind block-page retrieval outcomes and bounded carrier attempts without exposing identities or treating transport as certification.
 Previous: v0.62.0 - [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex] Lets a follower recover coordinator-authored blocks from bounded operator pins while requiring an exact-tip threshold certificate before reporting recovery.
@@ -98,6 +99,34 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
 
+### v0.66 Privacy-safe block-carrier circuit telemetry
+
+[BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex]
+
+- Local status and signed management heartbeat now expose three operational
+  aggregates: carrier slots cooling at the latest follower observation,
+  cumulative selections skipped during cooldown, and cumulative requests
+  attempted after an anonymous slot entered half-open state.
+- The current gauge is replaced on every terminal page retrieval; skip and
+  half-open counters are additive and saturating for the process lifetime.
+  They distinguish real outbound attempts from requests intentionally avoided
+  by the circuit breaker without inventing per-peer health history.
+- Pin normalization and circuit-slot alignment now happen before each direct
+  coordinator request. A pin-count change therefore clears positional state
+  even when the coordinator succeeds and no carrier fallback is needed.
+- Circuit storage still contains only bounded positional failure state and
+  monotonic deadlines. Status receives no slot order, coordinator or carrier
+  identity, witness set, endpoint, status code, raw error, request id, per-slot
+  deadline, per-source timing, block, certificate, signature, payload, owner,
+  route, or client metadata.
+- The counters remain process-local operations evidence. They cannot influence
+  source eligibility, witness policy, certificates, canonical chain state,
+  production authority, reputation, consensus, finality, or fork choice.
+- Tests cover follower-only/reset semantics, additive accounting, current gauge
+  replacement, exact JSON heartbeat fields, cooldown skip accounting, and one
+  real half-open request that fails availability and reopens before another
+  pinned carrier completes verified delivery.
+
 ### v0.65 Block-carrier circuit breaker
 
 [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex]
@@ -121,9 +150,10 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
   through to a later carrier.
 - Circuit slots contain only a failure count and `Instant` deadline. They hold
   no node id, endpoint, status code, error text, payload, route, or wall-clock
-  timestamp; they are not persisted, serialized, logged, reported, or included
-  in heartbeat data. A pin-count change clears all slots to prevent positional
-  state from being reassigned silently.
+  timestamp; they are not persisted, serialized, or logged. Later v0.66 status
+  reports only anonymous aggregate counts, never slot contents or order. A
+  pin-count change clears all slots to prevent positional state from being
+  reassigned silently.
 - Compatibility remains additive: the public one-page recovery API creates a
   fresh circuit, so its historical direct-first operator-order behavior is
   unchanged. Only the server follower task retains circuit state across rounds.

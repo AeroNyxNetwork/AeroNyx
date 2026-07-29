@@ -53,6 +53,9 @@
 //     exposes only state, boolean readiness, evaluated tip height, witness
 //     count, threshold, and aggregate evaluation time after exact local
 //     cryptographic validation.
+//   - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Circuit health
+//     exposes only anonymous cooling-slot, skip, and half-open totals. Never
+//     add slot order, peer identity, endpoint, error, or timing dimensions.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -83,6 +86,7 @@
 //   v2.8.45        - Added source-blind certificate recovery telemetry
 //   v2.8.48        - Added identity-blind follower certificate policy readiness
 //   v2.8.49        - Bound certificate readiness to the exact audited tip
+//   v2.8.52        - Added source-blind block-carrier circuit health aggregates
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -271,6 +275,12 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub block_page_availability_exhausted_total: u64,
     /// Page retrievals stopped by security or protocol-integrity failures.
     pub block_page_security_stops_total: u64,
+    /// Fixed carrier slots cooling at the latest follower observation.
+    pub block_carrier_cooling_slots: usize,
+    /// Anonymous carrier selections skipped during process-local cooldown.
+    pub block_carrier_cooldown_skips_total: u64,
+    /// Anonymous carrier requests attempted after a cooldown expired.
+    pub block_carrier_half_open_attempts_total: u64,
     /// Current exact local certificate-policy state.
     pub certificate_policy_state: String,
     /// Whether the current audited tip satisfies current local policy.
@@ -981,6 +991,9 @@ mod tests {
                 block_carrier_recoveries_total: 1,
                 block_page_availability_exhausted_total: 1,
                 block_page_security_stops_total: 1,
+                block_carrier_cooling_slots: 1,
+                block_carrier_cooldown_skips_total: 3,
+                block_carrier_half_open_attempts_total: 2,
                 certificate_policy_state: "ready".to_string(),
                 certificate_policy_ready: true,
                 certificate_policy_last_evaluated_at: Some(111),
@@ -1129,6 +1142,9 @@ mod tests {
         assert_eq!(sync["block_carrier_recoveries_total"], 1);
         assert_eq!(sync["block_page_availability_exhausted_total"], 1);
         assert_eq!(sync["block_page_security_stops_total"], 1);
+        assert_eq!(sync["block_carrier_cooling_slots"], 1);
+        assert_eq!(sync["block_carrier_cooldown_skips_total"], 3);
+        assert_eq!(sync["block_carrier_half_open_attempts_total"], 2);
         assert_eq!(sync["certificate_policy_state"], "ready");
         assert_eq!(sync["certificate_policy_ready"], true);
         assert_eq!(sync["certificate_policy_last_evaluated_at"], 111);

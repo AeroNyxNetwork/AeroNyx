@@ -137,6 +137,9 @@
 //!   never be interpreted as votes, quorum, finality, or fork choice.
 //! - Outbound announcement retry fields are process-local aggregate counters.
 //!   Never add peer identities, endpoints, response bodies, or retry timing.
+//! - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Carrier circuit
+//!   status may contain only current cooling-slot and cumulative scheduling
+//!   counts. Never retain slot order, identities, endpoints, errors, or timing.
 //! - Checkpoint certificates are immutable local evidence bundles over
 //!   independently verified operator-pinned witness frames. They prove only
 //!   that the configured threshold signed one local checkpoint; they are not
@@ -158,6 +161,7 @@
 //!   converged frame may clear it. Recovery requires operator review/restart.
 //!
 //! ## Last Modified
+//! v2.8.52-BlockCarrierCircuitTelemetry - Added source-blind circuit health aggregates.
 //! v2.8.49-FollowerCertificateTipBinding - Bound readiness to the exact audited tip height.
 //! v2.8.48-FollowerCertificateReadiness - Added identity-blind current-policy readiness evidence.
 //! v2.8.18-TipSupersession - Added aggregate superseded announcement evidence.
@@ -583,6 +587,12 @@ pub struct RecordCommitmentSyncStatus {
     pub block_page_availability_exhausted_total: u64,
     /// Page retrievals stopped by security or protocol-integrity failures.
     pub block_page_security_stops_total: u64,
+    /// Fixed operator-pin slots cooling at the latest follower observation.
+    pub block_carrier_cooling_slots: usize,
+    /// Carrier selections skipped while their anonymous slot was cooling.
+    pub block_carrier_cooldown_skips_total: u64,
+    /// Outbound carrier requests started after an anonymous cooldown expired.
+    pub block_carrier_half_open_attempts_total: u64,
     /// Current certificate policy state without witness identities.
     pub certificate_policy_state: String,
     /// Whether the exact current audited tip satisfies current local policy.
@@ -836,6 +846,9 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) block_carrier_recoveries_total: u64,
     pub(crate) block_page_availability_exhausted_total: u64,
     pub(crate) block_page_security_stops_total: u64,
+    pub(crate) block_carrier_cooling_slots: usize,
+    pub(crate) block_carrier_cooldown_skips_total: u64,
+    pub(crate) block_carrier_half_open_attempts_total: u64,
     pub(crate) certificate_policy_state: &'static str,
     pub(crate) certificate_policy_ready: bool,
     pub(crate) certificate_policy_last_evaluated_at: Option<u64>,
@@ -903,6 +916,9 @@ impl Default for RecordCommitmentSyncRuntime {
             block_carrier_recoveries_total: 0,
             block_page_availability_exhausted_total: 0,
             block_page_security_stops_total: 0,
+            block_carrier_cooling_slots: 0,
+            block_carrier_cooldown_skips_total: 0,
+            block_carrier_half_open_attempts_total: 0,
             certificate_policy_state: "not_applicable",
             certificate_policy_ready: false,
             certificate_policy_last_evaluated_at: None,

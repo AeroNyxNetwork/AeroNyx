@@ -386,6 +386,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.52-BlockCarrierCircuitTelemetry - Forwarded anonymous carrier circuit
+//     cooling, skip, and half-open aggregates into signed heartbeat status
 //   v2.8.50-BlockCarrierCircuitBreaker - Added process-only fixed-slot cooldown
 //     and half-open recovery for repeated follower carrier availability faults
 //   v2.8.49-FollowerCertificateTipBinding - Bound readiness heartbeat state to
@@ -4450,6 +4452,11 @@ impl Server {
                                 .block_page_availability_exhausted_total,
                             block_page_security_stops_total: status
                                 .block_page_security_stops_total,
+                            block_carrier_cooling_slots: status.block_carrier_cooling_slots,
+                            block_carrier_cooldown_skips_total: status
+                                .block_carrier_cooldown_skips_total,
+                            block_carrier_half_open_attempts_total: status
+                                .block_carrier_half_open_attempts_total,
                             certificate_policy_state: status.certificate_policy_state,
                             certificate_policy_ready: status.certificate_policy_ready,
                             certificate_policy_last_evaluated_at: status
