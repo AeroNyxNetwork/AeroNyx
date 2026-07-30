@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.77.0 - Made the required DNS proxy transactional,
-concurrency-bounded, process-supervised, and shutdown-owned.
+Modification Reason: v0.78.0 - Brought all management-plane workers under
+explicit process supervision and bounded shutdown ownership.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.77.0 - [DNS-STARTUP-READINESS 2026-07-30 by Codex] Prevents readiness before DNS bind and bounds the complete DNS forwarding task lifecycle.
+Last Modified: v0.78.0 - [MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex] Prevents heartbeat, command, or session-reporting workers from disappearing behind a healthy process.
+Previous: v0.77.0 - [DNS-STARTUP-READINESS 2026-07-30 by Codex] Prevents readiness before DNS bind and bounds the complete DNS forwarding task lifecycle.
 Previous: v0.76.0 - [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Prevents persistent UDP/TUN receive errors from leaving a hot-looping or falsely healthy node.
 Previous: v0.75.0 - [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Escalates unexpected API supervisor and configured follower exits to process recovery.
 Previous: v0.74.0 - [FOLLOWER-READINESS-LIVENESS 2026-07-30 by Codex] Revokes follower readiness on task exit and after three missed signed convergence checks.
@@ -110,6 +111,37 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.78 Management workers are owned required tasks
+
+[MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex]
+
+- `init_management_reporter` now returns a typed `ManagementRuntime` containing
+  the session-event sender and exactly three long-lived task handles: command
+  handling, heartbeat/policy reporting, and session-event reporting.
+- The main runtime immediately adopts all three handles into the existing
+  required-task supervisor. An unexpected normal return, panic, cancellation,
+  or join failure now enters graceful process recovery instead of leaving an
+  apparently healthy node without policy updates, remote commands, or session
+  telemetry.
+- Immediately before systemd readiness, the main task consumes any required
+  failure already queued during startup and treats a disconnected supervisor
+  channel as fatal. A node with a known dead required worker therefore never
+  emits a contradictory `READY` transition.
+- Ordinary backend timeouts and request errors remain handled inside the
+  workers under their existing fail-open and retry behavior. A transient
+  management-service outage therefore does not restart the privacy data plane;
+  only disappearance of the worker itself is process-fatal.
+- Global shutdown still sets the shared shutdown marker before broadcasting.
+  Cooperative worker exits are not misclassified as failures, and the main
+  task applies its existing bounded join, abort, and cancellation-confirmation
+  policy to every management worker.
+- The fixed-size ownership boundary makes a future additional management task
+  an explicit architecture change rather than allowing another detached
+  `tokio::spawn`.
+- No management wire schema, command semantics, membership policy, reporting
+  interval, user-plane handling, or blind-node privacy boundary changes in
+  this milestone.
 
 ### v0.77 Required DNS startup and forwarding are lifecycle-owned
 

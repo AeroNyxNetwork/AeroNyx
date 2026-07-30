@@ -270,6 +270,12 @@
 // 107. [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] Prevents a
 //      certificate evaluated for an older audited tip from remaining ready
 //      while follower synchronization advances the local chain.
+// 108. [MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex] Returns command,
+//      heartbeat, and session-reporting task handles to the main runtime so
+//      unexpected exits trigger recovery and shutdown confirms cancellation.
+// 109. [PRE-READY-RUNTIME-GATE 2026-07-30 by Codex] Refuses systemd READY
+//      when a required worker already failed during startup or every required
+//      supervisor disappeared before the readiness transition.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -2208,6 +2214,31 @@ struct CriticalRuntimeFailure {
     reason: String,
 }
 
+fn required_runtime_supervisor_channel_closed() -> CriticalRuntimeFailure {
+    CriticalRuntimeFailure {
+        task: "required_runtime_task_group",
+        reason: "critical runtime supervisor channel closed unexpectedly".to_string(),
+    }
+}
+
+/// Consumes a failure already known before the process advertises readiness.
+///
+/// [PRE-READY-RUNTIME-GATE 2026-07-30 by Codex] An empty channel means all
+/// registered supervisors are still eligible to report. A disconnected
+/// channel means every supervisor disappeared and is itself a critical
+/// failure; it must not be treated like an empty startup queue.
+fn take_pre_ready_runtime_failure(
+    critical_failure_rx: &mut mpsc::Receiver<CriticalRuntimeFailure>,
+) -> Option<CriticalRuntimeFailure> {
+    match critical_failure_rx.try_recv() {
+        Ok(failure) => Some(failure),
+        Err(mpsc::error::TryRecvError::Empty) => None,
+        Err(mpsc::error::TryRecvError::Disconnected) => {
+            Some(required_runtime_supervisor_channel_closed())
+        }
+    }
+}
+
 /// Action after one consecutive required data-plane receive failure.
 ///
 /// [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Keep the policy typed and
@@ -2330,6 +2361,19 @@ impl Drop for RequiredRuntimeTaskJoinGuard {
             self.task.abort();
         }
     }
+}
+
+/// Owns the management-plane sender and every long-lived management task until
+/// the main runtime adopts them.
+///
+/// [MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex] A management task must
+/// never become fire-and-forget: losing heartbeat, policy commands, or session
+/// reporting while the process remains healthy creates a false operational
+/// state. The fixed-size array also makes adding a fourth detached task a
+/// compile-visible architecture change.
+struct ManagementRuntime {
+    session_events: SessionEventSender,
+    tasks: [(&'static str, JoinHandle<()>); 3],
 }
 
 /// Result of bringing one long-lived runtime task to a terminal state.
@@ -2650,7 +2694,10 @@ impl Server {
 
         // init_management_reporter needs udp + traffic_tracker,
         // so it is called here after both are available.
-        let session_event_sender = self
+        let ManagementRuntime {
+            session_events: session_event_sender,
+            tasks: management_tasks,
+        } = self
             .init_management_reporter(
                 &sessions,
                 Arc::clone(&ip_pool),
@@ -2667,6 +2714,17 @@ impl Server {
                 chat_relay_enabled,
             )
             .await;
+        for (name, task) in management_tasks {
+            tasks.push((
+                name,
+                Self::supervise_required_runtime_task(
+                    name,
+                    task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
+        }
 
         let udp_task = self.spawn_udp_task(
             Arc::clone(&udp),
@@ -3203,9 +3261,18 @@ impl Server {
         // every supervisor disappears without reporting, receiver closure is
         // itself fatal.
         drop(critical_failure_tx);
-        systemd_notifier.ready("AeroNyx privacy node is ready")?;
-        info!("Server started successfully");
-        let runtime_failure = self.wait_for_shutdown(&mut critical_failure_rx).await;
+        // [PRE-READY-RUNTIME-GATE 2026-07-30 by Codex] Startup can be long
+        // enough for a required worker to fail before all optional services
+        // are initialized. Never advertise READY when that failure is already
+        // queued or every required-task supervisor has disappeared.
+        let runtime_failure =
+            if let Some(failure) = take_pre_ready_runtime_failure(&mut critical_failure_rx) {
+                Some(failure)
+            } else {
+                systemd_notifier.ready("AeroNyx privacy node is ready")?;
+                info!("Server started successfully");
+                self.wait_for_shutdown(&mut critical_failure_rx).await
+            };
         if let Some(failure) = runtime_failure.as_ref() {
             error!(
                 task = failure.task,
@@ -4541,6 +4608,11 @@ impl Server {
     // Management Reporter
     // ============================================
 
+    /// Builds the complete management plane and returns ownership to `run`.
+    ///
+    /// [MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex] Network reporting
+    /// failures remain fail-open inside each worker, but disappearance of a
+    /// worker is a process-liveness failure and must be supervised centrally.
     async fn init_management_reporter(
         &self,
         sessions: &Arc<SessionManager>,
@@ -4556,7 +4628,7 @@ impl Server {
         memchain_storage: Option<Arc<MemoryStorage>>,
         chat_relay: Option<Arc<ChatRelayService>>,
         chat_relay_enabled: bool,
-    ) -> SessionEventSender {
+    ) -> ManagementRuntime {
         info!("Initializing management reporting...");
 
         let mgmt_client = Arc::new(ManagementClient::new(
@@ -4576,7 +4648,7 @@ impl Server {
             .with_deny_list(Arc::clone(&deny_list))
             .with_node_policy(Arc::clone(&node_policy));
         let cmd_shutdown = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        let command_handler_task = tokio::spawn(async move {
             cmd_handler.run(cmd_shutdown).await;
         });
 
@@ -5061,19 +5133,26 @@ impl Server {
 
         let sess = Arc::clone(sessions);
         let hb_shutdown = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        let heartbeat_task = tokio::spawn(async move {
             heartbeat
                 .run(move || sess.count() as u32, hb_shutdown)
                 .await;
         });
 
         let sr_shutdown = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        let session_reporter_task = tokio::spawn(async move {
             session_reporter.run(sr_shutdown).await;
         });
 
         info!("[MANAGEMENT] Reporting started");
-        session_event_sender
+        ManagementRuntime {
+            session_events: session_event_sender,
+            tasks: [
+                ("management-command-handler", command_handler_task),
+                ("management-heartbeat", heartbeat_task),
+                ("management-session-reporter", session_reporter_task),
+            ],
+        }
     }
 
     // ============================================
@@ -11414,10 +11493,10 @@ impl Server {
                     if self.shutdown.load(Ordering::Acquire) {
                         None
                     } else {
-                        Some(failure.unwrap_or_else(|| CriticalRuntimeFailure {
-                            task: "required_runtime_task_group",
-                            reason: "critical runtime supervisor channel closed unexpectedly".to_string(),
-                        }))
+                        Some(
+                            failure
+                                .unwrap_or_else(required_runtime_supervisor_channel_closed),
+                        )
                     }
                 }
             }
@@ -11439,10 +11518,10 @@ impl Server {
                     if self.shutdown.load(Ordering::Acquire) {
                         None
                     } else {
-                        Some(failure.unwrap_or_else(|| CriticalRuntimeFailure {
-                            task: "required_runtime_task_group",
-                            reason: "critical runtime supervisor channel closed unexpectedly".to_string(),
-                        }))
+                        Some(
+                            failure
+                                .unwrap_or_else(required_runtime_supervisor_channel_closed),
+                        )
                     }
                 }
             }
@@ -11481,7 +11560,8 @@ mod tests {
         commitment_coordinator_lease_production_valid_for,
         commitment_follower_success_retry_delay, commitment_witness_startup_decision,
         data_plane_receive_failure_action, memchain_index_rejection_reason, prefix_to_netmask,
-        retry_required_data_plane_receive, unix_now_secs, CriticalRuntimeFailure,
+        required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
+        take_pre_ready_runtime_failure, unix_now_secs, CriticalRuntimeFailure,
         CommitmentCoordinatorLeaseRound, CommitmentFollowerRoundOutcome,
         CommitmentSyncTaskLivenessGuard,
         CommitmentTipAnnouncementWaitOutcome, CommitmentWitnessStartupBlockReason,
@@ -11774,6 +11854,30 @@ mod tests {
             .await
         );
         assert_eq!(shutdown_failures, 0);
+    }
+
+    #[test]
+    fn pre_ready_runtime_gate_distinguishes_empty_failure_and_disconnect() {
+        // [PRE-READY-RUNTIME-GATE 2026-07-30 by Codex] Readiness may proceed
+        // only while the supervisor channel is live and has no queued failure.
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        assert_eq!(take_pre_ready_runtime_failure(&mut failure_rx), None);
+
+        let expected = CriticalRuntimeFailure {
+            task: "management-heartbeat",
+            reason: "required runtime task exited unexpectedly".to_string(),
+        };
+        failure_tx.try_send(expected.clone()).unwrap();
+        assert_eq!(
+            take_pre_ready_runtime_failure(&mut failure_rx),
+            Some(expected)
+        );
+
+        drop(failure_tx);
+        assert_eq!(
+            take_pre_ready_runtime_failure(&mut failure_rx),
+            Some(required_runtime_supervisor_channel_closed())
+        );
     }
 
     #[tokio::test]
