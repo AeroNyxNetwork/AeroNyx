@@ -21,6 +21,8 @@
 //!                          local operator status response.
 //! v2.7.14-RustdocQuality - Marked request-context extraction pseudocode as a
 //!                          non-standalone Rustdoc example.
+//! v2.7.15-InferenceReadiness - Centralized local inference readiness and
+//!                              exposed the previously omitted reranker state.
 //!
 //! ## Main Functionality
 //! - POST /api/mpi/remember    - store a new memory record
@@ -58,8 +60,13 @@
 //!   record IDs, proposer IDs, peer IDs, owners, or payloads in MPI status.
 //! - record_commitment_sync is bounded runtime evidence. Error codes are
 //!   allow-listed and events never contain endpoints or node identities.
+//! - Local inference readiness is serialized through `LocalInferenceStatus`.
+//!   Preserve its flattened field names for nodeboard and operator tooling.
 //!
 //! ## Last Modified
+//! v2.7.15-InferenceReadiness -
+//!   [MEMCHAIN-INFERENCE-READINESS 2026-07-30 by Codex] Added the missing
+//!   reranker readiness field without changing existing status JSON keys.
 //! v2.7.14-RustdocQuality - Corrected executable-example classification.
 //! v1.0.1-SaaSFix - Replaced all direct state.storage/vector_index accesses
 //!                  with Extension extraction throughout all handlers.
@@ -870,6 +877,38 @@ pub struct TodayStats {
     pub estimated_cost_usd: String,
 }
 
+/// Privacy-safe readiness of the node's optional local inference engines.
+///
+/// The snapshot exposes capabilities only; it never includes filesystem paths,
+/// model contents, prompts, memory records, or user identifiers.
+#[derive(Debug, Serialize)]
+pub struct LocalInferenceStatus {
+    /// True when the local embedding model loaded successfully.
+    pub embed_ready: bool,
+    /// Active embedding output dimension, absent when embedding is unavailable.
+    pub embed_dim: Option<usize>,
+    /// True when the local named-entity model loaded successfully.
+    pub ner_ready: bool,
+    /// True when the local cross-encoder reranker loaded successfully.
+    pub reranker_ready: bool,
+}
+
+impl LocalInferenceStatus {
+    /// Build one readiness snapshot from the engines owned by `MpiState`.
+    ///
+    /// [MEMCHAIN-INFERENCE-READINESS 2026-07-30 by Codex] Keep all inference
+    /// status fields in this constructor so adding an engine cannot silently
+    /// update runtime state without updating the operator API.
+    fn from_state(state: &MpiState) -> Self {
+        Self {
+            embed_ready: state.embed_engine.is_some(),
+            embed_dim: state.embed_engine.as_ref().map(|engine| engine.dim()),
+            ner_ready: state.ner_engine.is_some(),
+            reranker_ready: state.reranker_engine.is_some(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct MpiStatusResponse {
     pub memchain_enabled: bool,
@@ -886,12 +925,12 @@ pub struct MpiStatusResponse {
     pub record_commitment_chain: crate::services::memchain::RecordCommitmentChainStatus,
     pub record_commitment_sync: crate::services::memchain::RecordCommitmentSyncStatus,
     pub index_ready: bool,
-    pub embed_ready: bool,
-    pub embed_dim: Option<usize>,
+    /// Flattened to preserve the established top-level readiness keys.
+    #[serde(flatten)]
+    pub inference: LocalInferenceStatus,
     pub mvf: MvfMetrics,
     pub remote_storage_enabled: bool,
     pub blind_storage_enabled: bool,
-    pub ner_ready: bool,
     pub graph_enabled: bool,
     pub graph_stats: Option<crate::services::memchain::storage_graph::GraphStats>,
     pub supernode: SuperNodeStatus,
@@ -1070,8 +1109,7 @@ pub async fn mpi_status(
             record_commitment_chain,
             record_commitment_sync,
             index_ready: state.index_ready.load(std::sync::atomic::Ordering::Relaxed),
-            embed_ready: state.embed_engine.is_some(),
-            embed_dim: state.embed_engine.as_ref().map(|e| e.dim()),
+            inference: LocalInferenceStatus::from_state(&state),
             mvf: MvfMetrics {
                 enabled: state.mvf_enabled,
                 alpha: state.mvf_alpha,
@@ -1086,7 +1124,6 @@ pub async fn mpi_status(
             },
             remote_storage_enabled: state.allow_remote_storage,
             blind_storage_enabled: state.blind_storage_enabled,
-            ner_ready: state.ner_engine.is_some(),
             graph_enabled: state.graph_enabled,
             graph_stats: gs,
             supernode: supernode_status,
@@ -1567,6 +1604,36 @@ pub async fn mpi_record_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_inference_status_serializes_stable_operator_contract() {
+        // [MEMCHAIN-INFERENCE-READINESS 2026-07-30 by Codex] This locks the
+        // flattened API names consumed by nodeboard and health tooling.
+        #[derive(Serialize)]
+        struct FlattenedStatusContract {
+            status: &'static str,
+            #[serde(flatten)]
+            inference: LocalInferenceStatus,
+        }
+
+        let value = serde_json::to_value(FlattenedStatusContract {
+            status: "ready",
+            inference: LocalInferenceStatus {
+                embed_ready: true,
+                embed_dim: Some(384),
+                ner_ready: false,
+                reranker_ready: true,
+            },
+        })
+        .unwrap();
+
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["embed_ready"], true);
+        assert_eq!(value["embed_dim"], 384);
+        assert_eq!(value["ner_ready"], false);
+        assert_eq!(value["reranker_ready"], true);
+        assert!(value.get("inference").is_none());
+    }
 
     #[test]
     fn test_attest_root_deterministic_order_independent_and_membership_sensitive() {
