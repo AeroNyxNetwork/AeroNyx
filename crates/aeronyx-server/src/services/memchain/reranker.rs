@@ -78,6 +78,9 @@
 //!   the reranker is too aggressive (degrading good BM25/graph results), lower to 0.5.
 //!
 //! ## Last Modified
+//! v2.4.5-TokenizerBatchBoundary -
+//!   [MEMCHAIN-TOKENIZER-BATCH 2026-07-30 by Codex] Reused the shared padded
+//!   batch contract and stopped silently fabricating missing tensor fields.
 //! v2.4.4-OnnxOutputBoundary -
 //!   [MEMCHAIN-ONNX-OUTPUT-BOUNDARY 2026-07-30 by Codex] Replaced panicking
 //!   positional output indexing with the shared bounds-checked inference
@@ -108,7 +111,9 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
 
 // Re-use the ORT initialization and session boundary from embed.rs.
-use super::embed::{init_ort_runtime, require_onnx_output, InferenceSession};
+use super::embed::{
+    init_ort_runtime, require_onnx_output, validate_tokenized_batch, InferenceSession,
+};
 
 // ============================================
 // Constants
@@ -367,12 +372,13 @@ impl RerankerEngine {
             .encode_batch(pairs, true)
             .map_err(|e| format!("Reranker tokenization: {}", e))?;
 
-        if encodings.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let seq_len = encodings[0].get_ids().len();
-        let total = batch_size * seq_len;
+        let (seq_len, total) = validate_tokenized_batch(
+            "Reranker",
+            &encodings,
+            batch_size,
+            self.max_seq_length,
+            true,
+        )?;
 
         // ── Build input tensors ──
         let mut input_ids = Vec::with_capacity(total);
@@ -380,14 +386,9 @@ impl RerankerEngine {
         let mut token_type_ids = Vec::with_capacity(total);
 
         for enc in &encodings {
-            let ids = enc.get_ids();
-            let mask = enc.get_attention_mask();
-            let types = enc.get_type_ids();
-            for i in 0..seq_len {
-                input_ids.push(ids.get(i).copied().unwrap_or(0) as i64);
-                attention_mask.push(mask.get(i).copied().unwrap_or(0) as i64);
-                token_type_ids.push(types.get(i).copied().unwrap_or(0) as i64);
-            }
+            input_ids.extend(enc.get_ids().iter().copied().map(i64::from));
+            attention_mask.extend(enc.get_attention_mask().iter().copied().map(i64::from));
+            token_type_ids.extend(enc.get_type_ids().iter().copied().map(i64::from));
         }
 
         let shape = [batch_size, seq_len];

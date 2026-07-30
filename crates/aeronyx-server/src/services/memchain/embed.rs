@@ -145,6 +145,10 @@
 //!   from HTTP handlers.
 //!
 //! ## Last Modified
+//! v2.7.20-TokenizerBatchBoundary -
+//!   [MEMCHAIN-TOKENIZER-BATCH 2026-07-30 by Codex] Centralized tokenizer
+//!   batch-shape validation and stopped silently padding malformed encoding
+//!   fields with zeroes before ONNX inference.
 //! v2.7.19-OnnxOutputBoundary -
 //!   [MEMCHAIN-ONNX-OUTPUT-BOUNDARY 2026-07-30 by Codex] Centralized
 //!   bounds-checked ONNX output retrieval so missing or incompatible model
@@ -177,7 +181,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 use parking_lot::{Mutex, MutexGuard};
 use std::path::{Path, PathBuf};
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{Encoding, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
 
 // ============================================
@@ -236,6 +240,81 @@ pub(super) fn require_onnx_output<T>(
             engine, output_count, index
         )
     })
+}
+
+/// Validate the structural contract of a padded tokenizer batch.
+///
+/// [MEMCHAIN-TOKENIZER-BATCH 2026-07-30 by Codex] HuggingFace tokenization is
+/// a model-file boundary, not trusted application state. Every encoding must
+/// match the requested batch and padded sequence dimensions before tensor
+/// construction. This prevents first-element indexing panics, tensor shape
+/// mismatches, and silent zero-filling of malformed masks or segment IDs.
+pub(super) fn validate_tokenized_batch(
+    engine: &str,
+    encodings: &[Encoding],
+    expected_batch: usize,
+    max_sequence_length: usize,
+    require_type_ids: bool,
+) -> Result<(usize, usize), String> {
+    if encodings.len() != expected_batch {
+        return Err(format!(
+            "{} tokenizer returned {} encodings for input batch {}",
+            engine,
+            encodings.len(),
+            expected_batch
+        ));
+    }
+
+    let sequence_length = encodings
+        .first()
+        .map(Encoding::len)
+        .ok_or_else(|| format!("{} tokenizer returned an empty batch", engine))?;
+    if sequence_length == 0 {
+        return Err(format!(
+            "{} tokenizer returned an empty token sequence",
+            engine
+        ));
+    }
+    if sequence_length > max_sequence_length {
+        return Err(format!(
+            "{} tokenizer sequence length {} exceeds configured maximum {}",
+            engine, sequence_length, max_sequence_length
+        ));
+    }
+
+    for (batch_index, encoding) in encodings.iter().enumerate() {
+        let ids_length = encoding.get_ids().len();
+        let mask_length = encoding.get_attention_mask().len();
+        let type_ids_length = encoding.get_type_ids().len();
+
+        if ids_length != sequence_length {
+            return Err(format!(
+                "{} tokenizer encoding {} has {} token IDs; expected padded length {}",
+                engine, batch_index, ids_length, sequence_length
+            ));
+        }
+        if mask_length != sequence_length {
+            return Err(format!(
+                "{} tokenizer encoding {} has attention-mask length {}; expected {}",
+                engine, batch_index, mask_length, sequence_length
+            ));
+        }
+        if require_type_ids && type_ids_length != sequence_length {
+            return Err(format!(
+                "{} tokenizer encoding {} has type-ID length {}; expected {}",
+                engine, batch_index, type_ids_length, sequence_length
+            ));
+        }
+    }
+
+    let total_tokens = expected_batch.checked_mul(sequence_length).ok_or_else(|| {
+        format!(
+            "{} tokenizer tensor size overflow: {} x {}",
+            engine, expected_batch, sequence_length
+        )
+    })?;
+
+    Ok((sequence_length, total_tokens))
 }
 
 /// Default max sequence length for MiniLM.
@@ -875,22 +954,17 @@ impl EmbedEngine {
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
 
-        let seq_len = encodings[0].get_ids().len();
-        let total = batch_size * seq_len;
+        let (seq_len, total) =
+            validate_tokenized_batch("MiniLM", &encodings, batch_size, self.max_seq_length, true)?;
 
         let mut input_ids = Vec::with_capacity(total);
         let mut attention_mask_raw = Vec::with_capacity(total);
         let mut token_type_ids = Vec::with_capacity(total);
 
         for enc in &encodings {
-            let ids = enc.get_ids();
-            let mask = enc.get_attention_mask();
-            let types = enc.get_type_ids();
-            for i in 0..seq_len {
-                input_ids.push(ids.get(i).copied().unwrap_or(0) as i64);
-                attention_mask_raw.push(mask.get(i).copied().unwrap_or(0) as i64);
-                token_type_ids.push(types.get(i).copied().unwrap_or(0) as i64);
-            }
+            input_ids.extend(enc.get_ids().iter().copied().map(i64::from));
+            attention_mask_raw.extend(enc.get_attention_mask().iter().copied().map(i64::from));
+            token_type_ids.extend(enc.get_type_ids().iter().copied().map(i64::from));
         }
 
         let shape = [batch_size, seq_len];
@@ -1016,20 +1090,21 @@ impl EmbedEngine {
             .encode_batch(text_refs, true)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
 
-        let seq_len = encodings[0].get_ids().len();
-        let total = batch_size * seq_len;
+        let (seq_len, total) = validate_tokenized_batch(
+            "EmbeddingGemma",
+            &encodings,
+            batch_size,
+            self.max_seq_length,
+            false,
+        )?;
 
         // EmbeddingGemma: input_ids + attention_mask only (NO token_type_ids)
         let mut input_ids = Vec::with_capacity(total);
         let mut attention_mask = Vec::with_capacity(total);
 
         for enc in &encodings {
-            let ids = enc.get_ids();
-            let mask = enc.get_attention_mask();
-            for i in 0..seq_len {
-                input_ids.push(ids.get(i).copied().unwrap_or(0) as i64);
-                attention_mask.push(mask.get(i).copied().unwrap_or(0) as i64);
-            }
+            input_ids.extend(enc.get_ids().iter().copied().map(i64::from));
+            attention_mask.extend(enc.get_attention_mask().iter().copied().map(i64::from));
         }
 
         let shape = [batch_size, seq_len];
@@ -1212,6 +1287,79 @@ mod tests {
         let short_error = require_onnx_output("test-engine", [11_u8].into_iter(), 1).unwrap_err();
         assert!(short_error.contains("returned 1 outputs"));
         assert!(short_error.contains("index 1"));
+    }
+
+    fn test_encoding(ids: Vec<u32>, type_ids: Vec<u32>, attention_mask: Vec<u32>) -> Encoding {
+        let length = ids.len();
+        Encoding::new(
+            ids,
+            type_ids,
+            vec!["token".to_string(); length],
+            vec![None; length],
+            vec![(0, 0); length],
+            vec![0; length],
+            attention_mask,
+            Vec::new(),
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn tokenizer_batch_boundary_accepts_consistent_padding() {
+        let encodings = [
+            test_encoding(vec![1, 2], vec![0, 0], vec![1, 1]),
+            test_encoding(vec![3, 0], vec![0, 0], vec![1, 0]),
+        ];
+
+        assert_eq!(
+            validate_tokenized_batch("test-engine", &encodings, 2, 8, true).unwrap(),
+            (2, 4)
+        );
+    }
+
+    #[test]
+    fn tokenizer_batch_boundary_rejects_batch_and_sequence_mismatch() {
+        let encoding = test_encoding(vec![1, 2], vec![0, 0], vec![1, 1]);
+        let batch_error =
+            validate_tokenized_batch("test-engine", &[encoding.clone()], 2, 8, true).unwrap_err();
+        assert!(batch_error.contains("returned 1 encodings"));
+
+        let uneven = test_encoding(vec![3], vec![0], vec![1]);
+        let sequence_error =
+            validate_tokenized_batch("test-engine", &[encoding, uneven], 2, 8, true).unwrap_err();
+        assert!(sequence_error.contains("padded length 2"));
+    }
+
+    #[test]
+    fn tokenizer_batch_boundary_rejects_empty_or_oversized_sequence() {
+        let empty_error =
+            validate_tokenized_batch("test-engine", &[Encoding::default()], 1, 8, false)
+                .unwrap_err();
+        assert!(empty_error.contains("empty token sequence"));
+
+        let encoding = test_encoding(vec![1, 2], Vec::new(), vec![1, 1]);
+        let oversized_error =
+            validate_tokenized_batch("test-engine", &[encoding], 1, 1, false).unwrap_err();
+        assert!(oversized_error.contains("exceeds configured maximum 1"));
+    }
+
+    #[test]
+    fn tokenizer_batch_boundary_validates_required_tensor_fields() {
+        let bad_mask = test_encoding(vec![1, 2], vec![0, 0], vec![1]);
+        let mask_error =
+            validate_tokenized_batch("test-engine", &[bad_mask], 1, 8, true).unwrap_err();
+        assert!(mask_error.contains("attention-mask length 1"));
+
+        let missing_types = test_encoding(vec![1, 2], Vec::new(), vec![1, 1]);
+        let type_error =
+            validate_tokenized_batch("test-engine", &[missing_types.clone()], 1, 8, true)
+                .unwrap_err();
+        assert!(type_error.contains("type-ID length 0"));
+
+        assert_eq!(
+            validate_tokenized_batch("test-engine", &[missing_types], 1, 8, false).unwrap(),
+            (2, 2)
+        );
     }
 
     #[test]
