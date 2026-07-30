@@ -73,6 +73,8 @@
 //!   contiguous external high-water decisions for signed delivery-cache anchors
 //! - v2.8.31-FollowerCertificatePolicy: re-audits current-tip certificate
 //!   membership against the follower's current local witness pins
+//! - v2.8.59-FollowerEffectiveReadiness: derives one fail-closed follower
+//!   readiness state from block convergence and exact-tip certificate policy
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -130,6 +132,7 @@
 //!   routes, message identifiers, payloads, endpoints, or user identities.
 //!
 //! ## Modification History
+//! v2.8.59-FollowerEffectiveReadiness - Added composite follower readiness without changing legacy state.
 //! v2.8.53-TypedCarrierCircuit - Added isolated certificate-carrier circuit scheduling counters.
 //! v2.8.52-BlockCarrierCircuitTelemetry - Added anonymous carrier circuit scheduling counters.
 //! v2.8.45-FollowerCertificateTelemetry - Added source-blind recovery outcome counters.
@@ -227,6 +230,7 @@ use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
     RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificatePolicyReadiness,
     RecordCommitmentCertificateBackfillDisposition, RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentFollowerReadiness,
     RecordCommitmentCheckpointCertificateAnchorConfig,
     RecordCommitmentCheckpointCertificateAnchorRuntime,
     RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
@@ -251,6 +255,50 @@ fn record_monotonic_observation(last_observed_at: &mut Option<u64>, now: u64) ->
     let observed_at = last_observed_at.map_or(now, |previous| previous.max(now));
     *last_observed_at = Some(observed_at);
     observed_at
+}
+
+/// Derives fail-closed follower readiness without changing the legacy state.
+///
+/// [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] `current` proves block
+/// convergence only. A required exact-tip certificate must also be ready before
+/// the additive readiness contract reports `ready`. Certified carrier recovery
+/// remains degraded because it cannot prove that the producer has no later tip.
+fn record_commitment_follower_readiness(
+    role: &str,
+    enabled: bool,
+    sync_state: &str,
+    certificate_policy_state: &str,
+    certificate_policy_ready: bool,
+) -> RecordCommitmentFollowerReadiness {
+    if role != "follower" || !enabled {
+        return RecordCommitmentFollowerReadiness::NotApplicable;
+    }
+    if sync_state == "stopped" {
+        return RecordCommitmentFollowerReadiness::Stopped;
+    }
+    if certificate_policy_state == "security_stopped" {
+        return RecordCommitmentFollowerReadiness::SecurityStopped;
+    }
+    if certificate_policy_state == "configuration_error" {
+        return RecordCommitmentFollowerReadiness::ConfigurationError;
+    }
+
+    match sync_state {
+        "starting" => RecordCommitmentFollowerReadiness::Starting,
+        "catching_up" | "checkpointing" => RecordCommitmentFollowerReadiness::Synchronizing,
+        "backoff" => RecordCommitmentFollowerReadiness::Backoff,
+        "certified_recovered" => RecordCommitmentFollowerReadiness::CertifiedRecovered,
+        "current" => match certificate_policy_state {
+            "disabled" => RecordCommitmentFollowerReadiness::Ready,
+            "ready" if certificate_policy_ready => RecordCommitmentFollowerReadiness::Ready,
+            "source_unavailable" => RecordCommitmentFollowerReadiness::SourceUnavailable,
+            "waiting_for_convergence" | "waiting_for_certificate" | "ready" => {
+                RecordCommitmentFollowerReadiness::WaitingForCertificate
+            }
+            _ => RecordCommitmentFollowerReadiness::WaitingForCertificate,
+        },
+        _ => RecordCommitmentFollowerReadiness::Synchronizing,
+    }
 }
 
 // ============================================
@@ -5294,10 +5342,21 @@ impl MemoryStorage {
         } else {
             runtime.certificate_policy_state
         };
+        let certificate_policy_ready =
+            runtime.certificate_policy_ready && !certificate_policy_evaluation_is_stale;
+        let follower_readiness = record_commitment_follower_readiness(
+            runtime.role,
+            runtime.enabled,
+            runtime.state,
+            certificate_policy_state,
+            certificate_policy_ready,
+        );
         RecordCommitmentSyncStatus {
             contract_version: "record_commitment_sync.v1",
             role: runtime.role.to_string(),
             state: runtime.state.to_string(),
+            follower_readiness_state: follower_readiness.as_str().to_string(),
+            follower_fully_ready: follower_readiness.is_fully_ready(),
             enabled: runtime.enabled,
             last_trigger: runtime.last_trigger.to_string(),
             last_announcement_at: runtime.last_announcement_at,
@@ -5348,8 +5407,7 @@ impl MemoryStorage {
             block_carrier_half_open_attempts_total: runtime
                 .block_carrier_half_open_attempts_total,
             certificate_policy_state: certificate_policy_state.to_string(),
-            certificate_policy_ready: runtime.certificate_policy_ready
-                && !certificate_policy_evaluation_is_stale,
+            certificate_policy_ready,
             certificate_policy_last_evaluated_at: runtime
                 .certificate_policy_last_evaluated_at,
             certificate_policy_evaluated_tip_height: runtime
@@ -5416,7 +5474,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; follower block-page/certificate recovery and coordinator certificate backfill expose role-isolated, source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, monotonic latest-observation timestamps, and sticky security-stop timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, security reason, raw error, record commitment, owner, payload, route, or client metadata; these counters and times are operations evidence, not authority, reputation, consensus, finality, or fork choice",
+                "aggregate runtime only; effective follower readiness combines block convergence with exact-tip local certificate-policy readiness and follower block-page/certificate recovery plus coordinator certificate backfill expose role-isolated, source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, monotonic latest-observation timestamps, and sticky security-stop timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, security reason, raw error, record commitment, owner, payload, route, or client metadata; readiness and counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
         }
     }
 
@@ -9349,6 +9407,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_follower_readiness_keeps_security_failures_above_transport_backoff() {
+        // [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] A later transport
+        // outage must not make an existing proof-security stop look like an
+        // ordinary retryable availability fault.
+        assert_eq!(
+            record_commitment_follower_readiness(
+                "follower",
+                true,
+                "backoff",
+                "security_stopped",
+                false,
+            ),
+            RecordCommitmentFollowerReadiness::SecurityStopped
+        );
+        assert_eq!(
+            record_commitment_follower_readiness(
+                "follower",
+                true,
+                "catching_up",
+                "configuration_error",
+                false,
+            ),
+            RecordCommitmentFollowerReadiness::ConfigurationError
+        );
+        assert_eq!(
+            record_commitment_follower_readiness(
+                "coordinator",
+                false,
+                "producing",
+                "security_stopped",
+                false,
+            ),
+            RecordCommitmentFollowerReadiness::NotApplicable
+        );
+        assert_eq!(
+            record_commitment_follower_readiness(
+                "follower",
+                true,
+                "stopped",
+                "security_stopped",
+                false,
+            ),
+            RecordCommitmentFollowerReadiness::Stopped
+        );
+    }
+
     #[tokio::test]
     async fn test_certificate_policy_readiness_requires_exact_local_validation() {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
@@ -9363,7 +9468,11 @@ mod tests {
         storage.configure_record_commitment_sync(false, true);
 
         storage.configure_record_commitment_certificate_policy(0, 1);
+        storage.record_commitment_sync_checkpoint_success(90, 1);
         let disabled = storage.record_commitment_sync_status();
+        assert_eq!(disabled.state, "current");
+        assert_eq!(disabled.follower_readiness_state, "ready");
+        assert!(disabled.follower_fully_ready);
         assert_eq!(disabled.certificate_policy_state, "disabled");
         assert!(!disabled.certificate_policy_ready);
         assert_eq!(disabled.certificate_witnesses_configured, 0);
@@ -9371,6 +9480,12 @@ mod tests {
 
         storage.configure_record_commitment_certificate_policy(2, 2);
         let waiting = storage.record_commitment_sync_status();
+        assert_eq!(waiting.state, "current");
+        assert_eq!(
+            waiting.follower_readiness_state,
+            "waiting_for_certificate"
+        );
+        assert!(!waiting.follower_fully_ready);
         assert_eq!(waiting.certificate_policy_state, "waiting_for_convergence");
         assert!(!waiting.certificate_policy_ready);
         assert_eq!(waiting.certificate_witnesses_configured, 2);
@@ -9381,6 +9496,8 @@ mod tests {
             RecordCommitmentCertificatePolicyReadiness::Ready { tip_height: 1 },
         );
         let ready = storage.record_commitment_sync_status();
+        assert_eq!(ready.follower_readiness_state, "ready");
+        assert!(ready.follower_fully_ready);
         assert_eq!(ready.certificate_policy_state, "ready");
         assert!(ready.certificate_policy_ready);
         assert_eq!(ready.certificate_policy_last_evaluated_at, Some(100));
@@ -9392,6 +9509,8 @@ mod tests {
             .await
             .unwrap();
         let stale = storage.record_commitment_sync_status();
+        assert_eq!(stale.follower_readiness_state, "waiting_for_certificate");
+        assert!(!stale.follower_fully_ready);
         assert_eq!(stale.certificate_policy_state, "waiting_for_certificate");
         assert!(!stale.certificate_policy_ready);
         assert_eq!(stale.certificate_policy_evaluated_tip_height, Some(1));
@@ -9401,12 +9520,24 @@ mod tests {
             RecordCommitmentCertificatePolicyReadiness::Ready { tip_height: 2 },
         );
         let refreshed = storage.record_commitment_sync_status();
+        assert_eq!(refreshed.follower_readiness_state, "ready");
+        assert!(refreshed.follower_fully_ready);
         assert_eq!(refreshed.certificate_policy_state, "ready");
         assert!(refreshed.certificate_policy_ready);
         assert_eq!(
             refreshed.certificate_policy_evaluated_tip_height,
             Some(2)
         );
+
+        storage.record_commitment_sync_certified_recovery_success(111, 2);
+        let certified_recovered = storage.record_commitment_sync_status();
+        assert_eq!(certified_recovered.state, "certified_recovered");
+        assert_eq!(
+            certified_recovered.follower_readiness_state,
+            "certified_recovered"
+        );
+        assert!(!certified_recovered.follower_fully_ready);
+        storage.record_commitment_sync_checkpoint_success(112, 2);
 
         storage.record_commitment_certificate_policy_evaluation(
             90,
@@ -9439,15 +9570,54 @@ mod tests {
             stale_unavailable.certificate_policy_evaluated_tip_height,
             Some(1)
         );
+        assert_eq!(
+            stale_unavailable.follower_readiness_state,
+            "waiting_for_certificate"
+        );
+        assert!(!stale_unavailable.follower_fully_ready);
+
+        storage.record_commitment_certificate_policy_evaluation(
+            121,
+            RecordCommitmentCertificatePolicyReadiness::SourceUnavailable { tip_height: 2 },
+        );
+        let unavailable = storage.record_commitment_sync_status();
+        assert_eq!(unavailable.certificate_policy_state, "source_unavailable");
+        assert_eq!(
+            unavailable.follower_readiness_state,
+            "source_unavailable"
+        );
+        assert!(!unavailable.follower_fully_ready);
+
+        storage.record_commitment_certificate_policy_evaluation(
+            122,
+            RecordCommitmentCertificatePolicyReadiness::SecurityStopped,
+        );
+        let security_stopped = storage.record_commitment_sync_status();
+        assert_eq!(
+            security_stopped.certificate_policy_state,
+            "security_stopped"
+        );
+        assert_eq!(
+            security_stopped.follower_readiness_state,
+            "security_stopped"
+        );
+        assert!(!security_stopped.follower_fully_ready);
 
         storage.configure_record_commitment_certificate_policy(1, 2);
         let invalid = storage.record_commitment_sync_status();
+        assert_eq!(
+            invalid.follower_readiness_state,
+            "configuration_error"
+        );
+        assert!(!invalid.follower_fully_ready);
         assert_eq!(invalid.certificate_policy_state, "configuration_error");
         assert!(!invalid.certificate_policy_ready);
 
         storage.configure_record_commitment_sync(true, false);
         storage.configure_record_commitment_certificate_policy(3, 2);
         let coordinator = storage.record_commitment_sync_status();
+        assert_eq!(coordinator.follower_readiness_state, "not_applicable");
+        assert!(!coordinator.follower_fully_ready);
         assert_eq!(coordinator.certificate_policy_state, "not_applicable");
         assert!(!coordinator.certificate_policy_ready);
         assert_eq!(coordinator.certificate_witnesses_configured, 0);

@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.72.0 - Added bounded follower retry after verified certificate persistence deferral.
+Modification Reason: v0.73.0 - Added fail-closed composite follower readiness.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.72.0 - [FOLLOWER-CERTIFICATE-RETRY 2026-07-30 by Codex] Retries deferred follower certificate persistence promptly without creating a polling loop.
+Last Modified: v0.73.0 - [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] Prevents block convergence from being reported as complete follower readiness while required proof is unavailable.
+Previous: v0.72.0 - [FOLLOWER-CERTIFICATE-RETRY 2026-07-30 by Codex] Retries deferred follower certificate persistence promptly without creating a polling loop.
 Previous: v0.71.0 - [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] Reports authenticated-but-unpersisted follower certificates without claiming durable recovery.
 Previous: v0.70.0 - [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] Preserves source-blind security-stop times when later retrievals succeed.
 Previous: v0.69.0 - [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Reports coordinator certificate backfill without exposing carrier identity or mixing follower state.
@@ -104,6 +105,30 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.73 Effective follower readiness is fail-closed
+
+[FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex]
+
+- The legacy synchronization `state` remains backward compatible and continues
+  to describe block transport and convergence only.
+- Additive `follower_readiness_state` and `follower_fully_ready` fields combine
+  that block state with the exact audited-tip certificate policy. A follower is
+  fully ready only after an equal-tip producer checkpoint and either a disabled
+  witness policy or a durable certificate satisfying the current local pins and
+  threshold.
+- Missing, unavailable, stale, configuration-invalid, or security-stopped
+  certificate evidence therefore cannot coexist with a misleading
+  `follower_fully_ready=true`.
+- `certified_recovered` remains explicitly degraded: an exact threshold-
+  certified recovered prefix does not prove that an unavailable producer has
+  no later tip.
+- Non-follower roles report `not_applicable`. Unknown follower or certificate
+  states fail closed as synchronizing or waiting for certificate.
+- The fields expose no node identity, endpoint, witness membership, certificate
+  frame, hash, signature, raw error, block, record, payload, route, or client
+  metadata. They are operations evidence only and cannot affect authority,
+  consensus, finality, reputation, or fork choice.
 
 ### v0.72 Bounded retry for deferred follower certificate persistence
 

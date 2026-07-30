@@ -544,6 +544,50 @@ impl RecordCommitmentCertificatePolicyReadiness {
     }
 }
 
+/// Effective follower readiness after combining block convergence and policy.
+///
+/// [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] This process-local,
+/// identity-blind classification prevents a signed equal-tip checkpoint from
+/// being mistaken for complete follower readiness while a required certificate
+/// is pending, unavailable, or security-stopped. It is status only and never
+/// participates in chain choice, certificate policy, or peer authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordCommitmentFollowerReadiness {
+    NotApplicable,
+    Starting,
+    Synchronizing,
+    Backoff,
+    Stopped,
+    CertifiedRecovered,
+    WaitingForCertificate,
+    SourceUnavailable,
+    SecurityStopped,
+    ConfigurationError,
+    Ready,
+}
+
+impl RecordCommitmentFollowerReadiness {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Starting => "starting",
+            Self::Synchronizing => "synchronizing",
+            Self::Backoff => "backoff",
+            Self::Stopped => "stopped",
+            Self::CertifiedRecovered => "certified_recovered",
+            Self::WaitingForCertificate => "waiting_for_certificate",
+            Self::SourceUnavailable => "source_unavailable",
+            Self::SecurityStopped => "security_stopped",
+            Self::ConfigurationError => "configuration_error",
+            Self::Ready => "ready",
+        }
+    }
+
+    pub(crate) const fn is_fully_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
 /// Privacy-safe runtime status for commitment block replication.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecordCommitmentSyncStatus {
@@ -554,6 +598,10 @@ pub struct RecordCommitmentSyncStatus {
     /// Runtime state such as `current`, `certified_recovered`, `catching_up`,
     /// or `backoff`. [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex]
     pub state: String,
+    /// Effective follower state after block and certificate-policy evaluation.
+    pub follower_readiness_state: String,
+    /// Whether a follower is producer-current and satisfies local policy.
+    pub follower_fully_ready: bool,
     /// Whether active follower polling is configured.
     pub enabled: bool,
     /// Trigger used by the most recent pull attempt: `scheduled` or

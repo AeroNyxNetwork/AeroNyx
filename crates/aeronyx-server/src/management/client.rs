@@ -67,6 +67,9 @@
 //   - [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] A verified response
 //     that loses a current-tip/policy persistence race is reported separately
 //     and never counted as coordinator success or carrier recovery.
+//   - [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] Composite follower
+//     readiness is fail-closed across block convergence and current-tip
+//     certificate policy. It remains aggregate operational evidence only.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -102,6 +105,7 @@
 //   v2.8.55        - Added coordinator-only certificate-backfill aggregates
 //   v2.8.56        - Added role-isolated sticky security-stop timestamps
 //   v2.8.57        - Added verified-unpersisted follower certificate outcomes
+//   v2.8.59        - Added fail-closed composite follower readiness
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -226,6 +230,10 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     /// prefix while the producer is unavailable; it does not claim the latest
     /// producer tip. [CERTIFIED-BLOCK-CARRIER 2026-07-29 by Codex]
     pub state: String,
+    /// Effective follower state after block and certificate-policy evaluation.
+    pub follower_readiness_state: String,
+    /// Whether a follower is producer-current and satisfies local policy.
+    pub follower_fully_ready: bool,
     /// Whether active follower polling is configured.
     pub enabled: bool,
     /// Trigger used by the latest pull attempt: `scheduled` or `block_announce`.
@@ -1012,6 +1020,8 @@ mod tests {
                 contract_version: "record_commitment_sync.v1",
                 role: "follower".to_string(),
                 state: "backoff".to_string(),
+                follower_readiness_state: "backoff".to_string(),
+                follower_fully_ready: false,
                 enabled: true,
                 last_trigger: "block_announce".to_string(),
                 last_announcement_at: Some(98),
@@ -1180,6 +1190,8 @@ mod tests {
         assert_eq!(integrity["rollback_guard_write_failures_total"], 0);
         let sync = &value["record_commitment_sync"];
         assert_eq!(sync["state"], "backoff");
+        assert_eq!(sync["follower_readiness_state"], "backoff");
+        assert_eq!(sync["follower_fully_ready"], false);
         assert_eq!(sync["enabled"], true);
         assert_eq!(sync["last_trigger"], "block_announce");
         assert_eq!(sync["last_announcement_at"], 98);

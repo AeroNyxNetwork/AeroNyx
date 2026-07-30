@@ -386,6 +386,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.59-FollowerEffectiveReadiness - Added fail-closed composite follower
+//     readiness to local status and signed heartbeat telemetry.
 //   v2.8.58-FollowerCertificateRetry - Replaced the follower round tuple with a
 //     typed outcome and added bounded retry scheduling for deferred certificates.
 //   v2.8.57-CertificatePersistenceTruth - Kept verified-but-unpersisted follower
@@ -4459,6 +4461,8 @@ impl Server {
                             contract_version: status.contract_version,
                             role: status.role,
                             state: status.state,
+                            follower_readiness_state: status.follower_readiness_state,
+                            follower_fully_ready: status.follower_fully_ready,
                             enabled: status.enabled,
                             last_trigger: status.last_trigger,
                             last_announcement_at: status.last_announcement_at,
