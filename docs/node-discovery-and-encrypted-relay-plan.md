@@ -4,9 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.83.0 - Removed the SystemDb mutex poison failure mode
-and completed privacy-safe join diagnostics across signed anchors and Directory
-status workers.
+Modification Reason: v0.84.0 - Centralized every Directory peer blocking
+worker join behind one privacy-safe fail-closed execution boundary.
 
 Main Functionality:
 
@@ -31,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.83.0 - [BLOCKING-WORKER-RECOVERY 2026-07-30 by Codex] Keeps SystemDb usable after a failed worker and prevents raw JoinError payloads from entering anchor/status diagnostics.
+Last Modified: v0.84.0 - [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] Gives all authenticated Directory peer blocking workers one privacy-safe failure and observability contract.
+Previous: v0.83.0 - [BLOCKING-WORKER-RECOVERY 2026-07-30 by Codex] Keeps SystemDb usable after a failed worker and prevents raw JoinError payloads from entering anchor/status diagnostics.
 Previous: v0.82.0 - [STORAGE-JOIN-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering shared storage errors, API logs, or scheduler diagnostics.
 Previous: v0.81.0 - [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering process-health status or structured shutdown diagnostics.
 Previous: v0.80.0 - [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Aborts every owned process task when a later startup gate fails instead of detaching its JoinHandle.
@@ -117,6 +117,30 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.84 Directory peer workers share one failure contract
+
+[DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex]
+
+- All eleven synchronous Directory peer operations now enter Tokio's blocking
+  pool through `run_directory_chain_blocking`. This includes producer tip,
+  block-range, object and inclusion-proof audits; replica carrier reads;
+  policy-anchor persistence; certificate export; and witness recomputation.
+- A worker panic, cancellation, or unexpected join failure remains fail-closed
+  with the established `503 audit_task_failed` protocol response. Existing
+  authenticated peer clients therefore require no compatibility change.
+- Internal diagnostics now retain the static operation role plus only the
+  shared fixed `Panicked` / `Cancelled` / `Failed` category. The raw
+  `JoinError` and its potentially sensitive panic payload are never formatted.
+- The helper accepts only a `'static` operation label defined in source code,
+  preventing request data, descriptor material, paths, identities, or payloads
+  from becoming diagnostic labels.
+- A regression test terminates a real blocking worker with a sensitive marker
+  and proves the HTTP status and response body remain exactly the stable,
+  privacy-safe protocol bucket.
+- This milestone does not change Directory Sync frames, request admission,
+  signatures, chain selection, witness authority, mirror policy, rate limits,
+  API paths, or consensus semantics.
 
 ### v0.83 Blocking worker failure is bounded and recoverable
 

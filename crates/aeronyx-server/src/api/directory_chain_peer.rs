@@ -48,6 +48,9 @@
 //!   next verified carrier without retrying malformed protocol requests.
 //! - Multi-block catch-up pages capped to one block's maximum aggregate
 //!   commitment budget and stopped before repeated descriptor objects.
+//! - [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] One fail-closed
+//!   blocking-worker boundary preserves the existing protocol response while
+//!   recording only a static operation role and fixed join-failure category.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` only when `DirectoryChainStore` is configured.
@@ -113,8 +116,12 @@
 //! - Replica proof recovery may follow verified-public mirror admission, but
 //!   only for a producer still in the durable mirror registry. Carrier
 //!   availability is never producer, checkpoint, witness, or policy authority.
+//! - Never format a blocking worker's raw `JoinError`; Tokio panic payloads may
+//!   contain filesystem, descriptor, or other internal process material.
 //!
 //! ## Last Modified
+//! v0.16.0-BlockingWorkerBoundary - Centralized all Directory peer blocking
+//! worker joins behind privacy-safe, fail-closed diagnostics.
 //! v0.15.0-ReplicaDescriptorInclusionProof - Added registry-gated carrier
 //! recovery for exact original producer descriptor inclusion proofs.
 //! v0.14.0-DirectoryInclusionProof - Added exact-block, audit-gated,
@@ -193,6 +200,7 @@ use aeronyx_core::protocol::discovery::{
 };
 
 use crate::api::memchain_peer::{commitment_peer_endpoint_is_public, commitment_peer_url};
+use crate::error::RuntimeTaskJoinFailureKind;
 use crate::services::directory_replica::{
     DirectoryObservationWitnessCarrierOutcome, DirectoryObservationWitnessPolicyAnchorDecision,
     DirectoryReplicaEvidencePage, DirectoryReplicaSyncRuntime,
@@ -731,11 +739,14 @@ async fn tip_handler(State(state): State<DirectoryChainPeerState>, body: Bytes) 
     }
 
     let store = Arc::clone(&state.store);
-    let audit = match tokio::task::spawn_blocking(move || store.audited_tip(now)).await {
-        Ok(Ok(audit)) => audit,
-        Ok(Err(error)) => return store_error_response(&error),
-        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
-    };
+    let audit =
+        match run_directory_chain_blocking("producer_tip_audit", move || store.audited_tip(now))
+            .await
+        {
+            Ok(Ok(audit)) => audit,
+            Ok(Err(error)) => return store_error_response(&error),
+            Err(response) => return response,
+        };
     let responder = state.identity.public_key_bytes();
     let response_timestamp = now_secs();
     let response_signing_bytes = directory_tip_response_signing_bytes(
@@ -811,14 +822,14 @@ async fn block_range_handler(
     }
 
     let store = Arc::clone(&state.store);
-    let page = match tokio::task::spawn_blocking(move || {
+    let page = match run_directory_chain_blocking("producer_block_range_audit", move || {
         store.audited_block_page(from_height, limit, now)
     })
     .await
     {
         Ok(Ok(page)) => page,
         Ok(Err(error)) => return store_error_response(&error),
-        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
+        Err(response) => return response,
     };
     let blocks = bounded_directory_transport_blocks(page.blocks);
     let has_more = blocks
@@ -908,16 +919,17 @@ async fn descriptor_objects_handler(
 
     let store = Arc::clone(&state.store);
     let requested_hashes = descriptor_hashes.clone();
-    let objects = match tokio::task::spawn_blocking(move || {
-        store.audited_descriptor_objects(&requested_hashes, now)
-    })
-    .await
-    {
-        Ok(Ok(Some(objects))) => objects,
-        Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "object_not_found"),
-        Ok(Err(error)) => return store_error_response(&error),
-        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
-    };
+    let objects =
+        match run_directory_chain_blocking("producer_descriptor_objects_audit", move || {
+            store.audited_descriptor_objects(&requested_hashes, now)
+        })
+        .await
+        {
+            Ok(Ok(Some(objects))) => objects,
+            Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "object_not_found"),
+            Ok(Err(error)) => return store_error_response(&error),
+            Err(response) => return response,
+        };
     let responder = state.identity.public_key_bytes();
     let response_timestamp = now_secs();
     let response_signing_bytes = directory_descriptor_objects_response_signing_bytes(
@@ -992,16 +1004,17 @@ async fn descriptor_inclusion_proof_handler(
     }
 
     let store = Arc::clone(&state.store);
-    let proof = match tokio::task::spawn_blocking(move || {
-        store.audited_descriptor_inclusion_proof(&descriptor_hash, &block_hash, now)
-    })
-    .await
-    {
-        Ok(Ok(Some(proof))) => proof,
-        Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "proof_not_found"),
-        Ok(Err(error)) => return store_error_response(&error),
-        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
-    };
+    let proof =
+        match run_directory_chain_blocking("producer_descriptor_inclusion_proof_audit", move || {
+            store.audited_descriptor_inclusion_proof(&descriptor_hash, &block_hash, now)
+        })
+        .await
+        {
+            Ok(Ok(Some(proof))) => proof,
+            Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "proof_not_found"),
+            Ok(Err(error)) => return store_error_response(&error),
+            Err(response) => return response,
+        };
     let responder = state.identity.public_key_bytes();
     if proof
         .verify_at(&chain_id, &responder, &block_hash, now)
@@ -1057,7 +1070,7 @@ async fn audited_replica_page_for_request(
             "replica_store_disabled",
         ));
     };
-    match tokio::task::spawn_blocking(move || {
+    match run_directory_chain_blocking("replica_block_range_audit", move || {
         if producer_is_pinned {
             store.audited_evidence_page(&producer, from_height, limit, observed_at)
         } else {
@@ -1069,10 +1082,7 @@ async fn audited_replica_page_for_request(
         Ok(Ok(page)) if page.tip_height > 0 => Ok(page),
         Ok(Ok(_)) => Err(protocol_error(StatusCode::NOT_FOUND, "replica_not_found")),
         Ok(Err(error)) => Err(replica_store_error_response(&error)),
-        Err(_) => Err(protocol_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "audit_task_failed",
-        )),
+        Err(response) => Err(response),
     }
 }
 
@@ -1095,7 +1105,7 @@ async fn audited_replica_objects_for_request(
             "replica_store_disabled",
         ));
     };
-    match tokio::task::spawn_blocking(move || {
+    match run_directory_chain_blocking("replica_descriptor_objects_audit", move || {
         if producer_is_pinned {
             store.audited_evidence_descriptor_objects(&producer, &descriptor_hashes, observed_at)
         } else {
@@ -1114,10 +1124,7 @@ async fn audited_replica_objects_for_request(
             "replica_object_not_found",
         )),
         Ok(Err(error)) => Err(replica_store_error_response(&error)),
-        Err(_) => Err(protocol_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "audit_task_failed",
-        )),
+        Err(response) => Err(response),
     }
 }
 
@@ -1141,7 +1148,7 @@ async fn audited_replica_descriptor_proof_for_request(
             "replica_store_disabled",
         ));
     };
-    match tokio::task::spawn_blocking(move || {
+    match run_directory_chain_blocking("replica_descriptor_inclusion_proof_audit", move || {
         if producer_is_pinned {
             store.audited_evidence_descriptor_inclusion_proof(
                 &producer,
@@ -1166,10 +1173,7 @@ async fn audited_replica_descriptor_proof_for_request(
             "replica_descriptor_proof_not_found",
         )),
         Ok(Err(error)) => Err(replica_store_error_response(&error)),
-        Err(_) => Err(protocol_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "audit_task_failed",
-        )),
+        Err(response) => Err(response),
     }
 }
 
@@ -2052,14 +2056,14 @@ async fn observation_policy_anchor_handler(
         return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_store_disabled");
     };
     let anchor_request = message.clone();
-    let decision = match tokio::task::spawn_blocking(move || {
+    let decision = match run_directory_chain_blocking("observation_policy_anchor", move || {
         store.persist_remote_observation_witness_policy_anchor(&anchor_request, now)
     })
     .await
     {
         Ok(Ok(decision)) => decision,
         Ok(Err(error)) => return replica_store_error_response(&error),
-        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
+        Err(response) => return response,
     };
     let responder = state.identity.public_key_bytes();
     let response_timestamp = now_secs();
@@ -2146,27 +2150,32 @@ async fn observation_certificate_handler(
     };
     let mut eligible_witnesses = state.pinned_peers.iter().copied().collect::<Vec<_>>();
     eligible_witnesses.sort_unstable();
-    let certificate = match tokio::task::spawn_blocking(move || {
-        let snapshot = store.status_snapshot()?;
-        let minimum_witnesses =
-            usize::try_from(snapshot.observation_witness_policy_threshold).unwrap_or(usize::MAX);
-        if minimum_witnesses == 0 || minimum_witnesses > eligible_witnesses.len() {
-            return Ok(None);
-        }
-        store.latest_observation_certificate_for_pins(&eligible_witnesses, minimum_witnesses, now)
-    })
-    .await
-    {
-        Ok(Ok(Some(certificate))) => certificate,
-        Ok(Ok(None)) => {
-            return protocol_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "observation_certificate_unavailable",
+    let certificate =
+        match run_directory_chain_blocking("observation_certificate_audit", move || {
+            let snapshot = store.status_snapshot()?;
+            let minimum_witnesses = usize::try_from(snapshot.observation_witness_policy_threshold)
+                .unwrap_or(usize::MAX);
+            if minimum_witnesses == 0 || minimum_witnesses > eligible_witnesses.len() {
+                return Ok(None);
+            }
+            store.latest_observation_certificate_for_pins(
+                &eligible_witnesses,
+                minimum_witnesses,
+                now,
             )
-        }
-        Ok(Err(error)) => return replica_store_error_response(&error),
-        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_task_failed"),
-    };
+        })
+        .await
+        {
+            Ok(Ok(Some(certificate))) => certificate,
+            Ok(Ok(None)) => {
+                return protocol_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "observation_certificate_unavailable",
+                )
+            }
+            Ok(Err(error)) => return replica_store_error_response(&error),
+            Err(response) => return response,
+        };
     let certificate_frame = match encode_directory_observation_certificate(&certificate) {
         Ok(frame) if frame.len() <= MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES => frame,
         Ok(_) => {
@@ -2236,7 +2245,11 @@ async fn independently_evaluate_checkpoint(
         ));
     };
     let chain_store = Arc::clone(&state.store);
-    match tokio::task::spawn_blocking(move || chain_store.audit(now)).await {
+    match run_directory_chain_blocking("local_producer_witness_audit", move || {
+        chain_store.audit(now)
+    })
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             warn!(error = %error, "[DIRECTORY_CHAIN] Local producer audit failed closed");
@@ -2245,15 +2258,10 @@ async fn independently_evaluate_checkpoint(
                 "chain_not_verified",
             ));
         }
-        Err(_) => {
-            return Err(protocol_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "audit_task_failed",
-            ))
-        }
+        Err(response) => return Err(response),
     }
     let checkpoint = checkpoint.clone();
-    match tokio::task::spawn_blocking(move || {
+    match run_directory_chain_blocking("observation_witness_recomputation", move || {
         replica_store.evaluate_observation_checkpoint_witness(&checkpoint, now)
     })
     .await
@@ -2270,10 +2278,7 @@ async fn independently_evaluate_checkpoint(
                 "replica_not_verified",
             ))
         }
-        Err(_) => Err(protocol_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "audit_task_failed",
-        )),
+        Err(response) => Err(response),
     }
 }
 
@@ -2331,6 +2336,36 @@ fn replica_store_error_response(error: &DirectoryReplicaStoreError) -> Response 
 
 fn protocol_error(status: StatusCode, code: &'static str) -> Response {
     (status, [(header::CONTENT_TYPE, "text/plain")], code).into_response()
+}
+
+/// Runs one synchronous Directory peer operation on Tokio's blocking pool.
+///
+/// [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] `operation` must be a
+/// static code-defined role. A failed join always keeps the established
+/// `audit_task_failed` protocol bucket while logs receive only the shared fixed
+/// category, never the potentially payload-bearing raw `JoinError`.
+async fn run_directory_chain_blocking<T, F>(
+    operation: &'static str,
+    worker: F,
+) -> Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(worker).await {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            warn!(
+                operation,
+                failure = ?RuntimeTaskJoinFailureKind::classify(&error),
+                "[DIRECTORY_CHAIN] Blocking worker failed closed"
+            );
+            Err(protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit_task_failed",
+            ))
+        }
+    }
 }
 
 fn now_secs() -> u64 {
@@ -2593,6 +2628,26 @@ mod tests {
             .unwrap();
         assert_eq!(proof.commitment.descriptor_hash, descriptor_hash);
         proof
+    }
+
+    #[tokio::test]
+    async fn blocking_worker_failure_preserves_privacy_safe_protocol_bucket() {
+        // [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] A panic payload
+        // must never become part of the authenticated peer API response.
+        let response = run_directory_chain_blocking("test_audit", || {
+            panic!("test-only-sensitive-directory-worker-payload");
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("worker failure body");
+        assert_eq!(&body[..], b"audit_task_failed");
+        assert!(!body
+            .windows(b"sensitive-directory-worker-payload".len())
+            .any(|window| window == b"sensitive-directory-worker-payload"));
     }
 
     #[test]
