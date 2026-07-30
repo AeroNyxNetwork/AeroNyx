@@ -75,6 +75,8 @@
 //!   membership against the follower's current local witness pins
 //! - v2.8.59-FollowerEffectiveReadiness: derives one fail-closed follower
 //!   readiness state from block convergence and exact-tip certificate policy
+//! - [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Runs signed local-anchor
+//!   writes through one privacy-safe blocking worker boundary.
 //!
 //! ## Split Architecture (v2.4.0+Search)
 //! This file was split into three files to reduce size:
@@ -170,6 +172,8 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.60-AnchorWorkerPrivacy - Redact Tokio panic payloads from signed
+//! local-anchor persistence failures.
 //! v2.8.57-CertificatePersistenceTruth - Distinguish verified-unpersisted follower outcomes.
 //! v2.8.56-StickySecurityEvidence - Retain source-blind security-stop times across later success.
 //! v2.8.55-CertificateBackfillTelemetry - Record atomic coordinator-only recovery aggregates.
@@ -225,6 +229,8 @@ use aeronyx_core::protocol::memchain::{
     record_checkpoint_certificate_digest_v1, MemChainMessage, MAX_COORDINATOR_LEASE_TTL_SECS_V1,
     MEMCHAIN_MAGIC, MIN_COORDINATOR_LEASE_TTL_SECS_V1,
 };
+
+use crate::error::RuntimeTaskJoinFailureKind;
 
 use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
@@ -1132,6 +1138,21 @@ fn write_signed_local_anchor_atomic(
     result
 }
 
+/// Runs one signed local-anchor write without exposing Tokio panic payloads.
+///
+/// [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Anchor persistence failures
+/// may reach startup, readiness, or operator logs. The caller-provided label is
+/// static and the JoinError is collapsed before it crosses that boundary.
+async fn run_blocking_local_anchor_write<F>(label: &'static str, write: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(write).await.map_err(|error| {
+        let failure = RuntimeTaskJoinFailureKind::classify(&error);
+        format!("{label} write worker {failure}")
+    })?
+}
+
 async fn persist_record_commitment_tip_anchor(
     path: PathBuf,
     tip_height: u64,
@@ -1143,9 +1164,10 @@ async fn persist_record_commitment_tip_anchor(
         RecordCommitmentTipAnchorV1::new_signed(tip_height, tip_hash, identity, updated_at);
     let bytes = serde_json::to_vec(&anchor)
         .map_err(|error| format!("encode commitment tip anchor: {error}"))?;
-    tokio::task::spawn_blocking(move || write_record_commitment_tip_anchor_atomic(&path, &bytes))
-        .await
-        .map_err(|error| format!("join commitment tip anchor write: {error}"))??;
+    run_blocking_local_anchor_write("commitment tip anchor", move || {
+        write_record_commitment_tip_anchor_atomic(&path, &bytes)
+    })
+    .await?;
     Ok(updated_at)
 }
 
@@ -1425,9 +1447,10 @@ async fn persist_checkpoint_certificate_anchor(
     let anchor = RecordCheckpointCertificateAnchorV1::new_signed(state, identity, updated_at);
     let bytes = serde_json::to_vec(&anchor)
         .map_err(|error| format!("encode checkpoint certificate anchor: {error}"))?;
-    tokio::task::spawn_blocking(move || write_checkpoint_certificate_anchor_atomic(&path, &bytes))
-        .await
-        .map_err(|error| format!("join checkpoint certificate anchor write: {error}"))??;
+    run_blocking_local_anchor_write("checkpoint certificate anchor", move || {
+        write_checkpoint_certificate_anchor_atomic(&path, &bytes)
+    })
+    .await?;
     Ok(updated_at)
 }
 
@@ -6853,6 +6876,20 @@ mod tests {
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::ledger::MemoryRecord;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn blocking_anchor_writer_redacts_panic_payload() {
+        // [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] A panic payload must
+        // not enter startup/readiness error strings returned by anchor writes.
+        let error = run_blocking_local_anchor_write("test anchor", || {
+            panic!("test-only-sensitive-anchor-payload");
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "test anchor write worker task panicked");
+        assert!(!error.contains("sensitive"));
+    }
 
     fn signed_commitment_block(
         height: u64,

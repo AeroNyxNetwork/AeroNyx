@@ -24,7 +24,7 @@
 //! - Used by Admin endpoints (Task 5) for usage statistics
 //!
 //! ## Thread Safety
-//! Internal `Arc<Mutex<Connection>>` — all blocking DB ops run inside
+//! Internal `Arc<parking_lot::Mutex<Connection>>` — all blocking DB ops run inside
 //! `tokio::task::spawn_blocking` to avoid blocking the async runtime.
 //! The Arc is cloned into each closure so MutexGuard is never Send-crossed.
 //!
@@ -38,6 +38,9 @@
 //! - spawn_blocking pattern: Arc::clone(&self.conn) INSIDE the async fn,
 //!   then lock() INSIDE the spawn_blocking closure. Never hold a MutexGuard
 //!   across an await point or pass it across spawn_blocking boundaries.
+//! - [SYSTEM-DB-POISON-RECOVERY 2026-07-30 by Codex] Use parking_lot's
+//!   non-poisoning mutex. Reintroducing std::sync::Mutex would let one worker
+//!   panic permanently poison all later metadata operations.
 //! - owner_pubkey BLOB binding: always use owner.as_slice() not &owner[..]
 //! - assign_volume is idempotent-safe via INSERT OR IGNORE + existence check
 //! - update_last_active silently ignores unknown owners (no error returned)
@@ -48,15 +51,18 @@
 //!   handled by update_last_active() which has no table growth concern.
 //!
 //! ## Last Modified
+//! v1.2.0-PoisonRecovery - Prevent one blocking worker panic from permanently
+//!   poisoning the shared SQLite connection lock.
 //! v1.1.0-JoinFailurePrivacy - Preserve the public Join variant while
 //!   preventing Tokio panic payloads from crossing error/log boundaries.
 //! v1.0.0-MultiTenant - Initial implementation (Task 1a)
 // ============================================
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::task;
 use tracing::{debug, error, info, warn};
@@ -274,7 +280,7 @@ impl SystemDb {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             conn.query_row(
                 "SELECT volume_id FROM volume_assignments WHERE owner_pubkey = ?1",
                 params![owner.as_slice()],
@@ -305,7 +311,7 @@ impl SystemDb {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || -> Result<(), SystemDbError> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             let now = now_unix();
 
             // INSERT OR IGNORE: safe against concurrent assign attempts.
@@ -340,7 +346,7 @@ impl SystemDb {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || -> Result<Vec<(String, usize)>, rusqlite::Error> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT volume_id, COUNT(*) as cnt
                  FROM volume_assignments
@@ -373,7 +379,7 @@ impl SystemDb {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             let now = now_unix();
             // Silently ignore if owner not found (0 rows updated is fine).
             conn.execute(
@@ -395,7 +401,7 @@ impl SystemDb {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || -> Result<Vec<ActiveOwner>, rusqlite::Error> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT owner_pubkey, volume_id, last_active_at
                  FROM volume_assignments
@@ -452,7 +458,7 @@ impl SystemDb {
 
         task::spawn_blocking(
             move || -> Result<Vec<([u8; 32], String)>, rusqlite::Error> {
-                let conn = conn.lock().unwrap();
+                let conn = conn.lock();
                 let mut stmt =
                     conn.prepare("SELECT owner_pubkey, volume_id FROM volume_assignments")?;
 
@@ -510,7 +516,7 @@ impl SystemDb {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             let now = now_unix();
             conn.execute(
                 "INSERT INTO global_llm_usage
@@ -545,7 +551,7 @@ impl SystemDb {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || -> Result<Vec<OwnerUsageStats>, rusqlite::Error> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT owner_pubkey,
                         SUM(input_tokens),
@@ -622,7 +628,7 @@ impl SystemDb {
         let conn = Arc::clone(&self.conn);
 
         task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             let now = now_unix();
             conn.execute(
                 "INSERT INTO auth_events
@@ -679,6 +685,29 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn connection_lock_remains_usable_after_worker_panic() {
+        // [SYSTEM-DB-POISON-RECOVERY 2026-07-30 by Codex] The historical
+        // std::sync::Mutex would remain poisoned after this worker exited,
+        // causing every later metadata call to panic at lock().unwrap().
+        let (_dir, db) = open_temp_db().await;
+        let conn = Arc::clone(&db.conn);
+        let join_error = task::spawn_blocking(move || {
+            let _guard = conn.lock();
+            panic!("test-only-system-db-lock-panic");
+        })
+        .await
+        .unwrap_err();
+        assert!(join_error.is_panic());
+
+        let owner = make_owner(0xA5);
+        db.assign_volume(&owner, "vol-recovered").await.unwrap();
+        assert_eq!(
+            db.get_assignment(&owner).await.unwrap(),
+            Some("vol-recovered".to_string())
+        );
+    }
+
     /// Helper: create a SystemDb in a temp directory.
     async fn open_temp_db() -> (TempDir, Arc<SystemDb>) {
         let dir = TempDir::new().unwrap();
@@ -700,7 +729,7 @@ mod tests {
         let conn = Arc::clone(&db.conn);
 
         let tables = task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             let mut stmt = conn
                 .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap();
@@ -893,7 +922,7 @@ mod tests {
         // Verify rows were inserted.
         let conn = Arc::clone(&db.conn);
         let count: i64 = task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock();
             conn.query_row(
                 "SELECT COUNT(*) FROM auth_events WHERE owner_pubkey = ?1",
                 params![owner.as_slice()],

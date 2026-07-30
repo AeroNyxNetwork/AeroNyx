@@ -4,8 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.82.0 - Extended privacy-safe Tokio join diagnostics
-from process supervision into shared SystemDb and StoragePool boundaries.
+Modification Reason: v0.83.0 - Removed the SystemDb mutex poison failure mode
+and completed privacy-safe join diagnostics across signed anchors and Directory
+status workers.
 
 Main Functionality:
 
@@ -30,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.82.0 - [STORAGE-JOIN-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering shared storage errors, API logs, or scheduler diagnostics.
+Last Modified: v0.83.0 - [BLOCKING-WORKER-RECOVERY 2026-07-30 by Codex] Keeps SystemDb usable after a failed worker and prevents raw JoinError payloads from entering anchor/status diagnostics.
+Previous: v0.82.0 - [STORAGE-JOIN-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering shared storage errors, API logs, or scheduler diagnostics.
 Previous: v0.81.0 - [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering process-health status or structured shutdown diagnostics.
 Previous: v0.80.0 - [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Aborts every owned process task when a later startup gate fails instead of detaching its JoinHandle.
 Previous: v0.79.0 - [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Prevents configured Directory synchronization or Full-node Mirror from disappearing behind a ready process.
@@ -115,6 +117,35 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.83 Blocking worker failure is bounded and recoverable
+
+[BLOCKING-WORKER-RECOVERY 2026-07-30 by Codex]
+
+- `SystemDb` now uses the crate-standard `parking_lot::Mutex` around its
+  private SQLite connection. A blocking worker that panics while holding the
+  lock can no longer poison the mutex and force every later tenant metadata
+  operation through another `lock().unwrap()` panic.
+- SQLite work remains inside `spawn_blocking`; no mutex guard crosses an
+  `.await`, no database schema changes, and the public `SystemDb` API remains
+  unchanged.
+- Signed commitment-tip and checkpoint-certificate anchor writes now share one
+  `run_blocking_local_anchor_write` boundary. Join failures contain only the
+  static anchor role and fixed `Panicked` / `Cancelled` / `Failed` category.
+- Directory replica status workers likewise log only a static operation role
+  and the fixed shared join category. Public/operator API response reason
+  buckets remain unchanged.
+- The connection-lock recovery test deliberately terminates one worker while
+  it holds the lock, then proves a later volume assignment and lookup still
+  complete. The anchor-worker test proves panic text cannot enter returned
+  persistence errors.
+- This recovery property does not make panics acceptable and does not suppress
+  Rust's global panic hook. A worker that panics fails its current operation;
+  the invariant is that unrelated later operations do not inherit a permanent
+  poisoned-lock failure.
+- No wire schema, SQLite schema, anchor format, API JSON shape, trust policy,
+  routing decision, synchronization authority, or consensus behavior changes
+  in this milestone.
 
 ### v0.82 Storage task failures remain blind
 

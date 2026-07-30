@@ -155,8 +155,13 @@
 //!   evidence. Never insert it into the durable Directory incident ledger.
 //! - Witness recovery and carrier health must come from exact service-owned
 //!   terminal event order. Never reconstruct event order from timestamps.
+//! - [DIRECTORY-WORKER-PRIVACY 2026-07-30 by Codex] Blocking worker failures
+//!   may log only a static operation role and fixed join category, never the
+//!   raw JoinError or panic payload.
 //!
 //! ## Last Modified
+//! `v0.31.0-DirectoryWorkerPrivacy` - Redacted Tokio panic payloads from
+//! operator/public status worker diagnostics.
 //! `v0.30.0-WitnessTerminalStateStatus` - Replaced timestamp-order inference
 //! with service-owned terminal outcomes and additive consistency diagnostics.
 //! `v0.29.0-DirectoryTransportLifecycleStatus` - Centralized health policy in
@@ -236,6 +241,7 @@ use crate::api::directory_replica_sync::{
     DIRECTORY_SYNC_MAX_REQUESTS_PER_PAGE, DIRECTORY_SYNC_PRODUCER_ROUND_TIMEOUT_SECS,
     DIRECTORY_SYNC_REQUEST_BUDGET_PER_ROUND,
 };
+use crate::error::RuntimeTaskJoinFailureKind;
 use crate::services::directory_replica::{
     DirectoryFullNodeMirrorRuntimeSnapshot, DirectoryObservationWitnessCarrierSnapshot,
     DirectoryObservationWitnessRecoverySnapshot, DirectoryReplicaTransportOutcome,
@@ -983,10 +989,7 @@ async fn directory_observation_certificate_handler(
             )
         }
         Err(error) => {
-            warn!(
-                error = %error,
-                "[DIRECTORY_REPLICA] Observation certificate worker failed"
-            );
+            log_blocking_worker_failure("observation_certificate", &error);
             observation_certificate_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 generated_at,
@@ -1081,10 +1084,7 @@ async fn directory_replica_incidents_handler(
             )
         }
         Err(error) => {
-            warn!(
-                error = %error,
-                "[DIRECTORY_REPLICA] Incident summary worker failed"
-            );
+            log_blocking_worker_failure("incident_summary", &error);
             incident_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 generated_at,
@@ -1139,10 +1139,7 @@ async fn directory_replica_incident_evidence_handler(
             )
         }
         Err(error) => {
-            warn!(
-                error = %error,
-                "[DIRECTORY_REPLICA] Incident evidence worker failed"
-            );
+            log_blocking_worker_failure("incident_evidence", &error);
             incident_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 generated_at,
@@ -1330,10 +1327,7 @@ async fn directory_replica_status_handler(
                     .into_response();
             }
             Err(error) => {
-                warn!(
-                    error = %error,
-                    "[DIRECTORY_REPLICA] Status snapshot worker failed"
-                );
+                log_blocking_worker_failure("status_snapshot", &error);
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(DirectoryReplicaStatusErrorResponse {
@@ -2350,6 +2344,19 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Logs one privacy-safe blocking worker failure for the status surface.
+///
+/// [DIRECTORY-WORKER-PRIVACY 2026-07-30 by Codex] `operation` is restricted
+/// to static code-defined roles. The potentially payload-bearing JoinError is
+/// consumed only for classification and is never formatted.
+fn log_blocking_worker_failure(operation: &'static str, error: &tokio::task::JoinError) {
+    warn!(
+        operation,
+        failure = ?RuntimeTaskJoinFailureKind::classify(error),
+        "[DIRECTORY_REPLICA] Blocking worker failed"
+    );
 }
 
 #[cfg(test)]
