@@ -42,10 +42,11 @@
 //! Fallback: if all CE scores are identical (degenerate batch), sigmoid is used instead.
 //!
 //! ## ORT Runtime Sharing
-//! init_ort_runtime() in embed.rs uses std::sync::Once. RerankerEngine::load() calls
-//! it with the reranker model directory — if ORT is already initialized (by EmbedEngine),
-//! the Once is a no-op and the existing runtime is reused. If EmbedEngine is not loaded,
-//! RerankerEngine will initialize ORT itself.
+//! init_ort_runtime() in embed.rs uses a serialized success-only gate.
+//! RerankerEngine::load() calls it with the reranker model directory — if ORT
+//! is already initialized (by EmbedEngine), the existing runtime is reused. If
+//! an earlier engine failed to find a runtime, reranker may retry from its own
+//! independently configured model directory.
 //!
 //! ## Fallback
 //! If model files are missing or reranker disabled:
@@ -65,7 +66,8 @@
 //!   NOT the MiniLM embedding tokenizer or GLiNER DeBERTa tokenizer.
 //! - max_seq_length for cross-encoder is 512 (query+doc combined). Truncation
 //!   happens on the DOCUMENT side (TruncationParams::max_length applies to the pair).
-//! - ORT runtime is shared via Once in embed.rs — safe to load alongside embed + ner.
+//! - ORT runtime is shared via the retryable gate in embed.rs — safe to load
+//!   alongside embed + ner.
 //! - Session::run() requires &mut self → shared `InferenceSession` wrapper
 //!   (same recovery contract as embed.rs and ner.rs).
 //! - Always use rerank_batch() — it processes all pairs in one ONNX session.run() call,
@@ -76,6 +78,9 @@
 //!   the reranker is too aggressive (degrading good BM25/graph results), lower to 0.5.
 //!
 //! ## Last Modified
+//! v2.4.2-RetryableOrtInitialization -
+//!   [MEMCHAIN-ORT-RECOVERY 2026-07-30 by Codex] Documented the shared
+//!   success-only initialization contract used by all inference engines.
 //! v2.4.1-InferenceSessionRecovery -
 //!   [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] Reused the shared
 //!   non-poisoning ONNX session boundary.

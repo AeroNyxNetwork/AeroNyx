@@ -135,15 +135,19 @@
 //!   `InferenceSession` boundary for interior mutability).
 //! - Run `scripts/download_models.sh` before first build/run to fetch model files
 //!   AND libonnxruntime.so.
-//! - ort::init_from() MUST be called exactly once before any Session is created.
-//!   `OnceLock<Result<(), String>>` safely publishes the first success or error
-//!   to every caller, even when multiple requests race during startup.
+//! - ort::init_from() MUST succeed before any Session is created. The shared
+//!   initialization gate serializes concurrent attempts, caches the first
+//!   success, and leaves failures retryable so another enabled engine can use
+//!   its own valid co-located runtime library.
 //! - Session::run() takes &mut self in ort rc.11. The `InferenceSession`
 //!   wrapper handles this transparently. Do NOT remove the wrapper or change
 //!   &self to &mut self on public methods — that would break concurrent access
 //!   from HTTP handlers.
 //!
 //! ## Last Modified
+//! v2.7.17-RetryableOrtInitialization -
+//!   [MEMCHAIN-ORT-RECOVERY 2026-07-30 by Codex] Replaced sticky failed ORT
+//!   initialization with a serialized success-only gate.
 //! v2.7.16-InferenceSessionRecovery -
 //!   [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] Centralized ONNX session
 //!   serialization behind a non-poisoning lock so a recovered panic cannot
@@ -160,13 +164,11 @@
 //!   Matryoshka truncation (768→384), embed_with_mode() API,
 //!   configurable embed_output_dim. Interface unchanged for all callers.
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 use parking_lot::{Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
 
@@ -361,32 +363,42 @@ fn detect_model_type(session: &Session) -> (EmbedModelType, Option<usize>) {
 // ORT Runtime Initialization (once per process)
 // ============================================
 
-/// Safely publishes the first ORT initialization result to every caller.
+/// Serializes ORT initialization and remembers only a successful commit.
 ///
-/// The first model directory still determines the runtime library, matching
-/// the prior `Once` behavior. A failure is intentionally sticky because ORT
-/// cannot be safely reconfigured after another thread starts session setup.
-static ORT_INIT_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+/// [MEMCHAIN-ORT-RECOVERY 2026-07-30 by Codex] Model directories are
+/// independently configurable. A missing runtime beside the first enabled
+/// model must not permanently prevent a later engine from loading a valid
+/// co-located runtime. Holding the non-poisoning mutex across initialization
+/// also prevents concurrent attempts from racing the process-global ORT state.
+static ORT_INITIALIZED: Mutex<bool> = Mutex::new(false);
 
-fn initialize_once<F>(result: &OnceLock<Result<(), String>>, initialize: F) -> Result<(), String>
+fn initialize_runtime<F>(initialized: &Mutex<bool>, initialize: F) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String>,
 {
-    result.get_or_init(initialize).clone()
+    let mut initialized = initialized.lock();
+    if *initialized {
+        return Ok(());
+    }
+
+    initialize()?;
+    *initialized = true;
+    Ok(())
 }
 
 /// Initialize ONNX Runtime by loading libonnxruntime.so from the given path.
 ///
 /// This MUST be called before creating any ort::Session.
-/// Uses `OnceLock` to ensure it runs exactly once per process and to publish
-/// the same immutable result to every concurrent caller.
+/// Concurrent attempts are serialized. The first successful initialization is
+/// retained for the process lifetime; failures remain retryable by another
+/// enabled engine with a different model directory.
 ///
 /// ## Search Order for libonnxruntime.so
 /// 1. `{model_dir}/libonnxruntime.so` (co-located with model, preferred)
 /// 2. `ORT_DYLIB_PATH` environment variable (user override)
 /// 3. System library paths (`/usr/lib`, `/usr/local/lib`)
 pub(crate) fn init_ort_runtime(model_dir: &Path) -> Result<(), String> {
-    initialize_once(&ORT_INIT_RESULT, || {
+    initialize_runtime(&ORT_INITIALIZED, || {
         let colocated = model_dir.join(ORT_LIB_FILENAME);
         let env_path = std::env::var("ORT_DYLIB_PATH").ok().map(PathBuf::from);
         let system_paths = [
@@ -971,38 +983,61 @@ mod tests {
     }
 
     #[test]
-    fn test_initialize_once_is_thread_safe_and_failure_is_sticky() {
+    fn runtime_initialization_serializes_callers_and_caches_success() {
         const THREADS: usize = 16;
-        let result = Arc::new(OnceLock::new());
+        let initialized = Arc::new(Mutex::new(false));
         let calls = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(THREADS));
         let workers: Vec<_> = (0..THREADS)
             .map(|_| {
-                let result = Arc::clone(&result);
+                let initialized = Arc::clone(&initialized);
                 let calls = Arc::clone(&calls);
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    initialize_once(&result, || {
+                    initialize_runtime(&initialized, || {
                         calls.fetch_add(1, Ordering::SeqCst);
                         std::thread::sleep(std::time::Duration::from_millis(10));
-                        Err("deterministic ORT init failure".to_string())
+                        Ok(())
                     })
                 })
             })
             .collect();
 
         for worker in workers {
-            assert_eq!(
-                worker.join().unwrap().unwrap_err(),
-                "deterministic ORT init failure"
-            );
+            worker.join().unwrap().unwrap();
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            initialize_once(&result, || Ok(())).unwrap_err(),
-            "deterministic ORT init failure"
-        );
+        initialize_runtime(&initialized, || Err("must not run".to_string())).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn runtime_initialization_retries_after_failure() {
+        // [MEMCHAIN-ORT-RECOVERY 2026-07-30 by Codex] A broken runtime beside
+        // the first model cannot poison later independently configured engines.
+        let initialized = Mutex::new(false);
+        let calls = AtomicUsize::new(0);
+
+        let first_error = initialize_runtime(&initialized, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("first runtime unavailable".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(first_error, "first runtime unavailable");
+
+        initialize_runtime(&initialized, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        initialize_runtime(&initialized, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("must not run after success".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

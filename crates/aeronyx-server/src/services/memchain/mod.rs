@@ -53,8 +53,13 @@
 //! - [NER-RUNTIME-INDEPENDENCE 2026-07-30 by Codex] Every independently
 //!   configurable inference engine must initialize ORT itself. NER must also
 //!   honor `MemChainConfig::effective_ner_tokenizer_path()`.
+//! - [MEMCHAIN-ORT-RECOVERY 2026-07-30 by Codex] ORT initialization caches
+//!   only success. A failed model-local runtime lookup must remain retryable by
+//!   another independently configured inference engine.
 //!
 //! ## Last Modified
+//! v2.8.58-RetryableOrtInitialization - Made process-global ORT startup
+//! failure-recoverable while preserving single-success semantics.
 //! v2.8.57-NerRuntimeIndependence - Wired the configured tokenizer and removed
 //! NER's hidden dependency on embedding initialization order.
 //! v2.8.56-InferenceSessionRecovery - Centralized local ONNX session
