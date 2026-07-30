@@ -279,6 +279,9 @@
 // 110. [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Treats configured
 //      Directory replica initialization and task liveness as required runtime
 //      state, preventing READY after mirror/synchronization silently vanished.
+// 111. [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Registers every spawned
+//      process task immediately so any later startup error aborts owned work
+//      instead of detaching JoinHandles from the failed startup transaction.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -2379,6 +2382,41 @@ struct ManagementRuntime {
     tasks: [(&'static str, JoinHandle<()>); 3],
 }
 
+/// Owns all process-lifetime tasks across startup and normal operation.
+///
+/// [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Tokio detaches a task when its
+/// `JoinHandle` is dropped. Keeping every handle here makes startup
+/// transactional: any early return aborts registered work, while the explicit
+/// handoff preserves the existing bounded graceful-shutdown path.
+#[derive(Default)]
+struct RuntimeTaskRegistry {
+    tasks: Vec<(&'static str, JoinHandle<()>)>,
+}
+
+impl RuntimeTaskRegistry {
+    fn push(&mut self, task: (&'static str, JoinHandle<()>)) {
+        self.tasks.push(task);
+    }
+
+    fn take_for_shutdown(mut self) -> Vec<(&'static str, JoinHandle<()>)> {
+        std::mem::take(&mut self.tasks)
+    }
+}
+
+impl Drop for RuntimeTaskRegistry {
+    fn drop(&mut self) {
+        for (name, task) in &self.tasks {
+            if !task.is_finished() {
+                task.abort();
+                debug!(
+                    task = *name,
+                    "[STARTUP] Aborted owned runtime task while unwinding startup"
+                );
+            }
+        }
+    }
+}
+
 /// Result of bringing one long-lived runtime task to a terminal state.
 ///
 /// [TASK-SHUTDOWN 2026-07-29 by Codex] Keep shutdown outcomes typed so timeout
@@ -2461,6 +2499,10 @@ impl Server {
         // only the first critical runtime failure. The receiver stays in the
         // main task so required listener loss can terminate the process.
         let (critical_failure_tx, mut critical_failure_rx) = mpsc::channel(1);
+        // [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Create ownership before
+        // the first process task can be spawned. Every later `?` then aborts
+        // work already started by this startup transaction.
+        let mut tasks = RuntimeTaskRegistry::default();
 
         let peer_http_clients = PeerHttpClients::build(&self.config)?;
         info!(
@@ -2585,26 +2627,42 @@ impl Server {
         } else {
             None
         };
-        let peer_store_persistence_task = self.spawn_peer_store_persistence_task(
+        if let Some(task) = self.spawn_peer_store_persistence_task(
             Arc::clone(&peer_store),
             Arc::clone(&peer_http_clients.control),
-        );
-        let directory_chain_persistence_task = self.spawn_directory_chain_persistence_task(
+        ) {
+            tasks.push(("peer-cache-persistence", task));
+        }
+        if let Some(task) = self.spawn_directory_chain_persistence_task(
             Arc::clone(&peer_store),
             directory_chain_store.clone(),
-        );
-        let directory_replica_sync_task = self.spawn_directory_replica_sync_task(
+        ) {
+            tasks.push(("directory-chain-persistence", task));
+        }
+        if let Some(task) = self.spawn_directory_replica_sync_task(
             Arc::clone(&peer_store),
             directory_replica_store.clone(),
             Arc::clone(&directory_replica_sync_runtime),
             Arc::clone(&peer_http_clients.directory_sync),
-        )?;
-        let discovery_gossip_task = self.spawn_discovery_gossip_task(
+        )? {
+            tasks.push((
+                "directory-replica-sync",
+                Self::supervise_required_runtime_task(
+                    "directory-replica-sync",
+                    task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
+        }
+        if let Some(task) = self.spawn_discovery_gossip_task(
             Arc::clone(&peer_store),
             directory_replica_store.clone(),
             chat_relay_runtime_ready,
             Arc::clone(&peer_http_clients.gossip),
-        );
+        ) {
+            tasks.push(("discovery-gossip", task));
+        }
 
         let udp = Arc::new(
             UdpTransport::bind_addr(self.config.listen_addr())
@@ -2617,27 +2675,6 @@ impl Server {
         let tun = self.init_tun().await?;
 
         let server_pubkey_hex = hex::encode(self.identity.public_key_bytes());
-        let mut tasks: Vec<(&'static str, JoinHandle<()>)> = Vec::new();
-        if let Some(task) = peer_store_persistence_task {
-            tasks.push(("peer-cache-persistence", task));
-        }
-        if let Some(task) = directory_chain_persistence_task {
-            tasks.push(("directory-chain-persistence", task));
-        }
-        if let Some(task) = directory_replica_sync_task {
-            tasks.push((
-                "directory-replica-sync",
-                Self::supervise_required_runtime_task(
-                    "directory-replica-sync",
-                    task,
-                    Arc::clone(&self.shutdown),
-                    critical_failure_tx.clone(),
-                ),
-            ));
-        }
-        if let Some(task) = discovery_gossip_task {
-            tasks.push(("discovery-gossip", task));
-        }
 
         // AeroNyx client readiness requires DNS to be available at the tunnel
         // gateway. When enabled, this proxy forwards opaque UDP DNS bytes only
@@ -3308,7 +3345,7 @@ impl Server {
         // broadcast already, so join them concurrently. This bounds total
         // shutdown by the longest grace period instead of the sum of all
         // per-task deadlines.
-        for report in Self::shutdown_runtime_tasks(tasks).await {
+        for report in Self::shutdown_runtime_tasks(tasks.take_for_shutdown()).await {
             match report.outcome {
                 RuntimeTaskShutdownOutcome::Completed => {
                     debug!(task = report.name, "Runtime task completed");
@@ -11589,8 +11626,8 @@ mod tests {
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
         DiscoveryPeerIdentityHints, PeerHttpClients, PeerStoreCacheDocument,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
-        RequiredApiListenerExit, RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server,
-        SystemdNotifier,
+        RequiredApiListenerExit, RuntimeTaskRegistry, RuntimeTaskShutdownOutcome,
+        RuntimeTaskShutdownReport, Server, SystemdNotifier,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DATA_PLANE_RECV_FAILURE_LIMIT,
@@ -11908,6 +11945,53 @@ mod tests {
             take_pre_ready_runtime_failure(&mut failure_rx),
             Some(required_runtime_supervisor_channel_closed())
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_task_registry_aborts_tasks_when_startup_unwinds() {
+        // [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Dropping the registry
+        // models any `?` after a process task has started.
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = task.abort_handle();
+        let mut registry = RuntimeTaskRegistry::default();
+        registry.push(("test-startup-task", task));
+
+        drop(registry);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(abort_handle.is_finished());
+    }
+
+    #[tokio::test]
+    async fn runtime_task_registry_hands_tasks_to_bounded_shutdown() {
+        // [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Successful startup
+        // disarms Drop ownership and transfers the same handles into the
+        // established concurrent shutdown policy.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = release_rx.await;
+        });
+        let abort_handle = task.abort_handle();
+        let mut registry = RuntimeTaskRegistry::default();
+        registry.push(("test-runtime-task", task));
+
+        let tasks = registry.take_for_shutdown();
+        assert!(!abort_handle.is_finished());
+        release_tx.send(()).unwrap();
+        let reports = Server::shutdown_runtime_tasks(tasks).await;
+        assert_eq!(
+            reports,
+            vec![RuntimeTaskShutdownReport {
+                name: "test-runtime-task",
+                outcome: RuntimeTaskShutdownOutcome::Completed,
+            }]
+        );
+        assert!(abort_handle.is_finished());
     }
 
     #[test]

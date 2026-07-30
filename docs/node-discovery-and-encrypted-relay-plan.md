@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.79.0 - Made configured Directory replica and Full-node
-Mirror startup/liveness fail closed instead of allowing a false-ready node.
+Modification Reason: v0.80.0 - Added RAII ownership for every process task so
+failed startup transactions cannot leave detached background work.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.79.0 - [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Prevents configured Directory synchronization or Full-node Mirror from disappearing behind a ready process.
+Last Modified: v0.80.0 - [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Aborts every owned process task when a later startup gate fails instead of detaching its JoinHandle.
+Previous: v0.79.0 - [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Prevents configured Directory synchronization or Full-node Mirror from disappearing behind a ready process.
 Previous: v0.78.0 - [MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex] Prevents heartbeat, command, or session-reporting workers from disappearing behind a healthy process.
 Previous: v0.77.0 - [DNS-STARTUP-READINESS 2026-07-30 by Codex] Prevents readiness before DNS bind and bounds the complete DNS forwarding task lifecycle.
 Previous: v0.76.0 - [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Prevents persistent UDP/TUN receive errors from leaving a hot-looping or falsely healthy node.
@@ -112,6 +113,36 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.80 Process tasks belong to one startup transaction
+
+[STARTUP-TASK-REGISTRY 2026-07-30 by Codex]
+
+- `Server::run` creates one `RuntimeTaskRegistry` before spawning the first
+  process-lifetime task. Peer-cache persistence, Directory persistence,
+  Directory replica synchronization, discovery gossip, management workers,
+  data-plane workers, cleanup jobs, miners, and API supervisors all enter this
+  same ownership boundary.
+- Early persistence and gossip handles are registered immediately instead of
+  remaining in local variables across later fallible UDP, TUN, DNS, management,
+  and API initialization.
+- Rust/Tokio normally detaches a task when its `JoinHandle` is dropped. The
+  registry's RAII `Drop` instead aborts every still-running owned handle when
+  startup returns an error, preventing failed embedded starts from leaving
+  hidden background work in the caller's Tokio runtime.
+- Required-task supervisor handles remain nested owners. Aborting one through
+  the registry also aborts its guarded inner task, so supervision does not
+  reintroduce detachment during startup unwind.
+- After a successful runtime wait, ownership is explicitly transferred to the
+  existing concurrent bounded-shutdown implementation. Normal SIGINT, SIGTERM,
+  programmatic stop, or critical-task recovery therefore retains cooperative
+  broadcast, bounded joins, timeout aborts, and cancellation confirmation.
+- Registry diagnostics contain only fixed local task role names. They never
+  include peers, endpoints, routes, packet metadata, block contents, message
+  identifiers, client identities, payloads, or other user-plane data.
+- No wire schema, synchronization authority, mirror policy, routing policy,
+  storage format, API behavior, or blind-node privacy invariant changes in
+  this milestone.
 
 ### v0.79 Configured Directory synchronization is required runtime state
 
