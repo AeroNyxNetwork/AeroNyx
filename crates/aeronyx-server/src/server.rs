@@ -3553,14 +3553,27 @@ impl Server {
             return None;
         }
         let model_path = &self.config.memchain.ner_model_path;
+        let tokenizer_path = self.config.memchain.effective_ner_tokenizer_path();
         let threshold = self.config.memchain.ner_confidence_threshold;
-        match NerEngine::load(model_path, threshold, 0) {
+        // [NER-RUNTIME-INDEPENDENCE 2026-07-30 by Codex] Honor the existing
+        // tokenizer override instead of silently forcing model_dir/tokenizer.json.
+        match NerEngine::load_with_tokenizer(model_path, &tokenizer_path, threshold, 0) {
             Ok(engine) => {
-                info!(model = %model_path, threshold, "[NER] Local NER engine loaded");
+                info!(
+                    model = %model_path,
+                    tokenizer = %tokenizer_path,
+                    threshold,
+                    "[NER] Local NER engine loaded"
+                );
                 Some(Arc::new(engine))
             }
             Err(e) => {
-                warn!(model = %model_path, error = %e, "[NER] Unavailable");
+                warn!(
+                    model = %model_path,
+                    tokenizer = %tokenizer_path,
+                    error = %e,
+                    "[NER] Unavailable"
+                );
                 None
             }
         }

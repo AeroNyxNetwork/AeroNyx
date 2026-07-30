@@ -108,6 +108,9 @@
 //! - span_mask tensor type is bool (not u8). ort 2.0.0-rc.11 supports bool directly.
 //!
 //! ## Last Modified
+//! v2.4.2-IndependentRuntimeInitialization -
+//!   [NER-RUNTIME-INDEPENDENCE 2026-07-30 by Codex] Made NER initialize the
+//!   shared ORT runtime itself and honored the configured tokenizer path.
 //! v2.4.1-InferenceSessionRecovery -
 //!   [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] Reused the shared
 //!   non-poisoning ONNX session boundary.
@@ -126,7 +129,7 @@ use ort::value::Tensor;
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
-use super::embed::InferenceSession;
+use super::embed::{init_ort_runtime, InferenceSession};
 
 // ============================================
 // Constants
@@ -233,10 +236,9 @@ pub struct NerEngine {
 impl NerEngine {
     /// Load GLiNER ONNX model and tokenizer from the given directory.
     ///
-    /// ## Prerequisites
-    /// - `init_ort_runtime()` must have been called (by EmbedEngine::load or directly).
-    ///   If EmbedEngine is loaded first (which is the normal case), ORT is already initialized.
-    ///   If NerEngine is loaded standalone, the caller must ensure ORT init.
+    /// This entry point preserves the historical API and resolves the tokenizer
+    /// to `{model_dir}/tokenizer.json`. Use [`Self::load_with_tokenizer`] when
+    /// the tokenizer is stored elsewhere.
     ///
     /// ## Arguments
     /// * `model_dir` - Directory containing `model.onnx` and `tokenizer.json`
@@ -252,6 +254,23 @@ impl NerEngine {
         max_width: usize,
     ) -> Result<Self, String> {
         let model_dir = model_dir.as_ref();
+        let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
+        Self::load_with_tokenizer(model_dir, tokenizer_path, confidence_threshold, max_width)
+    }
+
+    /// Load GLiNER with an explicit tokenizer path.
+    ///
+    /// [NER-RUNTIME-INDEPENDENCE 2026-07-30 by Codex] NER is an independently
+    /// configurable engine. It initializes the process-global ORT runtime
+    /// itself instead of relying on embedding or reranking to run first.
+    pub fn load_with_tokenizer(
+        model_dir: impl AsRef<Path>,
+        tokenizer_path: impl AsRef<Path>,
+        confidence_threshold: f32,
+        max_width: usize,
+    ) -> Result<Self, String> {
+        let model_dir = model_dir.as_ref();
+        let tokenizer_path = tokenizer_path.as_ref();
         let confidence_threshold = if confidence_threshold <= 0.0 || confidence_threshold >= 1.0 {
             DEFAULT_CONFIDENCE_THRESHOLD
         } else {
@@ -264,7 +283,6 @@ impl NerEngine {
         };
 
         let model_path = model_dir.join(MODEL_FILENAME);
-        let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);
 
         if !model_path.exists() {
             return Err(format!(
@@ -278,6 +296,8 @@ impl NerEngine {
                 tokenizer_path.display()
             ));
         }
+
+        init_ort_runtime(model_dir)?;
 
         // Load ONNX model — same settings as EmbedEngine
         let session = Session::builder()
@@ -1000,6 +1020,22 @@ mod tests {
             "Error should mention 'not found': {}",
             err
         );
+    }
+
+    #[test]
+    fn custom_tokenizer_path_is_honored_before_runtime_initialization() {
+        // [NER-RUNTIME-INDEPENDENCE 2026-07-30 by Codex] This regression test
+        // remains model-free: model presence advances validation to the
+        // explicit tokenizer path, which must fail before ORT initialization.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(MODEL_FILENAME), b"test-model").unwrap();
+        let tokenizer_path = directory.path().join("custom").join("tokenizer.json");
+
+        let error =
+            NerEngine::load_with_tokenizer(directory.path(), &tokenizer_path, 0.5, 12).unwrap_err();
+
+        assert!(error.contains(&tokenizer_path.display().to_string()));
+        assert!(error.contains("not found"));
     }
 
     /// Standalone word_split for testing without NerEngine instance.

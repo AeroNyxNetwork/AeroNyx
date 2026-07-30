@@ -50,8 +50,13 @@
 //! - [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] Embedding, NER, and
 //!   reranking must share `embed::InferenceSession`; do not reintroduce
 //!   individually poisonable `std::sync::Mutex<ort::Session>` fields.
+//! - [NER-RUNTIME-INDEPENDENCE 2026-07-30 by Codex] Every independently
+//!   configurable inference engine must initialize ORT itself. NER must also
+//!   honor `MemChainConfig::effective_ner_tokenizer_path()`.
 //!
 //! ## Last Modified
+//! v2.8.57-NerRuntimeIndependence - Wired the configured tokenizer and removed
+//! NER's hidden dependency on embedding initialization order.
 //! v2.8.56-InferenceSessionRecovery - Centralized local ONNX session
 //! serialization behind one non-poisoning recovery boundary.
 //! v2.8.55-CertificateBackfillTelemetry - Re-exported the coordinator backfill outcome.
