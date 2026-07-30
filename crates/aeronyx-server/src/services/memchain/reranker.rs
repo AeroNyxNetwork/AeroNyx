@@ -78,6 +78,10 @@
 //!   the reranker is too aggressive (degrading good BM25/graph results), lower to 0.5.
 //!
 //! ## Last Modified
+//! v2.4.7-OnnxModelContract -
+//!   [MEMCHAIN-ONNX-MODEL-CONTRACT 2026-07-30 by Codex] Validate model input
+//!   names, tensor types/ranks, and the logits output during engine loading;
+//!   inference now uses the resolved output index instead of assuming zero.
 //! v2.4.6-ModelSequenceBounds -
 //!   [MEMCHAIN-MODEL-SEQUENCE-BOUNDS 2026-07-30 by Codex] Rejects sequence
 //!   limits above the cross-encoder's positional capacity during engine load.
@@ -109,14 +113,16 @@ use std::path::Path;
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
+use ort::tensor::TensorElementType;
 use ort::value::Tensor;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
 
 // Re-use the ORT initialization and session boundary from embed.rs.
 use super::embed::{
-    init_ort_runtime, require_onnx_output, resolve_model_sequence_length, validate_tokenized_batch,
-    InferenceSession,
+    init_ort_runtime, require_onnx_output, resolve_model_sequence_length,
+    validate_onnx_model_contract, validate_tokenized_batch, InferenceSession, OnnxOutputSelector,
+    OnnxTensorContract,
 };
 
 // ============================================
@@ -252,6 +258,8 @@ pub struct RerankerEngine {
     session: InferenceSession<Session>,
     tokenizer: Tokenizer,
     max_seq_length: usize,
+    /// Load-time-validated logits output index.
+    output_idx: usize,
 }
 
 /// A reranked candidate with its cross-encoder score and blended final score.
@@ -315,6 +323,20 @@ impl RerankerEngine {
 
         info!(model = %model_path.display(), max_seq = max_seq_length, "[RERANKER] ONNX model loaded");
 
+        let output_idx = validate_onnx_model_contract(
+            "Reranker",
+            session.inputs(),
+            session.outputs(),
+            &[
+                OnnxTensorContract::new("input_ids", TensorElementType::Int64, &[2]),
+                OnnxTensorContract::new("attention_mask", TensorElementType::Int64, &[2]),
+                OnnxTensorContract::new("token_type_ids", TensorElementType::Int64, &[2]),
+            ],
+            OnnxOutputSelector::NamedOrOnly("logits"),
+            TensorElementType::Float32,
+            &[1, 2],
+        )?;
+
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("Reranker tokenizer ({}): {}", tokenizer_path.display(), e))?;
 
@@ -324,6 +346,7 @@ impl RerankerEngine {
             session: InferenceSession::new(session),
             tokenizer,
             max_seq_length,
+            output_idx,
         })
     }
 
@@ -420,7 +443,7 @@ impl RerankerEngine {
             .map_err(|e| format!("Reranker ONNX inference: {}", e))?;
 
         // Output: logits shaped [batch_size, 1] or [batch_size]
-        let logits_output = require_onnx_output("Reranker", outputs.values(), 0)?;
+        let logits_output = require_onnx_output("Reranker", outputs.values(), self.output_idx)?;
         let logits = logits_output
             .try_extract_array::<f32>()
             .map_err(|e| format!("Reranker output extraction: {}", e))?;

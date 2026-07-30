@@ -70,7 +70,8 @@
 //! ## Model Auto-Detection
 //! `EmbedEngine::load()` auto-detects the model type by checking ONNX output names:
 //! - If output named "sentence_embedding" exists → EmbeddingGemma pipeline
-//! - Otherwise → MiniLM pipeline (mean pooling)
+//! - If output named "last_hidden_state" exists → MiniLM pipeline (mean pooling)
+//! - Otherwise loading fails as an incompatible model instead of guessing
 //! This means users can switch models by changing `embed_model_path` in config.toml
 //! and re-running `download_models.sh --embed-gemma`. Zero code changes needed.
 //!
@@ -145,6 +146,11 @@
 //!   from HTTP handlers.
 //!
 //! ## Last Modified
+//! v2.7.22-OnnxModelContract -
+//!   [MEMCHAIN-ONNX-MODEL-CONTRACT 2026-07-30 by Codex] Added shared load-time
+//!   ONNX input/output name, tensor-type, and rank validation. Embedding model
+//!   detection now rejects unknown exports and resolves every output index
+//!   before inference instead of assuming output zero.
 //! v2.7.21-ModelSequenceBounds -
 //!   [MEMCHAIN-MODEL-SEQUENCE-BOUNDS 2026-07-30 by Codex] Added explicit
 //!   model-specific sequence limits so invalid configuration fails during
@@ -182,7 +188,8 @@
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
-use ort::value::Tensor;
+use ort::tensor::TensorElementType;
+use ort::value::{Outlet, Tensor};
 use parking_lot::{Mutex, MutexGuard};
 use std::path::{Path, PathBuf};
 use tokenizers::{Encoding, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -244,6 +251,172 @@ pub(super) fn require_onnx_output<T>(
             engine, output_count, index
         )
     })
+}
+
+/// Tensor metadata required by one local ONNX inference engine.
+///
+/// [MEMCHAIN-ONNX-MODEL-CONTRACT 2026-07-30 by Codex] Model files are an
+/// untrusted deployment boundary. Keeping the expected element type and rank
+/// beside each input name lets every engine fail during loading rather than
+/// building an incompatible tensor on its first request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OnnxTensorContract {
+    name: &'static str,
+    element_type: TensorElementType,
+    accepted_ranks: &'static [usize],
+}
+
+impl OnnxTensorContract {
+    pub(super) const fn new(
+        name: &'static str,
+        element_type: TensorElementType,
+        accepted_ranks: &'static [usize],
+    ) -> Self {
+        Self {
+            name,
+            element_type,
+            accepted_ranks,
+        }
+    }
+}
+
+/// How an inference engine identifies its result tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OnnxOutputSelector {
+    /// The named output is part of the stable model contract.
+    Named(&'static str),
+    /// Prefer the conventional name, but accept an arbitrary name only when
+    /// the graph has exactly one output. This preserves compatible exports
+    /// without relying on output ordering in a multi-output graph.
+    NamedOrOnly(&'static str),
+}
+
+fn validate_onnx_outlet(
+    engine: &str,
+    boundary: &str,
+    outlet: &Outlet,
+    contract: OnnxTensorContract,
+) -> Result<(), String> {
+    let actual_type = outlet.dtype().tensor_type().ok_or_else(|| {
+        format!(
+            "{} ONNX {} '{}' must be a tensor, found {}",
+            engine,
+            boundary,
+            outlet.name(),
+            outlet.dtype()
+        )
+    })?;
+    if actual_type != contract.element_type {
+        return Err(format!(
+            "{} ONNX {} '{}' has element type {}; expected {}",
+            engine,
+            boundary,
+            outlet.name(),
+            actual_type,
+            contract.element_type
+        ));
+    }
+
+    let actual_rank = outlet
+        .dtype()
+        .tensor_shape()
+        .map(|shape| shape.len())
+        .ok_or_else(|| {
+            format!(
+                "{} ONNX {} '{}' is missing tensor shape metadata",
+                engine,
+                boundary,
+                outlet.name()
+            )
+        })?;
+    if !contract.accepted_ranks.contains(&actual_rank) {
+        return Err(format!(
+            "{} ONNX {} '{}' has rank {}; expected one of {:?}",
+            engine,
+            boundary,
+            outlet.name(),
+            actual_rank,
+            contract.accepted_ranks
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate a loaded ONNX session and return the selected output index.
+///
+/// Inputs are exact because `Session::run` receives precisely the tensors
+/// declared by the engine. Outputs may contain additional diagnostic tensors,
+/// but the consumed output must be unambiguous and type-compatible.
+pub(super) fn validate_onnx_model_contract(
+    engine: &str,
+    inputs: &[Outlet],
+    outputs: &[Outlet],
+    expected_inputs: &[OnnxTensorContract],
+    output_selector: OnnxOutputSelector,
+    output_element_type: TensorElementType,
+    output_ranks: &'static [usize],
+) -> Result<usize, String> {
+    let actual_input_names: Vec<&str> = inputs.iter().map(Outlet::name).collect();
+    if inputs.len() != expected_inputs.len() {
+        let expected_names: Vec<&str> = expected_inputs
+            .iter()
+            .map(|contract| contract.name)
+            .collect();
+        return Err(format!(
+            "{} ONNX inputs {:?} do not match required inputs {:?}",
+            engine, actual_input_names, expected_names
+        ));
+    }
+
+    for contract in expected_inputs {
+        let outlet = inputs
+            .iter()
+            .find(|outlet| outlet.name() == contract.name)
+            .ok_or_else(|| {
+                format!(
+                    "{} ONNX is missing required input '{}'; available inputs: {:?}",
+                    engine, contract.name, actual_input_names
+                )
+            })?;
+        validate_onnx_outlet(engine, "input", outlet, *contract)?;
+    }
+
+    let output_name = match output_selector {
+        OnnxOutputSelector::Named(name) | OnnxOutputSelector::NamedOrOnly(name) => name,
+    };
+    let output_index = outputs
+        .iter()
+        .position(|outlet| outlet.name() == output_name)
+        .or_else(|| match output_selector {
+            OnnxOutputSelector::Named(_) => None,
+            OnnxOutputSelector::NamedOrOnly(_) if outputs.len() == 1 => Some(0),
+            OnnxOutputSelector::NamedOrOnly(_) => None,
+        })
+        .ok_or_else(|| {
+            let available: Vec<&str> = outputs.iter().map(Outlet::name).collect();
+            format!(
+                "{} ONNX is missing unambiguous output '{}'; available outputs: {:?}",
+                engine, output_name, available
+            )
+        })?;
+
+    validate_onnx_outlet(
+        engine,
+        "output",
+        &outputs[output_index],
+        OnnxTensorContract::new(output_name, output_element_type, output_ranks),
+    )?;
+
+    debug!(
+        engine,
+        inputs = ?actual_input_names,
+        output = outputs[output_index].name(),
+        output_index,
+        "[MEMCHAIN] ONNX model contract validated"
+    );
+
+    Ok(output_index)
 }
 
 /// Validate the structural contract of a padded tokenizer batch.
@@ -593,16 +766,12 @@ pub enum EmbedPromptMode {
 /// Checks if the model has a "sentence_embedding" output tensor,
 /// which is characteristic of EmbeddingGemma's ONNX export.
 /// MiniLM only has "last_hidden_state" (and optionally "pooler_output").
-/// Detect model type and optionally return the index of "sentence_embedding" output.
-///
-/// Returns (model_type, sentence_embedding_index).
-/// For EmbeddingGemma: index is Some(N) where N is the output position.
-/// For MiniLM: index is None.
+/// Detect the model type and validate its complete inference contract.
 ///
 /// We resolve the index here (before Session::run()) to avoid borrow conflicts:
 /// Session::run() returns SessionOutputs that borrows &mut Session, so we
 /// cannot call session.outputs() while SessionOutputs is alive.
-fn detect_model_type(session: &Session) -> (EmbedModelType, Option<usize>) {
+fn detect_model_type(session: &Session) -> Result<(EmbedModelType, usize), String> {
     let output_names: Vec<String> = session
         .outputs()
         .iter()
@@ -611,17 +780,45 @@ fn detect_model_type(session: &Session) -> (EmbedModelType, Option<usize>) {
 
     debug!(outputs = ?output_names, "[EMBED] ONNX model output tensor names");
 
-    let se_idx = output_names
-        .iter()
-        .position(|name| name == "sentence_embedding");
-
-    if se_idx.is_some() {
+    if output_names.iter().any(|name| name == "sentence_embedding") {
+        let output_index = validate_onnx_model_contract(
+            "EmbeddingGemma",
+            session.inputs(),
+            session.outputs(),
+            &[
+                OnnxTensorContract::new("input_ids", TensorElementType::Int64, &[2]),
+                OnnxTensorContract::new("attention_mask", TensorElementType::Int64, &[2]),
+            ],
+            OnnxOutputSelector::Named("sentence_embedding"),
+            TensorElementType::Float32,
+            &[2],
+        )?;
         info!("[EMBED] Detected EmbeddingGemma model (sentence_embedding output found)");
-        (EmbedModelType::EmbeddingGemma, se_idx)
-    } else {
-        info!("[EMBED] Detected MiniLM model (no sentence_embedding output)");
-        (EmbedModelType::MiniLM, None)
+        return Ok((EmbedModelType::EmbeddingGemma, output_index));
     }
+
+    if output_names.iter().any(|name| name == "last_hidden_state") {
+        let output_index = validate_onnx_model_contract(
+            "MiniLM",
+            session.inputs(),
+            session.outputs(),
+            &[
+                OnnxTensorContract::new("input_ids", TensorElementType::Int64, &[2]),
+                OnnxTensorContract::new("attention_mask", TensorElementType::Int64, &[2]),
+                OnnxTensorContract::new("token_type_ids", TensorElementType::Int64, &[2]),
+            ],
+            OnnxOutputSelector::Named("last_hidden_state"),
+            TensorElementType::Float32,
+            &[3],
+        )?;
+        info!("[EMBED] Detected MiniLM model (last_hidden_state output found)");
+        return Ok((EmbedModelType::MiniLM, output_index));
+    }
+
+    Err(format!(
+        "Unsupported embedding ONNX outputs {:?}; expected 'sentence_embedding' or 'last_hidden_state'",
+        output_names
+    ))
 }
 
 // ============================================
@@ -748,10 +945,9 @@ pub struct EmbedEngine {
     max_seq_length: usize,
     /// Auto-detected model type (MiniLM or EmbeddingGemma).
     model_type: EmbedModelType,
-    /// Index of "sentence_embedding" output in ONNX session outputs.
-    /// Only Some for EmbeddingGemma; None for MiniLM.
-    /// Pre-resolved at load time to avoid borrow conflicts with Session::run().
-    se_output_idx: Option<usize>,
+    /// Validated model output index, resolved before inference to avoid borrow
+    /// conflicts with `Session::run()` and output-order assumptions.
+    embedding_output_idx: usize,
     /// Output embedding dimension after Matryoshka truncation.
     /// For MiniLM: always 384 (native dimension, no truncation).
     /// For EmbeddingGemma: configurable, default 384 (truncated from 768).
@@ -816,7 +1012,7 @@ impl EmbedEngine {
         info!(model = %model_path.display(), "[EMBED] ONNX model loaded");
 
         // Auto-detect model type from ONNX output tensor names
-        let (model_type, se_output_idx) = detect_model_type(&session);
+        let (model_type, embedding_output_idx) = detect_model_type(&session)?;
 
         // Resolve max_seq_length: 0 → model-specific default, while rejecting
         // values beyond each model's positional embedding capacity.
@@ -868,7 +1064,7 @@ impl EmbedEngine {
             tokenizer,
             max_seq_length,
             model_type,
-            se_output_idx,
+            embedding_output_idx,
             output_dim,
         })
     }
@@ -1034,8 +1230,9 @@ impl EmbedEngine {
             ])
             .map_err(|e| format!("ONNX inference: {}", e))?;
 
-        // Output[0] = last_hidden_state: [batch_size, seq_len, hidden_dim]
-        let hidden_output = require_onnx_output("MiniLM", outputs.values(), 0)?;
+        // last_hidden_state: [batch_size, seq_len, hidden_dim]
+        let hidden_output =
+            require_onnx_output("MiniLM", outputs.values(), self.embedding_output_idx)?;
         let hidden = hidden_output
             .try_extract_array::<f32>()
             .map_err(|e| format!("Output extraction: {}", e))?;
@@ -1171,12 +1368,12 @@ impl EmbedEngine {
             ])
             .map_err(|e| format!("ONNX inference: {}", e))?;
 
-        // Use pre-resolved output index (computed at load time to avoid borrow conflict).
-        let se_idx = self.se_output_idx.ok_or_else(|| {
-            "EmbeddingGemma ONNX missing 'sentence_embedding' output index".to_string()
-        })?;
-
-        let embeddings_output = require_onnx_output("EmbeddingGemma", outputs.values(), se_idx)?;
+        // Use the load-time-validated output index to avoid borrow conflicts.
+        let embeddings_output = require_onnx_output(
+            "EmbeddingGemma",
+            outputs.values(),
+            self.embedding_output_idx,
+        )?;
         let embeddings = embeddings_output
             .try_extract_array::<f32>()
             .map_err(|e| format!("sentence_embedding extraction: {}", e))?;
@@ -1232,6 +1429,8 @@ impl std::fmt::Debug for EmbedEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ort::tensor::{Shape, SymbolicDimensions};
+    use ort::value::ValueType;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
@@ -1334,6 +1533,163 @@ mod tests {
         let short_error = require_onnx_output("test-engine", [11_u8].into_iter(), 1).unwrap_err();
         assert!(short_error.contains("returned 1 outputs"));
         assert!(short_error.contains("index 1"));
+    }
+
+    fn test_tensor_outlet(name: &str, element_type: TensorElementType, rank: usize) -> Outlet {
+        Outlet::new(
+            name,
+            ValueType::Tensor {
+                ty: element_type,
+                shape: Shape::new(std::iter::repeat(-1).take(rank)),
+                dimension_symbols: SymbolicDimensions::empty(rank),
+            },
+        )
+    }
+
+    #[test]
+    fn onnx_model_contract_resolves_named_output_without_order_assumption() {
+        let inputs = [
+            test_tensor_outlet("attention_mask", TensorElementType::Int64, 2),
+            test_tensor_outlet("input_ids", TensorElementType::Int64, 2),
+        ];
+        let outputs = [
+            test_tensor_outlet("diagnostics", TensorElementType::Float32, 1),
+            test_tensor_outlet("sentence_embedding", TensorElementType::Float32, 2),
+        ];
+        let expected_inputs = [
+            OnnxTensorContract::new("input_ids", TensorElementType::Int64, &[2]),
+            OnnxTensorContract::new("attention_mask", TensorElementType::Int64, &[2]),
+        ];
+
+        let output_index = validate_onnx_model_contract(
+            "test-engine",
+            &inputs,
+            &outputs,
+            &expected_inputs,
+            OnnxOutputSelector::Named("sentence_embedding"),
+            TensorElementType::Float32,
+            &[2],
+        )
+        .unwrap();
+
+        assert_eq!(output_index, 1);
+    }
+
+    #[test]
+    fn onnx_model_contract_accepts_only_output_as_compatible_fallback() {
+        let inputs = [test_tensor_outlet("input_ids", TensorElementType::Int64, 2)];
+        let outputs = [test_tensor_outlet(
+            "export_specific_name",
+            TensorElementType::Float32,
+            1,
+        )];
+
+        let output_index = validate_onnx_model_contract(
+            "test-engine",
+            &inputs,
+            &outputs,
+            &[OnnxTensorContract::new(
+                "input_ids",
+                TensorElementType::Int64,
+                &[2],
+            )],
+            OnnxOutputSelector::NamedOrOnly("logits"),
+            TensorElementType::Float32,
+            &[1, 2],
+        )
+        .unwrap();
+
+        assert_eq!(output_index, 0);
+    }
+
+    #[test]
+    fn onnx_model_contract_rejects_input_shape_type_and_set_mismatch() {
+        let expected = [OnnxTensorContract::new(
+            "input_ids",
+            TensorElementType::Int64,
+            &[2],
+        )];
+        let outputs = [test_tensor_outlet("logits", TensorElementType::Float32, 1)];
+
+        let wrong_type = [test_tensor_outlet("input_ids", TensorElementType::Int32, 2)];
+        let type_error = validate_onnx_model_contract(
+            "test-engine",
+            &wrong_type,
+            &outputs,
+            &expected,
+            OnnxOutputSelector::Named("logits"),
+            TensorElementType::Float32,
+            &[1],
+        )
+        .unwrap_err();
+        assert!(type_error.contains("element type i32"));
+
+        let wrong_rank = [test_tensor_outlet("input_ids", TensorElementType::Int64, 3)];
+        let rank_error = validate_onnx_model_contract(
+            "test-engine",
+            &wrong_rank,
+            &outputs,
+            &expected,
+            OnnxOutputSelector::Named("logits"),
+            TensorElementType::Float32,
+            &[1],
+        )
+        .unwrap_err();
+        assert!(rank_error.contains("rank 3"));
+
+        let extra_input = [
+            test_tensor_outlet("input_ids", TensorElementType::Int64, 2),
+            test_tensor_outlet("unexpected", TensorElementType::Int64, 2),
+        ];
+        let set_error = validate_onnx_model_contract(
+            "test-engine",
+            &extra_input,
+            &outputs,
+            &expected,
+            OnnxOutputSelector::Named("logits"),
+            TensorElementType::Float32,
+            &[1],
+        )
+        .unwrap_err();
+        assert!(set_error.contains("do not match required inputs"));
+    }
+
+    #[test]
+    fn onnx_model_contract_rejects_ambiguous_or_incompatible_output() {
+        let inputs = [test_tensor_outlet("input_ids", TensorElementType::Int64, 2)];
+        let expected = [OnnxTensorContract::new(
+            "input_ids",
+            TensorElementType::Int64,
+            &[2],
+        )];
+        let ambiguous_outputs = [
+            test_tensor_outlet("first", TensorElementType::Float32, 1),
+            test_tensor_outlet("second", TensorElementType::Float32, 1),
+        ];
+        let ambiguity_error = validate_onnx_model_contract(
+            "test-engine",
+            &inputs,
+            &ambiguous_outputs,
+            &expected,
+            OnnxOutputSelector::NamedOrOnly("logits"),
+            TensorElementType::Float32,
+            &[1],
+        )
+        .unwrap_err();
+        assert!(ambiguity_error.contains("missing unambiguous output"));
+
+        let wrong_output = [test_tensor_outlet("logits", TensorElementType::Float64, 3)];
+        let output_error = validate_onnx_model_contract(
+            "test-engine",
+            &inputs,
+            &wrong_output,
+            &expected,
+            OnnxOutputSelector::Named("logits"),
+            TensorElementType::Float32,
+            &[1, 2],
+        )
+        .unwrap_err();
+        assert!(output_error.contains("element type f64"));
     }
 
     fn test_encoding(ids: Vec<u32>, type_ids: Vec<u32>, attention_mask: Vec<u32>) -> Encoding {

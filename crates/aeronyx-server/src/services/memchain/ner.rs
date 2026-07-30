@@ -108,6 +108,10 @@
 //! - span_mask tensor type is bool (not u8). ort 2.0.0-rc.11 supports bool directly.
 //!
 //! ## Last Modified
+//! v2.4.5-OnnxModelContract -
+//!   [MEMCHAIN-ONNX-MODEL-CONTRACT 2026-07-30 by Codex] Validate all six
+//!   GLiNER input tensors and the logits output during engine loading, then
+//!   reuse the resolved output index during inference.
 //! v2.4.4-OnnxOutputBoundary -
 //!   [MEMCHAIN-ONNX-OUTPUT-BOUNDARY 2026-07-30 by Codex] Replaced panicking
 //!   positional output indexing with the shared bounds-checked inference
@@ -133,11 +137,15 @@ use std::path::Path;
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
+use ort::tensor::TensorElementType;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
 use tracing::{debug, info};
 
-use super::embed::{init_ort_runtime, require_onnx_output, InferenceSession};
+use super::embed::{
+    init_ort_runtime, require_onnx_output, validate_onnx_model_contract, InferenceSession,
+    OnnxOutputSelector, OnnxTensorContract,
+};
 
 // ============================================
 // Constants
@@ -312,6 +320,8 @@ struct WordSpan {
 pub struct NerEngine {
     /// ONNX session serialized through the shared non-poisoning boundary.
     session: InferenceSession<Session>,
+    /// Load-time-validated logits output index.
+    output_idx: usize,
     /// HuggingFace tokenizer (DeBERTa-v3 or BERT depending on model).
     tokenizer: Tokenizer,
     /// Maximum entity span width in words.
@@ -408,6 +418,23 @@ impl NerEngine {
 
         info!(model = %model_path.display(), "[NER] GLiNER ONNX model loaded");
 
+        let output_idx = validate_onnx_model_contract(
+            "GLiNER",
+            session.inputs(),
+            session.outputs(),
+            &[
+                OnnxTensorContract::new("input_ids", TensorElementType::Int64, &[2]),
+                OnnxTensorContract::new("attention_mask", TensorElementType::Int64, &[2]),
+                OnnxTensorContract::new("words_mask", TensorElementType::Int64, &[2]),
+                OnnxTensorContract::new("text_lengths", TensorElementType::Int64, &[2]),
+                OnnxTensorContract::new("span_idx", TensorElementType::Int64, &[3]),
+                OnnxTensorContract::new("span_mask", TensorElementType::Bool, &[2]),
+            ],
+            OnnxOutputSelector::NamedOrOnly("logits"),
+            TensorElementType::Float32,
+            &[3, 4],
+        )?;
+
         // Load tokenizer
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
             format!(
@@ -432,6 +459,7 @@ impl NerEngine {
 
         Ok(Self {
             session: InferenceSession::new(session),
+            output_idx,
             tokenizer,
             max_width,
             confidence_threshold,
@@ -539,7 +567,7 @@ impl NerEngine {
             .map_err(|e| format!("GLiNER ONNX inference: {}", e))?;
 
         // Output: logits [batch_size, num_spans, num_labels]
-        let logits_output = require_onnx_output("GLiNER", outputs.values(), 0)?;
+        let logits_output = require_onnx_output("GLiNER", outputs.values(), self.output_idx)?;
         let logits = logits_output
             .try_extract_array::<f32>()
             .map_err(|e| format!("GLiNER output extraction: {}", e))?;
