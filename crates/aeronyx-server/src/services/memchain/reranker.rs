@@ -78,6 +78,9 @@
 //!   the reranker is too aggressive (degrading good BM25/graph results), lower to 0.5.
 //!
 //! ## Last Modified
+//! v2.4.6-ModelSequenceBounds -
+//!   [MEMCHAIN-MODEL-SEQUENCE-BOUNDS 2026-07-30 by Codex] Rejects sequence
+//!   limits above the cross-encoder's positional capacity during engine load.
 //! v2.4.5-TokenizerBatchBoundary -
 //!   [MEMCHAIN-TOKENIZER-BATCH 2026-07-30 by Codex] Reused the shared padded
 //!   batch contract and stopped silently fabricating missing tensor fields.
@@ -112,7 +115,8 @@ use tracing::{debug, info, warn};
 
 // Re-use the ORT initialization and session boundary from embed.rs.
 use super::embed::{
-    init_ort_runtime, require_onnx_output, validate_tokenized_batch, InferenceSession,
+    init_ort_runtime, require_onnx_output, resolve_model_sequence_length, validate_tokenized_batch,
+    InferenceSession,
 };
 
 // ============================================
@@ -125,6 +129,9 @@ const TOKENIZER_FILENAME: &str = "tokenizer.json";
 /// Default max sequence length for cross-encoder (query + document combined).
 /// ms-marco-MiniLM-L-6-v2 supports up to 512 tokens.
 const DEFAULT_MAX_SEQ_LENGTH: usize = 512;
+
+/// Maximum positional sequence length supported by ms-marco-MiniLM-L-6-v2.
+const MODEL_MAX_SEQ_LENGTH: usize = 512;
 
 /// Maximum number of (query, document) pairs per batch.
 const MAX_BATCH_SIZE: usize = 50;
@@ -271,11 +278,12 @@ impl RerankerEngine {
     /// * `max_seq_length` - Max combined query+document token length (pass 0 for default 512)
     pub fn load(model_dir: impl AsRef<Path>, max_seq_length: usize) -> Result<Self, String> {
         let model_dir = model_dir.as_ref();
-        let max_seq_length = if max_seq_length == 0 {
-            DEFAULT_MAX_SEQ_LENGTH
-        } else {
-            max_seq_length
-        };
+        let max_seq_length = resolve_model_sequence_length(
+            "Reranker",
+            max_seq_length,
+            DEFAULT_MAX_SEQ_LENGTH,
+            MODEL_MAX_SEQ_LENGTH,
+        )?;
 
         let model_path = model_dir.join(MODEL_FILENAME);
         let tokenizer_path = model_dir.join(TOKENIZER_FILENAME);

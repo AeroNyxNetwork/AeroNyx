@@ -145,6 +145,10 @@
 //!   from HTTP handlers.
 //!
 //! ## Last Modified
+//! v2.7.21-ModelSequenceBounds -
+//!   [MEMCHAIN-MODEL-SEQUENCE-BOUNDS 2026-07-30 by Codex] Added explicit
+//!   model-specific sequence limits so invalid configuration fails during
+//!   engine loading instead of creating oversized tensors or late ORT errors.
 //! v2.7.20-TokenizerBatchBoundary -
 //!   [MEMCHAIN-TOKENIZER-BATCH 2026-07-30 by Codex] Centralized tokenizer
 //!   batch-shape validation and stopped silently padding malformed encoding
@@ -317,13 +321,49 @@ pub(super) fn validate_tokenized_batch(
     Ok((sequence_length, total_tokens))
 }
 
+/// Resolve a requested model sequence length against explicit model bounds.
+///
+/// [MEMCHAIN-MODEL-SEQUENCE-BOUNDS 2026-07-30 by Codex] A configured value of
+/// zero retains the established "use model default" API. Any non-zero value
+/// above the model's positional capacity is rejected before inference starts;
+/// accepting it would permit excessive allocation and defer failure to ORT.
+pub(super) fn resolve_model_sequence_length(
+    engine: &str,
+    requested: usize,
+    default: usize,
+    maximum: usize,
+) -> Result<usize, String> {
+    if default == 0 || maximum == 0 || default > maximum {
+        return Err(format!(
+            "{} has invalid internal sequence bounds: default {}, maximum {}",
+            engine, default, maximum
+        ));
+    }
+
+    let resolved = if requested == 0 { default } else { requested };
+    if resolved > maximum {
+        return Err(format!(
+            "{} sequence length {} exceeds model maximum {}",
+            engine, resolved, maximum
+        ));
+    }
+
+    Ok(resolved)
+}
+
 /// Default max sequence length for MiniLM.
 /// MiniLM supports up to 512, but 128 is optimal for MemChain's short content.
 pub const DEFAULT_MAX_SEQ_LENGTH: usize = 128;
 
+/// Maximum positional sequence length supported by MiniLM-L6-v2.
+const MINILM_MAX_SEQ_LENGTH: usize = 512;
+
 /// Default max sequence length for EmbeddingGemma.
 /// EmbeddingGemma supports up to 2048. 256 balances quality and speed.
 pub const DEFAULT_GEMMA_MAX_SEQ_LENGTH: usize = 256;
+
+/// Maximum positional sequence length supported by EmbeddingGemma-300M.
+const GEMMA_MAX_SEQ_LENGTH: usize = 2048;
 
 /// Model filename within the model directory.
 const MODEL_FILENAME: &str = "model.onnx";
@@ -778,15 +818,22 @@ impl EmbedEngine {
         // Auto-detect model type from ONNX output tensor names
         let (model_type, se_output_idx) = detect_model_type(&session);
 
-        // Resolve max_seq_length: 0 → model-specific default
-        let max_seq_length = if max_seq_length == 0 {
-            match model_type {
-                EmbedModelType::MiniLM => DEFAULT_MAX_SEQ_LENGTH,
-                EmbedModelType::EmbeddingGemma => DEFAULT_GEMMA_MAX_SEQ_LENGTH,
-            }
-        } else {
-            max_seq_length
+        // Resolve max_seq_length: 0 → model-specific default, while rejecting
+        // values beyond each model's positional embedding capacity.
+        let (engine_name, default_sequence_length, maximum_sequence_length) = match model_type {
+            EmbedModelType::MiniLM => ("MiniLM", DEFAULT_MAX_SEQ_LENGTH, MINILM_MAX_SEQ_LENGTH),
+            EmbedModelType::EmbeddingGemma => (
+                "EmbeddingGemma",
+                DEFAULT_GEMMA_MAX_SEQ_LENGTH,
+                GEMMA_MAX_SEQ_LENGTH,
+            ),
         };
+        let max_seq_length = resolve_model_sequence_length(
+            engine_name,
+            max_seq_length,
+            default_sequence_length,
+            maximum_sequence_length,
+        )?;
 
         // Resolve output_dim: 0 → EMBED_DIM (384)
         let output_dim = if output_dim == 0 {
@@ -1360,6 +1407,31 @@ mod tests {
             validate_tokenized_batch("test-engine", &[missing_types], 1, 8, false).unwrap(),
             (2, 2)
         );
+    }
+
+    #[test]
+    fn model_sequence_bounds_preserve_defaults_and_valid_overrides() {
+        assert_eq!(
+            resolve_model_sequence_length("test-engine", 0, 128, 512).unwrap(),
+            128
+        );
+        assert_eq!(
+            resolve_model_sequence_length("test-engine", 512, 128, 512).unwrap(),
+            512
+        );
+    }
+
+    #[test]
+    fn model_sequence_bounds_reject_unsupported_or_invalid_limits() {
+        let excessive = resolve_model_sequence_length("test-engine", 513, 128, 512).unwrap_err();
+        assert!(excessive.contains("test-engine"));
+        assert!(excessive.contains("exceeds model maximum 512"));
+
+        for (default, maximum) in [(0, 512), (128, 0), (513, 512)] {
+            let error =
+                resolve_model_sequence_length("test-engine", 0, default, maximum).unwrap_err();
+            assert!(error.contains("invalid internal sequence bounds"));
+        }
     }
 
     #[test]
