@@ -2224,6 +2224,35 @@ impl Drop for CommitmentSyncTaskLivenessGuard {
     }
 }
 
+/// Owns an inner required task without inheriting Tokio's detach-on-drop
+/// behavior.
+///
+/// [REQUIRED-TASK-OWNERSHIP 2026-07-30 by Codex] Aborting the outer
+/// supervisor during bounded shutdown must also abort its inner task. A plain
+/// dropped `JoinHandle` would detach the inner future and leak it past the
+/// shutdown report.
+struct RequiredRuntimeTaskJoinGuard {
+    task: JoinHandle<()>,
+}
+
+impl RequiredRuntimeTaskJoinGuard {
+    fn new(task: JoinHandle<()>) -> Self {
+        Self { task }
+    }
+
+    async fn join(&mut self) -> std::result::Result<(), tokio::task::JoinError> {
+        (&mut self.task).await
+    }
+}
+
+impl Drop for RequiredRuntimeTaskJoinGuard {
+    fn drop(&mut self) {
+        if !self.task.is_finished() {
+            self.task.abort();
+        }
+    }
+}
+
 /// Result of bringing one long-lived runtime task to a terminal state.
 ///
 /// [TASK-SHUTDOWN 2026-07-29 by Codex] Keep shutdown outcomes typed so timeout
@@ -2815,7 +2844,15 @@ impl Server {
                     critical_failure_tx.clone(),
                 )
                 .await?;
-            tasks.push(("node-api", api_task));
+            tasks.push((
+                "node-api",
+                Self::supervise_required_runtime_task(
+                    "node-api",
+                    api_task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
             node_api_started = true;
 
             if let Some(sync_task) = self.spawn_memchain_commitment_sync_task(
@@ -2824,7 +2861,15 @@ impl Server {
                 commitment_sync_tip_rx,
                 Arc::clone(&peer_http_clients.sync),
             ) {
-                tasks.push(("memchain-block-sync", sync_task));
+                tasks.push((
+                    "memchain-block-sync",
+                    Self::supervise_required_runtime_task(
+                        "memchain-block-sync",
+                        sync_task,
+                        Arc::clone(&self.shutdown),
+                        critical_failure_tx.clone(),
+                    ),
+                ));
             }
             if let Some(reconciliation_task) = self.spawn_memchain_commitment_reconciliation_task(
                 Arc::clone(st),
@@ -3029,11 +3074,21 @@ impl Server {
                     critical_failure_tx.clone(),
                 )
                 .await?;
-            tasks.push(("node-api", api_task));
+            tasks.push((
+                "node-api",
+                Self::supervise_required_runtime_task(
+                    "node-api",
+                    api_task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
         }
 
-        // The API supervisor owns the remaining sender. If it panics or exits
-        // without reporting a failure, receiver closure is itself fatal.
+        // [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Required-task
+        // wrappers and the API listener group own the remaining senders. If
+        // every supervisor disappears without reporting, receiver closure is
+        // itself fatal.
         drop(critical_failure_tx);
         systemd_notifier.ready("AeroNyx privacy node is ready")?;
         info!("Server started successfully");
@@ -11077,6 +11132,53 @@ impl Server {
     // Shutdown
     // ============================================
 
+    /// Wraps one already-spawned required task with process-level supervision.
+    ///
+    /// [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] The wrapper owns the
+    /// `JoinHandle`, so normal unexpected return, panic, and cancellation all
+    /// reach the main failure channel. Reasons are fixed strings: a panic
+    /// payload, endpoint, peer, route, or user value can never enter status or
+    /// logs through this boundary.
+    fn supervise_required_runtime_task(
+        name: &'static str,
+        task: JoinHandle<()>,
+        shutdown_requested: Arc<AtomicBool>,
+        critical_failure_tx: mpsc::Sender<CriticalRuntimeFailure>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut task = RequiredRuntimeTaskJoinGuard::new(task);
+            let result = task.join().await;
+            if shutdown_requested.load(Ordering::Acquire) {
+                debug!(task = name, "Required runtime task joined during shutdown");
+                return;
+            }
+
+            let reason = match result {
+                Ok(()) => "required runtime task exited unexpectedly",
+                Err(error) if error.is_panic() => "required runtime task panicked",
+                Err(error) if error.is_cancelled() => {
+                    "required runtime task was cancelled unexpectedly"
+                }
+                Err(_) => "required runtime task join failed",
+            };
+            let failure = CriticalRuntimeFailure {
+                task: name,
+                reason: reason.to_string(),
+            };
+            error!(
+                task = failure.task,
+                reason = %failure.reason,
+                "[RUNTIME] Required runtime task disappeared"
+            );
+            if critical_failure_tx.send(failure).await.is_err() {
+                error!(
+                    task = name,
+                    "[RUNTIME] Main task dropped the critical failure receiver"
+                );
+            }
+        })
+    }
+
     fn runtime_task_shutdown_grace(name: &str) -> Duration {
         // The coordinator lease task may finish one bounded renewal and one
         // bounded release round before exit. Other tasks retain the historical
@@ -11174,7 +11276,7 @@ impl Server {
                         None
                     } else {
                         Some(failure.unwrap_or_else(|| CriticalRuntimeFailure {
-                            task: "required_api_listener_group",
+                            task: "required_runtime_task_group",
                             reason: "critical runtime supervisor channel closed unexpectedly".to_string(),
                         }))
                     }
@@ -11199,7 +11301,7 @@ impl Server {
                         None
                     } else {
                         Some(failure.unwrap_or_else(|| CriticalRuntimeFailure {
-                            task: "required_api_listener_group",
+                            task: "required_runtime_task_group",
                             reason: "critical runtime supervisor channel closed unexpectedly".to_string(),
                         }))
                     }
@@ -11467,6 +11569,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn required_runtime_task_supervisor_reports_unexpected_exit() {
+        // [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] A configured
+        // follower that returns without global shutdown is a process-health
+        // failure, even when its inner future returned `Ok(())`.
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let supervisor = Server::supervise_required_runtime_task(
+            "memchain-block-sync",
+            tokio::spawn(async {}),
+            shutdown_requested,
+            failure_tx,
+        );
+
+        let failure = tokio::time::timeout(Duration::from_secs(1), failure_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failure,
+            CriticalRuntimeFailure {
+                task: "memchain-block-sync",
+                reason: "required runtime task exited unexpectedly".to_string(),
+            }
+        );
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_runtime_task_supervisor_sanitizes_panic_failure() {
+        // [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] JoinError details
+        // are deliberately discarded so panic payloads cannot cross the
+        // process-health privacy boundary.
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let failed_task = tokio::spawn(async {
+            panic!("test-only panic payload");
+        });
+        let supervisor = Server::supervise_required_runtime_task(
+            "memchain-block-sync",
+            failed_task,
+            shutdown_requested,
+            failure_tx,
+        );
+
+        let failure = tokio::time::timeout(Duration::from_secs(1), failure_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failure,
+            CriticalRuntimeFailure {
+                task: "memchain-block-sync",
+                reason: "required runtime task panicked".to_string(),
+            }
+        );
+        assert!(!failure.reason.contains("test-only"));
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_runtime_task_supervisor_accepts_global_shutdown() {
+        // [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] The global marker
+        // is written before broadcasting shutdown. A cooperative inner return
+        // after that marker must not create a systemd restart loop.
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = release_rx.await;
+        });
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let supervisor = Server::supervise_required_runtime_task(
+            "memchain-block-sync",
+            task,
+            Arc::clone(&shutdown_requested),
+            failure_tx,
+        );
+
+        shutdown_requested.store(true, std::sync::atomic::Ordering::Release);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), failure_rx.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn required_runtime_task_supervisor_abort_cancels_inner_task() {
+        // [REQUIRED-TASK-OWNERSHIP 2026-07-30 by Codex] Tokio detaches a task
+        // when its JoinHandle is merely dropped. Cancelling the supervisor must
+        // instead propagate cancellation to the owned inner task.
+        let inner_task = tokio::spawn(std::future::pending::<()>());
+        let inner_abort_handle = inner_task.abort_handle();
+        let (failure_tx, _failure_rx) = tokio::sync::mpsc::channel(1);
+        let supervisor = Server::supervise_required_runtime_task(
+            "memchain-block-sync",
+            inner_task,
+            Arc::new(AtomicBool::new(false)),
+            failure_tx,
+        );
+
+        tokio::task::yield_now().await;
+        supervisor.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), supervisor)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !inner_abort_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(inner_abort_handle.is_finished());
+    }
+
+    #[tokio::test]
     async fn wait_for_shutdown_accepts_programmatic_shutdown() {
         // [RUNTIME-SUPERVISION 2026-07-29 by Codex] An operator-initiated
         // in-process stop is graceful even if listener shutdown closes the
@@ -11489,6 +11723,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn wait_for_shutdown_rejects_silent_required_task_group_loss() {
+        // [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Losing every
+        // required-task sender without an explicit failure must still trigger
+        // process recovery; otherwise the node could remain half healthy.
+        let server = Server::new(
+            ServerConfig::default(),
+            IdentityKeyPair::generate(),
+            None,
+        );
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        drop(failure_tx);
+
+        let failure = tokio::time::timeout(
+            Duration::from_secs(1),
+            server.wait_for_shutdown(&mut failure_rx),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            failure,
+            CriticalRuntimeFailure {
+                task: "required_runtime_task_group",
+                reason: "critical runtime supervisor channel closed unexpectedly".to_string(),
+            }
+        );
     }
 
     #[tokio::test]

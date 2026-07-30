@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.74.0 - Bounded follower readiness by task lifetime and signed convergence freshness.
+Modification Reason: v0.75.0 - Added process-level supervision for required API and follower tasks.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.74.0 - [FOLLOWER-READINESS-LIVENESS 2026-07-30 by Codex] Revokes follower readiness on task exit and after three missed signed convergence checks.
+Last Modified: v0.75.0 - [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Escalates unexpected API supervisor and configured follower exits to process recovery.
+Previous: v0.74.0 - [FOLLOWER-READINESS-LIVENESS 2026-07-30 by Codex] Revokes follower readiness on task exit and after three missed signed convergence checks.
 Previous: v0.73.0 - [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] Prevents block convergence from being reported as complete follower readiness while required proof is unavailable.
 Previous: v0.72.0 - [FOLLOWER-CERTIFICATE-RETRY 2026-07-30 by Codex] Retries deferred follower certificate persistence promptly without creating a polling loop.
 Previous: v0.71.0 - [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] Reports authenticated-but-unpersisted follower certificates without claiming durable recovery.
@@ -106,6 +107,35 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.75 Required background tasks are process-supervised
+
+[REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex]
+
+- The node API listener group and an explicitly enabled commitment follower
+  now run behind one shared required-task wrapper. The wrapper owns each inner
+  `JoinHandle`, so an unexpected normal return, panic, or cancellation reaches
+  the main runtime failure channel immediately.
+- A reported required-task failure enters the existing graceful shutdown path.
+  A systemd-managed production node can therefore restart the complete process
+  instead of remaining half healthy with an API but no follower.
+- The wrapper emits fixed failure reasons only. Rust panic payloads, task
+  internals, endpoints, identities, routes, records, and client data cannot
+  cross this operational boundary.
+- Global operator, signal, and programmatic shutdown remain non-errors. The
+  process sets the shared shutdown marker before broadcasting, and wrappers
+  suppress expected cooperative task exits after that marker.
+- Each wrapper owns its inner `JoinHandle` through an abort-on-drop guard.
+  Bounded shutdown cancellation therefore propagates to the inner task instead
+  of triggering Tokio's default detach-on-drop behavior and leaking work past
+  the shutdown report.
+- The existing RAII follower guard remains responsible for immediately
+  changing local follower readiness to `stopped`; process supervision adds
+  recovery orchestration rather than replacing fail-closed status.
+- Witness reconciliation, miner, cleanup, discovery gossip, and other
+  degradable workers are not silently promoted to required tasks in this
+  release. Each needs an explicit product availability decision and local
+  fail-closed state before process-fatal supervision is appropriate.
 
 ### v0.74 Follower readiness has a bounded lifetime
 
