@@ -4,7 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.76.0 - Added bounded failure recovery for required UDP and TUN data-plane tasks.
+Modification Reason: v0.77.0 - Made the required DNS proxy transactional,
+concurrency-bounded, process-supervised, and shutdown-owned.
 
 Main Functionality:
 
@@ -29,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.76.0 - [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Prevents persistent UDP/TUN receive errors from leaving a hot-looping or falsely healthy node.
+Last Modified: v0.77.0 - [DNS-STARTUP-READINESS 2026-07-30 by Codex] Prevents readiness before DNS bind and bounds the complete DNS forwarding task lifecycle.
+Previous: v0.76.0 - [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Prevents persistent UDP/TUN receive errors from leaving a hot-looping or falsely healthy node.
 Previous: v0.75.0 - [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Escalates unexpected API supervisor and configured follower exits to process recovery.
 Previous: v0.74.0 - [FOLLOWER-READINESS-LIVENESS 2026-07-30 by Codex] Revokes follower readiness on task exit and after three missed signed convergence checks.
 Previous: v0.73.0 - [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] Prevents block convergence from being reported as complete follower readiness while required proof is unavailable.
@@ -109,6 +111,34 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
 
+### v0.77 Required DNS startup and forwarding are lifecycle-owned
+
+[DNS-STARTUP-READINESS 2026-07-30 by Codex]
+
+- An enabled built-in DNS proxy now binds the configured VPN gateway address
+  before systemd readiness can be reported. A bind conflict or missing local
+  address fails the startup transaction instead of disappearing inside a
+  detached task after the node advertises a usable privacy data plane.
+- The production runtime uses the new fallible `start_dns_proxy` entry point.
+  The original `spawn_dns_proxy` signature remains available for backward
+  source compatibility, but it is no longer used by production startup.
+- The enabled DNS task is a required process task. Unexpected normal return,
+  panic, or cancellation enters the same graceful recovery path as the API,
+  UDP ingress, TUN egress, and configured commitment follower.
+- At most 256 opaque DNS datagrams may be forwarded concurrently. Additional
+  datagrams are dropped before payload cloning, and diagnostics expose only
+  aggregate power-of-two drop counts plus the fixed configured limit.
+- Every forwarding child is owned by a Tokio `JoinSet`. Shutdown aborts and
+  reaps all children before the DNS parent completes, so upstream requests
+  cannot become detached work after node shutdown or supervised recovery.
+- An operating-system receive error stops the required DNS task instead of
+  creating an unbounded hot loop. The required-task supervisor then recovers
+  the complete process so health cannot remain green with a failed listener.
+- The privacy boundary is unchanged: the proxy treats datagrams as opaque,
+  matches responses only by the two-byte DNS transaction identifier, and does
+  not parse, store, index, or log query names, answers, client addresses,
+  destinations, domains, URLs, or browsing history.
+
 ### v0.76 Required data-plane receive failures are bounded
 
 [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex]
@@ -129,9 +159,8 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
   count only. The process failure channel retains fixed reasons and never
   receives packet bytes, client addresses, session identities, destinations,
   routes, domains, or other user-plane metadata.
-- DNS startup transactionality is intentionally not mixed into this change.
-  The built-in DNS proxy still requires a separate pre-bind readiness upgrade
-  because its socket is currently bound inside its spawned task.
+- DNS startup transactionality was intentionally not mixed into v0.76 and is
+  completed separately by the v0.77 lifecycle-owned DNS milestone above.
 
 ### v0.75 Required background tasks are process-supervised
 

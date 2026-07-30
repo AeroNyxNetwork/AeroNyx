@@ -11,6 +11,9 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.14.0-DNSTransactionalStartup - [DNS-STARTUP-READINESS 2026-07-30 by
+//     Codex] Re-exported the pre-bound production DNS startup path while
+//     retaining the legacy spawn API
 //   v0.13.0-BlindVaultIssuerRuntime - Re-exported the monotonic issuer
 //     installation outcome and aggregate runtime status
 //   v0.12.0-DirectoryWitnessThreshold - Re-exported the audited checkpoint
@@ -79,7 +82,7 @@ pub use directory_replica::{
     DirectoryReplicaStoreError, DirectoryReplicaStoreSnapshot, DirectoryReplicaSyncObservation,
     DirectoryReplicaSyncRuntime, DirectoryReplicaTip,
 };
-pub use dns_proxy::spawn_dns_proxy;
+pub use dns_proxy::{spawn_dns_proxy, start_dns_proxy};
 pub use handshake::HandshakeService;
 pub use ip_pool::IpPoolService;
 pub use memchain::{AofWriter, MemPool};

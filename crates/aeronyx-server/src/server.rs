@@ -684,7 +684,7 @@ use crate::services::peer_store::{
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
 use crate::services::{
-    spawn_dns_proxy, BlindVaultService, DirectoryChainAppendReport, DirectoryChainStore,
+    start_dns_proxy, BlindVaultService, DirectoryChainAppendReport, DirectoryChainStore,
     DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,
     HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService, SessionManager,
 };
@@ -2590,8 +2590,26 @@ impl Server {
         // client IPs. Operators may disable it when systemd-resolved or another
         // hardened host resolver intentionally owns gateway_ip:53.
         if self.config.dns_proxy_enabled() {
-            let dns_task = spawn_dns_proxy(self.config.gateway_ip(), self.shutdown_tx.subscribe());
-            tasks.push(("dns-proxy", dns_task));
+            // [DNS-STARTUP-READINESS 2026-07-30 by Codex] Bind before
+            // systemd READY so the node cannot advertise a usable privacy
+            // data plane while its configured DNS listener is unavailable.
+            let dns_task =
+                start_dns_proxy(self.config.gateway_ip(), self.shutdown_tx.subscribe())
+                    .await
+                    .map_err(|error| {
+                        ServerError::startup_failed(format!(
+                            "required VPN DNS listener failed to bind: {error}"
+                        ))
+                    })?;
+            tasks.push((
+                "dns-proxy",
+                Self::supervise_required_runtime_task(
+                    "dns-proxy",
+                    dns_task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
         } else {
             info!(
                 gateway_ip = %self.config.gateway_ip(),
