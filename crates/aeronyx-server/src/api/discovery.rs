@@ -23,6 +23,9 @@
 //!   transport feature negotiation without route metadata
 //! - `GET /api/discovery/public-card`: returns the smallest product-facing
 //!   protocol health card for website, Nodeboard first-level views, and apps
+//! - [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] Keeps permissionless
+//!   gossip admission usable after an unrelated panic while the process-local
+//!   rate-limit lock is held.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -61,8 +64,13 @@
 //! - The gossip request body ceiling must remain outside the JSON handler so
 //!   oversized untrusted input is rejected before allocation/deserialization.
 //!   Keep `DISCOVERY_REQUEST_BODY_MAX_BYTES` aligned with protocol limits.
+//! - The global gossip limiter must use a non-poisoning mutex. A poisoned
+//!   process-local lock must never turn one recovered panic into a permanent
+//!   discovery outage.
 //!
 //! ## Last Modified
+//! v0.33.0-DiscoveryRateLimitRecovery - Prevent one panic from permanently
+//! poisoning the permissionless gossip admission limiter.
 //! v0.32.0-DirectoryGossipNegotiation - Advertise additive public transport
 //! feature hints so mixed-version peers can avoid unsupported proof frames
 //! v0.31.0-DirectoryAuthenticatedGossipAdmission - Gate proof announcements on
@@ -105,7 +113,6 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aeronyx_core::protocol::{NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage};
@@ -116,6 +123,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::api::directory_replica_sync::admit_directory_gossip_descriptor;
@@ -2035,7 +2043,6 @@ async fn gossip_handler(
     if !state
         .rate_limit
         .lock()
-        .expect("discovery rate limiter poisoned")
         .allow(now, state.policy.gossip_rate_limit_per_minute)
     {
         state.peer_store.record_rate_limited(
@@ -3754,6 +3761,39 @@ mod tests {
                 .map(|event| event.action.as_str()),
             Some("gossip_policy_rejected")
         );
+    }
+
+    #[tokio::test]
+    async fn gossip_rate_limiter_recovers_after_lock_owner_panic() {
+        // [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] The historical
+        // std::sync::Mutex became permanently poisoned here, causing every
+        // later gossip request to panic at lock().expect().
+        let rate_limit = Arc::new(Mutex::new(RateLimitState::new()));
+        let panic_lock = Arc::clone(&rate_limit);
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = panic_lock.lock();
+            panic!("test-only-discovery-rate-limit-panic");
+        }));
+        assert!(panic_result.is_err());
+
+        let state = DiscoveryApiState {
+            peer_store: Arc::new(PeerStore::new()),
+            directory_replica_store: None,
+            policy: DiscoveryApiPolicy::default(),
+            local_capabilities: DiscoveryLocalCapabilityStatus::default(),
+            rate_limit,
+        };
+        let response = gossip_handler(
+            State(state),
+            Json(NodeDiscoveryMessage::SnapshotRequest {
+                requested_at: now_secs(),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

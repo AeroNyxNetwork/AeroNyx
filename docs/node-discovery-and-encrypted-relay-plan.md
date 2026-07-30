@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.84.0 - Centralized every Directory peer blocking
-worker join behind one privacy-safe fail-closed execution boundary.
+Modification Reason: v0.85.0 - Removed the permanent mutex-poison failure mode
+from permissionless discovery gossip admission.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.84.0 - [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] Gives all authenticated Directory peer blocking workers one privacy-safe failure and observability contract.
+Last Modified: v0.85.0 - [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] Keeps node discovery gossip available after a recovered rate-limiter lock-owner panic.
+Previous: v0.84.0 - [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] Gives all authenticated Directory peer blocking workers one privacy-safe failure and observability contract.
 Previous: v0.83.0 - [BLOCKING-WORKER-RECOVERY 2026-07-30 by Codex] Keeps SystemDb usable after a failed worker and prevents raw JoinError payloads from entering anchor/status diagnostics.
 Previous: v0.82.0 - [STORAGE-JOIN-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering shared storage errors, API logs, or scheduler diagnostics.
 Previous: v0.81.0 - [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering process-health status or structured shutdown diagnostics.
@@ -117,6 +118,26 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.85 Discovery admission survives a recovered panic
+
+[DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex]
+
+- The permissionless gossip API's process-local global rate limiter now uses
+  the crate-standard non-poisoning `parking_lot::Mutex`.
+- Previously, a panic while the limiter lock was held poisoned
+  `std::sync::Mutex`; every later `/api/discovery/gossip` request then panicked
+  at `lock().expect()`. The process and health endpoint could remain alive while
+  descriptor propagation had become permanently unavailable.
+- Lock scope remains one small synchronous counter update. No guard crosses an
+  `.await`, and request admission still occurs before signature verification
+  and PeerStore mutation.
+- A regression test deliberately panics while holding the limiter lock, then
+  sends a real snapshot gossip message through the handler and requires the
+  established `200 OK` response.
+- This milestone does not change rate limits, request body ceilings, API JSON,
+  descriptor verification, allow/deny policy, Directory proof admission,
+  PeerStore semantics, transport frames, or discovery authority.
 
 ### v0.84 Directory peer workers share one failure contract
 
