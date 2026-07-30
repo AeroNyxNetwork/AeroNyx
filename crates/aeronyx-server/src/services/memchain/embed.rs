@@ -131,17 +131,23 @@
 //! - When switching models, ALL existing embeddings must be rebuilt.
 //!   reflection.rs Miner Step 0.5 handles this automatically via backfill.
 //!   storage.rs should detect model change and clear embedding columns.
-//! - EmbedEngine is Send + Sync (Session wrapped in Mutex for interior mutability).
+//! - EmbedEngine is Send + Sync (Session wrapped in the shared
+//!   `InferenceSession` boundary for interior mutability).
 //! - Run `scripts/download_models.sh` before first build/run to fetch model files
 //!   AND libonnxruntime.so.
 //! - ort::init_from() MUST be called exactly once before any Session is created.
 //!   `OnceLock<Result<(), String>>` safely publishes the first success or error
 //!   to every caller, even when multiple requests race during startup.
-//! - Session::run() takes &mut self in ort rc.11. The Mutex wrapper handles
-//!   this transparently. Do NOT remove the Mutex or change &self to &mut self
-//!   on public methods — that would break concurrent access from HTTP handlers.
+//! - Session::run() takes &mut self in ort rc.11. The `InferenceSession`
+//!   wrapper handles this transparently. Do NOT remove the wrapper or change
+//!   &self to &mut self on public methods — that would break concurrent access
+//!   from HTTP handlers.
 //!
 //! ## Last Modified
+//! v2.7.16-InferenceSessionRecovery -
+//!   [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] Centralized ONNX session
+//!   serialization behind a non-poisoning lock so a recovered panic cannot
+//!   permanently disable local cognition.
 //! v2.7.15-EmbedInitSafety - Replaced unsynchronised `static mut` ORT error
 //!   state with `OnceLock<Result<(), String>>` and added concurrent regression
 //!   coverage. Public APIs and first-initializer semantics are unchanged.
@@ -155,11 +161,12 @@
 //!   configurable embed_output_dim. Interface unchanged for all callers.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
+use parking_lot::{Mutex, MutexGuard};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
 
@@ -172,6 +179,33 @@ use tracing::{debug, info, warn};
 /// produce this dimension, ensuring downstream compatibility.
 /// Configurable via `embed_output_dim` in config.toml.
 pub const EMBED_DIM: usize = 384;
+
+// ============================================
+// Shared inference session boundary
+// ============================================
+
+/// Serializes mutable ONNX Runtime session access without lock poisoning.
+///
+/// [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] `ort::Session::run`
+/// requires mutable access. A standard-library mutex permanently poisons after
+/// any panic while held, which can leave the process healthy while embedding,
+/// NER, or reranking stays unavailable. This wrapper gives all local inference
+/// engines one recovery contract and keeps the guard synchronous.
+pub(super) struct InferenceSession<T> {
+    inner: Mutex<T>,
+}
+
+impl<T> InferenceSession<T> {
+    pub(super) fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+        }
+    }
+
+    pub(super) fn lock(&self) -> MutexGuard<'_, T> {
+        self.inner.lock()
+    }
+}
 
 /// Default max sequence length for MiniLM.
 /// MiniLM supports up to 512, but 128 is optimal for MemChain's short content.
@@ -431,8 +465,8 @@ pub(crate) fn init_ort_runtime(model_dir: &Path) -> Result<(), String> {
 /// assert_eq!(vecs[0].len(), 384);
 /// ```
 pub struct EmbedEngine {
-    /// Wrapped in Mutex because ort rc.11 Session::run() requires &mut self.
-    session: Mutex<Session>,
+    /// Shared serialization boundary for mutable ONNX inference.
+    session: InferenceSession<Session>,
     tokenizer: Tokenizer,
     max_seq_length: usize,
     /// Auto-detected model type (MiniLM or EmbeddingGemma).
@@ -546,7 +580,7 @@ impl EmbedEngine {
         );
 
         Ok(Self {
-            session: Mutex::new(session),
+            session: InferenceSession::new(session),
             tokenizer,
             max_seq_length,
             model_type,
@@ -712,10 +746,7 @@ impl EmbedEngine {
             .map_err(|e| format!("token_type_ids tensor: {}", e))?;
 
         // ── ONNX inference ──
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|e| format!("Session lock poisoned: {}", e))?;
+        let mut session = self.session.lock();
         let outputs = session
             .run(ort::inputs![
                 "input_ids" => ids_tensor,
@@ -853,10 +884,7 @@ impl EmbedEngine {
 
         // ── ONNX inference ──
         // EmbeddingGemma only takes input_ids + attention_mask
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|e| format!("Session lock poisoned: {}", e))?;
+        let mut session = self.session.lock();
         let outputs = session
             .run(ort::inputs![
                 "input_ids" => ids_tensor,
@@ -975,6 +1003,23 @@ mod tests {
             initialize_once(&result, || Ok(())).unwrap_err(),
             "deterministic ORT init failure"
         );
+    }
+
+    #[test]
+    fn inference_session_recovers_after_lock_owner_panic() {
+        // [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] This models a
+        // recovered request/task panic without requiring ONNX model files.
+        let session = Arc::new(InferenceSession::new(0_u8));
+        let panic_session = Arc::clone(&session);
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut guard = panic_session.lock();
+            *guard = 1;
+            panic!("test-only-inference-session-panic");
+        }));
+        assert!(panic_result.is_err());
+
+        *session.lock() += 1;
+        assert_eq!(*session.lock(), 2);
     }
 
     /// Helper: skip test if model files are not downloaded.

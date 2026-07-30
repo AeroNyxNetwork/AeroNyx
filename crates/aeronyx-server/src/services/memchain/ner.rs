@@ -99,7 +99,8 @@
 //! - The tokenizer MUST match the model's training tokenizer (typically DeBERTa-v3
 //!   for v2.x models). Using the wrong tokenizer silently degrades quality.
 //! - ORT init is shared with embed.rs via std::sync::Once — safe to load both.
-//! - Session::run() requires &mut self → Mutex wrapper (same pattern as embed.rs).
+//! - Session::run() requires &mut self → shared `InferenceSession` wrapper
+//!   (same recovery contract as embed.rs and reranker.rs).
 //! - max_width (max entity span in words) defaults to 12. Larger values increase
 //!   num_spans linearly (N × W) — only increase if needed.
 //! - The `<<ENT>>` and `<<SEP>>` special tokens must be in the tokenizer vocabulary.
@@ -107,6 +108,9 @@
 //! - span_mask tensor type is bool (not u8). ort 2.0.0-rc.11 supports bool directly.
 //!
 //! ## Last Modified
+//! v2.4.1-InferenceSessionRecovery -
+//!   [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] Reused the shared
+//!   non-poisoning ONNX session boundary.
 //! v2.4.0-GraphCognition - 🌟 Initial implementation
 //! v2.4.0+BugFix - 🔧 Fixed span_indices to use fixed-size grid (num_words × max_width)
 //!   instead of variable-length list. Fixes GLiNER reshape error:
@@ -115,13 +119,14 @@
 //!   GLiNER ONNX model expects tensor(bool), not tensor(uint8).
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
+
+use super::embed::InferenceSession;
 
 // ============================================
 // Constants
@@ -194,8 +199,8 @@ struct WordSpan {
 
 /// Local NER engine using GLiNER ONNX model.
 ///
-/// Thread-safe: `ort::Session` is wrapped in `Mutex` because `Session::run()`
-/// requires `&mut self` in ort 2.0.0-rc.11 (same pattern as EmbedEngine).
+/// Thread-safe: `ort::Session` is wrapped in `InferenceSession` because
+/// `Session::run()` requires `&mut self` in ort 2.0.0-rc.11.
 ///
 /// ## Usage
 /// ```rust,ignore
@@ -211,8 +216,8 @@ struct WordSpan {
 /// // "JWT" => technology (0.93)
 /// ```
 pub struct NerEngine {
-    /// ONNX session, Mutex-wrapped for &mut self requirement.
-    session: Mutex<Session>,
+    /// ONNX session serialized through the shared non-poisoning boundary.
+    session: InferenceSession<Session>,
     /// HuggingFace tokenizer (DeBERTa-v3 or BERT depending on model).
     tokenizer: Tokenizer,
     /// Maximum entity span width in words.
@@ -309,7 +314,7 @@ impl NerEngine {
         );
 
         Ok(Self {
-            session: Mutex::new(session),
+            session: InferenceSession::new(session),
             tokenizer,
             max_width,
             confidence_threshold,
@@ -403,10 +408,7 @@ impl NerEngine {
                 .map_err(|e| format!("span_mask tensor: {}", e))?;
 
         // Step 6: ONNX inference
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|e| format!("NER session lock poisoned: {}", e))?;
+        let mut session = self.session.lock();
 
         let outputs = session
             .run(ort::inputs![

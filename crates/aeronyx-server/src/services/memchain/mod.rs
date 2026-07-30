@@ -47,8 +47,13 @@
 //! - VolumeRouter::new() returns Arc<VolumeRouter> — same pattern.
 //! - The commitment chain stores opaque record IDs only. Sealed payload
 //!   replication and owner recovery must remain separate and authorised.
+//! - [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] Embedding, NER, and
+//!   reranking must share `embed::InferenceSession`; do not reintroduce
+//!   individually poisonable `std::sync::Mutex<ort::Session>` fields.
 //!
 //! ## Last Modified
+//! v2.8.56-InferenceSessionRecovery - Centralized local ONNX session
+//! serialization behind one non-poisoning recovery boundary.
 //! v2.8.55-CertificateBackfillTelemetry - Re-exported the coordinator backfill outcome.
 //! v2.8.49-FollowerCertificateTipBinding - Preserved typed tip-bound certificate readiness.
 //! v2.8.48-FollowerCertificateReadiness - Re-exported typed certificate policy readiness.

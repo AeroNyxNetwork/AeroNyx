@@ -66,7 +66,8 @@
 //! - max_seq_length for cross-encoder is 512 (query+doc combined). Truncation
 //!   happens on the DOCUMENT side (TruncationParams::max_length applies to the pair).
 //! - ORT runtime is shared via Once in embed.rs — safe to load alongside embed + ner.
-//! - Session::run() requires &mut self → Mutex wrapper (same pattern as embed.rs/ner.rs).
+//! - Session::run() requires &mut self → shared `InferenceSession` wrapper
+//!   (same recovery contract as embed.rs and ner.rs).
 //! - Always use rerank_batch() — it processes all pairs in one ONNX session.run() call,
 //!   which is significantly faster than calling one-by-one due to batching overhead.
 //! - tokenizer is cloned and configured per-call (same pattern as embed.rs embed_minilm).
@@ -75,6 +76,9 @@
 //!   the reranker is too aggressive (degrading good BM25/graph results), lower to 0.5.
 //!
 //! ## Last Modified
+//! v2.4.1-InferenceSessionRecovery -
+//!   [MEMCHAIN-INFERENCE-SESSION 2026-07-30 by Codex] Reused the shared
+//!   non-poisoning ONNX session boundary.
 //! v2.4.0+Reranker - 🌟 Initial implementation
 //!   Bug fixes vs original spec:
 //!   - RERANK_TOP_N: Option<usize> → usize (the Option wrapper was meaningless)
@@ -83,7 +87,6 @@
 //!   - tokenizer clone pattern aligned with embed.rs (project standard)
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -91,8 +94,8 @@ use ort::value::Tensor;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
 
-// Re-use the ORT initialization from embed.rs — it's process-global via Once.
-use super::embed::init_ort_runtime;
+// Re-use the ORT initialization and session boundary from embed.rs.
+use super::embed::{init_ort_runtime, InferenceSession};
 
 // ============================================
 // Constants
@@ -127,7 +130,7 @@ const NORM_EPSILON: f32 = 1e-6;
 
 /// Cross-encoder reranker using ms-marco-MiniLM-L-6-v2 ONNX model.
 ///
-/// Thread-safe: `ort::Session` wrapped in `Mutex` (same pattern as EmbedEngine/NerEngine).
+/// Thread-safe: `ort::Session` is serialized through `InferenceSession`.
 ///
 /// ## Usage
 /// ```rust,ignore
@@ -140,7 +143,7 @@ const NORM_EPSILON: f32 = 1e-6;
 /// // candidates[0].ce_score >> candidates[1].ce_score
 /// ```
 pub struct RerankerEngine {
-    session: Mutex<Session>,
+    session: InferenceSession<Session>,
     tokenizer: Tokenizer,
     max_seq_length: usize,
 }
@@ -211,7 +214,7 @@ impl RerankerEngine {
         info!(tokenizer = %tokenizer_path.display(), "[RERANKER] Tokenizer loaded");
 
         Ok(Self {
-            session: Mutex::new(session),
+            session: InferenceSession::new(session),
             tokenizer,
             max_seq_length,
         })
@@ -303,10 +306,7 @@ impl RerankerEngine {
             .map_err(|e| format!("Reranker token_type_ids tensor: {}", e))?;
 
         // ── ONNX inference ──
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|e| format!("Reranker session lock poisoned: {}", e))?;
+        let mut session = self.session.lock();
 
         let outputs = session
             .run(ort::inputs![
