@@ -145,6 +145,10 @@
 //!   from HTTP handlers.
 //!
 //! ## Last Modified
+//! v2.7.18-EmbeddingOutputValidation -
+//!   [MEMCHAIN-EMBED-OUTPUT 2026-07-30 by Codex] Added strict MiniLM and
+//!   EmbeddingGemma output-shape contracts, rejected non-finite tensors and
+//!   degenerate vectors, and moved L2 norm accumulation to f64.
 //! v2.7.17-RetryableOrtInitialization -
 //!   [MEMCHAIN-ORT-RECOVERY 2026-07-30 by Codex] Replaced sticky failed ORT
 //!   initialization with a serialized success-only gate.
@@ -236,6 +240,123 @@ const ORT_LIB_FILENAME: &str = "onnxruntime.dll";
 /// Maximum batch size for embed requests.
 /// Protects against OOM from excessively large batches.
 pub const MAX_BATCH_SIZE: usize = 100;
+
+// ============================================
+// Embedding output contract
+// ============================================
+
+/// Validate MiniLM's `[batch, sequence, native_dim]` output contract.
+///
+/// [MEMCHAIN-EMBED-OUTPUT 2026-07-30 by Codex] Exact batch and sequence
+/// dimensions are required because mean pooling indexes both axes using the
+/// tokenizer output. The native dimension must satisfy the configured public
+/// output dimension so callers never receive a shorter vector than promised.
+fn validate_minilm_output_shape(
+    shape: &[usize],
+    expected_batch: usize,
+    expected_sequence: usize,
+    output_dim: usize,
+) -> Result<usize, String> {
+    let [batch, sequence, native_dim] = shape else {
+        return Err(format!(
+            "MiniLM output shape {:?} is not [batch, sequence, native_dim]",
+            shape
+        ));
+    };
+
+    if *batch != expected_batch || *sequence != expected_sequence {
+        return Err(format!(
+            "MiniLM output shape {:?} does not match tokenized batch {} and sequence {}",
+            shape, expected_batch, expected_sequence
+        ));
+    }
+    if *native_dim < output_dim {
+        return Err(format!(
+            "MiniLM native dimension {} is smaller than configured output dimension {}",
+            native_dim, output_dim
+        ));
+    }
+
+    Ok(*native_dim)
+}
+
+/// Validate EmbeddingGemma's `[batch, native_dim]` output contract.
+fn validate_gemma_output_shape(
+    shape: &[usize],
+    expected_batch: usize,
+    output_dim: usize,
+) -> Result<usize, String> {
+    let [batch, native_dim] = shape else {
+        return Err(format!(
+            "EmbeddingGemma output shape {:?} is not [batch, native_dim]",
+            shape
+        ));
+    };
+
+    if *batch != expected_batch {
+        return Err(format!(
+            "EmbeddingGemma output batch {} does not match input batch {}",
+            batch, expected_batch
+        ));
+    }
+    if *native_dim < output_dim {
+        return Err(format!(
+            "EmbeddingGemma native dimension {} is smaller than configured output dimension {}",
+            native_dim, output_dim
+        ));
+    }
+
+    Ok(*native_dim)
+}
+
+/// Reject non-finite model output before pooling or vector-index insertion.
+fn validate_finite_embedding_output(
+    model: &str,
+    values: impl Iterator<Item = f32>,
+) -> Result<(), String> {
+    if let Some((index, value)) = values.enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(format!(
+            "{} output contains non-finite value at flat index {}: {}",
+            model, index, value
+        ));
+    }
+
+    Ok(())
+}
+
+/// L2-normalize one embedding using f64 accumulation.
+///
+/// Squaring large finite f32 values in f32 can overflow to infinity and turn a
+/// valid direction into an all-zero vector after division. Accumulating in f64
+/// covers the complete finite f32 range and makes zero-norm output explicit.
+fn normalize_embedding(
+    model: &str,
+    batch_index: usize,
+    embedding: &mut [f32],
+) -> Result<(), String> {
+    validate_finite_embedding_output(model, embedding.iter().copied())?;
+
+    let norm = embedding
+        .iter()
+        .copied()
+        .map(f64::from)
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+
+    if !norm.is_finite() || norm <= 1e-12 {
+        return Err(format!(
+            "{} produced a degenerate embedding at batch index {} (L2 norm: {})",
+            model, batch_index, norm
+        ));
+    }
+
+    for value in embedding {
+        *value = (f64::from(*value) / norm) as f32;
+    }
+
+    Ok(())
+}
 
 // ============================================
 // EmbeddingGemma Task Prompt Prefixes
@@ -772,48 +893,46 @@ impl EmbedEngine {
             .try_extract_array::<f32>()
             .map_err(|e| format!("Output extraction: {}", e))?;
 
-        let hidden_shape = hidden.shape();
-        if hidden_shape.len() != 3 {
-            return Err(format!(
-                "Expected 3D output [batch, seq, dim], got {}D",
-                hidden_shape.len()
-            ));
-        }
-        let hidden_dim = hidden_shape[2];
+        // [MEMCHAIN-EMBED-OUTPUT 2026-07-30 by Codex] Validate all axes and
+        // values before indexed pooling. A mismatched model must fail the
+        // request instead of panicking or inserting a corrupted vector.
+        let hidden_dim =
+            validate_minilm_output_shape(hidden.shape(), batch_size, seq_len, self.output_dim)?;
+        validate_finite_embedding_output("MiniLM", hidden.iter().copied())?;
 
         // ── Mean pooling + L2 normalize ──
         let mut results = Vec::with_capacity(batch_size);
 
         for b in 0..batch_size {
-            let mut pooled = vec![0.0f32; hidden_dim];
-            let mut mask_sum = 0.0f32;
+            let mut pooled = vec![0.0f64; hidden_dim];
+            let mut mask_sum = 0.0f64;
 
             for s in 0..seq_len {
-                let m = attention_mask_raw[b * seq_len + s] as f32;
+                let m = attention_mask_raw[b * seq_len + s] as f64;
                 if m > 0.0 {
                     mask_sum += m;
                     for d in 0..hidden_dim {
-                        pooled[d] += hidden[[b, s, d]] * m;
+                        pooled[d] += f64::from(hidden[[b, s, d]]) * m;
                     }
                 }
             }
 
-            if mask_sum > 0.0 {
-                for v in pooled.iter_mut() {
-                    *v /= mask_sum;
-                }
+            if mask_sum <= 0.0 {
+                return Err(format!(
+                    "MiniLM attention mask is empty at batch index {}",
+                    b
+                ));
             }
 
             // Matryoshka truncation for MiniLM (if output_dim < 384)
             pooled.truncate(self.output_dim);
+            let mut pooled: Vec<f32> = pooled
+                .into_iter()
+                .map(|value| (value / mask_sum) as f32)
+                .collect();
 
             // L2 normalize
-            let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 1e-12 {
-                for v in pooled.iter_mut() {
-                    *v /= norm;
-                }
-            }
+            normalize_embedding("MiniLM", b, &mut pooled)?;
 
             results.push(pooled);
         }
@@ -913,20 +1032,16 @@ impl EmbedEngine {
             .try_extract_array::<f32>()
             .map_err(|e| format!("sentence_embedding extraction: {}", e))?;
 
-        let emb_shape = embeddings.shape();
-        if emb_shape.len() != 2 {
-            return Err(format!(
-                "Expected 2D sentence_embedding [batch, dim], got {}D {:?}",
-                emb_shape.len(),
-                emb_shape
-            ));
-        }
-        let native_dim = emb_shape[1]; // 768 for EmbeddingGemma
+        // [MEMCHAIN-EMBED-OUTPUT 2026-07-30 by Codex] Preserve the public
+        // output-dimension contract and reject invalid values before indexing.
+        let native_dim =
+            validate_gemma_output_shape(embeddings.shape(), batch_size, self.output_dim)?;
+        validate_finite_embedding_output("EmbeddingGemma", embeddings.iter().copied())?;
 
         // ── Matryoshka truncation + L2 re-normalize ──
         // MRL guarantees that the first N dimensions contain the most information.
         // Procedure: truncate to output_dim, then L2 re-normalize to unit length.
-        let truncate_dim = self.output_dim.min(native_dim);
+        let truncate_dim = self.output_dim;
 
         let mut results = Vec::with_capacity(batch_size);
 
@@ -935,12 +1050,7 @@ impl EmbedEngine {
             let mut vec: Vec<f32> = (0..truncate_dim).map(|d| embeddings[[b, d]]).collect();
 
             // L2 re-normalize after truncation
-            let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 1e-12 {
-                for v in vec.iter_mut() {
-                    *v /= norm;
-                }
-            }
+            normalize_embedding("EmbeddingGemma", b, &mut vec)?;
 
             results.push(vec);
         }
@@ -1055,6 +1165,59 @@ mod tests {
 
         *session.lock() += 1;
         assert_eq!(*session.lock(), 2);
+    }
+
+    #[test]
+    fn embedding_output_shapes_require_exact_batch_and_sequence() {
+        assert_eq!(
+            validate_minilm_output_shape(&[2, 8, 384], 2, 8, 384).unwrap(),
+            384
+        );
+        assert!(validate_minilm_output_shape(&[1, 8, 384], 2, 8, 384).is_err());
+        assert!(validate_minilm_output_shape(&[2, 7, 384], 2, 8, 384).is_err());
+        assert!(validate_minilm_output_shape(&[2, 8], 2, 8, 384).is_err());
+
+        assert_eq!(validate_gemma_output_shape(&[2, 768], 2, 384).unwrap(), 768);
+        assert!(validate_gemma_output_shape(&[1, 768], 2, 384).is_err());
+        assert!(validate_gemma_output_shape(&[2, 8, 768], 2, 384).is_err());
+    }
+
+    #[test]
+    fn embedding_output_shapes_reject_short_native_dimensions() {
+        let minilm = validate_minilm_output_shape(&[1, 8, 383], 1, 8, 384).unwrap_err();
+        assert!(minilm.contains("smaller"));
+
+        let gemma = validate_gemma_output_shape(&[1, 383], 1, 384).unwrap_err();
+        assert!(gemma.contains("smaller"));
+    }
+
+    #[test]
+    fn embedding_output_rejects_non_finite_values() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = validate_finite_embedding_output("test-model", [0.0, value].into_iter())
+                .unwrap_err();
+            assert!(error.contains("non-finite"));
+        }
+    }
+
+    #[test]
+    fn embedding_normalization_handles_f32_extremes() {
+        let mut embedding = [f32::MAX, f32::MAX];
+        normalize_embedding("test-model", 0, &mut embedding).unwrap();
+
+        let expected = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((embedding[0] - expected).abs() < 1e-6);
+        assert!((embedding[1] - expected).abs() < 1e-6);
+        assert!(embedding.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn embedding_normalization_rejects_degenerate_vectors() {
+        let mut embedding = [0.0, 0.0];
+        let error = normalize_embedding("test-model", 3, &mut embedding).unwrap_err();
+
+        assert!(error.contains("degenerate"));
+        assert!(error.contains("batch index 3"));
     }
 
     /// Helper: skip test if model files are not downloaded.
