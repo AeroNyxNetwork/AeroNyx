@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.85.0 - Removed the permanent mutex-poison failure mode
-from permissionless discovery gossip admission.
+Modification Reason: v0.86.0 - Made MemChain volume placement and hot reload
+fail closed without retaining owner identities in operational logs.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.85.0 - [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] Keeps node discovery gossip available after a recovered rate-limiter lock-owner panic.
+Last Modified: v0.86.0 - [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Preserves canonical user-storage paths, rejects orphaning reloads, serializes placement with reload, and removes owner identifiers from volume logs.
+Previous: v0.85.0 - [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] Keeps node discovery gossip available after a recovered rate-limiter lock-owner panic.
 Previous: v0.84.0 - [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] Gives all authenticated Directory peer blocking workers one privacy-safe failure and observability contract.
 Previous: v0.83.0 - [BLOCKING-WORKER-RECOVERY 2026-07-30 by Codex] Keeps SystemDb usable after a failed worker and prevents raw JoinError payloads from entering anchor/status diagnostics.
 Previous: v0.82.0 - [STORAGE-JOIN-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering shared storage errors, API logs, or scheduler diagnostics.
@@ -118,6 +119,39 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.86 MemChain volume routing fails closed
+
+[VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex]
+
+- `VolumeRouter` now uses a non-poisoning `parking_lot::RwLock` for its short
+  synchronous configuration critical sections. A failed writer no longer
+  makes all later storage routing operations panic.
+- New-owner placement and volume configuration reload share one async control
+  gate. A reload cannot remove a volume after placement selected it but before
+  the durable `SystemDb` assignment commits.
+- Hot reload now enforces the contract already documented by the source: a
+  changed path for an existing volume is warned and ignored, so existing
+  owner database and vector-index filenames remain at their canonical path.
+- A reload may remove an unassigned volume, but it rejects the complete update
+  before mutation if any durable assignment still references that volume.
+- Startup likewise fails closed when durable assignments reference an absent
+  volume. The node cannot report ready while those users' storage paths are
+  unresolved.
+- Startup and assignment logs no longer contain full or abbreviated owner
+  public keys. Operational evidence is limited to volume identifiers and
+  aggregate assignment counts.
+- This milestone does not change Memory Chain ciphertext, record formats,
+  owner authentication, database filenames, API routes, vector-index formats,
+  chain authority, witness policy, consensus, or finality.
+
+Verification:
+
+- `rustfmt +1.97.1 --edition 2021 --check` on `volume_router.rs`.
+- `cargo +1.97.1 test -j 1 -p aeronyx-server volume_router`: 20 passed.
+- `cargo +1.97.1 test -j 1 -p aeronyx-server storage_pool`: 12 passed.
+- `cargo +1.97.1 check -j 1 -p aeronyx-server`.
+- `git diff --check`.
 
 ### v0.85 Discovery admission survives a recovered panic
 

@@ -37,30 +37,32 @@
 //! Draining support is reserved for future migration tooling.
 //!
 //! ⚠️ Important Note for Next Developer:
-//! - volumes field uses std::sync::RwLock (not tokio), because it is
-//!   only ever accessed from spawn_blocking contexts or sync code.
-//!   Do not switch to tokio::sync::RwLock without auditing all callers.
-//! - assign() has a TOCTOU window between count_users_per_volume() and
-//!   assign_volume(). Mitigation: SystemDb.assign_volume() uses
-//!   INSERT OR IGNORE + AlreadyAssigned error — the race results in a
-//!   retry, not a data corruption. See assign() implementation.
+//! - volumes uses parking_lot::RwLock because every critical section is
+//!   synchronous and short. Do not hold its guard across an await.
+//! - assignment_gate serializes new-owner placement and config reload. This
+//!   prevents a reload from removing a volume after assign() selected it and
+//!   keeps max_users decisions consistent within this process.
+//! - SystemDb.assign_volume() still uses INSERT OR IGNORE + AlreadyAssigned as
+//!   defense in depth against another process assigning the same owner.
 //! - reload_config(): path changes are intentionally ignored (the old
 //!   path is the canonical location for existing user DBs).
-//! - "Ghost volumes": if a volume is removed from config but still has
-//!   users assigned, route() still works (from in-memory DashMap), but
-//!   db_path() will fail at open time. This is an ops/deployment concern.
+//! - A hot reload cannot remove a volume with active assignments. Migrate its
+//!   users first; otherwise route() and db_path() could disagree.
 //! - ensure_volumes_config() is called from Server::new() in SaaS mode,
 //!   not from VolumeRouter::new() — keep them separate for testability.
 //!
 //! ## Last Modified
+//! v2.8.55-VolumeRouterIntegrity - Made hot reload fail closed and recoverable.
 //! v2.7.14-RustdocQuality - Classified the volume lifecycle diagram as text.
 //! v1.0.0-MultiTenant - Initial implementation (Task 1a)
 // ============================================
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use dashmap::DashMap;
+use parking_lot::RwLock;
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use super::system_db::{SystemDb, SystemDbError};
@@ -145,6 +147,15 @@ pub enum VolumeRouterError {
     #[error("Volume '{0}' not found in config")]
     VolumeNotFound(String),
 
+    /// Durable assignments reference a volume absent from active configuration.
+    #[error(
+        "Volume '{volume_id}' has {assigned_users} assigned users but is absent from active configuration"
+    )]
+    AssignedVolumeUnavailable {
+        volume_id: String,
+        assigned_users: usize,
+    },
+
     #[error("SystemDb error: {0}")]
     SystemDb(#[from] SystemDbError),
 
@@ -169,6 +180,13 @@ pub enum VolumeRouterError {
 pub struct VolumeRouter {
     /// Volume configuration list (hot-reloadable).
     volumes: RwLock<Vec<VolumeConfig>>,
+
+    /// Serializes new-owner placement with configuration replacement.
+    ///
+    /// [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Existing-owner lookups
+    /// remain lock-free through DashMap; only the rare placement/reload control
+    /// path is serialized across its async SystemDb boundary.
+    assignment_gate: TokioMutex<()>,
 
     /// In-memory owner → volume_id cache (populated at startup from SystemDb).
     assignments: DashMap<[u8; 32], String>,
@@ -207,17 +225,30 @@ impl VolumeRouter {
         let all = system_db.load_all_assignments().await?;
         let volume_ids: std::collections::HashSet<&str> =
             volumes.iter().map(|v| v.id.as_str()).collect();
+        let mut ghost_assignments = std::collections::BTreeMap::<String, usize>::new();
 
         for (owner, vol_id) in &all {
             if !volume_ids.contains(vol_id.as_str()) {
-                warn!(
-                    owner = hex::encode(owner),
-                    volume_id = vol_id,
-                    "[VOLUME_ROUTER] Assignment points to unconfigured volume (ghost volume) — \
-                     route() will work from cache but open may fail at DB level"
-                );
+                let count = ghost_assignments.entry(vol_id.clone()).or_default();
+                *count = count.saturating_add(1);
             }
             assignments.insert(*owner, vol_id.clone());
+        }
+        for (volume_id, assigned_users) in &ghost_assignments {
+            // [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Volume health is
+            // operator metadata; owner public keys must never enter node logs.
+            warn!(
+                volume_id,
+                assigned_users,
+                "[VOLUME_ROUTER] Assignments reference an unconfigured volume; \
+                 restore the volume configuration before opening user storage"
+            );
+        }
+        if let Some((volume_id, assigned_users)) = ghost_assignments.into_iter().next() {
+            return Err(VolumeRouterError::AssignedVolumeUnavailable {
+                volume_id,
+                assigned_users,
+            });
         }
 
         info!(
@@ -229,6 +260,7 @@ impl VolumeRouter {
 
         Ok(Arc::new(Self {
             volumes: RwLock::new(volumes),
+            assignment_gate: TokioMutex::new(()),
             assignments,
             system_db,
             config_path,
@@ -272,6 +304,11 @@ impl VolumeRouter {
     /// This function must only be called after the owner has been
     /// authenticated. Never call with an unverified owner pubkey.
     pub async fn assign(&self, owner: &[u8; 32]) -> Result<String, VolumeRouterError> {
+        // [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Hold one async control
+        // gate across selection and persistence so reload cannot invalidate the
+        // selected volume before the durable assignment commits.
+        let _assignment_guard = self.assignment_gate.lock().await;
+
         // Get current per-volume user counts.
         let counts: std::collections::HashMap<String, usize> = self
             .system_db
@@ -282,7 +319,7 @@ impl VolumeRouter {
 
         // Select the target volume under a read lock.
         let target_id = {
-            let vols = self.volumes.read().unwrap();
+            let vols = self.volumes.read();
 
             vols.iter()
                 .filter(|v| v.status == VolumeStatus::ReadWrite)
@@ -301,7 +338,6 @@ impl VolumeRouter {
                 // New assignment — update cache.
                 self.assignments.insert(*owner, target_id.clone());
                 info!(
-                    owner = &hex::encode(owner)[..8],
                     volume_id = target_id,
                     "[VOLUME_ROUTER] Assigned new user to volume"
                 );
@@ -348,7 +384,7 @@ impl VolumeRouter {
 
     /// Retrieve the filesystem path for a volume by ID.
     fn volume_path(&self, volume_id: &str) -> Result<PathBuf, VolumeRouterError> {
-        let vols = self.volumes.read().unwrap();
+        let vols = self.volumes.read();
         vols.iter()
             .find(|v| v.id == volume_id)
             .map(|v| v.path.clone())
@@ -364,18 +400,50 @@ impl VolumeRouter {
     /// ## Reload Rules
     /// - New volumes: added to the list immediately
     /// - Status changes: take effect immediately for new assignments
-    /// - Path changes: silently ignored (existing DBs are at old paths)
-    /// - Removed volumes: users who were on them become "ghost" assignments;
-    ///   route() still works from cache, but DB opens may fail at storage layer
+    /// - Path changes: warned and ignored (existing DBs stay at canonical paths)
+    /// - Removed unassigned volumes: removed immediately
+    /// - Removed assigned volumes: reject the complete reload without mutation
     ///
     /// Existing in-memory assignments are NOT invalidated on reload.
     pub async fn reload_config(&self) -> Result<(), VolumeRouterError> {
-        let new_volumes = load_volumes_config(&self.config_path)?;
+        let mut new_volumes = load_volumes_config(&self.config_path)?;
+        let _assignment_guard = self.assignment_gate.lock().await;
+        let mut vols = self.volumes.write();
 
-        let mut vols = self.volumes.write().unwrap();
+        let assigned_users_by_volume = self.assignments.iter().fold(
+            std::collections::HashMap::<String, usize>::new(),
+            |mut counts, assignment| {
+                let count = counts.entry(assignment.value().clone()).or_default();
+                *count = count.saturating_add(1);
+                counts
+            },
+        );
 
-        // Detect and warn about path changes (not applied).
-        for new_vol in &new_volumes {
+        // [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Reject the complete
+        // reload before mutating live state when it would orphan any durable
+        // assignment. Unassigned volumes remain removable.
+        for old_volume in vols.iter() {
+            if new_volumes
+                .iter()
+                .any(|candidate| candidate.id == old_volume.id)
+            {
+                continue;
+            }
+            let assigned_users = assigned_users_by_volume
+                .get(&old_volume.id)
+                .copied()
+                .unwrap_or(0);
+            if assigned_users > 0 {
+                return Err(VolumeRouterError::AssignedVolumeUnavailable {
+                    volume_id: old_volume.id.clone(),
+                    assigned_users,
+                });
+            }
+        }
+
+        // Preserve canonical paths while applying mutable capacity/status
+        // fields. A config typo must not redirect existing DB filenames.
+        for new_vol in &mut new_volumes {
             if let Some(old_vol) = vols.iter().find(|v| v.id == new_vol.id) {
                 if old_vol.path != new_vol.path {
                     warn!(
@@ -385,6 +453,7 @@ impl VolumeRouter {
                         "[VOLUME_ROUTER] Path change ignored on reload — \
                          existing user DBs remain at old path"
                     );
+                    new_vol.path.clone_from(&old_vol.path);
                 }
             }
         }
@@ -411,7 +480,7 @@ impl VolumeRouter {
             .into_iter()
             .collect();
 
-        let vols = self.volumes.read().unwrap();
+        let vols = self.volumes.read();
         let stats = vols
             .iter()
             .map(|v| VolumeStats {
@@ -430,7 +499,7 @@ impl VolumeRouter {
 
     /// Check whether the router has any writable volume available.
     pub fn has_writable_volume(&self) -> bool {
-        let vols = self.volumes.read().unwrap();
+        let vols = self.volumes.read();
         vols.iter().any(|v| v.status == VolumeStatus::ReadWrite)
     }
 }
@@ -668,6 +737,31 @@ mod tests {
         assert!(matches!(err, VolumeRouterError::DuplicateId(_)));
     }
 
+    #[tokio::test]
+    async fn test_new_rejects_assignments_for_unconfigured_volume() {
+        // [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Startup must not report
+        // ready when durable assignments cannot resolve to a configured path.
+        let dir = TempDir::new().unwrap();
+        let db = SystemDb::open(&dir.path().join("system.db")).await.unwrap();
+        db.assign_volume(&make_owner(0x41), "removed-volume")
+            .await
+            .unwrap();
+        let config_path = write_volumes_toml(dir.path(), &[("vol-001", VolumeStatus::ReadWrite)]);
+
+        let error = match VolumeRouter::new(&config_path, db).await {
+            Ok(_) => panic!("unconfigured durable assignment should fail startup"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            VolumeRouterError::AssignedVolumeUnavailable {
+                volume_id,
+                assigned_users: 1
+            } if volume_id == "removed-volume"
+        ));
+    }
+
     // ── Assignment / Routing ──────────────────────────────────────────
 
     #[tokio::test]
@@ -810,7 +904,7 @@ mod tests {
         router.reload_config().await.unwrap();
 
         // Now vol-002 should be in config.
-        let vols = router.volumes.read().unwrap();
+        let vols = router.volumes.read();
         assert_eq!(vols.len(), 2);
         assert!(vols.iter().any(|v| v.id == "vol-002"));
     }
@@ -827,6 +921,87 @@ mod tests {
         assert!(!router.has_writable_volume());
         let err = router.assign(&make_owner(0xAA)).await.unwrap_err();
         assert!(matches!(err, VolumeRouterError::NoWritableVolume));
+    }
+
+    #[tokio::test]
+    async fn test_reload_config_preserves_canonical_volume_path() {
+        // [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] A config typo must not
+        // silently redirect existing owner files to another directory.
+        let dir = TempDir::new().unwrap();
+        let (_db, router) = make_router(dir.path(), &[("vol-001", VolumeStatus::ReadWrite)]).await;
+        let owner = make_owner(0x42);
+        let original_path = router.db_path("vol-001", &owner).unwrap();
+        let replacement_dir = dir.path().join("replacement");
+        std::fs::create_dir_all(&replacement_dir).unwrap();
+        std::fs::write(
+            dir.path().join("volumes.toml"),
+            format!(
+                "[[volumes]]\nid = \"vol-001\"\npath = \"{}\"\nstatus = \"read-only\"\n",
+                replacement_dir.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        router.reload_config().await.unwrap();
+
+        assert_eq!(router.db_path("vol-001", &owner).unwrap(), original_path);
+        assert!(!router.has_writable_volume());
+    }
+
+    #[tokio::test]
+    async fn test_reload_config_rejects_removing_an_assigned_volume() {
+        let dir = TempDir::new().unwrap();
+        let (_db, router) = make_router(
+            dir.path(),
+            &[
+                ("vol-001", VolumeStatus::ReadWrite),
+                ("vol-002", VolumeStatus::ReadWrite),
+            ],
+        )
+        .await;
+        let owner = make_owner(0x43);
+        router.assign(&owner).await.unwrap();
+        let assigned_volume = router.route(&owner).unwrap();
+        let retained_path = router.db_path(&assigned_volume, &owner).unwrap();
+        let retained_id = assigned_volume.clone();
+        let replacement_id = if retained_id == "vol-001" {
+            "vol-002"
+        } else {
+            "vol-001"
+        };
+        write_volumes_toml(dir.path(), &[(replacement_id, VolumeStatus::ReadWrite)]);
+
+        let error = router.reload_config().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            VolumeRouterError::AssignedVolumeUnavailable {
+                volume_id,
+                assigned_users: 1
+            } if volume_id == retained_id
+        ));
+        assert_eq!(
+            router.db_path(&assigned_volume, &owner).unwrap(),
+            retained_path
+        );
+    }
+
+    #[tokio::test]
+    async fn test_volume_lock_recovers_after_writer_panic() {
+        let dir = TempDir::new().unwrap();
+        let (_db, router) = make_router(dir.path(), &[("vol-001", VolumeStatus::ReadWrite)]).await;
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _volumes = router.volumes.write();
+            panic!("sensitive volume writer failure");
+        }));
+
+        assert!(panic_result.is_err());
+        assert!(router.has_writable_volume());
+        assert!(router
+            .db_path("vol-001", &make_owner(0x44))
+            .unwrap()
+            .ends_with("4444444444444444.db"));
     }
 
     // ── ensure_volumes_config ─────────────────────────────────────────
