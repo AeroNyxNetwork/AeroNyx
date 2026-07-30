@@ -107,9 +107,15 @@
 //!   If they're missing, the model was not exported correctly.
 //! - Sequence start/end and unknown-token IDs are resolved from standard BERT
 //!   or SentencePiece aliases during loading. Never fabricate token ID zero.
+//! - `gliner_config.json` is an executable model contract. Prompt token count,
+//!   label count, and span width must remain within its declared capacities.
 //! - span_mask tensor type is bool (not u8). ort 2.0.0-rc.11 supports bool directly.
 //!
 //! ## Last Modified
+//! v2.4.7-ModelPromptBudget -
+//!   [MEMCHAIN-NER-PROMPT-BUDGET 2026-07-30 by Codex] Parse and validate
+//!   GLiNER artifact limits, bound input scanning, and construct prompts under
+//!   the model token budget without splitting a text word across inference.
 //! v2.4.6-SpecialTokenContract -
 //!   [MEMCHAIN-NER-SPECIAL-TOKENS 2026-07-30 by Codex] Added a load-time
 //!   contract for every GLiNER special token, removed token-ID-zero fallbacks,
@@ -139,12 +145,13 @@
 //! v2.4.0+BugFix - 🔧 Fixed span_mask tensor type from u8 to bool (B2 bug fix).
 //!   GLiNER ONNX model expects tensor(bool), not tensor(uint8).
 
-use std::path::Path;
+use std::{fs, path::Path};
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::tensor::TensorElementType;
 use ort::value::Tensor;
+use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tracing::{debug, info};
 
@@ -162,6 +169,9 @@ const MODEL_FILENAME: &str = "model.onnx";
 
 /// Tokenizer filename within the NER model directory.
 const TOKENIZER_FILENAME: &str = "tokenizer.json";
+
+/// GLiNER artifact configuration filename.
+const MODEL_CONFIG_FILENAME: &str = "gliner_config.json";
 
 /// GLiNER special token: entity type marker.
 /// In the prompt, each label is preceded by this token.
@@ -188,19 +198,37 @@ const DEFAULT_MAX_WIDTH: usize = 12;
 /// Spans with sigmoid(logit) < threshold are discarded.
 const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.5;
 
-/// Maximum number of entity labels per inference call.
-/// Protects against excessive prompt length.
-const MAX_LABELS: usize = 32;
-
 /// Maximum text length in words for a single inference call.
 /// Longer texts should be split into windows by the caller.
 const MAX_TEXT_WORDS: usize = 512;
+
+/// Maximum source bytes scanned for one NER inference call.
+///
+/// Token count is the authoritative model limit, but bounding the source scan
+/// prevents a single whitespace-free request from forcing an unbounded copy
+/// and tokenizer pass before that token budget can be applied.
+const MAX_TEXT_INPUT_BYTES: usize = 64 * 1024;
+
+/// Maximum UTF-8 bytes accepted for one entity-type label.
+///
+/// Production labels are short nouns such as `person` or `technology`.
+/// Bounding them before tokenization prevents public library callers from
+/// bypassing the prompt budget with a single oversized label string.
+const MAX_LABEL_INPUT_BYTES: usize = 256;
 
 /// Maximum configurable span width.
 ///
 /// Wider spans cannot be observed because inference already caps text at
 /// `MAX_TEXT_WORDS`; rejecting them also bounds the span-grid allocation.
 const MAX_ENTITY_WIDTH: usize = MAX_TEXT_WORDS;
+
+/// Bundled GLiNER small-v2.1 artifact defaults.
+const DEFAULT_MODEL_MAX_SEQUENCE_TOKENS: usize = 384;
+const DEFAULT_MODEL_MAX_LABELS: usize = 25;
+
+/// Defensive ceilings for operator-supplied model metadata.
+const HARD_MAX_SEQUENCE_TOKENS: usize = 4096;
+const HARD_MAX_LABELS: usize = 128;
 
 // ============================================
 // NER output and span-grid contracts
@@ -280,6 +308,91 @@ fn validate_finite_ner_logits(values: impl Iterator<Item = f32>) -> Result<(), S
 }
 
 // ============================================
+// Model artifact limits
+// ============================================
+
+/// Capacity fields consumed from the GLiNER artifact configuration.
+///
+/// The upstream file contains training metadata that the runtime does not
+/// need. Optional fields preserve compatibility with older artifact bundles;
+/// absent fields use the audited small-v2.1 defaults.
+#[derive(Debug, Default, Deserialize)]
+struct GlinerModelConfigFile {
+    max_len: Option<usize>,
+    max_types: Option<usize>,
+    max_width: Option<usize>,
+}
+
+/// Validated inference capacities for one GLiNER artifact.
+///
+/// [MEMCHAIN-NER-PROMPT-BUDGET 2026-07-30 by Codex] This is deliberately
+/// separate from operator tuning. Artifact limits describe what the exported
+/// model can accept; operator values may narrow them but never expand them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlinerModelLimits {
+    max_sequence_tokens: usize,
+    max_labels: usize,
+    max_width: usize,
+}
+
+impl Default for GlinerModelLimits {
+    fn default() -> Self {
+        Self {
+            max_sequence_tokens: DEFAULT_MODEL_MAX_SEQUENCE_TOKENS,
+            max_labels: DEFAULT_MODEL_MAX_LABELS,
+            max_width: DEFAULT_MAX_WIDTH,
+        }
+    }
+}
+
+impl GlinerModelLimits {
+    fn load(model_dir: &Path) -> Result<Self, String> {
+        let config_path = model_dir.join(MODEL_CONFIG_FILENAME);
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+
+        let bytes = fs::read(&config_path).map_err(|error| {
+            format!("GLiNER config read ({}): {}", config_path.display(), error)
+        })?;
+        let config: GlinerModelConfigFile = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("GLiNER config parse ({}): {}", config_path.display(), error)
+        })?;
+
+        Self::from_config(config)
+    }
+
+    fn from_config(config: GlinerModelConfigFile) -> Result<Self, String> {
+        let limits = Self {
+            max_sequence_tokens: config.max_len.unwrap_or(DEFAULT_MODEL_MAX_SEQUENCE_TOKENS),
+            max_labels: config.max_types.unwrap_or(DEFAULT_MODEL_MAX_LABELS),
+            max_width: config.max_width.unwrap_or(DEFAULT_MAX_WIDTH),
+        };
+
+        if !(4..=HARD_MAX_SEQUENCE_TOKENS).contains(&limits.max_sequence_tokens) {
+            return Err(format!(
+                "GLiNER max_len {} is outside supported range 4..={}",
+                limits.max_sequence_tokens, HARD_MAX_SEQUENCE_TOKENS
+            ));
+        }
+        if !(1..=HARD_MAX_LABELS).contains(&limits.max_labels) {
+            return Err(format!(
+                "GLiNER max_types {} is outside supported range 1..={}",
+                limits.max_labels, HARD_MAX_LABELS
+            ));
+        }
+        if !(1..=MAX_ENTITY_WIDTH).contains(&limits.max_width) {
+            return Err(format!(
+                "GLiNER max_width {} is outside supported range 1..={}",
+                limits.max_width, MAX_ENTITY_WIDTH
+            ));
+        }
+
+        Ok(limits)
+    }
+}
+
+// ============================================
 // Types
 // ============================================
 
@@ -308,6 +421,15 @@ struct WordSpan {
     text: String,
     byte_start: usize,
     byte_end: usize,
+}
+
+/// Fully budgeted GLiNER sequence inputs before tensor construction.
+#[derive(Debug, PartialEq, Eq)]
+struct GlinerPrompt {
+    input_ids: Vec<i64>,
+    attention_mask: Vec<i64>,
+    words_mask: Vec<i64>,
+    text_length: usize,
 }
 
 /// Complete tokenizer contract required to construct a GLiNER prompt.
@@ -365,6 +487,188 @@ fn resolve_token_alias(
         })
 }
 
+/// Split a bounded UTF-8 prefix into owned words with original byte offsets.
+///
+/// [MEMCHAIN-NER-PROMPT-BUDGET 2026-07-30 by Codex] Both word count and source
+/// bytes are bounded before allocation. When the byte ceiling falls inside a
+/// word, that partial word is omitted so inference never reports an entity for
+/// text it did not fully inspect.
+fn split_words_bounded(text: &str, max_words: usize, max_bytes: usize) -> Vec<WordSpan> {
+    if max_words == 0 || max_bytes == 0 || text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scan_end = text.len().min(max_bytes);
+    while scan_end > 0 && !text.is_char_boundary(scan_end) {
+        scan_end -= 1;
+    }
+
+    if scan_end < text.len() && scan_end > 0 {
+        let previous_is_whitespace = text[..scan_end]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+        let next_is_whitespace = text[scan_end..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace);
+        if !previous_is_whitespace && !next_is_whitespace {
+            scan_end = text[..scan_end]
+                .char_indices()
+                .rev()
+                .find_map(|(index, ch)| ch.is_whitespace().then_some(index))
+                .unwrap_or(0);
+        }
+    }
+
+    let mut words = Vec::new();
+    let mut chars = text[..scan_end].char_indices().peekable();
+    while words.len() < max_words {
+        let Some(&(byte_start, ch)) = chars.peek() else {
+            break;
+        };
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+
+        let mut byte_end = byte_start;
+        let mut word = String::new();
+        while let Some(&(byte_index, current)) = chars.peek() {
+            if current.is_whitespace() {
+                break;
+            }
+            byte_end = byte_index + current.len_utf8();
+            word.push(current);
+            chars.next();
+        }
+
+        if !word.is_empty() {
+            words.push(WordSpan {
+                text: word,
+                byte_start,
+                byte_end,
+            });
+        }
+    }
+
+    words
+}
+
+/// Build a token-budgeted GLiNER prompt with the production tokenizer.
+fn build_gliner_prompt(
+    tokenizer: &Tokenizer,
+    special_tokens: GlinerSpecialTokenIds,
+    labels: &[&str],
+    words: &[WordSpan],
+    max_sequence_tokens: usize,
+) -> Result<GlinerPrompt, String> {
+    build_gliner_prompt_with(
+        special_tokens,
+        labels,
+        words,
+        max_sequence_tokens,
+        |value| {
+            tokenizer
+                .encode(value.to_owned(), false)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+/// Assemble one prompt using a replaceable tokenizer boundary.
+///
+/// The injected tokenizer keeps token-budget behavior model-free in unit
+/// tests. Text words are atomic: if the next word does not fit together with
+/// the final sequence-end token, construction stops before that word.
+fn build_gliner_prompt_with(
+    special_tokens: GlinerSpecialTokenIds,
+    labels: &[&str],
+    words: &[WordSpan],
+    max_sequence_tokens: usize,
+    mut tokenize: impl FnMut(&str) -> Result<Vec<u32>, String>,
+) -> Result<GlinerPrompt, String> {
+    let mut token_ids = vec![special_tokens.sequence_start];
+    let mut words_mask = vec![0_i64];
+
+    for label in labels {
+        if label.is_empty() || label.len() > MAX_LABEL_INPUT_BYTES {
+            return Err(format!(
+                "GLiNER label length {} is outside supported range 1..={}",
+                label.len(),
+                MAX_LABEL_INPUT_BYTES
+            ));
+        }
+        let label_ids =
+            tokenize(label).map_err(|error| format!("Label tokenization failed: {}", error))?;
+        let projected = token_ids
+            .len()
+            .checked_add(1)
+            .and_then(|length| length.checked_add(label_ids.len()))
+            .and_then(|length| length.checked_add(2))
+            .ok_or_else(|| "GLiNER label prompt size overflow".to_string())?;
+        if projected > max_sequence_tokens {
+            return Err(format!(
+                "GLiNER label prompt exceeds model token limit {}",
+                max_sequence_tokens
+            ));
+        }
+
+        token_ids.push(special_tokens.entity_marker);
+        words_mask.push(0);
+        token_ids.extend(label_ids.iter().copied());
+        words_mask.resize(token_ids.len(), 0);
+    }
+
+    token_ids.push(special_tokens.prompt_separator);
+    words_mask.push(0);
+
+    let mut text_length = 0usize;
+    for word in words {
+        let mut word_ids =
+            tokenize(&word.text).map_err(|error| format!("Word tokenization failed: {}", error))?;
+        if word_ids.is_empty() {
+            word_ids.push(special_tokens.unknown);
+        }
+
+        let projected = token_ids
+            .len()
+            .checked_add(word_ids.len())
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| "GLiNER text prompt size overflow".to_string())?;
+        if projected > max_sequence_tokens {
+            break;
+        }
+
+        text_length += 1;
+        token_ids.extend(word_ids.iter().copied());
+        words_mask.resize(token_ids.len(), text_length as i64);
+    }
+
+    if text_length == 0 {
+        return Err(format!(
+            "GLiNER model token limit {} leaves no room for a complete text word",
+            max_sequence_tokens
+        ));
+    }
+
+    token_ids.push(special_tokens.sequence_end);
+    words_mask.push(0);
+    debug_assert_eq!(token_ids.len(), words_mask.len());
+    debug_assert!(token_ids.len() <= max_sequence_tokens);
+
+    let input_ids = token_ids.into_iter().map(i64::from).collect::<Vec<_>>();
+    let attention_mask = vec![1_i64; input_ids.len()];
+
+    Ok(GlinerPrompt {
+        input_ids,
+        attention_mask,
+        words_mask,
+        text_length,
+    })
+}
+
 // ============================================
 // NerEngine
 // ============================================
@@ -400,6 +704,10 @@ pub struct NerEngine {
     confidence_threshold: f32,
     /// Complete, load-time-validated prompt token contract.
     special_tokens: GlinerSpecialTokenIds,
+    /// Maximum complete prompt length declared by the model artifact.
+    max_sequence_tokens: usize,
+    /// Maximum entity labels declared by the model artifact.
+    max_labels: usize,
 }
 
 impl NerEngine {
@@ -472,6 +780,14 @@ impl NerEngine {
             ));
         }
 
+        let model_limits = GlinerModelLimits::load(model_dir)?;
+        if max_width > model_limits.max_width {
+            return Err(format!(
+                "GLiNER max_width {} exceeds model capacity {}",
+                max_width, model_limits.max_width
+            ));
+        }
+
         // Load and validate the tokenizer before initializing ORT or loading
         // the model's large weight file. An incompatible artifact should fail
         // quickly and leave other independently configured engines retryable.
@@ -518,6 +834,8 @@ impl NerEngine {
         info!(
             tokenizer = %tokenizer_path.display(),
             max_width = max_width,
+            max_sequence_tokens = model_limits.max_sequence_tokens,
+            max_labels = model_limits.max_labels,
             threshold = confidence_threshold,
             sequence_start_id = special_tokens.sequence_start,
             sequence_end_id = special_tokens.sequence_end,
@@ -534,6 +852,8 @@ impl NerEngine {
             max_width,
             confidence_threshold,
             special_tokens,
+            max_sequence_tokens: model_limits.max_sequence_tokens,
+            max_labels: model_limits.max_labels,
         })
     }
 
@@ -562,11 +882,11 @@ impl NerEngine {
         if text.is_empty() || labels.is_empty() {
             return Ok(Vec::new());
         }
-        if labels.len() > MAX_LABELS {
+        if labels.len() > self.max_labels {
             return Err(format!(
                 "Too many labels: {} (max {})",
                 labels.len(),
-                MAX_LABELS
+                self.max_labels
             ));
         }
 
@@ -575,14 +895,19 @@ impl NerEngine {
         if words.is_empty() {
             return Ok(Vec::new());
         }
-        let num_text_words = words.len().min(MAX_TEXT_WORDS);
-        let words = &words[..num_text_words];
 
         // Step 2-3: Build prompt and tokenize
-        let (input_ids, attention_mask, words_mask, text_length, _num_prompt_tokens) =
-            self.build_prompt_and_tokenize(labels, words)?;
+        let prompt = build_gliner_prompt(
+            &self.tokenizer,
+            self.special_tokens,
+            labels,
+            &words,
+            self.max_sequence_tokens,
+        )?;
+        let num_text_words = prompt.text_length;
+        let words = &words[..num_text_words];
 
-        let seq_len = input_ids.len();
+        let seq_len = prompt.input_ids.len();
 
         // Step 4: Build span indices (fixed-size grid: num_words × max_width)
         let (span_idx_flat, span_mask_flat, num_spans) = self.build_span_indices(num_text_words)?;
@@ -598,17 +923,18 @@ impl NerEngine {
         let shape_span_idx = [batch_size, num_spans, 2usize];
         let shape_span_mask = [batch_size, num_spans];
 
-        let ids_tensor = Tensor::from_array((shape_2d, input_ids.into_boxed_slice()))
+        let ids_tensor = Tensor::from_array((shape_2d, prompt.input_ids.into_boxed_slice()))
             .map_err(|e| format!("input_ids tensor: {}", e))?;
 
-        let mask_tensor = Tensor::from_array((shape_2d, attention_mask.into_boxed_slice()))
+        let mask_tensor = Tensor::from_array((shape_2d, prompt.attention_mask.into_boxed_slice()))
             .map_err(|e| format!("attention_mask tensor: {}", e))?;
 
-        let words_mask_tensor = Tensor::from_array((shape_2d, words_mask.into_boxed_slice()))
-            .map_err(|e| format!("words_mask tensor: {}", e))?;
+        let words_mask_tensor =
+            Tensor::from_array((shape_2d, prompt.words_mask.into_boxed_slice()))
+                .map_err(|e| format!("words_mask tensor: {}", e))?;
 
         let text_lengths_tensor =
-            Tensor::from_array((shape_tl, vec![text_length as i64].into_boxed_slice()))
+            Tensor::from_array((shape_tl, vec![num_text_words as i64].into_boxed_slice()))
                 .map_err(|e| format!("text_lengths tensor: {}", e))?;
 
         let span_idx_tensor =
@@ -726,126 +1052,7 @@ impl NerEngine {
     /// GLiNER's expected input format. Punctuation attached to words
     /// is kept with the word (e.g., "JWT," → "JWT" + ",").
     fn word_split(&self, text: &str) -> Vec<WordSpan> {
-        let mut words = Vec::new();
-        let mut chars = text.char_indices().peekable();
-
-        while let Some(&(byte_start, ch)) = chars.peek() {
-            if ch.is_whitespace() {
-                chars.next();
-                continue;
-            }
-
-            // Collect a word (non-whitespace run)
-            let mut byte_end = byte_start;
-            let mut word = String::new();
-
-            while let Some(&(bi, c)) = chars.peek() {
-                if c.is_whitespace() {
-                    break;
-                }
-                byte_end = bi + c.len_utf8();
-                word.push(c);
-                chars.next();
-            }
-
-            if !word.is_empty() {
-                words.push(WordSpan {
-                    text: word,
-                    byte_start,
-                    byte_end,
-                });
-            }
-        }
-
-        words
-    }
-
-    // ========================================
-    // Private: Prompt Construction + Tokenization
-    // ========================================
-
-    /// Build GLiNER prompt and tokenize it, returning the 4 sequence-level tensors
-    /// plus the text_length value.
-    ///
-    /// Prompt format:
-    /// [CLS] <<ENT>> label1 <<ENT>> label2 ... <<SEP>> word1 word2 ... [SEP]
-    ///
-    /// Returns: (input_ids, attention_mask, words_mask, text_length, num_prompt_tokens)
-    fn build_prompt_and_tokenize(
-        &self,
-        labels: &[&str],
-        words: &[WordSpan],
-    ) -> Result<(Vec<i64>, Vec<i64>, Vec<i64>, usize, usize), String> {
-        let mut all_token_ids: Vec<u32> = Vec::new();
-        let mut all_words_mask: Vec<i64> = Vec::new();
-
-        // Add [CLS]
-        all_token_ids.push(self.special_tokens.sequence_start);
-        all_words_mask.push(0); // not a text word
-
-        // Add entity labels: <<ENT>> label1 <<ENT>> label2 ...
-        for label in labels {
-            // <<ENT>> token
-            all_token_ids.push(self.special_tokens.entity_marker);
-            all_words_mask.push(0);
-
-            // Tokenize label text (may produce multiple subwords)
-            let label_encoding = self
-                .tokenizer
-                .encode(label.to_string(), false)
-                .map_err(|e| format!("Label tokenization failed: {}", e))?;
-
-            for &id in label_encoding.get_ids() {
-                all_token_ids.push(id);
-                all_words_mask.push(0); // label tokens are not text words
-            }
-        }
-
-        // <<SEP>> between labels and text
-        all_token_ids.push(self.special_tokens.prompt_separator);
-        all_words_mask.push(0);
-
-        let num_prompt_tokens = all_token_ids.len();
-
-        // Add text words — each word may produce multiple subword tokens.
-        // words_mask maps each subword token to its word index (1-based for GLiNER).
-        for (word_idx, word) in words.iter().enumerate() {
-            let word_encoding = self
-                .tokenizer
-                .encode(word.text.clone(), false)
-                .map_err(|e| format!("Word tokenization failed: {}", e))?;
-
-            let ids = word_encoding.get_ids();
-            if ids.is_empty() {
-                // Unknown word — use the load-time-validated UNK token.
-                all_token_ids.push(self.special_tokens.unknown);
-                all_words_mask.push((word_idx + 1) as i64);
-            } else {
-                for &id in ids {
-                    all_token_ids.push(id);
-                    all_words_mask.push((word_idx + 1) as i64);
-                }
-            }
-        }
-
-        // Add final [SEP]
-        all_token_ids.push(self.special_tokens.sequence_end);
-        all_words_mask.push(0);
-
-        let seq_len = all_token_ids.len();
-        let text_length = words.len();
-
-        // Build i64 tensors
-        let input_ids: Vec<i64> = all_token_ids.iter().map(|&id| id as i64).collect();
-        let attention_mask: Vec<i64> = vec![1i64; seq_len];
-
-        Ok((
-            input_ids,
-            attention_mask,
-            all_words_mask,
-            text_length,
-            num_prompt_tokens,
-        ))
+        split_words_bounded(text, MAX_TEXT_WORDS, MAX_TEXT_INPUT_BYTES)
     }
 
     // ========================================
@@ -930,6 +1137,8 @@ impl std::fmt::Debug for NerEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NerEngine")
             .field("max_width", &self.max_width)
+            .field("max_sequence_tokens", &self.max_sequence_tokens)
+            .field("max_labels", &self.max_labels)
             .field("confidence_threshold", &self.confidence_threshold)
             .field("special_tokens", &self.special_tokens)
             .finish()
@@ -999,6 +1208,33 @@ mod tests {
 
     // ── Unit tests that don't require model files ──
 
+    fn test_special_tokens() -> GlinerSpecialTokenIds {
+        GlinerSpecialTokenIds {
+            sequence_start: 1,
+            sequence_end: 2,
+            unknown: 3,
+            entity_marker: 4,
+            prompt_separator: 5,
+        }
+    }
+
+    fn test_words(values: &[&str]) -> Vec<WordSpan> {
+        let mut byte_offset = 0usize;
+        values
+            .iter()
+            .map(|value| {
+                let byte_start = byte_offset;
+                let byte_end = byte_start + value.len();
+                byte_offset = byte_end + 1;
+                WordSpan {
+                    text: (*value).to_string(),
+                    byte_start,
+                    byte_end,
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn test_sigmoid() {
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
@@ -1064,6 +1300,147 @@ mod tests {
         assert!(error.contains("unknown token not found"));
         assert!(error.contains("[UNK]"));
         assert!(error.contains("<unk>"));
+    }
+
+    #[test]
+    fn model_limits_use_audited_defaults_and_validate_artifact_values() {
+        assert_eq!(
+            GlinerModelLimits::from_config(GlinerModelConfigFile::default()).unwrap(),
+            GlinerModelLimits::default()
+        );
+        assert_eq!(
+            GlinerModelLimits::from_config(GlinerModelConfigFile {
+                max_len: Some(384),
+                max_types: Some(25),
+                max_width: Some(12),
+            })
+            .unwrap(),
+            GlinerModelLimits {
+                max_sequence_tokens: 384,
+                max_labels: 25,
+                max_width: 12,
+            }
+        );
+
+        for config in [
+            GlinerModelConfigFile {
+                max_len: Some(0),
+                ..Default::default()
+            },
+            GlinerModelConfigFile {
+                max_types: Some(HARD_MAX_LABELS + 1),
+                ..Default::default()
+            },
+            GlinerModelConfigFile {
+                max_width: Some(MAX_ENTITY_WIDTH + 1),
+                ..Default::default()
+            },
+        ] {
+            assert!(GlinerModelLimits::from_config(config).is_err());
+        }
+    }
+
+    #[test]
+    fn model_limits_load_optional_artifact_config_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            GlinerModelLimits::load(directory.path()).unwrap(),
+            GlinerModelLimits::default()
+        );
+
+        let config_path = directory.path().join(MODEL_CONFIG_FILENAME);
+        std::fs::write(
+            &config_path,
+            br#"{"max_len":384,"max_types":25,"max_width":12}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            GlinerModelLimits::load(directory.path()).unwrap(),
+            GlinerModelLimits {
+                max_sequence_tokens: 384,
+                max_labels: 25,
+                max_width: 12,
+            }
+        );
+
+        std::fs::write(&config_path, b"{not-json").unwrap();
+        let error = GlinerModelLimits::load(directory.path()).unwrap_err();
+        assert!(error.contains("config parse"));
+        assert!(error.contains(&config_path.display().to_string()));
+    }
+
+    #[test]
+    fn prompt_budget_keeps_only_complete_text_words() {
+        let words = test_words(&["alpha", "bravo"]);
+        let prompt =
+            build_gliner_prompt_with(test_special_tokens(), &["person"], &words, 8, |value| {
+                match value {
+                    "person" => Ok(vec![10]),
+                    "alpha" => Ok(vec![20, 21]),
+                    "bravo" => Ok(vec![30, 31]),
+                    _ => Err("unexpected tokenization input".to_string()),
+                }
+            })
+            .unwrap();
+
+        assert_eq!(prompt.input_ids, vec![1, 4, 10, 5, 20, 21, 2]);
+        assert_eq!(prompt.words_mask, vec![0, 0, 0, 0, 1, 1, 0]);
+        assert_eq!(prompt.text_length, 1);
+        assert_eq!(prompt.input_ids.len(), prompt.attention_mask.len());
+    }
+
+    #[test]
+    fn prompt_budget_rejects_oversized_labels_and_unrepresentable_text() {
+        let words = test_words(&["alpha"]);
+        let oversized_label_text = "x".repeat(MAX_LABEL_INPUT_BYTES + 1);
+        let oversized_label_length = build_gliner_prompt_with(
+            test_special_tokens(),
+            &[oversized_label_text.as_str()],
+            &words,
+            384,
+            |_| Ok(vec![10]),
+        )
+        .unwrap_err();
+        assert!(oversized_label_length.contains("label length"));
+
+        let oversized_label =
+            build_gliner_prompt_with(test_special_tokens(), &["person"], &words, 6, |value| {
+                match value {
+                    "person" => Ok(vec![10, 11, 12]),
+                    "alpha" => Ok(vec![20]),
+                    _ => Ok(Vec::new()),
+                }
+            })
+            .unwrap_err();
+        assert!(oversized_label.contains("label prompt exceeds"));
+
+        let oversized_word =
+            build_gliner_prompt_with(test_special_tokens(), &["person"], &words, 7, |value| {
+                match value {
+                    "person" => Ok(vec![10]),
+                    "alpha" => Ok(vec![20, 21, 22]),
+                    _ => Ok(Vec::new()),
+                }
+            })
+            .unwrap_err();
+        assert!(oversized_word.contains("no room for a complete text word"));
+    }
+
+    #[test]
+    fn prompt_budget_uses_validated_unknown_token_for_empty_encoding() {
+        let words = test_words(&["unknown"]);
+        let prompt =
+            build_gliner_prompt_with(test_special_tokens(), &["person"], &words, 8, |value| {
+                match value {
+                    "person" => Ok(vec![10]),
+                    "unknown" => Ok(Vec::new()),
+                    _ => Ok(Vec::new()),
+                }
+            })
+            .unwrap();
+
+        assert_eq!(prompt.input_ids, vec![1, 4, 10, 5, 3, 2]);
+        assert_eq!(prompt.text_length, 1);
     }
 
     #[test]
@@ -1226,6 +1603,30 @@ mod tests {
     }
 
     #[test]
+    fn word_split_bounds_count_bytes_and_utf8_without_partial_words() {
+        let count_limited = split_words_bounded("one two three", 2, usize::MAX);
+        assert_eq!(
+            count_limited
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+
+        let byte_limited = split_words_bounded("alpha bravo charlie", 10, 9);
+        assert_eq!(byte_limited.len(), 1);
+        assert_eq!(byte_limited[0].text, "alpha");
+        assert_eq!(byte_limited[0].byte_end, 5);
+
+        let unicode_limited = split_words_bounded("认证 模块", 10, 8);
+        assert_eq!(unicode_limited.len(), 1);
+        assert_eq!(unicode_limited[0].text, "认证");
+
+        let giant_first_word = split_words_bounded("abcdefghij tail", 10, 5);
+        assert!(giant_first_word.is_empty());
+    }
+
+    #[test]
     fn test_span_indices() {
         // 3 words, max_width = 2
         // Grid: 3 × 2 = 6 spans
@@ -1320,36 +1721,7 @@ mod tests {
 
     /// Standalone word_split for testing without NerEngine instance.
     fn word_split_standalone(text: &str) -> Vec<WordSpan> {
-        let mut words = Vec::new();
-        let mut chars = text.char_indices().peekable();
-
-        while let Some(&(byte_start, ch)) = chars.peek() {
-            if ch.is_whitespace() {
-                chars.next();
-                continue;
-            }
-            let mut byte_end = byte_start;
-            let mut word = String::new();
-
-            while let Some(&(bi, c)) = chars.peek() {
-                if c.is_whitespace() {
-                    break;
-                }
-                byte_end = bi + c.len_utf8();
-                word.push(c);
-                chars.next();
-            }
-
-            if !word.is_empty() {
-                words.push(WordSpan {
-                    text: word,
-                    byte_start,
-                    byte_end,
-                });
-            }
-        }
-
-        words
+        split_words_bounded(text, usize::MAX, usize::MAX)
     }
 
     // ── Integration tests requiring model files ──
