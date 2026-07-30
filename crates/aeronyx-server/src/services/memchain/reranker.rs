@@ -78,6 +78,10 @@
 //!   the reranker is too aggressive (degrading good BM25/graph results), lower to 0.5.
 //!
 //! ## Last Modified
+//! v2.4.3-RerankerOutputValidation -
+//!   [MEMCHAIN-RERANKER-OUTPUT 2026-07-30 by Codex] Added strict ONNX output
+//!   shape/cardinality validation, rejected non-finite logits, and moved score
+//!   normalization to f64 so malformed model output cannot silently mis-rank recall.
 //! v2.4.2-RetryableOrtInitialization -
 //!   [MEMCHAIN-ORT-RECOVERY 2026-07-30 by Codex] Documented the shared
 //!   success-only initialization contract used by all inference engines.
@@ -127,7 +131,88 @@ pub const RERANK_TOP_N: usize = 30;
 const CE_BLEND_WEIGHT: f64 = 0.7;
 
 /// Minimum denominator for min-max normalization to avoid division by zero.
-const NORM_EPSILON: f32 = 1e-6;
+const NORM_EPSILON: f64 = 1e-6;
+
+// ============================================
+// Output contract and score normalization
+// ============================================
+
+/// Validate the ONNX cross-encoder output before it reaches recall ranking.
+///
+/// [MEMCHAIN-RERANKER-OUTPUT 2026-07-30 by Codex] The supported model exports
+/// produce exactly one relevance logit per input pair, represented as either
+/// `[batch]` or `[batch, 1]`. Treat every other shape, cardinality mismatch, and
+/// non-finite value as an inference failure so recall can use its RRF fallback.
+fn validate_reranker_logits(
+    shape: &[usize],
+    logits: Vec<f32>,
+    expected_batch: usize,
+) -> Result<Vec<f32>, String> {
+    let shape_matches = match shape {
+        [batch] => *batch == expected_batch,
+        [batch, width] => *batch == expected_batch && *width == 1,
+        _ => false,
+    };
+
+    if !shape_matches {
+        return Err(format!(
+            "Reranker output shape {:?} does not match expected [{batch}] or [{batch}, 1]",
+            shape,
+            batch = expected_batch
+        ));
+    }
+
+    if logits.len() != expected_batch {
+        return Err(format!(
+            "Reranker output cardinality {} does not match batch {}",
+            logits.len(),
+            expected_batch
+        ));
+    }
+
+    if let Some((index, score)) = logits
+        .iter()
+        .enumerate()
+        .find(|(_, score)| !score.is_finite())
+    {
+        return Err(format!(
+            "Reranker output contains non-finite logit at index {}: {}",
+            index, score
+        ));
+    }
+
+    Ok(logits)
+}
+
+/// Normalize validated finite logits to [0, 1] without overflowing f32.
+///
+/// The ONNX tensor remains f32, but range arithmetic is performed in f64 so
+/// opposite finite f32 extremes cannot produce an infinite denominator and NaN.
+fn normalize_reranker_scores(raw_scores: &[f32]) -> Vec<f64> {
+    let score_min = raw_scores
+        .iter()
+        .copied()
+        .map(f64::from)
+        .fold(f64::INFINITY, f64::min);
+    let score_max = raw_scores
+        .iter()
+        .copied()
+        .map(f64::from)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let score_range = score_max - score_min;
+
+    if score_range > NORM_EPSILON {
+        raw_scores
+            .iter()
+            .map(|&score| (f64::from(score) - score_min) / score_range)
+            .collect()
+    } else {
+        raw_scores
+            .iter()
+            .map(|&score| 1.0 / (1.0 + (-f64::from(score)).exp()))
+            .collect()
+    }
+}
 
 // ============================================
 // RerankerEngine
@@ -168,7 +253,7 @@ pub struct RerankedCandidate {
 impl RerankerEngine {
     /// Load cross-encoder ONNX model and tokenizer.
     ///
-    /// Shares the ORT runtime with EmbedEngine/NerEngine via the Once in embed.rs.
+    /// Shares the ORT runtime with EmbedEngine/NerEngine via the retryable gate in embed.rs.
     /// If EmbedEngine was loaded first, ORT is already initialized — this is a no-op.
     /// If EmbedEngine was not loaded, this will initialize ORT from the reranker model dir.
     ///
@@ -199,7 +284,7 @@ impl RerankerEngine {
             ));
         }
 
-        // Initialize (or reuse) ORT runtime — same Once cell as embed.rs.
+        // Initialize (or reuse) ORT runtime through the shared retryable gate.
         init_ort_runtime(model_dir)?;
 
         let session = Session::builder()
@@ -326,37 +411,27 @@ impl RerankerEngine {
             .try_extract_array::<f32>()
             .map_err(|e| format!("Reranker output extraction: {}", e))?;
 
-        let logits_shape = logits.shape();
-
-        // ── Extract raw scores ──
-        let mut raw_scores: Vec<f32> = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
-            let score = match logits_shape.len() {
-                2 => logits[[i, 0]], // [batch, 1] — most common
-                1 => logits[[i]],    // [batch] — some exports
-                _ => logits
-                    .as_slice()
-                    .and_then(|s| s.get(i))
-                    .copied()
-                    .unwrap_or(0.0),
-            };
-            raw_scores.push(score);
-        }
+        // [MEMCHAIN-RERANKER-OUTPUT 2026-07-30 by Codex] Validate the model
+        // contract before indexing or ranking. A bad export must trigger the
+        // recall pipeline's RRF fallback instead of fabricating zero scores.
+        let raw_scores =
+            validate_reranker_logits(logits.shape(), logits.iter().copied().collect(), batch_size)?;
 
         // ── Dynamic min-max normalization ──
         // Scale raw CE logits to [0, 1] for blending with RRF scores.
         // Fallback to sigmoid if all scores are identical (degenerate batch).
-        let score_min = raw_scores.iter().cloned().fold(f32::INFINITY, f32::min);
-        let score_max = raw_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let score_min = raw_scores
+            .iter()
+            .copied()
+            .map(f64::from)
+            .fold(f64::INFINITY, f64::min);
+        let score_max = raw_scores
+            .iter()
+            .copied()
+            .map(f64::from)
+            .fold(f64::NEG_INFINITY, f64::max);
         let score_range = score_max - score_min;
-
-        let normalized_scores: Vec<f64> = if score_range > NORM_EPSILON {
-            // Standard min-max: maps [min, max] → [0, 1]
-            raw_scores
-                .iter()
-                .map(|&s| ((s - score_min) / score_range) as f64)
-                .collect()
-        } else {
+        if score_range <= NORM_EPSILON {
             // Degenerate: all scores identical → sigmoid fallback
             // sigmoid(x) = 1 / (1 + e^-x), maps ℝ → (0, 1)
             warn!(
@@ -364,11 +439,8 @@ impl RerankerEngine {
                 score = score_min,
                 "[RERANKER] All CE scores identical — using sigmoid normalization fallback"
             );
-            raw_scores
-                .iter()
-                .map(|&s| 1.0 / (1.0 + (-s as f64).exp()))
-                .collect()
-        };
+        }
+        let normalized_scores = normalize_reranker_scores(&raw_scores);
 
         // ── Build candidates and sort by raw CE score descending ──
         let mut candidates: Vec<RerankedCandidate> = raw_scores
@@ -383,11 +455,7 @@ impl RerankerEngine {
             .collect();
 
         // Sort by raw CE score descending (raw logit is the true relevance signal)
-        candidates.sort_by(|a, b| {
-            b.ce_score
-                .partial_cmp(&a.ce_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_by(|a, b| b.ce_score.total_cmp(&a.ce_score));
 
         debug!(
             batch = batch_size,
@@ -589,6 +657,47 @@ mod tests {
             "CE_BLEND_WEIGHT should be in (0, 1), got {}",
             w
         );
+    }
+
+    #[test]
+    fn test_validate_reranker_logits_accepts_supported_shapes() {
+        let vector = validate_reranker_logits(&[2], vec![0.25, -0.5], 2).unwrap();
+        assert_eq!(vector, vec![0.25, -0.5]);
+
+        let column = validate_reranker_logits(&[2, 1], vec![0.25, -0.5], 2).unwrap();
+        assert_eq!(column, vec![0.25, -0.5]);
+    }
+
+    #[test]
+    fn test_validate_reranker_logits_rejects_malformed_output() {
+        let wrong_batch = validate_reranker_logits(&[1], vec![0.25], 2).unwrap_err();
+        assert!(wrong_batch.contains("shape"));
+
+        let multiple_logits =
+            validate_reranker_logits(&[2, 2], vec![0.1, 0.2, 0.3, 0.4], 2).unwrap_err();
+        assert!(multiple_logits.contains("shape"));
+
+        let wrong_cardinality = validate_reranker_logits(&[2], vec![0.25], 2).unwrap_err();
+        assert!(wrong_cardinality.contains("cardinality"));
+    }
+
+    #[test]
+    fn test_validate_reranker_logits_rejects_non_finite_scores() {
+        for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = validate_reranker_logits(&[1], vec![score], 1).unwrap_err();
+            assert!(error.contains("non-finite"));
+        }
+    }
+
+    #[test]
+    fn test_normalize_reranker_scores_handles_f32_extremes() {
+        let normalized = normalize_reranker_scores(&[f32::MIN, 0.0, f32::MAX]);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0], 0.0);
+        assert_eq!(normalized[2], 1.0);
+        assert!(normalized.iter().all(|score| score.is_finite()));
+        assert!(normalized.iter().all(|score| (0.0..=1.0).contains(score)));
     }
 
     #[test]
