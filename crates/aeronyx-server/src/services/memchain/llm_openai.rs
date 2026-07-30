@@ -28,7 +28,9 @@
 //! ```
 //!
 //! ## Request Format
-//! POST {api_base}/v1/chat/completions
+//! POST the normalized endpoint:
+//! - `{api_base}/chat/completions` when `api_base` already ends in `/v1`
+//! - `{api_base}/v1/chat/completions` otherwise
 //! ```json
 //! {
 //!   "model": "deepseek-chat",
@@ -49,17 +51,23 @@
 //! - Ollama does not require Authorization header — empty api_key → no header sent.
 //! - Timeout is fixed at 60s for now. TODO: make configurable per provider.
 //! - The provider does NOT retry on failure — LlmRouter handles retry policy.
+//! - All response bodies use the shared bounded reader; provider-controlled
+//!   `Content-Length` is never trusted as the only memory guard.
 //!
 //! ## Last Modified
+//! v2.5.3-ResponseBoundary - [LLM-RESPONSE-BOUNDARY 2026-07-30 by Codex]
+//!   Bounded success/error bodies, added recoverable provider cooldowns, and
+//!   normalized `/v1` API bases so configured endpoints are not duplicated.
 //! v2.5.0+SuperNode - 🌟 Created.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::{debug, warn};
 
-use super::llm_provider::{ChatRequest, ChatResponse, LlmError, LlmProvider, TokenUsage};
+use super::llm_provider::{
+    read_bounded_llm_response, ChatRequest, ChatResponse, LlmError, LlmProvider, ProviderHealth,
+    TokenUsage, MAX_LLM_ERROR_BODY_BYTES, MAX_LLM_SUCCESS_BODY_BYTES,
+};
 
 // ============================================
 // Request / Response wire types
@@ -152,8 +160,8 @@ pub struct OpenAiCompatProvider {
     temperature: Option<f32>,
     /// Shared HTTP client (keep-alive connection pool).
     client: reqwest::Client,
-    /// Health flag — set to false on rate limit, reset after backoff.
-    healthy: Arc<AtomicBool>,
+    /// Monotonic cooldown state for router availability.
+    health: ProviderHealth,
 }
 
 impl OpenAiCompatProvider {
@@ -171,8 +179,7 @@ impl OpenAiCompatProvider {
     ) -> Result<Self, String> {
         let api_key_raw = api_key.into();
         // Resolve $ENV_VAR syntax
-        let api_key = if api_key_raw.starts_with('$') {
-            let var_name = &api_key_raw[1..];
+        let api_key = if let Some(var_name) = api_key_raw.strip_prefix('$') {
             std::env::var(var_name).unwrap_or_else(|_| {
                 warn!(
                     "[LLM_OPENAI] Env var '{}' not set, using empty api_key",
@@ -184,16 +191,12 @@ impl OpenAiCompatProvider {
             api_key_raw
         };
 
-        let mut api_base = api_base.into();
-        // Normalize: strip trailing slash
-        while api_base.ends_with('/') {
-            api_base.pop();
-        }
+        let api_base = normalize_api_base(&api_base.into());
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
-            .map_err(|e| format!("Build HTTP client: {}", e))?;
+            .map_err(|error| format!("Build HTTP client: {error}"))?;
 
         Ok(Self {
             name: name.into(),
@@ -203,9 +206,29 @@ impl OpenAiCompatProvider {
             max_tokens,
             temperature,
             client,
-            healthy: Arc::new(AtomicBool::new(true)),
+            health: ProviderHealth::default(),
         })
     }
+}
+
+/// Resolve root, versioned-base, and full-endpoint configurations uniformly.
+///
+/// [LLM-OPENAI-ENDPOINT 2026-07-30 by Codex] Project examples historically
+/// use both `https://host` and `https://host/v1`. Appending `/v1` blindly made
+/// the latter call `/v1/v1/chat/completions`.
+fn chat_completions_url(api_base: &str) -> String {
+    let api_base = normalize_api_base(api_base);
+    if api_base.ends_with("/chat/completions") {
+        api_base
+    } else if api_base.ends_with("/v1") {
+        format!("{api_base}/chat/completions")
+    } else {
+        format!("{api_base}/v1/chat/completions")
+    }
+}
+
+fn normalize_api_base(api_base: &str) -> String {
+    api_base.trim_end_matches('/').to_owned()
 }
 
 #[async_trait::async_trait]
@@ -234,7 +257,7 @@ impl LlmProvider for OpenAiCompatProvider {
             stop: req.stop.as_deref(),
         };
 
-        let url = format!("{}/v1/chat/completions", self.api_base);
+        let url = chat_completions_url(&self.api_base);
 
         let mut request_builder = self
             .client
@@ -247,14 +270,13 @@ impl LlmProvider for OpenAiCompatProvider {
                 request_builder.header("Authorization", format!("Bearer {}", self.api_key));
         }
 
-        let resp = request_builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        let resp = request_builder.json(&body).send().await.map_err(|e| {
+            self.health.mark_unhealthy();
+            LlmError::Transport(e.to_string())
+        })?;
 
         let status = resp.status().as_u16();
-        let latency_ms = start.elapsed().as_millis() as u64;
+        let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         if status == 429 {
             // Rate limit — extract Retry-After header if present
@@ -263,7 +285,7 @@ impl LlmProvider for OpenAiCompatProvider {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            self.healthy.store(false, Ordering::Relaxed);
+            self.health.mark_rate_limited(retry_after);
             warn!(provider = %self.name, retry_after = ?retry_after, "[LLM_OPENAI] Rate limited");
             return Err(LlmError::RateLimit {
                 retry_after_secs: retry_after,
@@ -271,18 +293,31 @@ impl LlmProvider for OpenAiCompatProvider {
         }
 
         if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
+            let body_bytes = read_bounded_llm_response(resp, MAX_LLM_ERROR_BODY_BYTES)
+                .await
+                .map_err(|error| {
+                    self.health.mark_unhealthy();
+                    error
+                })?;
             // Try to parse structured error
-            let msg = serde_json::from_str::<OpenAiErrorResponse>(&body_text)
-                .map(|e| e.error.message)
-                .unwrap_or_else(|_| body_text);
+            let msg = serde_json::from_slice::<OpenAiErrorResponse>(&body_bytes).map_or_else(
+                |_| String::from_utf8_lossy(&body_bytes).into_owned(),
+                |response| response.error.message,
+            );
+            self.health.mark_unhealthy();
             return Err(LlmError::ApiError { status, body: msg });
         }
 
-        let resp_json: OpenAiResponse = resp
-            .json()
+        let body_bytes = read_bounded_llm_response(resp, MAX_LLM_SUCCESS_BODY_BYTES)
             .await
-            .map_err(|e| LlmError::ParseError(e.to_string()))?;
+            .map_err(|error| {
+                self.health.mark_unhealthy();
+                error
+            })?;
+        let resp_json: OpenAiResponse = serde_json::from_slice(&body_bytes).map_err(|error| {
+            self.health.mark_unhealthy();
+            LlmError::ParseError(error.to_string())
+        })?;
 
         let content = resp_json
             .choices
@@ -292,14 +327,14 @@ impl LlmProvider for OpenAiCompatProvider {
             .unwrap_or_default();
 
         if content.is_empty() {
+            self.health.mark_unhealthy();
             return Err(LlmError::EmptyResponse);
         }
 
         let usage = resp_json.usage.unwrap_or_default();
         let cached = usage
             .prompt_tokens_details
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0);
+            .map_or(0, |details| details.cached_tokens);
 
         let model_used = resp_json.model.unwrap_or_else(|| model.to_string());
 
@@ -313,7 +348,7 @@ impl LlmProvider for OpenAiCompatProvider {
         );
 
         // Reset health on successful call
-        self.healthy.store(true, Ordering::Relaxed);
+        self.health.mark_healthy();
 
         Ok(ChatResponse {
             content,
@@ -337,7 +372,7 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 
     fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        self.health.is_healthy()
     }
 }
 
@@ -348,5 +383,38 @@ impl std::fmt::Debug for OpenAiCompatProvider {
             .field("api_base", &self.api_base)
             .field("model", &self.model)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_endpoint_accepts_root_versioned_and_complete_bases() {
+        assert_eq!(
+            chat_completions_url("https://api.example.com"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://api.example.com/v1"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://api.example.com/v1/chat/completions"),
+            "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn endpoint_resolution_removes_all_trailing_slashes_without_network_state() {
+        assert_eq!(
+            normalize_api_base("http://localhost:11434/v1///"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            chat_completions_url("http://localhost:11434/v1///"),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 }

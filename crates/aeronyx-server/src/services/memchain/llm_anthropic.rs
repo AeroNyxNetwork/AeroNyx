@@ -45,23 +45,27 @@
 //!   Now they are concatenated with "\n\n" and a warning is logged.
 //! - BUG FIX: 400 context-length check used OpenAI-style strings; added Anthropic's
 //!   "context window" phrase to the detection list.
-//! - BUG FIX: `healthy` flag was never reset to `false` on non-429 API errors,
-//!   meaning a consistently failing provider would still report healthy=true.
-//!   Now sets healthy=false on all terminal error paths.
+//! - Provider failures enter a bounded monotonic cooldown. The router can retry
+//!   automatically after expiry instead of permanently skipping the provider.
+//! - Response bodies must use the shared bounded reader before JSON parsing.
 //!
 //! ## Last Modified
+//! v2.5.3-ResponseBoundary - [LLM-RESPONSE-BOUNDARY 2026-07-30 by Codex]
+//!   Bounded response accumulation and recoverable provider cooldowns through
+//!   the shared provider layer.
 //! v2.5.0+SuperNode - 🌟 Created.
 //! v2.5.2+SecAudit  - 🔧 api_key redacted from Debug. Multiple system messages
 //!   concatenated. Context-length detection improved. healthy flag set on all
 //!   error paths.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::{debug, warn};
 
-use super::llm_provider::{ChatRequest, ChatResponse, LlmError, LlmProvider, TokenUsage};
+use super::llm_provider::{
+    read_bounded_llm_response, ChatRequest, ChatResponse, LlmError, LlmProvider, ProviderHealth,
+    TokenUsage, MAX_LLM_ERROR_BODY_BYTES, MAX_LLM_SUCCESS_BODY_BYTES,
+};
 
 // ============================================
 // Anthropic API Version
@@ -152,8 +156,8 @@ pub struct AnthropicProvider {
     temperature: Option<f32>,
     /// Shared HTTP client.
     client: reqwest::Client,
-    /// Health flag — set false on rate limit or API error, true on success.
-    healthy: Arc<AtomicBool>,
+    /// Monotonic cooldown state for router availability.
+    health: ProviderHealth,
 }
 
 impl AnthropicProvider {
@@ -168,8 +172,7 @@ impl AnthropicProvider {
         temperature: Option<f32>,
     ) -> Result<Self, String> {
         let api_key_raw = api_key.into();
-        let api_key = if api_key_raw.starts_with('$') {
-            let var_name = &api_key_raw[1..];
+        let api_key = if let Some(var_name) = api_key_raw.strip_prefix('$') {
             std::env::var(var_name).unwrap_or_else(|_| {
                 warn!("[LLM_ANTHROPIC] Env var '{}' not set", var_name);
                 String::new()
@@ -185,7 +188,7 @@ impl AnthropicProvider {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
-            .map_err(|e| format!("Build HTTP client: {}", e))?;
+            .map_err(|error| format!("Build HTTP client: {error}"))?;
 
         Ok(Self {
             name: name.into(),
@@ -194,7 +197,7 @@ impl AnthropicProvider {
             max_tokens,
             temperature,
             client,
-            healthy: Arc::new(AtomicBool::new(true)),
+            health: ProviderHealth::default(),
         })
     }
 }
@@ -264,7 +267,7 @@ impl LlmProvider for AnthropicProvider {
             stop_sequences: req.stop.as_deref(),
         };
 
-        let url = format!("{}/v1/messages", ANTHROPIC_API_BASE);
+        let url = format!("{ANTHROPIC_API_BASE}/v1/messages");
 
         let resp = self
             .client
@@ -277,12 +280,12 @@ impl LlmProvider for AnthropicProvider {
             .await
             .map_err(|e| {
                 // Network / transport error — mark unhealthy
-                self.healthy.store(false, Ordering::Relaxed);
+                self.health.mark_unhealthy();
                 LlmError::Transport(e.to_string())
             })?;
 
         let status = resp.status().as_u16();
-        let latency_ms = start.elapsed().as_millis() as u64;
+        let latency_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         if status == 429 {
             let retry_after = resp
@@ -290,7 +293,7 @@ impl LlmProvider for AnthropicProvider {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            self.healthy.store(false, Ordering::Relaxed);
+            self.health.mark_rate_limited(retry_after);
             warn!(provider = %self.name, "[LLM_ANTHROPIC] Rate limited");
             return Err(LlmError::RateLimit {
                 retry_after_secs: retry_after,
@@ -298,7 +301,13 @@ impl LlmProvider for AnthropicProvider {
         }
 
         if status == 400 {
-            let body_text = resp.text().await.unwrap_or_default();
+            let body_bytes = read_bounded_llm_response(resp, MAX_LLM_ERROR_BODY_BYTES)
+                .await
+                .map_err(|error| {
+                    self.health.mark_unhealthy();
+                    error
+                })?;
+            let body_text = String::from_utf8_lossy(&body_bytes);
             // BUG FIX: original check used OpenAI-style "prompt is too long" and
             // "context_length_exceeded" but Anthropic uses "context window" in its
             // error messages. Added Anthropic-specific phrases to the detection list.
@@ -307,32 +316,44 @@ impl LlmProvider for AnthropicProvider {
                 || body_text.contains("context window")
                 || body_text.contains("too many tokens")
             {
-                self.healthy.store(false, Ordering::Relaxed);
+                self.health.mark_unhealthy();
                 return Err(LlmError::ContextTooLong);
             }
-            self.healthy.store(false, Ordering::Relaxed);
+            self.health.mark_unhealthy();
             return Err(LlmError::ApiError {
                 status,
-                body: body_text,
+                body: body_text.into_owned(),
             });
         }
 
         if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            let msg = serde_json::from_str::<AnthropicErrorResponse>(&body_text)
-                .map(|e| e.error.message)
-                .unwrap_or_else(|_| body_text);
-            // BUG FIX: healthy was never set to false on non-429 API errors.
-            // A consistently failing provider (e.g. 401, 500) would still report
-            // healthy=true, causing the router to keep sending requests to it.
-            self.healthy.store(false, Ordering::Relaxed);
+            let body_bytes = read_bounded_llm_response(resp, MAX_LLM_ERROR_BODY_BYTES)
+                .await
+                .map_err(|error| {
+                    self.health.mark_unhealthy();
+                    error
+                })?;
+            let msg = serde_json::from_slice::<AnthropicErrorResponse>(&body_bytes).map_or_else(
+                |_| String::from_utf8_lossy(&body_bytes).into_owned(),
+                |response| response.error.message,
+            );
+            // A consistently failing provider enters the shared bounded
+            // cooldown instead of being retried on every router invocation.
+            self.health.mark_unhealthy();
             return Err(LlmError::ApiError { status, body: msg });
         }
 
-        let resp_json: AnthropicResponse = resp.json().await.map_err(|e| {
-            self.healthy.store(false, Ordering::Relaxed);
-            LlmError::ParseError(e.to_string())
-        })?;
+        let body_bytes = read_bounded_llm_response(resp, MAX_LLM_SUCCESS_BODY_BYTES)
+            .await
+            .map_err(|error| {
+                self.health.mark_unhealthy();
+                error
+            })?;
+        let resp_json: AnthropicResponse =
+            serde_json::from_slice(&body_bytes).map_err(|error| {
+                self.health.mark_unhealthy();
+                LlmError::ParseError(error.to_string())
+            })?;
 
         // Extract text from first text block
         let content = resp_json
@@ -343,7 +364,7 @@ impl LlmProvider for AnthropicProvider {
             .unwrap_or_default();
 
         if content.is_empty() {
-            self.healthy.store(false, Ordering::Relaxed);
+            self.health.mark_unhealthy();
             return Err(LlmError::EmptyResponse);
         }
 
@@ -360,7 +381,7 @@ impl LlmProvider for AnthropicProvider {
             "[LLM_ANTHROPIC] Call complete"
         );
 
-        self.healthy.store(true, Ordering::Relaxed);
+        self.health.mark_healthy();
 
         Ok(ChatResponse {
             content,
@@ -384,7 +405,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        self.health.is_healthy()
     }
 }
 

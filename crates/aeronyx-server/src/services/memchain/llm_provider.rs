@@ -33,8 +33,13 @@
 //!   prompt (simple completion), leave it None.
 //! - `LlmProvider::chat()` must be cancel-safe — the caller may drop the future
 //!   if the task is cancelled.
+//! - Provider response bodies must be consumed through
+//!   [`read_bounded_llm_response`]. Never call unbounded `Response::text/json`.
 //!
 //! ## Last Modified
+//! v2.5.3-ResponseBoundary - [LLM-RESPONSE-BOUNDARY 2026-07-30 by Codex]
+//!   Added a shared bounded response reader, UTF-8-safe error formatting, and
+//!   a monotonic provider cooldown that recovers without a background timer.
 //! v2.5.0+SuperNode - 🌟 Created.
 //! v2.5.0+Unify     - 🔧 [BUG FIX] Removed duplicate CognitiveTaskType definition.
 //!   CognitiveTaskType is now defined ONLY in config_supernode.rs and re-exported
@@ -44,6 +49,27 @@
 //!   task_worker.rs, llm_router.rs, and mod.rs re-exports.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// Maximum successful LLM response body retained before JSON parsing.
+///
+/// This is intentionally much larger than normal cognitive-task output while
+/// still preventing a custom or compromised provider from exhausting memory.
+pub(super) const MAX_LLM_SUCCESS_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum non-success response body retained for diagnostics.
+pub(super) const MAX_LLM_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Maximum API-error bytes rendered through `Display`.
+const MAX_LLM_ERROR_DISPLAY_BYTES: usize = 200;
+
+/// Default cooldown after transport, parsing, or provider API failure.
+const DEFAULT_LLM_PROVIDER_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Maximum provider-requested cooldown accepted from `Retry-After`.
+const MAX_LLM_PROVIDER_COOLDOWN_SECS: u64 = 5 * 60;
 
 // ============================================
 // Re-export CognitiveTaskType from canonical location
@@ -82,7 +108,12 @@ impl fmt::Display for LlmError {
         match self {
             Self::Transport(e) => write!(f, "transport error: {}", e),
             Self::ApiError { status, body } => {
-                write!(f, "API error {}: {}", status, &body[..body.len().min(200)])
+                write!(
+                    f,
+                    "API error {}: {}",
+                    status,
+                    utf8_prefix(body, MAX_LLM_ERROR_DISPLAY_BYTES)
+                )
             }
             Self::ParseError(e) => write!(f, "parse error: {}", e),
             Self::EmptyResponse => write!(f, "empty response from model"),
@@ -96,6 +127,158 @@ impl fmt::Display for LlmError {
 }
 
 impl std::error::Error for LlmError {}
+
+/// Monotonic provider availability state shared by all HTTP implementations.
+///
+/// [LLM-PROVIDER-COOLDOWN 2026-07-30 by Codex] A permanent boolean creates a
+/// one-way failure latch: once the router skips a provider, no future success
+/// can make it healthy. A monotonic deadline permits bounded automatic retry
+/// without wall-clock jumps or a background timer.
+#[derive(Debug, Default)]
+pub(super) struct ProviderHealth {
+    unhealthy_until_ms: AtomicU64,
+}
+
+impl ProviderHealth {
+    pub(super) fn mark_unhealthy(&self) {
+        self.mark_unhealthy_for(DEFAULT_LLM_PROVIDER_COOLDOWN);
+    }
+
+    pub(super) fn mark_rate_limited(&self, retry_after_secs: Option<u64>) {
+        self.mark_unhealthy_for(rate_limit_cooldown(retry_after_secs));
+    }
+
+    pub(super) fn mark_healthy(&self) {
+        self.mark_healthy_at(monotonic_millis());
+    }
+
+    pub(super) fn is_healthy(&self) -> bool {
+        self.is_healthy_at(monotonic_millis())
+    }
+
+    fn mark_unhealthy_for(&self, duration: Duration) {
+        self.mark_unhealthy_at(monotonic_millis(), duration_to_millis(duration));
+    }
+
+    fn mark_unhealthy_at(&self, now_ms: u64, duration_ms: u64) {
+        let deadline = now_ms.saturating_add(duration_ms.max(1));
+        self.unhealthy_until_ms
+            .fetch_max(deadline, Ordering::Relaxed);
+    }
+
+    fn mark_healthy_at(&self, now_ms: u64) {
+        // [LLM-PROVIDER-COOLDOWN 2026-07-30 by Codex] A successful request may
+        // have started before a concurrent request recorded a newer failure.
+        // Only clear an already-expired deadline so that stale success cannot
+        // erase a live cooldown.
+        let _ = self.unhealthy_until_ms.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |deadline| (deadline <= now_ms).then_some(0),
+        );
+    }
+
+    fn is_healthy_at(&self, now_ms: u64) -> bool {
+        now_ms >= self.unhealthy_until_ms.load(Ordering::Relaxed)
+    }
+}
+
+fn monotonic_millis() -> u64 {
+    static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
+    let elapsed = PROCESS_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis();
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
+}
+
+fn duration_to_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn rate_limit_cooldown(retry_after_secs: Option<u64>) -> Duration {
+    Duration::from_secs(
+        retry_after_secs
+            .unwrap_or(DEFAULT_LLM_PROVIDER_COOLDOWN.as_secs())
+            .clamp(1, MAX_LLM_PROVIDER_COOLDOWN_SECS),
+    )
+}
+
+/// Size-checked accumulator shared by fixed-length and chunked responses.
+struct BoundedLlmBody {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl BoundedLlmBody {
+    fn new(max_bytes: usize, content_length: Option<u64>) -> Result<Self, LlmError> {
+        if content_length
+            .is_some_and(|length| length > u64::try_from(max_bytes).unwrap_or(u64::MAX))
+        {
+            return Err(response_body_too_large(max_bytes));
+        }
+        let initial_capacity = content_length
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(max_bytes);
+
+        Ok(Self {
+            bytes: Vec::with_capacity(initial_capacity),
+            max_bytes,
+        })
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), LlmError> {
+        let next_length = self
+            .bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| response_body_too_large(self.max_bytes))?;
+        if next_length > self.max_bytes {
+            return Err(response_body_too_large(self.max_bytes));
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Consume one HTTP response under an explicit byte ceiling.
+///
+/// [LLM-RESPONSE-BOUNDARY 2026-07-30 by Codex] `Content-Length` is only an
+/// early rejection hint because chunked responses can omit or falsify it.
+/// Every received chunk is checked again before extending the accumulator.
+pub(super) async fn read_bounded_llm_response(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, LlmError> {
+    let mut body = BoundedLlmBody::new(max_bytes, response.content_length())?;
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| LlmError::Transport(error.to_string()))?
+    {
+        body.push(&chunk)?;
+    }
+
+    Ok(body.into_bytes())
+}
+
+fn response_body_too_large(max_bytes: usize) -> LlmError {
+    LlmError::ParseError(format!("LLM response body exceeds {max_bytes} byte limit"))
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
 
 // ============================================
 // Chat Types
@@ -238,5 +421,83 @@ pub trait LlmProvider: Send + Sync {
     /// Default: always healthy. Providers can override to implement circuit breaking.
     fn is_healthy(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_error_display_truncates_on_utf8_boundary() {
+        let error = LlmError::ApiError {
+            status: 500,
+            body: "界".repeat(100),
+        };
+        let rendered = error.to_string();
+
+        assert!(rendered.starts_with("API error 500: "));
+        assert!(rendered.is_char_boundary(rendered.len()));
+        assert!(!rendered.contains('\u{fffd}'));
+        assert!(rendered.len() <= "API error 500: ".len() + MAX_LLM_ERROR_DISPLAY_BYTES);
+    }
+
+    #[test]
+    fn utf8_prefix_handles_ascii_unicode_and_zero_budget() {
+        assert_eq!(utf8_prefix("abcdef", 3), "abc");
+        assert_eq!(utf8_prefix("认证模块", 7), "认证");
+        assert_eq!(utf8_prefix("认证模块", 0), "");
+        assert_eq!(utf8_prefix("short", usize::MAX), "short");
+    }
+
+    #[test]
+    fn oversized_response_error_is_bounded_and_stable() {
+        let error = response_body_too_large(MAX_LLM_SUCCESS_BODY_BYTES);
+        assert!(matches!(error, LlmError::ParseError(_)));
+        assert!(error.to_string().contains("exceeds"));
+        assert!(error.to_string().contains("8388608"));
+    }
+
+    #[test]
+    fn bounded_body_accepts_exact_limit_and_rejects_all_overflow_paths() {
+        let mut body = BoundedLlmBody::new(5, Some(5)).unwrap();
+        body.push(b"ab").unwrap();
+        body.push(b"cde").unwrap();
+        assert_eq!(body.into_bytes(), b"abcde");
+
+        assert!(BoundedLlmBody::new(5, Some(6)).is_err());
+
+        let mut chunked = BoundedLlmBody::new(5, None).unwrap();
+        chunked.push(b"abc").unwrap();
+        assert!(chunked.push(b"def").is_err());
+        assert_eq!(chunked.into_bytes(), b"abc");
+    }
+
+    #[test]
+    fn provider_health_recovers_after_monotonic_cooldown() {
+        let health = ProviderHealth::default();
+        assert!(health.is_healthy_at(100));
+
+        health.mark_unhealthy_at(100, 30_000);
+        assert!(!health.is_healthy_at(100));
+        assert!(!health.is_healthy_at(30_099));
+        assert!(health.is_healthy_at(30_100));
+
+        health.mark_unhealthy_at(200, 1_000);
+        assert!(!health.is_healthy_at(30_099));
+        health.mark_healthy_at(200);
+        assert!(!health.is_healthy_at(200));
+        health.mark_healthy_at(30_100);
+        assert!(health.is_healthy_at(200));
+    }
+
+    #[test]
+    fn rate_limit_cooldown_is_clamped_to_operational_bounds() {
+        assert_eq!(rate_limit_cooldown(Some(0)), Duration::from_secs(1));
+        assert_eq!(rate_limit_cooldown(None), DEFAULT_LLM_PROVIDER_COOLDOWN);
+        assert_eq!(
+            rate_limit_cooldown(Some(MAX_LLM_PROVIDER_COOLDOWN_SECS + 1)),
+            Duration::from_secs(MAX_LLM_PROVIDER_COOLDOWN_SECS)
+        );
     }
 }
