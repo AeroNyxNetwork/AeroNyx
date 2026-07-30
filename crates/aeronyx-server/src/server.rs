@@ -707,6 +707,12 @@ const POOL_EVICTION_INTERVAL_SECS: u64 = 300;
 const MINER_SCHEDULER_TICK_SECS: u64 = 60;
 const KEEPALIVE_PROBE_INTERVAL_SECS: u64 = 60;
 const KEEPALIVE_ACK_TIMEOUT_SECS: u64 = 90;
+/// First delay after a required data-plane receive failure.
+const DATA_PLANE_RECV_RETRY_BASE_MILLIS: u64 = 25;
+/// Upper bound for one required data-plane receive retry delay.
+const DATA_PLANE_RECV_RETRY_MAX_MILLIS: u64 = 1_000;
+/// Consecutive receive failures that make the data plane process-unhealthy.
+const DATA_PLANE_RECV_FAILURE_LIMIT: u32 = 8;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PROBE_REQUEST_LIMIT: usize = 8;
@@ -2202,6 +2208,79 @@ struct CriticalRuntimeFailure {
     reason: String,
 }
 
+/// Action after one consecutive required data-plane receive failure.
+///
+/// [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Keep the policy typed and
+/// source-blind. Runtime logs may include the local OS error, but process
+/// supervision receives only the required task name and a fixed reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataPlaneReceiveFailureAction {
+    RetryAfter(Duration),
+    Stop,
+}
+
+fn data_plane_receive_failure_action(
+    consecutive_failures: u32,
+) -> DataPlaneReceiveFailureAction {
+    if consecutive_failures >= DATA_PLANE_RECV_FAILURE_LIMIT {
+        return DataPlaneReceiveFailureAction::Stop;
+    }
+
+    let exponent = consecutive_failures.saturating_sub(1).min(6);
+    let delay_millis = DATA_PLANE_RECV_RETRY_BASE_MILLIS
+        .saturating_mul(1u64 << exponent)
+        .min(DATA_PLANE_RECV_RETRY_MAX_MILLIS);
+    DataPlaneReceiveFailureAction::RetryAfter(Duration::from_millis(delay_millis))
+}
+
+/// Applies one source-blind receive failure to a required data-plane task.
+///
+/// Returns `true` after the bounded retry delay, or `false` when global
+/// shutdown or the consecutive-failure limit requires the caller to stop.
+async fn retry_required_data_plane_receive<E: std::fmt::Display>(
+    task: &'static str,
+    receive_error: &E,
+    consecutive_failures: &mut u32,
+    shutdown_requested: &AtomicBool,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> bool {
+    if shutdown_requested.load(Ordering::Acquire) {
+        return false;
+    }
+
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    match data_plane_receive_failure_action(*consecutive_failures) {
+        DataPlaneReceiveFailureAction::Stop => {
+            error!(
+                task,
+                consecutive_failures = *consecutive_failures,
+                error = %receive_error,
+                "[DATA_PLANE] Receive failure limit reached"
+            );
+            false
+        }
+        DataPlaneReceiveFailureAction::RetryAfter(delay) => {
+            // [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Log the first
+            // and power-of-two failures only, preventing a broken descriptor
+            // from flooding local operations logs before process recovery.
+            if *consecutive_failures == 1 || consecutive_failures.is_power_of_two() {
+                warn!(
+                    task,
+                    consecutive_failures = *consecutive_failures,
+                    retry_delay_millis = delay.as_millis() as u64,
+                    error = %receive_error,
+                    "[DATA_PLANE] Receive failed; retrying"
+                );
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => false,
+                _ = tokio::time::sleep(delay) => true,
+            }
+        }
+    }
+}
+
 /// Ensures a configured follower cannot retain a stale ready state after its
 /// Tokio task exits, panics, or is aborted.
 ///
@@ -2591,7 +2670,15 @@ impl Server {
             Arc::clone(&peer_store),
             Arc::clone(&peer_http_clients.control),
         );
-        tasks.push(("udp", udp_task));
+        tasks.push((
+            "udp",
+            Self::supervise_required_runtime_task(
+                "udp",
+                udp_task,
+                Arc::clone(&self.shutdown),
+                critical_failure_tx.clone(),
+            ),
+        ));
 
         #[cfg(target_os = "linux")]
         {
@@ -2600,7 +2687,15 @@ impl Server {
                 Arc::clone(&udp),
                 Arc::clone(&packet_handler),
             );
-            tasks.push(("tun", tun_task));
+            tasks.push((
+                "tun",
+                Self::supervise_required_runtime_task(
+                    "tun",
+                    tun_task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
         }
 
         let cleanup_task = self.spawn_cleanup_task(
@@ -9940,6 +10035,7 @@ impl Server {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let crypto = DefaultTransportCrypto::new();
+            let mut consecutive_receive_failures = 0u32;
 
             loop {
                 tokio::select! {
@@ -9947,6 +10043,7 @@ impl Server {
                     result = udp.recv(&mut buf) => {
                         match result {
                             Ok((len, source)) => {
+                                consecutive_receive_failures = 0;
                                 if shutdown.load(Ordering::SeqCst) { break; }
                                 let data = &buf[..len];
 
@@ -10087,7 +10184,17 @@ impl Server {
                                 }
                             }
                             Err(e) => {
-                                if !shutdown.load(Ordering::SeqCst) { error!("UDP recv error: {}", e); }
+                                if !retry_required_data_plane_receive(
+                                    "udp",
+                                    &e,
+                                    &mut consecutive_receive_failures,
+                                    shutdown.as_ref(),
+                                    &mut shutdown_rx,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -10846,18 +10953,32 @@ impl Server {
         let mut rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            let mut consecutive_receive_failures = 0u32;
             loop {
                 tokio::select! {
                     _ = rx.recv() => break,
                     result = tun.read(&mut buf) => {
                         match result {
                             Ok(len) => {
+                                consecutive_receive_failures = 0;
                                 if shutdown.load(Ordering::SeqCst) { break; }
                                 if let Ok((enc, ep)) = handler.handle_tun_packet(&buf[..len]) {
                                     let _ = udp.send(&enc, &ep).await;
                                 }
                             }
-                            Err(e) => { if !shutdown.load(Ordering::SeqCst) { error!("TUN: {}", e); } }
+                            Err(e) => {
+                                if !retry_required_data_plane_receive(
+                                    "tun",
+                                    &e,
+                                    &mut consecutive_receive_failures,
+                                    shutdown.as_ref(),
+                                    &mut rx,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -11341,11 +11462,12 @@ mod tests {
         commitment_coordinator_lease_degraded_retry_delay,
         commitment_coordinator_lease_production_valid_for,
         commitment_follower_success_retry_delay, commitment_witness_startup_decision,
-        memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs, CriticalRuntimeFailure,
+        data_plane_receive_failure_action, memchain_index_rejection_reason, prefix_to_netmask,
+        retry_required_data_plane_receive, unix_now_secs, CriticalRuntimeFailure,
         CommitmentCoordinatorLeaseRound, CommitmentFollowerRoundOutcome,
         CommitmentSyncTaskLivenessGuard,
         CommitmentTipAnnouncementWaitOutcome, CommitmentWitnessStartupBlockReason,
-        CommitmentWitnessStartupDecision, DirectoryChainStore,
+        CommitmentWitnessStartupDecision, DataPlaneReceiveFailureAction, DirectoryChainStore,
         DirectoryProofGossipOutcome, DirectoryProofGossipPeerState, DirectoryProofGossipResult,
         DiscoveryGossipExecution, DiscoveryGossipFailure, DiscoveryGossipFailureKind,
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
@@ -11355,9 +11477,10 @@ mod tests {
         SystemdNotifier,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
-        COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DIRECTORY_OPERATOR_HTTP_PROFILE,
-        DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
-        DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, MEMCHAIN_SYNC_HTTP_PROFILE,
+        COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DATA_PLANE_RECV_FAILURE_LIMIT,
+        DIRECTORY_OPERATOR_HTTP_PROFILE, DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS,
+        DIRECTORY_SYNC_HTTP_PROFILE, DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
+        MEMCHAIN_SYNC_HTTP_PROFILE,
         ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
@@ -11566,6 +11689,73 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn data_plane_receive_failure_policy_backs_off_then_stops() {
+        // [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Transient errors
+        // receive bounded exponential retry, while a persistent broken socket
+        // or TUN descriptor reaches the required-task supervisor.
+        assert_eq!(
+            data_plane_receive_failure_action(1),
+            DataPlaneReceiveFailureAction::RetryAfter(Duration::from_millis(25))
+        );
+        assert_eq!(
+            data_plane_receive_failure_action(2),
+            DataPlaneReceiveFailureAction::RetryAfter(Duration::from_millis(50))
+        );
+        assert_eq!(
+            data_plane_receive_failure_action(6),
+            DataPlaneReceiveFailureAction::RetryAfter(Duration::from_millis(800))
+        );
+        assert_eq!(
+            data_plane_receive_failure_action(7),
+            DataPlaneReceiveFailureAction::RetryAfter(Duration::from_millis(1_000))
+        );
+        assert_eq!(
+            data_plane_receive_failure_action(DATA_PLANE_RECV_FAILURE_LIMIT),
+            DataPlaneReceiveFailureAction::Stop
+        );
+        assert_eq!(
+            data_plane_receive_failure_action(u32::MAX),
+            DataPlaneReceiveFailureAction::Stop
+        );
+    }
+
+    #[tokio::test]
+    async fn data_plane_receive_failure_policy_stops_at_limit_and_shutdown() {
+        // [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] The async boundary
+        // must stop deterministically without sleeping once recovery is
+        // required or global shutdown has already started.
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let shutdown_requested = AtomicBool::new(false);
+        let mut failures = DATA_PLANE_RECV_FAILURE_LIMIT - 1;
+        assert!(
+            !retry_required_data_plane_receive(
+                "test-data-plane",
+                &"forced receive failure",
+                &mut failures,
+                &shutdown_requested,
+                &mut shutdown_rx,
+            )
+            .await
+        );
+        assert_eq!(failures, DATA_PLANE_RECV_FAILURE_LIMIT);
+
+        shutdown_requested.store(true, std::sync::atomic::Ordering::Release);
+        let mut shutdown_failures = 0;
+        assert!(
+            !retry_required_data_plane_receive(
+                "test-data-plane",
+                &"ignored during shutdown",
+                &mut shutdown_failures,
+                &shutdown_requested,
+                &mut shutdown_rx,
+            )
+            .await
+        );
+        assert_eq!(shutdown_failures, 0);
     }
 
     #[tokio::test]

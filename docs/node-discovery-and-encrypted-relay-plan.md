@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.75.0 - Added process-level supervision for required API and follower tasks.
+Modification Reason: v0.76.0 - Added bounded failure recovery for required UDP and TUN data-plane tasks.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.75.0 - [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Escalates unexpected API supervisor and configured follower exits to process recovery.
+Last Modified: v0.76.0 - [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Prevents persistent UDP/TUN receive errors from leaving a hot-looping or falsely healthy node.
+Previous: v0.75.0 - [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Escalates unexpected API supervisor and configured follower exits to process recovery.
 Previous: v0.74.0 - [FOLLOWER-READINESS-LIVENESS 2026-07-30 by Codex] Revokes follower readiness on task exit and after three missed signed convergence checks.
 Previous: v0.73.0 - [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] Prevents block convergence from being reported as complete follower readiness while required proof is unavailable.
 Previous: v0.72.0 - [FOLLOWER-CERTIFICATE-RETRY 2026-07-30 by Codex] Retries deferred follower certificate persistence promptly without creating a polling loop.
@@ -107,6 +108,30 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.76 Required data-plane receive failures are bounded
+
+[DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex]
+
+- The always-required UDP ingress task and Linux TUN egress task now run
+  behind the same process-level required-task supervisor as the API and an
+  enabled commitment follower.
+- A transient receive error retries with source-blind exponential backoff from
+  25 milliseconds to a one-second ceiling. Any successful receive resets the
+  consecutive failure streak.
+- Eight consecutive receive failures stop the affected task. The supervisor
+  then enters the existing graceful process-recovery path instead of leaving
+  systemd with an API-healthy process whose privacy data plane is unavailable.
+- Backoff waits remain interruptible by the global shutdown broadcast. Normal
+  operator, signal, and programmatic shutdown therefore do not wait for a
+  retry timer and do not create a false critical failure.
+- Logs contain the local operating-system error and aggregate consecutive
+  count only. The process failure channel retains fixed reasons and never
+  receives packet bytes, client addresses, session identities, destinations,
+  routes, domains, or other user-plane metadata.
+- DNS startup transactionality is intentionally not mixed into this change.
+  The built-in DNS proxy still requires a separate pre-bind readiness upgrade
+  because its socket is currently bound inside its spawned task.
 
 ### v0.75 Required background tasks are process-supervised
 
