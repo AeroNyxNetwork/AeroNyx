@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.80.0 - Added RAII ownership for every process task so
-failed startup transactions cannot leave detached background work.
+Modification Reason: v0.81.0 - Replaced payload-bearing Tokio join diagnostics
+with fixed typed process-health failure categories.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.80.0 - [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Aborts every owned process task when a later startup gate fails instead of detaching its JoinHandle.
+Last Modified: v0.81.0 - [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering process-health status or structured shutdown diagnostics.
+Previous: v0.80.0 - [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Aborts every owned process task when a later startup gate fails instead of detaching its JoinHandle.
 Previous: v0.79.0 - [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Prevents configured Directory synchronization or Full-node Mirror from disappearing behind a ready process.
 Previous: v0.78.0 - [MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex] Prevents heartbeat, command, or session-reporting workers from disappearing behind a healthy process.
 Previous: v0.77.0 - [DNS-STARTUP-READINESS 2026-07-30 by Codex] Prevents readiness before DNS bind and bounds the complete DNS forwarding task lifecycle.
@@ -113,6 +114,28 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.81 Task failure diagnostics remain blind
+
+[JOIN-FAILURE-PRIVACY 2026-07-30 by Codex]
+
+- Required workers, required API listeners, Directory startup/reconciliation
+  blocking work, and bounded shutdown joins now share one typed
+  `RuntimeTaskJoinFailureKind` classification: `Panicked`, `Cancelled`, or
+  `Failed`.
+- Tokio `JoinError` values are inspected but never retained, formatted into a
+  process-health failure, forwarded to systemd status, or copied into
+  structured shutdown fields. A panic payload therefore cannot make that
+  control-plane hop even if the panic originated in request-handling code.
+- Listener-local I/O diagnostics remain local to the failure site. The
+  process-level recovery message carries only the fixed listener role and
+  local bind address, which is enough for restart policy without forwarding
+  arbitrary implementation text.
+- This boundary does not replace Rust's process panic hook. Code must still
+  avoid panicking on user-derived values and must not put payloads, identities,
+  routes, endpoints, or message identifiers into panic messages.
+- No wire schema, API response, routing decision, trust policy, synchronization
+  authority, storage format, or consensus behavior changes in this milestone.
 
 ### v0.80 Process tasks belong to one startup transaction
 

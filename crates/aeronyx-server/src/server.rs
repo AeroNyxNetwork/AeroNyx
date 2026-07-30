@@ -282,6 +282,9 @@
 // 111. [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Registers every spawned
 //      process task immediately so any later startup error aborts owned work
 //      instead of detaching JoinHandles from the failed startup transaction.
+// 112. [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Classifies Tokio task join
+//      failures into fixed typed reasons so panic payloads cannot cross the
+//      process-health, systemd status, or structured shutdown-log boundary.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -572,7 +575,7 @@ use nix::sys::socket::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tracing::{debug, error, info, trace, warn};
 
 use aeronyx_core::protocol::auth::{
@@ -2417,6 +2420,60 @@ impl Drop for RuntimeTaskRegistry {
     }
 }
 
+/// Privacy-safe classification for joining one Tokio runtime task.
+///
+/// [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] The category is sufficient for
+/// recovery and shutdown policy without retaining a potentially sensitive
+/// panic payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeTaskJoinFailureKind {
+    Panicked,
+    Cancelled,
+    Failed,
+}
+
+impl RuntimeTaskJoinFailureKind {
+    /// Collapses Tokio's potentially payload-bearing `JoinError` into a fixed
+    /// process-health category.
+    ///
+    /// [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Never retain or format the
+    /// source error here. Panic payloads may contain request-derived values and
+    /// therefore must not enter status, management, or structured log fields.
+    fn classify(error: &JoinError) -> Self {
+        if error.is_panic() {
+            Self::Panicked
+        } else if error.is_cancelled() {
+            Self::Cancelled
+        } else {
+            Self::Failed
+        }
+    }
+
+    fn required_task_reason(self) -> &'static str {
+        match self {
+            Self::Panicked => "required runtime task panicked",
+            Self::Cancelled => "required runtime task was cancelled unexpectedly",
+            Self::Failed => "required runtime task join failed",
+        }
+    }
+
+    fn required_api_listener_reason(self) -> &'static str {
+        match self {
+            Self::Panicked => "required API listener task panicked",
+            Self::Cancelled => "required API listener task was cancelled unexpectedly",
+            Self::Failed => "required API listener task join failed",
+        }
+    }
+
+    fn blocking_task_reason(self) -> &'static str {
+        match self {
+            Self::Panicked => "blocking task panicked",
+            Self::Cancelled => "blocking task was cancelled",
+            Self::Failed => "blocking task join failed",
+        }
+    }
+}
+
 /// Result of bringing one long-lived runtime task to a terminal state.
 ///
 /// [TASK-SHUTDOWN 2026-07-29 by Codex] Keep shutdown outcomes typed so timeout
@@ -2424,7 +2481,7 @@ impl Drop for RuntimeTaskRegistry {
 #[derive(Debug, PartialEq, Eq)]
 enum RuntimeTaskShutdownOutcome {
     Completed,
-    JoinFailed(String),
+    JoinFailed(RuntimeTaskJoinFailureKind),
     CancelledAfterTimeout,
     CompletedAfterTimeout,
     CancellationUnconfirmed,
@@ -2451,7 +2508,11 @@ impl RequiredApiListenerExit {
                 "required listener {} exited unexpectedly without an I/O error",
                 self.address
             ),
-            Err(error) => format!("required listener {} failed: {error}", self.address),
+            // [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] The listener already
+            // records its local I/O diagnostic at the failure site. Keep the
+            // process-health message fixed so it cannot become an accidental
+            // carrier for implementation-specific or request-derived text.
+            Err(_) => format!("required listener {} failed", self.address),
         };
         CriticalRuntimeFailure {
             task: self.role,
@@ -3350,8 +3411,12 @@ impl Server {
                 RuntimeTaskShutdownOutcome::Completed => {
                     debug!(task = report.name, "Runtime task completed");
                 }
-                RuntimeTaskShutdownOutcome::JoinFailed(reason) => {
-                    warn!(task = report.name, %reason, "Runtime task join failed");
+                RuntimeTaskShutdownOutcome::JoinFailed(failure) => {
+                    warn!(
+                        task = report.name,
+                        failure = ?failure,
+                        "Runtime task join failed"
+                    );
                 }
                 RuntimeTaskShutdownOutcome::CancelledAfterTimeout => {
                     warn!(
@@ -4504,7 +4569,9 @@ impl Server {
                 Some(Ok(listener_exit)) => listener_exit.into_failure(),
                 Some(Err(error)) => CriticalRuntimeFailure {
                     task: "required_api_listener_group",
-                    reason: format!("listener task join failed: {error}"),
+                    reason: RuntimeTaskJoinFailureKind::classify(&error)
+                        .required_api_listener_reason()
+                        .to_string(),
                 },
                 None => CriticalRuntimeFailure {
                     task: "required_api_listener_group",
@@ -4537,7 +4604,7 @@ impl Server {
                     "[RUNTIME] Required listener joined during shutdown"
                 ),
                 Err(error) => warn!(
-                    %error,
+                    failure = ?RuntimeTaskJoinFailureKind::classify(&error),
                     "[RUNTIME] Required listener join failed during shutdown"
                 ),
             }
@@ -5935,7 +6002,8 @@ impl Server {
         .await
         .map_err(|error| {
             ServerError::startup_failed(format!(
-                "Directory Chain store task failed before startup: {error}"
+                "Directory Chain store task failed before startup: {}",
+                RuntimeTaskJoinFailureKind::classify(&error).blocking_task_reason()
             ))
         })?
         .map_err(|error| {
@@ -5968,7 +6036,8 @@ impl Server {
             .await
             .map_err(|error| {
                 ServerError::startup_failed(format!(
-                    "Directory Chain post-append audit task failed: {error}"
+                    "Directory Chain post-append audit task failed: {}",
+                    RuntimeTaskJoinFailureKind::classify(&error).blocking_task_reason()
                 ))
             })?
             .map_err(|error| {
@@ -6021,7 +6090,8 @@ impl Server {
         .await
         .map_err(|error| {
             ServerError::startup_failed(format!(
-                "Directory replica store task failed before startup: {error}"
+                "Directory replica store task failed before startup: {}",
+                RuntimeTaskJoinFailureKind::classify(&error).blocking_task_reason()
             ))
         })?
         .map_err(|error| {
@@ -6141,7 +6211,12 @@ impl Server {
             store.append_descriptors(&descriptors, produced_at, identity.as_ref())
         })
         .await
-        .map_err(|error| format!("blocking reconciliation task failed: {error}"))?
+        .map_err(|error| {
+            format!(
+                "blocking reconciliation task failed: {}",
+                RuntimeTaskJoinFailureKind::classify(&error).blocking_task_reason()
+            )
+        })?
         .map_err(|error| error.to_string())
     }
 
@@ -11428,11 +11503,9 @@ impl Server {
 
             let reason = match result {
                 Ok(()) => "required runtime task exited unexpectedly",
-                Err(error) if error.is_panic() => "required runtime task panicked",
-                Err(error) if error.is_cancelled() => {
-                    "required runtime task was cancelled unexpectedly"
+                Err(error) => {
+                    RuntimeTaskJoinFailureKind::classify(&error).required_task_reason()
                 }
-                Err(_) => "required runtime task join failed",
             };
             let failure = CriticalRuntimeFailure {
                 task: name,
@@ -11475,7 +11548,9 @@ impl Server {
         // cancellation explicitly.
         let outcome = match tokio::time::timeout(grace, &mut task).await {
             Ok(Ok(())) => RuntimeTaskShutdownOutcome::Completed,
-            Ok(Err(error)) => RuntimeTaskShutdownOutcome::JoinFailed(error.to_string()),
+            Ok(Err(error)) => RuntimeTaskShutdownOutcome::JoinFailed(
+                RuntimeTaskJoinFailureKind::classify(&error),
+            ),
             Err(_) => {
                 task.abort();
                 match tokio::time::timeout(abort_confirmation, &mut task).await {
@@ -11483,7 +11558,9 @@ impl Server {
                     Ok(Err(error)) if error.is_cancelled() => {
                         RuntimeTaskShutdownOutcome::CancelledAfterTimeout
                     }
-                    Ok(Err(error)) => RuntimeTaskShutdownOutcome::JoinFailed(error.to_string()),
+                    Ok(Err(error)) => RuntimeTaskShutdownOutcome::JoinFailed(
+                        RuntimeTaskJoinFailureKind::classify(&error),
+                    ),
                     Err(_) => RuntimeTaskShutdownOutcome::CancellationUnconfirmed,
                 }
             }
@@ -11626,8 +11703,8 @@ mod tests {
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
         DiscoveryPeerIdentityHints, PeerHttpClients, PeerStoreCacheDocument,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
-        RequiredApiListenerExit, RuntimeTaskRegistry, RuntimeTaskShutdownOutcome,
-        RuntimeTaskShutdownReport, Server, SystemdNotifier,
+        RequiredApiListenerExit, RuntimeTaskJoinFailureKind, RuntimeTaskRegistry,
+        RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server, SystemdNotifier,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DATA_PLANE_RECV_FAILURE_LIMIT,
@@ -11805,10 +11882,55 @@ mod tests {
             failure,
             CriticalRuntimeFailure {
                 task: "test_api",
-                reason:
-                    "required listener 127.0.0.1:8421 failed: forced listener failure".to_string(),
+                reason: "required listener 127.0.0.1:8421 failed".to_string(),
             }
         );
+
+        shutdown_requested.store(true, std::sync::atomic::Ordering::Release);
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn required_api_listener_supervisor_sanitizes_panic_failure() {
+        // [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] A panic payload can be
+        // request-derived. It must not cross the process-health channel even
+        // though Tokio reports it through JoinError.
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
+        let mut listeners = tokio::task::JoinSet::new();
+        listeners.spawn(async move {
+            panic!("test-only-sensitive-listener-payload");
+            #[allow(unreachable_code)]
+            RequiredApiListenerExit {
+                role: "test_api",
+                address: "127.0.0.1:8421".parse().unwrap(),
+                result: Ok(()),
+            }
+        });
+
+        let supervisor = tokio::spawn(Server::supervise_required_api_listeners(
+            listeners,
+            Arc::clone(&shutdown_requested),
+            shutdown_tx.subscribe(),
+            failure_tx,
+        ));
+        let failure = tokio::time::timeout(Duration::from_secs(1), failure_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failure,
+            CriticalRuntimeFailure {
+                task: "required_api_listener_group",
+                reason: "required API listener task panicked".to_string(),
+            }
+        );
+        assert!(!failure.reason.contains("sensitive"));
 
         shutdown_requested.store(true, std::sync::atomic::Ordering::Release);
         shutdown_tx.send(()).unwrap();
@@ -12316,6 +12438,58 @@ mod tests {
             RuntimeTaskShutdownReport {
                 name: "stuck-test",
                 outcome: RuntimeTaskShutdownOutcome::CancelledAfterTimeout,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_task_shutdown_classifies_panic_without_retaining_payload() {
+        // [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Shutdown diagnostics
+        // retain only a typed category, never JoinError's panic payload.
+        let task = tokio::spawn(async {
+            panic!("test-only-sensitive-shutdown-payload");
+        });
+        let report = Server::join_runtime_task(
+            "panic-test",
+            task,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            RuntimeTaskShutdownReport {
+                name: "panic-test",
+                outcome: RuntimeTaskShutdownOutcome::JoinFailed(
+                    RuntimeTaskJoinFailureKind::Panicked,
+                ),
+            }
+        );
+        assert!(!format!("{report:?}").contains("sensitive"));
+    }
+
+    #[tokio::test]
+    async fn runtime_task_shutdown_distinguishes_external_cancellation() {
+        // [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Cancellation remains
+        // operationally distinct from panic while carrying no JoinError text.
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let report = Server::join_runtime_task(
+            "cancelled-test",
+            task,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            RuntimeTaskShutdownReport {
+                name: "cancelled-test",
+                outcome: RuntimeTaskShutdownOutcome::JoinFailed(
+                    RuntimeTaskJoinFailureKind::Cancelled,
+                ),
             }
         );
     }
