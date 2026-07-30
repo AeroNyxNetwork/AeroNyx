@@ -48,6 +48,8 @@
 //!   handled by update_last_active() which has no table growth concern.
 //!
 //! ## Last Modified
+//! v1.1.0-JoinFailurePrivacy - Preserve the public Join variant while
+//!   preventing Tokio panic payloads from crossing error/log boundaries.
 //! v1.0.0-MultiTenant - Initial implementation (Task 1a)
 // ============================================
 
@@ -58,6 +60,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::task;
 use tracing::{debug, error, info, warn};
+
+use crate::error::RuntimeTaskJoinFailureKind;
 
 // ============================================
 // Public Types
@@ -85,7 +89,7 @@ pub struct OwnerUsageStats {
 }
 
 /// Errors that can arise from SystemDb operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum SystemDbError {
     #[error("Database error: {0}")]
     Db(#[from] rusqlite::Error),
@@ -96,8 +100,36 @@ pub enum SystemDbError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Task join error: {0}")]
-    Join(#[from] tokio::task::JoinError),
+    /// A blocking database task failed to join.
+    ///
+    /// [SYSTEM-DB-JOIN-PRIVACY 2026-07-30 by Codex] Keep the existing tuple
+    /// variant and `From<JoinError>` interface for callers, but never format
+    /// the inner error because it may retain a request-derived panic payload.
+    #[error("Task join error")]
+    Join(tokio::task::JoinError),
+}
+
+impl From<tokio::task::JoinError> for SystemDbError {
+    fn from(error: tokio::task::JoinError) -> Self {
+        Self::Join(error)
+    }
+}
+
+impl std::fmt::Debug for SystemDbError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(error) => formatter.debug_tuple("Db").field(error).finish(),
+            Self::AlreadyAssigned(volume_id) => formatter
+                .debug_tuple("AlreadyAssigned")
+                .field(volume_id)
+                .finish(),
+            Self::Io(error) => formatter.debug_tuple("Io").field(error).finish(),
+            Self::Join(error) => formatter
+                .debug_tuple("Join")
+                .field(&RuntimeTaskJoinFailureKind::classify(error))
+                .finish(),
+        }
+    }
 }
 
 // ============================================
@@ -625,6 +657,27 @@ fn now_unix() -> i64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn task_join_error_redacts_panic_payload_and_source() {
+        // [SYSTEM-DB-JOIN-PRIVACY 2026-07-30 by Codex] SystemDb errors can
+        // enter API and scheduler logs. Preserve the variant for matching,
+        // while proving its public diagnostics cannot expose panic contents.
+        let join_error = tokio::spawn(async {
+            panic!("test-only-sensitive-system-db-payload");
+        })
+        .await
+        .unwrap_err();
+        let error = SystemDbError::from(join_error);
+
+        assert_eq!(error.to_string(), "Task join error");
+        assert!(!format!("{error:?}").contains("sensitive"));
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(matches!(
+            error,
+            SystemDbError::Join(ref source) if source.is_panic()
+        ));
+    }
 
     /// Helper: create a SystemDb in a temp directory.
     async fn open_temp_db() -> (TempDir, Arc<SystemDb>) {

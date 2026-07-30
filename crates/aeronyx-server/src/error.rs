@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/error.rs
 // ============================================
-// Version: 1.1.0-RuntimeSupervision
+// Version: 1.2.0-JoinFailurePrivacy
 //
 // Modification Reason:
 //   Added WalletDenied variant for deny list rejection at handshake time.
@@ -11,21 +11,26 @@
 //   [RUNTIME-SUPERVISION 2026-07-29 by Codex] Added an explicit fatal runtime
 //   error so required service loss is distinguishable from startup/config
 //   failure and can terminate the process for systemd recovery.
+//   [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Centralized privacy-safe Tokio
+//   task join classification for runtime and storage error boundaries.
 //
 // What changed:
 //   - Added WalletDenied { reason: String } variant
 //   - Added is_wallet_denied() helper method
 //
 // Last Modified:
+//   v1.2.0-JoinFailurePrivacy - Fixed typed Tokio join failure categories
 //   v1.1.0-RuntimeSupervision - Fatal required-task failure classification
 //   v0.1.2               - InvalidPacket source field rename
 //   v1.0.0-Voice+SessionFix - is_session_not_found() helper
 //   v1.0.0-Membership    - WalletDenied variant + is_wallet_denied()
 // ============================================
 
+use std::fmt;
 use std::net::SocketAddr;
 
 use thiserror::Error;
+use tokio::task::JoinError;
 
 use aeronyx_common::error::CommonError;
 use aeronyx_common::SessionId;
@@ -34,6 +39,73 @@ use aeronyx_transport::error::TransportError;
 
 /// Result type for server operations.
 pub type Result<T> = std::result::Result<T, ServerError>;
+
+/// Privacy-safe category for a Tokio task that failed to join.
+///
+/// [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] `JoinError` may retain a panic
+/// payload. Runtime status and storage errors use this fixed category whenever
+/// they need diagnostics, preventing that payload from crossing into API,
+/// management, or structured log fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeTaskJoinFailureKind {
+    /// The task panicked.
+    Panicked,
+    /// The task was cancelled before it completed.
+    Cancelled,
+    /// Tokio reported another join failure category.
+    Failed,
+}
+
+impl RuntimeTaskJoinFailureKind {
+    /// Classifies a Tokio join failure without retaining its payload.
+    pub(crate) fn classify(error: &JoinError) -> Self {
+        if error.is_panic() {
+            Self::Panicked
+        } else if error.is_cancelled() {
+            Self::Cancelled
+        } else {
+            Self::Failed
+        }
+    }
+
+    /// Returns the stable process-health reason for a required runtime task.
+    pub(crate) const fn required_task_reason(self) -> &'static str {
+        match self {
+            Self::Panicked => "required runtime task panicked",
+            Self::Cancelled => "required runtime task was cancelled unexpectedly",
+            Self::Failed => "required runtime task join failed",
+        }
+    }
+
+    /// Returns the stable process-health reason for a required API listener.
+    pub(crate) const fn required_api_listener_reason(self) -> &'static str {
+        match self {
+            Self::Panicked => "required API listener task panicked",
+            Self::Cancelled => "required API listener task was cancelled unexpectedly",
+            Self::Failed => "required API listener task join failed",
+        }
+    }
+
+    /// Returns the stable startup reason for a blocking task.
+    pub(crate) const fn blocking_task_reason(self) -> &'static str {
+        match self {
+            Self::Panicked => "blocking task panicked",
+            Self::Cancelled => "blocking task was cancelled",
+            Self::Failed => "blocking task join failed",
+        }
+    }
+}
+
+impl fmt::Display for RuntimeTaskJoinFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match self {
+            Self::Panicked => "task panicked",
+            Self::Cancelled => "task was cancelled",
+            Self::Failed => "task join failed",
+        };
+        formatter.write_str(reason)
+    }
+}
 
 /// Server error types.
 #[derive(Error, Debug)]

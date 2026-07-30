@@ -54,6 +54,8 @@
 //! v1.0.0-MultiTenant - Initial implementation (Task 1b)
 //! v1.0.1-OwnerOpenSingleFlight - Prevent same-owner concurrent SQLite opens
 //!   and serialize cache-capacity insertion without blocking unrelated I/O.
+//! v1.0.2-JoinFailurePrivacy - Preserve the public Join variant while
+//!   preventing Tokio panic payloads from crossing error/log boundaries.
 // ============================================
 
 use std::sync::Arc;
@@ -65,6 +67,8 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::task;
 use tracing::{info, warn};
 
+use crate::error::RuntimeTaskJoinFailureKind;
+
 use super::storage::MemoryStorage;
 use super::system_db::SystemDb;
 use super::volume_router::{VolumeRouter, VolumeRouterError};
@@ -74,7 +78,7 @@ use super::volume_router::{VolumeRouter, VolumeRouterError};
 // ============================================
 
 /// Errors that can arise from StoragePool operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum StoragePoolError {
     #[error("No writable volume available for new user: {0}")]
     NoVolume(#[from] VolumeRouterError),
@@ -82,8 +86,36 @@ pub enum StoragePoolError {
     #[error("Failed to open database at {path}: {reason}")]
     DbOpen { path: String, reason: String },
 
-    #[error("Task join error: {0}")]
-    Join(#[from] tokio::task::JoinError),
+    /// A blocking storage-open task failed to join.
+    ///
+    /// [STORAGE-POOL-JOIN-PRIVACY 2026-07-30 by Codex] Keep the existing
+    /// tuple variant and `From<JoinError>` interface for callers, but never
+    /// format the inner error because it may retain a sensitive panic payload.
+    #[error("Task join error")]
+    Join(tokio::task::JoinError),
+}
+
+impl From<tokio::task::JoinError> for StoragePoolError {
+    fn from(error: tokio::task::JoinError) -> Self {
+        Self::Join(error)
+    }
+}
+
+impl std::fmt::Debug for StoragePoolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoVolume(error) => formatter.debug_tuple("NoVolume").field(error).finish(),
+            Self::DbOpen { path, reason } => formatter
+                .debug_struct("DbOpen")
+                .field("path", path)
+                .field("reason", reason)
+                .finish(),
+            Self::Join(error) => formatter
+                .debug_tuple("Join")
+                .field(&RuntimeTaskJoinFailureKind::classify(error))
+                .finish(),
+        }
+    }
 }
 
 // ============================================
@@ -395,6 +427,27 @@ mod tests {
     use crate::services::memchain::system_db::SystemDb;
     use crate::services::memchain::volume_router::{VolumeRouter, VolumeStatus};
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn task_join_error_redacts_panic_payload_and_source() {
+        // [STORAGE-POOL-JOIN-PRIVACY 2026-07-30 by Codex] StoragePool errors
+        // are logged by MPI handlers and schedulers. Keep diagnostics useful
+        // without retaining the panic payload in Display, Debug, or source.
+        let join_error = tokio::spawn(async {
+            panic!("test-only-sensitive-storage-pool-payload");
+        })
+        .await
+        .unwrap_err();
+        let error = StoragePoolError::from(join_error);
+
+        assert_eq!(error.to_string(), "Task join error");
+        assert!(!format!("{error:?}").contains("sensitive"));
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(matches!(
+            error,
+            StoragePoolError::Join(ref source) if source.is_panic()
+        ));
+    }
 
     // ── Test Helpers ──────────────────────────────────────────────────
 

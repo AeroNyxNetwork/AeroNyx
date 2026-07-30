@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.81.0 - Replaced payload-bearing Tokio join diagnostics
-with fixed typed process-health failure categories.
+Modification Reason: v0.82.0 - Extended privacy-safe Tokio join diagnostics
+from process supervision into shared SystemDb and StoragePool boundaries.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.81.0 - [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering process-health status or structured shutdown diagnostics.
+Last Modified: v0.82.0 - [STORAGE-JOIN-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering shared storage errors, API logs, or scheduler diagnostics.
+Previous: v0.81.0 - [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Prevents Tokio panic payloads and raw join errors from entering process-health status or structured shutdown diagnostics.
 Previous: v0.80.0 - [STARTUP-TASK-REGISTRY 2026-07-30 by Codex] Aborts every owned process task when a later startup gate fails instead of detaching its JoinHandle.
 Previous: v0.79.0 - [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Prevents configured Directory synchronization or Full-node Mirror from disappearing behind a ready process.
 Previous: v0.78.0 - [MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex] Prevents heartbeat, command, or session-reporting workers from disappearing behind a healthy process.
@@ -114,6 +115,30 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.82 Storage task failures remain blind
+
+[STORAGE-JOIN-PRIVACY 2026-07-30 by Codex]
+
+- `RuntimeTaskJoinFailureKind` now lives in the shared server error module, so
+  runtime supervision, Directory startup, `SystemDb`, and `StoragePool` use one
+  fixed `Panicked` / `Cancelled` / `Failed` classification.
+- The public `SystemDbError::Join(JoinError)` and
+  `StoragePoolError::Join(JoinError)` tuple variants remain available for
+  source compatibility. Existing callers can still construct them through
+  `From<JoinError>` and can still pattern-match the inner Tokio state.
+- Their public `Display`, `Debug`, and `Error::source` boundaries no longer
+  expose or chain the raw Tokio error. API and scheduler logging therefore
+  receives only a fixed task-join category, never a panic payload.
+- The inner `JoinError` remains private to explicit Rust pattern matching for
+  backward compatibility. New status, telemetry, management, or API code must
+  use the fixed classifier and must not add raw join-error accessors.
+- This does not suppress Rust's global panic hook. Tasks must still avoid panic
+  messages containing payloads, identities, routes, endpoints, message IDs,
+  memory contents, or other user-derived data.
+- No wire schema, storage schema, database path, routing decision, trust
+  policy, synchronization authority, or public response shape changes in this
+  milestone.
 
 ### v0.81 Task failure diagnostics remain blind
 

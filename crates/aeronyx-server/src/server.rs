@@ -575,7 +575,7 @@ use nix::sys::socket::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
-use tokio::task::{JoinError, JoinHandle, JoinSet};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, trace, warn};
 
 use aeronyx_core::protocol::auth::{
@@ -667,7 +667,7 @@ use crate::api::{
 use crate::config::{
     DiscoveryConfig, MemChainConfig, MemChainMode, ServerConfig, VectorQuantizationMode,
 };
-use crate::error::{Result, ServerError};
+use crate::error::{Result, RuntimeTaskJoinFailureKind, ServerError};
 use crate::handlers::packet::DecryptedPayload;
 use crate::handlers::PacketHandler;
 use crate::management::{
@@ -2416,60 +2416,6 @@ impl Drop for RuntimeTaskRegistry {
                     "[STARTUP] Aborted owned runtime task while unwinding startup"
                 );
             }
-        }
-    }
-}
-
-/// Privacy-safe classification for joining one Tokio runtime task.
-///
-/// [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] The category is sufficient for
-/// recovery and shutdown policy without retaining a potentially sensitive
-/// panic payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RuntimeTaskJoinFailureKind {
-    Panicked,
-    Cancelled,
-    Failed,
-}
-
-impl RuntimeTaskJoinFailureKind {
-    /// Collapses Tokio's potentially payload-bearing `JoinError` into a fixed
-    /// process-health category.
-    ///
-    /// [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Never retain or format the
-    /// source error here. Panic payloads may contain request-derived values and
-    /// therefore must not enter status, management, or structured log fields.
-    fn classify(error: &JoinError) -> Self {
-        if error.is_panic() {
-            Self::Panicked
-        } else if error.is_cancelled() {
-            Self::Cancelled
-        } else {
-            Self::Failed
-        }
-    }
-
-    fn required_task_reason(self) -> &'static str {
-        match self {
-            Self::Panicked => "required runtime task panicked",
-            Self::Cancelled => "required runtime task was cancelled unexpectedly",
-            Self::Failed => "required runtime task join failed",
-        }
-    }
-
-    fn required_api_listener_reason(self) -> &'static str {
-        match self {
-            Self::Panicked => "required API listener task panicked",
-            Self::Cancelled => "required API listener task was cancelled unexpectedly",
-            Self::Failed => "required API listener task join failed",
-        }
-    }
-
-    fn blocking_task_reason(self) -> &'static str {
-        match self {
-            Self::Panicked => "blocking task panicked",
-            Self::Cancelled => "blocking task was cancelled",
-            Self::Failed => "blocking task join failed",
         }
     }
 }
@@ -11703,8 +11649,8 @@ mod tests {
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
         DiscoveryPeerIdentityHints, PeerHttpClients, PeerStoreCacheDocument,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
-        RequiredApiListenerExit, RuntimeTaskJoinFailureKind, RuntimeTaskRegistry,
-        RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server, SystemdNotifier,
+        RequiredApiListenerExit, RuntimeTaskRegistry, RuntimeTaskShutdownOutcome,
+        RuntimeTaskShutdownReport, Server, SystemdNotifier,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DATA_PLANE_RECV_FAILURE_LIMIT,
@@ -11722,6 +11668,7 @@ mod tests {
     use crate::api::{
         decode_bounded_json_response, read_bounded_http_response, BoundedHttpResponseError,
     };
+    use crate::error::RuntimeTaskJoinFailureKind;
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
