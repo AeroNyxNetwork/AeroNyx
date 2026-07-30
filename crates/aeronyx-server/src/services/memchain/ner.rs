@@ -98,7 +98,7 @@
 //! - text_lengths counts only TEXT words (excludes prompt prefix tokens).
 //! - The tokenizer MUST match the model's training tokenizer (typically DeBERTa-v3
 //!   for v2.x models). Using the wrong tokenizer silently degrades quality.
-//! - ORT init is shared with embed.rs via std::sync::Once — safe to load both.
+//! - ORT init is shared with embed.rs via the retryable success-only gate.
 //! - Session::run() requires &mut self → shared `InferenceSession` wrapper
 //!   (same recovery contract as embed.rs and reranker.rs).
 //! - max_width (max entity span in words) defaults to 12. Larger values increase
@@ -108,6 +108,10 @@
 //! - span_mask tensor type is bool (not u8). ort 2.0.0-rc.11 supports bool directly.
 //!
 //! ## Last Modified
+//! v2.4.3-NerOutputValidation -
+//!   [MEMCHAIN-NER-OUTPUT 2026-07-30 by Codex] Added strict 3D/4D output
+//!   contracts, rejected non-finite logits, and made span-grid sizing bounded
+//!   and fallible so incompatible models/configuration cannot panic or truncate.
 //! v2.4.2-IndependentRuntimeInitialization -
 //!   [NER-RUNTIME-INDEPENDENCE 2026-07-30 by Codex] Made NER initialize the
 //!   shared ORT runtime itself and honored the configured tokenizer path.
@@ -127,7 +131,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::embed::{init_ort_runtime, InferenceSession};
 
@@ -164,6 +168,89 @@ const MAX_LABELS: usize = 32;
 /// Maximum text length in words for a single inference call.
 /// Longer texts should be split into windows by the caller.
 const MAX_TEXT_WORDS: usize = 512;
+
+/// Maximum configurable span width.
+///
+/// Wider spans cannot be observed because inference already caps text at
+/// `MAX_TEXT_WORDS`; rejecting them also bounds the span-grid allocation.
+const MAX_ENTITY_WIDTH: usize = MAX_TEXT_WORDS;
+
+// ============================================
+// NER output and span-grid contracts
+// ============================================
+
+/// Supported ONNX output layout after validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NerOutputLayout {
+    /// `[batch, num_spans, num_labels]`.
+    Flattened,
+    /// `[batch, num_words, max_width, num_labels]`.
+    Grid,
+}
+
+/// Compute the fixed GLiNER span-grid capacities without integer overflow.
+fn checked_span_dimensions(num_words: usize, max_width: usize) -> Result<(usize, usize), String> {
+    let num_spans = num_words.checked_mul(max_width).ok_or_else(|| {
+        format!(
+            "GLiNER span grid overflow: {} words x width {}",
+            num_words, max_width
+        )
+    })?;
+    let span_index_values = num_spans.checked_mul(2).ok_or_else(|| {
+        format!(
+            "GLiNER span index capacity overflow for {} spans",
+            num_spans
+        )
+    })?;
+
+    Ok((num_spans, span_index_values))
+}
+
+/// Validate GLiNER's flattened or grid-form output contract.
+///
+/// [MEMCHAIN-NER-OUTPUT 2026-07-30 by Codex] Every axis must match the
+/// tensors built for this request. Accepting smaller axes and decoding with
+/// `min()` hides model incompatibility; accepting larger axes misaligns spans.
+fn validate_ner_output_shape(
+    shape: &[usize],
+    expected_words: usize,
+    expected_width: usize,
+    expected_labels: usize,
+) -> Result<NerOutputLayout, String> {
+    let (expected_spans, _) = checked_span_dimensions(expected_words, expected_width)?;
+
+    match shape {
+        [batch, spans, labels]
+            if *batch == 1 && *spans == expected_spans && *labels == expected_labels =>
+        {
+            Ok(NerOutputLayout::Flattened)
+        }
+        [batch, words, width, labels]
+            if *batch == 1
+                && *words == expected_words
+                && *width == expected_width
+                && *labels == expected_labels =>
+        {
+            Ok(NerOutputLayout::Grid)
+        }
+        _ => Err(format!(
+            "GLiNER output shape {:?} does not match [1, {}, {}] or [1, {}, {}, {}]",
+            shape, expected_spans, expected_labels, expected_words, expected_width, expected_labels
+        )),
+    }
+}
+
+/// Reject non-finite logits before sigmoid and confidence sorting.
+fn validate_finite_ner_logits(values: impl Iterator<Item = f32>) -> Result<(), String> {
+    if let Some((index, value)) = values.enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(format!(
+            "GLiNER output contains non-finite logit at flat index {}: {}",
+            index, value
+        ));
+    }
+
+    Ok(())
+}
 
 // ============================================
 // Types
@@ -281,6 +368,12 @@ impl NerEngine {
         } else {
             max_width
         };
+        if max_width > MAX_ENTITY_WIDTH {
+            return Err(format!(
+                "GLiNER max_width {} exceeds maximum {}",
+                max_width, MAX_ENTITY_WIDTH
+            ));
+        }
 
         let model_path = model_dir.join(MODEL_FILENAME);
 
@@ -391,7 +484,7 @@ impl NerEngine {
         let seq_len = input_ids.len();
 
         // Step 4: Build span indices (fixed-size grid: num_words × max_width)
-        let (span_idx_flat, span_mask_flat, num_spans) = self.build_span_indices(num_text_words);
+        let (span_idx_flat, span_mask_flat, num_spans) = self.build_span_indices(num_text_words)?;
 
         if num_spans == 0 {
             return Ok(Vec::new());
@@ -446,46 +539,34 @@ impl NerEngine {
             .try_extract_array::<f32>()
             .map_err(|e| format!("GLiNER output extraction: {}", e))?;
 
-        let logits_shape = logits.shape();
-
-        // GLiNER output can be either:
-        //   3D: [batch, num_spans, num_labels] — flattened
-        //   4D: [batch, num_words, max_width, num_labels] — grid form
-        // We handle both by indexing appropriately.
-        let (out_num_words, out_max_width, out_num_labels, is_4d) = match logits_shape.len() {
-            3 => {
-                // [batch, num_spans, num_labels]
-                let nl = logits_shape[2];
-                (num_text_words, self.max_width, nl, false)
-            }
-            4 => {
-                // [batch, num_words, max_width, num_labels]
-                (logits_shape[1], logits_shape[2], logits_shape[3], true)
-            }
-            other => {
-                return Err(format!(
-                    "Expected 3D or 4D logits, got {}D (shape: {:?})",
-                    other, logits_shape
-                ));
-            }
-        };
+        // [MEMCHAIN-NER-OUTPUT 2026-07-30 by Codex] Validate every output axis
+        // and value before indexed decoding. Model mismatch must be an explicit
+        // inference failure rather than a partial result or index panic.
+        let output_layout = validate_ner_output_shape(
+            logits.shape(),
+            num_text_words,
+            self.max_width,
+            labels.len(),
+        )?;
+        validate_finite_ner_logits(logits.iter().copied())?;
 
         // Step 7: Sigmoid + threshold + decode
         let mut raw_detections: Vec<DetectedEntity> = Vec::new();
 
-        for start in 0..out_num_words.min(num_text_words) {
-            for offset in 0..out_max_width {
+        for start in 0..num_text_words {
+            for offset in 0..self.max_width {
                 let end = start + offset;
                 if end >= num_text_words {
                     break;
                 }
 
-                for l in 0..out_num_labels.min(labels.len()) {
-                    let logit = if is_4d {
-                        logits[[0, start, offset, l]]
-                    } else {
-                        let span_idx = start * self.max_width + offset;
-                        logits[[0, span_idx, l]]
+                for (label_index, label) in labels.iter().enumerate() {
+                    let logit = match output_layout {
+                        NerOutputLayout::Grid => logits[[0, start, offset, label_index]],
+                        NerOutputLayout::Flattened => {
+                            let span_index = start * self.max_width + offset;
+                            logits[[0, span_index, label_index]]
+                        }
                     };
                     let score = sigmoid(logit);
 
@@ -496,7 +577,7 @@ impl NerEngine {
 
                         raw_detections.push(DetectedEntity {
                             text: entity_text.to_string(),
-                            label: labels[l].to_string(),
+                            label: (*label).to_string(),
                             confidence: score,
                             char_start,
                             char_end,
@@ -694,12 +775,30 @@ impl NerEngine {
     ///     if end < num_words → valid span (start, end), mask=true
     ///     else → padding (0, 0), mask=false
     ///
-    /// Returns: (span_idx_flat [num_spans * 2], span_mask_flat [num_spans], num_spans)
-    /// where num_spans = num_text_words * max_width (FIXED size).
-    fn build_span_indices(&self, num_text_words: usize) -> (Vec<i64>, Vec<bool>, usize) {
-        let num_spans = num_text_words * self.max_width;
-        let mut span_idx: Vec<i64> = Vec::with_capacity(num_spans * 2);
-        let mut span_mask: Vec<bool> = Vec::with_capacity(num_spans);
+    /// Returns the fixed-size span buffers, or an error if capacity arithmetic
+    /// overflows or the allocation cannot be reserved.
+    fn build_span_indices(
+        &self,
+        num_text_words: usize,
+    ) -> Result<(Vec<i64>, Vec<bool>, usize), String> {
+        let (num_spans, span_index_values) =
+            checked_span_dimensions(num_text_words, self.max_width)?;
+        let mut span_idx: Vec<i64> = Vec::new();
+        let mut span_mask: Vec<bool> = Vec::new();
+        span_idx
+            .try_reserve_exact(span_index_values)
+            .map_err(|error| {
+                format!(
+                    "GLiNER span index allocation failed for {} values: {}",
+                    span_index_values, error
+                )
+            })?;
+        span_mask.try_reserve_exact(num_spans).map_err(|error| {
+            format!(
+                "GLiNER span mask allocation failed for {} spans: {}",
+                num_spans, error
+            )
+        })?;
 
         for start in 0..num_text_words {
             for offset in 0..self.max_width {
@@ -718,7 +817,7 @@ impl NerEngine {
             }
         }
 
-        (span_idx, span_mask, num_spans)
+        Ok((span_idx, span_mask, num_spans))
     }
 
     /// Convert a linear span index back to (start_word, end_word) pair.
@@ -787,12 +886,9 @@ fn greedy_dedup(mut detections: Vec<DetectedEntity>) -> Vec<DetectedEntity> {
         return detections;
     }
 
-    // Sort by confidence descending
-    detections.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Sort by confidence descending. Logits are validated before decoding, so
+    // total ordering is both deterministic and explicit.
+    detections.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
 
     let mut claimed: Vec<bool> = Vec::new();
     // Find max word index to size the claimed array
@@ -834,6 +930,57 @@ mod tests {
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
         assert!(sigmoid(10.0) > 0.999);
         assert!(sigmoid(-10.0) < 0.001);
+    }
+
+    #[test]
+    fn ner_output_shape_accepts_exact_flattened_and_grid_layouts() {
+        assert_eq!(
+            validate_ner_output_shape(&[1, 6, 2], 3, 2, 2).unwrap(),
+            NerOutputLayout::Flattened
+        );
+        assert_eq!(
+            validate_ner_output_shape(&[1, 3, 2, 2], 3, 2, 2).unwrap(),
+            NerOutputLayout::Grid
+        );
+    }
+
+    #[test]
+    fn ner_output_shape_rejects_axis_and_label_mismatches() {
+        for shape in [
+            &[2, 6, 2][..],
+            &[1, 5, 2],
+            &[1, 6, 1],
+            &[1, 2, 2, 2],
+            &[1, 3, 1, 2],
+            &[1, 3, 2, 3],
+            &[6, 2],
+        ] {
+            let error = validate_ner_output_shape(shape, 3, 2, 2).unwrap_err();
+            assert!(error.contains("does not match"), "shape={:?}", shape);
+        }
+    }
+
+    #[test]
+    fn ner_output_rejects_non_finite_logits() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = validate_finite_ner_logits([0.0, value].into_iter()).unwrap_err();
+            assert!(error.contains("non-finite"));
+        }
+    }
+
+    #[test]
+    fn span_dimensions_are_checked_before_allocation() {
+        assert_eq!(checked_span_dimensions(3, 2).unwrap(), (6, 12));
+        assert!(checked_span_dimensions(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn max_width_is_bounded_before_model_loading() {
+        let error = NerEngine::load("/nonexistent/path", 0.5, MAX_ENTITY_WIDTH.saturating_add(1))
+            .unwrap_err();
+
+        assert!(error.contains("max_width"));
+        assert!(error.contains("exceeds maximum"));
     }
 
     #[test]
@@ -953,7 +1100,6 @@ mod tests {
         // (2,2), (2,3*)   ← start=2, offset=0,1 (*out of bounds → padding)
         let max_width = 2;
         let num_words = 3;
-        let num_spans = num_words * max_width;
 
         let mut span_idx: Vec<i64> = Vec::new();
         let mut span_mask: Vec<bool> = Vec::new();
