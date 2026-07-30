@@ -105,9 +105,15 @@
 //!   num_spans linearly (N × W) — only increase if needed.
 //! - The `<<ENT>>` and `<<SEP>>` special tokens must be in the tokenizer vocabulary.
 //!   If they're missing, the model was not exported correctly.
+//! - Sequence start/end and unknown-token IDs are resolved from standard BERT
+//!   or SentencePiece aliases during loading. Never fabricate token ID zero.
 //! - span_mask tensor type is bool (not u8). ort 2.0.0-rc.11 supports bool directly.
 //!
 //! ## Last Modified
+//! v2.4.6-SpecialTokenContract -
+//!   [MEMCHAIN-NER-SPECIAL-TOKENS 2026-07-30 by Codex] Added a load-time
+//!   contract for every GLiNER special token, removed token-ID-zero fallbacks,
+//!   and moved tokenizer validation ahead of expensive ONNX model loading.
 //! v2.4.5-OnnxModelContract -
 //!   [MEMCHAIN-ONNX-MODEL-CONTRACT 2026-07-30 by Codex] Validate all six
 //!   GLiNER input tensors and the logits output during engine loading, then
@@ -163,6 +169,15 @@ const ENT_TOKEN: &str = "<<ENT>>";
 
 /// GLiNER special token: separator between labels and text.
 const SEP_TOKEN: &str = "<<SEP>>";
+
+/// Supported sequence-start aliases across BERT and SentencePiece tokenizers.
+const SEQUENCE_START_TOKEN_ALIASES: &[&str] = &["[CLS]", "<s>"];
+
+/// Supported sequence-end aliases across BERT and SentencePiece tokenizers.
+const SEQUENCE_END_TOKEN_ALIASES: &[&str] = &["[SEP]", "</s>"];
+
+/// Supported unknown-token aliases across BERT and SentencePiece tokenizers.
+const UNKNOWN_TOKEN_ALIASES: &[&str] = &["[UNK]", "<unk>"];
 
 /// Default maximum entity span width in words.
 /// Entities longer than this many words are not considered.
@@ -295,6 +310,61 @@ struct WordSpan {
     byte_end: usize,
 }
 
+/// Complete tokenizer contract required to construct a GLiNER prompt.
+///
+/// [MEMCHAIN-NER-SPECIAL-TOKENS 2026-07-30 by Codex] These IDs are resolved
+/// exactly once during engine loading. A tokenizer that cannot represent the
+/// prompt must disable NER cleanly rather than inject token ID zero and return
+/// plausible-looking but invalid entity results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlinerSpecialTokenIds {
+    sequence_start: u32,
+    sequence_end: u32,
+    unknown: u32,
+    entity_marker: u32,
+    prompt_separator: u32,
+}
+
+impl GlinerSpecialTokenIds {
+    fn resolve(tokenizer: &Tokenizer) -> Result<Self, String> {
+        Self::resolve_with(|token| tokenizer.token_to_id(token))
+    }
+
+    fn resolve_with(mut lookup: impl FnMut(&str) -> Option<u32>) -> Result<Self, String> {
+        Ok(Self {
+            sequence_start: resolve_token_alias(
+                "sequence-start",
+                SEQUENCE_START_TOKEN_ALIASES,
+                &mut lookup,
+            )?,
+            sequence_end: resolve_token_alias(
+                "sequence-end",
+                SEQUENCE_END_TOKEN_ALIASES,
+                &mut lookup,
+            )?,
+            unknown: resolve_token_alias("unknown", UNKNOWN_TOKEN_ALIASES, &mut lookup)?,
+            entity_marker: resolve_token_alias("entity marker", &[ENT_TOKEN], &mut lookup)?,
+            prompt_separator: resolve_token_alias("prompt separator", &[SEP_TOKEN], &mut lookup)?,
+        })
+    }
+}
+
+fn resolve_token_alias(
+    role: &str,
+    aliases: &[&str],
+    mut lookup: impl FnMut(&str) -> Option<u32>,
+) -> Result<u32, String> {
+    aliases
+        .iter()
+        .find_map(|token| lookup(token))
+        .ok_or_else(|| {
+            format!(
+                "GLiNER {} token not found in tokenizer vocabulary; expected one of {:?}",
+                role, aliases
+            )
+        })
+}
+
 // ============================================
 // NerEngine
 // ============================================
@@ -328,10 +398,8 @@ pub struct NerEngine {
     max_width: usize,
     /// Confidence threshold for filtering detections.
     confidence_threshold: f32,
-    /// Token ID for <<ENT>> special token (cached at load time).
-    ent_token_id: u32,
-    /// Token ID for <<SEP>> special token (cached at load time).
-    sep_token_id: u32,
+    /// Complete, load-time-validated prompt token contract.
+    special_tokens: GlinerSpecialTokenIds,
 }
 
 impl NerEngine {
@@ -404,6 +472,18 @@ impl NerEngine {
             ));
         }
 
+        // Load and validate the tokenizer before initializing ORT or loading
+        // the model's large weight file. An incompatible artifact should fail
+        // quickly and leave other independently configured engines retryable.
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            format!(
+                "GLiNER tokenizer load ({}): {}",
+                tokenizer_path.display(),
+                e
+            )
+        })?;
+        let special_tokens = GlinerSpecialTokenIds::resolve(&tokenizer)?;
+
         init_ort_runtime(model_dir)?;
 
         // Load ONNX model — same settings as EmbedEngine
@@ -435,25 +515,15 @@ impl NerEngine {
             &[3, 4],
         )?;
 
-        // Load tokenizer
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
-            format!(
-                "GLiNER tokenizer load ({}): {}",
-                tokenizer_path.display(),
-                e
-            )
-        })?;
-
-        // Resolve special token IDs — these MUST exist in the tokenizer
-        let ent_token_id = Self::resolve_token_id(&tokenizer, ENT_TOKEN)?;
-        let sep_token_id = Self::resolve_token_id(&tokenizer, SEP_TOKEN)?;
-
         info!(
             tokenizer = %tokenizer_path.display(),
             max_width = max_width,
             threshold = confidence_threshold,
-            ent_token_id = ent_token_id,
-            sep_token_id = sep_token_id,
+            sequence_start_id = special_tokens.sequence_start,
+            sequence_end_id = special_tokens.sequence_end,
+            unknown_id = special_tokens.unknown,
+            entity_marker_id = special_tokens.entity_marker,
+            prompt_separator_id = special_tokens.prompt_separator,
             "[NER] GLiNER tokenizer loaded"
         );
 
@@ -463,8 +533,7 @@ impl NerEngine {
             tokenizer,
             max_width,
             confidence_threshold,
-            ent_token_id,
-            sep_token_id,
+            special_tokens,
         })
     }
 
@@ -710,24 +779,14 @@ impl NerEngine {
         let mut all_token_ids: Vec<u32> = Vec::new();
         let mut all_words_mask: Vec<i64> = Vec::new();
 
-        // [CLS] token
-        let cls_id = self
-            .get_special_token_id("[CLS]")
-            .or_else(|| self.get_special_token_id("<s>"))
-            .unwrap_or(0);
-        let sep_end_id = self
-            .get_special_token_id("[SEP]")
-            .or_else(|| self.get_special_token_id("</s>"))
-            .unwrap_or(0);
-
         // Add [CLS]
-        all_token_ids.push(cls_id);
+        all_token_ids.push(self.special_tokens.sequence_start);
         all_words_mask.push(0); // not a text word
 
         // Add entity labels: <<ENT>> label1 <<ENT>> label2 ...
         for label in labels {
             // <<ENT>> token
-            all_token_ids.push(self.ent_token_id);
+            all_token_ids.push(self.special_tokens.entity_marker);
             all_words_mask.push(0);
 
             // Tokenize label text (may produce multiple subwords)
@@ -743,7 +802,7 @@ impl NerEngine {
         }
 
         // <<SEP>> between labels and text
-        all_token_ids.push(self.sep_token_id);
+        all_token_ids.push(self.special_tokens.prompt_separator);
         all_words_mask.push(0);
 
         let num_prompt_tokens = all_token_ids.len();
@@ -758,9 +817,8 @@ impl NerEngine {
 
             let ids = word_encoding.get_ids();
             if ids.is_empty() {
-                // Unknown word — add UNK token
-                let unk_id = self.tokenizer.token_to_id("[UNK]").unwrap_or(0);
-                all_token_ids.push(unk_id);
+                // Unknown word — use the load-time-validated UNK token.
+                all_token_ids.push(self.special_tokens.unknown);
                 all_words_mask.push((word_idx + 1) as i64);
             } else {
                 for &id in ids {
@@ -771,7 +829,7 @@ impl NerEngine {
         }
 
         // Add final [SEP]
-        all_token_ids.push(sep_end_id);
+        all_token_ids.push(self.special_tokens.sequence_end);
         all_words_mask.push(0);
 
         let seq_len = all_token_ids.len();
@@ -866,22 +924,6 @@ impl NerEngine {
     // ========================================
     // Private: Token ID helpers
     // ========================================
-
-    /// Resolve a special token string to its token ID.
-    fn resolve_token_id(tokenizer: &Tokenizer, token: &str) -> Result<u32, String> {
-        tokenizer.token_to_id(token).ok_or_else(|| {
-            format!(
-                "GLiNER special token '{}' not found in tokenizer vocabulary. \
-                 Ensure the tokenizer matches the GLiNER model.",
-                token
-            )
-        })
-    }
-
-    /// Try to get a special token ID, returning None if not found.
-    fn get_special_token_id(&self, token: &str) -> Option<u32> {
-        self.tokenizer.token_to_id(token)
-    }
 }
 
 impl std::fmt::Debug for NerEngine {
@@ -889,8 +931,7 @@ impl std::fmt::Debug for NerEngine {
         f.debug_struct("NerEngine")
             .field("max_width", &self.max_width)
             .field("confidence_threshold", &self.confidence_threshold)
-            .field("ent_token_id", &self.ent_token_id)
-            .field("sep_token_id", &self.sep_token_id)
+            .field("special_tokens", &self.special_tokens)
             .finish()
     }
 }
@@ -963,6 +1004,66 @@ mod tests {
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
         assert!(sigmoid(10.0) > 0.999);
         assert!(sigmoid(-10.0) < 0.001);
+    }
+
+    #[test]
+    fn special_token_contract_accepts_bert_and_prefers_primary_aliases() {
+        let tokens = GlinerSpecialTokenIds::resolve_with(|token| match token {
+            "[CLS]" => Some(1),
+            "<s>" => Some(101),
+            "[SEP]" => Some(2),
+            "</s>" => Some(102),
+            "[UNK]" => Some(3),
+            "<unk>" => Some(103),
+            "<<ENT>>" => Some(4),
+            "<<SEP>>" => Some(5),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            tokens,
+            GlinerSpecialTokenIds {
+                sequence_start: 1,
+                sequence_end: 2,
+                unknown: 3,
+                entity_marker: 4,
+                prompt_separator: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn special_token_contract_accepts_sentencepiece_aliases() {
+        let tokens = GlinerSpecialTokenIds::resolve_with(|token| match token {
+            "<s>" => Some(11),
+            "</s>" => Some(12),
+            "<unk>" => Some(13),
+            "<<ENT>>" => Some(14),
+            "<<SEP>>" => Some(15),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(tokens.sequence_start, 11);
+        assert_eq!(tokens.sequence_end, 12);
+        assert_eq!(tokens.unknown, 13);
+    }
+
+    #[test]
+    fn special_token_contract_rejects_missing_required_role() {
+        let error = GlinerSpecialTokenIds::resolve_with(|token| match token {
+            "[CLS]" => Some(1),
+            "[SEP]" => Some(2),
+            "<<ENT>>" => Some(4),
+            "<<SEP>>" => Some(5),
+            _ => None,
+        })
+        .unwrap_err();
+
+        assert!(error.contains("unknown token not found"));
+        assert!(error.contains("[UNK]"));
+        assert!(error.contains("<unk>"));
     }
 
     #[test]
