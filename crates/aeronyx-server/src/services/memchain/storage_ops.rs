@@ -269,6 +269,7 @@ fn record_commitment_follower_readiness(
     sync_state: &str,
     certificate_policy_state: &str,
     certificate_policy_ready: bool,
+    convergence_observation_is_stale: bool,
 ) -> RecordCommitmentFollowerReadiness {
     if role != "follower" || !enabled {
         return RecordCommitmentFollowerReadiness::NotApplicable;
@@ -281,6 +282,9 @@ fn record_commitment_follower_readiness(
     }
     if certificate_policy_state == "configuration_error" {
         return RecordCommitmentFollowerReadiness::ConfigurationError;
+    }
+    if sync_state == "current" && convergence_observation_is_stale {
+        return RecordCommitmentFollowerReadiness::Stale;
     }
 
     match sync_state {
@@ -4133,6 +4137,25 @@ impl MemoryStorage {
         }
     }
 
+    /// Configures how long one signed equal-tip follower observation may be
+    /// treated as current.
+    ///
+    /// [FOLLOWER-READINESS-FRESHNESS 2026-07-30 by Codex] Three missed
+    /// operator-configured poll windows are tolerated. This process-local
+    /// deadline cannot affect chain choice, certificate policy, or storage.
+    pub fn configure_record_commitment_sync_readiness_freshness(
+        &self,
+        poll_interval_secs: u64,
+    ) {
+        const MISSED_POLL_WINDOWS_BEFORE_STALE: u64 = 3;
+
+        let mut runtime = self.commitment_sync.write();
+        if runtime.enabled && runtime.role == "follower" {
+            runtime.follower_readiness_max_age_secs =
+                Some(poll_interval_secs.saturating_mul(MISSED_POLL_WINDOWS_BEFORE_STALE));
+        }
+    }
+
     /// Configures identity-blind follower certificate-policy readiness.
     ///
     /// [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] Only aggregate
@@ -4967,8 +4990,15 @@ impl MemoryStorage {
             return;
         }
         let recovered = runtime.consecutive_failures > 0;
+        let confirmed_at = runtime
+            .follower_convergence_confirmed_at
+            .map_or(now, |previous| previous.max(now));
         runtime.state = "current";
         runtime.last_success_at = Some(now);
+        runtime.follower_convergence_confirmed_at = Some(confirmed_at);
+        runtime.follower_readiness_stale_after = runtime
+            .follower_readiness_max_age_secs
+            .map(|max_age_secs| confirmed_at.saturating_add(max_age_secs));
         runtime.remote_tip_height = Some(remote_tip_height);
         runtime.consecutive_failures = 0;
         runtime.last_error_code = None;
@@ -4997,6 +5027,8 @@ impl MemoryStorage {
         }
         runtime.state = "certified_recovered";
         runtime.last_success_at = Some(now);
+        runtime.follower_convergence_confirmed_at = None;
+        runtime.follower_readiness_stale_after = None;
         runtime.remote_tip_height = Some(certified_tip_height);
         runtime.consecutive_failures = 0;
         runtime.last_error_code = None;
@@ -5319,6 +5351,11 @@ impl MemoryStorage {
 
     /// Returns a privacy-safe snapshot for local APIs and heartbeat reporting.
     pub fn record_commitment_sync_status(&self) -> RecordCommitmentSyncStatus {
+        self.record_commitment_sync_status_at(unix_now_secs())
+    }
+
+    /// Builds a snapshot at an explicit time for deterministic boundary tests.
+    fn record_commitment_sync_status_at(&self, now: u64) -> RecordCommitmentSyncStatus {
         // [FOLLOWER-CERTIFICATE-TIP-BINDING 2026-07-29 by Codex] A certificate
         // decision is valid only for the audited tip it evaluated. Derive the
         // externally visible state against the latest complete integrity
@@ -5344,12 +5381,23 @@ impl MemoryStorage {
         };
         let certificate_policy_ready =
             runtime.certificate_policy_ready && !certificate_policy_evaluation_is_stale;
+        // [FOLLOWER-READINESS-FRESHNESS 2026-07-30 by Codex] `current` is a
+        // recent signed producer observation, not an eternal process claim.
+        // The task marks `syncing` before network I/O, while this deadline also
+        // catches a follower that vanished between scheduled rounds.
+        let convergence_observation_is_stale = runtime.role == "follower"
+            && runtime.enabled
+            && runtime.state == "current"
+            && runtime
+                .follower_readiness_stale_after
+                .is_some_and(|deadline| now >= deadline);
         let follower_readiness = record_commitment_follower_readiness(
             runtime.role,
             runtime.enabled,
             runtime.state,
             certificate_policy_state,
             certificate_policy_ready,
+            convergence_observation_is_stale,
         );
         RecordCommitmentSyncStatus {
             contract_version: "record_commitment_sync.v1",
@@ -5357,6 +5405,8 @@ impl MemoryStorage {
             state: runtime.state.to_string(),
             follower_readiness_state: follower_readiness.as_str().to_string(),
             follower_fully_ready: follower_readiness.is_fully_ready(),
+            follower_convergence_confirmed_at: runtime.follower_convergence_confirmed_at,
+            follower_readiness_stale_after: runtime.follower_readiness_stale_after,
             enabled: runtime.enabled,
             last_trigger: runtime.last_trigger.to_string(),
             last_announcement_at: runtime.last_announcement_at,
@@ -5474,7 +5524,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; effective follower readiness combines block convergence with exact-tip local certificate-policy readiness and follower block-page/certificate recovery plus coordinator certificate backfill expose role-isolated, source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, monotonic latest-observation timestamps, and sticky security-stop timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, security reason, raw error, record commitment, owner, payload, route, or client metadata; readiness and counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
+                "aggregate runtime only; effective follower readiness combines task liveness, bounded signed convergence freshness, and exact-tip local certificate-policy readiness while follower block-page/certificate recovery plus coordinator certificate backfill expose role-isolated, source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, monotonic latest-observation timestamps, and sticky security-stop timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, security reason, raw error, record commitment, owner, payload, route, or client metadata; readiness and counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
         }
     }
 
@@ -9419,6 +9469,7 @@ mod tests {
                 "backoff",
                 "security_stopped",
                 false,
+                true,
             ),
             RecordCommitmentFollowerReadiness::SecurityStopped
         );
@@ -9429,6 +9480,7 @@ mod tests {
                 "catching_up",
                 "configuration_error",
                 false,
+                true,
             ),
             RecordCommitmentFollowerReadiness::ConfigurationError
         );
@@ -9439,6 +9491,7 @@ mod tests {
                 "producing",
                 "security_stopped",
                 false,
+                true,
             ),
             RecordCommitmentFollowerReadiness::NotApplicable
         );
@@ -9449,9 +9502,55 @@ mod tests {
                 "stopped",
                 "security_stopped",
                 false,
+                true,
             ),
             RecordCommitmentFollowerReadiness::Stopped
         );
+        assert_eq!(
+            record_commitment_follower_readiness(
+                "follower",
+                true,
+                "current",
+                "ready",
+                true,
+                true,
+            ),
+            RecordCommitmentFollowerReadiness::Stale
+        );
+    }
+
+    #[test]
+    fn test_follower_readiness_expires_after_three_missed_poll_windows() {
+        // [FOLLOWER-READINESS-FRESHNESS 2026-07-30 by Codex] A successful
+        // signed checkpoint has a bounded operational lifetime. The legacy
+        // block state remains `current`, while the additive readiness contract
+        // fails closed exactly at the configured deadline.
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.configure_record_commitment_sync(false, true);
+        storage.configure_record_commitment_sync_readiness_freshness(30);
+        storage.record_commitment_sync_checkpoint_success(100, 7);
+
+        let fresh = storage.record_commitment_sync_status_at(189);
+        assert_eq!(fresh.state, "current");
+        assert_eq!(fresh.follower_readiness_state, "ready");
+        assert!(fresh.follower_fully_ready);
+        assert_eq!(fresh.follower_convergence_confirmed_at, Some(100));
+        assert_eq!(fresh.follower_readiness_stale_after, Some(190));
+
+        let stale = storage.record_commitment_sync_status_at(190);
+        assert_eq!(stale.state, "current");
+        assert_eq!(stale.follower_readiness_state, "stale");
+        assert!(!stale.follower_fully_ready);
+
+        storage.record_commitment_sync_attempt(191);
+        let syncing = storage.record_commitment_sync_status_at(191);
+        assert_eq!(syncing.follower_readiness_state, "synchronizing");
+
+        storage.record_commitment_sync_checkpoint_success(192, 7);
+        let refreshed = storage.record_commitment_sync_status_at(192);
+        assert_eq!(refreshed.follower_readiness_state, "ready");
+        assert_eq!(refreshed.follower_convergence_confirmed_at, Some(192));
+        assert_eq!(refreshed.follower_readiness_stale_after, Some(282));
     }
 
     #[tokio::test]

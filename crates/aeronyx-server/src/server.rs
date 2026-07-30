@@ -2202,6 +2202,28 @@ struct CriticalRuntimeFailure {
     reason: String,
 }
 
+/// Ensures a configured follower cannot retain a stale ready state after its
+/// Tokio task exits, panics, or is aborted.
+///
+/// [FOLLOWER-TASK-LIVENESS 2026-07-30 by Codex] This guard changes only
+/// process-local operational status. It never writes chain data, alters trust
+/// policy, or turns task liveness into consensus evidence.
+struct CommitmentSyncTaskLivenessGuard {
+    storage: Arc<MemoryStorage>,
+}
+
+impl CommitmentSyncTaskLivenessGuard {
+    fn new(storage: Arc<MemoryStorage>) -> Self {
+        Self { storage }
+    }
+}
+
+impl Drop for CommitmentSyncTaskLivenessGuard {
+    fn drop(&mut self) {
+        self.storage.stop_record_commitment_sync();
+    }
+}
+
 /// Result of bringing one long-lived runtime task to a terminal state.
 ///
 /// [TASK-SHUTDOWN 2026-07-29 by Codex] Keep shutdown outcomes typed so timeout
@@ -2319,6 +2341,9 @@ impl Server {
             commitment_storage.configure_record_commitment_sync(
                 self.config.memchain.commitment_coordinator_enabled,
                 self.config.memchain.commitment_sync_enabled,
+            );
+            commitment_storage.configure_record_commitment_sync_readiness_freshness(
+                self.config.memchain.commitment_sync_interval_secs,
             );
             commitment_storage.configure_record_commitment_certificate_policy(
                 self.config.memchain.commitment_witness_node_ids.len(),
@@ -4463,6 +4488,13 @@ impl Server {
                             state: status.state,
                             follower_readiness_state: status.follower_readiness_state,
                             follower_fully_ready: status.follower_fully_ready,
+                            // [FOLLOWER-READINESS-FRESHNESS 2026-07-30 by Codex]
+                            // Preserve the storage layer's already-derived,
+                            // identity-blind readiness deadline.
+                            follower_convergence_confirmed_at: status
+                                .follower_convergence_confirmed_at,
+                            follower_readiness_stale_after: status
+                                .follower_readiness_stale_after,
                             enabled: status.enabled,
                             last_trigger: status.last_trigger,
                             last_announcement_at: status.last_announcement_at,
@@ -6823,6 +6855,11 @@ impl Server {
         Some(tokio::spawn(async move {
             const MAX_BACKOFF_SECS: u64 = 600;
 
+            // [FOLLOWER-TASK-LIVENESS 2026-07-30 by Codex] Construct before
+            // any await so panic, cancellation, or an unexpected loop exit
+            // cannot leave the last successful readiness snapshot active.
+            let liveness_guard =
+                CommitmentSyncTaskLivenessGuard::new(Arc::clone(&storage));
             let mut consecutive_failures = 0u32;
             let mut consecutive_certificate_deferrals = 0u32;
             let mut next_delay = Duration::from_secs(0);
@@ -7174,7 +7211,7 @@ impl Server {
                     }
                 }
             }
-            storage.stop_record_commitment_sync();
+            drop(liveness_guard);
             info!("[MEMCHAIN_BLOCK] Pinned coordinator follower stopped");
         }))
     }
@@ -11204,6 +11241,7 @@ mod tests {
         commitment_follower_success_retry_delay, commitment_witness_startup_decision,
         memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs, CriticalRuntimeFailure,
         CommitmentCoordinatorLeaseRound, CommitmentFollowerRoundOutcome,
+        CommitmentSyncTaskLivenessGuard,
         CommitmentTipAnnouncementWaitOutcome, CommitmentWitnessStartupBlockReason,
         CommitmentWitnessStartupDecision, DirectoryChainStore,
         DirectoryProofGossipOutcome, DirectoryProofGossipPeerState, DirectoryProofGossipResult,
@@ -11277,6 +11315,28 @@ mod tests {
         assert!(!notifier.status("initializing").unwrap());
         assert!(!notifier.ready("ready").unwrap());
         assert!(!notifier.stopping("stopping").unwrap());
+    }
+
+    #[test]
+    fn commitment_sync_liveness_guard_marks_unexpected_task_exit_stopped() {
+        // [FOLLOWER-TASK-LIVENESS 2026-07-30 by Codex] Drop is the common
+        // cleanup path for normal return, panic unwinding, and Tokio abort.
+        // The guard must revoke readiness without changing the legacy role.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        storage.configure_record_commitment_sync(false, true);
+        storage.record_commitment_sync_checkpoint_success(100, 4);
+        assert_eq!(storage.record_commitment_sync_status().state, "current");
+
+        {
+            let _liveness_guard =
+                CommitmentSyncTaskLivenessGuard::new(Arc::clone(&storage));
+        }
+
+        let stopped = storage.record_commitment_sync_status();
+        assert_eq!(stopped.role, "follower");
+        assert_eq!(stopped.state, "stopped");
+        assert_eq!(stopped.follower_readiness_state, "stopped");
+        assert!(!stopped.follower_fully_ready);
     }
 
     #[cfg(target_os = "linux")]

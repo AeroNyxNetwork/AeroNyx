@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.73.0 - Added fail-closed composite follower readiness.
+Modification Reason: v0.74.0 - Bounded follower readiness by task lifetime and signed convergence freshness.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.73.0 - [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] Prevents block convergence from being reported as complete follower readiness while required proof is unavailable.
+Last Modified: v0.74.0 - [FOLLOWER-READINESS-LIVENESS 2026-07-30 by Codex] Revokes follower readiness on task exit and after three missed signed convergence checks.
+Previous: v0.73.0 - [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] Prevents block convergence from being reported as complete follower readiness while required proof is unavailable.
 Previous: v0.72.0 - [FOLLOWER-CERTIFICATE-RETRY 2026-07-30 by Codex] Retries deferred follower certificate persistence promptly without creating a polling loop.
 Previous: v0.71.0 - [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] Reports authenticated-but-unpersisted follower certificates without claiming durable recovery.
 Previous: v0.70.0 - [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] Preserves source-blind security-stop times when later retrievals succeed.
@@ -105,6 +106,30 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.74 Follower readiness has a bounded lifetime
+
+[FOLLOWER-READINESS-LIVENESS 2026-07-30 by Codex]
+
+- A follower synchronization task now owns an RAII liveness guard. Normal
+  return, panic unwinding, and Tokio cancellation all revoke process-local
+  readiness by moving the legacy runtime state to `stopped`.
+- A signed equal-tip producer checkpoint remains fully ready for at most three
+  configured polling windows. At the exact deadline, the additive
+  `follower_readiness_state` becomes `stale` and
+  `follower_fully_ready` becomes false until another signed convergence round
+  succeeds.
+- `follower_convergence_confirmed_at` and
+  `follower_readiness_stale_after` expose the anonymous operational boundary to
+  local status consumers and the signed heartbeat. Existing fields and legacy
+  `state=current` remain backward compatible.
+- The follower changes state to `syncing` before any remote I/O, so an ordinary
+  slow request already fails closed. The freshness deadline covers the
+  different failure class where the task disappears between scheduled rounds.
+- The deadline derives only from validated local configuration. It contains no
+  peer identity, endpoint, witness set, hash, signature, payload, route, owner,
+  or client metadata, and it cannot affect chain choice, certificate policy,
+  consensus, finality, or authority.
 
 ### v0.73 Effective follower readiness is fail-closed
 

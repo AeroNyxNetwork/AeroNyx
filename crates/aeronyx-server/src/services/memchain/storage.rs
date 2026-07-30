@@ -558,6 +558,7 @@ pub(crate) enum RecordCommitmentFollowerReadiness {
     Synchronizing,
     Backoff,
     Stopped,
+    Stale,
     CertifiedRecovered,
     WaitingForCertificate,
     SourceUnavailable,
@@ -574,6 +575,7 @@ impl RecordCommitmentFollowerReadiness {
             Self::Synchronizing => "synchronizing",
             Self::Backoff => "backoff",
             Self::Stopped => "stopped",
+            Self::Stale => "stale",
             Self::CertifiedRecovered => "certified_recovered",
             Self::WaitingForCertificate => "waiting_for_certificate",
             Self::SourceUnavailable => "source_unavailable",
@@ -602,6 +604,10 @@ pub struct RecordCommitmentSyncStatus {
     pub follower_readiness_state: String,
     /// Whether a follower is producer-current and satisfies local policy.
     pub follower_fully_ready: bool,
+    /// Most recent signed equal-tip producer convergence confirmation.
+    pub follower_convergence_confirmed_at: Option<u64>,
+    /// Time after which the current convergence observation is no longer ready.
+    pub follower_readiness_stale_after: Option<u64>,
     /// Whether active follower polling is configured.
     pub enabled: bool,
     /// Trigger used by the most recent pull attempt: `scheduled` or
@@ -1000,6 +1006,13 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) coordinator_certificate_backfill_carrier_half_open_attempts_total: u64,
     pub(crate) last_attempt_at: Option<u64>,
     pub(crate) last_success_at: Option<u64>,
+    /// Configured maximum age of one producer convergence observation.
+    ///
+    /// [FOLLOWER-READINESS-FRESHNESS 2026-07-30 by Codex] This is derived
+    /// solely from the operator's polling interval and never from peer input.
+    pub(crate) follower_readiness_max_age_secs: Option<u64>,
+    pub(crate) follower_convergence_confirmed_at: Option<u64>,
+    pub(crate) follower_readiness_stale_after: Option<u64>,
     pub(crate) last_failure_at: Option<u64>,
     pub(crate) last_recovered_at: Option<u64>,
     pub(crate) next_poll_at: Option<u64>,
@@ -1088,6 +1101,9 @@ impl Default for RecordCommitmentSyncRuntime {
             coordinator_certificate_backfill_carrier_half_open_attempts_total: 0,
             last_attempt_at: None,
             last_success_at: None,
+            follower_readiness_max_age_secs: None,
+            follower_convergence_confirmed_at: None,
+            follower_readiness_stale_after: None,
             last_failure_at: None,
             last_recovered_at: None,
             next_poll_at: None,

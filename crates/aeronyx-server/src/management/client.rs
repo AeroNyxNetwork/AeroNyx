@@ -234,6 +234,12 @@ pub struct RecordCommitmentSyncHeartbeatStatus {
     pub follower_readiness_state: String,
     /// Whether a follower is producer-current and satisfies local policy.
     pub follower_fully_ready: bool,
+    /// [FOLLOWER-READINESS-FRESHNESS 2026-07-30 by Codex] These two timestamps
+    /// are local scheduling evidence and contain no peer or protocol material.
+    /// Most recent signed equal-tip producer convergence confirmation.
+    pub follower_convergence_confirmed_at: Option<u64>,
+    /// Time after which that convergence observation is no longer ready.
+    pub follower_readiness_stale_after: Option<u64>,
     /// Whether active follower polling is configured.
     pub enabled: bool,
     /// Trigger used by the latest pull attempt: `scheduled` or `block_announce`.
@@ -1022,6 +1028,8 @@ mod tests {
                 state: "backoff".to_string(),
                 follower_readiness_state: "backoff".to_string(),
                 follower_fully_ready: false,
+                follower_convergence_confirmed_at: Some(100),
+                follower_readiness_stale_after: Some(190),
                 enabled: true,
                 last_trigger: "block_announce".to_string(),
                 last_announcement_at: Some(98),
@@ -1192,6 +1200,8 @@ mod tests {
         assert_eq!(sync["state"], "backoff");
         assert_eq!(sync["follower_readiness_state"], "backoff");
         assert_eq!(sync["follower_fully_ready"], false);
+        assert_eq!(sync["follower_convergence_confirmed_at"], 100);
+        assert_eq!(sync["follower_readiness_stale_after"], 190);
         assert_eq!(sync["enabled"], true);
         assert_eq!(sync["last_trigger"], "block_announce");
         assert_eq!(sync["last_announcement_at"], 98);
