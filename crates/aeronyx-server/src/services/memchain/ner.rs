@@ -108,6 +108,10 @@
 //! - span_mask tensor type is bool (not u8). ort 2.0.0-rc.11 supports bool directly.
 //!
 //! ## Last Modified
+//! v2.4.4-OnnxOutputBoundary -
+//!   [MEMCHAIN-ONNX-OUTPUT-BOUNDARY 2026-07-30 by Codex] Replaced panicking
+//!   positional output indexing with the shared bounds-checked inference
+//!   boundary.
 //! v2.4.3-NerOutputValidation -
 //!   [MEMCHAIN-NER-OUTPUT 2026-07-30 by Codex] Added strict 3D/4D output
 //!   contracts, rejected non-finite logits, and made span-grid sizing bounded
@@ -133,7 +137,7 @@ use ort::value::Tensor;
 use tokenizers::Tokenizer;
 use tracing::{debug, info};
 
-use super::embed::{init_ort_runtime, InferenceSession};
+use super::embed::{init_ort_runtime, require_onnx_output, InferenceSession};
 
 // ============================================
 // Constants
@@ -535,7 +539,8 @@ impl NerEngine {
             .map_err(|e| format!("GLiNER ONNX inference: {}", e))?;
 
         // Output: logits [batch_size, num_spans, num_labels]
-        let logits = outputs[0]
+        let logits_output = require_onnx_output("GLiNER", outputs.values(), 0)?;
+        let logits = logits_output
             .try_extract_array::<f32>()
             .map_err(|e| format!("GLiNER output extraction: {}", e))?;
 

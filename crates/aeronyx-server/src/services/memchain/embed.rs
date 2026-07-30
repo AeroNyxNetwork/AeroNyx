@@ -145,6 +145,10 @@
 //!   from HTTP handlers.
 //!
 //! ## Last Modified
+//! v2.7.19-OnnxOutputBoundary -
+//!   [MEMCHAIN-ONNX-OUTPUT-BOUNDARY 2026-07-30 by Codex] Centralized
+//!   bounds-checked ONNX output retrieval so missing or incompatible model
+//!   outputs return an inference error instead of panicking the request task.
 //! v2.7.18-EmbeddingOutputValidation -
 //!   [MEMCHAIN-EMBED-OUTPUT 2026-07-30 by Codex] Added strict MiniLM and
 //!   EmbeddingGemma output-shape contracts, rejected non-finite tensors and
@@ -211,6 +215,27 @@ impl<T> InferenceSession<T> {
     pub(super) fn lock(&self) -> MutexGuard<'_, T> {
         self.inner.lock()
     }
+}
+
+/// Retrieve one ONNX output without using `SessionOutputs`' panicking index API.
+///
+/// [MEMCHAIN-ONNX-OUTPUT-BOUNDARY 2026-07-30 by Codex] ort rc.11 exposes
+/// bounds-checked lookup only for named outputs; numeric indexing panics when
+/// an export returns fewer values than the engine expects. Keeping this helper
+/// iterator-based works for both fixed output zero and load-time-resolved model
+/// output indices while preserving the underlying value's borrow lifetime.
+pub(super) fn require_onnx_output<T>(
+    engine: &str,
+    mut outputs: impl ExactSizeIterator<Item = T>,
+    index: usize,
+) -> Result<T, String> {
+    let output_count = outputs.len();
+    outputs.nth(index).ok_or_else(|| {
+        format!(
+            "{} ONNX returned {} outputs; required output index {}",
+            engine, output_count, index
+        )
+    })
 }
 
 /// Default max sequence length for MiniLM.
@@ -889,7 +914,8 @@ impl EmbedEngine {
             .map_err(|e| format!("ONNX inference: {}", e))?;
 
         // Output[0] = last_hidden_state: [batch_size, seq_len, hidden_dim]
-        let hidden = outputs[0]
+        let hidden_output = require_onnx_output("MiniLM", outputs.values(), 0)?;
+        let hidden = hidden_output
             .try_extract_array::<f32>()
             .map_err(|e| format!("Output extraction: {}", e))?;
 
@@ -1028,7 +1054,8 @@ impl EmbedEngine {
             "EmbeddingGemma ONNX missing 'sentence_embedding' output index".to_string()
         })?;
 
-        let embeddings = outputs[se_idx]
+        let embeddings_output = require_onnx_output("EmbeddingGemma", outputs.values(), se_idx)?;
+        let embeddings = embeddings_output
             .try_extract_array::<f32>()
             .map_err(|e| format!("sentence_embedding extraction: {}", e))?;
 
@@ -1165,6 +1192,26 @@ mod tests {
 
         *session.lock() += 1;
         assert_eq!(*session.lock(), 2);
+    }
+
+    #[test]
+    fn onnx_output_boundary_returns_requested_value() {
+        let output = require_onnx_output("test-engine", [11_u8, 22_u8].into_iter(), 1).unwrap();
+
+        assert_eq!(output, 22);
+    }
+
+    #[test]
+    fn onnx_output_boundary_rejects_missing_value() {
+        let empty_error =
+            require_onnx_output("test-engine", std::iter::empty::<u8>(), 0).unwrap_err();
+        assert!(empty_error.contains("test-engine"));
+        assert!(empty_error.contains("returned 0 outputs"));
+        assert!(empty_error.contains("index 0"));
+
+        let short_error = require_onnx_output("test-engine", [11_u8].into_iter(), 1).unwrap_err();
+        assert!(short_error.contains("returned 1 outputs"));
+        assert!(short_error.contains("index 1"));
     }
 
     #[test]

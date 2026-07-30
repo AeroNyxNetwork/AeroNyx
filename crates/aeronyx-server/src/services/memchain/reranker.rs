@@ -78,6 +78,10 @@
 //!   the reranker is too aggressive (degrading good BM25/graph results), lower to 0.5.
 //!
 //! ## Last Modified
+//! v2.4.4-OnnxOutputBoundary -
+//!   [MEMCHAIN-ONNX-OUTPUT-BOUNDARY 2026-07-30 by Codex] Replaced panicking
+//!   positional output indexing with the shared bounds-checked inference
+//!   boundary.
 //! v2.4.3-RerankerOutputValidation -
 //!   [MEMCHAIN-RERANKER-OUTPUT 2026-07-30 by Codex] Added strict ONNX output
 //!   shape/cardinality validation, rejected non-finite logits, and moved score
@@ -104,7 +108,7 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info, warn};
 
 // Re-use the ORT initialization and session boundary from embed.rs.
-use super::embed::{init_ort_runtime, InferenceSession};
+use super::embed::{init_ort_runtime, require_onnx_output, InferenceSession};
 
 // ============================================
 // Constants
@@ -407,7 +411,8 @@ impl RerankerEngine {
             .map_err(|e| format!("Reranker ONNX inference: {}", e))?;
 
         // Output: logits shaped [batch_size, 1] or [batch_size]
-        let logits = outputs[0]
+        let logits_output = require_onnx_output("Reranker", outputs.values(), 0)?;
+        let logits = logits_output
             .try_extract_array::<f32>()
             .map_err(|e| format!("Reranker output extraction: {}", e))?;
 
