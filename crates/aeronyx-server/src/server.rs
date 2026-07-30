@@ -386,6 +386,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.58-FollowerCertificateRetry - Replaced the follower round tuple with a
+//     typed outcome and added bounded retry scheduling for deferred certificates.
 //   v2.8.57-CertificatePersistenceTruth - Kept verified-but-unpersisted follower
 //     evidence separate from durable coordinator/carrier recovery.
 //   v2.8.56-StickySecurityEvidence - Preserved role-isolated security-stop times
@@ -1859,6 +1861,49 @@ fn commitment_coordinator_lease_degraded_retry_delay(
         COORDINATOR_LEASE_DEGRADED_RETRY_SECS.min(normal_interval_secs),
         |remaining| (remaining / 2).max(1).min(normal_interval_secs),
     )
+}
+
+/// Typed result of one bounded follower block/certificate synchronization round.
+///
+/// [FOLLOWER-CERTIFICATE-RETRY 2026-07-30 by Codex] Block backlog, certified
+/// carrier recovery, and a verified-but-unpersisted certificate have different
+/// scheduling and trust meanings. Keeping them as named fields prevents tuple
+/// position mistakes and avoids treating deferred durability as either a block
+/// transport failure or a completed certificate recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitmentFollowerRoundOutcome {
+    inserted: usize,
+    remote_tip_height: u64,
+    block_backlog_remaining: bool,
+    certificate_retry_pending: bool,
+    certified_recovered: bool,
+}
+
+/// Selects the next successful follower-round delay without creating a hot loop.
+///
+/// Block backlog remains the highest-priority one-second continuation. A
+/// certificate that verified but lost a local persistence race retries with
+/// bounded exponential delay until it reaches the configured normal interval.
+/// This state is process-local and cannot affect chain choice or peer authority.
+fn commitment_follower_success_retry_delay(
+    base_interval_secs: u64,
+    outcome: &CommitmentFollowerRoundOutcome,
+    consecutive_certificate_deferrals: u32,
+) -> u64 {
+    const MAX_CERTIFICATE_RETRY_SHIFT: u32 = 12;
+
+    let base_interval_secs = base_interval_secs.max(1);
+    if outcome.block_backlog_remaining {
+        return 1;
+    }
+    if !outcome.certificate_retry_pending {
+        return base_interval_secs;
+    }
+    let shift = consecutive_certificate_deferrals
+        .max(1)
+        .saturating_sub(1)
+        .min(MAX_CERTIFICATE_RETRY_SHIFT);
+    (1u64 << shift).min(base_interval_secs)
 }
 
 /// Result of waiting for one outbound tip announcement while continuing to
@@ -6775,6 +6820,7 @@ impl Server {
             const MAX_BACKOFF_SECS: u64 = 600;
 
             let mut consecutive_failures = 0u32;
+            let mut consecutive_certificate_deferrals = 0u32;
             let mut next_delay = Duration::from_secs(0);
             let mut announcement_channel_open = true;
             // [BLOCK-CARRIER-CIRCUIT-BREAKER 2026-07-29 by Codex] This
@@ -6929,12 +6975,13 @@ impl Server {
                                     unix_now_secs(),
                                     outcome.remote_tip_height,
                                 );
-                                return Ok((
+                                return Ok(CommitmentFollowerRoundOutcome {
                                     inserted,
-                                    outcome.remote_tip_height,
-                                    false,
-                                    true,
-                                ));
+                                    remote_tip_height: outcome.remote_tip_height,
+                                    block_backlog_remaining: false,
+                                    certificate_retry_pending: false,
+                                    certified_recovered: true,
+                                });
                             }
                             let checkpoint = match pull_record_commitment_checkpoint(
                                 &storage,
@@ -6964,6 +7011,7 @@ impl Server {
                                         checked_at,
                                         checkpoint.remote_tip_height,
                                     );
+                                    let mut certificate_retry_pending = false;
                                     // [FOLLOWER-CERTIFICATE-CARRIER 2026-07-29 by Codex]
                                     // Certificate availability is additive.
                                     // The coordinator is tried first; only a
@@ -7001,6 +7049,7 @@ impl Server {
                                                 outcome,
                                             ),
                                         ) => {
+                                            certificate_retry_pending = true;
                                             warn!(
                                                 checkpoint_height = outcome.checkpoint_height,
                                                 signer_count = outcome.signer_count,
@@ -7019,12 +7068,13 @@ impl Server {
                                             );
                                         }
                                     }
-                                    return Ok((
+                                    return Ok(CommitmentFollowerRoundOutcome {
                                         inserted,
-                                        checkpoint.remote_tip_height,
-                                        false,
-                                        false,
-                                    ));
+                                        remote_tip_height: checkpoint.remote_tip_height,
+                                        block_backlog_remaining: false,
+                                        certificate_retry_pending,
+                                        certified_recovered: false,
+                                    });
                                 }
                                 CommitmentCheckpointRelation::RemoteAhead => {
                                     remote_tip_height = checkpoint.remote_tip_height;
@@ -7039,44 +7089,57 @@ impl Server {
                             }
                         }
                     }
-                    Ok((inserted, remote_tip_height, true, false))
-                };
-                let round: std::result::Result<(usize, u64, bool, bool), String> = tokio::select! {
-                    _ = shutdown_rx.recv() => break 'sync_loop,
-                    result = round_future => result,
-                };
-
-                match round {
-                    Ok((
+                    Ok(CommitmentFollowerRoundOutcome {
                         inserted,
                         remote_tip_height,
-                        backlog_remaining,
-                        certified_recovered,
-                    )) => {
+                        block_backlog_remaining: true,
+                        certificate_retry_pending: false,
+                        certified_recovered: false,
+                    })
+                };
+                let round: std::result::Result<CommitmentFollowerRoundOutcome, String> =
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => break 'sync_loop,
+                        result = round_future => result,
+                    };
+
+                match round {
+                    Ok(outcome) => {
                         consecutive_failures = 0;
-                        if inserted > 0 {
+                        if outcome.certificate_retry_pending {
+                            consecutive_certificate_deferrals =
+                                consecutive_certificate_deferrals.saturating_add(1);
+                        } else {
+                            consecutive_certificate_deferrals = 0;
+                        }
+                        if outcome.inserted > 0 {
                             info!(
-                                blocks = inserted,
-                                tip_height = remote_tip_height,
-                                backlog_remaining,
-                                certified_recovered,
+                                blocks = outcome.inserted,
+                                tip_height = outcome.remote_tip_height,
+                                block_backlog_remaining = outcome.block_backlog_remaining,
+                                certificate_retry_pending = outcome.certificate_retry_pending,
+                                certified_recovered = outcome.certified_recovered,
                                 "[MEMCHAIN_BLOCK] Follower catch-up advanced"
                             );
                         } else {
                             debug!(
-                                tip_height = remote_tip_height,
+                                tip_height = outcome.remote_tip_height,
                                 trigger,
-                                certified_recovered,
+                                certificate_retry_pending = outcome.certificate_retry_pending,
+                                certified_recovered = outcome.certified_recovered,
                                 "[MEMCHAIN_BLOCK] Follower completed verified sync round"
                             );
                         }
                         // Keep each round bounded but drain a verified backlog
-                        // promptly without turning the normal loop into polling.
-                        next_delay = Duration::from_secs(if backlog_remaining {
-                            1
-                        } else {
-                            base_interval_secs
-                        });
+                        // promptly. Deferred certificate durability uses an
+                        // independent bounded retry schedule and never changes
+                        // the block transport failure streak.
+                        let retry_secs = commitment_follower_success_retry_delay(
+                            base_interval_secs,
+                            &outcome,
+                            consecutive_certificate_deferrals,
+                        );
+                        next_delay = Duration::from_secs(retry_secs);
                         storage.schedule_next_commitment_sync_poll(
                             unix_now_secs().saturating_add(next_delay.as_secs()),
                         );
@@ -11133,11 +11196,12 @@ mod tests {
     use super::{
         await_commitment_tip_announcement_or_newer,
         commitment_coordinator_lease_degraded_retry_delay,
-        commitment_coordinator_lease_production_valid_for, commitment_witness_startup_decision,
-        memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs,
-        CommitmentCoordinatorLeaseRound, CommitmentTipAnnouncementWaitOutcome,
-        CommitmentWitnessStartupBlockReason, CommitmentWitnessStartupDecision, DirectoryChainStore,
-        CriticalRuntimeFailure,
+        commitment_coordinator_lease_production_valid_for,
+        commitment_follower_success_retry_delay, commitment_witness_startup_decision,
+        memchain_index_rejection_reason, prefix_to_netmask, unix_now_secs, CriticalRuntimeFailure,
+        CommitmentCoordinatorLeaseRound, CommitmentFollowerRoundOutcome,
+        CommitmentTipAnnouncementWaitOutcome, CommitmentWitnessStartupBlockReason,
+        CommitmentWitnessStartupDecision, DirectoryChainStore,
         DirectoryProofGossipOutcome, DirectoryProofGossipPeerState, DirectoryProofGossipResult,
         DiscoveryGossipExecution, DiscoveryGossipFailure, DiscoveryGossipFailureKind,
         DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
@@ -11488,6 +11552,59 @@ mod tests {
         );
         assert_eq!(DIRECTORY_OPERATOR_HTTP_PROFILE.request_timeout_secs, 12);
         assert_eq!(MEMCHAIN_SYNC_HTTP_PROFILE.request_timeout_secs, 15);
+    }
+
+    #[test]
+    fn follower_certificate_deferral_retry_is_bounded_and_domain_isolated() {
+        // [FOLLOWER-CERTIFICATE-RETRY 2026-07-30 by Codex] A deferred
+        // certificate retries promptly, but repeated local churn converges to
+        // the normal interval. Block backlog retains independent priority.
+        let stable = CommitmentFollowerRoundOutcome {
+            inserted: 0,
+            remote_tip_height: 8,
+            block_backlog_remaining: false,
+            certificate_retry_pending: false,
+            certified_recovered: false,
+        };
+        assert_eq!(commitment_follower_success_retry_delay(30, &stable, 99), 30);
+
+        let deferred = CommitmentFollowerRoundOutcome {
+            certificate_retry_pending: true,
+            ..stable
+        };
+        assert_eq!(
+            commitment_follower_success_retry_delay(30, &deferred, 0),
+            1
+        );
+        assert_eq!(
+            commitment_follower_success_retry_delay(30, &deferred, 1),
+            1
+        );
+        assert_eq!(
+            commitment_follower_success_retry_delay(30, &deferred, 2),
+            2
+        );
+        assert_eq!(
+            commitment_follower_success_retry_delay(30, &deferred, 3),
+            4
+        );
+        assert_eq!(
+            commitment_follower_success_retry_delay(30, &deferred, 32),
+            30
+        );
+
+        let backlog = CommitmentFollowerRoundOutcome {
+            block_backlog_remaining: true,
+            ..deferred
+        };
+        assert_eq!(
+            commitment_follower_success_retry_delay(30, &backlog, 32),
+            1
+        );
+        assert_eq!(
+            commitment_follower_success_retry_delay(5, &deferred, u32::MAX),
+            5
+        );
     }
 
     #[tokio::test]

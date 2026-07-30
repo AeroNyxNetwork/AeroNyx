@@ -4,7 +4,7 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.71.0 - Separated verified certificate transport from durable follower recovery.
+Modification Reason: v0.72.0 - Added bounded follower retry after verified certificate persistence deferral.
 
 Main Functionality:
 
@@ -29,7 +29,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.71.0 - [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] Reports authenticated-but-unpersisted follower certificates without claiming durable recovery.
+Last Modified: v0.72.0 - [FOLLOWER-CERTIFICATE-RETRY 2026-07-30 by Codex] Retries deferred follower certificate persistence promptly without creating a polling loop.
+Previous: v0.71.0 - [CERTIFICATE-PERSISTENCE-TRUTH 2026-07-29 by Codex] Reports authenticated-but-unpersisted follower certificates without claiming durable recovery.
 Previous: v0.70.0 - [STICKY-SECURITY-EVIDENCE 2026-07-29 by Codex] Preserves source-blind security-stop times when later retrievals succeed.
 Previous: v0.69.0 - [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Reports coordinator certificate backfill without exposing carrier identity or mixing follower state.
 Previous: v0.68.0 - [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Prevents later certificate carriers from masking security failures and cools repeated coordinator-backfill outages.
@@ -103,6 +104,30 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.72 Bounded retry for deferred follower certificate persistence
+
+[FOLLOWER-CERTIFICATE-RETRY 2026-07-30 by Codex]
+
+- The follower runtime no longer represents one synchronization round as an
+  opaque four-element tuple. A typed result now names inserted blocks, remote
+  tip height, block backlog, deferred certificate persistence, and certified
+  carrier recovery independently.
+- When an authentic certificate loses a concurrent local tip or policy
+  persistence race, the next round is scheduled promptly instead of waiting the
+  normal synchronization interval. Retry delay grows as `1, 2, 4, ...` seconds
+  and is capped by the configured normal interval.
+- A real block backlog retains the existing one-second continuation priority.
+  Certificate deferral has its own process-local streak and cannot increment or
+  reset the block transport failure backoff.
+- Any subsequent non-deferral result clears this dedicated streak; availability
+  and security failures retain their existing independent control paths.
+  Persistent local churn therefore converges back to the normal interval rather
+  than becoming a hot loop.
+- The scheduler stores no source identity, endpoint, witness set, frame, hash,
+  signature, raw error, record, payload, route, or client metadata. It changes
+  neither chain state nor authority, consensus, finality, reputation, or fork
+  choice.
 
 ### v0.71 Verified transport is not durable certificate recovery
 
