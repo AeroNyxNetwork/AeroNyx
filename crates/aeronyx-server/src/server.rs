@@ -276,6 +276,9 @@
 // 109. [PRE-READY-RUNTIME-GATE 2026-07-30 by Codex] Refuses systemd READY
 //      when a required worker already failed during startup or every required
 //      supervisor disappeared before the readiness transition.
+// 110. [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Treats configured
+//      Directory replica initialization and task liveness as required runtime
+//      state, preventing READY after mirror/synchronization silently vanished.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -2595,7 +2598,7 @@ impl Server {
             directory_replica_store.clone(),
             Arc::clone(&directory_replica_sync_runtime),
             Arc::clone(&peer_http_clients.directory_sync),
-        );
+        )?;
         let discovery_gossip_task = self.spawn_discovery_gossip_task(
             Arc::clone(&peer_store),
             directory_replica_store.clone(),
@@ -2622,7 +2625,15 @@ impl Server {
             tasks.push(("directory-chain-persistence", task));
         }
         if let Some(task) = directory_replica_sync_task {
-            tasks.push(("directory-replica-sync", task));
+            tasks.push((
+                "directory-replica-sync",
+                Self::supervise_required_runtime_task(
+                    "directory-replica-sync",
+                    task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
         }
         if let Some(task) = discovery_gossip_task {
             tasks.push(("discovery-gossip", task));
@@ -6012,19 +6023,19 @@ impl Server {
     /// Starts bounded authority pulls and optional non-authoritative mirroring.
     ///
     /// Empty pins disable checkpoints/witnesses but may still run opt-in mirror
-    /// transport. Errors are logged only as stable aggregate reason buckets.
+    /// transport. Once either mode is configured, initialization and task
+    /// liveness are required process state.
     fn spawn_directory_replica_sync_task(
         &self,
         peer_store: Arc<PeerStore>,
         store: Option<Arc<DirectoryReplicaStore>>,
         runtime: Arc<DirectoryReplicaSyncRuntime>,
         directory_http_client: Arc<reqwest::Client>,
-    ) -> Option<JoinHandle<()>> {
+    ) -> Result<Option<JoinHandle<()>>> {
         let peers = self
             .config
             .discovery
             .directory_chain_sync_peer_node_id_bytes();
-        let store = store?;
         let full_node_mirror_enabled = self
             .config
             .discovery
@@ -6037,8 +6048,17 @@ impl Server {
             info!(
                 "[DIRECTORY_REPLICA] Outbound sync disabled; no peers are pinned and mirror mode is off"
             );
-            return None;
+            return Ok(None);
         }
+        // [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Validation
+        // normally binds an enabled synchronization mode to a durable store,
+        // but keep the runtime boundary fail-closed for embedders and future
+        // configuration paths that construct `ServerConfig` programmatically.
+        let store = store.ok_or_else(|| {
+            ServerError::startup_failed(
+                "Directory replica synchronization requires an initialized replica store",
+            )
+        })?;
         let interval_secs = self
             .config
             .discovery
@@ -6047,7 +6067,7 @@ impl Server {
             .config
             .discovery
             .directory_observation_witness_min_verified;
-        let coordinator = match DirectoryReplicaSyncCoordinator::new_with_policy_and_resources(
+        let coordinator = DirectoryReplicaSyncCoordinator::new_with_policy_and_resources(
             peers,
             interval_secs,
             DirectoryReplicaSyncResources {
@@ -6062,17 +6082,15 @@ impl Server {
                 full_node_mirror_enabled,
                 full_node_mirror_max_producers,
             },
-        ) {
-            Ok(coordinator) => coordinator,
-            Err(reason) => {
-                error!(
-                    reason = %reason,
-                    "[DIRECTORY_REPLICA] Synchronization coordinator initialization failed"
-                );
-                return None;
-            }
-        };
-        Some(coordinator.spawn(self.shutdown_tx.subscribe()))
+        )
+        .map_err(|reason| {
+            // Keep the startup reason stable and free of producer identities,
+            // endpoints, paths, blocks, or request metadata.
+            ServerError::startup_failed(format!(
+                "Directory replica synchronization initialization failed: {reason}"
+            ))
+        })?;
+        Ok(Some(coordinator.spawn(self.shutdown_tx.subscribe())))
     }
 
     async fn reconcile_directory_chain_once(
@@ -11627,8 +11645,20 @@ mod tests {
     use crate::config::{DiscoveryConfig, ServerConfig};
     use crate::services::memchain::MemoryStorage;
     use crate::services::{
-        DirectoryReplicaGossipAnnouncement, PeerStore, PeerStoreImportReport,
+        DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore,
+        DirectoryReplicaSyncRuntime, PeerStore, PeerStoreImportReport,
     };
+
+    fn test_peer_http_client() -> Arc<reqwest::Client> {
+        // [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Exercise the same
+        // proxy-free construction boundary as production; `Client::new()` may
+        // consult host proxy state and is not valid for isolated node tests.
+        Arc::new(
+            super::privacy_safe_peer_http_client_builder()
+                .build()
+                .unwrap(),
+        )
+    }
 
     #[test]
     fn systemd_notifier_is_backward_compatible_without_notify_socket() {
@@ -11877,6 +11907,84 @@ mod tests {
         assert_eq!(
             take_pre_ready_runtime_failure(&mut failure_rx),
             Some(required_runtime_supervisor_channel_closed())
+        );
+    }
+
+    #[test]
+    fn directory_replica_runtime_is_optional_only_when_unconfigured() {
+        // [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Preserve the
+        // default-off compatibility boundary: no pins plus mirror disabled
+        // needs neither a replica store nor a background task.
+        let server = Server::new(
+            ServerConfig::default(),
+            IdentityKeyPair::generate(),
+            None,
+        );
+        let task = server
+            .spawn_directory_replica_sync_task(
+                Arc::new(PeerStore::new()),
+                None,
+                Arc::new(DirectoryReplicaSyncRuntime::default()),
+                test_peer_http_client(),
+            )
+            .unwrap();
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn configured_directory_replica_runtime_requires_store() {
+        // [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Programmatic
+        // configuration must not bypass the validated file-config invariant
+        // and advertise readiness without the configured mirror runtime.
+        let mut config = ServerConfig::default();
+        config.discovery.directory_full_node_mirror_enabled = true;
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+        let error = server
+            .spawn_directory_replica_sync_task(
+                Arc::new(PeerStore::new()),
+                None,
+                Arc::new(DirectoryReplicaSyncRuntime::default()),
+                test_peer_http_client(),
+            )
+            .err()
+            .expect("configured mirror without a store must fail startup");
+        assert_eq!(
+            error.to_string(),
+            "Server failed to start: Directory replica synchronization requires an initialized replica store"
+        );
+    }
+
+    #[test]
+    fn configured_directory_replica_runtime_propagates_coordinator_error() {
+        // [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Do not reduce a
+        // coordinator construction failure to a log line and `None`.
+        let identity = IdentityKeyPair::generate();
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _) = DirectoryReplicaStore::open(
+            directory.path().join("directory.sqlite"),
+            identity.public_key_bytes(),
+            1_800_000_000,
+        )
+        .unwrap();
+        let mut config = ServerConfig::default();
+        config.discovery.directory_chain_sync_peer_node_ids =
+            vec![hex::encode([0x51_u8; 32])];
+        config.discovery.directory_chain_sync_interval_secs = 0;
+        config.discovery.directory_observation_witness_min_verified = 1;
+        let server = Server::new(config, identity, None);
+
+        let error = server
+            .spawn_directory_replica_sync_task(
+                Arc::new(PeerStore::new()),
+                Some(Arc::new(store)),
+                Arc::new(DirectoryReplicaSyncRuntime::default()),
+                test_peer_http_client(),
+            )
+            .err()
+            .expect("invalid coordinator state must fail startup");
+        assert_eq!(
+            error.to_string(),
+            "Server failed to start: Directory replica synchronization initialization failed: directory_sync_interval_invalid"
         );
     }
 

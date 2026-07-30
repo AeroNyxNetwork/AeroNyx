@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.78.0 - Brought all management-plane workers under
-explicit process supervision and bounded shutdown ownership.
+Modification Reason: v0.79.0 - Made configured Directory replica and Full-node
+Mirror startup/liveness fail closed instead of allowing a false-ready node.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.78.0 - [MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex] Prevents heartbeat, command, or session-reporting workers from disappearing behind a healthy process.
+Last Modified: v0.79.0 - [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Prevents configured Directory synchronization or Full-node Mirror from disappearing behind a ready process.
+Previous: v0.78.0 - [MANAGEMENT-RUNTIME-OWNERSHIP 2026-07-30 by Codex] Prevents heartbeat, command, or session-reporting workers from disappearing behind a healthy process.
 Previous: v0.77.0 - [DNS-STARTUP-READINESS 2026-07-30 by Codex] Prevents readiness before DNS bind and bounds the complete DNS forwarding task lifecycle.
 Previous: v0.76.0 - [DATA-PLANE-FAILURE-POLICY 2026-07-30 by Codex] Prevents persistent UDP/TUN receive errors from leaving a hot-looping or falsely healthy node.
 Previous: v0.75.0 - [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Escalates unexpected API supervisor and configured follower exits to process recovery.
@@ -111,6 +112,34 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.79 Configured Directory synchronization is required runtime state
+
+[DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex]
+
+- Directory replica synchronization remains disabled by default. A node with
+  no pinned Directory producers and Full-node Mirror disabled still starts
+  without a replica store or synchronization task.
+- Once an operator configures pinned producer synchronization or enables
+  Full-node Mirror, the runtime requires an initialized, audited replica store.
+  Programmatic configuration paths can no longer bypass the normal static
+  validation and silently omit the configured service.
+- Coordinator construction failures now propagate as stable startup errors.
+  Store promotion, mirror-capacity audit, retry-state restoration, and policy
+  initialization therefore complete before the node can advertise readiness.
+- A successfully started `directory-replica-sync` worker is adopted by the
+  required-task supervisor. Unexpected normal return, panic, cancellation, or
+  join failure initiates bounded graceful recovery and a non-zero process exit
+  for the service manager.
+- The existing pre-READY failure gate also covers this worker. If it exits
+  during later startup work, the node refuses to emit a contradictory
+  systemd `READY` transition.
+- Startup and runtime failures retain only fixed task names and stable reason
+  buckets. They do not expose producer identities, endpoints, paths, blocks,
+  descriptors, signatures, request metadata, or user-plane data.
+- This changes only local process health semantics. Full-node Mirror remains
+  non-authoritative and cannot affect witness policy, fork choice, quorum,
+  consensus, finality, routing weight, or producer authority.
 
 ### v0.78 Management workers are owned required tasks
 
