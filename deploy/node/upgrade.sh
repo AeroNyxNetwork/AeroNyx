@@ -21,6 +21,9 @@
 # - [LIVE-BUILD-RESOURCE-GUARD 2026-07-31 by Codex] Build upgrades with bounded
 #   Cargo parallelism and reduced CPU/I/O scheduling priority by default so a
 #   same-host release build does not starve the running privacy node.
+# - [SESSION-GATED-PROMOTION 2026-07-31 by Codex] Recheck active sessions after
+#   long builds and before deployment mutations, and restore staged artifacts
+#   without restarting if a session appears in the final promotion window.
 # - Write a local, privacy-safe upgrade status snapshot so nodeboard, health
 #   checks, AI assistants, and operators can understand which upgrade stage is
 #   running or failed without scraping shell logs.
@@ -58,6 +61,7 @@
 # - Can repair only the main systemd unit without pulling/building/restarting.
 # - Can repair only the network restore unit without pulling/building/restarting.
 # - Checks active VPN sessions before restart.
+# - Refuses binary/unit promotion when sessions appeared during compilation.
 # - Restarts systemd service and verifies post-upgrade health.
 # - Restores the previous systemd unit and binary if restart or health
 #   verification fails.
@@ -116,8 +120,13 @@
 #   owned by the existing node installation.
 # - Keep `live` as the default build priority. `normal` is an explicit
 #   maintenance-window override and must never become an implicit fast path.
+# - Session checks must remain on both sides of deployment preparation.
+#   Compilation can take minutes, and passing a check before compilation does
+#   not prove that promotion is safe afterward.
 #
 # Last Modified:
+# v1.21.0-node-deploy - Moved active-session protection ahead of binary/unit
+#                       promotion and added no-restart staged rollback.
 # v1.20.0-node-deploy - Added live-safe Cargo job limits and reduced CPU/I/O
 #                       priority for same-host production upgrades.
 # v1.19.0-node-deploy - Backs up the systemd-mapped executable even when a
@@ -663,9 +672,39 @@ active_sessions() {
         return
     fi
 
-    curl -fsS --max-time 3 http://127.0.0.1:8421/api/vpn/health 2>/dev/null \
+    curl -fsS --max-time 5 http://127.0.0.1:8421/api/vpn/health 2>/dev/null \
         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("active_sessions", "unknown"))' 2>/dev/null \
         || printf 'unknown'
+}
+
+restart_session_gate_passes() {
+    local sessions
+    [ "${NO_RESTART}" -eq 0 ] || return 0
+
+    sessions="$(active_sessions)"
+    if [ "${sessions}" = "unknown" ]; then
+        if [ "${FORCE}" -eq 1 ]; then
+            warn "Force upgrade allows deployment while the active session count is unavailable."
+            return 0
+        fi
+        if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
+            warn "Could not read active session count from the running node; failing closed."
+            return 1
+        fi
+        ok "Active session count unavailable because ${SERVICE_NAME} is not running"
+        return 0
+    fi
+
+    if [ "${sessions}" -gt 0 ] 2>/dev/null; then
+        if [ "${FORCE}" -eq 1 ]; then
+            warn "Force upgrade allows deployment with ${sessions} active VPN session(s)."
+            return 0
+        fi
+        warn "Active VPN sessions detected: ${sessions}"
+        return 1
+    fi
+
+    ok "Active VPN sessions before deployment: ${sessions}"
 }
 
 ensure_tracked_worktree_clean() {
@@ -1059,20 +1098,46 @@ rollback_binary() {
     fi
 }
 
-restart_service() {
-    local sessions
-    [ "${NO_RESTART}" -eq 0 ] || { ok "Restart skipped by --no-restart"; return; }
+restore_promoted_artifacts_without_restart() {
+    local binary restore_staging restore_failed=0
+    binary="${REPO_DIR}/target/release/aeronyx-server"
+    restore_staging="${binary}.restore.$$"
 
-    sessions="$(active_sessions)"
-
-    if [ "${sessions}" != "unknown" ] && [ "${sessions}" -gt 0 ] 2>/dev/null && [ "${FORCE}" -ne 1 ]; then
-        die "Active VPN sessions detected (${sessions}). Re-run with --force or drain sessions first."
+    # [SESSION-GATED-PROMOTION 2026-07-31 by Codex] The old process is still
+    # serving traffic from its mapped inode. Restore the stable path and unit
+    # files atomically without stopping that process or disconnecting users.
+    if [ -n "${BACKUP_BINARY}" ]; then
+        if [ "${DRY_RUN}" -eq 0 ] && [ ! -f "${BACKUP_BINARY}" ]; then
+            warn "Cannot restore promoted binary; rollback backup is missing: ${BACKUP_BINARY}"
+            restore_failed=1
+        elif ! run install -m 0755 "${BACKUP_BINARY}" "${restore_staging}"; then
+            warn "Could not stage the pre-upgrade binary for no-restart restoration."
+            restore_failed=1
+        elif ! run mv -f "${restore_staging}" "${binary}"; then
+            warn "Could not restore the stable binary path without restart."
+            restore_failed=1
+        else
+            ok "Stable binary path restored without restarting ${SERVICE_NAME}"
+        fi
+    else
+        warn "No binary backup is available for no-restart restoration."
+        restore_failed=1
     fi
 
-    if [ "${sessions}" = "unknown" ]; then
-        warn "Could not read active session count; continuing because health endpoint may be unavailable before restart."
-    else
-        ok "Active VPN sessions before restart: ${sessions}"
+    rollback_service_unit || restore_failed=1
+    rollback_network_restore_unit || restore_failed=1
+    return "${restore_failed}"
+}
+
+restart_service() {
+    [ "${NO_RESTART}" -eq 0 ] || { ok "Restart skipped by --no-restart"; return; }
+
+    if ! restart_session_gate_passes; then
+        warn "A session appeared after promotion; restoring staged artifacts without restarting the live process."
+        if ! restore_promoted_artifacts_without_restart; then
+            die "Active sessions blocked restart, and staged artifact restoration was incomplete. Manual operator review is required."
+        fi
+        die "Active sessions blocked restart; staged artifacts were restored without interrupting the live process."
     fi
 
     log "Restarting ${SERVICE_NAME}"
@@ -1207,12 +1272,24 @@ main() {
     build_release
     set_upgrade_step "validate" "Validating AeroNyx server configuration."
     validate_config
+    if [ "${NO_RESTART}" -eq 0 ]; then
+        set_upgrade_step "session_gate" "Rechecking active sessions after compilation and before deployment mutation."
+        restart_session_gate_passes \
+            || die "Active sessions appeared during compilation. Enter maintenance mode, drain sessions, and run the upgrade again."
+    fi
     set_upgrade_step "systemd" "Rendering and verifying AeroNyx systemd service unit."
     render_service_unit
     set_upgrade_step "network_restore" "Rendering and verifying AeroNyx network restore unit."
     if ! sync_network_restore_unit; then
         rollback_network_restore_unit
         die "Upgrade failed while syncing network restore unit."
+    fi
+    if [ "${NO_RESTART}" -eq 0 ] && ! restart_session_gate_passes; then
+        rollback_service_unit \
+            || warn "Systemd unit restoration failed after the late session gate."
+        rollback_network_restore_unit \
+            || warn "Network restore unit restoration failed after the late session gate."
+        die "Active sessions appeared while preparing deployment units. The units were restored and binary promotion was skipped."
     fi
     # [ATOMIC-BINARY-PROMOTION 2026-07-26 by Codex] Keep the stable binary
     # untouched until every non-runtime deployment artifact has been prepared.

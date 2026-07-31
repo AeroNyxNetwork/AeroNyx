@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [SESSION-GATED-PROMOTION 2026-07-31 by Codex] Document post-build session
+  gates that prevent binary/unit promotion from leaving a half-deployed node
+  when traffic appears during a long release build.
 - [LIVE-BUILD-RESOURCE-GUARD 2026-07-31 by Codex] Document bounded Cargo
   parallelism and reduced CPU/I/O scheduling priority for upgrades that build
   on a host still serving privacy-network traffic.
@@ -101,6 +104,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.46.0-node-deploy - Documented transactional post-build session gates.
 v1.45.0-node-deploy - Documented live-safe same-host release builds.
 v1.44.0-node-deploy - Documented exact commit-pinned isolated source upgrades.
 v1.43.0-node-deploy - Documented guarded Cargo build-cache maintenance.
@@ -755,6 +759,21 @@ sudo ./deploy/node/upgrade.sh --repo-dir /opt/aeronyx/AeroNyx
 
 `upgrade.sh` checks active VPN sessions before restart. If users are connected,
 the script stops unless the operator explicitly passes `--force`.
+
+The active-session decision is made after release compilation, not only before
+it. A build can take several minutes and traffic may arrive while Cargo is
+running. The workflow therefore checks again before installing systemd units,
+again before binary promotion, and immediately before restart. When a session
+appears before promotion, prepared units are restored and the candidate binary
+is not installed. If a session appears in the final promotion-to-restart
+window, the previous binary and units are restored atomically without stopping
+the process that is still serving traffic. This prevents a rejected upgrade
+from leaving a mixed old-process/new-disk state.
+
+When the health endpoint cannot provide an active-session count for a running
+service, the gate fails closed unless the operator explicitly selected
+`--force`. An unavailable counter is not treated as proof that zero users are
+connected.
 
 ### Commit-pinned isolated upgrade
 
