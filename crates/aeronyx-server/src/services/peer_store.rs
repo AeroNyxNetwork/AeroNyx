@@ -111,6 +111,8 @@
 //! - Two-hop path proof scope separates synthetic control-plane reachability
 //!   from synthetic terminal store-and-forward proof so public surfaces never
 //!   present node-generated checks as App/user chat delivery
+//! - Mixed-version two-hop ACKs remain control-plane compatibility evidence;
+//!   only terminal-signed receipts can enter message-delivery proof history
 //! - Two-hop message-delivery readiness exposes fresh synthetic terminal
 //!   ChatRelay proof as its own aggregate gate, so App/nodeboard/backend can
 //!   distinguish onion reachability from tested store-and-forward capability
@@ -164,6 +166,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.68.0-TwoHopProbeOutcome - Prevented legacy control ACKs from being
+//! classified as terminal message-delivery evidence
 //! v0.67.0-DiscoveryIdentityAmbiguity - Added a complete, lightweight
 //! valid-public endpoint identity view for fail-closed gossip hint resolution
 //! v0.66.0-DiscoveryGossipIsolation - Distinguish failed proof capability
@@ -4119,6 +4123,11 @@ impl PeerStore {
         match reason {
             "accepted" => "accepted".to_string(),
             "onion_terminal_delivered" => "onion_terminal_delivered".to_string(),
+            // [TWO-HOP-PROBE-OUTCOME 2026-07-31 by Codex] A mixed-version ACK
+            // proves only that the encrypted control route forwarded. Without
+            // a terminal-signed receipt it must never enter message-delivery
+            // history or unlock authenticated App routing.
+            "legacy_control_forwarded" => "legacy_control_forwarded".to_string(),
             "onion_ack_rejected" => "onion_ack_rejected".to_string(),
             "onion_ack_decode" => "onion_ack_decode".to_string(),
             "onion_kem_unavailable" => "onion_kem_unavailable".to_string(),
@@ -10214,6 +10223,39 @@ mod tests {
         assert!(!history.privacy_boundary.contains("route_id="));
         assert!(!history.privacy_boundary.contains("receiver="));
         assert!(!history.privacy_boundary.contains("encrypted_blob="));
+    }
+
+    #[test]
+    fn test_legacy_two_hop_ack_remains_control_plane_evidence() {
+        let store = PeerStore::new();
+
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            1_700_000_010,
+            true,
+            "legacy_control_forwarded",
+            3,
+            2,
+            2,
+            1,
+        );
+
+        // [TWO-HOP-PROBE-OUTCOME 2026-07-31 by Codex] A rolling-upgrade ACK
+        // keeps route compatibility observable, but only a terminal-signed
+        // receipt may produce message-delivery evidence.
+        let history = store.status(1_700_000_015).two_hop_path_proof_history;
+        assert_eq!(history.succeeded, 1);
+        assert_eq!(history.proof_scope, "control_plane");
+        assert_eq!(history.message_delivery_successes, 0);
+        assert_eq!(history.message_delivery_evidence_mode, "none");
+        assert_eq!(
+            history.latest_reason_bucket.as_deref(),
+            Some("legacy_control_forwarded")
+        );
+        assert_eq!(
+            history.events[0].evidence_mode,
+            "synthetic_two_hop_control_probe"
+        );
+        assert_eq!(history.events[0].proof_scope, "control_plane");
     }
 
     #[test]

@@ -285,6 +285,9 @@
 // 112. [JOIN-FAILURE-PRIVACY 2026-07-30 by Codex] Classifies Tokio task join
 //      failures into fixed typed reasons so panic payloads cannot cross the
 //      process-health, systemd status, or structured shutdown-log boundary.
+// 113. [TWO-HOP-PROBE-OUTCOME 2026-07-31 by Codex] Separates probe execution,
+//      mixed-version route acceptance, and terminal-signed delivery evidence
+//      so operator smoke success cannot overstate a failed or legacy-only path.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -751,6 +754,24 @@ const VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT: &str =
     "peer_store_verified_client_delivery_anchor.v1";
 /// Direct startup probes are bounded independently of untrusted peer count.
 const BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES: usize = 3;
+
+/// Aggregate-only result of one bounded two-hop relay probe round.
+///
+/// [TWO-HOP-PROBE-OUTCOME 2026-07-31 by Codex] These dimensions intentionally
+/// remain independent:
+/// - `attempted` drives the background cooldown after network work;
+/// - `route_accepted` preserves rolling-upgrade control-path compatibility;
+/// - `terminal_delivery_verified` requires a fresh terminal-signed receipt and
+///   is the only condition that may satisfy operator smoke `success`.
+///
+/// Never add selected hops, node ids, endpoints, route ids, receiver keys,
+/// payloads, or client metadata to this type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TwoHopBlindRelayProbeOutcome {
+    attempted: bool,
+    route_accepted: bool,
+    terminal_delivery_verified: bool,
+}
 
 /// Public IP services should return one textual IP address and whitespace.
 const PUBLIC_IP_RESPONSE_MAX_BYTES: usize = 256;
@@ -4203,7 +4224,7 @@ impl Server {
                                 &local_capabilities,
                             );
                             let self_node_id = identity.public_key_bytes();
-                            let accepted = Self::probe_two_hop_blind_relay_path(
+                            let outcome = Self::probe_two_hop_blind_relay_path(
                                 &client,
                                 &peer_store,
                                 &identity,
@@ -4219,14 +4240,19 @@ impl Server {
                                 &local_capabilities,
                             );
                             axum::Json(serde_json::json!({
-                                "success": accepted,
-                                "contract_version": "two_hop_smoke.v1",
+                                "success": outcome.terminal_delivery_verified,
+                                "contract_version": "two_hop_smoke.v2",
                                 "source": "rust_local_operator_smoke",
                                 "scope": "local_or_vpn_operator_api_only",
                                 "probe": {
                                     "type": "two_hop_onion_delivery",
                                     "payload": "synthetic_opaque_ciphertext",
                                     "ack_boundary": "terminal_chat_relay_store_or_online_delivery",
+                                },
+                                "outcome": {
+                                    "attempted": outcome.attempted,
+                                    "route_accepted": outcome.route_accepted,
+                                    "terminal_delivery_verified": outcome.terminal_delivery_verified,
                                 },
                                 "before": before_runtime,
                                 "after": after_runtime,
@@ -7884,15 +7910,15 @@ impl Server {
                             >= probe_cooldown_secs;
 
                     if two_hop_probe_due {
-                        if Self::probe_two_hop_blind_relay_path(
+                        let outcome = Self::probe_two_hop_blind_relay_path(
                             gossip_http_client.as_ref(),
                             &peer_store,
                             &identity,
                             &self_node_id,
                             probe_now,
                         )
-                        .await
-                        {
+                        .await;
+                        if outcome.attempted {
                             last_two_hop_blind_relay_probe_at = probe_now;
                         }
                     } else {
@@ -8419,7 +8445,7 @@ impl Server {
         identity: &IdentityKeyPair,
         self_node_id: &[u8; 32],
         now: u64,
-    ) -> bool {
+    ) -> TwoHopBlindRelayProbeOutcome {
         let mut middle_candidates = peer_store.route_probe_candidates_with_capability_excluding(
             NodeCapability::OnionMiddle,
             now,
@@ -8428,7 +8454,7 @@ impl Server {
         );
         Self::prioritize_probe_candidates(peer_store, now, &mut middle_candidates);
         if middle_candidates.is_empty() {
-            return false;
+            return TwoHopBlindRelayProbeOutcome::default();
         }
 
         let middle_candidate_count = middle_candidates.len();
@@ -8553,7 +8579,11 @@ impl Server {
                                             1,
                                         );
                                     peer_store.record_route_forward_success(&middle_node_id, now);
-                                    return true;
+                                    return TwoHopBlindRelayProbeOutcome {
+                                        attempted: true,
+                                        route_accepted: true,
+                                        terminal_delivery_verified: true,
+                                    };
                                 }
                                 Ok(ack) if ack.accepted && ack.forwarded => {
                                     // Mixed-version nodes can still prove the
@@ -8807,13 +8837,17 @@ impl Server {
             peer_store.record_blind_relay_two_hop_probe_result_with_context(
                 now,
                 true,
-                "onion_terminal_delivered",
+                "legacy_control_forwarded",
                 middle_candidates,
                 terminal_candidates,
                 2,
                 1,
             );
-            return true;
+            return TwoHopBlindRelayProbeOutcome {
+                attempted: true,
+                route_accepted: true,
+                terminal_delivery_verified: false,
+            };
         }
 
         if !attempted {
@@ -8831,7 +8865,11 @@ impl Server {
                 1,
             );
         }
-        true
+        TwoHopBlindRelayProbeOutcome {
+            attempted,
+            route_accepted: false,
+            terminal_delivery_verified: false,
+        }
     }
 
     fn build_two_hop_onion_delivery_probe_request(
@@ -13264,6 +13302,46 @@ mod tests {
         .is_none());
     }
 
+    #[tokio::test]
+    async fn two_hop_probe_does_not_report_success_without_a_distinct_terminal() {
+        let now = 1_800_000_100;
+        let source = IdentityKeyPair::generate();
+        let self_node_id = source.public_key_bytes();
+        let middle = signed_probe_peer_descriptor(
+            "http://198.51.100.10:8422".to_string(),
+            now,
+            now + 300,
+            vec![NodeCapability::OnionMiddle],
+            [0x31; 32],
+        );
+        let store = PeerStore::new();
+        store.upsert_verified(middle, now).unwrap();
+
+        let outcome = Server::probe_two_hop_blind_relay_path(
+            &reqwest::Client::new(),
+            &store,
+            &source,
+            &self_node_id,
+            now,
+        )
+        .await;
+
+        // [TWO-HOP-PROBE-OUTCOME 2026-07-31 by Codex] Candidate discovery is
+        // not network execution, and neither may be presented as terminal
+        // delivery without a distinct terminal-signed receipt.
+        assert!(!outcome.attempted);
+        assert!(!outcome.route_accepted);
+        assert!(!outcome.terminal_delivery_verified);
+        let history = store.status(now).two_hop_path_proof_history;
+        assert_eq!(history.attempted, 1);
+        assert_eq!(history.succeeded, 0);
+        assert_eq!(history.message_delivery_successes, 0);
+        assert_eq!(
+            history.latest_reason_bucket.as_deref(),
+            Some("no_distinct_path")
+        );
+    }
+
     #[test]
     fn signed_delivery_receipt_verification_binds_route_payload_terminal_and_freshness() {
         let now = 1_800_000_000;
@@ -14371,6 +14449,32 @@ mod tests {
         );
         let receipt_middle_id = receipt_middle.node_id();
 
+        // [TWO-HOP-PROBE-OUTCOME 2026-07-31 by Codex] A legacy-only network
+        // proves encrypted route compatibility, never terminal delivery.
+        let legacy_store = PeerStore::new();
+        for descriptor in [legacy_middle.clone(), terminal.clone()] {
+            legacy_store.upsert_verified(descriptor, now).unwrap();
+        }
+        let legacy_outcome = Server::probe_two_hop_blind_relay_path(
+            &reqwest::Client::new(),
+            &legacy_store,
+            &source_identity,
+            &self_node_id,
+            now,
+        )
+        .await;
+        assert!(legacy_outcome.attempted);
+        assert!(legacy_outcome.route_accepted);
+        assert!(!legacy_outcome.terminal_delivery_verified);
+        let legacy_history = legacy_store.status(now).two_hop_path_proof_history;
+        assert_eq!(legacy_history.succeeded, 1);
+        assert_eq!(legacy_history.proof_scope, "control_plane");
+        assert_eq!(legacy_history.message_delivery_successes, 0);
+
+        // Reset only the test counter. The second round below must still prove
+        // that search continues past this legacy-only route to a signed receipt.
+        legacy_requests.store(0, AtomicOrdering::SeqCst);
+
         let store = PeerStore::new();
         for descriptor in [legacy_middle, receipt_middle, terminal] {
             store.upsert_verified(descriptor, now).unwrap();
@@ -14380,7 +14484,7 @@ mod tests {
         // ACK before the signed-receipt route.
         store.record_route_forward_success(&receipt_middle_id, now);
 
-        let accepted = Server::probe_two_hop_blind_relay_path(
+        let outcome = Server::probe_two_hop_blind_relay_path(
             &reqwest::Client::new(),
             &store,
             &source_identity,
@@ -14389,7 +14493,9 @@ mod tests {
         )
         .await;
 
-        assert!(accepted);
+        assert!(outcome.attempted);
+        assert!(outcome.route_accepted);
+        assert!(outcome.terminal_delivery_verified);
         assert_eq!(legacy_requests.load(AtomicOrdering::SeqCst), 2);
         assert_eq!(receipt_requests.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(
