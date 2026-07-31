@@ -23,6 +23,9 @@
 //!   transport feature negotiation without route metadata
 //! - `GET /api/discovery/public-card`: returns the smallest product-facing
 //!   protocol health card for website, Nodeboard first-level views, and apps
+//! - [ONION-CANDIDATE-PROOF 2026-07-31 by Codex] Returns each onion candidate's
+//!   original signed node descriptor so App/SDK path builders can independently
+//!   verify identity, capability, endpoint, capacity, and rotating KEM metadata
 //! - [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] Keeps permissionless
 //!   gossip admission usable after an unrelated panic while the process-local
 //!   rate-limit lock is held.
@@ -69,6 +72,8 @@
 //!   discovery outage.
 //!
 //! ## Last Modified
+//! v0.34.0-OnionCandidateSignedProof - Preserve the verified signed descriptor
+//! in each public onion candidate and publish the client verification contract.
 //! v0.33.0-DiscoveryRateLimitRecovery - Prevent one panic from permanently
 //! poisoning the permissionless gossip admission limiter.
 //! v0.32.0-DirectoryGossipNegotiation - Advertise additive public transport
@@ -115,7 +120,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aeronyx_core::protocol::{NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage};
+use aeronyx_core::protocol::{
+    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, SignedNodeDescriptor,
+};
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
@@ -353,6 +360,16 @@ pub struct OnionRelayCandidate {
     pub max_bps: Option<u64>,
     /// Optional packet-rate policy advertised by the peer.
     pub max_pps: Option<u64>,
+    /// Original Ed25519-signed descriptor accepted by the local `PeerStore`.
+    ///
+    /// [ONION-CANDIDATE-PROOF 2026-07-31 by Codex] The flattened fields above
+    /// remain for backward compatibility. Security-sensitive App/SDK path
+    /// builders must independently call the protocol-equivalent of
+    /// `SignedNodeDescriptor::verify_at(generated_at)` and then derive node id,
+    /// KEM key, endpoint, capabilities, capacity, and region from this object.
+    /// A mismatch between a flattened field and this descriptor must reject the
+    /// candidate rather than silently trusting the API projection.
+    pub signed_descriptor: SignedNodeDescriptor,
 }
 
 /// Response for `GET /api/discovery/onion-candidates`.
@@ -415,6 +432,12 @@ pub struct OnionCandidatesResponse {
     pub next_action: String,
     /// Privacy-safe route selection policy used to build this candidate set.
     pub selection_policy: String,
+    /// Stable verification rule for each candidate's public metadata.
+    ///
+    /// This field is intentionally explicit so mixed-version App/SDK clients
+    /// can distinguish independently verifiable candidates from legacy
+    /// projections without inferring support from optional JSON members.
+    pub candidate_verification: String,
     /// Stable strategy clients should use when choosing among candidates.
     pub path_selection_strategy: String,
     /// Privacy-safe region diversity policy for client-side path builders.
@@ -1882,6 +1905,7 @@ async fn onion_candidates_handler(
                 max_sessions: capacity.max_sessions,
                 max_bps: capacity.max_bps,
                 max_pps: capacity.max_pps,
+                signed_descriptor: descriptor,
             })
         })
         .collect();
@@ -1920,6 +1944,7 @@ async fn onion_candidates_handler(
         readiness_reason: readiness_reason.to_string(),
         next_action: next_action.to_string(),
         selection_policy: ONION_CANDIDATES_SELECTION_POLICY.to_string(),
+        candidate_verification: "signed_node_descriptor_ed25519_v2".to_string(),
         path_selection_strategy: "weighted_random_health_ranked_distinct_hops".to_string(),
         region_diversity_policy:
             "prefer_distinct_regions_when_available_without_exposing_selected_route".to_string(),
@@ -1929,7 +1954,7 @@ async fn onion_candidates_handler(
         refresh_after_seconds: ONION_CANDIDATES_REFRESH_AFTER_SECONDS,
         routeability_stale_after_seconds: ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS,
         candidates,
-        privacy_boundary: "fresh routeable signed node discovery metadata only (node id, KEM public key, public endpoint, capabilities); no client IPs, route ids, encrypted payloads, receiver identities, DNS contents, destinations, voucher secrets, private keys, or wallet-level traffic".to_string(),
+        privacy_boundary: "fresh routeable signed node discovery metadata with the original public descriptor proof (node id, KEM public key, public endpoint, capabilities, capacity, and region); no client IPs, route ids, encrypted payloads, receiver identities, DNS contents, destinations, voucher secrets, private keys, wallet-level traffic, or social graph metadata".to_string(),
     })
 }
 
@@ -2460,6 +2485,10 @@ mod tests {
         assert_eq!(parsed.source, ONION_CANDIDATES_SOURCE);
         assert_eq!(parsed.selection_policy, ONION_CANDIDATES_SELECTION_POLICY);
         assert_eq!(
+            parsed.candidate_verification,
+            "signed_node_descriptor_ed25519_v2"
+        );
+        assert_eq!(
             parsed.refresh_after_seconds,
             ONION_CANDIDATES_REFRESH_AFTER_SECONDS
         );
@@ -2509,7 +2538,64 @@ mod tests {
         assert_eq!(candidate.selection_weight, 1_000);
         assert_eq!(candidate.region, None);
         assert_eq!(candidate.max_sessions, 0);
+        assert!(candidate
+            .signed_descriptor
+            .verify_at(parsed.generated_at)
+            .is_ok());
+        assert_eq!(
+            candidate.node_id,
+            hex::encode(candidate.signed_descriptor.node_id())
+        );
+        assert_eq!(
+            candidate.kem_alg,
+            candidate.signed_descriptor.descriptor.kem_alg
+        );
+        assert_eq!(
+            candidate.kem_public,
+            hex::encode(
+                candidate
+                    .signed_descriptor
+                    .descriptor
+                    .x25519_kem_public()
+                    .expect("candidate proof must carry its projected X25519 KEM key")
+            )
+        );
+        assert_eq!(
+            Some(candidate.public_endpoint.as_str()),
+            candidate
+                .signed_descriptor
+                .descriptor
+                .public_endpoint
+                .as_deref()
+        );
+        assert_eq!(
+            candidate.capabilities,
+            candidate.signed_descriptor.descriptor.capabilities
+        );
+        assert_eq!(
+            candidate.max_sessions,
+            candidate.signed_descriptor.descriptor.capacity.max_sessions
+        );
+        assert_eq!(
+            candidate.max_bps,
+            candidate.signed_descriptor.descriptor.capacity.max_bps
+        );
+        assert_eq!(
+            candidate.max_pps,
+            candidate.signed_descriptor.descriptor.capacity.max_pps
+        );
+        assert_eq!(
+            candidate.region,
+            candidate.signed_descriptor.descriptor.policy.region
+        );
+        let encoded = serde_json::to_value(&parsed).unwrap();
+        assert!(encoded["candidates"][0]["signed_descriptor"].is_object());
+        assert_eq!(
+            encoded["candidate_verification"],
+            "signed_node_descriptor_ed25519_v2"
+        );
         assert!(parsed.privacy_boundary.contains("fresh routeable"));
+        assert!(parsed.privacy_boundary.contains("descriptor proof"));
     }
 
     #[tokio::test]
