@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [LIVE-BUILD-RESOURCE-GUARD 2026-07-31 by Codex] Document bounded Cargo
+  parallelism and reduced CPU/I/O scheduling priority for upgrades that build
+  on a host still serving privacy-network traffic.
 - [COMMIT-PINNED-SOURCE 2026-07-29 by Codex] Document exact commit-pinned
   isolated upgrades for production nodes whose runtime checkout is dirty or
   intentionally diverged from the reviewed GitHub release.
@@ -88,7 +91,8 @@ Dependencies:
 Main Logical Flow:
 1. Operator installs the node with install.sh.
 2. Operator registers with a nodeboard registration code.
-3. systemd runs aeronyx-server and healthcheck.sh verifies runtime status.
+3. Upgrades compile with a live-safe resource policy before atomic promotion.
+4. systemd runs aeronyx-server and healthcheck.sh verifies runtime status.
 
 Important Note for Next Developer:
 - Do not document workflows that require exposing private keys or user traffic.
@@ -97,6 +101,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.45.0-node-deploy - Documented live-safe same-host release builds.
 v1.44.0-node-deploy - Documented exact commit-pinned isolated source upgrades.
 v1.43.0-node-deploy - Documented guarded Cargo build-cache maintenance.
 v1.42.0-node-deploy - Documented pinned Rust builds and atomic promotion from
@@ -205,6 +210,53 @@ sudo AERONYX_BUILD_TARGET_ROOT=/var/lib/aeronyx-jp1/build-targets \
 
 An exact toolchain bump is a release change. It requires the full Rust test
 suite, Clippy, a locked release build, and controlled node rollout evidence.
+
+### Live-safe upgrade builds
+
+`upgrade.sh` assumes the current node may continue serving VPN, discovery,
+blind relay, and Directory Chain APIs while the next release is compiling.
+Its default `live` policy therefore:
+
+- uses approximately half of the online CPUs for Cargo, with at least one job;
+- runs the compiler with CPU nice level 10;
+- uses the idle I/O scheduling class when `ionice` is available;
+- records the selected priority, job count, nice level, and I/O class in the
+  privacy-safe upgrade status snapshot.
+
+The policy affects compilation only. It does not change the running systemd
+service, protocol threads, active-session limits, node identity, or stored
+state:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh upgrade \
+  --repo-dir /root/open/AeroNyx \
+  --build-priority live \
+  --build-jobs auto
+```
+
+On a two-CPU node, `live` plus `auto` resolves to one Cargo job. An operator may
+choose an explicit positive job count no larger than the online CPU count:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh upgrade \
+  --repo-dir /root/open/AeroNyx \
+  --build-jobs 1
+```
+
+`normal` uses all online CPUs by default and does not lower CPU or I/O
+priority. Use it only in an approved maintenance window after traffic has
+drained:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh upgrade \
+  --repo-dir /root/open/AeroNyx \
+  --build-priority normal
+```
+
+Automation may set `AERONYX_BUILD_PRIORITY` and `AERONYX_BUILD_JOBS`; explicit
+command-line options override those defaults. Invalid modes, non-positive job
+counts, and job counts above the online CPU count fail during preflight before
+source, binary, service, or protocol state is changed.
 
 ## Cargo Build-Cache Maintenance
 
@@ -779,7 +831,8 @@ recovery improvements without a full reinstall.
 
 The file contains only operator workflow metadata: status, step, message,
 repo path, branch, source mode, requested/build commit, candidate binary
-SHA-256, service name, config path, `--no-restart`, `--force`, and `updated_at`.
+SHA-256, build resource policy, service name, config path, `--no-restart`,
+`--force`, and `updated_at`.
 It intentionally excludes registration codes, private keys, client public IPs,
 DNS contents, destinations, packet payloads, chat plaintext, voucher secrets,
 and wallet-level traffic. `aeronyx-node.sh status` displays a short summary of

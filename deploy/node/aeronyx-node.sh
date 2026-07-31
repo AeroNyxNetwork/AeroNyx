@@ -9,6 +9,9 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - [LIVE-BUILD-RESOURCE-GUARD 2026-07-31 by Codex] Expose the upgrade
+#   resource policy through the unified operator entrypoint so same-host
+#   builds remain discoverable without calling the lower-level script.
 # - [COMMIT-PINNED-SOURCE 2026-07-29 by Codex] Forward an exact release commit
 #   to the isolated Rust upgrade workflow without exposing lower-level scripts.
 # - [BUILD-CACHE-MAINTENANCE 2026-07-26 by Codex] Add read-only Cargo build
@@ -113,6 +116,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.23.0-node-entrypoint - Exposed live-safe upgrade build resource controls.
 # v1.22.0-node-entrypoint - Added exact commit-pinned isolated source upgrades.
 # v1.21.0-node-entrypoint - Added guarded Cargo build-cache inventory and pruning.
 # v1.20.0-node-entrypoint - Added isolated carrier-assisted cold-bootstrap smoke.
@@ -260,6 +264,8 @@ Command-specific options:
 
   upgrade:
     --commit SHA           Build exact commit without modifying a dirty runtime checkout.
+    --build-priority MODE  Build policy: live (default) or normal.
+    --build-jobs N|auto    Cargo jobs; live auto uses about half the online CPUs.
     --force                Restart even when active sessions exist.
     --no-restart           Build, validate, and stage; do not restart.
     --skip-pull            Build currently checked-out source.
@@ -423,6 +429,12 @@ parse_args() {
             --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
             --branch) BRANCH="${2:?missing value}"; shift 2 ;;
             --commit) SOURCE_COMMIT="${2:?missing value}"; shift 2 ;;
+            # [LIVE-BUILD-RESOURCE-GUARD 2026-07-31 by Codex] Keep the wrapper
+            # thin while preserving each option/value pair for upgrade.sh.
+            --build-priority|--build-jobs)
+                EXTRA_ARGS+=("$1" "${2:?missing value}")
+                shift 2
+                ;;
             --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
             --service) SERVICE_NAME="${2:?missing value}"; shift 2 ;;
             --registration-code) REGISTRATION_CODE="${2:?missing value}"; shift 2 ;;

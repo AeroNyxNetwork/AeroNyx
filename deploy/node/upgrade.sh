@@ -18,6 +18,9 @@
 # - [RUNNING-BINARY-BACKUP 2026-07-31 by Codex] Resolve the systemd-mapped
 #   executable before the repository target so a clean commit-pinned worktree
 #   can still preserve the real rollback artifact.
+# - [LIVE-BUILD-RESOURCE-GUARD 2026-07-31 by Codex] Build upgrades with bounded
+#   Cargo parallelism and reduced CPU/I/O scheduling priority by default so a
+#   same-host release build does not starve the running privacy node.
 # - Write a local, privacy-safe upgrade status snapshot so nodeboard, health
 #   checks, AI assistants, and operators can understand which upgrade stage is
 #   running or failed without scraping shell logs.
@@ -47,6 +50,8 @@
 # - Pulls the configured branch.
 # - Prevents concurrent upgrade runs on the same node.
 # - Builds aeronyx-server release binary.
+# - Protects the running node from release-build contention with a live-safe
+#   resource policy that operators may override during a maintenance window.
 # - Validates /etc/aeronyx/server.toml.
 # - Syncs the repository systemd unit template before restart.
 # - Syncs the generated network restore unit when persisted NAT rules exist.
@@ -72,7 +77,8 @@
 # 1. Acquire the node-local upgrade lock.
 # 2. Optionally repair only the main or network restore systemd unit and exit.
 # 3. Update the normal worktree or prepare an exact isolated commit checkout.
-# 4. Build and validate the release binary.
+# 4. Resolve the live-safe build resource policy, then build and validate the
+#    release binary.
 # 5. Restart only when no active sessions are present, unless --force is used.
 # 6. Sync and verify the systemd unit template and network restore unit.
 # 7. Verify local health and roll back the units/binary if restart health fails.
@@ -108,8 +114,12 @@
 #   mutate the runtime repository. The isolated checkout is build input only;
 #   stable binary, config, identity, protocol state, and rollback paths remain
 #   owned by the existing node installation.
+# - Keep `live` as the default build priority. `normal` is an explicit
+#   maintenance-window override and must never become an implicit fast path.
 #
 # Last Modified:
+# v1.20.0-node-deploy - Added live-safe Cargo job limits and reduced CPU/I/O
+#                       priority for same-host production upgrades.
 # v1.19.0-node-deploy - Backs up the systemd-mapped executable even when a
 #                       clean runtime worktree has no local target binary.
 # v1.18.0-node-deploy - Added exact commit-pinned isolated source builds.
@@ -193,6 +203,14 @@ BUILD_TARGET_DIR=""
 BUILD_BINARY=""
 BUILD_GIT_COMMIT=""
 BUILD_BINARY_SHA256=""
+BUILD_PRIORITY="${AERONYX_BUILD_PRIORITY:-live}"
+BUILD_JOBS_REQUESTED="${AERONYX_BUILD_JOBS:-auto}"
+BUILD_JOBS=""
+BUILD_CPU_COUNT=""
+BUILD_CPU_NICE=0
+BUILD_IO_CLASS="none"
+NICE_BIN=""
+IONICE_BIN=""
 
 log() { printf '[INFO] %s\n' "$*"; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -231,6 +249,10 @@ Options:
   --keep-releases N   Keep latest N binary/unit backups after success. Default: 10
   --health-retries N  Health polling attempts after restart. Default: 90
   --health-delay N    Seconds between health polling attempts. Default: 2
+  --build-priority MODE
+                      Build scheduling policy: live (default) or normal.
+  --build-jobs N|auto Cargo parallel jobs. live auto uses about half the
+                      online CPUs; normal auto uses all online CPUs.
   --dry-run           Print actions without changing the host.
   -h, --help          Show this help.
 USAGE
@@ -258,6 +280,10 @@ write_upgrade_status() {
     SOURCE_COMMIT_VALUE="${SOURCE_COMMIT}" \
     BUILD_GIT_COMMIT_VALUE="${BUILD_GIT_COMMIT}" \
     BUILD_BINARY_SHA256_VALUE="${BUILD_BINARY_SHA256}" \
+    BUILD_PRIORITY_VALUE="${BUILD_PRIORITY}" \
+    BUILD_JOBS_VALUE="${BUILD_JOBS}" \
+    BUILD_CPU_NICE_VALUE="${BUILD_CPU_NICE}" \
+    BUILD_IO_CLASS_VALUE="${BUILD_IO_CLASS}" \
     python3 - "${UPGRADE_STATUS_FILE}" <<'PY' || true
 import json
 import os
@@ -265,6 +291,11 @@ import sys
 from datetime import datetime, timezone
 
 path = sys.argv[1]
+
+def optional_int(name):
+    value = os.environ.get(name, "").strip()
+    return int(value) if value.isdigit() else None
+
 payload = {
     "status": os.environ.get("STATUS_NAME", "running"),
     "step": os.environ.get("STEP_NAME", "unknown"),
@@ -279,6 +310,10 @@ payload = {
     "requested_commit": os.environ.get("SOURCE_COMMIT_VALUE") or None,
     "build_git_commit": os.environ.get("BUILD_GIT_COMMIT_VALUE") or None,
     "build_binary_sha256": os.environ.get("BUILD_BINARY_SHA256_VALUE") or None,
+    "build_priority": os.environ.get("BUILD_PRIORITY_VALUE", "live"),
+    "build_jobs": optional_int("BUILD_JOBS_VALUE"),
+    "build_cpu_nice": optional_int("BUILD_CPU_NICE_VALUE"),
+    "build_io_class": os.environ.get("BUILD_IO_CLASS_VALUE", "none"),
     "privacy_boundary": (
         "upgrade workflow metadata only; no registration codes, private keys, "
         "client public IPs, destinations, DNS contents, packet payloads, chat "
@@ -326,6 +361,8 @@ while [ "$#" -gt 0 ]; do
         --keep-releases) KEEP_RELEASES="${2:?missing value}"; shift 2 ;;
         --health-retries) HEALTH_RETRIES="${2:?missing value}"; shift 2 ;;
         --health-delay) HEALTH_DELAY="${2:?missing value}"; shift 2 ;;
+        --build-priority) BUILD_PRIORITY="${2:?missing value}"; shift 2 ;;
+        --build-jobs) BUILD_JOBS_REQUESTED="${2:?missing value}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "Unknown option: $1" ;;
@@ -368,6 +405,18 @@ validate_health_polling() {
         || die "--health-retries must be a positive integer."
     printf '%s' "${HEALTH_DELAY}" | grep -Eq '^[1-9][0-9]*$' \
         || die "--health-delay must be a positive integer."
+}
+
+validate_build_resource_options() {
+    case "${BUILD_PRIORITY}" in
+        live|normal) ;;
+        *) die "--build-priority must be live or normal." ;;
+    esac
+
+    if [ "${BUILD_JOBS_REQUESTED}" != "auto" ]; then
+        printf '%s' "${BUILD_JOBS_REQUESTED}" | grep -Eq '^[1-9][0-9]*$' \
+            || die "--build-jobs must be auto or a positive integer."
+    fi
 }
 
 validate_source_commit() {
@@ -540,12 +589,72 @@ configure_pinned_rust_build() {
     ok "Isolated Cargo target: ${BUILD_TARGET_DIR}"
 }
 
-run_pinned_cargo() {
-    if [ -n "${RUSTUP_BIN}" ]; then
-        "${RUSTUP_BIN}" run "${PINNED_RUST_CHANNEL}" cargo "$@"
-    else
-        cargo "$@"
+# [LIVE-BUILD-RESOURCE-GUARD 2026-07-31 by Codex] Production upgrades usually
+# compile on the same host that is still serving traffic. Bound Cargo
+# parallelism and lower scheduler priority so health APIs, relays, and VPN
+# packet handling remain preferred by the kernel.
+online_cpu_count() {
+    local count
+    count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    if ! printf '%s' "${count}" | grep -Eq '^[1-9][0-9]*$'; then
+        count="$(nproc 2>/dev/null || true)"
     fi
+    if ! printf '%s' "${count}" | grep -Eq '^[1-9][0-9]*$'; then
+        count=1
+    fi
+    printf '%s\n' "${count}"
+}
+
+configure_build_resource_policy() {
+    BUILD_CPU_COUNT="$(online_cpu_count)"
+    if [ "${BUILD_JOBS_REQUESTED}" = "auto" ]; then
+        if [ "${BUILD_PRIORITY}" = "live" ]; then
+            BUILD_JOBS=$(((BUILD_CPU_COUNT + 1) / 2))
+        else
+            BUILD_JOBS="${BUILD_CPU_COUNT}"
+        fi
+    else
+        BUILD_JOBS="${BUILD_JOBS_REQUESTED}"
+    fi
+
+    [ "${BUILD_JOBS}" -le "${BUILD_CPU_COUNT}" ] \
+        || die "--build-jobs ${BUILD_JOBS} exceeds ${BUILD_CPU_COUNT} online CPU(s)."
+
+    if [ "${BUILD_PRIORITY}" = "live" ]; then
+        NICE_BIN="$(resolve_command_path nice)"
+        BUILD_CPU_NICE=10
+        IONICE_BIN="$(command -v ionice 2>/dev/null || true)"
+        if [ -n "${IONICE_BIN}" ]; then
+            BUILD_IO_CLASS="idle"
+        else
+            BUILD_IO_CLASS="none"
+            warn "ionice is unavailable; continuing with bounded jobs and CPU nice priority."
+        fi
+    else
+        BUILD_CPU_NICE=0
+        BUILD_IO_CLASS="none"
+        warn "Normal build priority selected; use it only after draining traffic in a maintenance window."
+    fi
+
+    ok "Build resource policy: priority=${BUILD_PRIORITY} online_cpus=${BUILD_CPU_COUNT} jobs=${BUILD_JOBS} cpu_nice=${BUILD_CPU_NICE} io_class=${BUILD_IO_CLASS}"
+}
+
+run_pinned_cargo_with_build_policy() {
+    local -a command
+    if [ -n "${RUSTUP_BIN}" ]; then
+        command=("${RUSTUP_BIN}" run "${PINNED_RUST_CHANNEL}" cargo)
+    else
+        command=(cargo)
+    fi
+
+    if [ "${BUILD_PRIORITY}" = "live" ]; then
+        if [ -n "${IONICE_BIN}" ]; then
+            command=("${IONICE_BIN}" -c 3 "${command[@]}")
+        fi
+        command=("${NICE_BIN}" -n "${BUILD_CPU_NICE}" "${command[@]}")
+    fi
+
+    "${command[@]}" "$@"
 }
 
 active_sessions() {
@@ -683,8 +792,16 @@ build_release() {
 
     log "Building release binary"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s CARGO_TARGET_DIR=%s rustup run %s cargo build --locked -p aeronyx-server --release\n' \
-            "${SOURCE_DIR}" "${build_git_commit}" "${BUILD_TARGET_DIR}" "${PINNED_RUST_CHANNEL}"
+        if [ "${BUILD_PRIORITY}" = "live" ] && [ -n "${IONICE_BIN}" ]; then
+            printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s CARGO_TARGET_DIR=%s nice -n %s ionice -c 3 rustup run %s cargo build --locked -p aeronyx-server --release --jobs %s\n' \
+                "${SOURCE_DIR}" "${build_git_commit}" "${BUILD_TARGET_DIR}" "${BUILD_CPU_NICE}" "${PINNED_RUST_CHANNEL}" "${BUILD_JOBS}"
+        elif [ "${BUILD_PRIORITY}" = "live" ]; then
+            printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s CARGO_TARGET_DIR=%s nice -n %s rustup run %s cargo build --locked -p aeronyx-server --release --jobs %s\n' \
+                "${SOURCE_DIR}" "${build_git_commit}" "${BUILD_TARGET_DIR}" "${BUILD_CPU_NICE}" "${PINNED_RUST_CHANNEL}" "${BUILD_JOBS}"
+        else
+            printf '[DRY-RUN] cd %s && AERONYX_GIT_COMMIT=%s CARGO_TARGET_DIR=%s rustup run %s cargo build --locked -p aeronyx-server --release --jobs %s\n' \
+                "${SOURCE_DIR}" "${build_git_commit}" "${BUILD_TARGET_DIR}" "${PINNED_RUST_CHANNEL}" "${BUILD_JOBS}"
+        fi
     else
         # [REPRODUCIBLE-RUST-BUILD 2026-07-26 by Codex] Fail before Cargo can
         # change the reviewed dependency/compiler graph or write over the live
@@ -695,7 +812,8 @@ build_release() {
             cd "${SOURCE_DIR}"
             export AERONYX_GIT_COMMIT="${build_git_commit}"
             export CARGO_TARGET_DIR="${BUILD_TARGET_DIR}"
-            run_pinned_cargo build --locked -p aeronyx-server --release
+            run_pinned_cargo_with_build_policy \
+                build --locked -p aeronyx-server --release --jobs "${BUILD_JOBS}"
         )
         BUILD_BINARY_SHA256="$(sha256sum "${BUILD_BINARY}" | awk '{print $1}')"
         printf '%s' "${BUILD_BINARY_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
@@ -1034,6 +1152,7 @@ main() {
     validate_service_name
     validate_keep_releases
     validate_health_polling
+    validate_build_resource_options
     validate_source_commit
     SOURCE_DIR="${REPO_DIR}"
     validate_option_combinations
@@ -1076,6 +1195,8 @@ main() {
     # `.git` is a directory; linked production worktrees use a pointer file.
     is_git_worktree || die "Git worktree not found: ${REPO_DIR}"
     ensure_tracked_worktree_clean
+    set_upgrade_step "build_policy" "Selecting a resource policy that protects the running node during compilation."
+    configure_build_resource_policy
     set_upgrade_step "backup" "Backing up current release binary before upgrade."
     backup_current_binary
     set_upgrade_step "repository" "Preparing verified AeroNyx source from Git."
