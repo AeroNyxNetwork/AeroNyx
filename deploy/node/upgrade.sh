@@ -15,6 +15,9 @@
 # - [COMMIT-PINNED-SOURCE 2026-07-29 by Codex] Build an operator-selected,
 #   full Git commit from a temporary isolated checkout so a dirty or diverged
 #   runtime repository cannot contaminate production release input.
+# - [RUNNING-BINARY-BACKUP 2026-07-31 by Codex] Resolve the systemd-mapped
+#   executable before the repository target so a clean commit-pinned worktree
+#   can still preserve the real rollback artifact.
 # - Write a local, privacy-safe upgrade status snapshot so nodeboard, health
 #   checks, AI assistants, and operators can understand which upgrade stage is
 #   running or failed without scraping shell logs.
@@ -107,6 +110,8 @@
 #   owned by the existing node installation.
 #
 # Last Modified:
+# v1.19.0-node-deploy - Backs up the systemd-mapped executable even when a
+#                       clean runtime worktree has no local target binary.
 # v1.18.0-node-deploy - Added exact commit-pinned isolated source builds.
 # v1.17.0-node-deploy - Supports linked Git worktrees in the upgrade path.
 # v1.16.0-node-deploy - Pins the Rust compiler and atomically promotes builds
@@ -580,18 +585,30 @@ is_git_worktree() {
 backup_current_binary() {
     local backup_source binary main_pid running_executable stamp
     binary="${REPO_DIR}/target/release/aeronyx-server"
-    [ -f "${binary}" ] || return
+    backup_source=""
 
-    backup_source="${binary}"
-    if [ "${DRY_RUN}" -eq 0 ]; then
-        main_pid="$(systemctl show "${SERVICE_NAME}" --property=MainPID --value 2>/dev/null || true)"
-        if printf '%s' "${main_pid}" | grep -Eq '^[1-9][0-9]*$'; then
-            running_executable="/proc/${main_pid}/exe"
-            if [ -r "${running_executable}" ] && ! cmp -s "${running_executable}" "${binary}"; then
-                backup_source="${running_executable}"
+    # [RUNNING-BINARY-BACKUP 2026-07-31 by Codex] The rollback artifact must
+    # match the process serving traffic, not whichever binary happens to exist
+    # in the selected Git worktree. This also makes commit-pinned upgrades work
+    # from a clean worktree whose target directory has not been built yet.
+    main_pid="$(systemctl show "${SERVICE_NAME}" --property=MainPID --value 2>/dev/null || true)"
+    if printf '%s' "${main_pid}" | grep -Eq '^[1-9][0-9]*$'; then
+        running_executable="/proc/${main_pid}/exe"
+        if [ -r "${running_executable}" ]; then
+            backup_source="${running_executable}"
+            if [ ! -f "${binary}" ]; then
+                warn "Repository binary is absent; backing up the mapped running executable."
+            elif ! cmp -s "${running_executable}" "${binary}"; then
                 warn "On-disk binary differs from the running process; backing up the mapped executable."
             fi
         fi
+    fi
+    if [ -z "${backup_source}" ] && [ -f "${binary}" ]; then
+        backup_source="${binary}"
+    fi
+    if [ -z "${backup_source}" ]; then
+        ok "No existing release binary found; rollback backup skipped."
+        return 0
     fi
 
     stamp="$(date -u +%Y%m%d_%H%M%S)"

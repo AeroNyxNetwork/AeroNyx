@@ -749,6 +749,13 @@ sudo ./deploy/node/aeronyx-node.sh upgrade \
 maintenance modes. Those options describe worktree-based upgrades, while
 commit-pinned mode deliberately makes the runtime worktree irrelevant.
 
+The rollback backup is taken from the executable currently mapped by the
+configured systemd service whenever that process exists. This remains true
+when the selected repository is a clean worktree with no local
+`target/release/aeronyx-server` yet. If neither a running process nor an
+existing repository binary is present, the backup step is treated as a
+first-install no-op and the candidate build continues.
+
 Only one install or upgrade can run on the same node at a time. The script takes
 the shared node-local deployment lock before pulling, building, replacing the
 systemd unit, or restarting the service.
