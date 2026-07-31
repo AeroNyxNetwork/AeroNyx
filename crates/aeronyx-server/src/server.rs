@@ -288,6 +288,9 @@
 // 113. [TWO-HOP-PROBE-OUTCOME 2026-07-31 by Codex] Separates probe execution,
 //      mixed-version route acceptance, and terminal-signed delivery evidence
 //      so operator smoke success cannot overstate a failed or legacy-only path.
+// 114. [CLIENT-ONION-PARTIAL-SUCCESS 2026-07-31 by Codex] Separates verified
+//      terminal delivery from full replica completion so one successful blind
+//      route never triggers a privacy-widening legacy direct-relay fallback.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -771,6 +774,34 @@ struct TwoHopBlindRelayProbeOutcome {
     attempted: bool,
     route_accepted: bool,
     terminal_delivery_verified: bool,
+}
+
+/// Aggregate-only result of one authenticated App/client onion relay round.
+///
+/// [CLIENT-ONION-PARTIAL-SUCCESS 2026-07-31 by Codex] A valid terminal-signed
+/// receipt is a hard delivery boundary even when another independently chosen
+/// replica fails. The caller may retry replica durability later, but it must
+/// not expose the same envelope to the legacy direct peer relay after any
+/// terminal has already accepted the exact opaque payload.
+///
+/// Never add selected hops, route ids, message ids, sender/receiver keys,
+/// endpoints, payload commitments, ciphertext, or client metadata here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AuthenticatedChatOnionRelayOutcome {
+    attempted_paths: usize,
+    verified_receipts: usize,
+}
+
+impl AuthenticatedChatOnionRelayOutcome {
+    #[must_use]
+    fn delivered(self) -> bool {
+        self.verified_receipts > 0
+    }
+
+    #[must_use]
+    fn fully_replicated(self) -> bool {
+        self.attempted_paths > 0 && self.attempted_paths == self.verified_receipts
+    }
 }
 
 /// Public IP services should return one textual IP address and whitespace.
@@ -9151,12 +9182,13 @@ impl Server {
     }
 
     /// Attempts authenticated client traffic over receipt-capable two-hop
-    /// onion paths. `true` means every planned terminal replica returned a
-    /// fresh signature bound to the exact opaque terminal payload.
+    /// onion paths and returns aggregate delivery/replication evidence.
     ///
-    /// Mixed-version meshes return `false` before sending when fewer than two
-    /// distinct receipt-capable peers exist. The caller then uses the legacy
-    /// direct encrypted relay path, preserving availability during rollout.
+    /// At least one verified receipt proves terminal delivery and suppresses
+    /// legacy direct relay fallback. `fully_replicated()` additionally means
+    /// every attempted independent terminal replica returned a fresh signature
+    /// bound to the exact opaque payload. Mixed-version meshes return an empty
+    /// outcome before sending, preserving the legacy availability fallback.
     async fn relay_authenticated_chat_over_onion_paths(
         client: Option<&reqwest::Client>,
         relay: Option<&ChatRelayService>,
@@ -9164,10 +9196,10 @@ impl Server {
         identity: &IdentityKeyPair,
         self_node_id: &[u8; 32],
         envelope: &ChatEnvelope,
-    ) -> bool {
+    ) -> AuthenticatedChatOnionRelayOutcome {
         let now = unix_now_secs();
         let Some(client) = client else {
-            return false;
+            return AuthenticatedChatOnionRelayOutcome::default();
         };
         let terminal_candidates = peer_store
             .delivery_receipt_route_candidates_with_capability_excluding(
@@ -9177,7 +9209,7 @@ impl Server {
                 &[*self_node_id],
             );
         if terminal_candidates.is_empty() {
-            return false;
+            return AuthenticatedChatOnionRelayOutcome::default();
         }
 
         let mut attempted = 0usize;
@@ -9306,7 +9338,20 @@ impl Server {
         if let Some(relay) = relay {
             relay.record_peer_relay_outbound(now, attempted, accepted, last_failure_reason);
         }
-        attempted > 0 && attempted == accepted
+        let outcome = AuthenticatedChatOnionRelayOutcome {
+            attempted_paths: attempted,
+            verified_receipts: accepted,
+        };
+        if outcome.attempted_paths > 0 {
+            debug!(
+                attempted_paths = outcome.attempted_paths,
+                verified_receipts = outcome.verified_receipts,
+                delivered = outcome.delivered(),
+                fully_replicated = outcome.fully_replicated(),
+                "[CHAT_RELAY] Authenticated onion relay round complete"
+            );
+        }
+        outcome
     }
 
     async fn relay_chat_envelope_to_discovered_peers(
@@ -10662,8 +10707,8 @@ impl Server {
                         }
                     }
                     if all_failed {
-                        let onion_delivered = authenticated_client_origin
-                            && Self::relay_authenticated_chat_over_onion_paths(
+                        let onion_outcome = if authenticated_client_origin {
+                            Self::relay_authenticated_chat_over_onion_paths(
                                 chat_peer_client,
                                 Some(relay.as_ref()),
                                 peer_store,
@@ -10671,8 +10716,11 @@ impl Server {
                                 self_node_id,
                                 &envelope,
                             )
-                            .await;
-                        if !onion_delivered {
+                            .await
+                        } else {
+                            AuthenticatedChatOnionRelayOutcome::default()
+                        };
+                        if !onion_outcome.delivered() {
                             Self::relay_chat_envelope_to_discovered_peers(
                                 chat_peer_client,
                                 Some(relay.as_ref()),
@@ -10697,8 +10745,8 @@ impl Server {
                         );
                     }
                 } else {
-                    let onion_delivered = authenticated_client_origin
-                        && Self::relay_authenticated_chat_over_onion_paths(
+                    let onion_outcome = if authenticated_client_origin {
+                        Self::relay_authenticated_chat_over_onion_paths(
                             chat_peer_client,
                             Some(relay.as_ref()),
                             peer_store,
@@ -10706,8 +10754,11 @@ impl Server {
                             self_node_id,
                             &envelope,
                         )
-                        .await;
-                    if !onion_delivered {
+                        .await
+                    } else {
+                        AuthenticatedChatOnionRelayOutcome::default()
+                    };
+                    if !onion_outcome.delivered() {
                         Self::relay_chat_envelope_to_discovered_peers(
                             chat_peer_client,
                             Some(relay.as_ref()),
@@ -13107,6 +13158,28 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_chat_partial_replica_success_is_terminal_delivery() {
+        // [CLIENT-ONION-PARTIAL-SUCCESS 2026-07-31 by Codex] Once any
+        // independently selected terminal signs acceptance of the exact
+        // opaque payload, direct-relay fallback would only duplicate delivery
+        // and expose additional routing metadata. Replica completeness remains
+        // a separate durability signal.
+        let partial = super::AuthenticatedChatOnionRelayOutcome {
+            attempted_paths: 2,
+            verified_receipts: 1,
+        };
+        assert!(partial.delivered());
+        assert!(!partial.fully_replicated());
+
+        let failed = super::AuthenticatedChatOnionRelayOutcome {
+            attempted_paths: 2,
+            verified_receipts: 0,
+        };
+        assert!(!failed.delivered());
+        assert!(!failed.fully_replicated());
+    }
+
+    #[test]
     fn memchain_startup_integrity_accepts_valid_sighted_and_blind_records() {
         let sighted = MemoryRecord::new(
             [0x11; 32],
@@ -13480,7 +13553,7 @@ mod tests {
         store.record_delivery_receipt_capability(&middle_node_id, now);
         store.record_delivery_receipt_capability(&terminal_node_id, now);
 
-        let delivered = Server::relay_authenticated_chat_over_onion_paths(
+        let outcome = Server::relay_authenticated_chat_over_onion_paths(
             Some(&reqwest::Client::new()),
             None,
             &store,
@@ -13491,7 +13564,10 @@ mod tests {
         .await;
         relay_server.abort();
 
-        assert!(delivered);
+        assert!(outcome.delivered());
+        assert!(outcome.fully_replicated());
+        assert_eq!(outcome.attempted_paths, 1);
+        assert_eq!(outcome.verified_receipts, 1);
         let quality = store.status(unix_now_secs()).blind_relay_quality;
         assert!(quality.real_relay_ready);
         assert_eq!(quality.verified_client_onion_deliveries, 1);
@@ -13553,7 +13629,7 @@ mod tests {
             store.record_delivery_receipt_capability(&node_id, now);
         }
 
-        let delivered = Server::relay_authenticated_chat_over_onion_paths(
+        let outcome = Server::relay_authenticated_chat_over_onion_paths(
             Some(&reqwest::Client::new()),
             None,
             &store,
@@ -13563,7 +13639,8 @@ mod tests {
         )
         .await;
 
-        assert!(!delivered);
+        assert!(!outcome.delivered());
+        assert!(!outcome.fully_replicated());
         assert_eq!(
             store
                 .status(unix_now_secs())
