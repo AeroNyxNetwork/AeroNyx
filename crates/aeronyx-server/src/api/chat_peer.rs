@@ -19,6 +19,9 @@
 //!   offline or all local routes are stale
 //! - Returns a terminal-signed receipt bound to the exact opaque payload after
 //!   successful onion terminal store-and-forward; middle hops only propagate it
+//! - [MULTIHOP-RECEIPT-VALIDATION 2026-08-01 by Codex] Validates terminal ACKs
+//!   against the immediate next hop while allowing a forwarded ACK to carry a
+//!   valid downstream terminal receipt through three-hop and longer paths
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -108,9 +111,13 @@
 //!   bucket while returning HTTP 503 to the previous hop.
 //! - Delivery receipts authenticate terminal acceptance only. They must not add
 //!   sender, receiver, endpoint, online-state, mailbox-state, or payload-size
-//!   fields, and intermediates must reject invalid signatures before forwarding.
+//!   fields. Intermediates verify route, freshness, and signature, but only the
+//!   source knows the complete route and final payload commitment and can
+//!   therefore enforce the final terminal/payload binding.
 //!
 //! ## Last Modified
+//! v0.28.0-MultihopReceiptValidation - Keep direct-terminal signer checks while
+//! accepting valid downstream terminal receipts propagated through longer paths
 //! v0.27.0-PeerEndpointPolicy - Enforce canonical public-IP-only next-hop URLs
 //! v0.26.0-SignedDeliveryReceipt - Sign exact terminal payload acceptance and propagate verified receipts
 //! v0.25.0-DurableQueueCapacity - Classify global pending-store quota exhaustion
@@ -1617,6 +1624,58 @@ fn duplicate_blind_relay_response(
     }
 }
 
+/// Validates the portion of a downstream delivery receipt visible at this hop.
+///
+/// [MULTIHOP-RECEIPT-VALIDATION 2026-08-01 by Codex] A direct terminal ACK must
+/// be signed by `immediate_next_hop`. A forwarded ACK may carry a receipt from a
+/// deeper terminal, so requiring that terminal to equal the immediate next hop
+/// incorrectly rejects every path longer than two relay nodes. This hop still
+/// verifies the route id, freshness, disposition, and Ed25519 signature. The
+/// source must additionally call `verify_expected` with the final payload
+/// commitment and terminal selected when it built the onion path.
+fn validate_downstream_delivery_receipt(
+    ack: &PeerBlindRelayResponse,
+    route_id: &[u8; 16],
+    immediate_next_hop: &[u8; 32],
+    observed_at: u64,
+) -> Result<(), &'static str> {
+    if ack.terminal && ack.forwarded {
+        return Err("invalid_ack_shape");
+    }
+
+    let Some(receipt) = ack.delivery_receipt.as_ref() else {
+        // Legacy peers may omit receipts. Keep wire compatibility; callers
+        // separately expose that this is not verified client-delivery evidence.
+        return Ok(());
+    };
+
+    if !ack.terminal && !ack.forwarded {
+        return Err("receipt_without_delivery");
+    }
+    if &receipt.route_id != route_id {
+        return Err("receipt_route_mismatch");
+    }
+    if receipt.delivered_at
+        > observed_at.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
+    {
+        return Err("receipt_timestamp_in_future");
+    }
+    if observed_at.saturating_sub(receipt.delivered_at)
+        > BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
+    {
+        return Err("receipt_timestamp_expired");
+    }
+    receipt
+        .verify_signature()
+        .map_err(|_| "receipt_signature_invalid")?;
+
+    if ack.terminal && &receipt.terminal_node_id != immediate_next_hop {
+        return Err("terminal_receipt_signer_mismatch");
+    }
+
+    Ok(())
+}
+
 async fn forward_blind_relay_with_retry(
     state: &ChatPeerState,
     url: &str,
@@ -1634,31 +1693,26 @@ async fn forward_blind_relay_with_retry(
                 .await
                 {
                     Ok(ack) if ack.accepted => {
-                        if let Some(receipt) = ack.delivery_receipt.as_ref() {
-                            if receipt.route_id != request.envelope.route_id
-                                || receipt.terminal_node_id != next_hop
-                                || receipt.delivered_at
-                                    > now.saturating_add(
-                                        BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS,
-                                    )
-                                || now.saturating_sub(receipt.delivered_at)
-                                    > BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
-                                || receipt.verify_signature().is_err()
-                            {
-                                debug!(
-                                    attempt,
-                                    "[BLIND_RELAY] Next-hop delivery receipt verification failed"
-                                );
-                                state.peer_store.record_route_forward_failure(
-                                    &next_hop,
-                                    now,
-                                    "delivery_receipt_invalid",
-                                );
-                                state
-                                    .peer_store
-                                    .record_blind_relay_rejected(now, "delivery_receipt_invalid");
-                                return Err(BlindRelayError::ForwardFailed);
-                            }
+                        if let Err(reason) = validate_downstream_delivery_receipt(
+                            &ack,
+                            &request.envelope.route_id,
+                            &next_hop,
+                            now,
+                        ) {
+                            debug!(
+                                attempt,
+                                reason,
+                                "[BLIND_RELAY] Next-hop delivery receipt verification failed"
+                            );
+                            state.peer_store.record_route_forward_failure(
+                                &next_hop,
+                                now,
+                                "delivery_receipt_invalid",
+                            );
+                            state
+                                .peer_store
+                                .record_blind_relay_rejected(now, "delivery_receipt_invalid");
+                            return Err(BlindRelayError::ForwardFailed);
                         }
                         if attempt > 1 {
                             state
@@ -1958,6 +2012,104 @@ mod tests {
         };
         envelope.signature = kp.sign(&envelope.sign_data());
         envelope
+    }
+
+    #[test]
+    fn three_hop_forwarded_ack_accepts_downstream_terminal_receipt() {
+        let now = 1_800_000_100;
+        let route_id = [0xa1; 16];
+        let immediate_middle = IdentityKeyPair::generate();
+        let downstream_terminal = IdentityKeyPair::generate();
+        assert_ne!(
+            immediate_middle.public_key_bytes(),
+            downstream_terminal.public_key_bytes()
+        );
+
+        let ack = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: false,
+            forwarded: true,
+            ttl_remaining: 1,
+            reason: Some("onion_forwarded".to_string()),
+            delivery_receipt: Some(BlindRelayDeliveryReceipt::accepted(
+                route_id,
+                [0xb2; 32],
+                now,
+                &downstream_terminal,
+            )),
+        };
+
+        validate_downstream_delivery_receipt(
+            &ack,
+            &route_id,
+            &immediate_middle.public_key_bytes(),
+            now,
+        )
+        .expect("an intermediate ACK may propagate a deeper terminal receipt");
+    }
+
+    #[test]
+    fn direct_terminal_ack_requires_immediate_next_hop_receipt_signer() {
+        let now = 1_800_000_100;
+        let route_id = [0xc3; 16];
+        let immediate_terminal = IdentityKeyPair::generate();
+        let wrong_terminal = IdentityKeyPair::generate();
+        let ack = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 1,
+            reason: Some("onion_terminal_delivered".to_string()),
+            delivery_receipt: Some(BlindRelayDeliveryReceipt::accepted(
+                route_id,
+                [0xd4; 32],
+                now,
+                &wrong_terminal,
+            )),
+        };
+
+        assert_eq!(
+            validate_downstream_delivery_receipt(
+                &ack,
+                &route_id,
+                &immediate_terminal.public_key_bytes(),
+                now,
+            ),
+            Err("terminal_receipt_signer_mismatch")
+        );
+    }
+
+    #[test]
+    fn forwarded_ack_rejects_tampered_downstream_receipt() {
+        let now = 1_800_000_100;
+        let route_id = [0xe5; 16];
+        let immediate_middle = IdentityKeyPair::generate();
+        let downstream_terminal = IdentityKeyPair::generate();
+        let mut receipt = BlindRelayDeliveryReceipt::accepted(
+            route_id,
+            [0xf6; 32],
+            now,
+            &downstream_terminal,
+        );
+        receipt.payload_commitment[0] ^= 0xff;
+        let ack = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: false,
+            forwarded: true,
+            ttl_remaining: 1,
+            reason: Some("onion_forwarded".to_string()),
+            delivery_receipt: Some(receipt),
+        };
+
+        assert_eq!(
+            validate_downstream_delivery_receipt(
+                &ack,
+                &route_id,
+                &immediate_middle.public_key_bytes(),
+                now,
+            ),
+            Err("receipt_signature_invalid")
+        );
     }
 
     fn test_chat_config(path: String) -> ChatRelayConfig {
