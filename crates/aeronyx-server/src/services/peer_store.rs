@@ -89,6 +89,9 @@
 //! - Bounded two-hop path proof history records recent entry -> middle ->
 //!   terminal proof outcomes for nodeboard/public status without exposing node
 //!   IDs, route IDs, endpoints, payloads, or social graph metadata
+//! - [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] Keeps an independent
+//!   bounded entry -> middle -> middle -> terminal runtime proof history so a
+//!   three-hop failure cannot overwrite mature two-hop readiness
 //! - Blind relay readiness reason gives operators a stable privacy-safe bucket
 //!   for why the relay path is ready, probe-only, degraded, protected, or idle
 //! - Blind relay timestamp freshness counters show stale/future route-frame
@@ -166,6 +169,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.69.0-ThreeHopRuntimeProof - Added independent privacy-safe three-hop
+//! message-delivery proof history while preserving the existing two-hop wire contract
 //! v0.68.0-TwoHopProbeOutcome - Prevented legacy control ACKs from being
 //! classified as terminal message-delivery evidence
 //! v0.67.0-DiscoveryIdentityAmbiguity - Added a complete, lightweight
@@ -434,7 +439,7 @@ pub struct PeerStoreTwoHopPathProofEvent {
 /// proving entry -> middle -> terminal reachability while preserving the
 /// blind-node invariant. A separately signed, freshness-bounded subset may be
 /// restored after a warm restart; stale history is discarded.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStoreTwoHopPathProofHistory {
     /// Unix timestamp when this summary was generated.
     pub generated_at: u64,
@@ -1361,6 +1366,14 @@ pub struct PeerStoreStatus {
     /// This lets dashboards show repeated protocol evidence instead of a
     /// single ready bit, while preserving the blind relay privacy boundary.
     pub two_hop_path_proof_history: PeerStoreTwoHopPathProofHistory,
+    /// Bounded privacy-safe runtime proof history for recent three-hop checks.
+    ///
+    /// [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] This intentionally stays
+    /// separate from two-hop readiness. It is rebuilt by low-frequency live
+    /// probes after restart and must not be presented as durable consensus,
+    /// App traffic, or a disclosed route.
+    #[serde(default)]
+    pub three_hop_path_proof_history: PeerStoreTwoHopPathProofHistory,
     /// Configured maximum peer count.
     pub max_peers: Option<usize>,
     /// Recent privacy-safe discovery control-plane audit events.
@@ -2281,6 +2294,7 @@ pub struct PeerStore {
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
     peer_events: RwLock<VecDeque<PeerStorePeerEvent>>,
     two_hop_path_proof_events: RwLock<VecDeque<PeerStoreTwoHopPathProofEvent>>,
+    three_hop_path_proof_events: RwLock<VecDeque<PeerStoreTwoHopPathProofEvent>>,
     bootstrap_status: RwLock<PeerStoreBootstrapStatus>,
     client_delivery_cache_dirty: AtomicBool,
     client_delivery_cache_notify: Notify,
@@ -2302,6 +2316,9 @@ impl PeerStore {
             audit_events: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_EVENTS)),
             peer_events: RwLock::new(VecDeque::with_capacity(MAX_PEER_EVENTS)),
             two_hop_path_proof_events: RwLock::new(VecDeque::with_capacity(
+                MAX_TWO_HOP_PATH_PROOF_EVENTS,
+            )),
+            three_hop_path_proof_events: RwLock::new(VecDeque::with_capacity(
                 MAX_TWO_HOP_PATH_PROOF_EVENTS,
             )),
             bootstrap_status: RwLock::new(PeerStoreBootstrapStatus::default()),
@@ -3687,7 +3704,7 @@ impl PeerStore {
                 Self::two_hop_ttl_shape(entry_ttl, onward_ttl),
             ),
         );
-        self.record_two_hop_path_proof_event(
+        self.record_path_proof_event(
             now,
             accepted,
             reason,
@@ -3695,6 +3712,52 @@ impl PeerStore {
             terminal_candidate_count,
             entry_ttl,
             onward_ttl,
+            2,
+            "entry_middle_terminal",
+        );
+    }
+
+    /// Records an entry -> middle -> middle -> terminal runtime proof.
+    ///
+    /// [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] Three-hop evidence is
+    /// isolated from the established two-hop counters and signed recovery
+    /// contract. The bounded history is runtime-only for this milestone and is
+    /// repopulated by the low-frequency probe after restart. Inputs are coarse
+    /// counts and stable reason buckets only; never pass route members, node
+    /// ids, endpoints, route ids, ciphertext, receivers, or client metadata.
+    pub fn record_blind_relay_three_hop_probe_result_with_context(
+        &self,
+        now: u64,
+        accepted: bool,
+        reason: impl AsRef<str>,
+        middle_candidate_count: usize,
+        terminal_candidate_count: usize,
+        entry_ttl: u8,
+        onward_ttl: u8,
+    ) {
+        let reason = reason.as_ref();
+        self.record_audit_event(
+            now,
+            "blind_relay_three_hop_probe",
+            if accepted { "accepted" } else { "rejected" },
+            format!(
+                "reason_bucket={}; middle_candidates={}; terminal_candidates={}; ttl_shape={}",
+                Self::two_hop_path_proof_reason_bucket(reason),
+                Self::two_hop_candidate_count_bucket(middle_candidate_count),
+                Self::two_hop_candidate_count_bucket(terminal_candidate_count),
+                Self::two_hop_ttl_shape(entry_ttl, onward_ttl),
+            ),
+        );
+        self.record_path_proof_event(
+            now,
+            accepted,
+            reason,
+            middle_candidate_count,
+            terminal_candidate_count,
+            entry_ttl,
+            onward_ttl,
+            3,
+            "entry_middle_middle_terminal",
         );
     }
 
@@ -4053,7 +4116,7 @@ impl PeerStore {
         });
     }
 
-    fn record_two_hop_path_proof_event(
+    fn record_path_proof_event(
         &self,
         now: u64,
         accepted: bool,
@@ -4062,8 +4125,15 @@ impl PeerStore {
         terminal_candidate_count: usize,
         entry_ttl: u8,
         onward_ttl: u8,
+        hop_count: u8,
+        path_shape: &'static str,
     ) {
-        let mut events = self.two_hop_path_proof_events.write();
+        let target = if hop_count == 3 {
+            &self.three_hop_path_proof_events
+        } else {
+            &self.two_hop_path_proof_events
+        };
+        let mut events = target.write();
         if events.len() >= MAX_TWO_HOP_PATH_PROOF_EVENTS {
             events.pop_front();
         }
@@ -4071,10 +4141,10 @@ impl PeerStore {
             at: now,
             outcome: if accepted { "accepted" } else { "rejected" }.to_string(),
             reason_bucket: Self::two_hop_path_proof_reason_bucket(reason),
-            evidence_mode: Self::two_hop_path_proof_evidence_mode(reason).to_string(),
+            evidence_mode: Self::path_proof_evidence_mode(reason, hop_count).to_string(),
             proof_scope: Self::two_hop_path_proof_scope(reason).to_string(),
-            path_shape: "entry_middle_terminal".to_string(),
-            hop_count: 2,
+            path_shape: path_shape.to_string(),
+            hop_count,
             path_policy: TWO_HOP_PATH_POLICY_NETWORK_DIVERSE.to_string(),
             middle_candidate_bucket: Self::two_hop_candidate_count_bucket(middle_candidate_count)
                 .to_string(),
@@ -4086,10 +4156,11 @@ impl PeerStore {
         });
     }
 
-    fn two_hop_path_proof_evidence_mode(reason: &str) -> &'static str {
+    fn path_proof_evidence_mode(reason: &str, hop_count: u8) -> &'static str {
         let bucket = Self::two_hop_path_proof_reason_bucket(reason);
         match bucket.as_str() {
             "onion_terminal_delivered" => "synthetic_onion_message_delivery_probe",
+            _ if hop_count == 3 => "synthetic_three_hop_control_probe",
             _ => "synthetic_two_hop_control_probe",
         }
     }
@@ -4130,6 +4201,7 @@ impl PeerStore {
             "legacy_control_forwarded" => "legacy_control_forwarded".to_string(),
             "onion_ack_rejected" => "onion_ack_rejected".to_string(),
             "onion_ack_decode" => "onion_ack_decode".to_string(),
+            "onion_receipt_unverified" => "onion_receipt_unverified".to_string(),
             "onion_kem_unavailable" => "onion_kem_unavailable".to_string(),
             "ack_rejected" => "ack_rejected".to_string(),
             "ack_decode" => "ack_decode".to_string(),
@@ -4146,6 +4218,9 @@ impl PeerStore {
             value if value.starts_with("two_hop_blind_relay_probe_request_") => {
                 "request_error".to_string()
             }
+            value if value.starts_with("three_hop_onion_delivery_probe_") => {
+                "onion_request_error".to_string()
+            }
             _ => "unknown".to_string(),
         }
     }
@@ -4157,6 +4232,29 @@ impl PeerStore {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        Self::path_proof_history(events, now, "two-hop")
+    }
+
+    fn three_hop_path_proof_history(&self, now: u64) -> PeerStoreTwoHopPathProofHistory {
+        let events = self
+            .three_hop_path_proof_events
+            .read()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        Self::path_proof_history(events, now, "three-hop")
+    }
+
+    /// Builds one privacy-safe summary for an isolated relay-hop history.
+    ///
+    /// [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] The summary algorithm is
+    /// shared so freshness, stability, failure streaks, and privacy bucketing
+    /// cannot drift between two-hop and three-hop runtime evidence.
+    fn path_proof_history(
+        events: Vec<PeerStoreTwoHopPathProofEvent>,
+        now: u64,
+        hop_label: &'static str,
+    ) -> PeerStoreTwoHopPathProofHistory {
         let attempted = events.len() as u64;
         let succeeded = events
             .iter()
@@ -4329,31 +4427,37 @@ impl PeerStore {
             (
                 "forming",
                 false,
-                "wait for the first synthetic two-hop path proof",
+                format!("wait for the first synthetic {hop_label} path proof"),
             )
         } else if recent_success_ready {
             (
                 "ready",
                 true,
-                "continue monitoring repeated two-hop path proof freshness",
+                format!("continue monitoring repeated {hop_label} path proof freshness"),
             )
         } else if failure_streak_active {
             (
                 "attention",
                 false,
-                "inspect recent routeability, middle-hop endpoint, and terminal-hop proof buckets",
+                format!(
+                    "inspect recent routeability, middle-hop endpoint, and terminal-hop {hop_label} proof buckets"
+                ),
             )
         } else if succeeded > 0 {
             (
                 "stale",
                 false,
-                "wait for a fresh two-hop path proof or verify peer routeability gossip",
+                format!(
+                    "wait for a fresh {hop_label} path proof or verify peer routeability gossip"
+                ),
             )
         } else {
             (
                 "idle",
                 false,
-                "wait for route candidates before advertising two-hop path proof readiness",
+                format!(
+                    "wait for route candidates before advertising {hop_label} path proof readiness"
+                ),
             )
         };
         let freshness_bucket = if attempted == 0 {
@@ -4421,10 +4525,12 @@ impl PeerStore {
                     }
                 })
                 .unwrap_or_else(|| "none".to_string()),
-            next_action: next_action.to_string(),
+            next_action,
             events,
             privacy_invariant: "blind_nodes_route_only_opaque_ciphertext".to_string(),
-            privacy_boundary: "bounded synthetic two-hop proof history only; no node IDs, endpoints, route IDs, encrypted payloads, receiver identities, client IPs, DNS contents, domains, URLs, Memory Chain plaintext, voucher secrets, wallet-level traffic, or social graph edges".to_string(),
+            privacy_boundary: format!(
+                "bounded synthetic {hop_label} proof history only; no node IDs, endpoints, route IDs, encrypted payloads, receiver identities, client IPs, DNS contents, domains, URLs, Memory Chain plaintext, voucher secrets, wallet-level traffic, or social graph edges"
+            ),
         }
     }
 
@@ -6027,6 +6133,7 @@ impl PeerStore {
         let snapshot = self.snapshot(now);
         let bootstrap = self.bootstrap_status.read().clone();
         let two_hop_path_proof_history = self.two_hop_path_proof_history(now);
+        let three_hop_path_proof_history = self.three_hop_path_proof_history(now);
         let runtime = self.counters.snapshot();
         let delivery_receipt_capable_peers = self
             .delivery_receipt_capability
@@ -6062,6 +6169,7 @@ impl PeerStore {
             runtime,
             blind_relay_quality,
             two_hop_path_proof_history,
+            three_hop_path_proof_history,
             max_peers: self.max_peers(),
             recent_audit_events: self.recent_audit_events(),
             recent_peer_events: self.recent_peer_events(),
@@ -11034,6 +11142,52 @@ mod tests {
         assert_eq!(
             status.stability.restart_recovery_sources,
             vec!["peer_cache".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_three_hop_runtime_proof_isolated_from_two_hop_readiness() {
+        let store = PeerStore::new();
+        let now = 1_800_300_000;
+        store.record_blind_relay_two_hop_probe_result_with_context(
+            now,
+            true,
+            "onion_terminal_delivered",
+            3,
+            2,
+            2,
+            1,
+        );
+        store.record_blind_relay_three_hop_probe_result_with_context(
+            now + 1,
+            false,
+            "onion_receipt_unverified",
+            3,
+            1,
+            3,
+            2,
+        );
+
+        let status = store.status(now + 1);
+        assert_eq!(status.two_hop_path_proof_history.attempted, 1);
+        assert_eq!(status.two_hop_path_proof_history.succeeded, 1);
+        assert!(status.two_hop_path_proof_history.proof_ready);
+        assert_eq!(status.three_hop_path_proof_history.attempted, 1);
+        assert_eq!(status.three_hop_path_proof_history.failed, 1);
+        assert!(!status.three_hop_path_proof_history.proof_ready);
+        assert_eq!(
+            status
+                .three_hop_path_proof_history
+                .latest_reason_bucket
+                .as_deref(),
+            Some("onion_receipt_unverified")
+        );
+        assert_eq!(
+            status
+                .three_hop_path_proof_history
+                .path_shape_counts
+                .get("entry_middle_middle_terminal"),
+            Some(&1)
         );
     }
 }

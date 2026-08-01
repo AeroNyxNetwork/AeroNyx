@@ -29,6 +29,8 @@
 //! - [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] Keeps permissionless
 //!   gossip admission usable after an unrelated panic while the process-local
 //!   rate-limit lock is held.
+//! - [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] Publishes independent,
+//!   aggregate-only three-hop runtime proof maturity without selected routes.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -72,6 +74,8 @@
 //!   discovery outage.
 //!
 //! ## Last Modified
+//! v0.35.0-ThreeHopRuntimeProof - Added compact independent three-hop onion
+//! message-delivery proof status to the public discovery summary.
 //! v0.34.0-OnionCandidateSignedProof - Preserve the verified signed descriptor
 //! in each public onion candidate and publish the client verification contract.
 //! v0.33.0-DiscoveryRateLimitRecovery - Prevent one panic from permanently
@@ -521,6 +525,8 @@ pub struct DiscoverySummaryResponse {
     blind_relay_runtime: serde_json::Value,
     /// Bounded two-hop path proof aggregate without route reconstruction data.
     two_hop_path_proof: serde_json::Value,
+    /// Bounded runtime-only three-hop proof aggregate without route data.
+    three_hop_path_proof: serde_json::Value,
     /// Aggregate permissionless relay-pool admission gate without route data.
     onion_relay_admission: serde_json::Value,
     /// Actionable next step for operators and AI runbooks.
@@ -1334,6 +1340,7 @@ pub fn discovery_summary_response(
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
     let two_hop_history = &status.two_hop_path_proof_history;
+    let three_hop_history = &status.three_hop_path_proof_history;
     let proof_restart_continuity = two_hop_proof_restart_continuity(status);
     let two_hop_restart_survivable_ready = two_hop_history.recent_message_delivery_ready
         && peer_quorum.quorum_ready
@@ -1622,6 +1629,26 @@ pub fn discovery_summary_response(
         }),
         blind_relay_runtime,
         two_hop_path_proof: serde_json::Value::Object(two_hop_path_proof),
+        three_hop_path_proof: serde_json::json!({
+            "status": &three_hop_history.status,
+            "freshness_bucket": &three_hop_history.freshness_bucket,
+            "proof_ready": three_hop_history.proof_ready,
+            "recent_success_ready": three_hop_history.recent_success_ready,
+            "message_delivery_ready": three_hop_history.message_delivery_ready,
+            "recent_message_delivery_ready": three_hop_history.recent_message_delivery_ready,
+            "attempted": three_hop_history.attempted,
+            "succeeded": three_hop_history.succeeded,
+            "failed": three_hop_history.failed,
+            "success_percent": three_hop_history.success_percent,
+            "latest_age_bucket": &three_hop_history.latest_age_bucket,
+            "latest_reason_bucket": &three_hop_history.latest_reason_bucket,
+            "latest_message_delivery_age_seconds": three_hop_history.latest_message_delivery_age_seconds,
+            "path_shape_counts": &three_hop_history.path_shape_counts,
+            "ttl_shape_counts": &three_hop_history.ttl_shape_counts,
+            "proof_scope": &three_hop_history.proof_scope,
+            "persistence": "runtime_reprobe_after_restart",
+            "privacy_boundary": &three_hop_history.privacy_boundary,
+        }),
         onion_relay_admission,
         next_action,
         privacy_invariant: "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
@@ -3158,6 +3185,15 @@ mod tests {
             2,
             1,
         );
+        store.record_blind_relay_three_hop_probe_result_with_context(
+            now,
+            true,
+            "onion_terminal_delivered",
+            3,
+            2,
+            3,
+            2,
+        );
         let app = build_discovery_router_with_local_status(
             store,
             DiscoveryApiPolicy::default(),
@@ -3245,6 +3281,28 @@ mod tests {
             Some("synthetic_onion_message_delivery_probe")
         );
         assert_eq!(parsed["two_hop_path_proof"]["succeeded"].as_u64(), Some(1));
+        assert_eq!(
+            parsed["three_hop_path_proof"]["proof_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["three_hop_path_proof"]["message_delivery_ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["three_hop_path_proof"]["succeeded"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["three_hop_path_proof"]["path_shape_counts"]
+                ["entry_middle_middle_terminal"]
+                .as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parsed["three_hop_path_proof"]["persistence"].as_str(),
+            Some("runtime_reprobe_after_restart")
+        );
         assert_eq!(
             parsed["two_hop_path_proof"]["message_delivery_successes"].as_u64(),
             Some(1)

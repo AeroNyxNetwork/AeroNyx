@@ -291,6 +291,10 @@
 // 114. [CLIENT-ONION-PARTIAL-SUCCESS 2026-07-31 by Codex] Separates verified
 //      terminal delivery from full replica completion so one successful blind
 //      route never triggers a privacy-widening legacy direct-relay fallback.
+// 115. [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] Runs a bounded, fully
+//      onion-wrapped entry -> middle -> middle -> terminal delivery probe only
+//      after two-hop receipt verification, keeping route members and payloads
+//      out of status while exposing independent three-hop runtime evidence.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -407,6 +411,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.60-ThreeHopRuntimeProof - Added bounded live three-hop onion delivery
+//     verification with terminal-signed receipts and isolated proof history.
 //   v2.8.59-FollowerEffectiveReadiness - Added fail-closed composite follower
 //     readiness to local status and signed heartbeat telemetry.
 //   v2.8.58-FollowerCertificateRetry - Replaced the follower round tuple with a
@@ -737,6 +743,7 @@ const DATA_PLANE_RECV_FAILURE_LIMIT: u32 = 8;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PROBE_REQUEST_LIMIT: usize = 8;
+const THREE_HOP_PROBE_REQUEST_LIMIT: usize = 4;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
 /// Manual mirror-carrier verification is local-only but remains low frequency.
@@ -7630,6 +7637,7 @@ impl Server {
             let mut run_immediately = true;
             let mut last_blind_relay_probe_at = 0u64;
             let mut last_two_hop_blind_relay_probe_at = 0u64;
+            let mut last_three_hop_blind_relay_probe_at = 0u64;
             loop {
                 if run_immediately {
                     run_immediately = false;
@@ -7951,6 +7959,29 @@ impl Server {
                         .await;
                         if outcome.attempted {
                             last_two_hop_blind_relay_probe_at = probe_now;
+                        }
+
+                        // [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex]
+                        // Three-hop traffic is attempted only after this same
+                        // round has cryptographically verified a two-hop
+                        // terminal receipt. This bounds cold-start fan-out and
+                        // avoids using an unhealthy mesh as a deeper probe.
+                        let three_hop_cooldown_secs = probe_cooldown_secs.saturating_mul(2);
+                        let three_hop_probe_due = last_three_hop_blind_relay_probe_at == 0
+                            || probe_now.saturating_sub(last_three_hop_blind_relay_probe_at)
+                                >= three_hop_cooldown_secs;
+                        if outcome.terminal_delivery_verified && three_hop_probe_due {
+                            let three_hop_outcome = Self::probe_three_hop_blind_relay_path(
+                                gossip_http_client.as_ref(),
+                                &peer_store,
+                                &identity,
+                                &self_node_id,
+                                probe_now,
+                            )
+                            .await;
+                            if three_hop_outcome.attempted {
+                                last_three_hop_blind_relay_probe_at = probe_now;
+                            }
                         }
                     } else {
                         trace!(
@@ -8903,6 +8934,318 @@ impl Server {
         }
     }
 
+    /// Proves entry -> middle -> middle -> terminal delivery with one opaque
+    /// synthetic ChatEnvelope and a terminal-signed receipt.
+    ///
+    /// [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] Candidate identities and
+    /// endpoints stay process-local. Public status receives only bounded
+    /// success/failure buckets through `PeerStore`; this function never logs or
+    /// persists the selected path, route id, receiver, commitment, or payload.
+    async fn probe_three_hop_blind_relay_path(
+        client: &reqwest::Client,
+        peer_store: &PeerStore,
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        now: u64,
+    ) -> TwoHopBlindRelayProbeOutcome {
+        let mut first_middle_candidates = peer_store
+            .route_probe_candidates_with_capability_excluding(
+                NodeCapability::OnionMiddle,
+                now,
+                ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
+                &[*self_node_id],
+            );
+        Self::prioritize_probe_candidates(peer_store, now, &mut first_middle_candidates);
+        if first_middle_candidates.is_empty() {
+            return TwoHopBlindRelayProbeOutcome::default();
+        }
+
+        let first_middle_candidate_count = first_middle_candidates.len();
+        let mut attempted = false;
+        let mut network_diversity_blocked = false;
+        let mut request_count = 0usize;
+
+        'first_middle_search: for first_middle in first_middle_candidates {
+            let first_middle_node_id = first_middle.node_id();
+            let mut second_middle_candidates = peer_store
+                .route_probe_candidates_with_capability_excluding(
+                    NodeCapability::OnionMiddle,
+                    now,
+                    ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
+                    &[*self_node_id, first_middle_node_id],
+                );
+            Self::prioritize_probe_candidates(peer_store, now, &mut second_middle_candidates);
+            let second_before_diversity = second_middle_candidates.len();
+            second_middle_candidates.retain(|second_middle| {
+                PeerStore::route_endpoints_are_network_diverse(&first_middle, second_middle)
+            });
+            network_diversity_blocked |=
+                second_before_diversity > 0 && second_middle_candidates.is_empty();
+
+            for second_middle in second_middle_candidates {
+                let second_middle_node_id = second_middle.node_id();
+                let mut terminal_candidates = peer_store
+                    .route_probe_candidates_with_capability_excluding(
+                        NodeCapability::ChatRelay,
+                        now,
+                        ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
+                        &[
+                            *self_node_id,
+                            first_middle_node_id,
+                            second_middle_node_id,
+                        ],
+                    );
+                Self::prioritize_probe_candidates(peer_store, now, &mut terminal_candidates);
+                let terminal_before_diversity = terminal_candidates.len();
+                terminal_candidates.retain(|terminal| {
+                    PeerStore::route_endpoints_are_network_diverse(&first_middle, terminal)
+                        && PeerStore::route_endpoints_are_network_diverse(
+                            &second_middle,
+                            terminal,
+                        )
+                });
+                network_diversity_blocked |=
+                    terminal_before_diversity > 0 && terminal_candidates.is_empty();
+                if terminal_candidates.is_empty() {
+                    continue;
+                }
+
+                let effective_middle_candidate_count = first_middle_candidate_count
+                    .min(second_before_diversity.max(1));
+                let terminal_candidate_count = terminal_candidates.len();
+                let Some(endpoint) = first_middle.descriptor.public_endpoint.as_deref() else {
+                    attempted = true;
+                    peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                        now,
+                        false,
+                        "middle_missing_endpoint",
+                        effective_middle_candidate_count,
+                        terminal_candidate_count,
+                        3,
+                        2,
+                    );
+                    peer_store.record_route_forward_failure(
+                        &first_middle_node_id,
+                        now,
+                        "missing_endpoint",
+                    );
+                    continue;
+                };
+                let Some(url) = Self::blind_relay_probe_url(endpoint) else {
+                    attempted = true;
+                    peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                        now,
+                        false,
+                        "middle_invalid_endpoint",
+                        effective_middle_candidate_count,
+                        terminal_candidate_count,
+                        3,
+                        2,
+                    );
+                    peer_store.record_route_forward_failure(
+                        &first_middle_node_id,
+                        now,
+                        "invalid_endpoint",
+                    );
+                    continue;
+                };
+
+                for terminal in terminal_candidates {
+                    if request_count >= THREE_HOP_PROBE_REQUEST_LIMIT {
+                        break 'first_middle_search;
+                    }
+                    attempted = true;
+                    let terminal_node_id = terminal.node_id();
+                    let Some((request, payload_commitment)) =
+                        Self::build_three_hop_onion_delivery_probe_request(
+                            identity,
+                            self_node_id,
+                            &first_middle,
+                            &second_middle,
+                            &terminal,
+                            now,
+                        )
+                    else {
+                        peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                            now,
+                            false,
+                            "onion_kem_unavailable",
+                            effective_middle_candidate_count,
+                            terminal_candidate_count,
+                            3,
+                            2,
+                        );
+                        continue;
+                    };
+                    request_count = request_count.saturating_add(1);
+
+                    match client.post(&url).json(&request).send().await {
+                        Ok(response) if response.status().is_success() => {
+                            match decode_bounded_json_response::<PeerBlindRelayResponse>(
+                                response,
+                                PEER_ACK_RESPONSE_MAX_BYTES,
+                            )
+                            .await
+                            {
+                                Ok(ack)
+                                    if ack.accepted
+                                        && ack.forwarded
+                                        && Self::verified_delivery_receipt(
+                                            ack.delivery_receipt.as_ref(),
+                                            &request.envelope.route_id,
+                                            &payload_commitment,
+                                            &terminal_node_id,
+                                            now,
+                                        ) =>
+                                {
+                                    for node_id in [
+                                        first_middle_node_id,
+                                        second_middle_node_id,
+                                        terminal_node_id,
+                                    ] {
+                                        peer_store.record_delivery_receipt_capability(&node_id, now);
+                                    }
+                                    peer_store
+                                        .record_blind_relay_three_hop_probe_result_with_context(
+                                            now,
+                                            true,
+                                            "onion_terminal_delivered",
+                                            effective_middle_candidate_count,
+                                            terminal_candidate_count,
+                                            3,
+                                            2,
+                                        );
+                                    peer_store
+                                        .record_route_forward_success(&first_middle_node_id, now);
+                                    return TwoHopBlindRelayProbeOutcome {
+                                        attempted: true,
+                                        route_accepted: true,
+                                        terminal_delivery_verified: true,
+                                    };
+                                }
+                                Ok(ack) if ack.accepted && ack.forwarded => {
+                                    peer_store
+                                        .record_blind_relay_three_hop_probe_result_with_context(
+                                            now,
+                                            false,
+                                            "onion_receipt_unverified",
+                                            effective_middle_candidate_count,
+                                            terminal_candidate_count,
+                                            3,
+                                            2,
+                                        );
+                                    peer_store.record_route_forward_failure(
+                                        &first_middle_node_id,
+                                        now,
+                                        "delivery_receipt_invalid",
+                                    );
+                                }
+                                Ok(_ack) => {
+                                    peer_store
+                                        .record_blind_relay_three_hop_probe_result_with_context(
+                                            now,
+                                            false,
+                                            "onion_ack_rejected",
+                                            effective_middle_candidate_count,
+                                            terminal_candidate_count,
+                                            3,
+                                            2,
+                                        );
+                                    peer_store.record_route_forward_failure(
+                                        &first_middle_node_id,
+                                        now,
+                                        "onion_ack_rejected",
+                                    );
+                                }
+                                Err(error) => {
+                                    let reason = format!("onion_ack_{}", error.as_str());
+                                    peer_store
+                                        .record_blind_relay_three_hop_probe_result_with_context(
+                                            now,
+                                            false,
+                                            &reason,
+                                            effective_middle_candidate_count,
+                                            terminal_candidate_count,
+                                            3,
+                                            2,
+                                        );
+                                    peer_store.record_route_forward_failure(
+                                        &first_middle_node_id,
+                                        now,
+                                        &reason,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(response) => {
+                            let reason = format!("onion_http_{}", response.status().as_u16());
+                            peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                                now,
+                                false,
+                                &reason,
+                                effective_middle_candidate_count,
+                                terminal_candidate_count,
+                                3,
+                                2,
+                            );
+                            peer_store.record_route_forward_failure(
+                                &first_middle_node_id,
+                                now,
+                                reason,
+                            );
+                        }
+                        Err(error) => {
+                            let reason = Self::classify_reqwest_error(
+                                "three_hop_onion_delivery_probe",
+                                &error,
+                            );
+                            debug!(
+                                reason = %reason,
+                                "[DISCOVERY] Three-hop onion delivery probe failed"
+                            );
+                            peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                                now,
+                                false,
+                                &reason,
+                                effective_middle_candidate_count,
+                                terminal_candidate_count,
+                                3,
+                                2,
+                            );
+                            peer_store.record_route_forward_failure(
+                                &first_middle_node_id,
+                                now,
+                                reason,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if !attempted {
+            peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                now,
+                false,
+                if network_diversity_blocked {
+                    "no_network_diverse_path"
+                } else {
+                    "no_distinct_path"
+                },
+                first_middle_candidate_count,
+                0,
+                3,
+                2,
+            );
+        }
+
+        TwoHopBlindRelayProbeOutcome {
+            attempted,
+            route_accepted: false,
+            terminal_delivery_verified: false,
+        }
+    }
+
     fn build_two_hop_onion_delivery_probe_request(
         identity: &IdentityKeyPair,
         self_node_id: &[u8; 32],
@@ -8938,6 +9281,43 @@ impl Server {
         )
     }
 
+    fn build_three_hop_onion_delivery_probe_request(
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        first_middle: &SignedNodeDescriptor,
+        second_middle: &SignedNodeDescriptor,
+        terminal: &SignedNodeDescriptor,
+        now: u64,
+    ) -> Option<(PeerBlindRelayRequest, [u8; 32])> {
+        let first_middle_node_id = first_middle.node_id();
+        let second_middle_node_id = second_middle.node_id();
+        let terminal_node_id = terminal.node_id();
+        let route_id = Self::blind_relay_three_hop_probe_route_id(
+            now,
+            self_node_id,
+            &first_middle_node_id,
+            &second_middle_node_id,
+            &terminal_node_id,
+        );
+        let chat_envelope = Self::synthetic_three_hop_probe_chat_envelope(
+            identity,
+            self_node_id,
+            &first_middle_node_id,
+            &second_middle_node_id,
+            &terminal_node_id,
+            route_id,
+            now,
+        );
+        Self::build_onion_request(
+            identity,
+            self_node_id,
+            &[first_middle, second_middle, terminal],
+            &chat_envelope,
+            route_id,
+            now,
+        )
+    }
+
     fn build_two_hop_onion_request(
         identity: &IdentityKeyPair,
         self_node_id: &[u8; 32],
@@ -8947,24 +9327,47 @@ impl Server {
         route_id: [u8; 16],
         now: u64,
     ) -> Option<(PeerBlindRelayRequest, [u8; 32])> {
-        let middle_node_id = middle.node_id();
-        let terminal_node_id = terminal.node_id();
-        let middle_kem_pub = middle.descriptor.x25519_kem_public()?;
-        let terminal_kem_pub = terminal.descriptor.x25519_kem_public()?;
+        Self::build_onion_request(
+            identity,
+            self_node_id,
+            &[middle, terminal],
+            chat_envelope,
+            route_id,
+            now,
+        )
+    }
+
+    /// Builds one onion request for a validated descriptor path.
+    ///
+    /// [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] The builder is shared by
+    /// two-hop and three-hop probes so TTL, payload commitment, KEM admission,
+    /// and outer-envelope signing stay identical. Callers remain responsible
+    /// for distinct-node and network anti-affinity policy before construction.
+    fn build_onion_request(
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        path_descriptors: &[&SignedNodeDescriptor],
+        chat_envelope: &ChatEnvelope,
+        route_id: [u8; 16],
+        now: u64,
+    ) -> Option<(PeerBlindRelayRequest, [u8; 32])> {
+        let ttl = u8::try_from(path_descriptors.len()).ok()?;
+        if ttl == 0 {
+            return None;
+        }
         let encoded_chat = encode_envelope(chat_envelope).ok()?;
         let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat);
-        let path = [
-            OnionHop {
-                node_id: middle_node_id,
-                kem_pub: middle_kem_pub,
-            },
-            OnionHop {
-                node_id: terminal_node_id,
-                kem_pub: terminal_kem_pub,
-            },
-        ];
+        let path = path_descriptors
+            .iter()
+            .map(|descriptor| {
+                Some(OnionHop {
+                    node_id: descriptor.node_id(),
+                    kem_pub: descriptor.descriptor.x25519_kem_public()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
         let envelope =
-            build_onion_envelope(&path, &encoded_chat, route_id, 2, now, identity).ok()?;
+            build_onion_envelope(&path, &encoded_chat, route_id, ttl, now, identity).ok()?;
 
         Some((
             PeerBlindRelayRequest {
@@ -9003,27 +9406,71 @@ impl Server {
         route_id: [u8; 16],
         now: u64,
     ) -> ChatEnvelope {
-        let receiver = Self::synthetic_two_hop_probe_wallet_id(
-            now,
+        Self::synthetic_path_probe_chat_envelope(
+            identity,
             self_node_id,
-            middle_node_id,
+            &[*middle_node_id, *terminal_node_id],
             terminal_node_id,
             &route_id,
+            now,
+            b"aeronyx:two-hop-onion-delivery-probe:v1",
+        )
+    }
+
+    fn synthetic_three_hop_probe_chat_envelope(
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        first_middle_node_id: &[u8; 32],
+        second_middle_node_id: &[u8; 32],
+        terminal_node_id: &[u8; 32],
+        route_id: [u8; 16],
+        now: u64,
+    ) -> ChatEnvelope {
+        Self::synthetic_path_probe_chat_envelope(
+            identity,
+            self_node_id,
+            &[
+                *first_middle_node_id,
+                *second_middle_node_id,
+                *terminal_node_id,
+            ],
+            terminal_node_id,
+            &route_id,
+            now,
+            b"aeronyx:three-hop-onion-delivery-probe:v1",
+        )
+    }
+
+    fn synthetic_path_probe_chat_envelope(
+        identity: &IdentityKeyPair,
+        self_node_id: &[u8; 32],
+        path_node_ids: &[[u8; 32]],
+        terminal_node_id: &[u8; 32],
+        route_id: &[u8; 16],
+        now: u64,
+        domain: &[u8],
+    ) -> ChatEnvelope {
+        let receiver = Self::synthetic_path_probe_wallet_id(
+            now,
+            self_node_id,
+            path_node_ids,
+            route_id,
+            domain,
             b"receiver",
         );
-        let nonce_source = Self::synthetic_two_hop_probe_wallet_id(
+        let nonce_source = Self::synthetic_path_probe_wallet_id(
             now,
             self_node_id,
-            middle_node_id,
-            terminal_node_id,
-            &route_id,
+            path_node_ids,
+            route_id,
+            domain,
             b"nonce",
         );
         let ciphertext = Self::blind_relay_probe_blob(now, self_node_id, terminal_node_id);
         let mut nonce = [0u8; 24];
         nonce.copy_from_slice(&nonce_source[..24]);
         let mut envelope = ChatEnvelope {
-            message_id: route_id,
+            message_id: *route_id,
             sender: identity.public_key_bytes(),
             receiver,
             timestamp: now,
@@ -9036,21 +9483,22 @@ impl Server {
         envelope
     }
 
-    fn synthetic_two_hop_probe_wallet_id(
+    fn synthetic_path_probe_wallet_id(
         now: u64,
         self_node_id: &[u8; 32],
-        middle_node_id: &[u8; 32],
-        terminal_node_id: &[u8; 32],
+        path_node_ids: &[[u8; 32]],
         route_id: &[u8; 16],
+        domain: &[u8],
         label: &[u8],
     ) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(b"aeronyx:two-hop-onion-delivery-probe:v1");
+        hasher.update(domain);
         hasher.update(label);
         hasher.update(now.to_be_bytes());
         hasher.update(self_node_id);
-        hasher.update(middle_node_id);
-        hasher.update(terminal_node_id);
+        for node_id in path_node_ids {
+            hasher.update(node_id);
+        }
         hasher.update(route_id);
         let digest = hasher.finalize();
         let mut out = [0u8; 32];
@@ -9091,6 +9539,26 @@ impl Server {
         hasher.update(now.to_be_bytes());
         hasher.update(self_node_id);
         hasher.update(middle_node_id);
+        hasher.update(terminal_node_id);
+        let digest = hasher.finalize();
+        let mut route_id = [0u8; 16];
+        route_id.copy_from_slice(&digest[..16]);
+        route_id
+    }
+
+    fn blind_relay_three_hop_probe_route_id(
+        now: u64,
+        self_node_id: &[u8; 32],
+        first_middle_node_id: &[u8; 32],
+        second_middle_node_id: &[u8; 32],
+        terminal_node_id: &[u8; 32],
+    ) -> [u8; 16] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"aeronyx:blind-relay-three-hop-probe:route-id:v1");
+        hasher.update(now.to_be_bytes());
+        hasher.update(self_node_id);
+        hasher.update(first_middle_node_id);
+        hasher.update(second_middle_node_id);
         hasher.update(terminal_node_id);
         let digest = hasher.finalize();
         let mut route_id = [0u8; 16];
@@ -13375,6 +13843,70 @@ mod tests {
         .is_none());
     }
 
+    #[test]
+    fn three_hop_onion_delivery_probe_builds_three_sealed_relay_layers() {
+        let source = IdentityKeyPair::generate();
+        let self_node_id = source.public_key_bytes();
+        let now = 1_800_000_050;
+        let first_middle = signed_probe_peer_descriptor(
+            "http://198.51.100.10:8422".to_string(),
+            now,
+            now + 300,
+            vec![NodeCapability::OnionMiddle],
+            [0x31; 32],
+        );
+        let second_middle = signed_probe_peer_descriptor(
+            "http://203.0.113.20:8422".to_string(),
+            now + 1,
+            now + 300,
+            vec![NodeCapability::OnionMiddle],
+            [0x32; 32],
+        );
+        let terminal = signed_probe_peer_descriptor(
+            "http://192.0.2.30:8422".to_string(),
+            now + 2,
+            now + 300,
+            vec![NodeCapability::ChatRelay],
+            [0x33; 32],
+        );
+
+        let (request, payload_commitment) =
+            Server::build_three_hop_onion_delivery_probe_request(
+                &source,
+                &self_node_id,
+                &first_middle,
+                &second_middle,
+                &terminal,
+                now,
+            )
+            .expect("three KEM-capable descriptors should build a three-hop onion probe");
+
+        assert_eq!(request.previous_hop_node_id, self_node_id);
+        assert_eq!(request.envelope.next_hop, first_middle.node_id());
+        assert_eq!(request.envelope.ttl, 3);
+        assert!(request.onward_envelope.is_none());
+        assert!(request.onward_descriptor_hint.is_none());
+        assert!(is_onion_blob(&request.envelope.encrypted_blob));
+
+        let synthetic_chat = Server::synthetic_three_hop_probe_chat_envelope(
+            &source,
+            &self_node_id,
+            &first_middle.node_id(),
+            &second_middle.node_id(),
+            &terminal.node_id(),
+            request.envelope.route_id,
+            now,
+        );
+        synthetic_chat
+            .verify_signature()
+            .expect("three-hop synthetic terminal envelope must remain signed");
+        let encoded_chat = encode_envelope(&synthetic_chat).unwrap();
+        assert_eq!(
+            payload_commitment,
+            BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat)
+        );
+    }
+
     #[tokio::test]
     async fn two_hop_probe_does_not_report_success_without_a_distinct_terminal() {
         let now = 1_800_000_100;
@@ -13413,6 +13945,129 @@ mod tests {
             history.latest_reason_bucket.as_deref(),
             Some("no_distinct_path")
         );
+    }
+
+    #[tokio::test]
+    async fn three_hop_probe_records_only_verified_terminal_delivery() {
+        let now = 1_800_000_200;
+        let source_identity = IdentityKeyPair::generate();
+        let first_middle_identity = IdentityKeyPair::generate();
+        let second_middle_identity = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+        let self_node_id = source_identity.public_key_bytes();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_middle_address = listener.local_addr().unwrap();
+        let signed_descriptor = |
+            identity: &IdentityKeyPair,
+            endpoint: String,
+            capabilities: Vec<NodeCapability>,
+            name: &str,
+        | {
+            let mut descriptor = NodeDescriptor::new(
+                identity.public_key_bytes(),
+                now,
+                now,
+                now + 300,
+                name,
+            )
+            .with_x25519_kem(identity.x25519_public_key_bytes());
+            descriptor.public_endpoint = Some(endpoint);
+            descriptor.capabilities = capabilities;
+            SignedNodeDescriptor::sign(descriptor, identity).unwrap()
+        };
+        let first_middle = signed_descriptor(
+            &first_middle_identity,
+            format!("http://{first_middle_address}"),
+            vec![NodeCapability::OnionMiddle],
+            "three-hop-first",
+        );
+        let second_middle = signed_descriptor(
+            &second_middle_identity,
+            "https://8.8.8.8:8421".to_string(),
+            vec![NodeCapability::OnionMiddle],
+            "three-hop-second",
+        );
+        let terminal = signed_descriptor(
+            &terminal_identity,
+            "https://1.1.1.1:8421".to_string(),
+            vec![NodeCapability::ChatRelay],
+            "three-hop-terminal",
+        );
+        let (expected_request, payload_commitment) =
+            Server::build_three_hop_onion_delivery_probe_request(
+                &source_identity,
+                &self_node_id,
+                &first_middle,
+                &second_middle,
+                &terminal,
+                now,
+            )
+            .unwrap();
+        let expected_route_id = expected_request.envelope.route_id;
+        let delivery_receipt = BlindRelayDeliveryReceipt::accepted(
+            expected_route_id,
+            payload_commitment,
+            now,
+            &terminal_identity,
+        );
+        let router = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                let receipt = delivery_receipt.clone();
+                async move {
+                    assert_eq!(request.envelope.route_id, expected_route_id);
+                    assert_eq!(request.envelope.ttl, 3);
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: false,
+                        forwarded: true,
+                        ttl_remaining: 1,
+                        reason: Some("onion_forwarded".to_string()),
+                        delivery_receipt: Some(receipt),
+                    })
+                }
+            }),
+        );
+        let http_server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let store = PeerStore::new();
+        for descriptor in [first_middle, second_middle, terminal] {
+            store.upsert_verified(descriptor, now).unwrap();
+        }
+        let outcome = Server::probe_three_hop_blind_relay_path(
+            &reqwest::Client::new(),
+            &store,
+            &source_identity,
+            &self_node_id,
+            now,
+        )
+        .await;
+
+        assert!(outcome.attempted);
+        assert!(outcome.route_accepted);
+        assert!(outcome.terminal_delivery_verified);
+        let status = store.status(now);
+        assert_eq!(status.two_hop_path_proof_history.attempted, 0);
+        assert_eq!(status.three_hop_path_proof_history.attempted, 1);
+        assert_eq!(status.three_hop_path_proof_history.succeeded, 1);
+        assert!(status.three_hop_path_proof_history.message_delivery_ready);
+        assert_eq!(
+            status
+                .three_hop_path_proof_history
+                .path_shape_counts
+                .get("entry_middle_middle_terminal"),
+            Some(&1)
+        );
+        assert_eq!(
+            status.blind_relay_quality.delivery_receipt_capable_peers,
+            3
+        );
+
+        http_server.abort();
+        let _ = http_server.await;
     }
 
     #[test]
