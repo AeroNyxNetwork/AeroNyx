@@ -295,6 +295,10 @@
 //      onion-wrapped entry -> middle -> middle -> terminal delivery probe only
 //      after two-hop receipt verification, keeping route members and payloads
 //      out of status while exposing independent three-hop runtime evidence.
+// 116. [BOUNDED-DISCOVERY-HEARTBEAT 2026-08-02 by Codex] Projects the local
+//      PeerStore into a stable aggregate heartbeat contract and exports signed
+//      descriptors in a fixed-size batch so growing local diagnostics cannot
+//      make the backend discard every discovery health field.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -411,6 +415,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.61-BoundedDiscoveryHeartbeat - Added a bounded aggregate PeerStore
+//                                      heartbeat projection and record batch
 //   v2.8.60-ThreeHopRuntimeProof - Added bounded live three-hop onion delivery
 //     verification with terminal-signed receipts and isolated proof history.
 //   v2.8.59-FollowerEffectiveReadiness - Added fail-closed composite follower
@@ -705,7 +711,7 @@ use crate::services::memchain::{
 };
 use crate::services::peer_store::{
     PeerStoreDirectoryProofGossipRound, PeerStoreRouteabilityCacheEvidence,
-    PeerStoreTwoHopPathProofEvent,
+    PeerStoreStatus, PeerStoreTwoHopPathProofEvent,
     PeerStoreVerifiedClientDeliveryCacheEvidence, PeerStoreVerifiedDeliveryWitnessRound,
     ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
@@ -744,6 +750,8 @@ const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PROBE_REQUEST_LIMIT: usize = 8;
 const THREE_HOP_PROBE_REQUEST_LIMIT: usize = 4;
+/// Keep signed discovery evidence bounded independently from peer-store size.
+const HEARTBEAT_SIGNED_PEER_RECORD_LIMIT: usize = 8;
 const BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS: u64 = 15 * 60;
 const BLIND_RELAY_PROBE_RECOVERY_COOLDOWN_SECS: u64 = 60;
 /// Manual mirror-carrier verification is local-only but remains low frequency.
@@ -823,6 +831,32 @@ const DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT: usize = 3;
 
 /// Bootstrap/cache snapshots may contain thousands of signed descriptors.
 const DISCOVERY_SNAPSHOT_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Build the bounded PeerStore projection sent in the management heartbeat.
+///
+/// [BOUNDED-DISCOVERY-HEARTBEAT 2026-08-02 by Codex] Full route candidates,
+/// per-peer health rows, and audit rings remain available from the local node
+/// API. Repeating them in every heartbeat caused the backend's 64 KiB safety
+/// gate to reject the entire discovery snapshot. This projection keeps the
+/// aggregate contracts consumed by nodeboard while excluding those heavy
+/// local diagnostics. Never add endpoints, full node ids, route ids, payloads,
+/// receiver identities, client IPs, or user traffic here.
+fn peer_store_heartbeat_status_value(status: &PeerStoreStatus) -> serde_json::Value {
+    serde_json::json!({
+        "snapshot": &status.snapshot,
+        "runtime": &status.runtime,
+        "blind_relay_quality": &status.blind_relay_quality,
+        "two_hop_path_proof_history": &status.two_hop_path_proof_history,
+        "three_hop_path_proof_history": &status.three_hop_path_proof_history,
+        "max_peers": status.max_peers,
+        "recent_peer_events": &status.recent_peer_events,
+        "bootstrap": &status.bootstrap,
+        "stability": &status.stability,
+        "route_governance": &status.route_governance,
+        "peer_quorum": &status.peer_quorum,
+        "network_story": &status.network_story,
+    })
+}
 
 /// Minimal additive fields read from a peer's public discovery summary.
 ///
@@ -5188,13 +5222,19 @@ impl Server {
                 let route_governance = serde_json::json!(&status.route_governance);
                 let blind_relay_runtime =
                     blind_relay_runtime_status_value(now, &status, &local_capabilities);
+                let peer_store_status = peer_store_heartbeat_status_value(&status);
                 let signed_peer_records = peer_store.export_signed_peer_records_for_heartbeat(
                     now,
-                    Some(config.discovery.max_snapshot_limit),
+                    Some(
+                        config
+                            .discovery
+                            .max_snapshot_limit
+                            .min(HEARTBEAT_SIGNED_PEER_RECORD_LIMIT),
+                    ),
                 );
                 Some(serde_json::json!({
                     "generated_at": now,
-                    "peer_store": status,
+                    "peer_store": peer_store_status,
                     "route_governance": route_governance,
                     "blind_relay_runtime": blind_relay_runtime,
                     "signed_peer_records": signed_peer_records,
@@ -12207,7 +12247,8 @@ mod tests {
         commitment_coordinator_lease_degraded_retry_delay,
         commitment_coordinator_lease_production_valid_for,
         commitment_follower_success_retry_delay, commitment_witness_startup_decision,
-        data_plane_receive_failure_action, memchain_index_rejection_reason, prefix_to_netmask,
+        data_plane_receive_failure_action, memchain_index_rejection_reason,
+        peer_store_heartbeat_status_value, prefix_to_netmask,
         required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
         take_pre_ready_runtime_failure, unix_now_secs, CriticalRuntimeFailure,
         CommitmentCoordinatorLeaseRound, CommitmentFollowerRoundOutcome,
@@ -14663,6 +14704,44 @@ mod tests {
         assert!(!serialized.contains("encrypted_blob"));
         assert!(!serialized.contains("payload_b64"));
         assert!(!serialized.contains("client_ip"));
+    }
+
+    #[test]
+    fn discovery_heartbeat_projection_keeps_aggregates_and_omits_heavy_local_rows() {
+        let peer_store = PeerStore::new();
+        peer_store.record_blind_relay_forwarded(1_700_000_010, 1);
+        let status = peer_store.status(1_700_000_020);
+        let projection = peer_store_heartbeat_status_value(&status);
+
+        for required in [
+            "snapshot",
+            "runtime",
+            "blind_relay_quality",
+            "two_hop_path_proof_history",
+            "three_hop_path_proof_history",
+            "recent_peer_events",
+            "bootstrap",
+            "stability",
+            "route_governance",
+            "peer_quorum",
+            "network_story",
+        ] {
+            assert!(projection.get(required).is_some(), "missing field: {required}");
+        }
+        for local_only in [
+            "recent_audit_events",
+            "peer_summary",
+            "route_candidates",
+            "peer_health_summary",
+        ] {
+            assert!(
+                projection.get(local_only).is_none(),
+                "unexpected local diagnostic field: {local_only}"
+            );
+        }
+
+        let serialized = serde_json::to_vec(&projection).unwrap();
+        assert!(serialized.len() < 32 * 1024);
     }
 
     #[test]
