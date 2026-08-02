@@ -195,10 +195,11 @@
 //  83. Binds aggregate delivery evidence to a monotonic cache generation and
 //      independent signed local anchor, rejecting older valid cache snapshots
 //      without coupling descriptor, routeability, or proof recovery.
-//  84. Optionally witnesses the opaque digest of each signed delivery-cache
-//      anchor on pinned peer nodes, serializing generations so whole-host
-//      rollback and missed-generation gaps fail closed without exporting
-//      delivery counts, timestamps, routes, messages, payloads, or clients.
+//  84. Optionally witnesses the opaque digest of each signed recovery anchor
+//      on pinned peer nodes. The v2 anchor also commits independently to the
+//      two-hop and three-hop proof sections, serializing generations so
+//      whole-host rollback and missed-generation gaps fail closed without
+//      exporting counts, timestamps, routes, messages, payloads, or clients.
 //  85. Optionally opens a producer-pinned SQLite Directory Chain journal,
 //      audits every signed block before listeners start, and transactionally
 //      reconciles authenticated descriptor commitments during runtime/shutdown.
@@ -419,6 +420,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.64-PathProofRollbackAnchor - Bound two-hop and three-hop proof
+//   digests independently into the monotonic local/external recovery anchor.
 //   v2.8.63-ThreeHopSignedRecovery - Added independent signed three-hop proof
 //     snapshot persistence, strict startup revalidation, and aggregate status.
 //   v2.8.62-ThreeHopFeatureNegotiation - Added fail-closed mixed-version
@@ -774,8 +777,9 @@ const CLIENT_DELIVERY_CACHE_FLUSH_DEBOUNCE_MILLIS: u64 = 250;
 const VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION: u16 = 1;
 /// Signed rollback anchors are intentionally tiny aggregate-only documents.
 const VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES: usize = 4 * 1024;
-const VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT: &str =
+const VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT: &str =
     "peer_store_verified_client_delivery_anchor.v1";
+const VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT: &str = "peer_store_recovery_anchor.v2";
 /// Direct startup probes are bounded independently of untrusted peer count.
 const BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES: usize = 3;
 
@@ -1488,6 +1492,12 @@ impl PeerStoreCacheDocument {
         .map_err(|error| format!("two-hop proof signing bytes: {error}"))
     }
 
+    fn two_hop_path_proof_digest(&self) -> std::result::Result<String, String> {
+        Ok(hex::encode(Sha256::digest(
+            self.two_hop_path_proof_signing_bytes()?,
+        )))
+    }
+
     fn verify_three_hop_path_proof_signature(
         &self,
         identity: &IdentityKeyPair,
@@ -1524,6 +1534,12 @@ impl PeerStoreCacheDocument {
             &self.three_hop_path_proof_events,
         ))
         .map_err(|error| format!("three-hop proof signing bytes: {error}"))
+    }
+
+    fn three_hop_path_proof_digest(&self) -> std::result::Result<String, String> {
+        Ok(hex::encode(Sha256::digest(
+            self.three_hop_path_proof_signing_bytes()?,
+        )))
     }
 
     fn verify_verified_client_delivery_signature(
@@ -1604,6 +1620,12 @@ struct PeerStoreVerifiedClientDeliveryAnchor {
     cache_generation: u64,
     cache_generated_at: u64,
     evidence: Option<PeerStoreVerifiedClientDeliveryCacheEvidence>,
+    /// Opaque digest of the independently signed two-hop proof section.
+    #[serde(default)]
+    two_hop_path_proof_digest: Option<String>,
+    /// Opaque digest of the independently signed three-hop proof section.
+    #[serde(default)]
+    three_hop_path_proof_digest: Option<String>,
     signer_node_id: String,
     signature_ed25519: String,
 }
@@ -1615,6 +1637,16 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
             cache_generation: document.verified_client_delivery_generation,
             cache_generated_at: document.descriptor_snapshot.generated_at,
             evidence: document.verified_client_delivery_evidence,
+            two_hop_path_proof_digest: Some(
+                document
+                    .two_hop_path_proof_digest()
+                    .map_err(ServerError::internal)?,
+            ),
+            three_hop_path_proof_digest: Some(
+                document
+                    .three_hop_path_proof_digest()
+                    .map_err(ServerError::internal)?,
+            ),
             signer_node_id: hex::encode(identity.public_key_bytes()),
             signature_ed25519: String::new(),
         };
@@ -1637,23 +1669,51 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
         }
         let anchor: Self = serde_json::from_slice(bytes)
             .map_err(|error| format!("verified client delivery anchor json: {error}"))?;
-        if anchor.contract_version != VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT {
+        if !matches!(
+            anchor.contract_version.as_str(),
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT
+                | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
+        ) {
             return Err("verified client delivery anchor contract unsupported".to_string());
         }
         if anchor.cache_generation == 0 {
             return Err("verified client delivery anchor generation invalid".to_string());
         }
+        if anchor.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT {
+            for digest in [
+                anchor.two_hop_path_proof_digest.as_deref(),
+                anchor.three_hop_path_proof_digest.as_deref(),
+            ] {
+                let digest =
+                    digest.ok_or_else(|| "recovery anchor proof digest missing".to_string())?;
+                let mut decoded = [0u8; 32];
+                hex::decode_to_slice(digest, &mut decoded)
+                    .map_err(|_| "recovery anchor proof digest encoding invalid".to_string())?;
+            }
+        }
         Ok(anchor)
     }
 
     fn signing_bytes(&self) -> std::result::Result<Vec<u8>, String> {
-        bincode::serialize(&(
-            "aeronyx-peer-cache-verified-client-delivery-anchor-v1",
-            self.contract_version.as_str(),
-            self.cache_generation,
-            self.cache_generated_at,
-            self.evidence,
-        ))
+        match self.contract_version.as_str() {
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT => bincode::serialize(&(
+                "aeronyx-peer-cache-verified-client-delivery-anchor-v1",
+                self.contract_version.as_str(),
+                self.cache_generation,
+                self.cache_generated_at,
+                self.evidence,
+            )),
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT => bincode::serialize(&(
+                "aeronyx-peer-cache-recovery-anchor-v2",
+                self.contract_version.as_str(),
+                self.cache_generation,
+                self.cache_generated_at,
+                self.evidence,
+                self.two_hop_path_proof_digest.as_deref(),
+                self.three_hop_path_proof_digest.as_deref(),
+            )),
+            _ => return Err("recovery anchor contract unsupported".to_string()),
+        }
         .map_err(|error| format!("verified client delivery anchor signing bytes: {error}"))
     }
 
@@ -1677,6 +1737,24 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
         self.cache_generation == document.verified_client_delivery_generation
             && self.cache_generated_at == document.descriptor_snapshot.generated_at
             && self.evidence == document.verified_client_delivery_evidence
+    }
+
+    fn matches_two_hop_path_proof_section(&self, document: &PeerStoreCacheDocument) -> bool {
+        self.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
+            && self.cache_generation == document.verified_client_delivery_generation
+            && self.cache_generated_at == document.descriptor_snapshot.generated_at
+            && document.two_hop_path_proof_digest().is_ok_and(|digest| {
+                self.two_hop_path_proof_digest.as_deref() == Some(digest.as_str())
+            })
+    }
+
+    fn matches_three_hop_path_proof_section(&self, document: &PeerStoreCacheDocument) -> bool {
+        self.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
+            && self.cache_generation == document.verified_client_delivery_generation
+            && self.cache_generated_at == document.descriptor_snapshot.generated_at
+            && document.three_hop_path_proof_digest().is_ok_and(|digest| {
+                self.three_hop_path_proof_digest.as_deref() == Some(digest.as_str())
+            })
     }
 
     /// Returns a domain-separated opaque digest of the exact signed anchor.
@@ -1760,6 +1838,53 @@ impl PeerStoreVerifiedClientDeliveryAnchorState {
                 } else if document.verified_client_delivery_generation > anchor.cache_generation {
                     "cache_ahead"
                 } else if anchor.matches_document(document) {
+                    "anchored"
+                } else {
+                    "anchor_conflict"
+                }
+            }
+        }
+    }
+
+    fn two_hop_path_proof_protection_for(&self, document: &PeerStoreCacheDocument) -> &'static str {
+        self.path_proof_protection_for(document, |anchor, document| {
+            anchor.matches_two_hop_path_proof_section(document)
+        })
+    }
+
+    fn three_hop_path_proof_protection_for(
+        &self,
+        document: &PeerStoreCacheDocument,
+    ) -> &'static str {
+        self.path_proof_protection_for(document, |anchor, document| {
+            anchor.matches_three_hop_path_proof_section(document)
+        })
+    }
+
+    /// Evaluates rollback protection independently from aggregate delivery
+    /// evidence so one proof-anchor mismatch cannot discard the other proof
+    /// section or valid descriptors.
+    fn path_proof_protection_for(
+        &self,
+        document: &PeerStoreCacheDocument,
+        matches_section: impl FnOnce(
+            &PeerStoreVerifiedClientDeliveryAnchor,
+            &PeerStoreCacheDocument,
+        ) -> bool,
+    ) -> &'static str {
+        match self {
+            Self::NotChecked => "not_checked",
+            Self::Missing => "anchor_missing",
+            Self::Invalid => "anchor_invalid",
+            Self::Verified(anchor) => {
+                if document.verified_client_delivery_generation < anchor.cache_generation {
+                    "rollback_detected"
+                } else if document.verified_client_delivery_generation > anchor.cache_generation {
+                    "cache_ahead"
+                } else if anchor.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT
+                {
+                    "legacy_unanchored"
+                } else if matches_section(anchor, document) {
                     "anchored"
                 } else {
                     "anchor_conflict"
@@ -10566,6 +10691,15 @@ impl Server {
                     } else {
                         "not_checked"
                     };
+                // [PATH-PROOF-ROLLBACK-ANCHOR 2026-08-02 by Codex] The same
+                // monotonic recovery anchor commits to opaque digests of both
+                // proof sections. This remains an independent failure domain:
+                // descriptors and aggregate delivery evidence keep their own
+                // authentication and restore decisions.
+                let two_hop_proof_rollback_protection =
+                    client_delivery_anchor.two_hop_path_proof_protection_for(&document);
+                let three_hop_proof_rollback_protection =
+                    client_delivery_anchor.three_hop_path_proof_protection_for(&document);
                 (
                     document.descriptor_snapshot,
                     Some(document.routeability_evidence),
@@ -10578,6 +10712,8 @@ impl Server {
                     client_delivery_authentication,
                     client_delivery_generation,
                     client_delivery_rollback_protection,
+                    two_hop_proof_rollback_protection,
+                    three_hop_proof_rollback_protection,
                 )
             })
         } else {
@@ -10595,6 +10731,8 @@ impl Server {
                         "not_applicable",
                         0,
                         "not_applicable",
+                        "not_applicable",
+                        "not_applicable",
                     )
                 })
                 .map_err(|error| error.to_string())
@@ -10611,6 +10749,8 @@ impl Server {
             client_delivery_authentication,
             client_delivery_generation,
             client_delivery_rollback_protection,
+            two_hop_proof_rollback_protection,
+            three_hop_proof_rollback_protection,
         ) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -10635,6 +10775,16 @@ impl Server {
                 now,
                 client_delivery_generation,
                 client_delivery_rollback_protection,
+            );
+            peer_store.record_two_hop_proof_cache_rollback_protection(
+                now,
+                client_delivery_generation,
+                two_hop_proof_rollback_protection,
+            );
+            peer_store.record_three_hop_proof_cache_rollback_protection(
+                now,
+                client_delivery_generation,
+                three_hop_proof_rollback_protection,
             );
         }
 
@@ -10693,6 +10843,21 @@ impl Server {
                     "identity_unavailable",
                 ))
             }
+            (_, Some(records)) if records.is_empty() => {
+                Some(peer_store.restore_two_hop_path_proof_cache_events(records, now))
+            }
+            (_, Some(records))
+                if !matches!(
+                    two_hop_proof_rollback_protection,
+                    "anchored" | "cache_ahead"
+                ) =>
+            {
+                Some(peer_store.reject_two_hop_path_proof_cache_events(
+                    records.len(),
+                    now,
+                    two_hop_proof_rollback_protection,
+                ))
+            }
             (_, Some(records)) => {
                 Some(peer_store.restore_two_hop_path_proof_cache_events(records, now))
             }
@@ -10722,6 +10887,21 @@ impl Server {
                     "identity_unavailable",
                 ))
             }
+            (_, Some(records)) if records.is_empty() => {
+                Some(peer_store.restore_three_hop_path_proof_cache_events(records, now))
+            }
+            (_, Some(records))
+                if !matches!(
+                    three_hop_proof_rollback_protection,
+                    "anchored" | "cache_ahead"
+                ) =>
+            {
+                Some(peer_store.reject_three_hop_path_proof_cache_events(
+                    records.len(),
+                    now,
+                    three_hop_proof_rollback_protection,
+                ))
+            }
             (_, Some(records)) => {
                 Some(peer_store.restore_three_hop_path_proof_cache_events(records, now))
             }
@@ -10737,6 +10917,25 @@ impl Server {
             three_hop_proof_authentication,
             "signature_invalid" | "identity_unavailable"
         );
+        let two_hop_proof_rollback_rejected = proof_report.is_some_and(|report| report.total > 0)
+            && matches!(
+                two_hop_proof_rollback_protection,
+                "legacy_unanchored"
+                    | "anchor_missing"
+                    | "anchor_invalid"
+                    | "anchor_conflict"
+                    | "rollback_detected"
+            );
+        let three_hop_proof_rollback_rejected = three_hop_proof_report
+            .is_some_and(|report| report.total > 0)
+            && matches!(
+                three_hop_proof_rollback_protection,
+                "legacy_unanchored"
+                    | "anchor_missing"
+                    | "anchor_invalid"
+                    | "anchor_conflict"
+                    | "rollback_detected"
+            );
         let client_delivery_report = if is_peer_cache {
             Some(
                 match (
@@ -10811,6 +11010,8 @@ impl Server {
                 || proof_authentication_rejected
                 || three_hop_proof_rejected > 0
                 || three_hop_proof_authentication_rejected
+                || two_hop_proof_rollback_rejected
+                || three_hop_proof_rollback_rejected
                 || client_delivery_rejected
                 || client_delivery_authentication_rejected
                 || client_delivery_rollback_rejected
@@ -10820,7 +11021,7 @@ impl Server {
                 "success"
             },
             format!(
-                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} three_hop_proof_authentication={} three_hop_proof_restored={} three_hop_proof_rejected={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
+                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} two_hop_proof_rollback_protection={} three_hop_proof_authentication={} three_hop_proof_restored={} three_hop_proof_rejected={} three_hop_proof_rollback_protection={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
                 report.total,
                 report.inserted,
                 report.unchanged,
@@ -10832,9 +11033,11 @@ impl Server {
                 two_hop_proof_authentication,
                 proof_restored,
                 proof_rejected,
+                two_hop_proof_rollback_protection,
                 three_hop_proof_authentication,
                 three_hop_proof_restored,
                 three_hop_proof_rejected,
+                three_hop_proof_rollback_protection,
                 client_delivery_authentication,
                 client_delivery_generation,
                 client_delivery_rollback_protection,
@@ -10856,9 +11059,11 @@ impl Server {
             two_hop_proof_authentication,
             two_hop_proof_restored = proof_restored,
             two_hop_proof_rejected = proof_rejected,
+            two_hop_proof_rollback_protection,
             three_hop_proof_authentication,
             three_hop_proof_restored,
             three_hop_proof_rejected,
+            three_hop_proof_rollback_protection,
             client_delivery_authentication,
             client_delivery_generation,
             client_delivery_rollback_protection,
@@ -12398,7 +12603,7 @@ mod tests {
         DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
         DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, MEMCHAIN_SYNC_HTTP_PROFILE,
         ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
-        TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT,
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
     };
@@ -14125,16 +14330,10 @@ mod tests {
             vec![NodeCapability::ChatRelay],
             "three-hop-terminal",
         );
-        let (_probe_template, payload_commitment) =
-            Server::build_three_hop_onion_delivery_probe_request(
-                &source_identity,
-                &self_node_id,
-                &first_middle,
-                &second_middle,
-                &terminal,
-                now,
-            )
-            .unwrap();
+        let first_middle_node_id = first_middle.node_id();
+        let second_middle_node_id = second_middle.node_id();
+        let terminal_node_id = terminal.node_id();
+        let probe_source_identity = source_identity.clone();
         let router = Router::new()
             .route(
                 "/api/discovery/summary",
@@ -14150,9 +14349,28 @@ mod tests {
                 "/api/chat/peer/blind-relay",
                 post(move |Json(request): Json<PeerBlindRelayRequest>| {
                     // [THREE-HOP-PROBE-TEST-DETERMINISM 2026-08-02 by Codex]
-                    // The runtime probe intentionally creates a fresh random
-                    // route id. Sign the route actually received instead of a
-                    // separately generated template route.
+                    // Reconstruct the synthetic terminal payload commitment
+                    // for the middle ordering actually selected at runtime.
+                    // Candidate order is randomized by design, so a fixed
+                    // template commitment makes this test spuriously retry.
+                    let selected_first_middle = request.envelope.next_hop;
+                    let selected_second_middle = if selected_first_middle == first_middle_node_id {
+                        second_middle_node_id
+                    } else {
+                        first_middle_node_id
+                    };
+                    let synthetic_chat = Server::synthetic_three_hop_probe_chat_envelope(
+                        &probe_source_identity,
+                        &self_node_id,
+                        &selected_first_middle,
+                        &selected_second_middle,
+                        &terminal_node_id,
+                        request.envelope.route_id,
+                        now,
+                    );
+                    let encoded_chat = encode_envelope(&synthetic_chat).unwrap();
+                    let payload_commitment =
+                        BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat);
                     let receipt = BlindRelayDeliveryReceipt::accepted(
                         request.envelope.route_id,
                         payload_commitment,
@@ -16586,6 +16804,8 @@ mod tests {
         let anchor = PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(&anchor_bytes).unwrap();
         assert!(anchor.verify(&server.identity).is_ok());
         assert!(anchor.matches_document(&document));
+        assert!(anchor.matches_two_hop_path_proof_section(&document));
+        assert!(anchor.matches_three_hop_path_proof_section(&document));
         let witness_digest = anchor.witness_digest().unwrap();
         assert_eq!(witness_digest, anchor.witness_digest().unwrap());
         let mut next_anchor = anchor.clone();
@@ -16594,6 +16814,23 @@ mod tests {
             hex::encode(server.identity.sign(&next_anchor.signing_bytes().unwrap()));
         assert!(next_anchor.verify(&server.identity).is_ok());
         assert_ne!(witness_digest, next_anchor.witness_digest().unwrap());
+        let mut legacy_anchor = anchor.clone();
+        legacy_anchor.contract_version =
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT.to_string();
+        legacy_anchor.two_hop_path_proof_digest = None;
+        legacy_anchor.three_hop_path_proof_digest = None;
+        legacy_anchor.signature_ed25519 = hex::encode(
+            server
+                .identity
+                .sign(&legacy_anchor.signing_bytes().unwrap()),
+        );
+        let parsed_legacy = PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(
+            &legacy_anchor.to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        assert!(parsed_legacy.verify(&server.identity).is_ok());
+        assert!(!parsed_legacy.matches_two_hop_path_proof_section(&document));
+        assert!(!parsed_legacy.matches_three_hop_path_proof_section(&document));
         let serialized_anchor = String::from_utf8(anchor_bytes).unwrap();
         for forbidden in [
             "route_id",
@@ -16992,14 +17229,9 @@ mod tests {
             1
         );
         let restored_store = PeerStore::new();
-        assert!(Server::import_bootstrap_snapshot_bytes(
-            &restored_store,
-            "cache",
-            &path_str,
-            &bytes,
-            now + 6,
-            Some(&server.identity),
-        ));
+        server
+            .load_peer_cache(&restored_store, &path_str, now + 6)
+            .await;
 
         assert!(restored_store.is_routeable_now(&middle.node_id(), now + 6));
         assert!(restored_store.is_routeable_now(&terminal.node_id(), now + 6));
@@ -17017,6 +17249,13 @@ mod tests {
             Some("verified")
         );
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_restored, 3);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_two_hop_proof_cache_rollback_protection
+                .as_deref(),
+            Some("anchored")
+        );
         assert!(
             status
                 .bootstrap
@@ -17043,6 +17282,13 @@ mod tests {
             Some("verified")
         );
         assert_eq!(status.bootstrap.last_three_hop_proof_cache_restored, 3);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_three_hop_proof_cache_rollback_protection
+                .as_deref(),
+            Some("anchored")
+        );
         assert!(
             status
                 .bootstrap
@@ -17118,6 +17364,24 @@ mod tests {
                 .as_deref(),
             Some("rejected")
         );
+        assert_eq!(
+            missing_anchor_status
+                .bootstrap
+                .last_three_hop_proof_cache_rollback_protection
+                .as_deref(),
+            Some("anchor_missing")
+        );
+        assert_eq!(
+            missing_anchor_status
+                .bootstrap
+                .last_three_hop_proof_cache_status
+                .as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(
+            missing_anchor_status.three_hop_path_proof_history.attempted,
+            0
+        );
 
         // A present but unauthentic anchor is not equivalent to the valid
         // crash window. Preserve independent peer and route recovery while
@@ -17157,10 +17421,161 @@ mod tests {
                 .as_deref(),
             Some("rejected")
         );
+        assert_eq!(
+            invalid_anchor_status
+                .bootstrap
+                .last_three_hop_proof_cache_rollback_protection
+                .as_deref(),
+            Some("anchor_invalid")
+        );
+        assert_eq!(
+            invalid_anchor_status
+                .bootstrap
+                .last_three_hop_proof_cache_status
+                .as_deref(),
+            Some("rejected")
+        );
 
         let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path_str)).await;
         let _ = tokio::fs::remove_file(anchor_path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_rejects_older_signed_path_proof_generation() {
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_016_000;
+        let middle = signed_probe_peer_descriptor(
+            "https://proof-rollback-middle-a.example".to_string(),
+            1,
+            now + 4_000,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0x71; 32],
+        );
+        let second_middle = signed_probe_peer_descriptor(
+            "https://proof-rollback-middle-b.example".to_string(),
+            2,
+            now + 4_000,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0x72; 32],
+        );
+        let terminal = signed_probe_peer_descriptor(
+            "https://proof-rollback-terminal.example".to_string(),
+            3,
+            now + 4_000,
+            vec![NodeCapability::ChatRelay],
+            [0x73; 32],
+        );
+        let original_store = Arc::new(PeerStore::new());
+        for descriptor in [&middle, &second_middle, &terminal] {
+            original_store
+                .upsert_verified(descriptor.clone(), now)
+                .unwrap();
+            original_store.record_route_forward_success(&descriptor.node_id(), now + 1);
+        }
+        original_store.record_blind_relay_two_hop_probe_result_with_context(
+            now + 2,
+            true,
+            "onion_terminal_delivered",
+            2,
+            2,
+            2,
+            1,
+        );
+        original_store.record_blind_relay_three_hop_probe_result_with_context(
+            now + 2,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            3,
+            2,
+        );
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aeronyx-peer-cache-path-proof-rollback-{unique}.json"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now + 3,
+        )
+        .await
+        .unwrap();
+        let older_signed_cache = tokio::fs::read(&path).await.unwrap();
+
+        original_store.record_blind_relay_two_hop_probe_result_with_context(
+            now + 4,
+            true,
+            "onion_terminal_delivered",
+            2,
+            2,
+            2,
+            1,
+        );
+        original_store.record_blind_relay_three_hop_probe_result_with_context(
+            now + 4,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            3,
+            2,
+        );
+        Server::save_peer_store_cache_snapshot(
+            &server.identity,
+            &original_store,
+            &path_str,
+            now + 5,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&path, older_signed_cache).await.unwrap();
+
+        let restored_store = PeerStore::new();
+        server
+            .load_peer_cache(&restored_store, &path_str, now + 6)
+            .await;
+        let status = restored_store.status(now + 6);
+        assert_eq!(status.snapshot.valid_peers, 3);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_two_hop_proof_cache_rollback_protection
+                .as_deref(),
+            Some("rollback_detected")
+        );
+        assert_eq!(
+            status.bootstrap.last_two_hop_proof_cache_status.as_deref(),
+            Some("rejected")
+        );
+        assert!(status.two_hop_path_proof_history.events.is_empty());
+        assert_eq!(
+            status
+                .bootstrap
+                .last_three_hop_proof_cache_rollback_protection
+                .as_deref(),
+            Some("rollback_detected")
+        );
+        assert_eq!(
+            status
+                .bootstrap
+                .last_three_hop_proof_cache_status
+                .as_deref(),
+            Some("rejected")
+        );
+        assert!(status.three_hop_path_proof_history.events.is_empty());
+
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path_str)).await;
+        let _ =
+            tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str)).await;
     }
 
     #[tokio::test]
@@ -17458,13 +17873,16 @@ mod tests {
         document.two_hop_path_proof_events[0].outcome = "rejected".to_string();
         let tampered = serde_json::to_vec_pretty(&document).unwrap();
         let restored_store = PeerStore::new();
-        assert!(Server::import_bootstrap_snapshot_bytes(
+        let anchor_state =
+            Server::read_peer_cache_client_delivery_anchor(&path_str, &server.identity).await;
+        assert!(Server::import_bootstrap_snapshot_bytes_with_anchor(
             &restored_store,
             "cache",
             &path_str,
             &tampered,
             now + 4,
             Some(&server.identity),
+            &anchor_state,
         ));
 
         assert!(restored_store.is_routeable_now(&middle.node_id(), now + 4));
@@ -17582,13 +18000,16 @@ mod tests {
             .verified_deliveries = 99;
         let tampered = serde_json::to_vec_pretty(&document).unwrap();
         let restored_store = PeerStore::new();
-        assert!(Server::import_bootstrap_snapshot_bytes(
+        let anchor_state =
+            Server::read_peer_cache_client_delivery_anchor(&path_str, &server.identity).await;
+        assert!(Server::import_bootstrap_snapshot_bytes_with_anchor(
             &restored_store,
             "cache",
             &path_str,
             &tampered,
             now + 6,
             Some(&server.identity),
+            &anchor_state,
         ));
 
         let status = restored_store.status(now + 6);

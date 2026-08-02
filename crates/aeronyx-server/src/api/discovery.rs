@@ -80,6 +80,8 @@
 //!   terminal signature and payload-commitment verification.
 //!
 //! ## Last Modified
+//! v0.38.0-PathProofRollbackAnchor - Require local recovery-anchor and optional
+//! external-witness readiness before signed proof continuity becomes ready
 //! v0.37.0-ThreeHopSignedRecovery - Expose aggregate signed persistence and
 //! warm-restart continuity without presenting it as consensus or user traffic.
 //! v0.36.0-ThreeHopFeatureNegotiation - Advertise multihop terminal-receipt
@@ -715,6 +717,9 @@ struct PathProofRestartContinuity {
     ready: bool,
     source: &'static str,
     authentication: String,
+    rollback_protection: String,
+    external_witness: String,
+    external_witness_required: bool,
     restored: u64,
     persisted: u64,
 }
@@ -724,6 +729,7 @@ fn path_proof_restart_continuity(
     generated_at: u64,
     stale_after_seconds: u64,
     authentication: Option<&str>,
+    rollback_protection: Option<&str>,
     restored_stability_ready: bool,
     restored_at: Option<u64>,
     restored: u64,
@@ -732,15 +738,36 @@ fn path_proof_restart_continuity(
     persisted: u64,
 ) -> PathProofRestartContinuity {
     let authentication = authentication.unwrap_or("not_observed").to_string();
+    let rollback_protection = rollback_protection.unwrap_or("not_observed").to_string();
+    let external_witness = status
+        .bootstrap
+        .last_client_delivery_witness_status
+        .as_deref()
+        .unwrap_or("not_observed")
+        .to_string();
+    let external_witness_required = status.bootstrap.last_client_delivery_witness_required;
+    let rollback_protection_ready =
+        matches!(rollback_protection.as_str(), "anchored" | "cache_ahead");
+    let external_witness_ready = !external_witness_required || external_witness == "verified";
     let restore_evidence_fresh = restored_at
         .map(|at| at <= generated_at && generated_at.saturating_sub(at) <= stale_after_seconds)
         .unwrap_or(false);
     let persistence_evidence_fresh = persisted_at
         .map(|at| at <= generated_at && generated_at.saturating_sub(at) <= stale_after_seconds)
         .unwrap_or(false);
-    let authenticated_restore_ready =
-        authentication == "verified" && restored_stability_ready && restore_evidence_fresh;
-    let signed_persistence_ready = persisted_stability_ready && persistence_evidence_fresh;
+    // [PATH-PROOF-ROLLBACK-ANCHOR 2026-08-02 by Codex] A valid section
+    // signature proves authorship, not freshness. Restart continuity therefore
+    // also requires the monotonic local anchor and, when configured as a
+    // startup gate, the existing opaque external witness quorum.
+    let authenticated_restore_ready = authentication == "verified"
+        && rollback_protection_ready
+        && external_witness_ready
+        && restored_stability_ready
+        && restore_evidence_fresh;
+    let signed_persistence_ready = rollback_protection_ready
+        && external_witness_ready
+        && persisted_stability_ready
+        && persistence_evidence_fresh;
     let peer_recovery_configured = status.peer_quorum.restart_recovery_configured;
     let ready = authenticated_restore_ready || signed_persistence_ready;
     let source = match (authenticated_restore_ready, signed_persistence_ready) {
@@ -752,6 +779,8 @@ fn path_proof_restart_continuity(
             "restore_identity_unavailable"
         }
         (false, false) if authentication == "legacy_descriptor_only" => "legacy_cache",
+        (false, false) if !rollback_protection_ready => "rollback_protection_not_ready",
+        (false, false) if !external_witness_ready => "external_witness_not_ready",
         _ => "not_ready",
     };
 
@@ -762,6 +791,9 @@ fn path_proof_restart_continuity(
         ready,
         source,
         authentication,
+        rollback_protection,
+        external_witness,
+        external_witness_required,
         restored,
         persisted,
     }
@@ -775,6 +807,9 @@ fn two_hop_proof_restart_continuity(status: &PeerStoreStatus) -> PathProofRestar
         proof.generated_at,
         proof.stale_after_seconds,
         bootstrap.last_two_hop_proof_cache_authentication.as_deref(),
+        bootstrap
+            .last_two_hop_proof_cache_rollback_protection
+            .as_deref(),
         bootstrap.last_two_hop_proof_cache_restored_stability_ready,
         bootstrap.last_two_hop_proof_cache_at,
         bootstrap.last_two_hop_proof_cache_restored,
@@ -793,6 +828,9 @@ fn three_hop_proof_restart_continuity(status: &PeerStoreStatus) -> PathProofRest
         proof.stale_after_seconds,
         bootstrap
             .last_three_hop_proof_cache_authentication
+            .as_deref(),
+        bootstrap
+            .last_three_hop_proof_cache_rollback_protection
             .as_deref(),
         bootstrap.last_three_hop_proof_cache_restored_stability_ready,
         bootstrap.last_three_hop_proof_cache_at,
@@ -976,6 +1014,18 @@ pub fn onion_relay_admission_status_value(
     admission_fields.insert(
         "proof_cache_authentication".to_string(),
         serde_json::json!(proof_restart_continuity.authentication),
+    );
+    admission_fields.insert(
+        "proof_cache_rollback_protection".to_string(),
+        serde_json::json!(proof_restart_continuity.rollback_protection),
+    );
+    admission_fields.insert(
+        "proof_cache_external_witness".to_string(),
+        serde_json::json!(proof_restart_continuity.external_witness),
+    );
+    admission_fields.insert(
+        "proof_cache_external_witness_required".to_string(),
+        serde_json::json!(proof_restart_continuity.external_witness_required),
     );
     admission_fields.insert(
         "proof_cache_authenticated_restore_ready".to_string(),
@@ -1593,6 +1643,18 @@ pub fn discovery_summary_response(
         serde_json::json!(proof_restart_continuity.authentication),
     );
     two_hop_path_proof.insert(
+        "proof_cache_rollback_protection".to_string(),
+        serde_json::json!(proof_restart_continuity.rollback_protection),
+    );
+    two_hop_path_proof.insert(
+        "proof_cache_external_witness".to_string(),
+        serde_json::json!(proof_restart_continuity.external_witness),
+    );
+    two_hop_path_proof.insert(
+        "proof_cache_external_witness_required".to_string(),
+        serde_json::json!(proof_restart_continuity.external_witness_required),
+    );
+    two_hop_path_proof.insert(
         "proof_cache_restored_events".to_string(),
         serde_json::json!(proof_restart_continuity.restored),
     );
@@ -1695,9 +1757,12 @@ pub fn discovery_summary_response(
             "proof_restart_continuity_ready": three_hop_restart_continuity.ready,
             "proof_restart_continuity_source": three_hop_restart_continuity.source,
             "proof_cache_authentication": three_hop_restart_continuity.authentication,
+            "proof_cache_rollback_protection": three_hop_restart_continuity.rollback_protection,
+            "proof_cache_external_witness": three_hop_restart_continuity.external_witness,
+            "proof_cache_external_witness_required": three_hop_restart_continuity.external_witness_required,
             "proof_cache_restored_events": three_hop_restart_continuity.restored,
             "proof_cache_persisted_events": three_hop_restart_continuity.persisted,
-            "rollback_boundary": "rejects_invalid_future_stale_or_route_pool_unbound_evidence; whole_host_rollback_requires_external_witness",
+            "rollback_boundary": "signed_section_plus_monotonic_local_anchor; whole_host_rollback_is_fail_closed_when_external_witness_is_required",
             "privacy_boundary": &three_hop_history.privacy_boundary,
         }),
         onion_relay_admission,
@@ -3353,6 +3418,14 @@ mod tests {
             Some("signed_local_cache_with_runtime_revalidation")
         );
         assert_eq!(
+            parsed["three_hop_path_proof"]["proof_cache_rollback_protection"].as_str(),
+            Some("not_observed")
+        );
+        assert_eq!(
+            parsed["three_hop_path_proof"]["proof_cache_external_witness_required"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
             parsed["two_hop_path_proof"]["message_delivery_successes"].as_u64(),
             Some(1)
         );
@@ -3545,6 +3618,10 @@ mod tests {
             after_admission["proof_cache_signed_persistence_ready"].as_bool(),
             Some(true)
         );
+        assert_eq!(
+            after_admission["proof_cache_rollback_protection"].as_str(),
+            Some("anchored")
+        );
 
         let summary = discovery_summary_response(now + 8, &after_persist, &local_capabilities);
         assert_eq!(
@@ -3554,6 +3631,51 @@ mod tests {
         assert_eq!(
             summary.two_hop_path_proof["restart_recovery_basis"].as_str(),
             Some("message_delivery_proof_with_verified_restart_continuity")
+        );
+
+        store.record_client_delivery_witness_round(
+            now + 9,
+            1,
+            true,
+            1,
+            crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound {
+                configured: 1,
+                attempted: 1,
+                failed: 1,
+                ..Default::default()
+            },
+        );
+        let witness_blocked =
+            onion_relay_admission_status_value(&store.status(now + 9), &local_capabilities);
+        assert_eq!(witness_blocked["status"].as_str(), Some("warming"));
+        assert_eq!(
+            witness_blocked["proof_restart_continuity_source"].as_str(),
+            Some("external_witness_not_ready")
+        );
+        assert_eq!(
+            witness_blocked["proof_cache_external_witness"].as_str(),
+            Some("unavailable")
+        );
+
+        store.record_client_delivery_witness_round(
+            now + 10,
+            1,
+            true,
+            1,
+            crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound {
+                configured: 1,
+                attempted: 1,
+                verified: 1,
+                idempotent: 1,
+                ..Default::default()
+            },
+        );
+        let witness_verified =
+            onion_relay_admission_status_value(&store.status(now + 10), &local_capabilities);
+        assert_eq!(witness_verified["status"].as_str(), Some("eligible"));
+        assert_eq!(
+            witness_verified["proof_cache_external_witness"].as_str(),
+            Some("verified")
         );
     }
 

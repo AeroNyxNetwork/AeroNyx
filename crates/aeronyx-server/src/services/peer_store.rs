@@ -169,6 +169,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.71.0-PathProofRollbackAnchor - Track independent local-anchor decisions
+//! for signed two-hop and three-hop proof recovery without retaining digests
 //! v0.70.0-ThreeHopSignedRecovery - Added independently signed, route-pool-
 //! bound three-hop aggregate proof persistence and warm-restart recovery
 //! v0.69.0-ThreeHopRuntimeProof - Added independent privacy-safe three-hop
@@ -818,6 +820,12 @@ pub struct PeerStoreBootstrapStatus {
     /// Timestamp of the latest successful signed proof-cache persistence.
     #[serde(default)]
     pub last_two_hop_proof_cache_persisted_at: Option<u64>,
+    /// Local recovery-anchor result for the latest two-hop proof section.
+    ///
+    /// [PATH-PROOF-ROLLBACK-ANCHOR 2026-08-02 by Codex] Stable buckets mirror
+    /// the aggregate delivery anchor without retaining proof digests or paths.
+    #[serde(default)]
+    pub last_two_hop_proof_cache_rollback_protection: Option<String>,
     /// Signed three-hop proof cache restore status: restored, partial, empty, or rejected.
     #[serde(default)]
     pub last_three_hop_proof_cache_status: Option<String>,
@@ -845,6 +853,9 @@ pub struct PeerStoreBootstrapStatus {
     /// Timestamp of the latest successful signed three-hop cache persistence.
     #[serde(default)]
     pub last_three_hop_proof_cache_persisted_at: Option<u64>,
+    /// Local recovery-anchor result for the latest three-hop proof section.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_rollback_protection: Option<String>,
     /// Signed aggregate client-delivery cache restore status.
     ///
     /// Stable buckets are `restored`, `empty`, and `rejected`. The section
@@ -1048,6 +1059,7 @@ impl Default for PeerStoreBootstrapStatus {
             last_two_hop_proof_cache_persisted: 0,
             last_two_hop_proof_cache_persisted_stability_ready: false,
             last_two_hop_proof_cache_persisted_at: None,
+            last_two_hop_proof_cache_rollback_protection: None,
             last_three_hop_proof_cache_status: None,
             last_three_hop_proof_cache_authentication: None,
             last_three_hop_proof_cache_restored: 0,
@@ -1057,6 +1069,7 @@ impl Default for PeerStoreBootstrapStatus {
             last_three_hop_proof_cache_persisted: 0,
             last_three_hop_proof_cache_persisted_stability_ready: false,
             last_three_hop_proof_cache_persisted_at: None,
+            last_three_hop_proof_cache_rollback_protection: None,
             last_client_delivery_cache_status: None,
             last_client_delivery_cache_authentication: None,
             last_client_delivery_cache_restored: 0,
@@ -2653,11 +2666,15 @@ impl PeerStore {
                     status.last_two_hop_proof_cache_persisted = persisted as u64;
                     status.last_two_hop_proof_cache_persisted_stability_ready = stability_ready;
                     status.last_two_hop_proof_cache_persisted_at = Some(now);
+                    status.last_two_hop_proof_cache_rollback_protection =
+                        Some("anchored".to_string());
                 }
                 PathProofCacheKind::ThreeHop => {
                     status.last_three_hop_proof_cache_persisted = persisted as u64;
                     status.last_three_hop_proof_cache_persisted_stability_ready = stability_ready;
                     status.last_three_hop_proof_cache_persisted_at = Some(now);
+                    status.last_three_hop_proof_cache_rollback_protection =
+                        Some("anchored".to_string());
                 }
             }
         }
@@ -2669,6 +2686,76 @@ impl PeerStore {
                 "schema_version={} persisted={persisted} stability_ready={stability_ready}",
                 kind.schema_version()
             ),
+        );
+    }
+
+    /// Records the local recovery-anchor decision for a signed two-hop cache.
+    pub fn record_two_hop_proof_cache_rollback_protection(
+        &self,
+        now: u64,
+        generation: u64,
+        protection: &str,
+    ) {
+        self.record_path_proof_cache_rollback_protection(
+            PathProofCacheKind::TwoHop,
+            now,
+            generation,
+            protection,
+        );
+    }
+
+    /// Records the local recovery-anchor decision for a signed three-hop cache.
+    pub fn record_three_hop_proof_cache_rollback_protection(
+        &self,
+        now: u64,
+        generation: u64,
+        protection: &str,
+    ) {
+        self.record_path_proof_cache_rollback_protection(
+            PathProofCacheKind::ThreeHop,
+            now,
+            generation,
+            protection,
+        );
+    }
+
+    fn record_path_proof_cache_rollback_protection(
+        &self,
+        kind: PathProofCacheKind,
+        now: u64,
+        generation: u64,
+        protection: &str,
+    ) {
+        let protection = match protection {
+            "anchored" | "cache_ahead" | "legacy_unanchored" | "anchor_missing"
+            | "anchor_invalid" | "anchor_conflict" | "rollback_detected" | "not_checked" => {
+                protection
+            }
+            _ => "unknown",
+        };
+        {
+            let mut status = self.bootstrap_status.write();
+            match kind {
+                PathProofCacheKind::TwoHop => {
+                    status.last_two_hop_proof_cache_rollback_protection =
+                        Some(protection.to_string());
+                }
+                PathProofCacheKind::ThreeHop => {
+                    status.last_three_hop_proof_cache_rollback_protection =
+                        Some(protection.to_string());
+                }
+            }
+        }
+        let outcome = match protection {
+            "anchored" => "accepted",
+            "cache_ahead" | "legacy_unanchored" | "not_checked" => "warning",
+            _ => "rejected",
+        };
+        self.record_audit_event(
+            now,
+            format!("{}_rollback_protection", kind.audit_prefix()),
+            outcome,
+            format!("generation={generation} protection={protection}"),
         );
     }
 
@@ -5188,6 +5275,11 @@ impl PeerStore {
     ) -> PeerStoreTwoHopProofCacheRestoreReport {
         let reason_bucket = match reason {
             "identity_unavailable" => "identity_unavailable",
+            "legacy_unanchored" => "legacy_unanchored",
+            "anchor_missing" => "anchor_missing",
+            "anchor_invalid" => "anchor_invalid",
+            "anchor_conflict" => "anchor_conflict",
+            "rollback_detected" => "rollback_detected",
             _ => "signature_invalid",
         };
         {
