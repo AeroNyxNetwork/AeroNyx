@@ -169,6 +169,8 @@
 //!   false by default and must be governed by a separate reviewed policy.
 //!
 //! ## Last Modified
+//! v0.70.0-ThreeHopSignedRecovery - Added independently signed, route-pool-
+//! bound three-hop aggregate proof persistence and warm-restart recovery
 //! v0.69.0-ThreeHopRuntimeProof - Added independent privacy-safe three-hop
 //! message-delivery proof history while preserving the existing two-hop wire contract
 //! v0.68.0-TwoHopProbeOutcome - Prevented legacy control ACKs from being
@@ -275,6 +277,8 @@ const PEER_ROUTEABILITY_STALE_AFTER_SECS: u64 = 1_800;
 pub const ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 /// Local peer-cache two-hop proof history schema understood by this node.
 pub const TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION: u16 = 1;
+/// Local peer-cache three-hop proof history schema understood by this node.
+pub const THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION: u16 = 1;
 /// Local peer-cache aggregate verified-client delivery schema understood by this node.
 pub const VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION: u16 = 2;
 const ROUTEABILITY_EVIDENCE_KIND_EXACT_DESCRIPTOR: &str = "direct_opaque_route_success";
@@ -289,6 +293,61 @@ const PEER_QUORUM_MIN_VALID_PEERS: usize = 2;
 const PEER_QUORUM_MIN_ROUTEABLE_CHAT_RELAYS: usize = 1;
 const TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS: usize = 2;
 const TWO_HOP_PATH_POLICY_NETWORK_DIVERSE: &str = "distinct_node_and_network_prefix";
+
+/// Internal selector for signed path-proof cache sections.
+///
+/// [THREE-HOP-SIGNED-RECOVERY 2026-08-02 by Codex] Keeping path shape,
+/// validation, route-pool gates, and status mutation behind one selector
+/// prevents the two-hop and three-hop recovery contracts from drifting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathProofCacheKind {
+    TwoHop,
+    ThreeHop,
+}
+
+impl PathProofCacheKind {
+    const fn schema_version(self) -> u16 {
+        match self {
+            Self::TwoHop => TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+            Self::ThreeHop => THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        }
+    }
+
+    const fn hop_count(self) -> u8 {
+        match self {
+            Self::TwoHop => 2,
+            Self::ThreeHop => 3,
+        }
+    }
+
+    const fn path_shape(self) -> &'static str {
+        match self {
+            Self::TwoHop => "entry_middle_terminal",
+            Self::ThreeHop => "entry_middle_middle_terminal",
+        }
+    }
+
+    const fn ttl_shape(self) -> &'static str {
+        match self {
+            Self::TwoHop => "entry_ttl_2_onward_ttl_1",
+            Self::ThreeHop => "entry_ttl_3_onward_ttl_2",
+        }
+    }
+
+    const fn control_evidence_mode(self) -> &'static str {
+        match self {
+            Self::TwoHop => "synthetic_two_hop_control_probe",
+            Self::ThreeHop => "synthetic_three_hop_control_probe",
+        }
+    }
+
+    const fn audit_prefix(self) -> &'static str {
+        match self {
+            Self::TwoHop => "two_hop_proof_cache",
+            Self::ThreeHop => "three_hop_proof_cache",
+        }
+    }
+}
 
 /// Coarse endpoint identity used only to prevent obviously collocated hops.
 ///
@@ -759,6 +818,33 @@ pub struct PeerStoreBootstrapStatus {
     /// Timestamp of the latest successful signed proof-cache persistence.
     #[serde(default)]
     pub last_two_hop_proof_cache_persisted_at: Option<u64>,
+    /// Signed three-hop proof cache restore status: restored, partial, empty, or rejected.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_status: Option<String>,
+    /// Authentication result for the independently signed three-hop section.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_authentication: Option<String>,
+    /// Number of fresh three-hop synthetic proof events restored at startup.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_restored: u64,
+    /// Whether restored three-hop events reconstruct a mature fresh window.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_restored_stability_ready: bool,
+    /// Number of three-hop events rejected by authentication or validation.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_rejected: u64,
+    /// Timestamp of the latest three-hop proof-cache restore attempt.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_at: Option<u64>,
+    /// Number of fresh three-hop events in the latest durable signed snapshot.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_persisted: u64,
+    /// Whether the latest persisted three-hop section held a mature window.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_persisted_stability_ready: bool,
+    /// Timestamp of the latest successful signed three-hop cache persistence.
+    #[serde(default)]
+    pub last_three_hop_proof_cache_persisted_at: Option<u64>,
     /// Signed aggregate client-delivery cache restore status.
     ///
     /// Stable buckets are `restored`, `empty`, and `rejected`. The section
@@ -962,6 +1048,15 @@ impl Default for PeerStoreBootstrapStatus {
             last_two_hop_proof_cache_persisted: 0,
             last_two_hop_proof_cache_persisted_stability_ready: false,
             last_two_hop_proof_cache_persisted_at: None,
+            last_three_hop_proof_cache_status: None,
+            last_three_hop_proof_cache_authentication: None,
+            last_three_hop_proof_cache_restored: 0,
+            last_three_hop_proof_cache_restored_stability_ready: false,
+            last_three_hop_proof_cache_rejected: 0,
+            last_three_hop_proof_cache_at: None,
+            last_three_hop_proof_cache_persisted: 0,
+            last_three_hop_proof_cache_persisted_stability_ready: false,
+            last_three_hop_proof_cache_persisted_at: None,
             last_client_delivery_cache_status: None,
             last_client_delivery_cache_authentication: None,
             last_client_delivery_cache_restored: 0,
@@ -1366,12 +1461,12 @@ pub struct PeerStoreStatus {
     /// This lets dashboards show repeated protocol evidence instead of a
     /// single ready bit, while preserving the blind relay privacy boundary.
     pub two_hop_path_proof_history: PeerStoreTwoHopPathProofHistory,
-    /// Bounded privacy-safe runtime proof history for recent three-hop checks.
+    /// Bounded privacy-safe proof history for recent three-hop checks.
     ///
-    /// [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] This intentionally stays
-    /// separate from two-hop readiness. It is rebuilt by low-frequency live
-    /// probes after restart and must not be presented as durable consensus,
-    /// App traffic, or a disclosed route.
+    /// [THREE-HOP-SIGNED-RECOVERY 2026-08-02 by Codex] This intentionally stays
+    /// separate from two-hop admission. Fresh aggregate events may be restored
+    /// from an independently signed local cache after the current route pool is
+    /// revalidated. They are not consensus, App traffic, or a disclosed route.
     #[serde(default)]
     pub three_hop_path_proof_history: PeerStoreTwoHopPathProofHistory,
     /// Configured maximum peer count.
@@ -2520,19 +2615,59 @@ impl PeerStore {
         persisted: usize,
         stability_ready: bool,
     ) {
+        self.record_path_proof_cache_persisted(
+            PathProofCacheKind::TwoHop,
+            now,
+            persisted,
+            stability_ready,
+        );
+    }
+
+    /// Records durable persistence of the independently signed three-hop
+    /// aggregate proof section.
+    pub fn record_three_hop_proof_cache_persisted(
+        &self,
+        now: u64,
+        persisted: usize,
+        stability_ready: bool,
+    ) {
+        self.record_path_proof_cache_persisted(
+            PathProofCacheKind::ThreeHop,
+            now,
+            persisted,
+            stability_ready,
+        );
+    }
+
+    fn record_path_proof_cache_persisted(
+        &self,
+        kind: PathProofCacheKind,
+        now: u64,
+        persisted: usize,
+        stability_ready: bool,
+    ) {
         {
             let mut status = self.bootstrap_status.write();
-            status.last_two_hop_proof_cache_persisted = persisted as u64;
-            status.last_two_hop_proof_cache_persisted_stability_ready = stability_ready;
-            status.last_two_hop_proof_cache_persisted_at = Some(now);
+            match kind {
+                PathProofCacheKind::TwoHop => {
+                    status.last_two_hop_proof_cache_persisted = persisted as u64;
+                    status.last_two_hop_proof_cache_persisted_stability_ready = stability_ready;
+                    status.last_two_hop_proof_cache_persisted_at = Some(now);
+                }
+                PathProofCacheKind::ThreeHop => {
+                    status.last_three_hop_proof_cache_persisted = persisted as u64;
+                    status.last_three_hop_proof_cache_persisted_stability_ready = stability_ready;
+                    status.last_three_hop_proof_cache_persisted_at = Some(now);
+                }
+            }
         }
         self.record_audit_event(
             now,
-            "two_hop_proof_cache_persist",
+            format!("{}_persist", kind.audit_prefix()),
             "success",
             format!(
                 "schema_version={} persisted={persisted} stability_ready={stability_ready}",
-                TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION
+                kind.schema_version()
             ),
         );
     }
@@ -2550,8 +2685,7 @@ impl PeerStore {
             status.last_client_delivery_cache_persisted = persisted;
             status.last_client_delivery_cache_persisted_at = Some(now);
             status.last_client_delivery_cache_generation = generation;
-            status.last_client_delivery_cache_rollback_protection =
-                Some("anchored".to_string());
+            status.last_client_delivery_cache_rollback_protection = Some("anchored".to_string());
         }
         self.record_audit_event(
             now,
@@ -2574,15 +2708,15 @@ impl PeerStore {
     ) {
         let protection = match protection {
             "anchored" | "cache_ahead" | "legacy_unanchored" | "anchor_missing"
-            | "anchor_invalid" | "anchor_conflict" | "rollback_detected"
-            | "not_checked" => protection,
+            | "anchor_invalid" | "anchor_conflict" | "rollback_detected" | "not_checked" => {
+                protection
+            }
             _ => "unknown",
         };
         {
             let mut status = self.bootstrap_status.write();
             status.last_client_delivery_cache_generation = generation;
-            status.last_client_delivery_cache_rollback_protection =
-                Some(protection.to_string());
+            status.last_client_delivery_cache_rollback_protection = Some(protection.to_string());
         }
         let outcome = match protection {
             "anchored" => "accepted",
@@ -2709,22 +2843,50 @@ impl PeerStore {
     ///
     /// The parser owns signature verification; PeerStore stores only this
     /// allowlisted result so API admission never depends on free-form log text.
-    pub fn record_two_hop_proof_cache_authentication(
+    pub fn record_two_hop_proof_cache_authentication(&self, now: u64, authentication: &str) {
+        self.record_path_proof_cache_authentication(
+            PathProofCacheKind::TwoHop,
+            now,
+            authentication,
+        );
+    }
+
+    /// Records independent authentication of the signed three-hop proof
+    /// section without retaining signature bytes or route metadata.
+    pub fn record_three_hop_proof_cache_authentication(&self, now: u64, authentication: &str) {
+        self.record_path_proof_cache_authentication(
+            PathProofCacheKind::ThreeHop,
+            now,
+            authentication,
+        );
+    }
+
+    fn record_path_proof_cache_authentication(
         &self,
+        kind: PathProofCacheKind,
         now: u64,
         authentication: &str,
     ) {
         let authentication = match authentication {
-            "verified" | "legacy_descriptor_only" | "signature_invalid"
+            "verified"
+            | "legacy_descriptor_only"
+            | "signature_invalid"
             | "identity_unavailable" => authentication,
             _ => "unknown",
         };
-        self.bootstrap_status
-            .write()
-            .last_two_hop_proof_cache_authentication = Some(authentication.to_string());
+        let mut status = self.bootstrap_status.write();
+        match kind {
+            PathProofCacheKind::TwoHop => {
+                status.last_two_hop_proof_cache_authentication = Some(authentication.to_string());
+            }
+            PathProofCacheKind::ThreeHop => {
+                status.last_three_hop_proof_cache_authentication = Some(authentication.to_string());
+            }
+        }
+        drop(status);
         self.record_audit_event(
             now,
-            "two_hop_proof_cache_authentication",
+            format!("{}_authentication", kind.audit_prefix()),
             if authentication == "verified" {
                 "accepted"
             } else if authentication == "legacy_descriptor_only" {
@@ -2738,13 +2900,11 @@ impl PeerStore {
 
     /// Records the independently evaluated aggregate client-delivery cache
     /// authentication bucket without retaining any proof inputs.
-    pub fn record_client_delivery_cache_authentication(
-        &self,
-        now: u64,
-        authentication: &str,
-    ) {
+    pub fn record_client_delivery_cache_authentication(&self, now: u64, authentication: &str) {
         let authentication = match authentication {
-            "verified" | "legacy_descriptor_only" | "signature_invalid"
+            "verified"
+            | "legacy_descriptor_only"
+            | "signature_invalid"
             | "identity_unavailable" => authentication,
             _ => "unknown",
         };
@@ -3350,11 +3510,7 @@ impl PeerStore {
                 self.load_bootstrap_snapshot_from_source(snapshot, now, "gossip_snapshot")
             }
             NodeDiscoveryMessage::DescriptorAnnounce { descriptor } => self
-                .apply_verified_descriptor_from_source(
-                    descriptor.clone(),
-                    now,
-                    "gossip_announce",
-                ),
+                .apply_verified_descriptor_from_source(descriptor.clone(), now, "gossip_announce"),
             // [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] PeerStore has
             // no Directory replica trust anchor. Direct callers therefore fail
             // closed; the discovery API may use the dedicated locally anchored
@@ -3397,10 +3553,7 @@ impl PeerStore {
 
     /// Records one fail-closed proof-gossip rejection without retaining any
     /// producer, descriptor, block, endpoint, route, or sender identity.
-    pub(crate) fn record_rejected_directory_proof_import(
-        &self,
-        now: u64,
-    ) -> PeerStoreImportReport {
+    pub(crate) fn record_rejected_directory_proof_import(&self, now: u64) -> PeerStoreImportReport {
         let report = PeerStoreImportReport {
             total: 1,
             inserted: 0,
@@ -3719,10 +3872,11 @@ impl PeerStore {
 
     /// Records an entry -> middle -> middle -> terminal runtime proof.
     ///
-    /// [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] Three-hop evidence is
-    /// isolated from the established two-hop counters and signed recovery
-    /// contract. The bounded history is runtime-only for this milestone and is
-    /// repopulated by the low-frequency probe after restart. Inputs are coarse
+    /// [THREE-HOP-SIGNED-RECOVERY 2026-08-02 by Codex] Three-hop evidence is
+    /// isolated from established two-hop admission and relay counters. Its
+    /// bounded aggregate history can be independently signed for warm restart,
+    /// but is accepted only after the current three-hop route pool is rebuilt.
+    /// Inputs are coarse
     /// counts and stable reason buckets only; never pass route members, node
     /// ids, endpoints, route ids, ciphertext, receivers, or client metadata.
     pub fn record_blind_relay_three_hop_probe_result_with_context(
@@ -4128,12 +4282,12 @@ impl PeerStore {
         hop_count: u8,
         path_shape: &'static str,
     ) {
-        let target = if hop_count == 3 {
-            &self.three_hop_path_proof_events
+        let kind = if hop_count == 3 {
+            PathProofCacheKind::ThreeHop
         } else {
-            &self.two_hop_path_proof_events
+            PathProofCacheKind::TwoHop
         };
-        let mut events = target.write();
+        let mut events = self.path_proof_events(kind).write();
         if events.len() >= MAX_TWO_HOP_PATH_PROOF_EVENTS {
             events.pop_front();
         }
@@ -4154,6 +4308,16 @@ impl PeerStore {
             .to_string(),
             ttl_shape: Self::two_hop_ttl_shape(entry_ttl, onward_ttl),
         });
+    }
+
+    fn path_proof_events(
+        &self,
+        kind: PathProofCacheKind,
+    ) -> &RwLock<VecDeque<PeerStoreTwoHopPathProofEvent>> {
+        match kind {
+            PathProofCacheKind::TwoHop => &self.two_hop_path_proof_events,
+            PathProofCacheKind::ThreeHop => &self.three_hop_path_proof_events,
+        }
     }
 
     fn path_proof_evidence_mode(reason: &str, hop_count: u8) -> &'static str {
@@ -4779,19 +4943,35 @@ impl PeerStore {
         &self,
         generated_at: u64,
     ) -> Vec<PeerStoreTwoHopPathProofEvent> {
+        self.export_path_proof_cache_events(PathProofCacheKind::TwoHop, generated_at)
+    }
+
+    /// Exports a bounded, freshness-checked three-hop aggregate proof window.
+    #[must_use]
+    pub fn export_three_hop_path_proof_cache_events(
+        &self,
+        generated_at: u64,
+    ) -> Vec<PeerStoreTwoHopPathProofEvent> {
+        self.export_path_proof_cache_events(PathProofCacheKind::ThreeHop, generated_at)
+    }
+
+    fn export_path_proof_cache_events(
+        &self,
+        kind: PathProofCacheKind,
+        generated_at: u64,
+    ) -> Vec<PeerStoreTwoHopPathProofEvent> {
         let fresh_events = self
-            .two_hop_path_proof_events
+            .path_proof_events(kind)
             .read()
             .iter()
-            .filter(|event| Self::two_hop_path_proof_cache_event_valid(event, generated_at))
+            .filter(|event| Self::path_proof_cache_event_valid(event, generated_at, kind))
             .cloned()
             .collect::<Vec<_>>();
         let message_delivery_count = fresh_events
             .iter()
             .filter(|event| event.proof_scope == "message_delivery")
             .count();
-        let events = if message_delivery_count
-            >= TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS as usize
+        let events = if message_delivery_count >= TWO_HOP_PATH_PROOF_STABILITY_MIN_ATTEMPTS as usize
         {
             // Preserve the same evidence used by runtime stability while also
             // retaining up to the three trailing failures that control the
@@ -4840,17 +5020,38 @@ impl PeerStore {
         };
         self.record_audit_event(
             generated_at,
-            "two_hop_proof_cache_export",
+            format!("{}_export", kind.audit_prefix()),
             "accepted",
             format!(
                 "schema_version={} exported={} max_entries={} stale_after_seconds={}",
-                TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+                kind.schema_version(),
                 events.len(),
                 TWO_HOP_PATH_PROOF_CACHE_MAX_ENTRIES,
                 PEER_ROUTEABILITY_STALE_AFTER_SECS
             ),
         );
         events
+    }
+
+    fn path_proof_route_pool_ready(&self, kind: PathProofCacheKind, now: u64) -> bool {
+        match kind {
+            PathProofCacheKind::TwoHop => {
+                self.route_path_status(now)
+                    .chat_two_hop_onion_ready
+                    .complete
+            }
+            PathProofCacheKind::ThreeHop => self
+                .scored_route_path_with_capabilities_excluding(
+                    &[
+                        NodeCapability::OnionMiddle,
+                        NodeCapability::OnionMiddle,
+                        NodeCapability::ChatRelay,
+                    ],
+                    now,
+                    &[],
+                )
+                .is_some(),
+        }
     }
 
     /// Restores a signed, bounded two-hop synthetic proof window.
@@ -4865,12 +5066,36 @@ impl PeerStore {
         records: &[PeerStoreTwoHopPathProofEvent],
         now: u64,
     ) -> PeerStoreTwoHopProofCacheRestoreReport {
+        self.restore_path_proof_cache_events(PathProofCacheKind::TwoHop, records, now)
+    }
+
+    /// Restores an independently signed, bounded three-hop aggregate proof
+    /// window after rebuilding a complete network-diverse route pool.
+    pub fn restore_three_hop_path_proof_cache_events(
+        &self,
+        records: &[PeerStoreTwoHopPathProofEvent],
+        now: u64,
+    ) -> PeerStoreTwoHopProofCacheRestoreReport {
+        self.restore_path_proof_cache_events(PathProofCacheKind::ThreeHop, records, now)
+    }
+
+    fn restore_path_proof_cache_events(
+        &self,
+        kind: PathProofCacheKind,
+        records: &[PeerStoreTwoHopPathProofEvent],
+        now: u64,
+    ) -> PeerStoreTwoHopProofCacheRestoreReport {
         if records.is_empty() {
-            return self.finish_two_hop_proof_cache_restore(0, 0, 0, now, None);
+            return self.finish_path_proof_cache_restore(kind, 0, 0, 0, now, None);
         }
-        if !self.route_path_status(now).chat_two_hop_onion_ready.complete {
-            return self.finish_two_hop_proof_cache_restore(
-                records.len(), 0, records.len(), now, Some("route_pool_unready"),
+        if !self.path_proof_route_pool_ready(kind, now) {
+            return self.finish_path_proof_cache_restore(
+                kind,
+                records.len(),
+                0,
+                records.len(),
+                now,
+                Some("route_pool_unready"),
             );
         }
 
@@ -4881,12 +5106,12 @@ impl PeerStore {
         let mut restored_events = Vec::new();
         let mut previous_at = None;
         {
-            let mut history = self.two_hop_path_proof_events.write();
+            let mut history = self.path_proof_events(kind).write();
             for event in records.iter().skip(bounded_start) {
                 let timestamp_order_valid = previous_at.is_none_or(|at| event.at >= at);
                 previous_at = Some(event.at);
                 if !timestamp_order_valid
-                    || !Self::two_hop_path_proof_cache_event_valid(event, now)
+                    || !Self::path_proof_cache_event_valid(event, now, kind)
                     || history.iter().any(|existing| existing == event)
                 {
                     rejected = rejected.saturating_add(1);
@@ -4901,7 +5126,7 @@ impl PeerStore {
         }
 
         let restored = restored_events.len();
-        if restored > 0 {
+        if restored > 0 && kind == PathProofCacheKind::TwoHop {
             let succeeded = restored_events
                 .iter()
                 .filter(|event| event.outcome == "accepted")
@@ -4929,9 +5154,7 @@ impl PeerStore {
                 .fetch_max(latest_at, Ordering::Relaxed);
         }
 
-        self.finish_two_hop_proof_cache_restore(
-            records.len(), restored, rejected, now, None,
-        )
+        self.finish_path_proof_cache_restore(kind, records.len(), restored, rejected, now, None)
     }
 
     /// Records cache authentication failure without discarding independently
@@ -4942,25 +5165,57 @@ impl PeerStore {
         now: u64,
         reason: &str,
     ) -> PeerStoreTwoHopProofCacheRestoreReport {
+        self.reject_path_proof_cache_events(PathProofCacheKind::TwoHop, total, now, reason)
+    }
+
+    /// Records a three-hop cache authentication failure without discarding
+    /// independently verified descriptors, routeability, or two-hop history.
+    pub fn reject_three_hop_path_proof_cache_events(
+        &self,
+        total: usize,
+        now: u64,
+        reason: &str,
+    ) -> PeerStoreTwoHopProofCacheRestoreReport {
+        self.reject_path_proof_cache_events(PathProofCacheKind::ThreeHop, total, now, reason)
+    }
+
+    fn reject_path_proof_cache_events(
+        &self,
+        kind: PathProofCacheKind,
+        total: usize,
+        now: u64,
+        reason: &str,
+    ) -> PeerStoreTwoHopProofCacheRestoreReport {
         let reason_bucket = match reason {
             "identity_unavailable" => "identity_unavailable",
             _ => "signature_invalid",
         };
         {
             let mut status = self.bootstrap_status.write();
-            status.last_two_hop_proof_cache_status = Some("rejected".to_string());
-            status.last_two_hop_proof_cache_restored = 0;
-            status.last_two_hop_proof_cache_restored_stability_ready = false;
-            status.last_two_hop_proof_cache_rejected = total as u64;
-            status.last_two_hop_proof_cache_at = Some(now);
+            match kind {
+                PathProofCacheKind::TwoHop => {
+                    status.last_two_hop_proof_cache_status = Some("rejected".to_string());
+                    status.last_two_hop_proof_cache_restored = 0;
+                    status.last_two_hop_proof_cache_restored_stability_ready = false;
+                    status.last_two_hop_proof_cache_rejected = total as u64;
+                    status.last_two_hop_proof_cache_at = Some(now);
+                }
+                PathProofCacheKind::ThreeHop => {
+                    status.last_three_hop_proof_cache_status = Some("rejected".to_string());
+                    status.last_three_hop_proof_cache_restored = 0;
+                    status.last_three_hop_proof_cache_restored_stability_ready = false;
+                    status.last_three_hop_proof_cache_rejected = total as u64;
+                    status.last_three_hop_proof_cache_at = Some(now);
+                }
+            }
         }
         self.record_audit_event(
             now,
-            "two_hop_proof_cache_restore",
+            format!("{}_restore", kind.audit_prefix()),
             "rejected",
             format!(
                 "schema_version={} total={} restored=0 rejected={} status=rejected reason={reason_bucket}",
-                TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+                kind.schema_version(),
                 total,
                 total
             ),
@@ -4972,8 +5227,9 @@ impl PeerStore {
         }
     }
 
-    fn finish_two_hop_proof_cache_restore(
+    fn finish_path_proof_cache_restore(
         &self,
+        kind: PathProofCacheKind,
         total: usize,
         restored: usize,
         rejected: usize,
@@ -4990,28 +5246,47 @@ impl PeerStore {
             "rejected"
         };
         let restored_stability_ready = restored > 0
-            && self
-                .two_hop_path_proof_history(now)
-                .stability_ready;
+            && match kind {
+                PathProofCacheKind::TwoHop => self.two_hop_path_proof_history(now).stability_ready,
+                PathProofCacheKind::ThreeHop => {
+                    self.three_hop_path_proof_history(now).stability_ready
+                }
+            };
         {
             let mut status = self.bootstrap_status.write();
-            status.last_two_hop_proof_cache_status = Some(status_bucket.to_string());
-            status.last_two_hop_proof_cache_restored = restored as u64;
-            status.last_two_hop_proof_cache_restored_stability_ready =
-                restored_stability_ready;
-            status.last_two_hop_proof_cache_rejected = rejected as u64;
-            status.last_two_hop_proof_cache_at = Some(now);
+            match kind {
+                PathProofCacheKind::TwoHop => {
+                    status.last_two_hop_proof_cache_status = Some(status_bucket.to_string());
+                    status.last_two_hop_proof_cache_restored = restored as u64;
+                    status.last_two_hop_proof_cache_restored_stability_ready =
+                        restored_stability_ready;
+                    status.last_two_hop_proof_cache_rejected = rejected as u64;
+                    status.last_two_hop_proof_cache_at = Some(now);
+                }
+                PathProofCacheKind::ThreeHop => {
+                    status.last_three_hop_proof_cache_status = Some(status_bucket.to_string());
+                    status.last_three_hop_proof_cache_restored = restored as u64;
+                    status.last_three_hop_proof_cache_restored_stability_ready =
+                        restored_stability_ready;
+                    status.last_three_hop_proof_cache_rejected = rejected as u64;
+                    status.last_three_hop_proof_cache_at = Some(now);
+                }
+            }
         }
         let reason_detail = rejection_reason
             .map(|reason| format!(" reason={reason}"))
             .unwrap_or_default();
         self.record_audit_event(
             now,
-            "two_hop_proof_cache_restore",
-            if restored > 0 || total == 0 { "accepted" } else { "rejected" },
+            format!("{}_restore", kind.audit_prefix()),
+            if restored > 0 || total == 0 {
+                "accepted"
+            } else {
+                "rejected"
+            },
             format!(
                 "schema_version={} total={} restored={} rejected={} status={} stability_ready={}{}",
-                TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+                kind.schema_version(),
                 total,
                 restored,
                 rejected,
@@ -5027,19 +5302,26 @@ impl PeerStore {
         }
     }
 
-    fn two_hop_path_proof_cache_event_valid(
+    fn path_proof_cache_event_valid(
         event: &PeerStoreTwoHopPathProofEvent,
         now: u64,
+        kind: PathProofCacheKind,
     ) -> bool {
         if event.at == 0
             || event.at > now
             || now.saturating_sub(event.at) > PEER_ROUTEABILITY_STALE_AFTER_SECS
-            || event.path_shape != "entry_middle_terminal"
-            || event.hop_count != 2
+            || event.path_shape != kind.path_shape()
+            || event.hop_count != kind.hop_count()
             || event.path_policy != TWO_HOP_PATH_POLICY_NETWORK_DIVERSE
-            || event.ttl_shape != "entry_ttl_2_onward_ttl_1"
-            || !matches!(event.middle_candidate_bucket.as_str(), "none" | "one" | "few" | "healthy" | "deep")
-            || !matches!(event.terminal_candidate_bucket.as_str(), "none" | "one" | "few" | "healthy" | "deep")
+            || event.ttl_shape != kind.ttl_shape()
+            || !matches!(
+                event.middle_candidate_bucket.as_str(),
+                "none" | "one" | "few" | "healthy" | "deep"
+            )
+            || !matches!(
+                event.terminal_candidate_bucket.as_str(),
+                "none" | "one" | "few" | "healthy" | "deep"
+            )
         {
             return false;
         }
@@ -5052,17 +5334,24 @@ impl PeerStore {
             }
             "accepted" => {
                 event.outcome == "accepted"
-                    && event.evidence_mode == "synthetic_two_hop_control_probe"
+                    && event.evidence_mode == kind.control_evidence_mode()
                     && event.proof_scope == "control_plane"
             }
-            "onion_ack_rejected" | "onion_ack_decode" | "onion_kem_unavailable"
-            | "ack_rejected" | "ack_decode" | "no_distinct_path"
+            "onion_ack_rejected"
+            | "onion_ack_decode"
+            | "onion_kem_unavailable"
+            | "ack_rejected"
+            | "ack_decode"
+            | "no_distinct_path"
             | "no_network_diverse_path"
-            | "middle_missing_endpoint" | "middle_invalid_endpoint"
-            | "onion_http_error" | "http_error" | "onion_request_error"
+            | "middle_missing_endpoint"
+            | "middle_invalid_endpoint"
+            | "onion_http_error"
+            | "http_error"
+            | "onion_request_error"
             | "request_error" => {
                 event.outcome == "rejected"
-                    && event.evidence_mode == "synthetic_two_hop_control_probe"
+                    && event.evidence_mode == kind.control_evidence_mode()
                     && event.proof_scope == "control_plane"
             }
             _ => false,
@@ -5081,14 +5370,11 @@ impl PeerStore {
         generated_at: u64,
     ) -> Option<PeerStoreVerifiedClientDeliveryCacheEvidence> {
         let stats = self.counters.snapshot();
-        let last_verified_at = stats
-            .blind_relay
-            .last_verified_client_onion_delivery_at?;
+        let last_verified_at = stats.blind_relay.last_verified_client_onion_delivery_at?;
         if stats.blind_relay.verified_client_onion_deliveries == 0
             || last_verified_at == 0
             || last_verified_at > generated_at
-            || generated_at.saturating_sub(last_verified_at)
-                > PEER_ROUTEABILITY_STALE_AFTER_SECS
+            || generated_at.saturating_sub(last_verified_at) > PEER_ROUTEABILITY_STALE_AFTER_SECS
         {
             return None;
         }
@@ -5115,9 +5401,11 @@ impl PeerStore {
         let valid = evidence.verified_deliveries > 0
             && evidence.last_verified_at > 0
             && evidence.last_verified_at <= now
-            && now.saturating_sub(evidence.last_verified_at)
-                <= PEER_ROUTEABILITY_STALE_AFTER_SECS
-            && self.route_path_status(now).chat_two_hop_onion_ready.complete;
+            && now.saturating_sub(evidence.last_verified_at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+            && self
+                .route_path_status(now)
+                .chat_two_hop_onion_ready
+                .complete;
         if !valid {
             return self.finish_client_delivery_cache_restore(
                 true,
@@ -5581,11 +5869,7 @@ impl PeerStore {
     /// endpoint safety and trust policy. In particular, public discovery is not
     /// authority membership, voting weight, consensus, or finality.
     #[must_use]
-    pub fn valid_public_descriptors(
-        &self,
-        now: u64,
-        limit: usize,
-    ) -> Vec<SignedNodeDescriptor> {
+    pub fn valid_public_descriptors(&self, now: u64, limit: usize) -> Vec<SignedNodeDescriptor> {
         if limit == 0 {
             return Vec::new();
         }
@@ -5912,12 +6196,12 @@ impl PeerStore {
         now: u64,
         excluded_node_ids: &[[u8; 32]],
     ) -> Option<Vec<SignedNodeDescriptor>> {
-        self.scored_route_path_with_capabilities_excluding(
-            capabilities,
-            now,
-            excluded_node_ids,
-        )
-        .map(|path| path.into_iter().map(|candidate| candidate.descriptor).collect())
+        self.scored_route_path_with_capabilities_excluding(capabilities, now, excluded_node_ids)
+            .map(|path| {
+                path.into_iter()
+                    .map(|candidate| candidate.descriptor)
+                    .collect()
+            })
     }
 
     /// Downgrades descriptors that are no longer valid at `now`.
@@ -6223,8 +6507,7 @@ impl PeerStore {
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
                 .unwrap_or(false);
         let real_relay_ready = verified_client_onion_evidence_fresh
-            && delivery_receipt_capable_peers
-                >= TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS;
+            && delivery_receipt_capable_peers >= TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS;
         let probe_ready = probe_evidence_seen
             && last_probe_age_seconds
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
@@ -6235,12 +6518,11 @@ impl PeerStore {
                 .unwrap_or(false);
         let synthetic_probe_ready = probe_ready || two_hop_probe_ready;
         let runtime_ready = real_relay_ready || accepted_relay_ready || synthetic_probe_ready;
-        let stale_success_evidence =
-            (verified_client_onion_evidence_seen
-                || accepted_evidence_seen
-                || probe_evidence_seen
-                || two_hop_probe_evidence_seen)
-                && !runtime_ready;
+        let stale_success_evidence = (verified_client_onion_evidence_seen
+            || accepted_evidence_seen
+            || probe_evidence_seen
+            || two_hop_probe_evidence_seen)
+            && !runtime_ready;
         let evidence_mode = if verified_client_onion_evidence_seen {
             "verified_client_onion_delivery_receipt"
         } else if accepted_evidence_seen {
@@ -7991,14 +8273,32 @@ mod tests {
         let store = PeerStore::new();
         for offset in 1..=10 {
             store.record_blind_relay_two_hop_probe_result_with_context(
-                now + offset, true, "onion_terminal_delivered", 3, 3, 2, 1,
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                3,
+                3,
+                2,
+                1,
             );
         }
         store.record_blind_relay_two_hop_probe_result_with_context(
-            now + 11, false, "not_allowlisted", 3, 3, 2, 1,
+            now + 11,
+            false,
+            "not_allowlisted",
+            3,
+            3,
+            2,
+            1,
         );
         store.record_blind_relay_two_hop_probe_result_with_context(
-            now + 100, true, "onion_terminal_delivered", 3, 3, 2, 1,
+            now + 100,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            2,
+            1,
         );
         store.record_blind_relay_two_hop_probe_result_with_context(
             now.saturating_sub(PEER_ROUTEABILITY_STALE_AFTER_SECS + 1),
@@ -8033,7 +8333,10 @@ mod tests {
         let terminal_kp = IdentityKeyPair::generate();
         let mut middle = signed_descriptor_for(&middle_kp, 1, now + 4_000);
         middle.descriptor.public_endpoint = Some("https://middle.example".to_string());
-        middle.descriptor.capabilities.push(NodeCapability::OnionMiddle);
+        middle
+            .descriptor
+            .capabilities
+            .push(NodeCapability::OnionMiddle);
         middle = SignedNodeDescriptor::sign(middle.descriptor, &middle_kp).unwrap();
         let mut terminal = signed_descriptor_for(&terminal_kp, 1, now + 4_000);
         terminal.descriptor.public_endpoint = Some("https://terminal.example".to_string());
@@ -8046,7 +8349,13 @@ mod tests {
         source.record_route_forward_success(&terminal.node_id(), now + 1);
         for offset in 2..=4 {
             source.record_blind_relay_two_hop_probe_result_with_context(
-                now + offset, true, "onion_terminal_delivered", 2, 2, 2, 1,
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                2,
+                2,
+                2,
+                1,
             );
         }
         let route_evidence = source.export_routeability_cache_evidence(now + 5);
@@ -8066,7 +8375,9 @@ mod tests {
         restored.upsert_verified(middle, now + 6).unwrap();
         restored.upsert_verified(terminal, now + 6).unwrap();
         assert_eq!(
-            restored.restore_routeability_cache_evidence(&route_evidence, now + 6).restored,
+            restored
+                .restore_routeability_cache_evidence(&route_evidence, now + 6)
+                .restored,
             2
         );
         let report = restored.restore_two_hop_path_proof_cache_events(&proof_events, now + 6);
@@ -8075,11 +8386,18 @@ mod tests {
         assert_eq!(report.restored, 3);
         assert_eq!(report.rejected, 0);
         let status = restored.status(now + 6);
-        assert_eq!(status.bootstrap.last_two_hop_proof_cache_status.as_deref(), Some("restored"));
+        assert_eq!(
+            status.bootstrap.last_two_hop_proof_cache_status.as_deref(),
+            Some("restored")
+        );
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_restored, 3);
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_rejected, 0);
         assert!(status.two_hop_path_proof_history.stability_ready);
-        assert!(status.two_hop_path_proof_history.recent_message_delivery_ready);
+        assert!(
+            status
+                .two_hop_path_proof_history
+                .recent_message_delivery_ready
+        );
         assert_eq!(status.runtime.blind_relay.two_hop_probe_attempted, 3);
         assert_eq!(status.runtime.blind_relay.two_hop_probe_succeeded, 3);
         assert_eq!(status.runtime.blind_relay.received, 0);
@@ -8094,7 +8412,10 @@ mod tests {
         let terminal_kp = IdentityKeyPair::generate();
         let mut middle = signed_descriptor_for(&middle_kp, 1, now + 4_000);
         middle.descriptor.public_endpoint = Some("https://middle.example".to_string());
-        middle.descriptor.capabilities.push(NodeCapability::OnionMiddle);
+        middle
+            .descriptor
+            .capabilities
+            .push(NodeCapability::OnionMiddle);
         middle = SignedNodeDescriptor::sign(middle.descriptor, &middle_kp).unwrap();
         let mut terminal = signed_descriptor_for(&terminal_kp, 1, now + 4_000);
         terminal.descriptor.public_endpoint = Some("https://terminal.example".to_string());
@@ -8122,7 +8443,11 @@ mod tests {
         let report = store.restore_two_hop_path_proof_cache_events(&[invalid], now + 3);
         assert_eq!(report.restored, 0);
         assert_eq!(report.rejected, 1);
-        assert!(store.status(now + 3).two_hop_path_proof_history.events.is_empty());
+        assert!(store
+            .status(now + 3)
+            .two_hop_path_proof_history
+            .events
+            .is_empty());
     }
 
     #[test]
@@ -8130,11 +8455,7 @@ mod tests {
         let store = PeerStore::new();
         let now = 1_700_400_000;
 
-        let report = store.reject_two_hop_path_proof_cache_events(
-            0,
-            now,
-            "signature_invalid",
-        );
+        let report = store.reject_two_hop_path_proof_cache_events(0, now, "signature_invalid");
 
         assert_eq!(report.total, 0);
         assert_eq!(report.restored, 0);
@@ -8541,21 +8862,17 @@ mod tests {
         let alternate_middle_kp = IdentityKeyPair::generate();
         let terminal_kp = IdentityKeyPair::generate();
 
-        let mut preferred_middle =
-            signed_descriptor_for(&preferred_middle_kp, 1, now + 2_000);
+        let mut preferred_middle = signed_descriptor_for(&preferred_middle_kp, 1, now + 2_000);
         preferred_middle.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
-        preferred_middle.descriptor.public_endpoint =
-            Some("http://203.0.113.10:8422".to_string());
+        preferred_middle.descriptor.public_endpoint = Some("http://203.0.113.10:8422".to_string());
         preferred_middle.descriptor.capacity.max_sessions = 4096;
         preferred_middle =
             SignedNodeDescriptor::sign(preferred_middle.descriptor, &preferred_middle_kp).unwrap();
         let preferred_middle_id = preferred_middle.node_id();
 
-        let mut alternate_middle =
-            signed_descriptor_for(&alternate_middle_kp, 1, now + 2_000);
+        let mut alternate_middle = signed_descriptor_for(&alternate_middle_kp, 1, now + 2_000);
         alternate_middle.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
-        alternate_middle.descriptor.public_endpoint =
-            Some("http://198.51.100.10:8422".to_string());
+        alternate_middle.descriptor.public_endpoint = Some("http://198.51.100.10:8422".to_string());
         alternate_middle.descriptor.capacity.max_sessions = 64;
         alternate_middle =
             SignedNodeDescriptor::sign(alternate_middle.descriptor, &alternate_middle_kp).unwrap();
@@ -9240,9 +9557,7 @@ mod tests {
             store.upsert_verified(descriptor, 1_700_000_100).unwrap();
         }
 
-        assert!(store
-            .valid_public_descriptors(1_700_000_100, 0)
-            .is_empty());
+        assert!(store.valid_public_descriptors(1_700_000_100, 0).is_empty());
         let selected = store.valid_public_descriptors(1_700_000_100, 1);
         assert_eq!(selected.len(), 1);
         assert!(selected[0].descriptor.policy.public_discovery);
@@ -9761,10 +10076,8 @@ mod tests {
         let identity = IdentityKeyPair::generate();
         let mut descriptor = signed_descriptor_for(&identity, 1, now + 4_000);
         descriptor.descriptor.public_endpoint = Some("https://relay.example".to_string());
-        descriptor.descriptor.capabilities = vec![
-            NodeCapability::ChatRelay,
-            NodeCapability::OnionMiddle,
-        ];
+        descriptor.descriptor.capabilities =
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
         descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &identity).unwrap();
         let node_id = descriptor.node_id();
         let store = PeerStore::new();
@@ -9772,15 +10085,20 @@ mod tests {
         store.record_route_forward_success(&node_id, now + 1);
         store.record_delivery_receipt_capability(&node_id, now + 2);
 
-        let candidates = store
-            .delivery_receipt_route_candidates_with_capability_excluding(
-                NodeCapability::ChatRelay,
-                now + 3,
-                4,
-                &[],
-            );
+        let candidates = store.delivery_receipt_route_candidates_with_capability_excluding(
+            NodeCapability::ChatRelay,
+            now + 3,
+            4,
+            &[],
+        );
         assert_eq!(candidates.len(), 1);
-        assert_eq!(store.status(now + 3).blind_relay_quality.delivery_receipt_capable_peers, 1);
+        assert_eq!(
+            store
+                .status(now + 3)
+                .blind_relay_quality
+                .delivery_receipt_capable_peers,
+            1
+        );
 
         store.record_route_forward_failure(&node_id, now + 4, "request_failed");
         assert!(store
@@ -9801,7 +10119,13 @@ mod tests {
                 &[],
             )
             .is_empty());
-        assert_eq!(store.status(stale_at).blind_relay_quality.delivery_receipt_capable_peers, 0);
+        assert_eq!(
+            store
+                .status(stale_at)
+                .blind_relay_quality
+                .delivery_receipt_capable_peers,
+            0
+        );
     }
 
     #[test]
@@ -9902,15 +10226,22 @@ mod tests {
         );
 
         for (offset, endpoint, capability) in [
-            (1, "https://middle-receipt.example", NodeCapability::OnionMiddle),
-            (2, "https://terminal-receipt.example", NodeCapability::ChatRelay),
+            (
+                1,
+                "https://middle-receipt.example",
+                NodeCapability::OnionMiddle,
+            ),
+            (
+                2,
+                "https://terminal-receipt.example",
+                NodeCapability::ChatRelay,
+            ),
         ] {
             let identity = IdentityKeyPair::generate();
             let mut descriptor = signed_descriptor_for(&identity, offset, now + 4_000);
             descriptor.descriptor.public_endpoint = Some(endpoint.to_string());
             descriptor.descriptor.capabilities = vec![capability];
-            descriptor =
-                SignedNodeDescriptor::sign(descriptor.descriptor, &identity).unwrap();
+            descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &identity).unwrap();
             let node_id = descriptor.node_id();
             store.upsert_verified(descriptor, now).unwrap();
             store.record_route_forward_success(&node_id, now);
@@ -9920,10 +10251,19 @@ mod tests {
         let fresh = store.status(now + 10).blind_relay_quality;
         assert!(fresh.real_relay_ready);
         assert_eq!(fresh.verified_client_onion_deliveries, 1);
-        assert_eq!(fresh.last_verified_client_onion_delivery_age_seconds, Some(10));
-        assert_eq!(fresh.evidence_mode, "verified_client_onion_delivery_receipt");
+        assert_eq!(
+            fresh.last_verified_client_onion_delivery_age_seconds,
+            Some(10)
+        );
+        assert_eq!(
+            fresh.evidence_mode,
+            "verified_client_onion_delivery_receipt"
+        );
         assert_eq!(fresh.proof_scope, "client_message_delivery");
-        assert_eq!(fresh.readiness_reason, "verified_client_onion_delivery_receipt_ready");
+        assert_eq!(
+            fresh.readiness_reason,
+            "verified_client_onion_delivery_receipt_ready"
+        );
 
         let stale = store
             .status(now + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1)

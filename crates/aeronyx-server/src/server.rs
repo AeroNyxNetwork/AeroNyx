@@ -419,6 +419,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.63-ThreeHopSignedRecovery - Added independent signed three-hop proof
+//     snapshot persistence, strict startup revalidation, and aggregate status.
 //   v2.8.62-ThreeHopFeatureNegotiation - Added fail-closed mixed-version
 //     selection for the first middle of three-hop runtime probes.
 //   v2.8.61-BoundedDiscoveryHeartbeat - Added a bounded aggregate PeerStore
@@ -645,12 +647,6 @@ use crate::api::chat_peer::{
     build_chat_peer_router, PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
     PeerChatRelayResponse,
 };
-use crate::api::discovery::{
-    blind_relay_runtime_status_value,
-    build_discovery_router_with_local_status_and_directory_admission,
-    discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
-    GossipResponse,
-};
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
     build_directory_replica_status_router_with_witness_carrier, DirectoryReplicaStatusScope,
@@ -658,23 +654,27 @@ use crate::api::directory_replica_status::{
 use crate::api::directory_replica_sync::{
     run_directory_carrier_cold_bootstrap_smoke, run_directory_mirror_carrier_smoke,
     DirectoryCarrierColdBootstrapSmokeReport, DirectoryMirrorCarrierSmokeReport,
-    DirectoryReplicaSyncCoordinator, DirectoryReplicaSyncPolicy,
-    DirectoryReplicaSyncResources, DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS,
-    DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
+    DirectoryReplicaSyncCoordinator, DirectoryReplicaSyncPolicy, DirectoryReplicaSyncResources,
+    DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
+};
+use crate::api::discovery::{
+    blind_relay_runtime_status_value,
+    build_discovery_router_with_local_status_and_directory_admission,
+    discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
+    GossipResponse,
 };
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     publish_current_descriptor_to_commitment_witnesses, pull_record_commitment_checkpoint,
     pull_record_commitment_page_with_carrier_runtime,
-    recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime,
-    CommitmentBlockCarrierCircuitBreaker,
-    CommitmentBlockCarrierCursor, CommitmentCertificateCarrierCircuitBreaker,
-    CommitmentCertificateCarrierRecoveryDisposition,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
-    reconcile_record_commitment_witnesses, release_record_commitment_coordinator_lease,
-    request_record_commitment_coordinator_lease,
+    reconcile_record_commitment_witnesses,
+    recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime,
+    release_record_commitment_coordinator_lease, request_record_commitment_coordinator_lease,
     sync_follower_record_commitment_checkpoint_certificate_with_carrier_runtime,
-    witness_verified_delivery_anchor, CommitmentCheckpointRelation,
+    witness_verified_delivery_anchor, CommitmentBlockCarrierCircuitBreaker,
+    CommitmentBlockCarrierCursor, CommitmentCertificateCarrierCircuitBreaker,
+    CommitmentCertificateCarrierRecoveryDisposition, CommitmentCheckpointRelation,
     CommitmentFollowerCertificateSyncOutcome, CommitmentReconciliationOutcome,
     CommitmentSyncPageSource, VerifiedDeliveryAnchorWitnessRound,
 };
@@ -716,10 +716,10 @@ use crate::services::memchain::{
     LlmRouter, RecordCommitmentCertificateBackfillDisposition, TaskWorker,
 };
 use crate::services::peer_store::{
-    PeerStoreDirectoryProofGossipRound, PeerStoreRouteabilityCacheEvidence,
-    PeerStoreStatus, PeerStoreTwoHopPathProofEvent,
-    PeerStoreVerifiedClientDeliveryCacheEvidence, PeerStoreVerifiedDeliveryWitnessRound,
-    ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+    PeerStoreDirectoryProofGossipRound, PeerStoreRouteabilityCacheEvidence, PeerStoreStatus,
+    PeerStoreTwoHopPathProofEvent, PeerStoreVerifiedClientDeliveryCacheEvidence,
+    PeerStoreVerifiedDeliveryWitnessRound, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+    THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
 use crate::services::{
@@ -1030,10 +1030,11 @@ impl DiscoveryGossipFailure {
         } else if error.is_connect() {
             DiscoveryGossipFailureKind::Connect
         } else if error.is_status() {
-            error.status().map_or(
-                DiscoveryGossipFailureKind::HttpStatus,
-                |status| DiscoveryGossipFailureKind::Http(status.as_u16()),
-            )
+            error
+                .status()
+                .map_or(DiscoveryGossipFailureKind::HttpStatus, |status| {
+                    DiscoveryGossipFailureKind::Http(status.as_u16())
+                })
         } else if error.is_decode() {
             DiscoveryGossipFailureKind::Decode
         } else if error.is_body() {
@@ -1218,8 +1219,7 @@ impl DiscoveryGossipRoundAccumulator {
         if self.directory_proof.capable == 0 {
             0
         } else {
-            self.directory_proof.accepted.saturating_mul(100)
-                / self.directory_proof.capable
+            self.directory_proof.accepted.saturating_mul(100) / self.directory_proof.capable
         }
     }
 }
@@ -1228,7 +1228,7 @@ impl DiscoveryGossipRoundAccumulator {
 ///
 /// `descriptor_snapshot` is flattened so legacy readers still see the exact
 /// `NodeBootstrapSnapshot` top-level shape and ignore the additive routeability
-/// and two-hop proof fields. Each recovery section has an independent signature
+/// and path-proof fields. Each recovery section has an independent signature
 /// domain, allowing one invalid section to fail closed without discarding the
 /// separately signed descriptors or other recovery evidence. This document is
 /// local-only and must never be served by gossip.
@@ -1253,6 +1253,14 @@ struct PeerStoreCacheDocument {
     #[serde(default)]
     two_hop_path_proof_signature_ed25519: Option<String>,
     #[serde(default)]
+    three_hop_path_proof_schema_version: u16,
+    #[serde(default)]
+    three_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
+    #[serde(default)]
+    three_hop_path_proof_signer_node_id: Option<String>,
+    #[serde(default)]
+    three_hop_path_proof_signature_ed25519: Option<String>,
+    #[serde(default)]
     verified_client_delivery_schema_version: u16,
     #[serde(default)]
     verified_client_delivery_generation: u64,
@@ -1264,11 +1272,27 @@ struct PeerStoreCacheDocument {
     verified_client_delivery_signature_ed25519: Option<String>,
 }
 
+/// Aggregate result of one durable peer-cache write.
+///
+/// [THREE-HOP-SIGNED-RECOVERY 2026-08-02 by Codex] A named report replaces the
+/// positional tuple so adding independently signed recovery sections cannot
+/// silently swap counters at call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerStoreCachePersistReport {
+    two_hop_events: usize,
+    two_hop_stability_ready: bool,
+    three_hop_events: usize,
+    three_hop_stability_ready: bool,
+    client_deliveries: u64,
+    client_delivery_generation: u64,
+}
+
 impl PeerStoreCacheDocument {
     fn new(
         descriptor_snapshot: NodeBootstrapSnapshot,
         routeability_evidence: Vec<PeerStoreRouteabilityCacheEvidence>,
         two_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
+        three_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
         verified_client_delivery_generation: u64,
         verified_client_delivery_evidence: Option<PeerStoreVerifiedClientDeliveryCacheEvidence>,
         identity: &IdentityKeyPair,
@@ -1283,8 +1307,11 @@ impl PeerStoreCacheDocument {
             two_hop_path_proof_events,
             two_hop_path_proof_signer_node_id: None,
             two_hop_path_proof_signature_ed25519: None,
-            verified_client_delivery_schema_version:
-                VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
+            three_hop_path_proof_schema_version: THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+            three_hop_path_proof_events,
+            three_hop_path_proof_signer_node_id: None,
+            three_hop_path_proof_signature_ed25519: None,
+            verified_client_delivery_schema_version: VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
             verified_client_delivery_generation,
             verified_client_delivery_evidence,
             verified_client_delivery_signer_node_id: None,
@@ -1300,18 +1327,26 @@ impl PeerStoreCacheDocument {
         let proof_signing_bytes = document
             .two_hop_path_proof_signing_bytes()
             .map_err(ServerError::internal)?;
-        document.two_hop_path_proof_signer_node_id =
-            Some(hex::encode(identity.public_key_bytes()));
+        document.two_hop_path_proof_signer_node_id = Some(hex::encode(identity.public_key_bytes()));
         document.two_hop_path_proof_signature_ed25519 =
             Some(hex::encode(identity.sign(&proof_signing_bytes)));
+        // [THREE-HOP-SIGNED-RECOVERY 2026-08-02 by Codex] Three-hop aggregate
+        // evidence uses an independent signing domain so tampering cannot
+        // invalidate descriptors, routeability, or the two-hop admission cache.
+        let three_hop_signing_bytes = document
+            .three_hop_path_proof_signing_bytes()
+            .map_err(ServerError::internal)?;
+        document.three_hop_path_proof_signer_node_id =
+            Some(hex::encode(identity.public_key_bytes()));
+        document.three_hop_path_proof_signature_ed25519 =
+            Some(hex::encode(identity.sign(&three_hop_signing_bytes)));
         let client_delivery_signing_bytes = document
             .verified_client_delivery_signing_bytes()
             .map_err(ServerError::internal)?;
         document.verified_client_delivery_signer_node_id =
             Some(hex::encode(identity.public_key_bytes()));
-        document.verified_client_delivery_signature_ed25519 = Some(hex::encode(
-            identity.sign(&client_delivery_signing_bytes),
-        ));
+        document.verified_client_delivery_signature_ed25519 =
+            Some(hex::encode(identity.sign(&client_delivery_signing_bytes)));
         Ok(document)
     }
 
@@ -1322,8 +1357,8 @@ impl PeerStoreCacheDocument {
                 DISCOVERY_SNAPSHOT_MAX_BYTES
             ));
         }
-        let document: Self = serde_json::from_slice(bytes)
-            .map_err(|error| format!("peer cache json: {error}"))?;
+        let document: Self =
+            serde_json::from_slice(bytes).map_err(|error| format!("peer cache json: {error}"))?;
         document
             .descriptor_snapshot
             .validate_schema()
@@ -1348,9 +1383,17 @@ impl PeerStoreCacheDocument {
                 document.two_hop_path_proof_schema_version
             ));
         }
-        let client_delivery_version_valid = match document
-            .verified_client_delivery_schema_version
-        {
+        let three_hop_proof_version_valid = (document.three_hop_path_proof_events.is_empty()
+            && document.three_hop_path_proof_schema_version == 0)
+            || document.three_hop_path_proof_schema_version
+                == THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION;
+        if !three_hop_proof_version_valid {
+            return Err(format!(
+                "unsupported three-hop proof schema version: {}",
+                document.three_hop_path_proof_schema_version
+            ));
+        }
+        let client_delivery_version_valid = match document.verified_client_delivery_schema_version {
             0 => {
                 document.verified_client_delivery_evidence.is_none()
                     && document.verified_client_delivery_generation == 0
@@ -1376,9 +1419,7 @@ impl PeerStoreCacheDocument {
         &self,
         identity: &IdentityKeyPair,
     ) -> std::result::Result<(), String> {
-        if self.routeability_evidence.is_empty()
-            && self.routeability_evidence_schema_version == 0
-        {
+        if self.routeability_evidence.is_empty() && self.routeability_evidence_schema_version == 0 {
             return Ok(());
         }
         let expected_signer = hex::encode(identity.public_key_bytes());
@@ -1414,8 +1455,7 @@ impl PeerStoreCacheDocument {
         &self,
         identity: &IdentityKeyPair,
     ) -> std::result::Result<(), String> {
-        if self.two_hop_path_proof_events.is_empty()
-            && self.two_hop_path_proof_schema_version == 0
+        if self.two_hop_path_proof_events.is_empty() && self.two_hop_path_proof_schema_version == 0
         {
             return Ok(());
         }
@@ -1446,6 +1486,44 @@ impl PeerStoreCacheDocument {
             &self.two_hop_path_proof_events,
         ))
         .map_err(|error| format!("two-hop proof signing bytes: {error}"))
+    }
+
+    fn verify_three_hop_path_proof_signature(
+        &self,
+        identity: &IdentityKeyPair,
+    ) -> std::result::Result<(), String> {
+        if self.three_hop_path_proof_events.is_empty()
+            && self.three_hop_path_proof_schema_version == 0
+        {
+            return Ok(());
+        }
+        let expected_signer = hex::encode(identity.public_key_bytes());
+        if self.three_hop_path_proof_signer_node_id.as_deref() != Some(&expected_signer) {
+            return Err("three-hop proof signer mismatch".to_string());
+        }
+        let signature_hex = self
+            .three_hop_path_proof_signature_ed25519
+            .as_deref()
+            .ok_or_else(|| "three-hop proof signature missing".to_string())?;
+        let mut signature = [0u8; 64];
+        hex::decode_to_slice(signature_hex, &mut signature)
+            .map_err(|_| "three-hop proof signature encoding invalid".to_string())?;
+        let public_key = IdentityPublicKey::from_bytes(&identity.public_key_bytes())
+            .map_err(|_| "three-hop proof signer key invalid".to_string())?;
+        let signing_bytes = self.three_hop_path_proof_signing_bytes()?;
+        public_key
+            .verify(&signing_bytes, &signature)
+            .map_err(|_| "three-hop proof signature invalid".to_string())
+    }
+
+    fn three_hop_path_proof_signing_bytes(&self) -> std::result::Result<Vec<u8>, String> {
+        bincode::serialize(&(
+            "aeronyx-peer-cache-three-hop-proof-v1",
+            self.descriptor_snapshot.generated_at,
+            self.three_hop_path_proof_schema_version,
+            &self.three_hop_path_proof_events,
+        ))
+        .map_err(|error| format!("three-hop proof signing bytes: {error}"))
     }
 
     fn verify_verified_client_delivery_signature(
@@ -1545,11 +1623,8 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
                 "verified client delivery anchor generation must be positive",
             ));
         }
-        anchor.signature_ed25519 = hex::encode(identity.sign(
-            &anchor
-                .signing_bytes()
-                .map_err(ServerError::internal)?,
-        ));
+        anchor.signature_ed25519 =
+            hex::encode(identity.sign(&anchor.signing_bytes().map_err(ServerError::internal)?));
         Ok(anchor)
     }
 
@@ -1588,8 +1663,9 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
             return Err("verified client delivery anchor signer mismatch".to_string());
         }
         let mut signature = [0u8; 64];
-        hex::decode_to_slice(&self.signature_ed25519, &mut signature)
-            .map_err(|_| "verified client delivery anchor signature encoding invalid".to_string())?;
+        hex::decode_to_slice(&self.signature_ed25519, &mut signature).map_err(|_| {
+            "verified client delivery anchor signature encoding invalid".to_string()
+        })?;
         let public_key = IdentityPublicKey::from_bytes(&identity.public_key_bytes())
             .map_err(|_| "verified client delivery anchor signer key invalid".to_string())?;
         public_key
@@ -1681,9 +1757,7 @@ impl PeerStoreVerifiedClientDeliveryAnchorState {
             Self::Verified(anchor) => {
                 if document.verified_client_delivery_generation < anchor.cache_generation {
                     "rollback_detected"
-                } else if document.verified_client_delivery_generation
-                    > anchor.cache_generation
-                {
+                } else if document.verified_client_delivery_generation > anchor.cache_generation {
                     "cache_ahead"
                 } else if anchor.matches_document(document) {
                     "anchored"
@@ -2362,9 +2436,7 @@ enum DataPlaneReceiveFailureAction {
     Stop,
 }
 
-fn data_plane_receive_failure_action(
-    consecutive_failures: u32,
-) -> DataPlaneReceiveFailureAction {
+fn data_plane_receive_failure_action(consecutive_failures: u32) -> DataPlaneReceiveFailureAction {
     if consecutive_failures >= DATA_PLANE_RECV_FAILURE_LIMIT {
         return DataPlaneReceiveFailureAction::Stop;
     }
@@ -2705,10 +2777,7 @@ impl Server {
         let chat_relay_runtime_ready = chat_relay.is_some();
 
         let peer_store = self
-            .init_peer_store(
-                chat_relay_runtime_ready,
-                peer_http_clients.control.as_ref(),
-            )
+            .init_peer_store(chat_relay_runtime_ready, peer_http_clients.control.as_ref())
             .await;
         self.publish_memchain_commitment_descriptor_preflight(
             &peer_store,
@@ -2717,8 +2786,7 @@ impl Server {
         .await;
         let directory_chain_store = self.init_directory_chain(&peer_store).await?;
         let directory_replica_store = self.init_directory_replica().await?;
-        let directory_replica_sync_runtime =
-            Arc::new(DirectoryReplicaSyncRuntime::default());
+        let directory_replica_sync_runtime = Arc::new(DirectoryReplicaSyncRuntime::default());
         if let Some(ref commitment_storage) = storage {
             self.verify_memchain_commitment_startup_witnesses(
                 commitment_storage,
@@ -2795,14 +2863,13 @@ impl Server {
             // [DNS-STARTUP-READINESS 2026-07-30 by Codex] Bind before
             // systemd READY so the node cannot advertise a usable privacy
             // data plane while its configured DNS listener is unavailable.
-            let dns_task =
-                start_dns_proxy(self.config.gateway_ip(), self.shutdown_tx.subscribe())
-                    .await
-                    .map_err(|error| {
-                        ServerError::startup_failed(format!(
-                            "required VPN DNS listener failed to bind: {error}"
-                        ))
-                    })?;
+            let dns_task = start_dns_proxy(self.config.gateway_ip(), self.shutdown_tx.subscribe())
+                .await
+                .map_err(|error| {
+                    ServerError::startup_failed(format!(
+                        "required VPN DNS listener failed to bind: {error}"
+                    ))
+                })?;
             tasks.push((
                 "dns-proxy",
                 Self::supervise_required_runtime_task(
@@ -4156,9 +4223,7 @@ impl Server {
         let directory_cold_bootstrap_identity = Arc::clone(&node_identity);
         let directory_cold_bootstrap_gate = Arc::new(TokioMutex::new(()));
         let directory_cold_bootstrap_last_started_at = Arc::new(AtomicU64::new(0));
-        let commitment_storage = mpi_state
-            .as_ref()
-            .and_then(|state| state.storage.clone());
+        let commitment_storage = mpi_state.as_ref().and_then(|state| state.storage.clone());
         let commitment_lease_authorized_coordinator =
             self.config.memchain.commitment_sync_coordinator_node_id();
         let public_commitment_sync_tip_notifier = commitment_sync_tip_notifier.clone();
@@ -4171,14 +4236,10 @@ impl Server {
             .config
             .discovery
             .directory_observation_witness_min_verified;
-        let directory_observation_witness_maturity_delay_secs = self
-            .config
-            .discovery
-            .directory_chain_sync_interval_secs;
-        let directory_full_node_mirror_enabled = self
-            .config
-            .discovery
-            .directory_full_node_mirror_enabled;
+        let directory_observation_witness_maturity_delay_secs =
+            self.config.discovery.directory_chain_sync_interval_secs;
+        let directory_full_node_mirror_enabled =
+            self.config.discovery.directory_full_node_mirror_enabled;
         let directory_full_node_mirror_max_producers = self
             .config
             .discovery
@@ -4188,8 +4249,7 @@ impl Server {
         let public_directory_observation_witness_min_verified =
             directory_observation_witness_min_verified;
         let public_directory_replica_store = directory_replica_store.clone();
-        let public_directory_replica_sync_runtime =
-            Arc::clone(&directory_replica_sync_runtime);
+        let public_directory_replica_sync_runtime = Arc::clone(&directory_replica_sync_runtime);
         let public_directory_full_node_mirror_enabled = directory_full_node_mirror_enabled;
         let public_directory_full_node_mirror_max_producers =
             directory_full_node_mirror_max_producers;
@@ -4248,14 +4308,8 @@ impl Server {
                 .as_ref()
                 .map(|relay| build_chat_router(Arc::clone(relay)))
                 .unwrap_or_else(axum::Router::new);
-            let blind_vault_router = match (
-                blind_vault_public_api_enabled,
-                local_blind_vault,
-            ) {
-                (true, Some(vault)) => build_blind_vault_router(
-                    vault,
-                    Arc::clone(&node_identity),
-                ),
+            let blind_vault_router = match (blind_vault_public_api_enabled, local_blind_vault) {
+                (true, Some(vault)) => build_blind_vault_router(vault, Arc::clone(&node_identity)),
                 _ => axum::Router::new(),
             };
             // [WITNESS-CARRIER-SERVICE 2026-07-27 by Codex] The status route
@@ -4748,9 +4802,7 @@ impl Server {
             app
         };
         let app = match (blind_vault_public_api_enabled, blind_vault) {
-            (true, Some(vault)) => {
-                app.merge(build_blind_vault_router(vault, node_identity))
-            }
+            (true, Some(vault)) => app.merge(build_blind_vault_router(vault, node_identity)),
             _ => app,
         };
         if let Some(storage) = commitment_storage {
@@ -4839,298 +4891,278 @@ impl Server {
             .memchain
             .is_enabled()
         {
-                let allow_remote = self.config.memchain.allow_remote_storage;
-                let max_owners = self.config.memchain.max_remote_owners;
-                let pinned_witnesses_configured =
-                    self.config.memchain.commitment_witness_node_ids.len();
-                let witness_scope = if pinned_witnesses_configured == 0 {
-                    "permissionless_evidence"
-                } else {
-                    "operator_pinned"
-                };
-                let startup_evidence_required =
-                    self.config.memchain.commitment_witness_startup_required;
-                let startup_minimum_verified = self.config.memchain.commitment_witness_min_verified;
-                let commitment_storage = memchain_storage.clone();
-                Some(Box::new(move || {
-                    let record_commitment_integrity = commitment_storage.as_ref().map(|storage| {
-                        let status = storage.record_commitment_chain_integrity_status();
-                        crate::management::client::RecordCommitmentIntegrityHeartbeatStatus {
-                            contract_version: status.contract_version,
-                            state: status.state.to_string(),
-                            baseline_verified_at: status.baseline_verified_at,
-                            last_verified_at: status.last_verified_at,
-                            verification_duration_ms: status.verification_duration_ms,
-                            verified_block_count: status.verified_block_count,
-                            verified_commitment_count: status.verified_commitment_count,
-                            verified_tip_height: status.verified_tip_height,
-                            durability_mode: status.durability_mode,
-                            coordinator_fence_state: status.coordinator_fence_state,
-                            coordinator_fence_acquired_at: status.coordinator_fence_acquired_at,
-                            coordinator_fence_acquisition_failures_total: status
-                                .coordinator_fence_acquisition_failures_total,
-                            coordinator_fence_scope: status.coordinator_fence_scope,
-                            coordinator_lease_state: status.coordinator_lease_state,
-                            coordinator_lease_granted_witnesses: status
-                                .coordinator_lease_granted_witnesses,
-                            coordinator_lease_required_witnesses: status
-                                .coordinator_lease_required_witnesses,
-                            coordinator_lease_expires_at: status.coordinator_lease_expires_at,
-                            coordinator_lease_seconds_remaining: status
-                                .coordinator_lease_seconds_remaining,
-                            coordinator_lease_production_permitted: status
-                                .coordinator_lease_production_permitted,
-                            coordinator_lease_last_attempted_at: status
-                                .coordinator_lease_last_attempted_at,
-                            coordinator_lease_last_renewed_at: status
-                                .coordinator_lease_last_renewed_at,
-                            coordinator_lease_last_failure_at: status
-                                .coordinator_lease_last_failure_at,
-                            coordinator_lease_renewal_failures_total: status
-                                .coordinator_lease_renewal_failures_total,
-                            coordinator_lease_consecutive_failures: status
-                                .coordinator_lease_consecutive_failures,
-                            coordinator_lease_recoveries_total: status
-                                .coordinator_lease_recoveries_total,
-                            coordinator_lease_scope: status.coordinator_lease_scope,
-                            rollback_guard_state: status.rollback_guard_state,
-                            rollback_guard_height: status.rollback_guard_height,
-                            rollback_guard_last_verified_at: status.rollback_guard_last_verified_at,
-                            rollback_guard_last_persisted_at: status
-                                .rollback_guard_last_persisted_at,
-                            rollback_guard_write_failures_total: status
-                                .rollback_guard_write_failures_total,
-                        }
-                    });
-                    let record_commitment_sync = commitment_storage.as_ref().map(|storage| {
-                        let status = storage.record_commitment_sync_status();
-                        crate::management::client::RecordCommitmentSyncHeartbeatStatus {
-                            contract_version: status.contract_version,
-                            role: status.role,
-                            state: status.state,
-                            follower_readiness_state: status.follower_readiness_state,
-                            follower_fully_ready: status.follower_fully_ready,
-                            // [FOLLOWER-READINESS-FRESHNESS 2026-07-30 by Codex]
-                            // Preserve the storage layer's already-derived,
-                            // identity-blind readiness deadline.
-                            follower_convergence_confirmed_at: status
-                                .follower_convergence_confirmed_at,
-                            follower_readiness_stale_after: status
-                                .follower_readiness_stale_after,
-                            enabled: status.enabled,
-                            last_trigger: status.last_trigger,
-                            last_announcement_at: status.last_announcement_at,
-                            last_announced_height: status.last_announced_height,
-                            last_announcement_result: status.last_announcement_result,
-                            announcements_accepted_total: status.announcements_accepted_total,
-                            announcements_coalesced_total: status.announcements_coalesced_total,
-                            announcements_stale_total: status.announcements_stale_total,
-                            announcements_unavailable_total: status
-                                .announcements_unavailable_total,
-                            last_outbound_announcement_at: status.last_outbound_announcement_at,
-                            last_outbound_announced_height: status
-                                .last_outbound_announced_height,
-                            last_outbound_announcement_result: status
-                                .last_outbound_announcement_result,
-                            outbound_announcement_rounds_total: status
-                                .outbound_announcement_rounds_total,
-                            outbound_announcement_rounds_skipped_total: status
-                                .outbound_announcement_rounds_skipped_total,
-                            outbound_announcement_rounds_superseded_total: status
-                                .outbound_announcement_rounds_superseded_total,
-                            outbound_announcements_attempted_total: status
-                                .outbound_announcements_attempted_total,
-                            outbound_announcements_accepted_total: status
-                                .outbound_announcements_accepted_total,
-                            outbound_announcements_stale_total: status
-                                .outbound_announcements_stale_total,
-                            outbound_announcements_failed_total: status
-                                .outbound_announcements_failed_total,
-                            outbound_announcement_retries_attempted_total: status
-                                .outbound_announcement_retries_attempted_total,
-                            outbound_announcement_retries_succeeded_total: status
-                                .outbound_announcement_retries_succeeded_total,
-                            outbound_announcement_retries_exhausted_total: status
-                                .outbound_announcement_retries_exhausted_total,
-                            // [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex]
-                            // Forward only the storage layer's source-blind
-                            // aggregate contract into the signed heartbeat.
-                            last_block_page_pull_at: status.last_block_page_pull_at,
-                            last_block_page_pull_result: status.last_block_page_pull_result,
-                            last_block_carrier_recovered_at: status
-                                .last_block_carrier_recovered_at,
-                            block_page_pulls_total: status.block_page_pulls_total,
-                            block_page_coordinator_success_total: status
-                                .block_page_coordinator_success_total,
-                            block_carrier_attempts_total: status.block_carrier_attempts_total,
-                            block_carrier_recoveries_total: status
-                                .block_carrier_recoveries_total,
-                            block_page_availability_exhausted_total: status
-                                .block_page_availability_exhausted_total,
-                            block_page_security_stops_total: status
-                                .block_page_security_stops_total,
-                            last_block_page_security_stop_at: status
-                                .last_block_page_security_stop_at,
-                            block_carrier_cooling_slots: status.block_carrier_cooling_slots,
-                            block_carrier_cooldown_skips_total: status
-                                .block_carrier_cooldown_skips_total,
-                            block_carrier_half_open_attempts_total: status
-                                .block_carrier_half_open_attempts_total,
-                            certificate_policy_state: status.certificate_policy_state,
-                            certificate_policy_ready: status.certificate_policy_ready,
-                            certificate_policy_last_evaluated_at: status
-                                .certificate_policy_last_evaluated_at,
-                            certificate_policy_evaluated_tip_height: status
-                                .certificate_policy_evaluated_tip_height,
-                            certificate_witnesses_configured: status
-                                .certificate_witnesses_configured,
-                            certificate_minimum_signers: status.certificate_minimum_signers,
-                            last_certificate_sync_at: status.last_certificate_sync_at,
-                            last_certificate_sync_result: status.last_certificate_sync_result,
-                            last_certificate_carrier_recovered_at: status
-                                .last_certificate_carrier_recovered_at,
-                            certificate_sync_rounds_total: status.certificate_sync_rounds_total,
-                            certificate_coordinator_success_total: status
-                                .certificate_coordinator_success_total,
-                            certificate_carrier_attempts_total: status
-                                .certificate_carrier_attempts_total,
-                            certificate_carrier_recoveries_total: status
-                                .certificate_carrier_recoveries_total,
-                            certificate_verified_unpersisted_total: status
-                                .certificate_verified_unpersisted_total,
-                            certificate_availability_exhausted_total: status
-                                .certificate_availability_exhausted_total,
-                            certificate_security_stops_total: status
-                                .certificate_security_stops_total,
-                            last_certificate_security_stop_at: status
-                                .last_certificate_security_stop_at,
-                            certificate_carrier_cooling_slots: status
-                                .certificate_carrier_cooling_slots,
-                            certificate_carrier_cooldown_skips_total: status
-                                .certificate_carrier_cooldown_skips_total,
-                            certificate_carrier_half_open_attempts_total: status
-                                .certificate_carrier_half_open_attempts_total,
-                            // [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex]
-                            // Coordinator recovery remains a separate,
-                            // source-blind domain from follower certificate sync.
-                            last_coordinator_certificate_backfill_at: status
-                                .last_coordinator_certificate_backfill_at,
-                            last_coordinator_certificate_backfill_result: status
-                                .last_coordinator_certificate_backfill_result,
-                            coordinator_certificate_backfill_rounds_total: status
-                                .coordinator_certificate_backfill_rounds_total,
-                            coordinator_certificate_backfill_persisted_total: status
-                                .coordinator_certificate_backfill_persisted_total,
-                            coordinator_certificate_backfill_verified_unpersisted_total: status
-                                .coordinator_certificate_backfill_verified_unpersisted_total,
-                            coordinator_certificate_backfill_availability_exhausted_total: status
-                                .coordinator_certificate_backfill_availability_exhausted_total,
-                            coordinator_certificate_backfill_security_stops_total: status
-                                .coordinator_certificate_backfill_security_stops_total,
-                            last_coordinator_certificate_backfill_security_stop_at: status
-                                .last_coordinator_certificate_backfill_security_stop_at,
-                            coordinator_certificate_backfill_carrier_attempts_total: status
-                                .coordinator_certificate_backfill_carrier_attempts_total,
-                            coordinator_certificate_backfill_carrier_cooling_slots: status
-                                .coordinator_certificate_backfill_carrier_cooling_slots,
-                            coordinator_certificate_backfill_carrier_cooldown_skips_total: status
-                                .coordinator_certificate_backfill_carrier_cooldown_skips_total,
-                            coordinator_certificate_backfill_carrier_half_open_attempts_total:
-                                status
-                                    .coordinator_certificate_backfill_carrier_half_open_attempts_total,
-                            last_attempt_at: status.last_attempt_at,
-                            last_success_at: status.last_success_at,
-                            last_failure_at: status.last_failure_at,
-                            last_recovered_at: status.last_recovered_at,
-                            next_poll_at: status.next_poll_at,
-                            consecutive_failures: status.consecutive_failures,
-                            last_error_code: status.last_error_code,
-                            remote_tip_height: status.remote_tip_height,
-                            pages_received_total: status.pages_received_total,
-                            blocks_received_total: status.blocks_received_total,
-                            failure_events_total: status.failure_events_total,
-                            recovery_events_total: status.recovery_events_total,
-                        }
-                    });
-                    let record_commitment_checkpoint = commitment_storage.as_ref().map(|storage| {
-                        let status = storage.record_commitment_checkpoint_status();
-                        crate::management::client::RecordCommitmentCheckpointHeartbeatStatus {
-                            contract_version: status.contract_version,
-                            witness_scope,
-                            pinned_witnesses_configured,
-                            startup_evidence_required,
-                            startup_minimum_verified,
-                            state: status.state,
-                            last_checked_at: status.last_checked_at,
-                            last_converged_at: status.last_converged_at,
-                            last_divergence_at: status.last_divergence_at,
-                            last_failure_at: status.last_failure_at,
-                            last_served_at: status.last_served_at,
-                            local_tip_height: status.local_tip_height,
-                            remote_tip_height: status.remote_tip_height,
-                            proofs_verified_total: status.proofs_verified_total,
-                            proofs_failed_total: status.proofs_failed_total,
-                            divergences_total: status.divergences_total,
-                            requests_served_total: status.requests_served_total,
-                            evidence_state: status.evidence_state,
-                            evidence_records: status.evidence_records,
-                            applicable_evidence_records: status.applicable_evidence_records,
-                            deferred_evidence_records: status.deferred_evidence_records,
-                            divergence_evidence_records: status.divergence_evidence_records,
-                            equivocation_incidents: status.equivocation_incidents,
-                            trusted_divergence_incidents: status.trusted_divergence_incidents,
-                            checkpoint_certificates: status.checkpoint_certificates,
-                            latest_certified_height: status.latest_certified_height,
-                            latest_certificate_signers: status.latest_certificate_signers,
-                            latest_certificate_required_signers: status
-                                .latest_certificate_required_signers,
-                            block_confirmation_state: status.block_confirmation_state,
-                            uncertified_block_count: status.uncertified_block_count,
-                            block_confirmation_policy: status.block_confirmation_policy,
-                            certificate_rollback_guard_state: status
-                                .certificate_rollback_guard_state,
-                            certificate_rollback_guard_height: status
-                                .certificate_rollback_guard_height,
-                            certificate_rollback_guard_last_verified_at: status
-                                .certificate_rollback_guard_last_verified_at,
-                            certificate_rollback_guard_last_persisted_at: status
-                                .certificate_rollback_guard_last_persisted_at,
-                            certificate_rollback_guard_write_failures_total: status
-                                .certificate_rollback_guard_write_failures_total,
-                            certificate_rollback_guard_scope: status
-                                .certificate_rollback_guard_scope,
-                            production_halted: status.production_halted,
-                            last_evidence_at: status.last_evidence_at,
-                            observation_freshness: status.observation_freshness,
-                            observation_age_seconds: status.observation_age_seconds,
-                            freshness_window_seconds: status.freshness_window_seconds,
-                            last_round_state: status.last_round_state,
-                            last_round_at: status.last_round_at,
-                            last_round_eligible: status.last_round_eligible,
-                            last_round_attempted: status.last_round_attempted,
-                            last_round_verified: status.last_round_verified,
-                            last_round_failed: status.last_round_failed,
-                            last_round_converged: status.last_round_converged,
-                            last_round_remote_ahead: status.last_round_remote_ahead,
-                            last_round_remote_behind: status.last_round_remote_behind,
-                            last_round_diverged: status.last_round_diverged,
-                            evidence_persistence_failures_total: status
-                                .evidence_persistence_failures_total,
-                        }
-                    });
-                    Some(crate::management::client::MemChainHeartbeatStatus {
-                        enabled: true,
-                        allow_remote_storage: allow_remote,
-                        max_remote_owners: max_owners,
-                        current_remote_owners: 0,
-                        record_commitment_integrity,
-                        record_commitment_sync,
-                        record_commitment_checkpoint,
-                    })
-                }))
+            let allow_remote = self.config.memchain.allow_remote_storage;
+            let max_owners = self.config.memchain.max_remote_owners;
+            let pinned_witnesses_configured =
+                self.config.memchain.commitment_witness_node_ids.len();
+            let witness_scope = if pinned_witnesses_configured == 0 {
+                "permissionless_evidence"
             } else {
-                None
+                "operator_pinned"
             };
+            let startup_evidence_required =
+                self.config.memchain.commitment_witness_startup_required;
+            let startup_minimum_verified = self.config.memchain.commitment_witness_min_verified;
+            let commitment_storage = memchain_storage.clone();
+            Some(Box::new(move || {
+                let record_commitment_integrity = commitment_storage.as_ref().map(|storage| {
+                    let status = storage.record_commitment_chain_integrity_status();
+                    crate::management::client::RecordCommitmentIntegrityHeartbeatStatus {
+                        contract_version: status.contract_version,
+                        state: status.state.to_string(),
+                        baseline_verified_at: status.baseline_verified_at,
+                        last_verified_at: status.last_verified_at,
+                        verification_duration_ms: status.verification_duration_ms,
+                        verified_block_count: status.verified_block_count,
+                        verified_commitment_count: status.verified_commitment_count,
+                        verified_tip_height: status.verified_tip_height,
+                        durability_mode: status.durability_mode,
+                        coordinator_fence_state: status.coordinator_fence_state,
+                        coordinator_fence_acquired_at: status.coordinator_fence_acquired_at,
+                        coordinator_fence_acquisition_failures_total: status
+                            .coordinator_fence_acquisition_failures_total,
+                        coordinator_fence_scope: status.coordinator_fence_scope,
+                        coordinator_lease_state: status.coordinator_lease_state,
+                        coordinator_lease_granted_witnesses: status
+                            .coordinator_lease_granted_witnesses,
+                        coordinator_lease_required_witnesses: status
+                            .coordinator_lease_required_witnesses,
+                        coordinator_lease_expires_at: status.coordinator_lease_expires_at,
+                        coordinator_lease_seconds_remaining: status
+                            .coordinator_lease_seconds_remaining,
+                        coordinator_lease_production_permitted: status
+                            .coordinator_lease_production_permitted,
+                        coordinator_lease_last_attempted_at: status
+                            .coordinator_lease_last_attempted_at,
+                        coordinator_lease_last_renewed_at: status.coordinator_lease_last_renewed_at,
+                        coordinator_lease_last_failure_at: status.coordinator_lease_last_failure_at,
+                        coordinator_lease_renewal_failures_total: status
+                            .coordinator_lease_renewal_failures_total,
+                        coordinator_lease_consecutive_failures: status
+                            .coordinator_lease_consecutive_failures,
+                        coordinator_lease_recoveries_total: status
+                            .coordinator_lease_recoveries_total,
+                        coordinator_lease_scope: status.coordinator_lease_scope,
+                        rollback_guard_state: status.rollback_guard_state,
+                        rollback_guard_height: status.rollback_guard_height,
+                        rollback_guard_last_verified_at: status.rollback_guard_last_verified_at,
+                        rollback_guard_last_persisted_at: status.rollback_guard_last_persisted_at,
+                        rollback_guard_write_failures_total: status
+                            .rollback_guard_write_failures_total,
+                    }
+                });
+                let record_commitment_sync = commitment_storage.as_ref().map(|storage| {
+                    let status = storage.record_commitment_sync_status();
+                    crate::management::client::RecordCommitmentSyncHeartbeatStatus {
+                        contract_version: status.contract_version,
+                        role: status.role,
+                        state: status.state,
+                        follower_readiness_state: status.follower_readiness_state,
+                        follower_fully_ready: status.follower_fully_ready,
+                        // [FOLLOWER-READINESS-FRESHNESS 2026-07-30 by Codex]
+                        // Preserve the storage layer's already-derived,
+                        // identity-blind readiness deadline.
+                        follower_convergence_confirmed_at: status.follower_convergence_confirmed_at,
+                        follower_readiness_stale_after: status.follower_readiness_stale_after,
+                        enabled: status.enabled,
+                        last_trigger: status.last_trigger,
+                        last_announcement_at: status.last_announcement_at,
+                        last_announced_height: status.last_announced_height,
+                        last_announcement_result: status.last_announcement_result,
+                        announcements_accepted_total: status.announcements_accepted_total,
+                        announcements_coalesced_total: status.announcements_coalesced_total,
+                        announcements_stale_total: status.announcements_stale_total,
+                        announcements_unavailable_total: status.announcements_unavailable_total,
+                        last_outbound_announcement_at: status.last_outbound_announcement_at,
+                        last_outbound_announced_height: status.last_outbound_announced_height,
+                        last_outbound_announcement_result: status.last_outbound_announcement_result,
+                        outbound_announcement_rounds_total: status
+                            .outbound_announcement_rounds_total,
+                        outbound_announcement_rounds_skipped_total: status
+                            .outbound_announcement_rounds_skipped_total,
+                        outbound_announcement_rounds_superseded_total: status
+                            .outbound_announcement_rounds_superseded_total,
+                        outbound_announcements_attempted_total: status
+                            .outbound_announcements_attempted_total,
+                        outbound_announcements_accepted_total: status
+                            .outbound_announcements_accepted_total,
+                        outbound_announcements_stale_total: status
+                            .outbound_announcements_stale_total,
+                        outbound_announcements_failed_total: status
+                            .outbound_announcements_failed_total,
+                        outbound_announcement_retries_attempted_total: status
+                            .outbound_announcement_retries_attempted_total,
+                        outbound_announcement_retries_succeeded_total: status
+                            .outbound_announcement_retries_succeeded_total,
+                        outbound_announcement_retries_exhausted_total: status
+                            .outbound_announcement_retries_exhausted_total,
+                        // [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex]
+                        // Forward only the storage layer's source-blind
+                        // aggregate contract into the signed heartbeat.
+                        last_block_page_pull_at: status.last_block_page_pull_at,
+                        last_block_page_pull_result: status.last_block_page_pull_result,
+                        last_block_carrier_recovered_at: status.last_block_carrier_recovered_at,
+                        block_page_pulls_total: status.block_page_pulls_total,
+                        block_page_coordinator_success_total: status
+                            .block_page_coordinator_success_total,
+                        block_carrier_attempts_total: status.block_carrier_attempts_total,
+                        block_carrier_recoveries_total: status.block_carrier_recoveries_total,
+                        block_page_availability_exhausted_total: status
+                            .block_page_availability_exhausted_total,
+                        block_page_security_stops_total: status.block_page_security_stops_total,
+                        last_block_page_security_stop_at: status.last_block_page_security_stop_at,
+                        block_carrier_cooling_slots: status.block_carrier_cooling_slots,
+                        block_carrier_cooldown_skips_total: status
+                            .block_carrier_cooldown_skips_total,
+                        block_carrier_half_open_attempts_total: status
+                            .block_carrier_half_open_attempts_total,
+                        certificate_policy_state: status.certificate_policy_state,
+                        certificate_policy_ready: status.certificate_policy_ready,
+                        certificate_policy_last_evaluated_at: status
+                            .certificate_policy_last_evaluated_at,
+                        certificate_policy_evaluated_tip_height: status
+                            .certificate_policy_evaluated_tip_height,
+                        certificate_witnesses_configured: status.certificate_witnesses_configured,
+                        certificate_minimum_signers: status.certificate_minimum_signers,
+                        last_certificate_sync_at: status.last_certificate_sync_at,
+                        last_certificate_sync_result: status.last_certificate_sync_result,
+                        last_certificate_carrier_recovered_at: status
+                            .last_certificate_carrier_recovered_at,
+                        certificate_sync_rounds_total: status.certificate_sync_rounds_total,
+                        certificate_coordinator_success_total: status
+                            .certificate_coordinator_success_total,
+                        certificate_carrier_attempts_total: status
+                            .certificate_carrier_attempts_total,
+                        certificate_carrier_recoveries_total: status
+                            .certificate_carrier_recoveries_total,
+                        certificate_verified_unpersisted_total: status
+                            .certificate_verified_unpersisted_total,
+                        certificate_availability_exhausted_total: status
+                            .certificate_availability_exhausted_total,
+                        certificate_security_stops_total: status.certificate_security_stops_total,
+                        last_certificate_security_stop_at: status.last_certificate_security_stop_at,
+                        certificate_carrier_cooling_slots: status.certificate_carrier_cooling_slots,
+                        certificate_carrier_cooldown_skips_total: status
+                            .certificate_carrier_cooldown_skips_total,
+                        certificate_carrier_half_open_attempts_total: status
+                            .certificate_carrier_half_open_attempts_total,
+                        // [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex]
+                        // Coordinator recovery remains a separate,
+                        // source-blind domain from follower certificate sync.
+                        last_coordinator_certificate_backfill_at: status
+                            .last_coordinator_certificate_backfill_at,
+                        last_coordinator_certificate_backfill_result: status
+                            .last_coordinator_certificate_backfill_result,
+                        coordinator_certificate_backfill_rounds_total: status
+                            .coordinator_certificate_backfill_rounds_total,
+                        coordinator_certificate_backfill_persisted_total: status
+                            .coordinator_certificate_backfill_persisted_total,
+                        coordinator_certificate_backfill_verified_unpersisted_total: status
+                            .coordinator_certificate_backfill_verified_unpersisted_total,
+                        coordinator_certificate_backfill_availability_exhausted_total: status
+                            .coordinator_certificate_backfill_availability_exhausted_total,
+                        coordinator_certificate_backfill_security_stops_total: status
+                            .coordinator_certificate_backfill_security_stops_total,
+                        last_coordinator_certificate_backfill_security_stop_at: status
+                            .last_coordinator_certificate_backfill_security_stop_at,
+                        coordinator_certificate_backfill_carrier_attempts_total: status
+                            .coordinator_certificate_backfill_carrier_attempts_total,
+                        coordinator_certificate_backfill_carrier_cooling_slots: status
+                            .coordinator_certificate_backfill_carrier_cooling_slots,
+                        coordinator_certificate_backfill_carrier_cooldown_skips_total: status
+                            .coordinator_certificate_backfill_carrier_cooldown_skips_total,
+                        coordinator_certificate_backfill_carrier_half_open_attempts_total: status
+                            .coordinator_certificate_backfill_carrier_half_open_attempts_total,
+                        last_attempt_at: status.last_attempt_at,
+                        last_success_at: status.last_success_at,
+                        last_failure_at: status.last_failure_at,
+                        last_recovered_at: status.last_recovered_at,
+                        next_poll_at: status.next_poll_at,
+                        consecutive_failures: status.consecutive_failures,
+                        last_error_code: status.last_error_code,
+                        remote_tip_height: status.remote_tip_height,
+                        pages_received_total: status.pages_received_total,
+                        blocks_received_total: status.blocks_received_total,
+                        failure_events_total: status.failure_events_total,
+                        recovery_events_total: status.recovery_events_total,
+                    }
+                });
+                let record_commitment_checkpoint = commitment_storage.as_ref().map(|storage| {
+                    let status = storage.record_commitment_checkpoint_status();
+                    crate::management::client::RecordCommitmentCheckpointHeartbeatStatus {
+                        contract_version: status.contract_version,
+                        witness_scope,
+                        pinned_witnesses_configured,
+                        startup_evidence_required,
+                        startup_minimum_verified,
+                        state: status.state,
+                        last_checked_at: status.last_checked_at,
+                        last_converged_at: status.last_converged_at,
+                        last_divergence_at: status.last_divergence_at,
+                        last_failure_at: status.last_failure_at,
+                        last_served_at: status.last_served_at,
+                        local_tip_height: status.local_tip_height,
+                        remote_tip_height: status.remote_tip_height,
+                        proofs_verified_total: status.proofs_verified_total,
+                        proofs_failed_total: status.proofs_failed_total,
+                        divergences_total: status.divergences_total,
+                        requests_served_total: status.requests_served_total,
+                        evidence_state: status.evidence_state,
+                        evidence_records: status.evidence_records,
+                        applicable_evidence_records: status.applicable_evidence_records,
+                        deferred_evidence_records: status.deferred_evidence_records,
+                        divergence_evidence_records: status.divergence_evidence_records,
+                        equivocation_incidents: status.equivocation_incidents,
+                        trusted_divergence_incidents: status.trusted_divergence_incidents,
+                        checkpoint_certificates: status.checkpoint_certificates,
+                        latest_certified_height: status.latest_certified_height,
+                        latest_certificate_signers: status.latest_certificate_signers,
+                        latest_certificate_required_signers: status
+                            .latest_certificate_required_signers,
+                        block_confirmation_state: status.block_confirmation_state,
+                        uncertified_block_count: status.uncertified_block_count,
+                        block_confirmation_policy: status.block_confirmation_policy,
+                        certificate_rollback_guard_state: status.certificate_rollback_guard_state,
+                        certificate_rollback_guard_height: status.certificate_rollback_guard_height,
+                        certificate_rollback_guard_last_verified_at: status
+                            .certificate_rollback_guard_last_verified_at,
+                        certificate_rollback_guard_last_persisted_at: status
+                            .certificate_rollback_guard_last_persisted_at,
+                        certificate_rollback_guard_write_failures_total: status
+                            .certificate_rollback_guard_write_failures_total,
+                        certificate_rollback_guard_scope: status.certificate_rollback_guard_scope,
+                        production_halted: status.production_halted,
+                        last_evidence_at: status.last_evidence_at,
+                        observation_freshness: status.observation_freshness,
+                        observation_age_seconds: status.observation_age_seconds,
+                        freshness_window_seconds: status.freshness_window_seconds,
+                        last_round_state: status.last_round_state,
+                        last_round_at: status.last_round_at,
+                        last_round_eligible: status.last_round_eligible,
+                        last_round_attempted: status.last_round_attempted,
+                        last_round_verified: status.last_round_verified,
+                        last_round_failed: status.last_round_failed,
+                        last_round_converged: status.last_round_converged,
+                        last_round_remote_ahead: status.last_round_remote_ahead,
+                        last_round_remote_behind: status.last_round_remote_behind,
+                        last_round_diverged: status.last_round_diverged,
+                        evidence_persistence_failures_total: status
+                            .evidence_persistence_failures_total,
+                    }
+                });
+                Some(crate::management::client::MemChainHeartbeatStatus {
+                    enabled: true,
+                    allow_remote_storage: allow_remote,
+                    max_remote_owners: max_owners,
+                    current_remote_owners: 0,
+                    record_commitment_integrity,
+                    record_commitment_sync,
+                    record_commitment_checkpoint,
+                })
+            }))
+        } else {
+            None
+        };
 
         // Note: .with_sessions / .with_traffic_tracker / .with_udp are
         // injected here — all three are available at this call site.
@@ -5616,17 +5648,16 @@ impl Server {
 
         if let Some(path) = &self.config.discovery.peer_cache_path {
             let cache_save_at = unix_now_secs();
-            if let Err(e) =
-                Self::persist_peer_store_cache_with_delivery_witnesses(
-                    &self.identity,
-                    &peer_store,
-                    &self.config.discovery,
-                    control_http_client,
-                    path,
-                    cache_save_at,
-                    true,
-                )
-                .await
+            if let Err(e) = Self::persist_peer_store_cache_with_delivery_witnesses(
+                &self.identity,
+                &peer_store,
+                &self.config.discovery,
+                control_http_client,
+                path,
+                cache_save_at,
+                true,
+            )
+            .await
             {
                 warn!(
                     source = %path,
@@ -5690,11 +5721,7 @@ impl Server {
         identity: &IdentityKeyPair,
     ) -> PeerStoreVerifiedClientDeliveryAnchorState {
         let anchor_path = Self::peer_cache_client_delivery_anchor_path(path);
-        match Self::read_bounded_file(
-            &anchor_path,
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES,
-        )
-        .await
+        match Self::read_bounded_file(&anchor_path, VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES).await
         {
             Ok(bytes) => match PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(&bytes) {
                 Ok(anchor) if anchor.verify(identity).is_ok() => {
@@ -5723,13 +5750,8 @@ impl Server {
                     Some(&self.identity),
                     &client_delivery_anchor,
                 ) {
-                    self.load_peer_cache_backup(
-                        peer_store,
-                        path,
-                        now,
-                        &client_delivery_anchor,
-                    )
-                    .await;
+                    self.load_peer_cache_backup(peer_store, path, now, &client_delivery_anchor)
+                        .await;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -6216,10 +6238,7 @@ impl Server {
             .config
             .discovery
             .directory_chain_sync_peer_node_id_bytes();
-        let full_node_mirror_enabled = self
-            .config
-            .discovery
-            .directory_full_node_mirror_enabled;
+        let full_node_mirror_enabled = self.config.discovery.directory_full_node_mirror_enabled;
         let full_node_mirror_max_producers = self
             .config
             .discovery
@@ -6239,10 +6258,7 @@ impl Server {
                 "Directory replica synchronization requires an initialized replica store",
             )
         })?;
-        let interval_secs = self
-            .config
-            .discovery
-            .directory_chain_sync_interval_secs;
+        let interval_secs = self.config.discovery.directory_chain_sync_interval_secs;
         let witness_min_verified = self
             .config
             .discovery
@@ -6790,8 +6806,7 @@ impl Server {
                     &round,
                     witness_node_ids.len(),
                 ) {
-                    let previous_lease_status =
-                        storage.record_commitment_chain_integrity_status();
+                    let previous_lease_status = storage.record_commitment_chain_integrity_status();
                     if let Err(error) = storage.apply_record_commitment_coordinator_lease(
                         round.granted,
                         valid_for_secs,
@@ -6816,8 +6831,8 @@ impl Server {
                         info!(
                             granted = round.granted,
                             production_valid_for_secs = valid_for_secs,
-                            previous_consecutive_failures = previous_lease_status
-                                .coordinator_lease_consecutive_failures,
+                            previous_consecutive_failures =
+                                previous_lease_status.coordinator_lease_consecutive_failures,
                             recoveries_total = recovered.coordinator_lease_recoveries_total,
                             "[MEMCHAIN_BLOCK] Coordinator lease renewal recovered"
                         );
@@ -6844,11 +6859,9 @@ impl Server {
                         failed = round.failed,
                         lease_state = degraded.coordinator_lease_state,
                         production_permitted = degraded.coordinator_lease_production_permitted,
-                        seconds_remaining = degraded
-                            .coordinator_lease_seconds_remaining
-                            .unwrap_or(0),
-                        consecutive_failures = degraded
-                            .coordinator_lease_consecutive_failures,
+                        seconds_remaining =
+                            degraded.coordinator_lease_seconds_remaining.unwrap_or(0),
+                        consecutive_failures = degraded.coordinator_lease_consecutive_failures,
                         next_retry_secs = next_round_delay_secs,
                         "[MEMCHAIN_BLOCK] Coordinator lease renewal incomplete"
                     );
@@ -6980,8 +6993,7 @@ impl Server {
                                     storage.record_commitment_outbound_announcement_superseded(
                                         unix_now_secs(),
                                     );
-                                    pending_tip_height =
-                                        pending_tip_height.max(newer_tip_height);
+                                    pending_tip_height = pending_tip_height.max(newer_tip_height);
                                     debug!(
                                         superseded_height = announcement_tip_height,
                                         latest_height = pending_tip_height,
@@ -7308,8 +7320,7 @@ impl Server {
             // [FOLLOWER-TASK-LIVENESS 2026-07-30 by Codex] Construct before
             // any await so panic, cancellation, or an unexpected loop exit
             // cannot leave the last successful readiness snapshot active.
-            let liveness_guard =
-                CommitmentSyncTaskLivenessGuard::new(Arc::clone(&storage));
+            let liveness_guard = CommitmentSyncTaskLivenessGuard::new(Arc::clone(&storage));
             let mut consecutive_failures = 0u32;
             let mut consecutive_certificate_deferrals = 0u32;
             let mut next_delay = Duration::from_secs(0);
@@ -7588,11 +7599,10 @@ impl Server {
                         certified_recovered: false,
                     })
                 };
-                let round: std::result::Result<CommitmentFollowerRoundOutcome, String> =
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => break 'sync_loop,
-                        result = round_future => result,
-                    };
+                let round: std::result::Result<CommitmentFollowerRoundOutcome, String> = tokio::select! {
+                    _ = shutdown_rx.recv() => break 'sync_loop,
+                    result = round_future => result,
+                };
 
                 match round {
                     Ok(outcome) => {
@@ -8701,14 +8711,10 @@ impl Server {
                                             now,
                                         ) =>
                                 {
-                                    peer_store.record_delivery_receipt_capability(
-                                        &middle_node_id,
-                                        now,
-                                    );
-                                    peer_store.record_delivery_receipt_capability(
-                                        &terminal_node_id,
-                                        now,
-                                    );
+                                    peer_store
+                                        .record_delivery_receipt_capability(&middle_node_id, now);
+                                    peer_store
+                                        .record_delivery_receipt_capability(&terminal_node_id, now);
                                     peer_store
                                         .record_blind_relay_two_hop_probe_result_with_context(
                                             now,
@@ -9103,20 +9109,13 @@ impl Server {
                         NodeCapability::ChatRelay,
                         now,
                         ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
-                        &[
-                            *self_node_id,
-                            first_middle_node_id,
-                            second_middle_node_id,
-                        ],
+                        &[*self_node_id, first_middle_node_id, second_middle_node_id],
                     );
                 Self::prioritize_probe_candidates(peer_store, now, &mut terminal_candidates);
                 let terminal_before_diversity = terminal_candidates.len();
                 terminal_candidates.retain(|terminal| {
                     PeerStore::route_endpoints_are_network_diverse(&first_middle, terminal)
-                        && PeerStore::route_endpoints_are_network_diverse(
-                            &second_middle,
-                            terminal,
-                        )
+                        && PeerStore::route_endpoints_are_network_diverse(&second_middle, terminal)
                 });
                 network_diversity_blocked |=
                     terminal_before_diversity > 0 && terminal_candidates.is_empty();
@@ -9124,8 +9123,8 @@ impl Server {
                     continue;
                 }
 
-                let effective_middle_candidate_count = first_middle_candidate_count
-                    .min(second_before_diversity.max(1));
+                let effective_middle_candidate_count =
+                    first_middle_candidate_count.min(second_before_diversity.max(1));
                 let terminal_candidate_count = terminal_candidates.len();
                 let Some(endpoint) = first_middle.descriptor.public_endpoint.as_deref() else {
                     attempted = true;
@@ -9217,7 +9216,8 @@ impl Server {
                                         second_middle_node_id,
                                         terminal_node_id,
                                     ] {
-                                        peer_store.record_delivery_receipt_capability(&node_id, now);
+                                        peer_store
+                                            .record_delivery_receipt_capability(&node_id, now);
                                     }
                                     peer_store
                                         .record_blind_relay_three_hop_probe_result_with_context(
@@ -9504,9 +9504,9 @@ impl Server {
         let Some(receipt) = receipt else {
             return false;
         };
-        receipt.delivered_at <= now.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
-            && now.saturating_sub(receipt.delivered_at)
-                <= BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
+        receipt.delivered_at
+            <= now.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
+            && now.saturating_sub(receipt.delivered_at) <= BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
             && receipt
                 .verify_expected(route_id, payload_commitment, terminal_node_id)
                 .is_ok()
@@ -9820,10 +9820,7 @@ impl Server {
                 .into_iter()
                 .find(|middle| {
                     PeerStore::route_endpoints_are_network_diverse(middle, &terminal)
-                        && PeerStore::route_endpoint_is_network_diverse_from_all(
-                            middle,
-                            &used_hops,
-                        )
+                        && PeerStore::route_endpoint_is_network_diverse_from_all(middle, &used_hops)
                 })
             else {
                 continue;
@@ -9896,11 +9893,7 @@ impl Server {
                         Err(error) => {
                             let reason = format!("onion_delivery_ack_{}", error.as_str());
                             last_failure_reason = Some(reason.clone());
-                            peer_store.record_route_forward_failure(
-                                &middle_node_id,
-                                now,
-                                reason,
-                            );
+                            peer_store.record_route_forward_failure(&middle_node_id, now, reason);
                         }
                     }
                 }
@@ -10089,7 +10082,7 @@ impl Server {
         peer_store: &PeerStore,
         path: &str,
         now: u64,
-    ) -> Result<(usize, bool, u64, u64)> {
+    ) -> Result<PeerStoreCachePersistReport> {
         let path = PathBuf::from(path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -10099,28 +10092,33 @@ impl Server {
 
         let descriptor_snapshot = peer_store.export_peer_cache_snapshot(now);
         let routeability_evidence = peer_store.export_routeability_cache_evidence(now);
-        let two_hop_path_proof_events =
-            peer_store.export_two_hop_path_proof_cache_events(now);
+        let two_hop_path_proof_events = peer_store.export_two_hop_path_proof_cache_events(now);
         let two_hop_path_proof_event_count = two_hop_path_proof_events.len();
         let two_hop_path_proof_stability_ready = peer_store
             .status(now)
             .two_hop_path_proof_history
+            .stability_ready;
+        let three_hop_path_proof_events = peer_store.export_three_hop_path_proof_cache_events(now);
+        let three_hop_path_proof_event_count = three_hop_path_proof_events.len();
+        let three_hop_path_proof_stability_ready = peer_store
+            .status(now)
+            .three_hop_path_proof_history
             .stability_ready;
         let verified_client_delivery_evidence =
             peer_store.export_verified_client_delivery_cache_evidence(now);
         let verified_client_delivery_count = verified_client_delivery_evidence
             .map(|evidence| evidence.verified_deliveries)
             .unwrap_or(0);
-        let verified_client_delivery_generation =
-            Self::next_peer_cache_client_delivery_generation(
-                path.to_string_lossy().as_ref(),
-                identity,
-            )
-            .await?;
+        let verified_client_delivery_generation = Self::next_peer_cache_client_delivery_generation(
+            path.to_string_lossy().as_ref(),
+            identity,
+        )
+        .await?;
         let document = PeerStoreCacheDocument::new(
             descriptor_snapshot,
             routeability_evidence,
             two_hop_path_proof_events,
+            three_hop_path_proof_events,
             verified_client_delivery_generation,
             verified_client_delivery_evidence,
             identity,
@@ -10154,27 +10152,24 @@ impl Server {
             &client_delivery_anchor,
         )
         .await?;
-        Ok((
-            two_hop_path_proof_event_count,
-            two_hop_path_proof_stability_ready,
-            verified_client_delivery_count,
-            verified_client_delivery_generation,
-        ))
+        Ok(PeerStoreCachePersistReport {
+            two_hop_events: two_hop_path_proof_event_count,
+            two_hop_stability_ready: two_hop_path_proof_stability_ready,
+            three_hop_events: three_hop_path_proof_event_count,
+            three_hop_stability_ready: three_hop_path_proof_stability_ready,
+            client_deliveries: verified_client_delivery_count,
+            client_delivery_generation: verified_client_delivery_generation,
+        })
     }
 
     async fn next_peer_cache_client_delivery_generation(
         path: &str,
         identity: &IdentityKeyPair,
     ) -> Result<u64> {
-        let mut high_water_mark = match Self::read_peer_cache_client_delivery_anchor(
-            path,
-            identity,
-        )
-        .await
+        let mut high_water_mark = match Self::read_peer_cache_client_delivery_anchor(path, identity)
+            .await
         {
-            PeerStoreVerifiedClientDeliveryAnchorState::Verified(anchor) => {
-                anchor.cache_generation
-            }
+            PeerStoreVerifiedClientDeliveryAnchorState::Verified(anchor) => anchor.cache_generation,
             _ => 0,
         };
 
@@ -10192,8 +10187,7 @@ impl Server {
                     .verify_verified_client_delivery_signature(identity)
                     .is_ok()
             {
-                high_water_mark = high_water_mark
-                    .max(document.verified_client_delivery_generation);
+                high_water_mark = high_water_mark.max(document.verified_client_delivery_generation);
             }
         }
 
@@ -10277,22 +10271,22 @@ impl Server {
         }
 
         match Self::save_peer_store_cache_snapshot(identity, peer_store, path, now).await {
-            Ok((
-                proof_events_persisted,
-                proof_stability_ready,
-                client_deliveries_persisted,
-                client_delivery_generation,
-            )) => {
+            Ok(report) => {
                 peer_store.record_cache_save_status(now, "success", "snapshot_persisted");
                 peer_store.record_two_hop_proof_cache_persisted(
                     now,
-                    proof_events_persisted,
-                    proof_stability_ready,
+                    report.two_hop_events,
+                    report.two_hop_stability_ready,
+                );
+                peer_store.record_three_hop_proof_cache_persisted(
+                    now,
+                    report.three_hop_events,
+                    report.three_hop_stability_ready,
                 );
                 peer_store.record_client_delivery_cache_persisted(
                     now,
-                    client_deliveries_persisted,
-                    client_delivery_generation,
+                    report.client_deliveries,
+                    report.client_delivery_generation,
                 );
                 Ok(())
             }
@@ -10537,6 +10531,20 @@ impl Server {
                     } else {
                         "identity_unavailable"
                     };
+                let three_hop_proof_authentication =
+                    if document.three_hop_path_proof_schema_version == 0 {
+                        "legacy_descriptor_only"
+                    } else if cache_identity.is_some_and(|identity| {
+                        document
+                            .verify_three_hop_path_proof_signature(identity)
+                            .is_ok()
+                    }) {
+                        "verified"
+                    } else if cache_identity.is_some() {
+                        "signature_invalid"
+                    } else {
+                        "identity_unavailable"
+                    };
                 let client_delivery_authentication =
                     if document.verified_client_delivery_schema_version == 0 {
                         "legacy_descriptor_only"
@@ -10551,8 +10559,7 @@ impl Server {
                     } else {
                         "identity_unavailable"
                     };
-                let client_delivery_generation =
-                    document.verified_client_delivery_generation;
+                let client_delivery_generation = document.verified_client_delivery_generation;
                 let client_delivery_rollback_protection =
                     if client_delivery_authentication == "verified" {
                         client_delivery_anchor.protection_for(&document)
@@ -10565,6 +10572,8 @@ impl Server {
                     routeability_authentication,
                     Some(document.two_hop_path_proof_events),
                     two_hop_proof_authentication,
+                    Some(document.three_hop_path_proof_events),
+                    three_hop_proof_authentication,
                     document.verified_client_delivery_evidence,
                     client_delivery_authentication,
                     client_delivery_generation,
@@ -10576,6 +10585,8 @@ impl Server {
                 .map(|snapshot| {
                     (
                         snapshot,
+                        None,
+                        "not_applicable",
                         None,
                         "not_applicable",
                         None,
@@ -10594,6 +10605,8 @@ impl Server {
             routeability_authentication,
             two_hop_proof_events,
             two_hop_proof_authentication,
+            three_hop_proof_events,
+            three_hop_proof_authentication,
             client_delivery_evidence,
             client_delivery_authentication,
             client_delivery_generation,
@@ -10613,14 +10626,11 @@ impl Server {
         };
 
         if is_peer_cache {
-            peer_store.record_two_hop_proof_cache_authentication(
-                now,
-                two_hop_proof_authentication,
-            );
-            peer_store.record_client_delivery_cache_authentication(
-                now,
-                client_delivery_authentication,
-            );
+            peer_store.record_two_hop_proof_cache_authentication(now, two_hop_proof_authentication);
+            peer_store
+                .record_three_hop_proof_cache_authentication(now, three_hop_proof_authentication);
+            peer_store
+                .record_client_delivery_cache_authentication(now, client_delivery_authentication);
             peer_store.record_client_delivery_cache_rollback_protection(
                 now,
                 client_delivery_generation,
@@ -10633,21 +10643,24 @@ impl Server {
         } else {
             peer_store.load_bootstrap_snapshot_from_source(&snapshot, now, source_kind)
         };
-        let route_report = match (routeability_authentication, routeability_evidence.as_deref()) {
-            ("signature_invalid", Some(records)) => Some(
-                peer_store.reject_routeability_cache_evidence(
+        let route_report = match (
+            routeability_authentication,
+            routeability_evidence.as_deref(),
+        ) {
+            ("signature_invalid", Some(records)) => {
+                Some(peer_store.reject_routeability_cache_evidence(
                     records.len(),
                     now,
                     "signature_invalid",
-                ),
-            ),
-            ("identity_unavailable", Some(records)) => Some(
-                peer_store.reject_routeability_cache_evidence(
+                ))
+            }
+            ("identity_unavailable", Some(records)) => {
+                Some(peer_store.reject_routeability_cache_evidence(
                     records.len(),
                     now,
                     "identity_unavailable",
-                ),
-            ),
+                ))
+            }
             (_, Some(records)) => {
                 Some(peer_store.restore_routeability_cache_evidence(records, now))
             }
@@ -10666,19 +10679,23 @@ impl Server {
             two_hop_proof_authentication,
             two_hop_proof_events.as_deref(),
         ) {
-            ("signature_invalid", Some(records)) => Some(
-                peer_store.reject_two_hop_path_proof_cache_events(
-                    records.len(), now, "signature_invalid",
-                ),
-            ),
-            ("identity_unavailable", Some(records)) => Some(
-                peer_store.reject_two_hop_path_proof_cache_events(
-                    records.len(), now, "identity_unavailable",
-                ),
-            ),
-            (_, Some(records)) => Some(
-                peer_store.restore_two_hop_path_proof_cache_events(records, now),
-            ),
+            ("signature_invalid", Some(records)) => {
+                Some(peer_store.reject_two_hop_path_proof_cache_events(
+                    records.len(),
+                    now,
+                    "signature_invalid",
+                ))
+            }
+            ("identity_unavailable", Some(records)) => {
+                Some(peer_store.reject_two_hop_path_proof_cache_events(
+                    records.len(),
+                    now,
+                    "identity_unavailable",
+                ))
+            }
+            (_, Some(records)) => {
+                Some(peer_store.restore_two_hop_path_proof_cache_events(records, now))
+            }
             (_, None) => None,
         };
         let proof_restored = proof_report.map(|value| value.restored).unwrap_or(0);
@@ -10687,60 +10704,95 @@ impl Server {
             two_hop_proof_authentication,
             "signature_invalid" | "identity_unavailable"
         );
-        let client_delivery_report = if is_peer_cache {
-            Some(match (
-                client_delivery_authentication,
-                client_delivery_rollback_protection,
-            ) {
-                ("signature_invalid", _) => peer_store
-                    .reject_verified_client_delivery_cache_evidence(
-                        client_delivery_evidence.is_some(),
-                        now,
-                        "signature_invalid",
-                    ),
-                ("identity_unavailable", _) => peer_store
-                    .reject_verified_client_delivery_cache_evidence(
-                        client_delivery_evidence.is_some(),
-                        now,
-                        "identity_unavailable",
-                    ),
-                (_, "anchor_missing") => peer_store
-                    .reject_verified_client_delivery_cache_evidence(
-                        client_delivery_evidence.is_some(),
-                        now,
-                        "anchor_missing",
-                    ),
-                (_, "anchor_invalid") => peer_store
-                    .reject_verified_client_delivery_cache_evidence(
-                        client_delivery_evidence.is_some(),
-                        now,
-                        "anchor_invalid",
-                    ),
-                (_, "anchor_conflict") => peer_store
-                    .reject_verified_client_delivery_cache_evidence(
-                        client_delivery_evidence.is_some(),
-                        now,
-                        "anchor_conflict",
-                    ),
-                (_, "rollback_detected") => peer_store
-                    .reject_verified_client_delivery_cache_evidence(
-                        client_delivery_evidence.is_some(),
-                        now,
-                        "rollback_detected",
-                    ),
-                _ => peer_store.restore_verified_client_delivery_cache_evidence(
-                    client_delivery_evidence.as_ref(),
+        let three_hop_proof_report = match (
+            three_hop_proof_authentication,
+            three_hop_proof_events.as_deref(),
+        ) {
+            ("signature_invalid", Some(records)) => {
+                Some(peer_store.reject_three_hop_path_proof_cache_events(
+                    records.len(),
                     now,
-                ),
-            })
+                    "signature_invalid",
+                ))
+            }
+            ("identity_unavailable", Some(records)) => {
+                Some(peer_store.reject_three_hop_path_proof_cache_events(
+                    records.len(),
+                    now,
+                    "identity_unavailable",
+                ))
+            }
+            (_, Some(records)) => {
+                Some(peer_store.restore_three_hop_path_proof_cache_events(records, now))
+            }
+            (_, None) => None,
+        };
+        let three_hop_proof_restored = three_hop_proof_report
+            .map(|value| value.restored)
+            .unwrap_or(0);
+        let three_hop_proof_rejected = three_hop_proof_report
+            .map(|value| value.rejected)
+            .unwrap_or(0);
+        let three_hop_proof_authentication_rejected = matches!(
+            three_hop_proof_authentication,
+            "signature_invalid" | "identity_unavailable"
+        );
+        let client_delivery_report = if is_peer_cache {
+            Some(
+                match (
+                    client_delivery_authentication,
+                    client_delivery_rollback_protection,
+                ) {
+                    ("signature_invalid", _) => peer_store
+                        .reject_verified_client_delivery_cache_evidence(
+                            client_delivery_evidence.is_some(),
+                            now,
+                            "signature_invalid",
+                        ),
+                    ("identity_unavailable", _) => peer_store
+                        .reject_verified_client_delivery_cache_evidence(
+                            client_delivery_evidence.is_some(),
+                            now,
+                            "identity_unavailable",
+                        ),
+                    (_, "anchor_missing") => peer_store
+                        .reject_verified_client_delivery_cache_evidence(
+                            client_delivery_evidence.is_some(),
+                            now,
+                            "anchor_missing",
+                        ),
+                    (_, "anchor_invalid") => peer_store
+                        .reject_verified_client_delivery_cache_evidence(
+                            client_delivery_evidence.is_some(),
+                            now,
+                            "anchor_invalid",
+                        ),
+                    (_, "anchor_conflict") => peer_store
+                        .reject_verified_client_delivery_cache_evidence(
+                            client_delivery_evidence.is_some(),
+                            now,
+                            "anchor_conflict",
+                        ),
+                    (_, "rollback_detected") => peer_store
+                        .reject_verified_client_delivery_cache_evidence(
+                            client_delivery_evidence.is_some(),
+                            now,
+                            "rollback_detected",
+                        ),
+                    _ => peer_store.restore_verified_client_delivery_cache_evidence(
+                        client_delivery_evidence.as_ref(),
+                        now,
+                    ),
+                },
+            )
         } else {
             None
         };
         let client_delivery_restored = client_delivery_report
             .map(|report| report.restored_deliveries)
             .unwrap_or(0);
-        let client_delivery_rejected = client_delivery_report
-            .is_some_and(|report| report.present && !report.restored);
+        let client_delivery_rejected =
+            client_delivery_report.is_some_and(|report| report.present && !report.restored);
         let client_delivery_authentication_rejected = matches!(
             client_delivery_authentication,
             "signature_invalid" | "identity_unavailable"
@@ -10757,6 +10809,8 @@ impl Server {
                 || route_authentication_rejected
                 || proof_rejected > 0
                 || proof_authentication_rejected
+                || three_hop_proof_rejected > 0
+                || three_hop_proof_authentication_rejected
                 || client_delivery_rejected
                 || client_delivery_authentication_rejected
                 || client_delivery_rollback_rejected
@@ -10766,7 +10820,7 @@ impl Server {
                 "success"
             },
             format!(
-                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
+                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} three_hop_proof_authentication={} three_hop_proof_restored={} three_hop_proof_rejected={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
                 report.total,
                 report.inserted,
                 report.unchanged,
@@ -10778,6 +10832,9 @@ impl Server {
                 two_hop_proof_authentication,
                 proof_restored,
                 proof_rejected,
+                three_hop_proof_authentication,
+                three_hop_proof_restored,
+                three_hop_proof_rejected,
                 client_delivery_authentication,
                 client_delivery_generation,
                 client_delivery_rollback_protection,
@@ -10799,6 +10856,9 @@ impl Server {
             two_hop_proof_authentication,
             two_hop_proof_restored = proof_restored,
             two_hop_proof_rejected = proof_rejected,
+            three_hop_proof_authentication,
+            three_hop_proof_restored,
+            three_hop_proof_rejected,
             client_delivery_authentication,
             client_delivery_generation,
             client_delivery_rollback_protection,
@@ -12133,9 +12193,7 @@ impl Server {
 
             let reason = match result {
                 Ok(()) => "required runtime task exited unexpectedly",
-                Err(error) => {
-                    RuntimeTaskJoinFailureKind::classify(&error).required_task_reason()
-                }
+                Err(error) => RuntimeTaskJoinFailureKind::classify(&error).required_task_reason(),
             };
             let failure = CriticalRuntimeFailure {
                 task: name,
@@ -12178,9 +12236,9 @@ impl Server {
         // cancellation explicitly.
         let outcome = match tokio::time::timeout(grace, &mut task).await {
             Ok(Ok(())) => RuntimeTaskShutdownOutcome::Completed,
-            Ok(Err(error)) => RuntimeTaskShutdownOutcome::JoinFailed(
-                RuntimeTaskJoinFailureKind::classify(&error),
-            ),
+            Ok(Err(error)) => {
+                RuntimeTaskShutdownOutcome::JoinFailed(RuntimeTaskJoinFailureKind::classify(&error))
+            }
             Err(_) => {
                 task.abort();
                 match tokio::time::timeout(abort_confirmation, &mut task).await {
@@ -12319,30 +12377,28 @@ mod tests {
     use super::{
         await_commitment_tip_announcement_or_newer,
         commitment_coordinator_lease_degraded_retry_delay,
-        commitment_coordinator_lease_production_valid_for,
-        commitment_follower_success_retry_delay, commitment_witness_startup_decision,
-        data_plane_receive_failure_action, memchain_index_rejection_reason,
-        peer_store_heartbeat_status_value, prefix_to_netmask,
+        commitment_coordinator_lease_production_valid_for, commitment_follower_success_retry_delay,
+        commitment_witness_startup_decision, data_plane_receive_failure_action,
+        memchain_index_rejection_reason, peer_store_heartbeat_status_value, prefix_to_netmask,
         required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
-        take_pre_ready_runtime_failure, unix_now_secs, CriticalRuntimeFailure,
-        CommitmentCoordinatorLeaseRound, CommitmentFollowerRoundOutcome,
-        CommitmentSyncTaskLivenessGuard,
+        take_pre_ready_runtime_failure, unix_now_secs, CommitmentCoordinatorLeaseRound,
+        CommitmentFollowerRoundOutcome, CommitmentSyncTaskLivenessGuard,
         CommitmentTipAnnouncementWaitOutcome, CommitmentWitnessStartupBlockReason,
-        CommitmentWitnessStartupDecision, DataPlaneReceiveFailureAction, DirectoryChainStore,
-        DirectoryProofGossipOutcome, DirectoryProofGossipPeerState, DirectoryProofGossipResult,
-        DiscoveryGossipExecution, DiscoveryGossipFailure, DiscoveryGossipFailureKind,
-        DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
-        DiscoveryPeerIdentityHints, PeerHttpClients, PeerStoreCacheDocument,
-        PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
-        RequiredApiListenerExit, RuntimeTaskRegistry, RuntimeTaskShutdownOutcome,
-        RuntimeTaskShutdownReport, Server, SystemdNotifier,
-        BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
-        BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
-        COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DATA_PLANE_RECV_FAILURE_LIMIT,
-        DIRECTORY_OPERATOR_HTTP_PROFILE, DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS,
-        DIRECTORY_SYNC_HTTP_PROFILE, DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
-        MEMCHAIN_SYNC_HTTP_PROFILE,
-        ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        CommitmentWitnessStartupDecision, CriticalRuntimeFailure, DataPlaneReceiveFailureAction,
+        DirectoryChainStore, DirectoryProofGossipOutcome, DirectoryProofGossipPeerState,
+        DirectoryProofGossipResult, DiscoveryGossipExecution, DiscoveryGossipFailure,
+        DiscoveryGossipFailureKind, DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator,
+        DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints, PeerHttpClients,
+        PeerStoreCacheDocument, PeerStoreVerifiedClientDeliveryAnchor,
+        PeerStoreVerifiedClientDeliveryCacheEvidence, RequiredApiListenerExit, RuntimeTaskRegistry,
+        RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server, SystemdNotifier,
+        BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
+        BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
+        DATA_PLANE_RECV_FAILURE_LIMIT, DIRECTORY_OPERATOR_HTTP_PROFILE,
+        DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
+        DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, MEMCHAIN_SYNC_HTTP_PROFILE,
+        ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
     };
@@ -12360,11 +12416,11 @@ mod tests {
     use aeronyx_core::protocol::chat::{
         encode_envelope, BlindRelayDeliveryReceipt, ChatContentType, ChatEnvelope,
     };
-    use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::discovery::{
         DirectoryCommitmentBlockV1, DirectoryDescriptorCommitmentV1,
         DirectoryDescriptorInclusionProofV1,
     };
+    use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
         NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
         SignedNodeDescriptor,
@@ -12384,15 +12440,14 @@ mod tests {
     use std::os::unix::net::UnixDatagram;
 
     use crate::api::chat_peer::{
-        PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
-        PeerChatRelayResponse,
+        PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest, PeerChatRelayResponse,
     };
     use crate::api::discovery::GossipResponse;
     use crate::config::{DiscoveryConfig, ServerConfig};
     use crate::services::memchain::MemoryStorage;
     use crate::services::{
-        DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore,
-        DirectoryReplicaSyncRuntime, PeerStore, PeerStoreImportReport,
+        DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,
+        PeerStore, PeerStoreImportReport,
     };
 
     fn test_peer_http_client() -> Arc<reqwest::Client> {
@@ -12427,8 +12482,7 @@ mod tests {
         assert_eq!(storage.record_commitment_sync_status().state, "current");
 
         {
-            let _liveness_guard =
-                CommitmentSyncTaskLivenessGuard::new(Arc::clone(&storage));
+            let _liveness_guard = CommitmentSyncTaskLivenessGuard::new(Arc::clone(&storage));
         }
 
         let stopped = storage.record_commitment_sync_status();
@@ -12450,8 +12504,7 @@ mod tests {
         receiver
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let notifier =
-            SystemdNotifier::from_socket(Some(socket_path.as_os_str().to_os_string()));
+        let notifier = SystemdNotifier::from_socket(Some(socket_path.as_os_str().to_os_string()));
 
         assert!(notifier.ready("ready\nwithout injection").unwrap());
 
@@ -12753,11 +12806,7 @@ mod tests {
         // [DIRECTORY-SYNC-RUNTIME-GATE 2026-07-30 by Codex] Preserve the
         // default-off compatibility boundary: no pins plus mirror disabled
         // needs neither a replica store nor a background task.
-        let server = Server::new(
-            ServerConfig::default(),
-            IdentityKeyPair::generate(),
-            None,
-        );
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
         let task = server
             .spawn_directory_replica_sync_task(
                 Arc::new(PeerStore::new()),
@@ -12805,8 +12854,7 @@ mod tests {
         )
         .unwrap();
         let mut config = ServerConfig::default();
-        config.discovery.directory_chain_sync_peer_node_ids =
-            vec![hex::encode([0x51_u8; 32])];
+        config.discovery.directory_chain_sync_peer_node_ids = vec![hex::encode([0x51_u8; 32])];
         config.discovery.directory_chain_sync_interval_secs = 0;
         config.discovery.directory_observation_witness_min_verified = 1;
         let server = Server::new(config, identity, None);
@@ -12941,13 +12989,11 @@ mod tests {
 
         tokio::task::yield_now().await;
         supervisor.abort();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), supervisor)
-                .await
-                .unwrap()
-                .unwrap_err()
-                .is_cancelled()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled());
         tokio::time::timeout(Duration::from_secs(1), async {
             while !inner_abort_handle.is_finished() {
                 tokio::task::yield_now().await;
@@ -12988,11 +13034,7 @@ mod tests {
         // [REQUIRED-TASK-SUPERVISION 2026-07-30 by Codex] Losing every
         // required-task sender without an explicit failure must still trigger
         // process recovery; otherwise the node could remain half healthy.
-        let server = Server::new(
-            ServerConfig::default(),
-            IdentityKeyPair::generate(),
-            None,
-        );
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
         let (failure_tx, mut failure_rx) = tokio::sync::mpsc::channel(1);
         drop(failure_tx);
 
@@ -13209,22 +13251,10 @@ mod tests {
             certificate_retry_pending: true,
             ..stable
         };
-        assert_eq!(
-            commitment_follower_success_retry_delay(30, &deferred, 0),
-            1
-        );
-        assert_eq!(
-            commitment_follower_success_retry_delay(30, &deferred, 1),
-            1
-        );
-        assert_eq!(
-            commitment_follower_success_retry_delay(30, &deferred, 2),
-            2
-        );
-        assert_eq!(
-            commitment_follower_success_retry_delay(30, &deferred, 3),
-            4
-        );
+        assert_eq!(commitment_follower_success_retry_delay(30, &deferred, 0), 1);
+        assert_eq!(commitment_follower_success_retry_delay(30, &deferred, 1), 1);
+        assert_eq!(commitment_follower_success_retry_delay(30, &deferred, 2), 2);
+        assert_eq!(commitment_follower_success_retry_delay(30, &deferred, 3), 4);
         assert_eq!(
             commitment_follower_success_retry_delay(30, &deferred, 32),
             30
@@ -13234,10 +13264,7 @@ mod tests {
             block_backlog_remaining: true,
             ..deferred
         };
-        assert_eq!(
-            commitment_follower_success_retry_delay(30, &backlog, 32),
-            1
-        );
+        assert_eq!(commitment_follower_success_retry_delay(30, &backlog, 32), 1);
         assert_eq!(
             commitment_follower_success_retry_delay(5, &deferred, u32::MAX),
             5
@@ -13273,10 +13300,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(
-            outcome,
-            CommitmentTipAnnouncementWaitOutcome::Completed(42)
-        );
+        assert_eq!(outcome, CommitmentTipAnnouncementWaitOutcome::Completed(42));
     }
 
     #[tokio::test]
@@ -13985,16 +14009,15 @@ mod tests {
             [0x33; 32],
         );
 
-        let (request, payload_commitment) =
-            Server::build_three_hop_onion_delivery_probe_request(
-                &source,
-                &self_node_id,
-                &first_middle,
-                &second_middle,
-                &terminal,
-                now,
-            )
-            .expect("three KEM-capable descriptors should build a three-hop onion probe");
+        let (request, payload_commitment) = Server::build_three_hop_onion_delivery_probe_request(
+            &source,
+            &self_node_id,
+            &first_middle,
+            &second_middle,
+            &terminal,
+            now,
+        )
+        .expect("three KEM-capable descriptors should build a three-hop onion probe");
 
         assert_eq!(request.previous_hop_node_id, self_node_id);
         assert_eq!(request.envelope.next_hop, first_middle.node_id());
@@ -14073,20 +14096,13 @@ mod tests {
 
         let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let relay_port = listener.local_addr().unwrap().port();
-        let signed_descriptor = |
-            identity: &IdentityKeyPair,
-            endpoint: String,
-            capabilities: Vec<NodeCapability>,
-            name: &str,
-        | {
-            let mut descriptor = NodeDescriptor::new(
-                identity.public_key_bytes(),
-                now,
-                now,
-                now + 300,
-                name,
-            )
-            .with_x25519_kem(identity.x25519_public_key_bytes());
+        let signed_descriptor = |identity: &IdentityKeyPair,
+                                 endpoint: String,
+                                 capabilities: Vec<NodeCapability>,
+                                 name: &str| {
+            let mut descriptor =
+                NodeDescriptor::new(identity.public_key_bytes(), now, now, now + 300, name)
+                    .with_x25519_kem(identity.x25519_public_key_bytes());
             descriptor.public_endpoint = Some(endpoint);
             descriptor.capabilities = capabilities;
             SignedNodeDescriptor::sign(descriptor, identity).unwrap()
@@ -14109,7 +14125,7 @@ mod tests {
             vec![NodeCapability::ChatRelay],
             "three-hop-terminal",
         );
-        let (expected_request, payload_commitment) =
+        let (_probe_template, payload_commitment) =
             Server::build_three_hop_onion_delivery_probe_request(
                 &source_identity,
                 &self_node_id,
@@ -14119,13 +14135,6 @@ mod tests {
                 now,
             )
             .unwrap();
-        let expected_route_id = expected_request.envelope.route_id;
-        let delivery_receipt = BlindRelayDeliveryReceipt::accepted(
-            expected_route_id,
-            payload_commitment,
-            now,
-            &terminal_identity,
-        );
         let router = Router::new()
             .route(
                 "/api/discovery/summary",
@@ -14140,9 +14149,17 @@ mod tests {
             .route(
                 "/api/chat/peer/blind-relay",
                 post(move |Json(request): Json<PeerBlindRelayRequest>| {
-                    let receipt = delivery_receipt.clone();
+                    // [THREE-HOP-PROBE-TEST-DETERMINISM 2026-08-02 by Codex]
+                    // The runtime probe intentionally creates a fresh random
+                    // route id. Sign the route actually received instead of a
+                    // separately generated template route.
+                    let receipt = BlindRelayDeliveryReceipt::accepted(
+                        request.envelope.route_id,
+                        payload_commitment,
+                        now,
+                        &terminal_identity,
+                    );
                     async move {
-                        assert_eq!(request.envelope.route_id, expected_route_id);
                         assert_eq!(request.envelope.ttl, 3);
                         Json(PeerBlindRelayResponse {
                             accepted: true,
@@ -14163,8 +14180,11 @@ mod tests {
         for descriptor in [first_middle, second_middle, terminal] {
             store.upsert_verified(descriptor, now).unwrap();
         }
+        // [THREE-HOP-PROBE-TEST-DETERMINISM 2026-08-02 by Codex] Loopback
+        // network-diversity aliases must never be routed through host proxies.
+        let test_client = reqwest::Client::builder().no_proxy().build().unwrap();
         let outcome = Server::probe_three_hop_blind_relay_path(
-            &reqwest::Client::new(),
+            &test_client,
             &store,
             &source_identity,
             &self_node_id,
@@ -14187,10 +14207,7 @@ mod tests {
                 .get("entry_middle_middle_terminal"),
             Some(&1)
         );
-        assert_eq!(
-            status.blind_relay_quality.delivery_receipt_capable_peers,
-            3
-        );
+        assert_eq!(status.blind_relay_quality.delivery_receipt_capable_peers, 3);
 
         http_server.abort();
         let _ = http_server.await;
@@ -14274,12 +14291,8 @@ mod tests {
         let route_id = [0x31; 16];
         let payload_commitment =
             BlindRelayDeliveryReceipt::payload_commitment(b"opaque terminal payload");
-        let receipt = BlindRelayDeliveryReceipt::accepted(
-            route_id,
-            payload_commitment,
-            now,
-            &terminal,
-        );
+        let receipt =
+            BlindRelayDeliveryReceipt::accepted(route_id, payload_commitment, now, &terminal);
 
         assert!(Server::verified_delivery_receipt(
             Some(&receipt),
@@ -14339,9 +14352,8 @@ mod tests {
             signature: [0u8; 64],
         };
         envelope.signature = chat_sender.sign(&envelope.sign_data());
-        let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment(
-            &encode_envelope(&envelope).unwrap(),
-        );
+        let payload_commitment =
+            BlindRelayDeliveryReceipt::payload_commitment(&encode_envelope(&envelope).unwrap());
 
         let terminal_receipt_identity = terminal_identity.clone();
         let relay = Router::new().route(
@@ -14371,14 +14383,9 @@ mod tests {
             axum::serve(listener, relay).await.unwrap();
         });
 
-        let mut middle_descriptor = NodeDescriptor::new(
-            middle_node_id,
-            now,
-            now,
-            now + 300,
-            "test-receipt-middle",
-        )
-        .with_x25519_kem(middle_identity.x25519_public_key_bytes());
+        let mut middle_descriptor =
+            NodeDescriptor::new(middle_node_id, now, now, now + 300, "test-receipt-middle")
+                .with_x25519_kem(middle_identity.x25519_public_key_bytes());
         middle_descriptor.public_endpoint = Some(middle_endpoint);
         middle_descriptor.capabilities = vec![NodeCapability::OnionMiddle];
         let middle_descriptor =
@@ -14424,7 +14431,10 @@ mod tests {
         assert!(quality.real_relay_ready);
         assert_eq!(quality.verified_client_onion_deliveries, 1);
         assert_eq!(quality.delivery_receipt_capable_peers, 2);
-        assert_eq!(quality.evidence_mode, "verified_client_onion_delivery_receipt");
+        assert_eq!(
+            quality.evidence_mode,
+            "verified_client_onion_delivery_receipt"
+        );
     }
 
     #[tokio::test]
@@ -14882,7 +14892,10 @@ mod tests {
             "peer_quorum",
             "network_story",
         ] {
-            assert!(projection.get(required).is_some(), "missing field: {required}");
+            assert!(
+                projection.get(required).is_some(),
+                "missing field: {required}"
+            );
         }
         for local_only in [
             "recent_audit_events",
@@ -14943,24 +14956,16 @@ mod tests {
         // change its wire advertisement until the operator completes the
         // mixed-version decoder rollout.
         let identity = IdentityKeyPair::generate();
-        let staged = Server::build_self_discovery_descriptor_for(
-            &config,
-            &identity,
-            1_800_000_000,
-        )
-        .unwrap();
+        let staged =
+            Server::build_self_discovery_descriptor_for(&config, &identity, 1_800_000_000).unwrap();
         assert!(!staged
             .descriptor
             .capabilities
             .contains(&NodeCapability::DirectoryMirrorCarrier));
 
         config.discovery.advertise_directory_mirror_carrier = true;
-        let advertised = Server::build_self_discovery_descriptor_for(
-            &config,
-            &identity,
-            1_800_000_001,
-        )
-        .unwrap();
+        let advertised =
+            Server::build_self_discovery_descriptor_for(&config, &identity, 1_800_000_001).unwrap();
         assert!(advertised
             .descriptor
             .capabilities
@@ -14968,12 +14973,8 @@ mod tests {
         assert!(advertised.verify_at(1_800_000_002).is_ok());
 
         config.discovery.public_discovery = false;
-        let private = Server::build_self_discovery_descriptor_for(
-            &config,
-            &identity,
-            1_800_000_002,
-        )
-        .unwrap();
+        let private =
+            Server::build_self_discovery_descriptor_for(&config, &identity, 1_800_000_002).unwrap();
         assert!(!private
             .descriptor
             .capabilities
@@ -15297,20 +15298,13 @@ mod tests {
         let receipt_middle_identity = IdentityKeyPair::generate();
         let terminal_identity = IdentityKeyPair::generate();
 
-        let signed_descriptor = |
-            identity: &IdentityKeyPair,
-            endpoint: String,
-            capability: NodeCapability,
-            name: &str,
-        | {
-            let mut descriptor = NodeDescriptor::new(
-                identity.public_key_bytes(),
-                now,
-                now,
-                now + 300,
-                name,
-            )
-            .with_x25519_kem(identity.x25519_public_key_bytes());
+        let signed_descriptor = |identity: &IdentityKeyPair,
+                                 endpoint: String,
+                                 capability: NodeCapability,
+                                 name: &str| {
+            let mut descriptor =
+                NodeDescriptor::new(identity.public_key_bytes(), now, now, now + 300, name)
+                    .with_x25519_kem(identity.x25519_public_key_bytes());
             descriptor.public_endpoint = Some(endpoint);
             descriptor.capabilities = vec![capability];
             SignedNodeDescriptor::sign(descriptor, identity).unwrap()
@@ -15632,11 +15626,8 @@ mod tests {
             .unwrap()
             .as_secs();
         let peer_store = PeerStore::new();
-        let peer_descriptor = signed_chat_relay_peer_descriptor(
-            endpoint,
-            now.saturating_sub(1),
-            now + 300,
-        );
+        let peer_descriptor =
+            signed_chat_relay_peer_descriptor(endpoint, now.saturating_sub(1), now + 300);
         let peer_node_id = peer_descriptor.node_id();
         let peer_prefix = hex::encode(&peer_node_id[..4]);
         peer_store
@@ -15711,22 +15702,14 @@ mod tests {
 
     fn directory_gossip_announcement(now: u64) -> DirectoryReplicaGossipAnnouncement {
         let producer = IdentityKeyPair::generate();
-        let descriptor = signed_chat_relay_peer_descriptor(
-            "http://127.0.0.1:9".to_string(),
-            now,
-            now + 300,
-        );
+        let descriptor =
+            signed_chat_relay_peer_descriptor("http://127.0.0.1:9".to_string(), now, now + 300);
         let commitment =
             DirectoryDescriptorCommitmentV1::from_signed_descriptor(&descriptor).unwrap();
         let descriptor_hash = commitment.descriptor_hash;
-        let block = DirectoryCommitmentBlockV1::new_signed(
-            1,
-            now,
-            [0u8; 32],
-            vec![commitment],
-            &producer,
-        )
-        .unwrap();
+        let block =
+            DirectoryCommitmentBlockV1::new_signed(1, now, [0u8; 32], vec![commitment], &producer)
+                .unwrap();
         let block_hash = block.hash();
         let proof =
             DirectoryDescriptorInclusionProofV1::from_block_at(&block, &descriptor, now).unwrap();
@@ -16575,6 +16558,11 @@ mod tests {
         );
         assert!(document.two_hop_path_proof_events.is_empty());
         assert_eq!(
+            document.three_hop_path_proof_schema_version,
+            THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION
+        );
+        assert!(document.three_hop_path_proof_events.is_empty());
+        assert_eq!(
             document.verified_client_delivery_schema_version,
             VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION
         );
@@ -16585,6 +16573,9 @@ mod tests {
             .is_ok());
         assert!(document
             .verify_two_hop_path_proof_signature(&server.identity)
+            .is_ok());
+        assert!(document
+            .verify_three_hop_path_proof_signature(&server.identity)
             .is_ok());
         assert!(document
             .verify_verified_client_delivery_signature(&server.identity)
@@ -16641,12 +16632,17 @@ mod tests {
         );
         let original_store = Arc::new(PeerStore::new());
         original_store.upsert_verified(middle.clone(), now).unwrap();
-        original_store.upsert_verified(terminal.clone(), now).unwrap();
+        original_store
+            .upsert_verified(terminal.clone(), now)
+            .unwrap();
         original_store.record_route_forward_success(&middle.node_id(), now + 1);
         original_store.record_route_forward_success(&terminal.node_id(), now + 1);
         original_store.record_verified_client_onion_delivery(now + 2);
 
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "aeronyx-peer-cache-client-delivery-v1-{unique}.json"
         ));
@@ -16665,11 +16661,10 @@ mod tests {
         document.verified_client_delivery_schema_version =
             VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION;
         document.verified_client_delivery_generation = 0;
-        document.verified_client_delivery_signature_ed25519 = Some(hex::encode(
-            server
-                .identity
-                .sign(&document.verified_client_delivery_signing_bytes().unwrap()),
-        ));
+        document.verified_client_delivery_signature_ed25519 =
+            Some(hex::encode(server.identity.sign(
+                &document.verified_client_delivery_signing_bytes().unwrap(),
+            )));
         let legacy_bytes = serde_json::to_vec_pretty(&document).unwrap();
 
         let restored_store = PeerStore::new();
@@ -16682,7 +16677,10 @@ mod tests {
             Some(&server.identity),
         ));
         let status = restored_store.status(now + 4);
-        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 1);
+        assert_eq!(
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            1
+        );
         assert_eq!(
             status
                 .bootstrap
@@ -16724,10 +16722,8 @@ mod tests {
 
         let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path_str)).await;
-        let _ = tokio::fs::remove_file(
-            Server::peer_cache_client_delivery_anchor_path(&path_str),
-        )
-        .await;
+        let _ =
+            tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str)).await;
     }
 
     #[tokio::test]
@@ -16756,8 +16752,8 @@ mod tests {
             &path_str,
             now + 2,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let restored_store = PeerStore::new();
         let bytes = tokio::fs::read(&path).await.unwrap();
@@ -16852,6 +16848,14 @@ mod tests {
             restored_store
                 .status(now + 1)
                 .bootstrap
+                .last_three_hop_proof_cache_status
+                .as_deref(),
+            Some("empty")
+        );
+        assert_eq!(
+            restored_store
+                .status(now + 1)
+                .bootstrap
                 .last_client_delivery_cache_status
                 .as_deref(),
             Some("empty")
@@ -16859,7 +16863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_store_cache_restores_signed_two_hop_proof_window() {
+    async fn peer_store_cache_restores_independently_signed_path_proof_windows() {
         let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
         let now: u64 = 1_800_015_000;
         let middle = signed_probe_peer_descriptor(
@@ -16876,23 +16880,60 @@ mod tests {
             vec![NodeCapability::ChatRelay],
             [0x42; 32],
         );
+        let second_middle = signed_probe_peer_descriptor(
+            "https://second-middle-cache.example".to_string(),
+            3,
+            now + 4_000,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0x43; 32],
+        );
         let original_store = Arc::new(PeerStore::new());
         original_store.upsert_verified(middle.clone(), now).unwrap();
-        original_store.upsert_verified(terminal.clone(), now).unwrap();
+        original_store
+            .upsert_verified(terminal.clone(), now)
+            .unwrap();
+        original_store
+            .upsert_verified(second_middle.clone(), now)
+            .unwrap();
         original_store.record_route_forward_success(&middle.node_id(), now + 1);
         original_store.record_route_forward_success(&terminal.node_id(), now + 1);
+        original_store.record_route_forward_success(&second_middle.node_id(), now + 1);
         for offset in 2..=4 {
             original_store.record_blind_relay_two_hop_probe_result_with_context(
-                now + offset, true, "onion_terminal_delivered", 2, 2, 2, 1,
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                2,
+                2,
+                2,
+                1,
+            );
+        }
+        for offset in 2..=4 {
+            original_store.record_blind_relay_three_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                3,
+                3,
+                3,
+                2,
             );
         }
         original_store.record_verified_client_onion_delivery(now + 4);
 
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-two-hop-proof-{unique}.json"));
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("aeronyx-peer-cache-two-hop-proof-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
         Server::persist_peer_store_cache_once(
-            &server.identity, &original_store, &path_str, now + 5,
+            &server.identity,
+            &original_store,
+            &path_str,
+            now + 5,
         )
         .await
         .unwrap();
@@ -16900,7 +16941,17 @@ mod tests {
         let bytes = tokio::fs::read(&path).await.unwrap();
         let document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
         assert_eq!(document.two_hop_path_proof_events.len(), 3);
-        assert!(document.verify_two_hop_path_proof_signature(&server.identity).is_ok());
+        assert!(document
+            .verify_two_hop_path_proof_signature(&server.identity)
+            .is_ok());
+        assert_eq!(
+            document.three_hop_path_proof_schema_version,
+            THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION
+        );
+        assert_eq!(document.three_hop_path_proof_events.len(), 3);
+        assert!(document
+            .verify_three_hop_path_proof_signature(&server.identity)
+            .is_ok());
         assert_eq!(
             document.verified_client_delivery_evidence,
             Some(PeerStoreVerifiedClientDeliveryCacheEvidence {
@@ -16918,9 +16969,22 @@ mod tests {
                 .last_two_hop_proof_cache_persisted,
             3
         );
-        assert!(persisted_status
-            .bootstrap
-            .last_two_hop_proof_cache_persisted_stability_ready);
+        assert!(
+            persisted_status
+                .bootstrap
+                .last_two_hop_proof_cache_persisted_stability_ready
+        );
+        assert_eq!(
+            persisted_status
+                .bootstrap
+                .last_three_hop_proof_cache_persisted,
+            3
+        );
+        assert!(
+            persisted_status
+                .bootstrap
+                .last_three_hop_proof_cache_persisted_stability_ready
+        );
         assert_eq!(
             persisted_status
                 .bootstrap
@@ -16929,13 +16993,22 @@ mod tests {
         );
         let restored_store = PeerStore::new();
         assert!(Server::import_bootstrap_snapshot_bytes(
-            &restored_store, "cache", &path_str, &bytes, now + 6, Some(&server.identity),
+            &restored_store,
+            "cache",
+            &path_str,
+            &bytes,
+            now + 6,
+            Some(&server.identity),
         ));
 
         assert!(restored_store.is_routeable_now(&middle.node_id(), now + 6));
         assert!(restored_store.is_routeable_now(&terminal.node_id(), now + 6));
+        assert!(restored_store.is_routeable_now(&second_middle.node_id(), now + 6));
         let status = restored_store.status(now + 6);
-        assert_eq!(status.bootstrap.last_two_hop_proof_cache_status.as_deref(), Some("restored"));
+        assert_eq!(
+            status.bootstrap.last_two_hop_proof_cache_status.as_deref(),
+            Some("restored")
+        );
         assert_eq!(
             status
                 .bootstrap
@@ -16944,17 +17017,55 @@ mod tests {
             Some("verified")
         );
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_restored, 3);
-        assert!(status
-            .bootstrap
-            .last_two_hop_proof_cache_restored_stability_ready);
+        assert!(
+            status
+                .bootstrap
+                .last_two_hop_proof_cache_restored_stability_ready
+        );
         assert!(status.two_hop_path_proof_history.stability_ready);
-        assert!(status.two_hop_path_proof_history.recent_message_delivery_ready);
+        assert!(
+            status
+                .two_hop_path_proof_history
+                .recent_message_delivery_ready
+        );
+        assert_eq!(
+            status
+                .bootstrap
+                .last_three_hop_proof_cache_status
+                .as_deref(),
+            Some("restored")
+        );
+        assert_eq!(
+            status
+                .bootstrap
+                .last_three_hop_proof_cache_authentication
+                .as_deref(),
+            Some("verified")
+        );
+        assert_eq!(status.bootstrap.last_three_hop_proof_cache_restored, 3);
+        assert!(
+            status
+                .bootstrap
+                .last_three_hop_proof_cache_restored_stability_ready
+        );
+        assert!(status.three_hop_path_proof_history.stability_ready);
+        assert!(
+            status
+                .three_hop_path_proof_history
+                .recent_message_delivery_ready
+        );
         assert_eq!(status.runtime.blind_relay.received, 0);
         assert_eq!(status.runtime.blind_relay.terminal, 0);
         assert_eq!(status.runtime.blind_relay.forwarded, 0);
-        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 1);
         assert_eq!(
-            status.bootstrap.last_client_delivery_cache_status.as_deref(),
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            1
+        );
+        assert_eq!(
+            status
+                .bootstrap
+                .last_client_delivery_cache_status
+                .as_deref(),
             Some("restored")
         );
         assert_eq!(
@@ -16970,10 +17081,12 @@ mod tests {
         for node_id in [middle.node_id(), terminal.node_id()] {
             restored_store.record_delivery_receipt_capability(&node_id, now + 6);
         }
-        assert!(restored_store
-            .status(now + 7)
-            .blind_relay_quality
-            .real_relay_ready);
+        assert!(
+            restored_store
+                .status(now + 7)
+                .blind_relay_quality
+                .real_relay_ready
+        );
 
         let anchor_path = Server::peer_cache_client_delivery_anchor_path(&path_str);
         let anchor_bytes = tokio::fs::read(&anchor_path).await.unwrap();
@@ -16983,7 +17096,7 @@ mod tests {
             .load_peer_cache(&missing_anchor_store, &path_str, now + 8)
             .await;
         let missing_anchor_status = missing_anchor_store.status(now + 8);
-        assert_eq!(missing_anchor_status.snapshot.valid_peers, 2);
+        assert_eq!(missing_anchor_status.snapshot.valid_peers, 3);
         assert_eq!(
             missing_anchor_status
                 .runtime
@@ -17020,7 +17133,7 @@ mod tests {
             .load_peer_cache(&invalid_anchor_store, &path_str, now + 9)
             .await;
         let invalid_anchor_status = invalid_anchor_store.status(now + 9);
-        assert_eq!(invalid_anchor_status.snapshot.valid_peers, 2);
+        assert_eq!(invalid_anchor_status.snapshot.valid_peers, 3);
         assert!(invalid_anchor_store.is_routeable_now(&middle.node_id(), now + 9));
         assert!(invalid_anchor_store.is_routeable_now(&terminal.node_id(), now + 9));
         assert_eq!(
@@ -17070,12 +17183,17 @@ mod tests {
         );
         let original_store = Arc::new(PeerStore::new());
         original_store.upsert_verified(middle.clone(), now).unwrap();
-        original_store.upsert_verified(terminal.clone(), now).unwrap();
+        original_store
+            .upsert_verified(terminal.clone(), now)
+            .unwrap();
         original_store.record_route_forward_success(&middle.node_id(), now + 1);
         original_store.record_route_forward_success(&terminal.node_id(), now + 1);
         original_store.record_verified_client_onion_delivery(now + 2);
 
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "aeronyx-peer-cache-client-delivery-rollback-{unique}.json"
         ));
@@ -17099,10 +17217,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let current = PeerStoreCacheDocument::from_json_bytes(
-            &tokio::fs::read(&path).await.unwrap(),
-        )
-        .unwrap();
+        let current =
+            PeerStoreCacheDocument::from_json_bytes(&tokio::fs::read(&path).await.unwrap())
+                .unwrap();
         assert_eq!(current.verified_client_delivery_generation, 2);
         assert_eq!(
             current
@@ -17124,9 +17241,15 @@ mod tests {
         assert_eq!(status.snapshot.valid_peers, 2);
         assert!(restored_store.is_routeable_now(&middle.node_id(), now + 6));
         assert!(restored_store.is_routeable_now(&terminal.node_id(), now + 6));
-        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 0);
         assert_eq!(
-            status.bootstrap.last_client_delivery_cache_authentication.as_deref(),
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            0
+        );
+        assert_eq!(
+            status
+                .bootstrap
+                .last_client_delivery_cache_authentication
+                .as_deref(),
             Some("verified")
         );
         assert_eq!(
@@ -17138,16 +17261,17 @@ mod tests {
         );
         assert_eq!(status.bootstrap.last_client_delivery_cache_generation, 1);
         assert_eq!(
-            status.bootstrap.last_client_delivery_cache_status.as_deref(),
+            status
+                .bootstrap
+                .last_client_delivery_cache_status
+                .as_deref(),
             Some("rejected")
         );
 
         let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path_str)).await;
-        let _ = tokio::fs::remove_file(
-            Server::peer_cache_client_delivery_anchor_path(&path_str),
-        )
-        .await;
+        let _ =
+            tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str)).await;
     }
 
     #[tokio::test]
@@ -17170,12 +17294,17 @@ mod tests {
         );
         let original_store = Arc::new(PeerStore::new());
         original_store.upsert_verified(middle.clone(), now).unwrap();
-        original_store.upsert_verified(terminal.clone(), now).unwrap();
+        original_store
+            .upsert_verified(terminal.clone(), now)
+            .unwrap();
         original_store.record_route_forward_success(&middle.node_id(), now + 1);
         original_store.record_route_forward_success(&terminal.node_id(), now + 1);
         original_store.record_verified_client_onion_delivery(now + 2);
 
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "aeronyx-peer-cache-client-delivery-cache-ahead-{unique}.json"
         ));
@@ -17207,7 +17336,10 @@ mod tests {
             .load_peer_cache(&restored_store, &path_str, now + 6)
             .await;
         let status = restored_store.status(now + 6);
-        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 2);
+        assert_eq!(
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            2
+        );
         assert_eq!(
             status
                 .bootstrap
@@ -17225,10 +17357,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let repaired_document = PeerStoreCacheDocument::from_json_bytes(
-            &tokio::fs::read(&path).await.unwrap(),
-        )
-        .unwrap();
+        let repaired_document =
+            PeerStoreCacheDocument::from_json_bytes(&tokio::fs::read(&path).await.unwrap())
+                .unwrap();
         let repaired_anchor = PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(
             &tokio::fs::read(&anchor_path).await.unwrap(),
         )
@@ -17268,21 +17399,56 @@ mod tests {
             vec![NodeCapability::ChatRelay],
             [0x52; 32],
         );
+        let second_middle = signed_probe_peer_descriptor(
+            "https://second-middle-tamper.example".to_string(),
+            3,
+            now + 4_000,
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+            [0x53; 32],
+        );
         let original_store = Arc::new(PeerStore::new());
         original_store.upsert_verified(middle.clone(), now).unwrap();
-        original_store.upsert_verified(terminal.clone(), now).unwrap();
+        original_store
+            .upsert_verified(terminal.clone(), now)
+            .unwrap();
+        original_store
+            .upsert_verified(second_middle.clone(), now)
+            .unwrap();
         original_store.record_route_forward_success(&middle.node_id(), now + 1);
         original_store.record_route_forward_success(&terminal.node_id(), now + 1);
+        original_store.record_route_forward_success(&second_middle.node_id(), now + 1);
         original_store.record_blind_relay_two_hop_probe_result_with_context(
-            now + 2, true, "onion_terminal_delivered", 2, 2, 2, 1,
+            now + 2,
+            true,
+            "onion_terminal_delivered",
+            2,
+            2,
+            2,
+            1,
+        );
+        original_store.record_blind_relay_three_hop_probe_result_with_context(
+            now + 2,
+            true,
+            "onion_terminal_delivered",
+            3,
+            3,
+            3,
+            2,
         );
         original_store.record_verified_client_onion_delivery(now + 2);
 
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-two-hop-tamper-{unique}.json"));
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("aeronyx-peer-cache-two-hop-tamper-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
         Server::save_peer_store_cache_snapshot(
-            &server.identity, &original_store, &path_str, now + 3,
+            &server.identity,
+            &original_store,
+            &path_str,
+            now + 3,
         )
         .await
         .unwrap();
@@ -17293,14 +17459,25 @@ mod tests {
         let tampered = serde_json::to_vec_pretty(&document).unwrap();
         let restored_store = PeerStore::new();
         assert!(Server::import_bootstrap_snapshot_bytes(
-            &restored_store, "cache", &path_str, &tampered, now + 4, Some(&server.identity),
+            &restored_store,
+            "cache",
+            &path_str,
+            &tampered,
+            now + 4,
+            Some(&server.identity),
         ));
 
         assert!(restored_store.is_routeable_now(&middle.node_id(), now + 4));
         assert!(restored_store.is_routeable_now(&terminal.node_id(), now + 4));
         let status = restored_store.status(now + 4);
-        assert_eq!(status.bootstrap.last_source_status.as_deref(), Some("warning"));
-        assert_eq!(status.bootstrap.last_two_hop_proof_cache_status.as_deref(), Some("rejected"));
+        assert_eq!(
+            status.bootstrap.last_source_status.as_deref(),
+            Some("warning")
+        );
+        assert_eq!(
+            status.bootstrap.last_two_hop_proof_cache_status.as_deref(),
+            Some("rejected")
+        );
         assert_eq!(
             status
                 .bootstrap
@@ -17309,17 +17486,34 @@ mod tests {
             Some("signature_invalid")
         );
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_restored, 0);
-        assert!(!status
-            .bootstrap
-            .last_two_hop_proof_cache_restored_stability_ready);
+        assert!(
+            !status
+                .bootstrap
+                .last_two_hop_proof_cache_restored_stability_ready
+        );
         assert_eq!(status.bootstrap.last_two_hop_proof_cache_rejected, 1);
         assert!(status.two_hop_path_proof_history.events.is_empty());
         assert_eq!(
-            status.bootstrap.last_client_delivery_cache_status.as_deref(),
+            status
+                .bootstrap
+                .last_three_hop_proof_cache_authentication
+                .as_deref(),
+            Some("verified")
+        );
+        assert_eq!(status.bootstrap.last_three_hop_proof_cache_restored, 1);
+        assert_eq!(status.three_hop_path_proof_history.events.len(), 1);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_client_delivery_cache_status
+                .as_deref(),
             Some("restored")
         );
         assert_eq!(status.bootstrap.last_client_delivery_cache_restored, 1);
-        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 1);
+        assert_eq!(
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            1
+        );
 
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -17344,17 +17538,28 @@ mod tests {
         );
         let original_store = Arc::new(PeerStore::new());
         original_store.upsert_verified(middle.clone(), now).unwrap();
-        original_store.upsert_verified(terminal.clone(), now).unwrap();
+        original_store
+            .upsert_verified(terminal.clone(), now)
+            .unwrap();
         original_store.record_route_forward_success(&middle.node_id(), now + 1);
         original_store.record_route_forward_success(&terminal.node_id(), now + 1);
         for offset in 2..=4 {
             original_store.record_blind_relay_two_hop_probe_result_with_context(
-                now + offset, true, "onion_terminal_delivered", 2, 2, 2, 1,
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                2,
+                2,
+                2,
+                1,
             );
         }
         original_store.record_verified_client_onion_delivery(now + 4);
 
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "aeronyx-peer-cache-client-delivery-tamper-{unique}.json"
         ));
@@ -17387,9 +17592,15 @@ mod tests {
         ));
 
         let status = restored_store.status(now + 6);
-        assert_eq!(status.bootstrap.last_source_status.as_deref(), Some("warning"));
         assert_eq!(
-            status.bootstrap.last_client_delivery_cache_status.as_deref(),
+            status.bootstrap.last_source_status.as_deref(),
+            Some("warning")
+        );
+        assert_eq!(
+            status
+                .bootstrap
+                .last_client_delivery_cache_status
+                .as_deref(),
             Some("rejected")
         );
         assert_eq!(
@@ -17400,7 +17611,10 @@ mod tests {
             Some("signature_invalid")
         );
         assert_eq!(status.bootstrap.last_client_delivery_cache_restored, 0);
-        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 0);
+        assert_eq!(
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            0
+        );
         assert_eq!(
             status.bootstrap.last_two_hop_proof_cache_status.as_deref(),
             Some("restored")
@@ -17435,7 +17649,10 @@ mod tests {
         original_store.upsert_verified(terminal, now).unwrap();
         original_store.record_verified_client_onion_delivery(now + 1);
 
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "aeronyx-peer-cache-client-delivery-expired-{unique}.json"
         ));
@@ -17478,11 +17695,17 @@ mod tests {
             Some("verified")
         );
         assert_eq!(
-            status.bootstrap.last_client_delivery_cache_status.as_deref(),
+            status
+                .bootstrap
+                .last_client_delivery_cache_status
+                .as_deref(),
             Some("rejected")
         );
         assert_eq!(status.bootstrap.last_client_delivery_cache_restored, 0);
-        assert_eq!(status.runtime.blind_relay.verified_client_onion_deliveries, 0);
+        assert_eq!(
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            0
+        );
         assert!(!status.blind_relay_quality.real_relay_ready);
 
         let _ = tokio::fs::remove_file(path).await;
@@ -17504,9 +17727,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "aeronyx-peer-cache-signature-tamper-{unique}.json"
-        ));
+        let path =
+            std::env::temp_dir().join(format!("aeronyx-peer-cache-signature-tamper-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
         Server::save_peer_store_cache_snapshot(
             &server.identity,
@@ -17587,12 +17809,7 @@ mod tests {
             std::env::temp_dir().join(format!("aeronyx-peer-cache-expired-restore-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
 
-        Server::save_peer_store_cache_snapshot(
-            &server.identity,
-            &original_store,
-            &path_str,
-            now,
-        )
+        Server::save_peer_store_cache_snapshot(&server.identity, &original_store, &path_str, now)
             .await
             .unwrap();
 
@@ -17642,12 +17859,7 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
         let backup_path = Server::peer_cache_backup_path(&path_str);
 
-        Server::save_peer_store_cache_snapshot(
-            &server.identity,
-            &original_store,
-            &path_str,
-            now,
-        )
+        Server::save_peer_store_cache_snapshot(&server.identity, &original_store, &path_str, now)
             .await
             .unwrap();
         tokio::fs::copy(&path, &backup_path).await.unwrap();
@@ -17707,12 +17919,7 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
         let backup_path = Server::peer_cache_backup_path(&path_str);
 
-        Server::save_peer_store_cache_snapshot(
-            &server.identity,
-            &original_store,
-            &path_str,
-            now,
-        )
+        Server::save_peer_store_cache_snapshot(&server.identity, &original_store, &path_str, now)
             .await
             .unwrap();
         tokio::fs::copy(&path, &backup_path).await.unwrap();
@@ -17851,22 +18058,12 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-preserve-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
 
-        Server::save_peer_store_cache_snapshot(
-            &server.identity,
-            &recovery_store,
-            &path_str,
-            now,
-        )
+        Server::save_peer_store_cache_snapshot(&server.identity, &recovery_store, &path_str, now)
             .await
             .unwrap();
 
         let empty_store = Arc::new(PeerStore::new());
-        Server::persist_peer_store_cache_once(
-            &server.identity,
-            &empty_store,
-            &path_str,
-            now + 1,
-        )
+        Server::persist_peer_store_cache_once(&server.identity, &empty_store, &path_str, now + 1)
             .await
             .unwrap();
 
@@ -17914,12 +18111,7 @@ mod tests {
         let cache_store = Arc::new(PeerStore::new());
         assert!(cache_store.upsert_verified(fresh.clone(), now).unwrap());
         let identity = IdentityKeyPair::generate();
-        Server::save_peer_store_cache_snapshot(
-            &identity,
-            &cache_store,
-            &cache_path_str,
-            now,
-        )
+        Server::save_peer_store_cache_snapshot(&identity, &cache_store, &cache_path_str, now)
             .await
             .unwrap();
 
@@ -18041,10 +18233,7 @@ mod tests {
 
         let _ = tokio::fs::remove_file(&path).await;
         let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path)).await;
-        let _ = tokio::fs::remove_file(
-            Server::peer_cache_client_delivery_anchor_path(&path),
-        )
-        .await;
+        let _ = tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path)).await;
     }
 
     #[tokio::test]

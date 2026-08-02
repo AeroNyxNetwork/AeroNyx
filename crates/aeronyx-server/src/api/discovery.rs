@@ -80,6 +80,8 @@
 //!   terminal signature and payload-commitment verification.
 //!
 //! ## Last Modified
+//! v0.37.0-ThreeHopSignedRecovery - Expose aggregate signed persistence and
+//! warm-restart continuity without presenting it as consensus or user traffic.
 //! v0.36.0-ThreeHopFeatureNegotiation - Advertise multihop terminal-receipt
 //! compatibility so new entries do not penalize legacy middle relays.
 //! v0.35.0-ThreeHopRuntimeProof - Added compact independent three-hop onion
@@ -147,9 +149,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::directory_replica_sync::admit_directory_gossip_descriptor;
 use crate::config::DiscoveryConfig;
-use crate::services::{
-    DirectoryReplicaStore, PeerStore, PeerStoreImportReport, PeerStoreStatus,
-};
+use crate::services::{DirectoryReplicaStore, PeerStore, PeerStoreImportReport, PeerStoreStatus};
 
 // ============================================
 // State / Request / Response Types
@@ -708,7 +708,7 @@ impl Default for DiscoveryLocalCapabilityStatus {
 /// Internal aggregate proof-continuity decision shared by admission and the
 /// public summary. It deliberately carries only authentication/status buckets
 /// and counts already present in `PeerStoreBootstrapStatus`.
-struct TwoHopProofRestartContinuity {
+struct PathProofRestartContinuity {
     peer_recovery_configured: bool,
     authenticated_restore_ready: bool,
     signed_persistence_ready: bool,
@@ -719,32 +719,28 @@ struct TwoHopProofRestartContinuity {
     persisted: u64,
 }
 
-fn two_hop_proof_restart_continuity(status: &PeerStoreStatus) -> TwoHopProofRestartContinuity {
-    let bootstrap = &status.bootstrap;
-    let proof = &status.two_hop_path_proof_history;
-    let authentication = bootstrap
-        .last_two_hop_proof_cache_authentication
-        .clone()
-        .unwrap_or_else(|| "not_observed".to_string());
-    let restore_evidence_fresh = bootstrap
-        .last_two_hop_proof_cache_at
-        .map(|at| {
-            at <= proof.generated_at
-                && proof.generated_at.saturating_sub(at) <= proof.stale_after_seconds
-        })
+fn path_proof_restart_continuity(
+    status: &PeerStoreStatus,
+    generated_at: u64,
+    stale_after_seconds: u64,
+    authentication: Option<&str>,
+    restored_stability_ready: bool,
+    restored_at: Option<u64>,
+    restored: u64,
+    persisted_stability_ready: bool,
+    persisted_at: Option<u64>,
+    persisted: u64,
+) -> PathProofRestartContinuity {
+    let authentication = authentication.unwrap_or("not_observed").to_string();
+    let restore_evidence_fresh = restored_at
+        .map(|at| at <= generated_at && generated_at.saturating_sub(at) <= stale_after_seconds)
         .unwrap_or(false);
-    let persistence_evidence_fresh = bootstrap
-        .last_two_hop_proof_cache_persisted_at
-        .map(|at| {
-            at <= proof.generated_at
-                && proof.generated_at.saturating_sub(at) <= proof.stale_after_seconds
-        })
+    let persistence_evidence_fresh = persisted_at
+        .map(|at| at <= generated_at && generated_at.saturating_sub(at) <= stale_after_seconds)
         .unwrap_or(false);
-    let authenticated_restore_ready = authentication == "verified"
-        && bootstrap.last_two_hop_proof_cache_restored_stability_ready
-        && restore_evidence_fresh;
-    let signed_persistence_ready =
-        bootstrap.last_two_hop_proof_cache_persisted_stability_ready && persistence_evidence_fresh;
+    let authenticated_restore_ready =
+        authentication == "verified" && restored_stability_ready && restore_evidence_fresh;
+    let signed_persistence_ready = persisted_stability_ready && persistence_evidence_fresh;
     let peer_recovery_configured = status.peer_quorum.restart_recovery_configured;
     let ready = authenticated_restore_ready || signed_persistence_ready;
     let source = match (authenticated_restore_ready, signed_persistence_ready) {
@@ -759,16 +755,52 @@ fn two_hop_proof_restart_continuity(status: &PeerStoreStatus) -> TwoHopProofRest
         _ => "not_ready",
     };
 
-    TwoHopProofRestartContinuity {
+    PathProofRestartContinuity {
         peer_recovery_configured,
         authenticated_restore_ready,
         signed_persistence_ready,
         ready,
         source,
         authentication,
-        restored: bootstrap.last_two_hop_proof_cache_restored,
-        persisted: bootstrap.last_two_hop_proof_cache_persisted,
+        restored,
+        persisted,
     }
+}
+
+fn two_hop_proof_restart_continuity(status: &PeerStoreStatus) -> PathProofRestartContinuity {
+    let proof = &status.two_hop_path_proof_history;
+    let bootstrap = &status.bootstrap;
+    path_proof_restart_continuity(
+        status,
+        proof.generated_at,
+        proof.stale_after_seconds,
+        bootstrap.last_two_hop_proof_cache_authentication.as_deref(),
+        bootstrap.last_two_hop_proof_cache_restored_stability_ready,
+        bootstrap.last_two_hop_proof_cache_at,
+        bootstrap.last_two_hop_proof_cache_restored,
+        bootstrap.last_two_hop_proof_cache_persisted_stability_ready,
+        bootstrap.last_two_hop_proof_cache_persisted_at,
+        bootstrap.last_two_hop_proof_cache_persisted,
+    )
+}
+
+fn three_hop_proof_restart_continuity(status: &PeerStoreStatus) -> PathProofRestartContinuity {
+    let proof = &status.three_hop_path_proof_history;
+    let bootstrap = &status.bootstrap;
+    path_proof_restart_continuity(
+        status,
+        proof.generated_at,
+        proof.stale_after_seconds,
+        bootstrap
+            .last_three_hop_proof_cache_authentication
+            .as_deref(),
+        bootstrap.last_three_hop_proof_cache_restored_stability_ready,
+        bootstrap.last_three_hop_proof_cache_at,
+        bootstrap.last_three_hop_proof_cache_restored,
+        bootstrap.last_three_hop_proof_cache_persisted_stability_ready,
+        bootstrap.last_three_hop_proof_cache_persisted_at,
+        bootstrap.last_three_hop_proof_cache_persisted,
+    )
 }
 
 /// Builds the aggregate relay-pool admission contract.
@@ -1350,6 +1382,7 @@ pub fn discovery_summary_response(
     let two_hop_history = &status.two_hop_path_proof_history;
     let three_hop_history = &status.three_hop_path_proof_history;
     let proof_restart_continuity = two_hop_proof_restart_continuity(status);
+    let three_hop_restart_continuity = three_hop_proof_restart_continuity(status);
     let two_hop_restart_survivable_ready = two_hop_history.recent_message_delivery_ready
         && peer_quorum.quorum_ready
         && proof_restart_continuity.peer_recovery_configured
@@ -1658,7 +1691,13 @@ pub fn discovery_summary_response(
             "path_shape_counts": &three_hop_history.path_shape_counts,
             "ttl_shape_counts": &three_hop_history.ttl_shape_counts,
             "proof_scope": &three_hop_history.proof_scope,
-            "persistence": "runtime_reprobe_after_restart",
+            "persistence": "signed_local_cache_with_runtime_revalidation",
+            "proof_restart_continuity_ready": three_hop_restart_continuity.ready,
+            "proof_restart_continuity_source": three_hop_restart_continuity.source,
+            "proof_cache_authentication": three_hop_restart_continuity.authentication,
+            "proof_cache_restored_events": three_hop_restart_continuity.restored,
+            "proof_cache_persisted_events": three_hop_restart_continuity.persisted,
+            "rollback_boundary": "rejects_invalid_future_stale_or_route_pool_unbound_evidence; whole_host_rollback_requires_external_witness",
             "privacy_boundary": &three_hop_history.privacy_boundary,
         }),
         onion_relay_admission,
@@ -2199,9 +2238,7 @@ fn apply_gossip_message(
     let Some(replica_store) = state.directory_replica_store.as_deref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            state
-                .peer_store
-                .record_rejected_directory_proof_import(now),
+            state.peer_store.record_rejected_directory_proof_import(now),
         );
     };
     match admit_directory_gossip_descriptor(
@@ -2216,9 +2253,7 @@ fn apply_gossip_message(
         Ok(report) => (StatusCode::OK, report),
         Err(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
-            state
-                .peer_store
-                .record_rejected_directory_proof_import(now),
+            state.peer_store.record_rejected_directory_proof_import(now),
         ),
     }
 }
@@ -2942,13 +2977,12 @@ mod tests {
         let (empty_replica, _) =
             DirectoryReplicaStore::open(":memory:", empty_local.public_key_bytes(), now).unwrap();
         let store_without_anchor = Arc::new(PeerStore::new());
-        let app_without_anchor =
-            build_discovery_router_with_local_status_and_directory_admission(
-                Arc::clone(&store_without_anchor),
-                DiscoveryApiPolicy::default(),
-                DiscoveryLocalCapabilityStatus::default(),
-                Some(Arc::new(empty_replica)),
-            );
+        let app_without_anchor = build_discovery_router_with_local_status_and_directory_admission(
+            Arc::clone(&store_without_anchor),
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::default(),
+            Some(Arc::new(empty_replica)),
+        );
         let response = app_without_anchor
             .oneshot(
                 Request::builder()
@@ -3310,14 +3344,13 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            parsed["three_hop_path_proof"]["path_shape_counts"]
-                ["entry_middle_middle_terminal"]
+            parsed["three_hop_path_proof"]["path_shape_counts"]["entry_middle_middle_terminal"]
                 .as_u64(),
             Some(1)
         );
         assert_eq!(
             parsed["three_hop_path_proof"]["persistence"].as_str(),
-            Some("runtime_reprobe_after_restart")
+            Some("signed_local_cache_with_runtime_revalidation")
         );
         assert_eq!(
             parsed["two_hop_path_proof"]["message_delivery_successes"].as_u64(),
@@ -3528,11 +3561,9 @@ mod tests {
     async fn test_public_card_endpoint_returns_minimal_product_protocol_card() {
         let store = Arc::new(PeerStore::new());
         let now = now_secs();
-        let middle =
-            signed_routeable_chat_descriptor(1, now + 300, "https://middle.example");
+        let middle = signed_routeable_chat_descriptor(1, now + 300, "https://middle.example");
         let middle_node_id = middle.node_id();
-        let terminal =
-            signed_routeable_chat_descriptor(1, now + 300, "https://terminal.example");
+        let terminal = signed_routeable_chat_descriptor(1, now + 300, "https://terminal.example");
         let terminal_node_id = terminal.node_id();
 
         store.upsert_verified(middle, now).unwrap();
