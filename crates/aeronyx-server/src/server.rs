@@ -299,6 +299,10 @@
 //      PeerStore into a stable aggregate heartbeat contract and exports signed
 //      descriptors in a fixed-size batch so growing local diagnostics cannot
 //      make the backend discard every discovery health field.
+// 117. [THREE-HOP-FEATURE-NEGOTIATION 2026-08-02 by Codex] Negotiates
+//      multihop terminal-receipt support before selecting the first middle of
+//      a synthetic three-hop route, preventing rolling-upgrade incompatibility
+//      from becoming false route-health failure evidence.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -415,6 +419,8 @@
 //     forward history gaps fail closed and never mutate the accepted head.
 //
 // Last Modified:
+//   v2.8.62-ThreeHopFeatureNegotiation - Added fail-closed mixed-version
+//     selection for the first middle of three-hop runtime probes.
 //   v2.8.61-BoundedDiscoveryHeartbeat - Added a bounded aggregate PeerStore
 //                                      heartbeat projection and record batch
 //   v2.8.60-ThreeHopRuntimeProof - Added bounded live three-hop onion delivery
@@ -874,6 +880,10 @@ struct DiscoveryNegotiationSummary {
 struct DiscoveryNegotiationFeatures {
     #[serde(default)]
     directory_descriptor_proof_gossip_v1: bool,
+    /// Whether this relay accepts a terminal receipt propagated through more
+    /// than one middle hop. Missing means legacy/unsupported.
+    #[serde(default)]
+    multihop_delivery_receipt_v1: bool,
 }
 
 /// Terminal result for optional Directory-authenticated proof transmission.
@@ -8182,6 +8192,20 @@ impl Server {
         let Some(summary_url) = Self::discovery_summary_url_from_gossip_url(gossip_url) else {
             return Err(DirectoryProofGossipResult::ProtocolRejected);
         };
+        let features = Self::peer_discovery_negotiation_features(client, &summary_url).await?;
+        Ok(features.directory_descriptor_proof_gossip_v1)
+    }
+
+    /// Reads one bounded unsigned feature document from a public peer.
+    ///
+    /// [THREE-HOP-FEATURE-NEGOTIATION 2026-08-02 by Codex] Sharing this reader
+    /// keeps optional Directory proof and multihop receipt negotiation under
+    /// the same response ceiling and fail-closed decoding rules. The returned
+    /// hints never grant identity, route, witness, or delivery authority.
+    async fn peer_discovery_negotiation_features(
+        client: &reqwest::Client,
+        summary_url: &str,
+    ) -> std::result::Result<DiscoveryNegotiationFeatures, DirectoryProofGossipResult> {
         let response = client
             .get(summary_url)
             .send()
@@ -8198,9 +8222,24 @@ impl Server {
         )
         .await
         .map_err(|_| DirectoryProofGossipResult::ProtocolRejected)?;
-        Ok(summary
-            .protocol_features
-            .directory_descriptor_proof_gossip_v1)
+        Ok(summary.protocol_features)
+    }
+
+    /// Returns true only when a signed descriptor's public endpoint explicitly
+    /// advertises multihop terminal-receipt support.
+    async fn peer_supports_multihop_delivery_receipt(
+        client: &reqwest::Client,
+        endpoint: &str,
+    ) -> bool {
+        let Some(summary_url) =
+            Self::permissionless_peer_transport_url(endpoint, "/api/discovery/summary")
+        else {
+            return false;
+        };
+        Self::peer_discovery_negotiation_features(client, &summary_url)
+            .await
+            .map(|features| features.multihop_delivery_receipt_v1)
+            .unwrap_or(false)
     }
 
     /// Runs one peer exchange under a total lifetime budget.
@@ -8999,6 +9038,41 @@ impl Server {
         if first_middle_candidates.is_empty() {
             return TwoHopBlindRelayProbeOutcome::default();
         }
+
+        // [THREE-HOP-FEATURE-NEGOTIATION 2026-08-02 by Codex] Only the first
+        // middle must understand a terminal receipt signed by a non-adjacent
+        // downstream node. Legacy nodes omit the additive summary field and
+        // therefore remain valid two-hop relays without receiving false 502
+        // penalties from this optional three-hop probe. Candidate fan-out is
+        // bounded by the existing route selection limit.
+        let unnegotiated_candidate_count = first_middle_candidates.len();
+        let negotiated_candidates = futures::stream::iter(first_middle_candidates)
+            .map(|candidate| async move {
+                let supported = match candidate.descriptor.public_endpoint.as_deref() {
+                    Some(endpoint) => {
+                        Self::peer_supports_multihop_delivery_receipt(client, endpoint).await
+                    }
+                    None => false,
+                };
+                supported.then_some(candidate)
+            })
+            // Preserve the health-ranked input order even when later feature
+            // requests complete first; negotiation must not become routing.
+            .buffered(ONION_ROUTE_SELECTION_CANDIDATE_LIMIT)
+            .collect::<Vec<_>>()
+            .await;
+        let mut first_middle_candidates = negotiated_candidates
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if first_middle_candidates.is_empty() {
+            trace!(
+                candidate_count = unnegotiated_candidate_count,
+                "[DISCOVERY] Three-hop probe deferred until a first middle advertises multihop receipt support"
+            );
+            return TwoHopBlindRelayProbeOutcome::default();
+        }
+        Self::prioritize_probe_candidates(peer_store, now, &mut first_middle_candidates);
 
         let first_middle_candidate_count = first_middle_candidates.len();
         let mut attempted = false;
@@ -13997,8 +14071,8 @@ mod tests {
         let terminal_identity = IdentityKeyPair::generate();
         let self_node_id = source_identity.public_key_bytes();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let first_middle_address = listener.local_addr().unwrap();
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let relay_port = listener.local_addr().unwrap().port();
         let signed_descriptor = |
             identity: &IdentityKeyPair,
             endpoint: String,
@@ -14019,19 +14093,19 @@ mod tests {
         };
         let first_middle = signed_descriptor(
             &first_middle_identity,
-            format!("http://{first_middle_address}"),
+            format!("http://127.0.0.1:{relay_port}"),
             vec![NodeCapability::OnionMiddle],
             "three-hop-first",
         );
         let second_middle = signed_descriptor(
             &second_middle_identity,
-            "https://8.8.8.8:8421".to_string(),
+            format!("http://127.0.1.1:{relay_port}"),
             vec![NodeCapability::OnionMiddle],
             "three-hop-second",
         );
         let terminal = signed_descriptor(
             &terminal_identity,
-            "https://1.1.1.1:8421".to_string(),
+            format!("http://127.0.2.1:{relay_port}"),
             vec![NodeCapability::ChatRelay],
             "three-hop-terminal",
         );
@@ -14052,24 +14126,35 @@ mod tests {
             now,
             &terminal_identity,
         );
-        let router = Router::new().route(
-            "/api/chat/peer/blind-relay",
-            post(move |Json(request): Json<PeerBlindRelayRequest>| {
-                let receipt = delivery_receipt.clone();
-                async move {
-                    assert_eq!(request.envelope.route_id, expected_route_id);
-                    assert_eq!(request.envelope.ttl, 3);
-                    Json(PeerBlindRelayResponse {
-                        accepted: true,
-                        terminal: false,
-                        forwarded: true,
-                        ttl_remaining: 1,
-                        reason: Some("onion_forwarded".to_string()),
-                        delivery_receipt: Some(receipt),
-                    })
-                }
-            }),
-        );
+        let router = Router::new()
+            .route(
+                "/api/discovery/summary",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "protocol_features": {
+                            "multihop_delivery_receipt_v1": true
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/api/chat/peer/blind-relay",
+                post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                    let receipt = delivery_receipt.clone();
+                    async move {
+                        assert_eq!(request.envelope.route_id, expected_route_id);
+                        assert_eq!(request.envelope.ttl, 3);
+                        Json(PeerBlindRelayResponse {
+                            accepted: true,
+                            terminal: false,
+                            forwarded: true,
+                            ttl_remaining: 1,
+                            reason: Some("onion_forwarded".to_string()),
+                            delivery_receipt: Some(receipt),
+                        })
+                    }
+                }),
+            );
         let http_server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
@@ -14106,6 +14191,77 @@ mod tests {
             status.blind_relay_quality.delivery_receipt_capable_peers,
             3
         );
+
+        http_server.abort();
+        let _ = http_server.await;
+    }
+
+    #[tokio::test]
+    async fn three_hop_probe_defers_legacy_first_middle_without_route_penalty() {
+        let now = 1_800_000_300;
+        let source_identity = IdentityKeyPair::generate();
+        let middle_identity = IdentityKeyPair::generate();
+        let self_node_id = source_identity.public_key_bytes();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_middle_address = listener.local_addr().unwrap();
+        let blind_relay_requests = Arc::new(AtomicUsize::new(0));
+        let counted_requests = Arc::clone(&blind_relay_requests);
+        let router = Router::new()
+            .route(
+                "/api/discovery/summary",
+                get(|| async {
+                    // [THREE-HOP-FEATURE-NEGOTIATION 2026-08-02 by Codex]
+                    // Missing additive fields model a valid legacy runtime.
+                    Json(serde_json::json!({
+                        "protocol_features": {
+                            "legacy_descriptor_gossip_v1": true
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/api/chat/peer/blind-relay",
+                post(move || {
+                    let requests = Arc::clone(&counted_requests);
+                    async move {
+                        requests.fetch_add(1, AtomicOrdering::Relaxed);
+                        StatusCode::BAD_GATEWAY
+                    }
+                }),
+            );
+        let http_server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let mut descriptor = NodeDescriptor::new(
+            middle_identity.public_key_bytes(),
+            now,
+            now,
+            now + 300,
+            "legacy-three-hop-first",
+        )
+        .with_x25519_kem(middle_identity.x25519_public_key_bytes());
+        descriptor.public_endpoint = Some(format!("http://{first_middle_address}"));
+        descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        let first_middle = SignedNodeDescriptor::sign(descriptor, &middle_identity).unwrap();
+        let store = PeerStore::new();
+        store.upsert_verified(first_middle, now).unwrap();
+
+        let outcome = Server::probe_three_hop_blind_relay_path(
+            &reqwest::Client::new(),
+            &store,
+            &source_identity,
+            &self_node_id,
+            now,
+        )
+        .await;
+
+        assert!(!outcome.attempted);
+        assert!(!outcome.route_accepted);
+        assert!(!outcome.terminal_delivery_verified);
+        assert_eq!(blind_relay_requests.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(store.status(now).three_hop_path_proof_history.attempted, 0);
 
         http_server.abort();
         let _ = http_server.await;

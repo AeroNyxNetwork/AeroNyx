@@ -31,6 +31,9 @@
 //!   rate-limit lock is held.
 //! - [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] Publishes independent,
 //!   aggregate-only three-hop runtime proof maturity without selected routes.
+//! - [THREE-HOP-FEATURE-NEGOTIATION 2026-08-02 by Codex] Advertises whether
+//!   this runtime can validate a terminal delivery receipt propagated through
+//!   more than one middle relay, allowing safe mixed-version probe selection.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -72,8 +75,13 @@
 //! - The global gossip limiter must use a non-poisoning mutex. A poisoned
 //!   process-local lock must never turn one recovered panic into a permanent
 //!   discovery outage.
+//! - Protocol feature fields are unsigned compatibility hints only. They may
+//!   suppress an optional probe, but must never grant route trust or replace
+//!   terminal signature and payload-commitment verification.
 //!
 //! ## Last Modified
+//! v0.36.0-ThreeHopFeatureNegotiation - Advertise multihop terminal-receipt
+//! compatibility so new entries do not penalize legacy middle relays.
 //! v0.35.0-ThreeHopRuntimeProof - Added compact independent three-hop onion
 //! message-delivery proof status to the public discovery summary.
 //! v0.34.0-OnionCandidateSignedProof - Preserve the verified signed descriptor
@@ -1579,6 +1587,10 @@ pub fn discovery_summary_response(
         protocol_features: serde_json::json!({
             "legacy_descriptor_gossip_v1": true,
             "directory_descriptor_proof_gossip_v1": true,
+            // [THREE-HOP-FEATURE-NEGOTIATION 2026-08-02 by Codex] This is an
+            // unsigned transport hint only. A successful path still requires
+            // the terminal's signed, route-bound delivery receipt.
+            "multihop_delivery_receipt_v1": true,
         }),
         status: status_bucket,
         stage: stage_bucket,
@@ -3228,6 +3240,10 @@ mod tests {
         );
         assert_eq!(
             parsed["protocol_features"]["directory_descriptor_proof_gossip_v1"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["protocol_features"]["multihop_delivery_receipt_v1"].as_bool(),
             Some(true)
         );
         assert_eq!(parsed["local_capability"]["status"].as_str(), Some("ready"));
