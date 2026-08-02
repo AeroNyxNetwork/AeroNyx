@@ -46,6 +46,9 @@
 //! - [ONION-DIVERSITY-AWARE-POOL 2026-08-03 by Codex] Preserves a lower-ranked
 //!   network-diverse subset before applying a small client response limit, so
 //!   healthier collocated relays cannot hide an otherwise valid onion path.
+//! - [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] Production routers inject
+//!   the local node id and exclude candidates sharing the entry node's coarse
+//!   endpoint network identity before multi-hop readiness is evaluated.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -105,8 +108,13 @@
 //!   requested-hop subset (or a safe two-hop fallback). This endpoint prepares
 //!   an eligible pool; the client still chooses the actual weighted-random
 //!   route and must independently verify every signed descriptor.
+//! - Production callers must use `build_discovery_router_with_local_entry` so
+//!   candidate anti-affinity includes the entry node itself. Legacy builders
+//!   remain for compatibility and explicitly report that this gate is absent.
 //!
 //! ## Last Modified
+//! v0.43.0-OnionEntryAntiAffinity - Exclude candidates collocated with the
+//! local entry node without exposing the local node id or endpoint.
 //! v0.42.0-OnionDiversityAwarePool - Preserve a valid lower-ranked diverse
 //! subset when producing a client-limited public candidate pool.
 //! v0.41.0-OnionNetworkDiversity - Gate multi-hop candidate readiness on a
@@ -214,6 +222,9 @@ const DISCOVERY_PUBLIC_CARD_SOURCE: &str = "rust_discovery_public_card";
 #[derive(Clone)]
 struct DiscoveryApiState {
     peer_store: Arc<PeerStore>,
+    /// Local entry identity used only to resolve its signed public descriptor
+    /// and enforce coarse route anti-affinity. Never serialize this value.
+    local_node_id: Option<[u8; 32]>,
     /// Audited local Directory replica used only as an admission trust anchor.
     directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
     policy: DiscoveryApiPolicy,
@@ -498,6 +509,10 @@ pub struct OnionCandidatesResponse {
     /// requested hop count.
     #[serde(default)]
     pub requested_network_diversity_ready: bool,
+    /// Whether candidates were also checked against the local entry node's
+    /// coarse endpoint network identity.
+    #[serde(default)]
+    pub local_entry_network_diversity_enforced: bool,
     /// Whether this requested path requires matching runtime delivery proof.
     pub requested_runtime_proof_required: bool,
     /// Whether the matching runtime delivery proof gate currently passes.
@@ -2060,8 +2075,47 @@ pub fn build_discovery_router_with_local_status_and_directory_admission(
     local_capabilities: DiscoveryLocalCapabilityStatus,
     directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
 ) -> Router {
+    build_discovery_router_state(
+        peer_store,
+        policy,
+        local_capabilities,
+        directory_replica_store,
+        None,
+    )
+}
+
+/// Builds the production discovery router with local-entry anti-affinity.
+///
+/// [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] The local id is process
+/// context only. The handler resolves the already-public signed descriptor and
+/// filters collocated route candidates without returning the local id,
+/// endpoint, selected route, or any client metadata.
+pub fn build_discovery_router_with_local_entry(
+    peer_store: Arc<PeerStore>,
+    policy: DiscoveryApiPolicy,
+    local_capabilities: DiscoveryLocalCapabilityStatus,
+    directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
+    local_node_id: [u8; 32],
+) -> Router {
+    build_discovery_router_state(
+        peer_store,
+        policy,
+        local_capabilities,
+        directory_replica_store,
+        Some(local_node_id),
+    )
+}
+
+fn build_discovery_router_state(
+    peer_store: Arc<PeerStore>,
+    policy: DiscoveryApiPolicy,
+    local_capabilities: DiscoveryLocalCapabilityStatus,
+    directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
+    local_node_id: Option<[u8; 32]>,
+) -> Router {
     let state = DiscoveryApiState {
         peer_store,
+        local_node_id,
         directory_replica_store,
         policy,
         local_capabilities,
@@ -2119,6 +2173,9 @@ async fn onion_candidates_handler(
     let limit = state.policy.snapshot_limit(query.limit);
     let requested_privacy_mode = OnionPrivacyMode::from_query(query.privacy_mode.as_deref());
     let requested_hops = normalize_requested_hops(requested_privacy_mode, query.hops);
+    let local_descriptor = state
+        .local_node_id
+        .and_then(|node_id| state.peer_store.get_valid(&node_id, now));
     // [ONION-CAPABILITY-GATE 2026-08-02 by Codex] Query the bounded policy
     // pool first, then apply every onion-hop eligibility rule before the
     // client limit and ranking. Limiting earlier can let ineligible high-rank
@@ -2133,6 +2190,9 @@ async fn onion_candidates_handler(
         .into_iter()
         .filter_map(|descriptor| {
             let node_id = descriptor.node_id();
+            if state.local_node_id == Some(node_id) {
+                return None;
+            }
             if !descriptor
                 .descriptor
                 .capabilities
@@ -2145,6 +2205,15 @@ async fn onion_candidates_handler(
             }
             let kem_public = descriptor.descriptor.x25519_kem_public()?;
             let public_endpoint = descriptor.descriptor.public_endpoint.clone()?;
+            // [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] A first remote
+            // hop collocated with the entry weakens the route before pairwise
+            // candidate diversity is considered. Missing/malformed entry or
+            // candidate endpoints fail this production gate closed.
+            if local_descriptor.as_ref().is_some_and(|local_descriptor| {
+                !PeerStore::route_endpoints_are_network_diverse(local_descriptor, &descriptor)
+            }) {
+                return None;
+            }
             Some((descriptor, kem_public, public_endpoint))
         })
         .enumerate()
@@ -2173,8 +2242,13 @@ async fn onion_candidates_handler(
         select_onion_candidate_response_pool(eligible_candidates, limit, requested_hops as usize);
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
     let min_candidates_for_requested_hops = requested_hops as usize;
-    let requested_network_diversity_ready =
-        onion_candidate_network_diversity_ready(&candidates, min_candidates_for_requested_hops);
+    // [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] Legacy builders have no
+    // entry context and retain their historical pairwise behavior. Production
+    // builders inject an id and fail multi-hop readiness closed until its
+    // signed descriptor can be resolved and used for entry anti-affinity.
+    let local_entry_context_ready = state.local_node_id.is_none() || local_descriptor.is_some();
+    let requested_network_diversity_ready = local_entry_context_ready
+        && onion_candidate_network_diversity_ready(&candidates, min_candidates_for_requested_hops);
     let peer_status = state.peer_store.status(now);
     let requested_path_gates = onion_requested_path_gates(
         &peer_status,
@@ -2183,10 +2257,11 @@ async fn onion_candidates_handler(
         requested_network_diversity_ready,
     );
     let requested_path_ready = requested_path_gates.ready();
-    let two_hop_network_diversity_ready = onion_candidate_network_diversity_ready(
-        &candidates,
-        ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
-    );
+    let two_hop_network_diversity_ready = local_entry_context_ready
+        && onion_candidate_network_diversity_ready(
+            &candidates,
+            ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+        );
     let two_hop_fallback_ready = requested_hops > 2
         && onion_requested_path_gates(
             &peer_status,
@@ -2239,6 +2314,7 @@ async fn onion_candidates_handler(
         requested_candidate_pool_ready: requested_path_gates.candidate_pool_ready,
         requested_network_diversity_required: requested_path_gates.network_diversity_required,
         requested_network_diversity_ready: requested_path_gates.network_diversity_ready,
+        local_entry_network_diversity_enforced: local_descriptor.is_some(),
         requested_runtime_proof_required: requested_path_gates.runtime_proof_required,
         requested_runtime_proof_ready: requested_path_gates.runtime_proof_ready,
         requested_restart_continuity_required: requested_path_gates
@@ -2254,9 +2330,12 @@ async fn onion_candidates_handler(
         selection_policy: ONION_CANDIDATES_SELECTION_POLICY.to_string(),
         candidate_verification: "signed_node_descriptor_ed25519_v2".to_string(),
         path_selection_strategy: "weighted_random_health_ranked_distinct_hops".to_string(),
-        network_diversity_policy:
-            "required_pairwise_ipv4_24_ipv6_48_or_distinct_dns_hostnames; not_operator_or_as_proof"
-                .to_string(),
+        network_diversity_policy: match (state.local_node_id.is_some(), local_descriptor.is_some()) {
+            (_, true) => "required_against_local_entry_and_pairwise_ipv4_24_ipv6_48_or_distinct_dns_hostnames; not_operator_or_as_proof",
+            (true, false) => "local_entry_descriptor_unavailable_fail_closed; required_pairwise_ipv4_24_ipv6_48_or_distinct_dns_hostnames; not_operator_or_as_proof",
+            (false, false) => "required_pairwise_ipv4_24_ipv6_48_or_distinct_dns_hostnames; legacy_local_entry_context_unavailable; not_operator_or_as_proof",
+        }
+        .to_string(),
         region_diversity_policy:
             "prefer_distinct_regions_when_available_without_exposing_selected_route".to_string(),
         user_choice_policy:
@@ -3556,6 +3635,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_production_onion_pool_excludes_candidate_collocated_with_entry() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let local = signed_routeable_chat_descriptor(1, now + 300, "https://192.0.2.5:8422");
+        let local_node_id = local.node_id();
+        store.upsert_verified(local, now).unwrap();
+
+        let remotes = [
+            signed_routeable_chat_descriptor(1, now + 300, "https://192.0.2.10:8422"),
+            signed_routeable_chat_descriptor(1, now + 300, "https://198.51.100.10:8422"),
+            signed_routeable_chat_descriptor(1, now + 300, "https://203.0.113.10:8422"),
+            signed_routeable_chat_descriptor(1, now + 300, "https://198.18.0.10:8422"),
+        ];
+        for remote in remotes {
+            let node_id = remote.node_id();
+            store.upsert_verified(remote, now).unwrap();
+            store.record_route_forward_success(&node_id, now);
+        }
+        record_stable_path_proof(store.as_ref(), now, 3);
+
+        let app = build_discovery_router_with_local_entry(
+            store,
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::default(),
+            None,
+            local_node_id,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?privacy_mode=high&limit=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        // [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] The collocated
+        // remote is valid and routeable, but a production pool must remove it
+        // before count, diversity, and requested-path readiness are computed.
+        assert_eq!(parsed.count, 3);
+        assert!(parsed.local_entry_network_diversity_enforced);
+        assert!(parsed.requested_network_diversity_ready);
+        assert!(parsed.requested_path_ready);
+        assert!(parsed
+            .network_diversity_policy
+            .contains("against_local_entry"));
+        assert!(parsed
+            .candidates
+            .iter()
+            .all(|candidate| !candidate.public_endpoint.starts_with("https://192.0.2.")));
+    }
+
+    #[tokio::test]
+    async fn test_production_onion_pool_fails_closed_without_entry_descriptor() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        for endpoint in [
+            "https://192.0.2.10:8422",
+            "https://198.51.100.10:8422",
+            "https://203.0.113.10:8422",
+        ] {
+            let remote = signed_routeable_chat_descriptor(1, now + 300, endpoint);
+            let node_id = remote.node_id();
+            store.upsert_verified(remote, now).unwrap();
+            store.record_route_forward_success(&node_id, now);
+        }
+        record_stable_path_proof(store.as_ref(), now, 3);
+
+        let missing_local_node_id = IdentityKeyPair::generate().public_key_bytes();
+        let app = build_discovery_router_with_local_entry(
+            store,
+            DiscoveryApiPolicy::default(),
+            DiscoveryLocalCapabilityStatus::default(),
+            None,
+            missing_local_node_id,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?privacy_mode=high&limit=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed.count, 3);
+        assert!(parsed.requested_candidate_pool_ready);
+        assert!(!parsed.local_entry_network_diversity_enforced);
+        assert!(!parsed.requested_network_diversity_ready);
+        assert!(!parsed.requested_path_ready);
+        assert_eq!(parsed.pool_status, "diversity_limited");
+        assert_eq!(
+            parsed.fallback_reason,
+            "requested_path_network_diversity_not_ready"
+        );
+        assert!(parsed
+            .network_diversity_policy
+            .contains("local_entry_descriptor_unavailable_fail_closed"));
+    }
+
+    #[tokio::test]
     async fn test_high_privacy_candidates_fall_back_until_three_hop_proof_is_mature() {
         let store = Arc::new(PeerStore::new());
         let now = now_secs();
@@ -4806,6 +5002,7 @@ mod tests {
 
         let state = DiscoveryApiState {
             peer_store: Arc::new(PeerStore::new()),
+            local_node_id: None,
             directory_replica_store: None,
             policy: DiscoveryApiPolicy::default(),
             local_capabilities: DiscoveryLocalCapabilityStatus::default(),

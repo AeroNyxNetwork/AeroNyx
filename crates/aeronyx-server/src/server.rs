@@ -418,8 +418,13 @@
 //   - Directory Replica schema v8 records only opaque signed policy-head
 //     anchors. First observation is TOFU; rollback, same-epoch conflict, and
 //     forward history gaps fail closed and never mutate the accepted head.
+//   - [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] Required production
+//     discovery routers receive the local node id as private runtime context so
+//     public onion pools can exclude candidates collocated with the entry.
 //
 // Last Modified:
+//   v2.8.65-OnionEntryAntiAffinity - Injected local entry identity into both
+//     required discovery listeners without serializing it in public status.
 //   v2.8.64-PathProofRollbackAnchor - Bound two-hop and three-hop proof
 //   digests independently into the monotonic local/external recovery anchor.
 //   v2.8.63-ThreeHopSignedRecovery - Added independent signed three-hop proof
@@ -661,8 +666,7 @@ use crate::api::directory_replica_sync::{
     DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
 };
 use crate::api::discovery::{
-    blind_relay_runtime_status_value,
-    build_discovery_router_with_local_status_and_directory_admission,
+    blind_relay_runtime_status_value, build_discovery_router_with_local_entry,
     discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
     GossipResponse,
 };
@@ -4668,11 +4672,12 @@ impl Server {
                 // [DIRECTORY-GOSSIP-ADMISSION 2026-07-27 by Codex] Both
                 // operator and public gossip surfaces use the same audited
                 // replica trust anchor; absent replicas fail proof gossip closed.
-                .merge(build_discovery_router_with_local_status_and_directory_admission(
+                .merge(build_discovery_router_with_local_entry(
                     Arc::clone(&peer_store),
                     discovery_api_policy,
                     local_capability_status,
                     directory_replica_store.clone(),
+                    node_identity.public_key_bytes(),
                 ))
                 .merge(build_directory_replica_status_router_with_witness_carrier(
                     directory_replica_store.clone(),
@@ -4888,11 +4893,12 @@ impl Server {
         // capability truth coupled to the actual peer-route prerequisites.
         let witness_carrier_route_enabled =
             directory_chain_store.is_some() && directory_replica_store.is_some();
-        let app = build_discovery_router_with_local_status_and_directory_admission(
+        let app = build_discovery_router_with_local_entry(
             Arc::clone(&peer_store),
             discovery_api_policy,
             local_capability_status,
             directory_replica_store.clone(),
+            node_identity.public_key_bytes(),
         )
         .merge(build_chat_peer_router(
             chat_relay,
