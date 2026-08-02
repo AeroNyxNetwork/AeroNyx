@@ -37,6 +37,9 @@
 //! - [ONION-PATH-ADMISSION 2026-08-02 by Codex] Fails closed when a requested
 //!   multi-hop path has enough candidates but lacks stable runtime proof or
 //!   restart-continuity evidence, with an explicit lower-hop fallback.
+//! - [ONION-CAPABILITY-GATE 2026-08-02 by Codex] Requires every public onion
+//!   candidate to advertise both `ChatRelay` and `OnionMiddle`, preventing a
+//!   single-hop-only relay from being counted toward a multi-hop route.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -84,8 +87,14 @@
 //! - Candidate count alone must never make a multi-hop path ready. Keep
 //!   `requested_path_ready` gated by the matching two-hop or three-hop runtime
 //!   proof and signed restart-continuity decision.
+//! - An onion candidate must advertise both `ChatRelay` and `OnionMiddle` in
+//!   its verified signed descriptor. Apply client limits only after capability,
+//!   routeability, KEM, and endpoint filtering so valid lower-ranked relays are
+//!   not hidden by ineligible peers.
 //!
 //! ## Last Modified
+//! v0.40.0-OnionCapabilityGate - Require signed ChatRelay + OnionMiddle
+//! capability and apply candidate limits after all eligibility filters.
 //! v0.39.0-OnionPathAdmission - Gate requested multi-hop candidate plans on
 //! stable matching runtime proof and signed restart continuity.
 //! v0.38.0-PathProofRollbackAnchor - Require local recovery-anchor and optional
@@ -418,6 +427,10 @@ pub struct OnionRelayCandidate {
     pub signed_descriptor: SignedNodeDescriptor,
 }
 
+fn onion_required_capabilities() -> Vec<NodeCapability> {
+    vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle]
+}
+
 /// Response for `GET /api/discovery/onion-candidates`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnionCandidatesResponse {
@@ -427,6 +440,13 @@ pub struct OnionCandidatesResponse {
     pub contract_version: String,
     /// Stable source label for downstream telemetry/runbooks.
     pub source: String,
+    /// Signed capabilities every returned onion candidate must advertise.
+    ///
+    /// [ONION-CAPABILITY-GATE 2026-08-02 by Codex] This additive field makes
+    /// the multi-hop eligibility contract machine-readable while preserving
+    /// the existing `onion_candidates.v1` response for older clients.
+    #[serde(default = "onion_required_capabilities")]
+    pub required_capabilities: Vec<NodeCapability>,
     /// Number of candidates returned.
     pub count: usize,
     /// Minimum unique candidates required for a client-planned two-hop path.
@@ -2068,22 +2088,40 @@ async fn onion_candidates_handler(
     let limit = state.policy.snapshot_limit(query.limit);
     let requested_privacy_mode = OnionPrivacyMode::from_query(query.privacy_mode.as_deref());
     let requested_hops = normalize_requested_hops(requested_privacy_mode, query.hops);
+    // [ONION-CAPABILITY-GATE 2026-08-02 by Codex] Query the bounded policy
+    // pool first, then apply every onion-hop eligibility rule before the
+    // client limit and ranking. Limiting earlier can let ineligible high-rank
+    // ChatRelay peers hide valid OnionMiddle relays below them.
     let candidates: Vec<OnionRelayCandidate> = state
         .peer_store
-        .route_candidates_with_capability(NodeCapability::ChatRelay, now, limit)
+        .route_candidates_with_capability(
+            NodeCapability::ChatRelay,
+            now,
+            state.policy.max_snapshot_limit,
+        )
         .into_iter()
-        .enumerate()
         .filter_map(|descriptor| {
-            let (rank, descriptor) = descriptor;
             let node_id = descriptor.node_id();
+            if !descriptor
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::OnionMiddle)
+            {
+                return None;
+            }
             if !state.peer_store.is_routeable_now(&node_id, now) {
                 return None;
             }
             let kem_public = descriptor.descriptor.x25519_kem_public()?;
             let public_endpoint = descriptor.descriptor.public_endpoint.clone()?;
+            Some((descriptor, kem_public, public_endpoint))
+        })
+        .take(limit)
+        .enumerate()
+        .map(|(rank, (descriptor, kem_public, public_endpoint))| {
             let capacity = descriptor.descriptor.capacity.clone();
-            Some(OnionRelayCandidate {
-                node_id: hex::encode(node_id),
+            OnionRelayCandidate {
+                node_id: hex::encode(descriptor.node_id()),
                 kem_alg: descriptor.descriptor.kem_alg,
                 kem_public: hex::encode(kem_public),
                 public_endpoint,
@@ -2094,7 +2132,7 @@ async fn onion_candidates_handler(
                 max_bps: capacity.max_bps,
                 max_pps: capacity.max_pps,
                 signed_descriptor: descriptor,
-            })
+            }
         })
         .collect();
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
@@ -2146,6 +2184,7 @@ async fn onion_candidates_handler(
         generated_at: now,
         contract_version: ONION_CANDIDATES_CONTRACT_VERSION.to_string(),
         source: ONION_CANDIDATES_SOURCE.to_string(),
+        required_capabilities: onion_required_capabilities(),
         count: candidates.len(),
         min_candidates_for_two_hop: ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
         two_hop_ready,
@@ -2767,7 +2806,8 @@ mod tests {
         let store = Arc::new(PeerStore::new());
         let now = now_secs();
 
-        // (a) Routeable ChatRelay relay advertising a KEM key + endpoint -> included.
+        // (a) Routeable ChatRelay + OnionMiddle advertising a KEM key and
+        // endpoint -> included.
         let kp = IdentityKeyPair::generate();
         let kem = kp.x25519_public_key_bytes();
         let mut included = NodeDescriptor::new(
@@ -2777,7 +2817,7 @@ mod tests {
             now + 300,
             "test",
         );
-        included.capabilities = vec![NodeCapability::ChatRelay];
+        included.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
         included.public_endpoint = Some("relay.example:443".to_string());
         let included = included.with_x25519_kem(kem);
         let included = aeronyx_core::protocol::SignedNodeDescriptor::sign(included, &kp).unwrap();
@@ -2786,7 +2826,7 @@ mod tests {
         store.upsert_verified(included, now).unwrap();
         store.record_route_forward_success(&included_node_id, now);
 
-        // (b) ChatRelay relay WITHOUT a KEM key -> filtered out (cannot be a hop).
+        // (b) ChatRelay + OnionMiddle WITHOUT a KEM key -> filtered out.
         let kp2 = IdentityKeyPair::generate();
         let mut no_kem = NodeDescriptor::new(
             kp2.public_key_bytes(),
@@ -2795,14 +2835,14 @@ mod tests {
             now + 300,
             "test",
         );
-        no_kem.capabilities = vec![NodeCapability::ChatRelay];
+        no_kem.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
         no_kem.public_endpoint = Some("nokem.example:443".to_string());
         let no_kem = aeronyx_core::protocol::SignedNodeDescriptor::sign(no_kem, &kp2).unwrap();
         store.upsert_verified(no_kem, now).unwrap();
 
-        // (c) KEM-bearing ChatRelay without routeability evidence -> filtered
-        // out. This keeps clients from building paths through unknown peers
-        // while allowing internal probes to continue learning about them.
+        // (c) KEM-bearing ChatRelay + OnionMiddle without routeability
+        // evidence -> filtered out. This keeps clients from building paths
+        // through unknown peers while allowing probes to keep learning.
         let kp3 = IdentityKeyPair::generate();
         let mut unknown = NodeDescriptor::new(
             kp3.public_key_bytes(),
@@ -2811,18 +2851,46 @@ mod tests {
             now + 300,
             "test",
         );
-        unknown.capabilities = vec![NodeCapability::ChatRelay];
+        unknown.capabilities = vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
         unknown.public_endpoint = Some("unknown.example:443".to_string());
         let unknown = unknown.with_x25519_kem(kp3.x25519_public_key_bytes());
         let unknown = aeronyx_core::protocol::SignedNodeDescriptor::sign(unknown, &kp3).unwrap();
         store.upsert_verified(unknown, now).unwrap();
+
+        // (d) Routeable KEM-bearing ChatRelay without OnionMiddle -> filtered
+        // out. It can serve a standard encrypted relay path, but must never be
+        // counted as a blind multi-hop onion relay.
+        let kp4 = IdentityKeyPair::generate();
+        let mut single_hop_only = NodeDescriptor::new(
+            kp4.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now + 300,
+            "test",
+        );
+        single_hop_only.capabilities = vec![NodeCapability::ChatRelay];
+        single_hop_only.public_endpoint = Some("single-hop.example:443".to_string());
+        // [ONION-CAPABILITY-GATE 2026-08-02 by Codex] Give the ineligible
+        // relay a higher route-capacity score. With `limit=1`, this proves the
+        // limit is applied after capability filtering rather than before it.
+        single_hop_only.capacity = NodeCapacity {
+            max_sessions: 10_000,
+            max_bps: Some(10_000_000_000),
+            max_pps: Some(1_000_000),
+        };
+        let single_hop_only = single_hop_only.with_x25519_kem(kp4.x25519_public_key_bytes());
+        let single_hop_only =
+            aeronyx_core::protocol::SignedNodeDescriptor::sign(single_hop_only, &kp4).unwrap();
+        let single_hop_node_id = single_hop_only.node_id();
+        store.upsert_verified(single_hop_only, now).unwrap();
+        store.record_route_forward_success(&single_hop_node_id, now);
 
         let app = build_discovery_router(store, DiscoveryApiPolicy::default());
         let response = app
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
-                    .uri("/api/discovery/onion-candidates")
+                    .uri("/api/discovery/onion-candidates?limit=1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2838,6 +2906,10 @@ mod tests {
         // Only the routeable KEM-bearing relay is exposed, with its KEM key for the client.
         assert_eq!(parsed.contract_version, ONION_CANDIDATES_CONTRACT_VERSION);
         assert_eq!(parsed.source, ONION_CANDIDATES_SOURCE);
+        assert_eq!(
+            parsed.required_capabilities,
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle]
+        );
         assert_eq!(parsed.selection_policy, ONION_CANDIDATES_SELECTION_POLICY);
         assert_eq!(
             parsed.candidate_verification,
@@ -2868,16 +2940,13 @@ mod tests {
         assert_eq!(parsed.recommended_hops, 1);
         assert!(!parsed.two_hop_ready);
         assert!(parsed.fallback_required);
-        assert_eq!(parsed.pool_status, "warming");
+        assert_eq!(parsed.pool_status, "client_limited");
         assert_eq!(parsed.route_plan, "standard_relay_fallback");
-        assert_eq!(parsed.fallback_reason, "single_routeable_candidate");
-        assert_eq!(
-            parsed.readiness_reason,
-            "waiting_for_second_routeable_kem_relay"
-        );
+        assert_eq!(parsed.fallback_reason, "client_limit_below_two_hop_minimum");
+        assert_eq!(parsed.readiness_reason, "client_limit_blocks_two_hop_pool");
         assert_eq!(
             parsed.next_action,
-            "use standard encrypted relay fallback and refresh candidate pool later"
+            "increase candidate limit or use standard encrypted relay fallback"
         );
         assert_eq!(
             parsed.path_selection_strategy,
@@ -2895,6 +2964,9 @@ mod tests {
         assert_eq!(candidate.kem_public, hex::encode(kem));
         assert_eq!(candidate.public_endpoint, "relay.example:443");
         assert!(candidate.capabilities.contains(&NodeCapability::ChatRelay));
+        assert!(candidate
+            .capabilities
+            .contains(&NodeCapability::OnionMiddle));
         assert_eq!(candidate.selection_weight, 1_000);
         assert_eq!(candidate.region, None);
         assert_eq!(candidate.max_sessions, 0);
