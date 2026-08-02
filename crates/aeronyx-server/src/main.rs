@@ -28,6 +28,9 @@
 //! - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Bind the validated VPN
 //!   listener port and optional operator name/region/public policy during the
 //!   one-time registration request instead of accepting stale CMS defaults.
+//! - [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] Accept bounded registration
+//!   codes from standard input so installers do not expose one-time credentials
+//!   through process command lines; the legacy `--code` flag remains compatible.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -47,9 +50,10 @@
 //! v1.7.0-AuthenticatedCertificatePull - Add hardened pinned-source certificate
 //! pull, exact response verification, local trust policy, and freshness gate
 //! v1.8.0-NodeOnboarding - Add policy-safe node registration metadata
+//! v1.9.0-RegistrationCodeStdin - Add bounded secret-safe registration input
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -93,8 +97,17 @@ enum Commands {
     /// Register this node with AeroNyx network
     Register {
         /// Registration code from dashboard (e.g., NYX-1234-ABCDE)
-        #[arg(short = 'C', long)]
-        code: String,
+        #[arg(
+            short = 'C',
+            long,
+            required_unless_present = "code_stdin",
+            conflicts_with = "code_stdin"
+        )]
+        code: Option<String>,
+
+        /// Read the registration code from one bounded line on standard input
+        #[arg(long, required_unless_present = "code", conflicts_with = "code")]
+        code_stdin: bool,
 
         /// Path to configuration file
         #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
@@ -345,12 +358,16 @@ async fn main() {
     let result = match cli.command {
         Commands::Register {
             code,
+            code_stdin,
             config,
             cms_url,
             node_name,
             region,
             public_vpn,
-        } => cmd_register(code, config, cms_url, node_name, region, public_vpn).await,
+        } => match resolve_registration_code(code, code_stdin) {
+            Ok(code) => cmd_register(code, config, cms_url, node_name, region, public_vpn).await,
+            Err(error) => Err(error),
+        },
         Commands::Start { config } => cmd_start(config).await,
         Commands::Status { config } => cmd_status(config).await,
         Commands::Validate { config } => cmd_validate(config).await,
@@ -368,6 +385,46 @@ async fn main() {
 // ============================================
 // Commands
 // ============================================
+
+/// Maximum accepted one-time registration-code length after trimming.
+const MAX_REGISTRATION_CODE_BYTES: usize = 128;
+
+/// Validates a registration code without logging or retaining surrounding input.
+fn normalize_registration_code(value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "registration code cannot be empty");
+    anyhow::ensure!(
+        value.len() <= MAX_REGISTRATION_CODE_BYTES,
+        "registration code cannot exceed {MAX_REGISTRATION_CODE_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !value.chars().any(char::is_control),
+        "registration code cannot contain control characters"
+    );
+    Ok(value.to_string())
+}
+
+/// Reads at most one bounded registration-code line from an anonymous stream.
+fn read_registration_code<R: BufRead>(reader: R) -> anyhow::Result<String> {
+    // [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] `take` bounds allocation
+    // before UTF-8 validation. A malformed or unbounded pipe must fail closed
+    // without copying secret material into logs or process arguments.
+    let mut bounded = reader.take((MAX_REGISTRATION_CODE_BYTES + 2) as u64);
+    let mut line = String::new();
+    bounded
+        .read_line(&mut line)
+        .context("failed to read registration code from standard input")?;
+    normalize_registration_code(&line)
+}
+
+/// Resolves the backward-compatible CLI value or the secret-safe stdin mode.
+fn resolve_registration_code(code: Option<String>, code_stdin: bool) -> anyhow::Result<String> {
+    match (code, code_stdin) {
+        (Some(code), false) => normalize_registration_code(&code),
+        (None, true) => read_registration_code(std::io::stdin().lock()),
+        _ => anyhow::bail!("provide exactly one of --code or --code-stdin"),
+    }
+}
 
 /// Validates an optional node name before it reaches the one-time bind API.
 fn normalize_registration_name(value: Option<String>) -> anyhow::Result<Option<String>> {
@@ -492,7 +549,7 @@ async fn cmd_register(
             println!("  • Has the code expired? (codes expire in 15 minutes)");
             println!("  • Is there network connectivity?");
             println!();
-            println!("Get a new code from: https://dashboard.aeronyx.network");
+            println!("Get a new code from: https://app.aeronyx.network");
             std::process::exit(1);
         }
     }
@@ -537,8 +594,9 @@ async fn cmd_start(config_path: PathBuf) -> anyhow::Result<()> {
         println!("All nodes must be registered to join the AeroNyx network.");
         println!();
         println!("To register your node:");
-        println!("  1. Get a registration code from https://dashboard.aeronyx.network");
-        println!("  2. Run: aeronyx-server register --code <YOUR_CODE>");
+        println!("  1. Get a registration code from https://app.aeronyx.network");
+        println!("  2. Pipe it privately: printf '%s\\n' '<YOUR_CODE>' | aeronyx-server register --code-stdin");
+        println!("     Legacy compatibility: aeronyx-server register --code <YOUR_CODE>");
         println!();
         std::process::exit(1);
     }
@@ -1775,6 +1833,52 @@ mod tests {
         DirectoryObservationWitnessReceiptV1, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
     };
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn registration_cli_keeps_legacy_code_and_accepts_stdin_mode() {
+        let legacy =
+            Cli::try_parse_from(["aeronyx-server", "register", "--code", "NYX-LEGACY-123"])
+                .unwrap();
+        let Commands::Register {
+            code, code_stdin, ..
+        } = legacy.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(code.as_deref(), Some("NYX-LEGACY-123"));
+        assert!(!code_stdin);
+
+        let stdin = Cli::try_parse_from(["aeronyx-server", "register", "--code-stdin"]).unwrap();
+        let Commands::Register {
+            code, code_stdin, ..
+        } = stdin.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert!(code.is_none());
+        assert!(code_stdin);
+
+        assert!(Cli::try_parse_from(["aeronyx-server", "register"]).is_err());
+        assert!(Cli::try_parse_from([
+            "aeronyx-server",
+            "register",
+            "--code",
+            "NYX-123",
+            "--code-stdin",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn registration_code_stdin_is_trimmed_bounded_and_private_by_contract() {
+        let code = read_registration_code(std::io::Cursor::new("  NYX-STDIN-123  \n")).unwrap();
+        assert_eq!(code, "NYX-STDIN-123");
+
+        let oversized = format!("{}\n", "A".repeat(MAX_REGISTRATION_CODE_BYTES + 1));
+        assert!(read_registration_code(std::io::Cursor::new(oversized)).is_err());
+        assert!(normalize_registration_code("NYX-123\0hidden").is_err());
+        assert!(normalize_registration_code("   ").is_err());
+    }
 
     #[test]
     fn registration_profile_normalizes_operator_metadata() {

@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] Document hidden interactive
+  onboarding and bounded stdin automation so one-time codes do not appear in
+  child process command lines.
 - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Document explicit public
   VPN registration metadata and signed discovery restart defaults so a fresh
   node does not require manual backend or server.toml repair.
@@ -107,6 +110,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.48.0-node-deploy - Documented secret-safe registration-code input for the
+                     unified quickstart and lower-level installer.
 v1.47.0-node-deploy - Documented policy-safe public VPN onboarding and signed
                      discovery bootstrap defaults.
 v1.46.0-node-deploy - Documented transactional post-build session gates.
@@ -372,26 +377,49 @@ git pull --ff-only origin main
 
 ## First Install
 
+The recommended human workflow uses the unified entrypoint. It prompts for the
+nodeboard registration code with terminal echo disabled, previews the resolved
+plan, asks for confirmation, and then installs, registers, starts, and verifies
+the node:
+
 ```bash
-sudo ./deploy/node/install.sh --registration-code <NODEBOARD_CODE> --start
+sudo ./deploy/node/aeronyx-node.sh quickstart
 ```
 
 Register a named public VPN node without a follow-up database edit:
 
 ```bash
 sudo ./deploy/node/aeronyx-node.sh quickstart \
-  --registration-code <NODEBOARD_CODE> \
   --node-name TW1 \
   --region TW \
   --public-vpn
 ```
 
+The legacy `--registration-code <NODEBOARD_CODE>` option remains supported,
+but it can be visible to same-host process inspection while the installer is
+running. Prefer the hidden prompt above. For non-interactive automation, pass
+the credential over one bounded stdin line and use `--yes` only after the
+generated plan has been approved:
+
+```bash
+read -r -s -p 'Nodeboard registration code: ' AERONYX_NODE_CODE; echo
+printf '%s\n' "${AERONYX_NODE_CODE}" | sudo ./deploy/node/aeronyx-node.sh \
+  quickstart --registration-code-stdin --node-name TW1 --region TW --public-vpn --yes
+unset AERONYX_NODE_CODE
+```
+
+The wrapper forwards the credential between shell/Rust processes through
+anonymous pipes, and curl reads the install-progress JSON from stdin. No child
+command line contains the code. Plan output contains only
+`registration_code_present=yes`; it never includes the code value.
+
 `--public-vpn` is an explicit operator choice. Without it, the Rust runtime is
 still registered as VPN-capable with its configured listener port, but remains
 private in nodeboard and is not returned by the public VPN pool endpoint.
 
-For the lowest-friction first install, pass the nodeboard registration code as
-an environment variable and let `--quick` keep the normal commercial defaults:
+The environment variable remains available for backward-compatible automation,
+but stdin is preferred because inherited environments can be inspected by
+same-privilege processes:
 
 ```bash
 sudo AERONYX_REGISTRATION_CODE=<NODEBOARD_CODE> ./deploy/node/install.sh --quick

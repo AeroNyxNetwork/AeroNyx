@@ -8,6 +8,9 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] Add bounded stdin secret
+#   intake and keep registration codes out of aeronyx-server and curl command
+#   arguments while preserving legacy flag/environment compatibility.
 # - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Add explicit node name,
 #   ISO region, and public VPN registration flags. The Rust listener port and
 #   VPN capability are bound automatically; public visibility stays opt-in.
@@ -128,8 +131,12 @@
 # - Keep Cargo output outside the live repo target until validation succeeds.
 # - Keep --public-vpn opt-in. Permissionless nodes must not become publicly
 #   listed merely because they run the protocol binary.
+# - Prefer --registration-code-stdin for automation. Registration credentials
+#   must not be forwarded in child-process command arguments.
 #
 # Last Modified:
+# v1.29.0-node-deploy - Adds bounded stdin registration-code handling and
+#                       removes the code from child process arguments.
 # v1.28.0-node-deploy - Adds policy-safe node registration metadata and an
 #                       explicit public VPN pool opt-in.
 # v1.27.0-node-deploy - Supports both regular clones and linked Git worktrees.
@@ -201,12 +208,14 @@ SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
-SCRIPT_VERSION="v1.28.0-node-deploy"
+SCRIPT_VERSION="v1.29.0-node-deploy"
 
 REPO_URL="${AERONYX_REPO_URL:-${DEFAULT_REPO_URL}}"
 BRANCH="${AERONYX_BRANCH:-${DEFAULT_BRANCH}}"
 REPO_DIR="${AERONYX_REPO_DIR:-${DEFAULT_REPO_DIR}}"
 REGISTRATION_CODE="${AERONYX_REGISTRATION_CODE:-}"
+unset AERONYX_REGISTRATION_CODE
+REGISTRATION_CODE_STDIN=0
 NODE_NAME="${AERONYX_NODE_NAME:-}"
 NODE_REGION="${AERONYX_NODE_REGION:-}"
 PUBLIC_VPN=0
@@ -353,9 +362,9 @@ print(json.dumps({
 PY
 )"
 
-    curl -fsS --max-time 4 -X POST "${url}" \
+    printf '%s' "${payload}" | curl -fsS --max-time 4 -X POST "${url}" \
         -H 'Content-Type: application/json' \
-        --data "${payload}" >/dev/null 2>&1 \
+        --data-binary @- >/dev/null 2>&1 \
         || warn "Unable to report install progress to nodeboard (${step})."
 }
 
@@ -397,16 +406,20 @@ Options:
   --branch NAME           Git branch or ref. Default: main
   --repo-dir PATH         Install repository path. Default: /opt/aeronyx/AeroNyx
   --registration-code C   Register node after build.
+  --registration-code-stdin
+                          Read one bounded registration code line from stdin.
+                          Preferred for automation because it avoids argv.
   --node-name NAME        Node name shown in nodeboard and the VPN pool.
   --region CC             ISO 3166-1 alpha-2 deployment region, e.g. TW.
   --public-vpn            Publish the registered VPN node in the public pool.
                           Omit this flag to keep visibility private.
-  --quick                 First-install shortcut. Requires --registration-code
-                          or AERONYX_REGISTRATION_CODE and starts the service.
+  --quick                 First-install shortcut. Requires a registration code
+                          flag, stdin line, or environment value and starts the service.
   --print-plan            Print resolved install options and exit without
                           requiring root, systemd, package install, build,
                           network changes, registration, or service start.
-  --start                 Start service after install. Automatically enabled when --registration-code is used.
+  --start                 Start service after install. Automatically enabled
+                          when any registration-code input is used.
   --no-build              Skip cargo release build.
   --no-network            Skip sysctl and NAT setup.
   --no-enable             Do not enable systemd service.
@@ -424,6 +437,7 @@ Options:
 
 Examples:
   sudo ./deploy/node/install.sh --registration-code NYX-1234-ABCDE --start
+  printf '%s\n' 'NYX-1234-ABCDE' | sudo ./deploy/node/install.sh --registration-code-stdin --quick
   sudo ./deploy/node/install.sh --registration-code NYX-1234-ABCDE \
     --node-name TW1 --region TW --public-vpn --start
   sudo AERONYX_REGISTRATION_CODE=NYX-1234-ABCDE ./deploy/node/install.sh --quick
@@ -438,6 +452,7 @@ while [ "$#" -gt 0 ]; do
         --branch) BRANCH="${2:?missing value}"; shift 2 ;;
         --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
         --registration-code) REGISTRATION_CODE="${2:?missing value}"; DO_START=1; shift 2 ;;
+        --registration-code-stdin) REGISTRATION_CODE_STDIN=1; DO_START=1; shift ;;
         --node-name) NODE_NAME="${2:?missing value}"; shift 2 ;;
         --region) NODE_REGION="${2:?missing value}"; shift 2 ;;
         --public-vpn) PUBLIC_VPN=1; shift ;;
@@ -476,6 +491,23 @@ run_shell() {
     fi
 }
 
+load_registration_code() {
+    [ "${REGISTRATION_CODE_STDIN}" -eq 1 ] || return 0
+    [ -z "${REGISTRATION_CODE}" ] \
+        || die "--registration-code-stdin cannot be combined with --registration-code or AERONYX_REGISTRATION_CODE."
+
+    # [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] Read exactly one line. The
+    # value remains in this shell and is forwarded to child tools over anonymous
+    # pipes, never as a command argument.
+    IFS= read -r -n 129 REGISTRATION_CODE || [ -n "${REGISTRATION_CODE}" ] \
+        || die "Unable to read registration code from stdin."
+    [ -n "${REGISTRATION_CODE}" ] || die "Registration code from stdin cannot be empty."
+    [ "${#REGISTRATION_CODE}" -le 128 ] || die "Registration code cannot exceed 128 characters."
+    case "${REGISTRATION_CODE}" in
+        *$'\n'*|*$'\r'*|*$'\t'*) die "Registration code cannot contain control characters." ;;
+    esac
+}
+
 require_root() {
     [ "$(id -u)" -eq 0 ] || die "Please run as root, for example: sudo $0"
 }
@@ -508,7 +540,7 @@ validate_option_combinations() {
         die "--set-vpn-cidr cannot be combined with --quick."
     fi
     if [ "${QUICK}" -eq 1 ] && [ -z "${REGISTRATION_CODE}" ]; then
-        die "--quick requires --registration-code or AERONYX_REGISTRATION_CODE."
+        die "--quick requires --registration-code, --registration-code-stdin, or AERONYX_REGISTRATION_CODE."
     fi
     if { [ -n "${NODE_NAME}" ] || [ -n "${NODE_REGION}" ] || [ "${PUBLIC_VPN}" -eq 1 ]; } \
         && [ -z "${REGISTRATION_CODE}" ]; then
@@ -1356,7 +1388,7 @@ register_node() {
     register_args=(
         "${REPO_DIR}/target/release/aeronyx-server"
         register
-        --code "${REGISTRATION_CODE}"
+        --code-stdin
         -c "${CONFIG_FILE}"
     )
     if [ -n "${NODE_NAME}" ]; then
@@ -1377,7 +1409,7 @@ register_node() {
         [ "${PUBLIC_VPN}" -eq 1 ] && printf ' --public-vpn'
         printf '\n'
     else
-        "${register_args[@]}"
+        printf '%s\n' "${REGISTRATION_CODE}" | "${register_args[@]}"
     fi
 }
 
@@ -1393,6 +1425,7 @@ start_service() {
 }
 
 main() {
+    load_registration_code
     validate_option_combinations
     if [ "${PRINT_PLAN}" -eq 1 ]; then
         report_install_progress "planning" "plan" "Install plan generated; waiting for operator approval."

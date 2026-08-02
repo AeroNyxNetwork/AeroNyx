@@ -9,6 +9,9 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] Add hidden interactive and
+#   bounded stdin registration-code intake, then forward credentials only over
+#   anonymous pipes instead of child process arguments or sudo environment argv.
 # - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Forward explicit node
 #   name, ISO region, and public VPN pool opt-in through plan, install, and
 #   quickstart without exposing the registration code.
@@ -91,8 +94,8 @@
 #   --config, and --service to the appropriate lower-level script.
 # - Preserves optional onboarding metadata as paired arguments when delegating
 #   to the production installer.
-# - Keeps secret handling safe: registration codes are accepted as arguments or
-#   environment variables and are not printed by the plan path.
+# - Keeps secret handling safe: the preferred hidden-prompt/stdin modes do not
+#   print registration codes or forward them through child process arguments.
 #
 # Dependencies:
 # - deploy/node/install.sh
@@ -121,6 +124,8 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.25.0-node-entrypoint - Adds hidden/stdin registration-code intake and
+#                           secret-safe delegation to the lower-level installer.
 # v1.24.0-node-entrypoint - Added policy-safe VPN node registration options.
 # v1.23.0-node-entrypoint - Exposed live-safe upgrade build resource controls.
 # v1.22.0-node-entrypoint - Added exact commit-pinned isolated source upgrades.
@@ -171,6 +176,8 @@ SOURCE_COMMIT="${AERONYX_COMMIT:-}"
 CONFIG_FILE="${AERONYX_CONFIG_FILE:-${DEFAULT_CONFIG_FILE}}"
 SERVICE_NAME="${AERONYX_SERVICE_NAME:-${DEFAULT_SERVICE_NAME}}"
 REGISTRATION_CODE="${AERONYX_REGISTRATION_CODE:-}"
+unset AERONYX_REGISTRATION_CODE
+REGISTRATION_CODE_STDIN=0
 FORCE=0
 NO_RESTART=0
 DRY_RUN=0
@@ -255,6 +262,10 @@ Common options:
   --config PATH            Config path for upgrade/health/status.
   --service NAME           systemd service name. Default: aeronyx-server
   --registration-code CODE Registration code for install.
+  --registration-code-stdin
+                            Read one bounded registration code line from stdin.
+                            With quickstart and a TTY, omit both code flags to
+                            use the hidden interactive prompt instead.
   --node-name NAME         Node name shown in nodeboard and the VPN pool.
   --region CC              ISO 3166-1 alpha-2 deployment region.
   --public-vpn             Opt in to the public VPN node pool.
@@ -263,6 +274,8 @@ Common options:
 Command-specific options:
   install:
     --quick                First-install shortcut. Requires a registration code.
+    --registration-code-stdin
+                           Read the one-time code from stdin instead of argv.
     --node-name NAME       Set the first-registration node name.
     --region CC            Set the first-registration node region.
     --public-vpn           Publish the registered VPN node; default is private.
@@ -369,6 +382,8 @@ Command-specific options:
     --yes                   Skip confirmation prompt. Required with --force.
 
 Examples:
+  sudo ./deploy/node/aeronyx-node.sh quickstart --node-name TW1 --region TW --public-vpn
+  printf '%s\n' 'NYX-1234-ABCDE' | sudo ./deploy/node/aeronyx-node.sh install --quick --registration-code-stdin
   ./deploy/node/aeronyx-node.sh plan --quick --registration-code NYX-1234-ABCDE
   ./deploy/node/aeronyx-node.sh quickstart --quick --registration-code NYX-1234-ABCDE
   ./deploy/node/aeronyx-node.sh quickstart --registration-code NYX-1234-ABCDE --node-name TW1 --region TW --public-vpn
@@ -407,9 +422,37 @@ validate_service_name() {
         || die "Invalid service name: ${SERVICE_NAME}"
 }
 
-append_registration_code() {
+validate_registration_code_value() {
+    [ -n "${REGISTRATION_CODE}" ] || return 0
+    [ "${#REGISTRATION_CODE}" -le 128 ] || die "Registration code cannot exceed 128 characters."
+    case "${REGISTRATION_CODE}" in
+        *$'\n'*|*$'\r'*|*$'\t'*) die "Registration code cannot contain control characters." ;;
+    esac
+}
+
+load_registration_code() {
+    if [ "${REGISTRATION_CODE_STDIN}" -eq 1 ]; then
+        [ -z "${REGISTRATION_CODE}" ] \
+            || die "--registration-code-stdin cannot be combined with --registration-code or AERONYX_REGISTRATION_CODE."
+        IFS= read -r -n 129 REGISTRATION_CODE || [ -n "${REGISTRATION_CODE}" ] \
+            || die "Unable to read registration code from stdin."
+        [ -n "${REGISTRATION_CODE}" ] || die "Registration code from stdin cannot be empty."
+    elif [ -z "${REGISTRATION_CODE}" ] && [ "${COMMAND}" = "quickstart" ] && [ -t 0 ]; then
+        # [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] The default guided
+        # path accepts the one-time credential without terminal echo or argv.
+        printf 'Nodeboard registration code: ' >&2
+        IFS= read -r -s -n 129 REGISTRATION_CODE || REGISTRATION_CODE=""
+        printf '\n' >&2
+        [ -n "${REGISTRATION_CODE}" ] || die "A registration code is required for quickstart."
+    fi
+    validate_registration_code_value
+}
+
+run_installer() {
     if [ -n "${REGISTRATION_CODE}" ]; then
-        EXTRA_ARGS+=("--registration-code" "${REGISTRATION_CODE}")
+        printf '%s\n' "${REGISTRATION_CODE}" | "${INSTALL_SCRIPT}" --registration-code-stdin "$@"
+    else
+        "${INSTALL_SCRIPT}" "$@"
     fi
 }
 
@@ -451,6 +494,7 @@ parse_args() {
             --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
             --service) SERVICE_NAME="${2:?missing value}"; shift 2 ;;
             --registration-code) REGISTRATION_CODE="${2:?missing value}"; shift 2 ;;
+            --registration-code-stdin) REGISTRATION_CODE_STDIN=1; shift ;;
             --node-name|--region)
                 EXTRA_ARGS+=("$1" "${2:?missing value}")
                 shift 2
@@ -509,8 +553,7 @@ parse_args() {
 
 run_plan() {
     require_script "${INSTALL_SCRIPT}"
-    append_registration_code
-    "${INSTALL_SCRIPT}" \
+    run_installer \
         --repo-dir "${REPO_DIR}" \
         --branch "${BRANCH}" \
         --print-plan \
@@ -519,13 +562,12 @@ run_plan() {
 
 run_install() {
     require_script "${INSTALL_SCRIPT}"
-    append_registration_code
 
     if [ "${DRY_RUN}" -eq 1 ]; then
         EXTRA_ARGS+=("--dry-run")
     fi
 
-    "${INSTALL_SCRIPT}" \
+    run_installer \
         --repo-dir "${REPO_DIR}" \
         --branch "${BRANCH}" \
         "${EXTRA_ARGS[@]}"
@@ -540,19 +582,24 @@ run_install_with_privilege() {
     command -v sudo >/dev/null 2>&1 || die "quickstart install requires root. Re-run with sudo or install sudo."
 
     log "Requesting sudo for install/register/start after approved plan."
-    sudo env \
-        AERONYX_REGISTRATION_CODE="${REGISTRATION_CODE}" \
+    printf '%s\n' "${REGISTRATION_CODE}" | sudo env \
         AERONYX_REPO_DIR="${REPO_DIR}" \
         AERONYX_BRANCH="${BRANCH}" \
         AERONYX_CONFIG_FILE="${CONFIG_FILE}" \
         AERONYX_SERVICE_NAME="${SERVICE_NAME}" \
         "${SCRIPT_DIR}/aeronyx-node.sh" install \
+        --registration-code-stdin \
         --repo-dir "${REPO_DIR}" \
         --branch "${BRANCH}" \
         "${EXTRA_ARGS[@]}"
 }
 
 confirm_quickstart_install() {
+    if [ "${YES}" -eq 1 ]; then
+        log "Quickstart confirmation accepted by --yes."
+        return
+    fi
+
     cat <<'CONFIRM'
 
 AeroNyx quickstart has printed the read-only install plan above.
@@ -566,7 +613,8 @@ CONFIRM
 }
 
 run_quickstart() {
-    [ -n "${REGISTRATION_CODE}" ] || die "quickstart requires --registration-code or AERONYX_REGISTRATION_CODE."
+    [ -n "${REGISTRATION_CODE}" ] \
+        || die "quickstart requires the hidden prompt, --registration-code-stdin, --registration-code, or AERONYX_REGISTRATION_CODE."
 
     local original_extra=("${EXTRA_ARGS[@]}")
 
@@ -3673,6 +3721,7 @@ MENU
 
 main() {
     parse_args "$@"
+    load_registration_code
 
     case "${COMMAND}" in
         help|-h|--help)
