@@ -9,6 +9,9 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - [NODE-ADMISSION-GATE 2026-08-02 by Codex] Expose the installer's bounded
+#   post-start admission timeout and explicit recovery-only bypass through the
+#   unified operator entrypoint.
 # - [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] Add hidden interactive and
 #   bounded stdin registration-code intake, then forward credentials only over
 #   anonymous pipes instead of child process arguments or sudo environment argv.
@@ -124,6 +127,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.26.0-node-entrypoint - Exposes post-start node admission verification.
 # v1.25.0-node-entrypoint - Adds hidden/stdin registration-code intake and
 #                           secret-safe delegation to the lower-level installer.
 # v1.24.0-node-entrypoint - Added policy-safe VPN node registration options.
@@ -269,6 +273,8 @@ Common options:
   --node-name NAME         Node name shown in nodeboard and the VPN pool.
   --region CC              ISO 3166-1 alpha-2 deployment region.
   --public-vpn             Opt in to the public VPN node pool.
+  --admission-timeout S    Wait up to S seconds for post-start network admission.
+  --skip-admission-check   Recovery-only bypass for admission verification.
   --dry-run                Preview actions where the delegated script supports it.
 
 Command-specific options:
@@ -280,6 +286,8 @@ Command-specific options:
     --region CC            Set the first-registration node region.
     --public-vpn           Publish the registered VPN node; default is private.
     --start                Start service after install.
+    --admission-timeout S  Override the 120-second acceptance window (10-600).
+    --skip-admission-check Skip acceptance only for isolated dev/recovery.
     --no-build             Skip release build.
     --no-network           Skip sysctl and NAT setup.
     --no-enable            Do not enable systemd service.
@@ -499,6 +507,10 @@ parse_args() {
                 EXTRA_ARGS+=("$1" "${2:?missing value}")
                 shift 2
                 ;;
+            --admission-timeout)
+                EXTRA_ARGS+=("$1" "${2:?missing value}")
+                shift 2
+                ;;
             --public-vpn)
                 EXTRA_ARGS+=("$1")
                 shift
@@ -539,7 +551,7 @@ parse_args() {
             --expected-binary-sha256) EXPECTED_BINARY_SHA256="${2:?missing value}"; shift 2 ;;
             --yes|-y) YES=1; shift ;;
             -h|--help) COMMAND="help"; shift ;;
-            --quick|--start|--no-build|--no-network|--no-enable|--skip-package-install|--skip-rust-install|--allow-dirty|--skip-pull)
+            --quick|--start|--no-build|--no-network|--no-enable|--skip-package-install|--skip-rust-install|--allow-dirty|--skip-pull|--skip-admission-check)
                 EXTRA_ARGS+=("$1")
                 shift
                 ;;

@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [NODE-ADMISSION-GATE 2026-08-02 by Codex] Document the bounded acceptance
+  gate that prevents systemd-only starts from being reported as successful
+  network admission.
 - [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] Document hidden interactive
   onboarding and bounded stdin automation so one-time codes do not appear in
   child process command lines.
@@ -100,8 +103,9 @@ Dependencies:
 Main Logical Flow:
 1. Operator installs the node with install.sh.
 2. Operator registers with a nodeboard registration code.
-3. Upgrades compile with a live-safe resource policy before atomic promotion.
-4. systemd runs aeronyx-server and healthcheck.sh verifies runtime status.
+3. The installer verifies bounded network admission before reporting success.
+4. Upgrades compile with a live-safe resource policy before atomic promotion.
+5. systemd runs aeronyx-server and healthcheck.sh verifies runtime status.
 
 Important Note for Next Developer:
 - Do not document workflows that require exposing private keys or user traffic.
@@ -110,6 +114,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.49.0-node-deploy - Documented post-start network admission acceptance.
 v1.48.0-node-deploy - Documented secret-safe registration-code input for the
                      unified quickstart and lower-level installer.
 v1.47.0-node-deploy - Documented policy-safe public VPN onboarding and signed
@@ -428,9 +433,43 @@ sudo AERONYX_REGISTRATION_CODE=<NODEBOARD_CODE> ./deploy/node/install.sh --quick
 `--quick` is intentionally a thin wrapper. It still runs preflight checks,
 capacity-plan warnings, package/Rust setup, repository update, config
 installation, network setup, release build, systemd verification, node
-registration, and service start. It fails when no registration code is
-provided, so an operator does not mistake an unregistered node for a live
-commercial node.
+registration, service start, and bounded network admission verification. It
+fails when no registration code is provided, so an operator does not mistake
+an unregistered node for a live commercial node.
+
+### Post-start admission gate
+
+An active systemd unit is necessary but does not prove that a new node joined
+the AeroNyx privacy network. Before the installer reports `completed`, the
+default admission gate waits up to 120 seconds for all applicable evidence:
+
+- `/api/vpn/health` reports `status=ok`, proving the Rust listener, TUN,
+  forwarding, NAT, DNS, and egress checks are usable.
+- A registered node has a fresh backend policy timestamp, proving a completed
+  signed management heartbeat round trip rather than only a local process
+  start.
+- `/api/discovery/status` reports a consistent local relay capability, at
+  least one validated peer, and a completed gossip round.
+- `/api/discovery/snapshot` exposes at least one validated signed descriptor.
+- A node installed with `--public-vpn` appears under its exact backend UUID in
+  the public privacy-network pool with `visibility=public`, VPN capability,
+  and `status=online`.
+
+Private nodes are deliberately not required to appear in the public pool.
+They still must pass local health, backend heartbeat (when registered), and
+signed discovery checks. The gate reads only aggregate runtime and routing
+metadata; it never reads encrypted payloads, destinations, DNS contents,
+client addresses, private keys, wallet traffic, or social graph data.
+
+Slow first boots can extend the bounded window without weakening the checks:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh quickstart --admission-timeout 240
+```
+
+`--skip-admission-check` is retained only for isolated development and
+operator recovery. It is explicit, emits a warning, and should not be used by
+normal nodeboard-generated production onboarding commands.
 
 The installer also accepts these environment defaults for automation systems
 that generate one-line setup commands:
@@ -442,6 +481,8 @@ that generate one-line setup commands:
 - `AERONYX_NODE_NAME`
 - `AERONYX_NODE_REGION`
 - `AERONYX_PUBLIC_VPN=1`
+- `AERONYX_ADMISSION_TIMEOUT=120`
+- `AERONYX_ADMISSION_CHECK=0` (isolated development/recovery only)
 - `AERONYX_START=1`
 
 Verify a generated command without root access, package installation, network

@@ -8,6 +8,10 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - [NODE-ADMISSION-GATE 2026-08-02 by Codex] Require a bounded post-start
+#   acceptance check before reporting install completion. The gate verifies
+#   local Rust health, validated signed discovery peers, relay capability
+#   consistency, and (when explicitly public) exact backend pool visibility.
 # - [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] Add bounded stdin secret
 #   intake and keep registration codes out of aeronyx-server and curl command
 #   arguments while preserving legacy flag/environment compatibility.
@@ -86,6 +90,7 @@
 # - Optionally configures IP forwarding/NAT and registers/starts the node.
 # - Sends validated operator metadata during one-time registration so nodeboard
 #   does not retain stale My Node / port 8001 / non-VPN defaults.
+# - Blocks completion until the started node passes bounded network admission.
 # - Persists VPN forwarding/NAT across host reboots.
 # - Renders and verifies reboot network restore with distro-specific
 #   sysctl/iptables paths.
@@ -102,6 +107,8 @@
 # 3. Acquire the shared node deployment lock before host writes.
 # 4. Prepare repository, directories, config, and network forwarding.
 # 5. Build release binary, install systemd unit, optionally register/start.
+# 6. Verify local health, management heartbeat, signed discovery, and any
+#    explicitly requested public-pool visibility before reporting completion.
 #
 # Important Note for Next Developer:
 # - Never overwrite /etc/aeronyx/server.toml, server_key.json, or node_info.json
@@ -131,10 +138,16 @@
 # - Keep Cargo output outside the live repo target until validation succeeds.
 # - Keep --public-vpn opt-in. Permissionless nodes must not become publicly
 #   listed merely because they run the protocol binary.
+# - Keep the admission gate privacy-safe. It may compare the local backend
+#   node UUID with public pool metadata, but must not inspect traffic, payloads,
+#   destinations, client addresses, wallet traffic, or private key material.
+# - Keep --skip-admission-check explicit. It exists for isolated development
+#   and recovery only; production quickstart should retain the default gate.
 # - Prefer --registration-code-stdin for automation. Registration credentials
 #   must not be forwarded in child-process command arguments.
 #
 # Last Modified:
+# v1.30.0-node-deploy - Adds bounded post-start node admission acceptance.
 # v1.29.0-node-deploy - Adds bounded stdin registration-code handling and
 #                       removes the code from child process arguments.
 # v1.28.0-node-deploy - Adds policy-safe node registration metadata and an
@@ -208,7 +221,7 @@ SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
-SCRIPT_VERSION="v1.29.0-node-deploy"
+SCRIPT_VERSION="v1.30.0-node-deploy"
 
 REPO_URL="${AERONYX_REPO_URL:-${DEFAULT_REPO_URL}}"
 BRANCH="${AERONYX_BRANCH:-${DEFAULT_BRANCH}}"
@@ -233,6 +246,8 @@ NETWORK_ONLY=0
 QUICK=0
 PRINT_PLAN=0
 SET_VPN_CIDR=""
+ADMISSION_CHECK=1
+ADMISSION_TIMEOUT="${AERONYX_ADMISSION_TIMEOUT:-120}"
 CURRENT_INSTALL_STEP="not_started"
 CURRENT_INSTALL_MESSAGE="Install has not started."
 PINNED_RUST_CHANNEL=""
@@ -248,6 +263,10 @@ case "${AERONYX_PUBLIC_VPN:-}" in
     1|true|TRUE|yes|YES|on|ON) PUBLIC_VPN=1 ;;
 esac
 
+case "${AERONYX_ADMISSION_CHECK:-}" in
+    0|false|FALSE|no|NO|off|OFF) ADMISSION_CHECK=0 ;;
+esac
+
 if [ -n "${REGISTRATION_CODE}" ]; then
     DO_START=1
 fi
@@ -257,7 +276,7 @@ ok() { printf '[OK] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
-install_progress_url() {
+management_base_url() {
     local cms_url="${AERONYX_CMS_URL:-}"
     if [ -z "${cms_url}" ] && [ -f "${CONFIG_FILE}" ] && command -v python3 >/dev/null 2>&1; then
         cms_url="$(python3 - "${CONFIG_FILE}" <<'PY' 2>/dev/null || true
@@ -280,7 +299,11 @@ PY
     fi
     cms_url="${cms_url:-${DEFAULT_CMS_URL}}"
     cms_url="${cms_url%/}"
-    printf '%s/codes/install-progress/\n' "${cms_url}"
+    printf '%s\n' "${cms_url}"
+}
+
+install_progress_url() {
+    printf '%s/codes/install-progress/\n' "$(management_base_url)"
 }
 
 report_install_progress() {
@@ -420,6 +443,10 @@ Options:
                           network changes, registration, or service start.
   --start                 Start service after install. Automatically enabled
                           when any registration-code input is used.
+  --admission-timeout S   Seconds to wait for local health, signed discovery,
+                          and public-pool visibility. Default: 120.
+  --skip-admission-check  Skip post-start network admission verification.
+                          Intended only for isolated development or recovery.
   --no-build              Skip cargo release build.
   --no-network            Skip sysctl and NAT setup.
   --no-enable             Do not enable systemd service.
@@ -459,6 +486,8 @@ while [ "$#" -gt 0 ]; do
         --quick) QUICK=1; DO_START=1; shift ;;
         --print-plan) PRINT_PLAN=1; shift ;;
         --start) DO_START=1; shift ;;
+        --admission-timeout) ADMISSION_TIMEOUT="${2:?missing value}"; shift 2 ;;
+        --skip-admission-check) ADMISSION_CHECK=0; shift ;;
         --no-build) DO_BUILD=0; shift ;;
         --no-network) DO_NETWORK=0; shift ;;
         --no-enable) DO_ENABLE=0; shift ;;
@@ -560,6 +589,12 @@ validate_option_combinations() {
     if [ "${QUICK}" -eq 1 ] && { [ "${CONFIG_ONLY}" -eq 1 ] || [ "${PREFLIGHT_ONLY}" -eq 1 ] || [ "${NETWORK_ONLY}" -eq 1 ]; }; then
         die "--quick cannot be combined with --config-only, --preflight-only, or --network-only."
     fi
+    if [ "${DO_START}" -eq 1 ] && [ "${ADMISSION_CHECK}" -eq 1 ]; then
+        printf '%s' "${ADMISSION_TIMEOUT}" | grep -Eq '^[0-9]+$' \
+            || die "--admission-timeout must be an integer number of seconds."
+        [ "${ADMISSION_TIMEOUT}" -ge 10 ] && [ "${ADMISSION_TIMEOUT}" -le 600 ] \
+            || die "--admission-timeout must be between 10 and 600 seconds."
+    fi
 }
 
 bool_word() {
@@ -586,6 +621,8 @@ build=$(bool_word "${DO_BUILD}")
 network=$(bool_word "${DO_NETWORK}")
 enable_service=$(bool_word "${DO_ENABLE}")
 start_service=$(bool_word "${DO_START}")
+admission_check=$(bool_word "${ADMISSION_CHECK}")
+admission_timeout_seconds=${ADMISSION_TIMEOUT}
 install_packages=$(bool_word "${INSTALL_PACKAGES}")
 install_rust=$(bool_word "${INSTALL_RUST}")
 rust_toolchain=repository-pinned
@@ -1424,6 +1461,237 @@ start_service() {
     run systemctl --no-pager --full status "${SERVICE_NAME}"
 }
 
+verify_node_admission() {
+    [ "${DO_START}" -eq 1 ] || return 0
+
+    if [ "${ADMISSION_CHECK}" -ne 1 ]; then
+        warn "Post-start node admission check skipped by explicit operator option."
+        return 0
+    fi
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[DRY-RUN] verify node admission for up to %ss\n' "${ADMISSION_TIMEOUT}"
+        return 0
+    fi
+
+    command -v python3 >/dev/null 2>&1 \
+        || die "Post-start node admission check requires python3."
+
+    local cms_url
+    cms_url="$(management_base_url)"
+    log "Waiting up to ${ADMISSION_TIMEOUT}s for Rust health, backend heartbeat, and signed discovery acceptance"
+
+    # [NODE-ADMISSION-GATE 2026-08-02 by Codex] Keep this gate bounded and
+    # evidence-based. Local health proves the data plane is usable, a fresh
+    # policy timestamp proves the registered node completed a CMS round trip,
+    # and validated signed peers plus a successful gossip round prove that the
+    # process joined discovery rather than merely binding a systemd service.
+    # Public nodes additionally require an exact UUID match in the public pool.
+    python3 - \
+        "${CONFIG_FILE}" \
+        "${CONFIG_DIR}/node_info.json" \
+        "${cms_url}" \
+        "${ADMISSION_TIMEOUT}" \
+        "${PUBLIC_VPN}" \
+        "${NODE_REGION}" <<'PY'
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlencode
+from urllib.request import ProxyHandler, Request, build_opener
+
+config_path, node_info_path, cms_url, timeout_raw, public_raw, region = sys.argv[1:]
+timeout = int(timeout_raw)
+require_public = public_raw == "1"
+deadline = time.monotonic() + timeout
+opener = build_opener(ProxyHandler({}))
+
+
+def config_value(section_name, key_name, default=None):
+    section = None
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1].strip()
+                    continue
+                if section == section_name and line.startswith(key_name) and "=" in line:
+                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    return value or default
+    except OSError:
+        pass
+    return default
+
+
+def endpoint_url():
+    listen = config_value("discovery", "public_api_listen_addr", "127.0.0.1:8422")
+    port = "8422"
+    if listen and ":" in listen:
+        candidate = listen.rsplit(":", 1)[-1].strip()
+        if candidate.isdigit():
+            port = candidate
+    return f"http://127.0.0.1:{port}"
+
+
+def fetch_json(url):
+    request = Request(url, headers={"Accept": "application/json", "User-Agent": "AeroNyx-Node-Admission/1"})
+    with opener.open(request, timeout=5) as response:
+        return json.load(response)
+
+
+def parse_utc(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+node_id = None
+try:
+    with open(node_info_path, "r", encoding="utf-8") as handle:
+        node_id = json.load(handle).get("node_id")
+except (OSError, ValueError, TypeError):
+    pass
+
+base = endpoint_url()
+state = {
+    "health": "pending",
+    "management": "not_registered" if not node_id else "pending",
+    "discovery": "pending",
+    "valid_peers": 0,
+    "signed_peers": 0,
+    "public_pool": "not_required" if not require_public else "pending",
+}
+last_report = 0.0
+
+while True:
+    now_mono = time.monotonic()
+    now_utc = datetime.now(timezone.utc)
+
+    try:
+        health = fetch_json("http://127.0.0.1:8421/api/vpn/health")
+        state["health"] = str(health.get("status") or "unknown")
+        policy = health.get("node_policy") or {}
+        if node_id:
+            policy_time = parse_utc(policy.get("updated_at"))
+            heartbeat_seconds = int(policy.get("heartbeat_interval_seconds") or 30)
+            freshness_limit = max(90, heartbeat_seconds * 2 + 15)
+            if policy_time is None:
+                state["management"] = "policy_pending"
+            else:
+                age = max(0, int((now_utc - policy_time).total_seconds()))
+                state["management"] = "fresh" if age <= freshness_limit else f"stale_{age}s"
+    except Exception:
+        state["health"] = "unreachable"
+
+    try:
+        discovery = fetch_json(f"{base}/api/discovery/status")
+        local = discovery.get("local_capabilities") or {}
+        peer_store = discovery.get("peer_store") or {}
+        snapshot = peer_store.get("snapshot") or {}
+        runtime = peer_store.get("runtime") or {}
+        valid_peers = int(snapshot.get("valid_peers") or 0)
+        state["valid_peers"] = valid_peers
+
+        local_ready = local.get("status") != "misconfigured" and local.get("capability_config_consistent") is not False
+        if local.get("chat_relay_configured"):
+            local_ready = local_ready and local.get("status") == "ready"
+        gossip_ready = runtime.get("last_gossip_at") is not None
+
+        signed_snapshot = fetch_json(f"{base}/api/discovery/snapshot?limit=8")
+        peers = signed_snapshot.get("peers") or []
+        signed_peers = sum(
+            1 for peer in peers
+            if isinstance(peer, dict) and peer.get("descriptor") and peer.get("signature")
+        )
+        state["signed_peers"] = signed_peers
+        if not local_ready:
+            state["discovery"] = "capability_misconfigured"
+        elif valid_peers < 1 or signed_peers < 1:
+            state["discovery"] = "peer_validation_pending"
+        elif not gossip_ready:
+            state["discovery"] = "gossip_pending"
+        else:
+            state["discovery"] = "ready"
+    except Exception:
+        state["discovery"] = "unreachable"
+
+    if require_public:
+        if not node_id:
+            state["public_pool"] = "node_identity_missing"
+        else:
+            try:
+                match = None
+                page = 1
+                while page <= 100:
+                    query = {"page_size": 100, "page": page}
+                    if region:
+                        query["region"] = region
+                    public_url = f"{cms_url.rstrip('/')}/nodes/public/?{urlencode(query)}"
+                    payload = fetch_json(public_url)
+                    entries = payload.get("data") or []
+                    match = next((item for item in entries if item.get("id") == node_id), None)
+                    if match is not None:
+                        break
+                    total = int(payload.get("count") or len(entries))
+                    if page * 100 >= total or not entries:
+                        break
+                    page += 1
+                if match is None:
+                    state["public_pool"] = "pending"
+                elif match.get("visibility") != "public" or not match.get("is_vpn_node"):
+                    state["public_pool"] = "policy_mismatch"
+                else:
+                    state["public_pool"] = str(match.get("status") or "visible")
+            except Exception:
+                state["public_pool"] = "unreachable"
+
+    local_ok = state["health"] == "ok"
+    management_ok = state["management"] in ("fresh", "not_registered")
+    discovery_ok = state["discovery"] == "ready"
+    public_ok = not require_public or state["public_pool"] == "online"
+    if local_ok and management_ok and discovery_ok and public_ok:
+        print(
+            "[OK] Node admission accepted: "
+            f"health={state['health']} management={state['management']} "
+            f"discovery={state['discovery']} valid_peers={state['valid_peers']} "
+            f"signed_peers={state['signed_peers']} public_pool={state['public_pool']}",
+            flush=True,
+        )
+        raise SystemExit(0)
+
+    if now_mono >= deadline:
+        print(
+            "[ERROR] Node admission timed out: "
+            f"health={state['health']} management={state['management']} "
+            f"discovery={state['discovery']} valid_peers={state['valid_peers']} "
+            f"signed_peers={state['signed_peers']} public_pool={state['public_pool']}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(1)
+
+    if now_mono - last_report >= 10:
+        print(
+            "[INFO] Admission pending: "
+            f"health={state['health']} management={state['management']} "
+            f"discovery={state['discovery']} valid_peers={state['valid_peers']} "
+            f"signed_peers={state['signed_peers']} public_pool={state['public_pool']}",
+            flush=True,
+        )
+        last_report = now_mono
+    time.sleep(3)
+PY
+}
+
 main() {
     load_registration_code
     validate_option_combinations
@@ -1490,6 +1758,8 @@ main() {
     register_node
     set_install_step "start" "Starting or verifying AeroNyx service."
     start_service
+    set_install_step "admission" "Verifying Rust health, management heartbeat, signed discovery, and public visibility."
+    verify_node_admission
     report_install_progress "completed" "completed" "Install workflow completed."
     trap - ERR
 }
