@@ -92,6 +92,9 @@
 //! - [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] Keeps an independent
 //!   bounded entry -> middle -> middle -> terminal runtime proof history so a
 //!   three-hop failure cannot overwrite mature two-hop readiness
+//! - [PATH-PROOF-CLOCK-GUARD 2026-08-03 by Codex] Fails closed when retained
+//!   path-proof evidence is future-dated relative to the current node clock,
+//!   preventing clock rollback from turning future evidence into fresh proof
 //! - Blind relay readiness reason gives operators a stable privacy-safe bucket
 //!   for why the relay path is ready, probe-only, degraded, protected, or idle
 //! - Blind relay timestamp freshness counters show stale/future route-frame
@@ -167,8 +170,13 @@
 //!   payloads, browsing history, voucher secrets, or private keys here.
 //! - Do not use this as public-exit authorization. `allows_public_exit` stays
 //!   false by default and must be governed by a separate reviewed policy.
+//! - Path-proof readiness must use only events at or before the current node
+//!   time. Future-dated retained evidence is an aggregate clock-health signal,
+//!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.72.0-PathProofClockGuard - Ignore future-dated path proofs and fail
+//! readiness closed until the node clock catches up
 //! v0.71.0-PathProofRollbackAnchor - Track independent local-anchor decisions
 //! for signed two-hop and three-hop proof recovery without retaining digests
 //! v0.70.0-ThreeHopSignedRecovery - Added independently signed, route-pool-
@@ -507,7 +515,7 @@ pub struct PeerStoreTwoHopPathProofHistory {
     /// Stable readiness bucket: forming, ready, stale, attention, or idle.
     pub status: String,
     /// Stable freshness bucket for UI and runbooks: forming, fresh_success,
-    /// stale_success, recent_failure, or no_success.
+    /// stale_success, recent_failure, future_ignored, or no_success.
     ///
     /// This is derived only from bounded local proof outcomes and coarse age
     /// windows. It must never encode node IDs, route IDs, endpoints, payloads,
@@ -541,6 +549,12 @@ pub struct PeerStoreTwoHopPathProofHistory {
     pub window_size: usize,
     /// Number of retained proof events in this summary.
     pub retained_events: usize,
+    /// Retained events ignored because their timestamps are ahead of `generated_at`.
+    ///
+    /// [PATH-PROOF-CLOCK-GUARD 2026-08-03 by Codex] This is an aggregate
+    /// clock-health counter only. It never contains route or peer dimensions.
+    #[serde(default)]
+    pub future_events_ignored: u64,
     /// Retained proof attempts in the bounded window.
     pub attempted: u64,
     /// Retained accepted proofs in the bounded window.
@@ -573,7 +587,7 @@ pub struct PeerStoreTwoHopPathProofHistory {
     #[serde(default)]
     pub stability_success_percent: u8,
     /// Stable maturity bucket: forming, warming_up, stable, degraded, stale,
-    /// failing, or circuit_breaker.
+    /// failing, circuit_breaker, or clock_attention.
     #[serde(default)]
     pub stability_status: String,
     /// Whether the recent proof window is mature enough for product surfaces to
@@ -4506,12 +4520,23 @@ impl PeerStore {
         now: u64,
         hop_label: &'static str,
     ) -> PeerStoreTwoHopPathProofHistory {
-        let attempted = events.len() as u64;
-        let succeeded = events
+        // [PATH-PROOF-CLOCK-GUARD 2026-08-03 by Codex] A monotonic runtime can
+        // still observe wall-clock rollback after NTP or operator correction.
+        // Never let `saturating_sub` turn future proof timestamps into age 0.
+        // Retain them for aggregate diagnostics, but exclude them from every
+        // readiness, quality, and reason calculation until the clock catches up.
+        let future_events_ignored = events.iter().filter(|event| event.at > now).count() as u64;
+        let observed_events = events
+            .iter()
+            .filter(|event| event.at <= now)
+            .cloned()
+            .collect::<Vec<_>>();
+        let attempted = observed_events.len() as u64;
+        let succeeded = observed_events
             .iter()
             .filter(|event| event.outcome == "accepted")
             .count() as u64;
-        let message_delivery_successes = events
+        let message_delivery_successes = observed_events
             .iter()
             .filter(|event| event.outcome == "accepted" && event.proof_scope == "message_delivery")
             .count() as u64;
@@ -4523,12 +4548,9 @@ impl PeerStore {
         };
         // Stability is a freshness claim, so old retained diagnostics must not
         // satisfy its sample threshold or keep a failure circuit open forever.
-        let fresh_events = events
+        let fresh_events = observed_events
             .iter()
-            .filter(|event| {
-                event.at <= now
-                    && now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
-            })
+            .filter(|event| now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
             .collect::<Vec<_>>();
         let fresh_message_delivery_events = fresh_events
             .iter()
@@ -4561,36 +4583,39 @@ impl PeerStore {
             ((stability_window_succeeded.saturating_mul(100)) / stability_window_attempted).min(100)
                 as u8
         };
-        let latest = events.last();
+        let latest = observed_events.last();
         let latest_age_seconds = latest.map(|event| now.saturating_sub(event.at));
-        let latest_success_age_seconds = events
+        let latest_success_age_seconds = observed_events
             .iter()
             .rev()
             .find(|event| event.outcome == "accepted")
             .map(|event| now.saturating_sub(event.at));
-        let latest_failure_age_seconds = events
+        let latest_failure_age_seconds = observed_events
             .iter()
             .rev()
             .find(|event| event.outcome == "rejected")
             .map(|event| now.saturating_sub(event.at));
-        let latest_message_delivery_age_seconds = events
+        let latest_message_delivery_age_seconds = observed_events
             .iter()
             .rev()
             .find(|event| event.outcome == "accepted" && event.proof_scope == "message_delivery")
             .map(|event| now.saturating_sub(event.at));
-        let message_delivery_evidence_mode = events
+        let message_delivery_evidence_mode = observed_events
             .iter()
             .rev()
             .find(|event| event.outcome == "accepted" && event.proof_scope == "message_delivery")
             .map(|event| event.evidence_mode.clone())
             .unwrap_or_else(|| "none".to_string());
-        let consecutive_successes = Self::count_trailing_two_hop_outcomes(&events, "accepted");
-        let consecutive_failures = Self::count_trailing_two_hop_outcomes(&events, "rejected");
+        let consecutive_successes =
+            Self::count_trailing_two_hop_outcomes(&observed_events, "accepted");
+        let consecutive_failures =
+            Self::count_trailing_two_hop_outcomes(&observed_events, "rejected");
         let consecutive_message_delivery_successes =
-            Self::count_trailing_two_hop_message_delivery_successes(&events);
-        let reason_bucket_counts =
-            Self::count_two_hop_event_buckets(&events, |event| event.reason_bucket.as_str());
-        let failure_events = events
+            Self::count_trailing_two_hop_message_delivery_successes(&observed_events);
+        let reason_bucket_counts = Self::count_two_hop_event_buckets(&observed_events, |event| {
+            event.reason_bucket.as_str()
+        });
+        let failure_events = observed_events
             .iter()
             .filter(|event| event.outcome == "rejected")
             .cloned()
@@ -4600,8 +4625,8 @@ impl PeerStore {
                 event.reason_bucket.as_str()
             });
         let path_shape_counts =
-            Self::count_two_hop_event_buckets(&events, |event| event.path_shape.as_str());
-        let candidate_pool_counts = Self::count_two_hop_event_buckets(&events, |event| {
+            Self::count_two_hop_event_buckets(&observed_events, |event| event.path_shape.as_str());
+        let candidate_pool_counts = Self::count_two_hop_event_buckets(&observed_events, |event| {
             if event.middle_candidate_bucket.is_empty()
                 || event.terminal_candidate_bucket.is_empty()
                 || event.middle_candidate_bucket == "none"
@@ -4621,33 +4646,38 @@ impl PeerStore {
             }
         });
         let ttl_shape_counts =
-            Self::count_two_hop_event_buckets(&events, |event| event.ttl_shape.as_str());
-        let proof_scope_counts = Self::count_two_hop_event_buckets(&events, |event| {
+            Self::count_two_hop_event_buckets(&observed_events, |event| event.ttl_shape.as_str());
+        let proof_scope_counts = Self::count_two_hop_event_buckets(&observed_events, |event| {
             if event.proof_scope.is_empty() {
                 "unknown"
             } else {
                 event.proof_scope.as_str()
             }
         });
-        let recent_success_ready = latest
-            .map(|event| {
-                event.outcome == "accepted"
-                    && now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
-            })
-            .unwrap_or(false);
-        let message_delivery_ready = latest
-            .map(|event| {
-                event.outcome == "accepted"
-                    && event.proof_scope == "message_delivery"
-                    && now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
-            })
-            .unwrap_or(false);
-        let recent_message_delivery_ready = latest_message_delivery_age_seconds
-            .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
-            .unwrap_or(false);
-        let latest_is_fresh = latest_age_seconds
-            .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
-            .unwrap_or(false);
+        let clock_sanity_ready = future_events_ignored == 0;
+        let recent_success_ready = clock_sanity_ready
+            && latest
+                .map(|event| {
+                    event.outcome == "accepted"
+                        && now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+                })
+                .unwrap_or(false);
+        let message_delivery_ready = clock_sanity_ready
+            && latest
+                .map(|event| {
+                    event.outcome == "accepted"
+                        && event.proof_scope == "message_delivery"
+                        && now.saturating_sub(event.at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+                })
+                .unwrap_or(false);
+        let recent_message_delivery_ready = clock_sanity_ready
+            && latest_message_delivery_age_seconds
+                .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
+                .unwrap_or(false);
+        let latest_is_fresh = clock_sanity_ready
+            && latest_age_seconds
+                .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
+                .unwrap_or(false);
         let failure_streak_active = latest_is_fresh && consecutive_failures > 0;
         let failure_circuit_breaker_active = latest_is_fresh
             && consecutive_failures >= TWO_HOP_PATH_PROOF_FAILURE_CIRCUIT_BREAKER_THRESHOLD;
@@ -4657,7 +4687,9 @@ impl PeerStore {
             && stability_success_percent >= TWO_HOP_PATH_PROOF_STABILITY_SUCCESS_PERCENT
             && recent_message_delivery_ready
             && !failure_circuit_breaker_active;
-        let stability_status = if attempted == 0 {
+        let stability_status = if !clock_sanity_ready {
+            "clock_attention"
+        } else if attempted == 0 {
             "forming"
         } else if failure_circuit_breaker_active {
             "circuit_breaker"
@@ -4674,7 +4706,15 @@ impl PeerStore {
         } else {
             "failing"
         };
-        let (status, proof_ready, next_action) = if attempted == 0 {
+        let (status, proof_ready, next_action) = if !clock_sanity_ready {
+            (
+                "attention",
+                false,
+                format!(
+                    "verify the local clock before accepting future-dated {hop_label} path proof evidence"
+                ),
+            )
+        } else if attempted == 0 {
             (
                 "forming",
                 false,
@@ -4711,7 +4751,9 @@ impl PeerStore {
                 ),
             )
         };
-        let freshness_bucket = if attempted == 0 {
+        let freshness_bucket = if !clock_sanity_ready {
+            "future_ignored"
+        } else if attempted == 0 {
             "forming"
         } else if recent_success_ready {
             "fresh_success"
@@ -4735,6 +4777,7 @@ impl PeerStore {
             failure_streak_active,
             window_size: MAX_TWO_HOP_PATH_PROOF_EVENTS,
             retained_events: events.len(),
+            future_events_ignored,
             attempted,
             succeeded,
             message_delivery_successes,
@@ -10979,6 +11022,74 @@ mod tests {
         assert!(stale_history
             .next_action
             .contains("fresh two-hop path proof"));
+    }
+
+    #[test]
+    fn test_path_proof_history_fails_closed_until_future_evidence_is_observable() {
+        let store = PeerStore::new();
+        let now = 1_700_100_000;
+
+        for offset in [10, 20, 30] {
+            store.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                3,
+                3,
+                2,
+                1,
+            );
+            store.record_blind_relay_three_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                3,
+                1,
+                3,
+                2,
+            );
+        }
+
+        // [PATH-PROOF-CLOCK-GUARD 2026-08-03 by Codex] A wall-clock rollback
+        // must not make future proof events appear zero seconds old. Both hop
+        // histories share the same fail-closed summarizer.
+        let guarded = store.status(now);
+        for history in [
+            &guarded.two_hop_path_proof_history,
+            &guarded.three_hop_path_proof_history,
+        ] {
+            assert_eq!(history.retained_events, 3);
+            assert_eq!(history.future_events_ignored, 3);
+            assert_eq!(history.attempted, 0);
+            assert_eq!(history.status, "attention");
+            assert_eq!(history.freshness_bucket, "future_ignored");
+            assert_eq!(history.stability_status, "clock_attention");
+            assert!(!history.proof_ready);
+            assert!(!history.recent_success_ready);
+            assert!(!history.message_delivery_ready);
+            assert!(!history.recent_message_delivery_ready);
+            assert!(!history.stability_ready);
+            assert_eq!(history.latest_age_seconds, None);
+            assert_eq!(history.latest_message_delivery_age_seconds, None);
+            assert!(history.next_action.contains("local clock"));
+        }
+
+        // Once wall time has safely passed every retained event, the same
+        // signed aggregate evidence can mature naturally without manual reset.
+        let recovered = store.status(now + 40);
+        for history in [
+            &recovered.two_hop_path_proof_history,
+            &recovered.three_hop_path_proof_history,
+        ] {
+            assert_eq!(history.future_events_ignored, 0);
+            assert_eq!(history.attempted, 3);
+            assert_eq!(history.status, "ready");
+            assert_eq!(history.stability_status, "stable");
+            assert!(history.proof_ready);
+            assert!(history.recent_message_delivery_ready);
+            assert!(history.stability_ready);
+            assert_eq!(history.latest_message_delivery_age_seconds, Some(10));
+        }
     }
 
     #[test]
