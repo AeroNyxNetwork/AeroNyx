@@ -43,6 +43,9 @@
 //! - [ONION-NETWORK-DIVERSITY 2026-08-03 by Codex] Requires a pairwise
 //!   network-diverse candidate subset before multi-hop admission can become
 //!   ready, reusing the Rust path planner's fail-closed endpoint policy.
+//! - [ONION-DIVERSITY-AWARE-POOL 2026-08-03 by Codex] Preserves a lower-ranked
+//!   network-diverse subset before applying a small client response limit, so
+//!   healthier collocated relays cannot hide an otherwise valid onion path.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -98,8 +101,14 @@
 //!   pairwise-diverse subset using the same coarse IPv4 /24, IPv6 /48, and DNS
 //!   hostname policy as the internal Rust path planner. This does not prove
 //!   distinct operators or autonomous systems.
+//! - Apply a client response limit only after preserving a network-diverse
+//!   requested-hop subset (or a safe two-hop fallback). This endpoint prepares
+//!   an eligible pool; the client still chooses the actual weighted-random
+//!   route and must independently verify every signed descriptor.
 //!
 //! ## Last Modified
+//! v0.42.0-OnionDiversityAwarePool - Preserve a valid lower-ranked diverse
+//! subset when producing a client-limited public candidate pool.
 //! v0.41.0-OnionNetworkDiversity - Gate multi-hop candidate readiness on a
 //! pairwise network-diverse subset without exposing the selected path.
 //! v0.40.0-OnionCapabilityGate - Require signed ChatRelay + OnionMiddle
@@ -2114,7 +2123,7 @@ async fn onion_candidates_handler(
     // pool first, then apply every onion-hop eligibility rule before the
     // client limit and ranking. Limiting earlier can let ineligible high-rank
     // ChatRelay peers hide valid OnionMiddle relays below them.
-    let candidates: Vec<OnionRelayCandidate> = state
+    let eligible_candidates: Vec<OnionRelayCandidate> = state
         .peer_store
         .route_candidates_with_capability(
             NodeCapability::ChatRelay,
@@ -2138,7 +2147,6 @@ async fn onion_candidates_handler(
             let public_endpoint = descriptor.descriptor.public_endpoint.clone()?;
             Some((descriptor, kem_public, public_endpoint))
         })
-        .take(limit)
         .enumerate()
         .map(|(rank, (descriptor, kem_public, public_endpoint))| {
             let capacity = descriptor.descriptor.capacity.clone();
@@ -2157,6 +2165,12 @@ async fn onion_candidates_handler(
             }
         })
         .collect();
+    // [ONION-DIVERSITY-AWARE-POOL 2026-08-03 by Codex] The health-ranked
+    // weights above belong to the full eligible pool and remain unchanged.
+    // Preserve a diverse requested path before applying a small response
+    // limit, then let the client independently choose the actual route.
+    let candidates =
+        select_onion_candidate_response_pool(eligible_candidates, limit, requested_hops as usize);
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
     let min_candidates_for_requested_hops = requested_hops as usize;
     let requested_network_diversity_ready =
@@ -2312,15 +2326,15 @@ fn onion_requested_path_gates(
 /// [ONION-NETWORK-DIVERSITY 2026-08-03 by Codex] This bounded backtracking
 /// search shares the internal path planner's endpoint anti-affinity rule. It
 /// returns only one aggregate decision and never exposes the selected subset.
-fn onion_candidate_network_diversity_ready(
+fn onion_candidate_network_diverse_subset_indices(
     candidates: &[OnionRelayCandidate],
     required_hops: usize,
-) -> bool {
-    fn search<'a>(
-        candidates: &'a [OnionRelayCandidate],
+) -> Option<Vec<usize>> {
+    fn search(
+        candidates: &[OnionRelayCandidate],
         start: usize,
         remaining: usize,
-        selected: &mut Vec<&'a OnionRelayCandidate>,
+        selected: &mut Vec<usize>,
     ) -> bool {
         if remaining == 0 {
             return true;
@@ -2331,15 +2345,15 @@ fn onion_candidate_network_diversity_ready(
 
         for index in start..candidates.len() {
             let candidate = &candidates[index];
-            if selected.iter().any(|selected_candidate| {
+            if selected.iter().any(|selected_index| {
                 !PeerStore::route_endpoints_are_network_diverse(
                     &candidate.signed_descriptor,
-                    &selected_candidate.signed_descriptor,
+                    &candidates[*selected_index].signed_descriptor,
                 )
             }) {
                 continue;
             }
-            selected.push(candidate);
+            selected.push(index);
             if search(candidates, index + 1, remaining - 1, selected) {
                 return true;
             }
@@ -2349,12 +2363,75 @@ fn onion_candidate_network_diversity_ready(
     }
 
     if required_hops == 0 {
-        return true;
+        return Some(Vec::new());
     }
     if candidates.len() < required_hops {
-        return false;
+        return None;
     }
-    search(candidates, 0, required_hops, &mut Vec::new())
+    let mut selected = Vec::with_capacity(required_hops);
+    if search(candidates, 0, required_hops, &mut selected) {
+        Some(selected)
+    } else {
+        None
+    }
+}
+
+fn onion_candidate_network_diversity_ready(
+    candidates: &[OnionRelayCandidate],
+    required_hops: usize,
+) -> bool {
+    onion_candidate_network_diverse_subset_indices(candidates, required_hops).is_some()
+}
+
+/// Produces the bounded public pool without hiding a valid diverse path.
+///
+/// [ONION-DIVERSITY-AWARE-POOL 2026-08-03 by Codex] Ranking remains the
+/// health-derived ordering/weight from the full eligible pool. When the first
+/// `limit` entries are collocated, one lower-ranked candidate may be promoted
+/// into the response only to preserve a pairwise-diverse requested path. For a
+/// three-hop request that is not diverse-ready, a diverse two-hop subset is
+/// preserved as the safe fallback. This is pool construction, not server-side
+/// route selection; no chosen path, route id, or client metadata is exposed.
+fn select_onion_candidate_response_pool(
+    candidates: Vec<OnionRelayCandidate>,
+    limit: usize,
+    requested_hops: usize,
+) -> Vec<OnionRelayCandidate> {
+    if candidates.len() <= limit {
+        return candidates;
+    }
+
+    let requested_subset = (requested_hops >= 2 && limit >= requested_hops)
+        .then(|| onion_candidate_network_diverse_subset_indices(&candidates, requested_hops))
+        .flatten();
+    let fallback_subset = (requested_hops > ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+        && limit >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES)
+        .then(|| {
+            onion_candidate_network_diverse_subset_indices(
+                &candidates,
+                ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+            )
+        })
+        .flatten();
+    let preferred_indices = requested_subset.or(fallback_subset).unwrap_or_default();
+
+    let mut selected = Vec::with_capacity(limit.min(candidates.len()));
+    let mut included = vec![false; candidates.len()];
+    for index in preferred_indices {
+        if let Some(candidate) = candidates.get(index) {
+            included[index] = true;
+            selected.push(candidate.clone());
+        }
+    }
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if selected.len() >= limit {
+            break;
+        }
+        if !included[index] {
+            selected.push(candidate);
+        }
+    }
+    selected
 }
 
 fn recommended_onion_hops(
@@ -2827,6 +2904,24 @@ mod tests {
         };
         descriptor.policy = NodePolicy::default();
         SignedNodeDescriptor::sign(descriptor, &kp).unwrap()
+    }
+
+    fn onion_candidate_for_test(endpoint: &str, rank: usize) -> OnionRelayCandidate {
+        let signed_descriptor = signed_routeable_chat_descriptor(1, now_secs() + 300, endpoint);
+        let descriptor = &signed_descriptor.descriptor;
+        OnionRelayCandidate {
+            node_id: hex::encode(signed_descriptor.node_id()),
+            kem_alg: descriptor.kem_alg,
+            kem_public: hex::encode(descriptor.x25519_kem_public().unwrap()),
+            public_endpoint: descriptor.public_endpoint.clone().unwrap(),
+            capabilities: descriptor.capabilities.clone(),
+            selection_weight: onion_candidate_selection_weight(rank),
+            region: descriptor.policy.region.clone(),
+            max_sessions: descriptor.capacity.max_sessions,
+            max_bps: descriptor.capacity.max_bps,
+            max_pps: descriptor.capacity.max_pps,
+            signed_descriptor,
+        }
     }
 
     /// Records enough fresh aggregate evidence for the requested synthetic
@@ -3426,6 +3521,38 @@ mod tests {
         assert!(parsed
             .network_diversity_policy
             .contains("not_operator_or_as_proof"));
+    }
+
+    #[test]
+    fn test_bounded_onion_pool_preserves_lower_rank_network_diverse_candidate() {
+        let candidates = vec![
+            onion_candidate_for_test("https://192.0.2.10:8422", 0),
+            onion_candidate_for_test("https://192.0.2.20:8422", 1),
+            onion_candidate_for_test("https://198.51.100.10:8422", 2),
+            onion_candidate_for_test("https://203.0.113.10:8422", 3),
+        ];
+
+        let selected = select_onion_candidate_response_pool(candidates, 3, 3);
+
+        // [ONION-DIVERSITY-AWARE-POOL 2026-08-03 by Codex] The first three
+        // ranked entries cannot form a diverse path because two share an IPv4
+        // /24. The bounded pool must retain the fourth candidate, preserve its
+        // original health weight, and exclude one collocated relay.
+        assert_eq!(selected.len(), 3);
+        assert!(onion_candidate_network_diversity_ready(&selected, 3));
+        assert!(selected
+            .iter()
+            .any(|candidate| candidate.public_endpoint == "https://203.0.113.10:8422"));
+        assert!(selected
+            .iter()
+            .any(|candidate| candidate.selection_weight == 700));
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|candidate| candidate.public_endpoint.starts_with("https://192.0.2."))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
