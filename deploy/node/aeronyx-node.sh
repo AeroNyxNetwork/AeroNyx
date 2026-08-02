@@ -9,6 +9,9 @@
 #   lower-level building blocks while reducing operator confusion.
 #
 # Modification Reason:
+# - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Forward explicit node
+#   name, ISO region, and public VPN pool opt-in through plan, install, and
+#   quickstart without exposing the registration code.
 # - [LIVE-BUILD-RESOURCE-GUARD 2026-07-31 by Codex] Expose the upgrade
 #   resource policy through the unified operator entrypoint so same-host
 #   builds remain discoverable without calling the lower-level script.
@@ -86,6 +89,8 @@
 #   binary promotion, and network maintenance.
 # - Passes common options such as --repo-dir, --branch, --registration-code,
 #   --config, and --service to the appropriate lower-level script.
+# - Preserves optional onboarding metadata as paired arguments when delegating
+#   to the production installer.
 # - Keeps secret handling safe: registration codes are accepted as arguments or
 #   environment variables and are not printed by the plan path.
 #
@@ -116,6 +121,7 @@
 #   and Windows remain client/development platforms, not production node hosts.
 #
 # Last Modified:
+# v1.24.0-node-entrypoint - Added policy-safe VPN node registration options.
 # v1.23.0-node-entrypoint - Exposed live-safe upgrade build resource controls.
 # v1.22.0-node-entrypoint - Added exact commit-pinned isolated source upgrades.
 # v1.21.0-node-entrypoint - Added guarded Cargo build-cache inventory and pruning.
@@ -249,11 +255,17 @@ Common options:
   --config PATH            Config path for upgrade/health/status.
   --service NAME           systemd service name. Default: aeronyx-server
   --registration-code CODE Registration code for install.
+  --node-name NAME         Node name shown in nodeboard and the VPN pool.
+  --region CC              ISO 3166-1 alpha-2 deployment region.
+  --public-vpn             Opt in to the public VPN node pool.
   --dry-run                Preview actions where the delegated script supports it.
 
 Command-specific options:
   install:
     --quick                First-install shortcut. Requires a registration code.
+    --node-name NAME       Set the first-registration node name.
+    --region CC            Set the first-registration node region.
+    --public-vpn           Publish the registered VPN node; default is private.
     --start                Start service after install.
     --no-build             Skip release build.
     --no-network           Skip sysctl and NAT setup.
@@ -359,6 +371,7 @@ Command-specific options:
 Examples:
   ./deploy/node/aeronyx-node.sh plan --quick --registration-code NYX-1234-ABCDE
   ./deploy/node/aeronyx-node.sh quickstart --quick --registration-code NYX-1234-ABCDE
+  ./deploy/node/aeronyx-node.sh quickstart --registration-code NYX-1234-ABCDE --node-name TW1 --region TW --public-vpn
   sudo ./deploy/node/aeronyx-node.sh install --quick --registration-code NYX-1234-ABCDE
   sudo ./deploy/node/aeronyx-node.sh upgrade --no-restart
   ./deploy/node/aeronyx-node.sh health --json
@@ -438,6 +451,14 @@ parse_args() {
             --config) CONFIG_FILE="${2:?missing value}"; shift 2 ;;
             --service) SERVICE_NAME="${2:?missing value}"; shift 2 ;;
             --registration-code) REGISTRATION_CODE="${2:?missing value}"; shift 2 ;;
+            --node-name|--region)
+                EXTRA_ARGS+=("$1" "${2:?missing value}")
+                shift 2
+                ;;
+            --public-vpn)
+                EXTRA_ARGS+=("$1")
+                shift
+                ;;
             --force) FORCE=1; shift ;;
             --no-restart) NO_RESTART=1; shift ;;
             --dry-run) DRY_RUN=1; shift ;;

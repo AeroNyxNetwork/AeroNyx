@@ -121,6 +121,16 @@ node_info_path = "/etc/aeronyx/node_info.json"
 enabled = true
 advertise_self = true
 peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
+# [NODE-BOOTSTRAP-DEFAULTS 2026-08-02 by Codex] New nodes need both a signed
+# snapshot path for restart recovery and independent live seeds for gossip.
+# Operators may replace these endpoints, but should keep at least two nodes
+# under separate infrastructure control to avoid a single bootstrap dependency.
+bootstrap_snapshot_path = "/etc/aeronyx/bootstrap-peers.json"
+seed_endpoints = [
+  "http://8.213.146.244:8422",
+  "http://149.33.18.44:8422",
+  "http://111.68.15.70:8422",
+]
 # Optional signed local Directory Chain journal. Once configured, startup
 # verifies every stored block, chain link, Merkle root, producer, and
 # commitment index before the service proceeds. This database contains public

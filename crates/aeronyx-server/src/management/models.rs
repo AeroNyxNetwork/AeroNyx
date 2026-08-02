@@ -23,6 +23,12 @@
 //!   - Added `is_final` field to `SessionEventReport` so the backend can
 //!     distinguish a snapshot (upsert, no billing trigger) from a final
 //!     session_ended event (closes billing period).
+//!
+//! Modification Reason (v1.4.0-NodeOnboarding):
+//!   - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Added optional,
+//!     backward-compatible node name, VPN port, region, visibility, and VPN
+//!     capability fields to first-time registration. Older servers and callers
+//!     can continue sending the original three-field request unchanged.
 //!   - All existing fields and behaviour preserved verbatim.
 //!
 //! Main Data Structures:
@@ -56,6 +62,7 @@
 //!   v1.3.0 - Added Command and CommandStatusReport
 //!   v1.0.0-TrafficAccounting - Added SessionTrafficSnapshot event type,
 //!     is_final field to SessionEventReport
+//!   v1.4.0-NodeOnboarding - Added an optional node registration profile
 
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +79,40 @@ pub struct BindNodeRequest {
     pub public_key: String,
     /// Hardware information for node identification
     pub hardware_info: HardwareInfo,
+    /// Optional operator-selected node name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// VPN listener port derived from the validated Rust configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Optional ISO 3166-1 alpha-2 operator region.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_code: Option<String>,
+    /// Optional nodeboard visibility policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// Whether this Rust runtime provides the AeroNyx privacy network tunnel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_vpn_node: Option<bool>,
+}
+
+/// Optional policy-safe metadata supplied during first-time node binding.
+///
+/// The registration code remains the authority for binding. This profile only
+/// avoids stale backend defaults such as port 8001; it never contains private
+/// keys, registration secrets, user traffic, or client metadata.
+#[derive(Debug, Clone, Default)]
+pub struct NodeRegistrationProfile {
+    /// Operator-selected display name.
+    pub name: Option<String>,
+    /// Validated VPN listener port.
+    pub port: Option<u16>,
+    /// ISO 3166-1 alpha-2 region code.
+    pub region_code: Option<String>,
+    /// Explicit public/private visibility selection.
+    pub visibility: Option<String>,
+    /// Explicit VPN capability flag.
+    pub is_vpn_node: Option<bool>,
 }
 
 /// Hardware information collected from the system.
@@ -697,5 +738,53 @@ impl StoredNodeInfo {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(profile: NodeRegistrationProfile) -> BindNodeRequest {
+        BindNodeRequest {
+            code: "NYX-TEST-CODE".to_string(),
+            public_key: "ab".repeat(32),
+            hardware_info: HardwareInfo {
+                cpu: "test".to_string(),
+                memory: "test".to_string(),
+                os: "test".to_string(),
+            },
+            name: profile.name,
+            port: profile.port,
+            region_code: profile.region_code,
+            visibility: profile.visibility,
+            is_vpn_node: profile.is_vpn_node,
+        }
+    }
+
+    #[test]
+    fn legacy_registration_omits_optional_profile_fields() {
+        let value = serde_json::to_value(request(NodeRegistrationProfile::default())).unwrap();
+        for field in ["name", "port", "region_code", "visibility", "is_vpn_node"] {
+            assert!(value.get(field).is_none(), "unexpected field: {field}");
+        }
+    }
+
+    #[test]
+    fn registration_serializes_explicit_vpn_profile() {
+        let value = serde_json::to_value(request(NodeRegistrationProfile {
+            name: Some("TW1".to_string()),
+            port: Some(51820),
+            region_code: Some("TW".to_string()),
+            visibility: Some("public".to_string()),
+            is_vpn_node: Some(true),
+        }))
+        .unwrap();
+
+        assert_eq!(value["name"], "TW1");
+        assert_eq!(value["port"], 51820);
+        assert_eq!(value["region_code"], "TW");
+        assert_eq!(value["visibility"], "public");
+        assert_eq!(value["is_vpn_node"], true);
     }
 }

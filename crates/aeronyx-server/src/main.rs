@@ -25,6 +25,9 @@
 //!   import command backed by the signed schema-v10 certificate history.
 //! - v1.7.0-AuthenticatedCertificatePull: add explicit pinned-source network
 //!   retrieval with a strict certificate-age gate before durable import.
+//! - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Bind the validated VPN
+//!   listener port and optional operator name/region/public policy during the
+//!   one-time registration request instead of accepting stale CMS defaults.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -43,6 +46,7 @@
 //! hash-linked third-party certificate persistence and restart audit
 //! v1.7.0-AuthenticatedCertificatePull - Add hardened pinned-source certificate
 //! pull, exact response verification, local trust policy, and freshness gate
+//! v1.8.0-NodeOnboarding - Add policy-safe node registration metadata
 
 use std::fs::File;
 use std::io::Read;
@@ -61,7 +65,7 @@ use aeronyx_server::api::auth::ensure_api_secret;
 use aeronyx_server::api::directory_replica_sync::{
     build_directory_certificate_exchange_http_client, fetch_authenticated_observation_certificate,
 };
-use aeronyx_server::management::models::StoredNodeInfo;
+use aeronyx_server::management::models::{NodeRegistrationProfile, StoredNodeInfo};
 use aeronyx_server::services::directory_replica::{
     verify_directory_observation_certificate_frame as verify_portable_observation_certificate_frame,
     DirectoryObservationCertificateTrustPolicy,
@@ -99,6 +103,18 @@ enum Commands {
         /// CMS API URL (usually not needed, uses default)
         #[arg(long, hide = true)]
         cms_url: Option<String>,
+
+        /// Operator-facing node name shown in nodeboard and the VPN pool
+        #[arg(long, value_name = "NAME")]
+        node_name: Option<String>,
+
+        /// ISO 3166-1 alpha-2 deployment region (for example TW or KR)
+        #[arg(long, value_name = "CC")]
+        region: Option<String>,
+
+        /// Publish this VPN node in the authenticated public node pool
+        #[arg(long)]
+        public_vpn: bool,
     },
 
     /// Start the server
@@ -331,7 +347,10 @@ async fn main() {
             code,
             config,
             cms_url,
-        } => cmd_register(code, config, cms_url).await,
+            node_name,
+            region,
+            public_vpn,
+        } => cmd_register(code, config, cms_url, node_name, region, public_vpn).await,
         Commands::Start { config } => cmd_start(config).await,
         Commands::Status { config } => cmd_status(config).await,
         Commands::Validate { config } => cmd_validate(config).await,
@@ -350,11 +369,45 @@ async fn main() {
 // Commands
 // ============================================
 
+/// Validates an optional node name before it reaches the one-time bind API.
+fn normalize_registration_name(value: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "node name cannot be empty");
+    anyhow::ensure!(
+        value.chars().count() <= 100,
+        "node name cannot exceed 100 characters"
+    );
+    anyhow::ensure!(
+        !value.chars().any(char::is_control),
+        "node name cannot contain control characters"
+    );
+    Ok(Some(value.to_string()))
+}
+
+/// Normalizes an optional ISO 3166-1 alpha-2 region code.
+fn normalize_registration_region(value: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    anyhow::ensure!(
+        value.len() == 2 && value.bytes().all(|byte| byte.is_ascii_alphabetic()),
+        "region must be a two-letter ISO 3166-1 alpha-2 code"
+    );
+    Ok(Some(value.to_ascii_uppercase()))
+}
+
 /// Registers node with CMS.
 async fn cmd_register(
     code: String,
     config_path: PathBuf,
     cms_url_override: Option<String>,
+    node_name: Option<String>,
+    region: Option<String>,
+    public_vpn: bool,
 ) -> anyhow::Result<()> {
     println!("🚀 AeroNyx Node Registration");
     println!("════════════════════════════════════════");
@@ -394,11 +447,21 @@ async fn cmd_register(
     }
 
     let client = ManagementClient::new(mgmt_config.clone(), identity);
+    let registration_profile = NodeRegistrationProfile {
+        name: normalize_registration_name(node_name)?,
+        port: Some(config.listen_addr().port()),
+        region_code: normalize_registration_region(region)?,
+        visibility: public_vpn.then(|| "public".to_string()),
+        is_vpn_node: Some(true),
+    };
 
     println!("📡 Connecting to AeroNyx network...");
     println!();
 
-    match client.register_node(&code).await {
+    match client
+        .register_node_with_profile(&code, registration_profile)
+        .await
+    {
         Ok(node_info) => {
             let stored = StoredNodeInfo {
                 node_id: node_info.id.clone(),
@@ -1712,6 +1775,26 @@ mod tests {
         DirectoryObservationWitnessReceiptV1, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
     };
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn registration_profile_normalizes_operator_metadata() {
+        assert_eq!(
+            normalize_registration_name(Some("  TW1  ".to_string())).unwrap(),
+            Some("TW1".to_string())
+        );
+        assert_eq!(
+            normalize_registration_region(Some("tw".to_string())).unwrap(),
+            Some("TW".to_string())
+        );
+    }
+
+    #[test]
+    fn registration_profile_rejects_unsafe_metadata() {
+        assert!(normalize_registration_name(Some("TW1\nadmin".to_string())).is_err());
+        assert!(normalize_registration_name(Some(" ".to_string())).is_err());
+        assert!(normalize_registration_region(Some("taiwan".to_string())).is_err());
+        assert!(normalize_registration_region(Some("T1".to_string())).is_err());
+    }
 
     fn portable_observation_certificate_fixture() -> (Vec<u8>, [u8; 32], [u8; 32], Vec<[u8; 32]>) {
         let observer = IdentityKeyPair::from_bytes(&[0x31; 32]).unwrap();

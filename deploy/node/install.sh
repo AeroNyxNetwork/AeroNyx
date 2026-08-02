@@ -8,6 +8,9 @@
 #   sysctl, iptables, and build commands.
 #
 # Modification Reason:
+# - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Add explicit node name,
+#   ISO region, and public VPN registration flags. The Rust listener port and
+#   VPN capability are bound automatically; public visibility stays opt-in.
 # - [GIT-WORKTREE-COMPAT 2026-07-26 by Codex] Recognize linked Git worktrees
 #   through Git plumbing instead of requiring `.git` to be a directory.
 # - [PINNED-RUST-BUILD 2026-07-26 by Codex] Pin production builds to the
@@ -78,6 +81,8 @@
 # - Builds the aeronyx-server release binary from the pinned Cargo.lock graph.
 # - Verifies, installs, and enables the systemd service.
 # - Optionally configures IP forwarding/NAT and registers/starts the node.
+# - Sends validated operator metadata during one-time registration so nodeboard
+#   does not retain stale My Node / port 8001 / non-VPN defaults.
 # - Persists VPN forwarding/NAT across host reboots.
 # - Renders and verifies reboot network restore with distro-specific
 #   sysctl/iptables paths.
@@ -121,8 +126,12 @@
 # - Keep rust-toolchain.toml exact. Never use a moving stable/beta/nightly
 #   channel for a production node release.
 # - Keep Cargo output outside the live repo target until validation succeeds.
+# - Keep --public-vpn opt-in. Permissionless nodes must not become publicly
+#   listed merely because they run the protocol binary.
 #
 # Last Modified:
+# v1.28.0-node-deploy - Adds policy-safe node registration metadata and an
+#                       explicit public VPN pool opt-in.
 # v1.27.0-node-deploy - Supports both regular clones and linked Git worktrees.
 # v1.26.0-node-deploy - Pins the Rust compiler, isolates build artifacts by
 #                       toolchain/service, and atomically promotes the binary.
@@ -192,12 +201,15 @@ SYSCTL_FILE="/etc/sysctl.d/99-aeronyx.conf"
 IPTABLES_RULES_FILE="/etc/iptables/rules.v4"
 LOCK_FILE="/run/lock/${SERVICE_NAME}.deploy.lock"
 LOCK_DIR=""
-SCRIPT_VERSION="v1.27.0-node-deploy"
+SCRIPT_VERSION="v1.28.0-node-deploy"
 
 REPO_URL="${AERONYX_REPO_URL:-${DEFAULT_REPO_URL}}"
 BRANCH="${AERONYX_BRANCH:-${DEFAULT_BRANCH}}"
 REPO_DIR="${AERONYX_REPO_DIR:-${DEFAULT_REPO_DIR}}"
 REGISTRATION_CODE="${AERONYX_REGISTRATION_CODE:-}"
+NODE_NAME="${AERONYX_NODE_NAME:-}"
+NODE_REGION="${AERONYX_NODE_REGION:-}"
+PUBLIC_VPN=0
 DO_BUILD=1
 DO_NETWORK=1
 DO_START=0
@@ -221,6 +233,10 @@ BUILD_BINARY=""
 
 case "${AERONYX_START:-}" in
     1|true|TRUE|yes|YES|on|ON) DO_START=1 ;;
+esac
+
+case "${AERONYX_PUBLIC_VPN:-}" in
+    1|true|TRUE|yes|YES|on|ON) PUBLIC_VPN=1 ;;
 esac
 
 if [ -n "${REGISTRATION_CODE}" ]; then
@@ -381,6 +397,10 @@ Options:
   --branch NAME           Git branch or ref. Default: main
   --repo-dir PATH         Install repository path. Default: /opt/aeronyx/AeroNyx
   --registration-code C   Register node after build.
+  --node-name NAME        Node name shown in nodeboard and the VPN pool.
+  --region CC             ISO 3166-1 alpha-2 deployment region, e.g. TW.
+  --public-vpn            Publish the registered VPN node in the public pool.
+                          Omit this flag to keep visibility private.
   --quick                 First-install shortcut. Requires --registration-code
                           or AERONYX_REGISTRATION_CODE and starts the service.
   --print-plan            Print resolved install options and exit without
@@ -404,6 +424,8 @@ Options:
 
 Examples:
   sudo ./deploy/node/install.sh --registration-code NYX-1234-ABCDE --start
+  sudo ./deploy/node/install.sh --registration-code NYX-1234-ABCDE \
+    --node-name TW1 --region TW --public-vpn --start
   sudo AERONYX_REGISTRATION_CODE=NYX-1234-ABCDE ./deploy/node/install.sh --quick
   AERONYX_REGISTRATION_CODE=NYX-1234-ABCDE ./deploy/node/install.sh --quick --print-plan
   sudo ./deploy/node/install.sh --repo-dir /root/open/AeroNyx --no-build --no-network
@@ -416,6 +438,9 @@ while [ "$#" -gt 0 ]; do
         --branch) BRANCH="${2:?missing value}"; shift 2 ;;
         --repo-dir) REPO_DIR="${2:?missing value}"; shift 2 ;;
         --registration-code) REGISTRATION_CODE="${2:?missing value}"; DO_START=1; shift 2 ;;
+        --node-name) NODE_NAME="${2:?missing value}"; shift 2 ;;
+        --region) NODE_REGION="${2:?missing value}"; shift 2 ;;
+        --public-vpn) PUBLIC_VPN=1; shift ;;
         --quick) QUICK=1; DO_START=1; shift ;;
         --print-plan) PRINT_PLAN=1; shift ;;
         --start) DO_START=1; shift ;;
@@ -485,6 +510,21 @@ validate_option_combinations() {
     if [ "${QUICK}" -eq 1 ] && [ -z "${REGISTRATION_CODE}" ]; then
         die "--quick requires --registration-code or AERONYX_REGISTRATION_CODE."
     fi
+    if { [ -n "${NODE_NAME}" ] || [ -n "${NODE_REGION}" ] || [ "${PUBLIC_VPN}" -eq 1 ]; } \
+        && [ -z "${REGISTRATION_CODE}" ]; then
+        die "--node-name, --region, and --public-vpn require a registration code."
+    fi
+    if [ -n "${NODE_NAME}" ]; then
+        [ "${#NODE_NAME}" -le 100 ] || die "--node-name cannot exceed 100 characters."
+        case "${NODE_NAME}" in
+            *$'\n'*|*$'\r'*|*$'\t'*) die "--node-name cannot contain control characters." ;;
+        esac
+    fi
+    if [ -n "${NODE_REGION}" ]; then
+        printf '%s' "${NODE_REGION}" | grep -Eq '^[A-Za-z]{2}$' \
+            || die "--region must be a two-letter ISO 3166-1 alpha-2 code."
+        NODE_REGION="$(printf '%s' "${NODE_REGION}" | tr '[:lower:]' '[:upper:]')"
+    fi
     if [ "${QUICK}" -eq 1 ] && { [ "${CONFIG_ONLY}" -eq 1 ] || [ "${PREFLIGHT_ONLY}" -eq 1 ] || [ "${NETWORK_ONLY}" -eq 1 ]; }; then
         die "--quick cannot be combined with --config-only, --preflight-only, or --network-only."
     fi
@@ -521,6 +561,9 @@ build_target_root=${BUILD_TARGET_ROOT}
 allow_dirty=$(bool_word "${ALLOW_DIRTY}")
 dry_run=$(bool_word "${DRY_RUN}")
 set_vpn_cidr=$([ -n "${SET_VPN_CIDR}" ] && printf '%s' "${SET_VPN_CIDR}" || printf 'none')
+node_name=$([ -n "${NODE_NAME}" ] && printf '%s' "${NODE_NAME}" || printf 'backend-default')
+node_region=$([ -n "${NODE_REGION}" ] && printf '%s' "${NODE_REGION}" || printf 'backend-default')
+public_vpn=$(bool_word "${PUBLIC_VPN}")
 registration_code_present=$([ -n "${REGISTRATION_CODE}" ] && printf 'yes' || printf 'no')
 registration_code_value=hidden
 PLAN
@@ -1309,11 +1352,32 @@ install_service() {
 register_node() {
     [ -n "${REGISTRATION_CODE}" ] || { ok "Node registration skipped"; return 0; }
 
+    local register_args
+    register_args=(
+        "${REPO_DIR}/target/release/aeronyx-server"
+        register
+        --code "${REGISTRATION_CODE}"
+        -c "${CONFIG_FILE}"
+    )
+    if [ -n "${NODE_NAME}" ]; then
+        register_args+=(--node-name "${NODE_NAME}")
+    fi
+    if [ -n "${NODE_REGION}" ]; then
+        register_args+=(--region "${NODE_REGION}")
+    fi
+    if [ "${PUBLIC_VPN}" -eq 1 ]; then
+        register_args+=(--public-vpn)
+    fi
+
     log "Registering node with provided registration code"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        printf '[DRY-RUN] %s/target/release/aeronyx-server register --code *** -c %s\n' "${REPO_DIR}" "${CONFIG_FILE}"
+        printf '[DRY-RUN] %s/target/release/aeronyx-server register --code *** -c %s' "${REPO_DIR}" "${CONFIG_FILE}"
+        [ -n "${NODE_NAME}" ] && printf ' --node-name %q' "${NODE_NAME}"
+        [ -n "${NODE_REGION}" ] && printf ' --region %q' "${NODE_REGION}"
+        [ "${PUBLIC_VPN}" -eq 1 ] && printf ' --public-vpn'
+        printf '\n'
     else
-        "${REPO_DIR}/target/release/aeronyx-server" register --code "${REGISTRATION_CODE}" -c "${CONFIG_FILE}"
+        "${register_args[@]}"
     fi
 }
 

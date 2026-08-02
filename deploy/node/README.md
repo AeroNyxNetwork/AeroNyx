@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Document explicit public
+  VPN registration metadata and signed discovery restart defaults so a fresh
+  node does not require manual backend or server.toml repair.
 - [SESSION-GATED-PROMOTION 2026-07-31 by Codex] Document post-build session
   gates that prevent binary/unit promotion from leaving a half-deployed node
   when traffic appears during a long release build.
@@ -104,6 +107,8 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.47.0-node-deploy - Documented policy-safe public VPN onboarding and signed
+                     discovery bootstrap defaults.
 v1.46.0-node-deploy - Documented transactional post-build session gates.
 v1.45.0-node-deploy - Documented live-safe same-host release builds.
 v1.44.0-node-deploy - Documented exact commit-pinned isolated source upgrades.
@@ -371,6 +376,20 @@ git pull --ff-only origin main
 sudo ./deploy/node/install.sh --registration-code <NODEBOARD_CODE> --start
 ```
 
+Register a named public VPN node without a follow-up database edit:
+
+```bash
+sudo ./deploy/node/aeronyx-node.sh quickstart \
+  --registration-code <NODEBOARD_CODE> \
+  --node-name TW1 \
+  --region TW \
+  --public-vpn
+```
+
+`--public-vpn` is an explicit operator choice. Without it, the Rust runtime is
+still registered as VPN-capable with its configured listener port, but remains
+private in nodeboard and is not returned by the public VPN pool endpoint.
+
 For the lowest-friction first install, pass the nodeboard registration code as
 an environment variable and let `--quick` keep the normal commercial defaults:
 
@@ -392,6 +411,9 @@ that generate one-line setup commands:
 - `AERONYX_BRANCH`
 - `AERONYX_REPO_DIR`
 - `AERONYX_REGISTRATION_CODE`
+- `AERONYX_NODE_NAME`
+- `AERONYX_NODE_REGION`
+- `AERONYX_PUBLIC_VPN=1`
 - `AERONYX_START=1`
 
 Verify a generated command without root access, package installation, network
@@ -1030,11 +1052,20 @@ purge allow-list:
 - TUN device: `aeronyx0`
 - max connections: `1000`
 - management API: `https://api.aeronyx.network/api/privacy_network`
+- signed bootstrap snapshot: `/etc/aeronyx/bootstrap-peers.json`
+- discovery recovery: three independent public seed endpoints
 - MemChain: `off`
 - ChatRelay: disabled by default; explicit opt-in through
   `[memchain.chat_relay].enabled = true`
 - OnionMiddle: disabled by default; explicit no-exit opt-in through
   `[discovery].advertise_onion_middle = true`
+
+The bootstrap snapshot contains signed public node descriptors only. The
+runtime verifies each descriptor before use; operators must refresh it with
+`aeronyx-node.sh refresh-bootstrap` instead of hand-editing endpoints inside
+the JSON. Live `seed_endpoints` provide recovery when the local cache or
+snapshot is absent, while the signed peer store remains the source of routing
+identity and capability truth.
 
 `vpn.virtual_ip_range` and `tun.device_name` are operational inputs, not only
 application settings. `install.sh` uses them when writing host NAT/FORWARD

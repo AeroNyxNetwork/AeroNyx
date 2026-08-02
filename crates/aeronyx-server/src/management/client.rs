@@ -106,6 +106,8 @@
 //   v2.8.56        - Added role-isolated sticky security-stop timestamps
 //   v2.8.57        - Added verified-unpersisted follower certificate outcomes
 //   v2.8.59        - Added fail-closed composite follower readiness
+//   v2.9.0         - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Added
+//                    optional policy-safe first-registration metadata
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -709,11 +711,30 @@ impl ManagementClient {
 
     /// Registers the node with the CMS using a binding code.
     pub async fn register_node(&self, code: &str) -> Result<NodeInfo, String> {
+        self.register_node_with_profile(code, NodeRegistrationProfile::default())
+            .await
+    }
+
+    /// Registers the node with optional operator-selected public metadata.
+    ///
+    /// The original `register_node` method remains available for callers that
+    /// rely on backend defaults. The profile contains no key material, binding
+    /// code, client metadata, or traffic information.
+    pub async fn register_node_with_profile(
+        &self,
+        code: &str,
+        profile: NodeRegistrationProfile,
+    ) -> Result<NodeInfo, String> {
         let url = format!("{}/node/bind/", self.config.cms_url);
         let request = BindNodeRequest {
             code: code.to_string(),
             public_key: self.node_id(),
             hardware_info: HardwareInfo::collect(),
+            name: profile.name,
+            port: profile.port,
+            region_code: profile.region_code,
+            visibility: profile.visibility,
+            is_vpn_node: profile.is_vpn_node,
         };
 
         info!("Registering node...");
