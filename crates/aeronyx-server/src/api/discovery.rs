@@ -34,6 +34,9 @@
 //! - [THREE-HOP-FEATURE-NEGOTIATION 2026-08-02 by Codex] Advertises whether
 //!   this runtime can validate a terminal delivery receipt propagated through
 //!   more than one middle relay, allowing safe mixed-version probe selection.
+//! - [ONION-PATH-ADMISSION 2026-08-02 by Codex] Fails closed when a requested
+//!   multi-hop path has enough candidates but lacks stable runtime proof or
+//!   restart-continuity evidence, with an explicit lower-hop fallback.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -78,8 +81,13 @@
 //! - Protocol feature fields are unsigned compatibility hints only. They may
 //!   suppress an optional probe, but must never grant route trust or replace
 //!   terminal signature and payload-commitment verification.
+//! - Candidate count alone must never make a multi-hop path ready. Keep
+//!   `requested_path_ready` gated by the matching two-hop or three-hop runtime
+//!   proof and signed restart-continuity decision.
 //!
 //! ## Last Modified
+//! v0.39.0-OnionPathAdmission - Gate requested multi-hop candidate plans on
+//! stable matching runtime proof and signed restart continuity.
 //! v0.38.0-PathProofRollbackAnchor - Require local recovery-anchor and optional
 //! external-witness readiness before signed proof continuity becomes ready
 //! v0.37.0-ThreeHopSignedRecovery - Expose aggregate signed persistence and
@@ -315,6 +323,30 @@ enum OnionPrivacyMode {
     High,
 }
 
+/// Internal fail-closed gates for the path requested by an App or SDK.
+///
+/// [ONION-PATH-ADMISSION 2026-08-02 by Codex] Candidate availability,
+/// runtime delivery proof, and restart continuity are deliberately separate.
+/// This keeps a populated descriptor pool from being mistaken for an actually
+/// exercised multi-hop transport. The structure contains aggregate booleans
+/// only and must never carry selected relays or route metadata.
+#[derive(Debug, Clone, Copy)]
+struct OnionRequestedPathGates {
+    candidate_pool_ready: bool,
+    runtime_proof_required: bool,
+    runtime_proof_ready: bool,
+    restart_continuity_required: bool,
+    restart_continuity_ready: bool,
+}
+
+impl OnionRequestedPathGates {
+    fn ready(self) -> bool {
+        self.candidate_pool_ready
+            && (!self.runtime_proof_required || self.runtime_proof_ready)
+            && (!self.restart_continuity_required || self.restart_continuity_ready)
+    }
+}
+
 impl OnionPrivacyMode {
     fn from_query(value: Option<&str>) -> Self {
         match value
@@ -415,21 +447,34 @@ pub struct OnionCandidatesResponse {
     pub min_candidates_for_requested_hops: usize,
     /// Whether this candidate set can satisfy the requested hop count.
     pub requested_path_ready: bool,
+    /// Whether enough distinct routeable candidates exist for the requested
+    /// hop count before runtime proof gates are applied.
+    pub requested_candidate_pool_ready: bool,
+    /// Whether this requested path requires matching runtime delivery proof.
+    pub requested_runtime_proof_required: bool,
+    /// Whether the matching runtime delivery proof gate currently passes.
+    pub requested_runtime_proof_ready: bool,
+    /// Whether this requested path requires signed restart continuity.
+    pub requested_restart_continuity_required: bool,
+    /// Whether the matching signed restart-continuity gate currently passes.
+    pub requested_restart_continuity_ready: bool,
     /// Best hop count the client can safely attempt from this response.
     pub recommended_hops: u8,
-    /// Whether the client should fall back to the standard encrypted relay path
-    /// before attempting to build an onion envelope.
+    /// Whether the requested path cannot currently be satisfied and the client
+    /// must follow `route_plan` as a lower-hop or standard encrypted fallback.
     pub fallback_required: bool,
-    /// Aggregate candidate-pool maturity bucket.
+    /// Aggregate requested-path maturity bucket.
     ///
-    /// Stable values are `ready`, `warming`, `empty`, or `client_limited`.
+    /// Stable values are `ready`, `proof_warming`, `continuity_warming`,
+    /// `warming`, `empty`, or `client_limited`.
     /// This lets App, nodeboard, backend aggregation, and AI-agent runbooks
     /// distinguish a usable pool from a partial pool without inspecting
     /// individual relay metadata.
     pub pool_status: String,
     /// Privacy-safe route plan recommendation for clients.
     ///
-    /// Stable values are `two_hop_onion_path` or `standard_relay_fallback`.
+    /// Stable values are `three_hop_onion_path`, `two_hop_onion_path`,
+    /// `single_hop_encrypted_relay`, or `standard_relay_fallback`.
     /// The server never returns route ids, selected path ids, receiver
     /// identities, payload metadata, or client information here.
     pub route_plan: String,
@@ -2054,19 +2099,48 @@ async fn onion_candidates_handler(
         .collect();
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
     let min_candidates_for_requested_hops = requested_hops as usize;
-    let requested_path_ready = candidates.len() >= min_candidates_for_requested_hops;
-    let recommended_hops = recommended_onion_hops(candidates.len(), requested_hops);
-    let fallback_reason =
-        onion_candidate_fallback_reason(candidates.len(), limit, min_candidates_for_requested_hops);
-    let pool_status =
-        onion_candidate_pool_status(candidates.len(), limit, min_candidates_for_requested_hops);
-    let route_plan = onion_candidate_route_plan(requested_path_ready, recommended_hops);
+    let peer_status = state.peer_store.status(now);
+    let requested_path_gates = onion_requested_path_gates(
+        &peer_status,
+        requested_hops,
+        candidates.len() >= min_candidates_for_requested_hops,
+    );
+    let requested_path_ready = requested_path_gates.ready();
+    let two_hop_fallback_ready = requested_hops > 2
+        && onion_requested_path_gates(
+            &peer_status,
+            2,
+            candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+        )
+        .ready();
+    let recommended_hops = recommended_onion_hops(
+        candidates.len(),
+        requested_hops,
+        requested_path_ready,
+        two_hop_fallback_ready,
+    );
+    let fallback_reason = onion_candidate_fallback_reason(
+        candidates.len(),
+        limit,
+        min_candidates_for_requested_hops,
+        requested_path_gates,
+    );
+    let pool_status = onion_candidate_pool_status(
+        candidates.len(),
+        limit,
+        min_candidates_for_requested_hops,
+        requested_path_gates,
+    );
+    let route_plan =
+        onion_candidate_route_plan(requested_path_ready, requested_hops, recommended_hops);
     let readiness_reason = onion_candidate_readiness_reason(
         candidates.len(),
         limit,
         min_candidates_for_requested_hops,
+        requested_path_gates,
     );
-    let next_action = onion_candidate_next_action(requested_path_ready, fallback_reason);
+    let next_action =
+        onion_candidate_next_action(requested_path_ready, recommended_hops, fallback_reason);
 
     Json(OnionCandidatesResponse {
         generated_at: now,
@@ -2079,6 +2153,12 @@ async fn onion_candidates_handler(
         requested_hops,
         min_candidates_for_requested_hops,
         requested_path_ready,
+        requested_candidate_pool_ready: requested_path_gates.candidate_pool_ready,
+        requested_runtime_proof_required: requested_path_gates.runtime_proof_required,
+        requested_runtime_proof_ready: requested_path_gates.runtime_proof_ready,
+        requested_restart_continuity_required: requested_path_gates
+            .restart_continuity_required,
+        requested_restart_continuity_ready: requested_path_gates.restart_continuity_ready,
         recommended_hops,
         fallback_required: !requested_path_ready,
         pool_status: pool_status.to_string(),
@@ -2107,8 +2187,63 @@ fn normalize_requested_hops(mode: OnionPrivacyMode, requested: Option<u8>) -> u8
         .clamp(1, ONION_CANDIDATES_MAX_CLIENT_HOPS)
 }
 
-fn recommended_onion_hops(candidate_count: usize, requested_hops: u8) -> u8 {
-    (candidate_count.min(requested_hops as usize) as u8).min(ONION_CANDIDATES_MAX_CLIENT_HOPS)
+fn onion_requested_path_gates(
+    status: &PeerStoreStatus,
+    requested_hops: u8,
+    candidate_pool_ready: bool,
+) -> OnionRequestedPathGates {
+    let runtime_proof_required = requested_hops >= 2;
+    let restart_continuity_required = requested_hops >= 2;
+    let (runtime_proof_ready, restart_continuity_ready) = match requested_hops {
+        3.. => {
+            let proof = &status.three_hop_path_proof_history;
+            let continuity = three_hop_proof_restart_continuity(status);
+            (
+                proof.recent_message_delivery_ready
+                    && proof.stability_ready
+                    && !proof.failure_streak_active
+                    && !proof.failure_circuit_breaker_active,
+                continuity.peer_recovery_configured && continuity.ready,
+            )
+        }
+        2 => {
+            let proof = &status.two_hop_path_proof_history;
+            let continuity = two_hop_proof_restart_continuity(status);
+            (
+                proof.recent_message_delivery_ready
+                    && proof.stability_ready
+                    && !proof.failure_streak_active
+                    && !proof.failure_circuit_breaker_active,
+                continuity.peer_recovery_configured && continuity.ready,
+            )
+        }
+        _ => (true, true),
+    };
+
+    OnionRequestedPathGates {
+        candidate_pool_ready,
+        runtime_proof_required,
+        runtime_proof_ready,
+        restart_continuity_required,
+        restart_continuity_ready,
+    }
+}
+
+fn recommended_onion_hops(
+    candidate_count: usize,
+    requested_hops: u8,
+    requested_path_ready: bool,
+    two_hop_fallback_ready: bool,
+) -> u8 {
+    let candidate_recommendation =
+        (candidate_count.min(requested_hops as usize) as u8).min(ONION_CANDIDATES_MAX_CLIENT_HOPS);
+    if requested_path_ready {
+        candidate_recommendation
+    } else if requested_hops > 2 && two_hop_fallback_ready {
+        2
+    } else {
+        candidate_recommendation.min(1)
+    }
 }
 
 fn onion_candidate_selection_weight(rank: usize) -> u16 {
@@ -2121,20 +2256,33 @@ fn onion_candidate_pool_status(
     candidate_count: usize,
     limit: usize,
     required_candidates: usize,
+    gates: OnionRequestedPathGates,
 ) -> &'static str {
-    if candidate_count >= required_candidates {
-        "ready"
-    } else if limit < required_candidates {
-        "client_limited"
-    } else if candidate_count == 0 {
-        "empty"
+    if !gates.candidate_pool_ready {
+        if limit < required_candidates {
+            "client_limited"
+        } else if candidate_count == 0 {
+            "empty"
+        } else {
+            "warming"
+        }
+    } else if gates.runtime_proof_required && !gates.runtime_proof_ready {
+        "proof_warming"
+    } else if gates.restart_continuity_required && !gates.restart_continuity_ready {
+        "continuity_warming"
     } else {
-        "warming"
+        "ready"
     }
 }
 
-fn onion_candidate_route_plan(requested_path_ready: bool, recommended_hops: u8) -> &'static str {
-    if !requested_path_ready {
+fn onion_candidate_route_plan(
+    requested_path_ready: bool,
+    requested_hops: u8,
+    recommended_hops: u8,
+) -> &'static str {
+    if !requested_path_ready && requested_hops > 2 && recommended_hops == 2 {
+        "two_hop_onion_path"
+    } else if !requested_path_ready {
         "standard_relay_fallback"
     } else if recommended_hops >= 3 {
         "three_hop_onion_path"
@@ -2151,22 +2299,29 @@ fn onion_candidate_fallback_reason(
     candidate_count: usize,
     limit: usize,
     required_candidates: usize,
+    gates: OnionRequestedPathGates,
 ) -> &'static str {
-    if candidate_count >= required_candidates {
-        "ready"
-    } else if limit < required_candidates {
+    if !gates.candidate_pool_ready && limit < required_candidates {
         if required_candidates == ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
             "client_limit_below_two_hop_minimum"
         } else {
             "client_limit_below_requested_hops"
         }
-    } else if candidate_count == 0 {
+    } else if !gates.candidate_pool_ready && candidate_count == 0 {
         "no_routeable_candidates"
-    } else if candidate_count == 1 && required_candidates == ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+    } else if !gates.candidate_pool_ready
+        && candidate_count == 1
+        && required_candidates == ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
     {
         "single_routeable_candidate"
-    } else {
+    } else if !gates.candidate_pool_ready {
         "insufficient_routeable_candidates"
+    } else if gates.runtime_proof_required && !gates.runtime_proof_ready {
+        "requested_path_runtime_proof_not_ready"
+    } else if gates.restart_continuity_required && !gates.restart_continuity_ready {
+        "requested_path_restart_continuity_not_ready"
+    } else {
+        "ready"
     }
 }
 
@@ -2174,8 +2329,9 @@ fn onion_candidate_readiness_reason(
     candidate_count: usize,
     limit: usize,
     required_candidates: usize,
+    gates: OnionRequestedPathGates,
 ) -> &'static str {
-    match onion_candidate_fallback_reason(candidate_count, limit, required_candidates) {
+    match onion_candidate_fallback_reason(candidate_count, limit, required_candidates, gates) {
         "ready" => {
             if required_candidates == ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
                 "two_hop_candidate_pool_ready"
@@ -2187,13 +2343,25 @@ fn onion_candidate_readiness_reason(
         "client_limit_below_requested_hops" => "client_limit_blocks_requested_hops",
         "no_routeable_candidates" => "waiting_for_routeable_kem_relays",
         "single_routeable_candidate" => "waiting_for_second_routeable_kem_relay",
+        "requested_path_runtime_proof_not_ready" => {
+            "waiting_for_stable_requested_path_runtime_proof"
+        }
+        "requested_path_restart_continuity_not_ready" => {
+            "waiting_for_requested_path_restart_continuity"
+        }
         _ => "waiting_for_more_routeable_kem_relays",
     }
 }
 
-fn onion_candidate_next_action(requested_path_ready: bool, fallback_reason: &str) -> &'static str {
+fn onion_candidate_next_action(
+    requested_path_ready: bool,
+    recommended_hops: u8,
+    fallback_reason: &str,
+) -> &'static str {
     if requested_path_ready {
         "build a weighted-random onion path with fresh distinct candidates"
+    } else if recommended_hops == 2 {
+        "use the mature two-hop onion fallback while requested path evidence warms"
     } else if fallback_reason == "client_limit_below_requested_hops"
         || fallback_reason == "client_limit_below_two_hop_minimum"
     {
@@ -2524,6 +2692,54 @@ mod tests {
         SignedNodeDescriptor::sign(descriptor, &kp).unwrap()
     }
 
+    /// Records enough fresh aggregate evidence for the requested synthetic
+    /// path depth and marks that stable window as durably persisted.
+    ///
+    /// [ONION-PATH-ADMISSION 2026-08-02 by Codex] Tests must establish the
+    /// same proof + restart-continuity contract used by production instead of
+    /// treating descriptor count as transport readiness.
+    fn record_stable_runtime_path_proof(store: &PeerStore, now: u64, hops: u8) {
+        store.configure_bootstrap_status(true, true, true, 2);
+        let first_at = now.saturating_sub(10);
+        for offset in 0..ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS {
+            let proof_at = first_at.saturating_add(offset);
+            if hops >= 3 {
+                store.record_blind_relay_three_hop_probe_result_with_context(
+                    proof_at,
+                    true,
+                    "onion_terminal_delivered",
+                    3,
+                    1,
+                    3,
+                    2,
+                );
+            } else {
+                store.record_blind_relay_two_hop_probe_result_with_context(
+                    proof_at,
+                    true,
+                    "onion_terminal_delivered",
+                    2,
+                    1,
+                    2,
+                    1,
+                );
+            }
+        }
+    }
+
+    fn record_stable_path_proof(store: &PeerStore, now: u64, hops: u8) {
+        record_stable_runtime_path_proof(store, now, hops);
+        let stability_proofs = usize::try_from(ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS)
+            .expect("stability proof count must fit usize");
+        let persisted_at = now.saturating_sub(1);
+        store.record_cache_save_status(persisted_at, "success", "snapshot_persisted");
+        if hops >= 3 {
+            store.record_three_hop_proof_cache_persisted(persisted_at, stability_proofs, true);
+        } else {
+            store.record_two_hop_proof_cache_persisted(persisted_at, stability_proofs, true);
+        }
+    }
+
     #[tokio::test]
     async fn test_snapshot_endpoint_returns_snapshot() {
         let store = Arc::new(PeerStore::new());
@@ -2644,6 +2860,11 @@ mod tests {
         assert_eq!(parsed.requested_hops, 2);
         assert_eq!(parsed.min_candidates_for_requested_hops, 2);
         assert!(!parsed.requested_path_ready);
+        assert!(!parsed.requested_candidate_pool_ready);
+        assert!(parsed.requested_runtime_proof_required);
+        assert!(!parsed.requested_runtime_proof_ready);
+        assert!(parsed.requested_restart_continuity_required);
+        assert!(!parsed.requested_restart_continuity_ready);
         assert_eq!(parsed.recommended_hops, 1);
         assert!(!parsed.two_hop_ready);
         assert!(parsed.fallback_required);
@@ -2750,6 +2971,7 @@ mod tests {
         store.upsert_verified(second, now).unwrap();
         store.record_route_forward_success(&first_node_id, now);
         store.record_route_forward_success(&second_node_id, now);
+        record_stable_path_proof(store.as_ref(), now, 2);
 
         let app = build_discovery_router(store, DiscoveryApiPolicy::default());
         let response = app
@@ -2778,6 +3000,11 @@ mod tests {
         assert_eq!(parsed.requested_hops, 2);
         assert_eq!(parsed.min_candidates_for_requested_hops, 2);
         assert!(parsed.requested_path_ready);
+        assert!(parsed.requested_candidate_pool_ready);
+        assert!(parsed.requested_runtime_proof_required);
+        assert!(parsed.requested_runtime_proof_ready);
+        assert!(parsed.requested_restart_continuity_required);
+        assert!(parsed.requested_restart_continuity_ready);
         assert_eq!(parsed.recommended_hops, 2);
         assert!(parsed.two_hop_ready);
         assert!(!parsed.fallback_required);
@@ -2844,6 +3071,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_two_hop_candidates_wait_for_signed_restart_continuity() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let first = signed_routeable_chat_descriptor(1, now + 300, "https://relay-one.example");
+        let first_node_id = first.node_id();
+        let second = signed_routeable_chat_descriptor(1, now + 300, "https://relay-two.example");
+        let second_node_id = second.node_id();
+
+        store.upsert_verified(first, now).unwrap();
+        store.upsert_verified(second, now).unwrap();
+        store.record_route_forward_success(&first_node_id, now);
+        store.record_route_forward_success(&second_node_id, now);
+        record_stable_runtime_path_proof(store.as_ref(), now, 2);
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(parsed.requested_candidate_pool_ready);
+        assert!(parsed.requested_runtime_proof_ready);
+        assert!(!parsed.requested_restart_continuity_ready);
+        assert!(!parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 1);
+        assert!(parsed.fallback_required);
+        assert_eq!(parsed.pool_status, "continuity_warming");
+        assert_eq!(parsed.route_plan, "standard_relay_fallback");
+        assert_eq!(
+            parsed.fallback_reason,
+            "requested_path_restart_continuity_not_ready"
+        );
+        assert_eq!(
+            parsed.readiness_reason,
+            "waiting_for_requested_path_restart_continuity"
+        );
+    }
+
+    #[tokio::test]
     async fn test_onion_candidates_endpoint_supports_high_privacy_three_hop_policy() {
         let store = Arc::new(PeerStore::new());
         let now = now_secs();
@@ -2860,6 +3138,7 @@ mod tests {
         store.record_route_forward_success(&first_node_id, now);
         store.record_route_forward_success(&second_node_id, now);
         store.record_route_forward_success(&third_node_id, now);
+        record_stable_path_proof(store.as_ref(), now, 3);
 
         let app = build_discovery_router(store, DiscoveryApiPolicy::default());
         let response = app
@@ -2883,6 +3162,11 @@ mod tests {
         assert_eq!(parsed.requested_hops, 3);
         assert_eq!(parsed.min_candidates_for_requested_hops, 3);
         assert!(parsed.requested_path_ready);
+        assert!(parsed.requested_candidate_pool_ready);
+        assert!(parsed.requested_runtime_proof_required);
+        assert!(parsed.requested_runtime_proof_ready);
+        assert!(parsed.requested_restart_continuity_required);
+        assert!(parsed.requested_restart_continuity_ready);
         assert_eq!(parsed.recommended_hops, 3);
         assert!(parsed.two_hop_ready);
         assert!(!parsed.fallback_required);
@@ -2901,6 +3185,69 @@ mod tests {
         assert_eq!(parsed.candidates[0].selection_weight, 1_000);
         assert_eq!(parsed.candidates[1].selection_weight, 900);
         assert_eq!(parsed.candidates[2].selection_weight, 800);
+    }
+
+    #[tokio::test]
+    async fn test_high_privacy_candidates_fall_back_until_three_hop_proof_is_mature() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let first = signed_routeable_chat_descriptor(1, now + 300, "https://relay-one.example");
+        let first_node_id = first.node_id();
+        let second = signed_routeable_chat_descriptor(1, now + 300, "https://relay-two.example");
+        let second_node_id = second.node_id();
+        let third = signed_routeable_chat_descriptor(1, now + 300, "https://relay-three.example");
+        let third_node_id = third.node_id();
+
+        store.upsert_verified(first, now).unwrap();
+        store.upsert_verified(second, now).unwrap();
+        store.upsert_verified(third, now).unwrap();
+        store.record_route_forward_success(&first_node_id, now);
+        store.record_route_forward_success(&second_node_id, now);
+        store.record_route_forward_success(&third_node_id, now);
+        record_stable_path_proof(store.as_ref(), now, 2);
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?privacy_mode=high&limit=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed.count, 3);
+        assert_eq!(parsed.requested_hops, 3);
+        assert!(parsed.requested_candidate_pool_ready);
+        assert!(parsed.requested_runtime_proof_required);
+        assert!(!parsed.requested_runtime_proof_ready);
+        assert!(parsed.requested_restart_continuity_required);
+        assert!(!parsed.requested_restart_continuity_ready);
+        assert!(!parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 2);
+        assert!(parsed.fallback_required);
+        assert_eq!(parsed.pool_status, "proof_warming");
+        assert_eq!(parsed.route_plan, "two_hop_onion_path");
+        assert_eq!(
+            parsed.fallback_reason,
+            "requested_path_runtime_proof_not_ready"
+        );
+        assert_eq!(
+            parsed.readiness_reason,
+            "waiting_for_stable_requested_path_runtime_proof"
+        );
+        assert_eq!(
+            parsed.next_action,
+            "use the mature two-hop onion fallback while requested path evidence warms"
+        );
     }
 
     #[tokio::test]
