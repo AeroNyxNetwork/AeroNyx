@@ -429,7 +429,10 @@ validate_build_resource_options() {
 }
 
 validate_source_commit() {
-    [ -n "${SOURCE_COMMIT}" ] || return
+    # [UPGRADE-OPTIONAL-COMMIT 2026-08-02 by Codex] A bare `return` inherits
+    # the failed `-n` status and terminates the script under `set -e`. Treat
+    # the default worktree mode as a successful validation outcome.
+    [ -n "${SOURCE_COMMIT}" ] || return 0
     printf '%s' "${SOURCE_COMMIT}" | grep -Eq '^[0-9A-Fa-f]{40}$' \
         || die "--commit must be one full 40-hex Git commit."
     git check-ref-format --branch "${BRANCH}" >/dev/null 2>&1 \
@@ -475,7 +478,9 @@ release_lock() {
 }
 
 cleanup_isolated_source() {
-    [ -n "${ISOLATED_SOURCE_DIR}" ] || return
+    # [UPGRADE-OPTIONAL-CLEANUP 2026-08-02 by Codex] EXIT traps must preserve
+    # a successful upgrade when the worktree mode created no isolated source.
+    [ -n "${ISOLATED_SOURCE_DIR}" ] || return 0
     case "${ISOLATED_SOURCE_DIR}" in
         "${SOURCE_ROOT}/${SERVICE_NAME}.${SOURCE_COMMIT}."*)
             if [ "${DRY_RUN}" -eq 1 ]; then
@@ -885,7 +890,9 @@ promote_built_binary() {
 
 backup_current_service_unit() {
     local stamp
-    [ -f "${SERVICE_FILE}" ] || return
+    # [UPGRADE-OPTIONAL-BACKUP 2026-08-02 by Codex] A missing prior unit is a
+    # valid first-install state, not a failed backup operation under `set -e`.
+    [ -f "${SERVICE_FILE}" ] || return 0
 
     stamp="$(date -u +%Y%m%d_%H%M%S)"
     BACKUP_SERVICE_FILE="${RELEASE_DIR}/${SERVICE_NAME}.service.${stamp}"
@@ -943,7 +950,9 @@ rollback_service_unit() {
 
 backup_current_network_restore_unit() {
     local stamp
-    [ -f "${NETWORK_RESTORE_FILE}" ] || return
+    # [UPGRADE-OPTIONAL-BACKUP 2026-08-02 by Codex] Preserve success when an
+    # older deployment has no network-restore unit to back up yet.
+    [ -f "${NETWORK_RESTORE_FILE}" ] || return 0
 
     stamp="$(date -u +%Y%m%d_%H%M%S)"
     BACKUP_NETWORK_RESTORE_FILE="${RELEASE_DIR}/${NETWORK_RESTORE_SERVICE}.${stamp}"
