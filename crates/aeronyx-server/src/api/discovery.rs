@@ -40,6 +40,9 @@
 //! - [ONION-CAPABILITY-GATE 2026-08-02 by Codex] Requires every public onion
 //!   candidate to advertise both `ChatRelay` and `OnionMiddle`, preventing a
 //!   single-hop-only relay from being counted toward a multi-hop route.
+//! - [ONION-NETWORK-DIVERSITY 2026-08-03 by Codex] Requires a pairwise
+//!   network-diverse candidate subset before multi-hop admission can become
+//!   ready, reusing the Rust path planner's fail-closed endpoint policy.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -91,8 +94,14 @@
 //!   its verified signed descriptor. Apply client limits only after capability,
 //!   routeability, KEM, and endpoint filtering so valid lower-ranked relays are
 //!   not hidden by ineligible peers.
+//! - Candidate count is not network diversity. Multi-hop admission must find a
+//!   pairwise-diverse subset using the same coarse IPv4 /24, IPv6 /48, and DNS
+//!   hostname policy as the internal Rust path planner. This does not prove
+//!   distinct operators or autonomous systems.
 //!
 //! ## Last Modified
+//! v0.41.0-OnionNetworkDiversity - Gate multi-hop candidate readiness on a
+//! pairwise network-diverse subset without exposing the selected path.
 //! v0.40.0-OnionCapabilityGate - Require signed ChatRelay + OnionMiddle
 //! capability and apply candidate limits after all eligibility filters.
 //! v0.39.0-OnionPathAdmission - Gate requested multi-hop candidate plans on
@@ -342,6 +351,8 @@ enum OnionPrivacyMode {
 #[derive(Debug, Clone, Copy)]
 struct OnionRequestedPathGates {
     candidate_pool_ready: bool,
+    network_diversity_required: bool,
+    network_diversity_ready: bool,
     runtime_proof_required: bool,
     runtime_proof_ready: bool,
     restart_continuity_required: bool,
@@ -351,6 +362,7 @@ struct OnionRequestedPathGates {
 impl OnionRequestedPathGates {
     fn ready(self) -> bool {
         self.candidate_pool_ready
+            && (!self.network_diversity_required || self.network_diversity_ready)
             && (!self.runtime_proof_required || self.runtime_proof_ready)
             && (!self.restart_continuity_required || self.restart_continuity_ready)
     }
@@ -470,6 +482,13 @@ pub struct OnionCandidatesResponse {
     /// Whether enough distinct routeable candidates exist for the requested
     /// hop count before runtime proof gates are applied.
     pub requested_candidate_pool_ready: bool,
+    /// Whether the requested path requires coarse endpoint-network diversity.
+    #[serde(default)]
+    pub requested_network_diversity_required: bool,
+    /// Whether a pairwise network-diverse candidate subset exists for the
+    /// requested hop count.
+    #[serde(default)]
+    pub requested_network_diversity_ready: bool,
     /// Whether this requested path requires matching runtime delivery proof.
     pub requested_runtime_proof_required: bool,
     /// Whether the matching runtime delivery proof gate currently passes.
@@ -485,8 +504,8 @@ pub struct OnionCandidatesResponse {
     pub fallback_required: bool,
     /// Aggregate requested-path maturity bucket.
     ///
-    /// Stable values are `ready`, `proof_warming`, `continuity_warming`,
-    /// `warming`, `empty`, or `client_limited`.
+    /// Stable values are `ready`, `diversity_limited`, `proof_warming`,
+    /// `continuity_warming`, `warming`, `empty`, or `client_limited`.
     /// This lets App, nodeboard, backend aggregation, and AI-agent runbooks
     /// distinguish a usable pool from a partial pool without inspecting
     /// individual relay metadata.
@@ -519,6 +538,9 @@ pub struct OnionCandidatesResponse {
     pub candidate_verification: String,
     /// Stable strategy clients should use when choosing among candidates.
     pub path_selection_strategy: String,
+    /// Coarse endpoint anti-affinity policy enforced before multi-hop admission.
+    #[serde(default)]
+    pub network_diversity_policy: String,
     /// Privacy-safe region diversity policy for client-side path builders.
     pub region_diversity_policy: String,
     /// Product-facing rule: users choose a privacy level, not raw node ids.
@@ -2137,18 +2159,26 @@ async fn onion_candidates_handler(
         .collect();
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
     let min_candidates_for_requested_hops = requested_hops as usize;
+    let requested_network_diversity_ready =
+        onion_candidate_network_diversity_ready(&candidates, min_candidates_for_requested_hops);
     let peer_status = state.peer_store.status(now);
     let requested_path_gates = onion_requested_path_gates(
         &peer_status,
         requested_hops,
         candidates.len() >= min_candidates_for_requested_hops,
+        requested_network_diversity_ready,
     );
     let requested_path_ready = requested_path_gates.ready();
+    let two_hop_network_diversity_ready = onion_candidate_network_diversity_ready(
+        &candidates,
+        ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+    );
     let two_hop_fallback_ready = requested_hops > 2
         && onion_requested_path_gates(
             &peer_status,
             2,
             candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+            two_hop_network_diversity_ready,
         )
         .ready();
     let recommended_hops = recommended_onion_hops(
@@ -2193,6 +2223,8 @@ async fn onion_candidates_handler(
         min_candidates_for_requested_hops,
         requested_path_ready,
         requested_candidate_pool_ready: requested_path_gates.candidate_pool_ready,
+        requested_network_diversity_required: requested_path_gates.network_diversity_required,
+        requested_network_diversity_ready: requested_path_gates.network_diversity_ready,
         requested_runtime_proof_required: requested_path_gates.runtime_proof_required,
         requested_runtime_proof_ready: requested_path_gates.runtime_proof_ready,
         requested_restart_continuity_required: requested_path_gates
@@ -2208,6 +2240,9 @@ async fn onion_candidates_handler(
         selection_policy: ONION_CANDIDATES_SELECTION_POLICY.to_string(),
         candidate_verification: "signed_node_descriptor_ed25519_v2".to_string(),
         path_selection_strategy: "weighted_random_health_ranked_distinct_hops".to_string(),
+        network_diversity_policy:
+            "required_pairwise_ipv4_24_ipv6_48_or_distinct_dns_hostnames; not_operator_or_as_proof"
+                .to_string(),
         region_diversity_policy:
             "prefer_distinct_regions_when_available_without_exposing_selected_route".to_string(),
         user_choice_policy:
@@ -2230,7 +2265,9 @@ fn onion_requested_path_gates(
     status: &PeerStoreStatus,
     requested_hops: u8,
     candidate_pool_ready: bool,
+    network_diversity_ready: bool,
 ) -> OnionRequestedPathGates {
+    let network_diversity_required = requested_hops >= 2;
     let runtime_proof_required = requested_hops >= 2;
     let restart_continuity_required = requested_hops >= 2;
     let (runtime_proof_ready, restart_continuity_ready) = match requested_hops {
@@ -2261,11 +2298,63 @@ fn onion_requested_path_gates(
 
     OnionRequestedPathGates {
         candidate_pool_ready,
+        network_diversity_required,
+        network_diversity_ready,
         runtime_proof_required,
         runtime_proof_ready,
         restart_continuity_required,
         restart_continuity_ready,
     }
+}
+
+/// Returns whether the public candidate set contains a pairwise-diverse path.
+///
+/// [ONION-NETWORK-DIVERSITY 2026-08-03 by Codex] This bounded backtracking
+/// search shares the internal path planner's endpoint anti-affinity rule. It
+/// returns only one aggregate decision and never exposes the selected subset.
+fn onion_candidate_network_diversity_ready(
+    candidates: &[OnionRelayCandidate],
+    required_hops: usize,
+) -> bool {
+    fn search<'a>(
+        candidates: &'a [OnionRelayCandidate],
+        start: usize,
+        remaining: usize,
+        selected: &mut Vec<&'a OnionRelayCandidate>,
+    ) -> bool {
+        if remaining == 0 {
+            return true;
+        }
+        if candidates.len().saturating_sub(start) < remaining {
+            return false;
+        }
+
+        for index in start..candidates.len() {
+            let candidate = &candidates[index];
+            if selected.iter().any(|selected_candidate| {
+                !PeerStore::route_endpoints_are_network_diverse(
+                    &candidate.signed_descriptor,
+                    &selected_candidate.signed_descriptor,
+                )
+            }) {
+                continue;
+            }
+            selected.push(candidate);
+            if search(candidates, index + 1, remaining - 1, selected) {
+                return true;
+            }
+            selected.pop();
+        }
+        false
+    }
+
+    if required_hops == 0 {
+        return true;
+    }
+    if candidates.len() < required_hops {
+        return false;
+    }
+    search(candidates, 0, required_hops, &mut Vec::new())
 }
 
 fn recommended_onion_hops(
@@ -2305,6 +2394,8 @@ fn onion_candidate_pool_status(
         } else {
             "warming"
         }
+    } else if gates.network_diversity_required && !gates.network_diversity_ready {
+        "diversity_limited"
     } else if gates.runtime_proof_required && !gates.runtime_proof_ready {
         "proof_warming"
     } else if gates.restart_continuity_required && !gates.restart_continuity_ready {
@@ -2355,6 +2446,8 @@ fn onion_candidate_fallback_reason(
         "single_routeable_candidate"
     } else if !gates.candidate_pool_ready {
         "insufficient_routeable_candidates"
+    } else if gates.network_diversity_required && !gates.network_diversity_ready {
+        "requested_path_network_diversity_not_ready"
     } else if gates.runtime_proof_required && !gates.runtime_proof_ready {
         "requested_path_runtime_proof_not_ready"
     } else if gates.restart_continuity_required && !gates.restart_continuity_ready {
@@ -2382,6 +2475,7 @@ fn onion_candidate_readiness_reason(
         "client_limit_below_requested_hops" => "client_limit_blocks_requested_hops",
         "no_routeable_candidates" => "waiting_for_routeable_kem_relays",
         "single_routeable_candidate" => "waiting_for_second_routeable_kem_relay",
+        "requested_path_network_diversity_not_ready" => "waiting_for_network_diverse_onion_relays",
         "requested_path_runtime_proof_not_ready" => {
             "waiting_for_stable_requested_path_runtime_proof"
         }
@@ -2399,6 +2493,10 @@ fn onion_candidate_next_action(
 ) -> &'static str {
     if requested_path_ready {
         "build a weighted-random onion path with fresh distinct candidates"
+    } else if recommended_hops == 2
+        && fallback_reason == "requested_path_network_diversity_not_ready"
+    {
+        "use the network-diverse two-hop fallback until a diverse third hop is available"
     } else if recommended_hops == 2 {
         "use the mature two-hop onion fallback while requested path evidence warms"
     } else if fallback_reason == "client_limit_below_requested_hops"
@@ -3257,6 +3355,77 @@ mod tests {
         assert_eq!(parsed.candidates[0].selection_weight, 1_000);
         assert_eq!(parsed.candidates[1].selection_weight, 900);
         assert_eq!(parsed.candidates[2].selection_weight, 800);
+    }
+
+    #[tokio::test]
+    async fn test_high_privacy_candidates_require_pairwise_network_diversity() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let first = signed_routeable_chat_descriptor(1, now + 300, "https://192.0.2.10:8422");
+        let first_node_id = first.node_id();
+        let second = signed_routeable_chat_descriptor(1, now + 300, "https://198.51.100.10:8422");
+        let second_node_id = second.node_id();
+        let collocated_third =
+            signed_routeable_chat_descriptor(1, now + 300, "https://192.0.2.20:8422");
+        let third_node_id = collocated_third.node_id();
+
+        store.upsert_verified(first, now).unwrap();
+        store.upsert_verified(second, now).unwrap();
+        store.upsert_verified(collocated_third, now).unwrap();
+        store.record_route_forward_success(&first_node_id, now);
+        store.record_route_forward_success(&second_node_id, now);
+        store.record_route_forward_success(&third_node_id, now);
+        record_stable_path_proof(store.as_ref(), now, 2);
+        record_stable_path_proof(store.as_ref(), now, 3);
+
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?privacy_mode=high&limit=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        // [ONION-NETWORK-DIVERSITY 2026-08-03 by Codex] Candidate count and
+        // mature proof are insufficient when two of three hops share an IPv4
+        // /24. The already-diverse two-hop subset remains a safe fallback.
+        assert_eq!(parsed.count, 3);
+        assert!(parsed.requested_candidate_pool_ready);
+        assert!(parsed.requested_network_diversity_required);
+        assert!(!parsed.requested_network_diversity_ready);
+        assert!(parsed.requested_runtime_proof_ready);
+        assert!(parsed.requested_restart_continuity_ready);
+        assert!(!parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 2);
+        assert!(parsed.fallback_required);
+        assert_eq!(parsed.pool_status, "diversity_limited");
+        assert_eq!(parsed.route_plan, "two_hop_onion_path");
+        assert_eq!(
+            parsed.fallback_reason,
+            "requested_path_network_diversity_not_ready"
+        );
+        assert_eq!(
+            parsed.readiness_reason,
+            "waiting_for_network_diverse_onion_relays"
+        );
+        assert_eq!(
+            parsed.next_action,
+            "use the network-diverse two-hop fallback until a diverse third hop is available"
+        );
+        assert!(parsed.network_diversity_policy.contains("ipv4_24"));
+        assert!(parsed
+            .network_diversity_policy
+            .contains("not_operator_or_as_proof"));
     }
 
     #[tokio::test]
