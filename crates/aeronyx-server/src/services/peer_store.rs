@@ -42,6 +42,9 @@
 //!   multi-hop admission under host-local opaque route-domain pins and a
 //!   portable independent-attestor quorum, while preserving direct single-hop
 //!   compatibility and never publishing trust identities or domain tokens
+//! - [ROUTE-DOMAIN-CERTIFICATE-RECOVERY 2026-08-03 by Codex] Deterministic,
+//!   bounded host-cache export and verifier-local restart revalidation for
+//!   current portable route-domain certificates
 //! - Blind relay runtime counters and drop reason buckets for nodeboard,
 //!   without exposing encrypted payloads, peer endpoint URLs, or user metadata
 //! - Blind relay audit size buckets so exact encrypted blob sizes do not become
@@ -179,6 +182,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.73.0-RouteDomainCertificateRecovery - Persist only currently valid
+//! route-domain certificates and reverify each record after restart
 //! v0.72.0-PathProofClockGuard - Ignore future-dated path proofs and fail
 //! readiness closed until the node clock catches up
 //! v0.71.0-PathProofRollbackAnchor - Track independent local-anchor decisions
@@ -296,6 +301,10 @@ pub const TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION: u16 = 1;
 pub const THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION: u16 = 1;
 /// Local peer-cache aggregate verified-client delivery schema understood by this node.
 pub const VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION: u16 = 2;
+/// Local peer-cache route-domain certificate schema understood by this node.
+pub const ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION: u16 = 1;
+/// Maximum route-domain certificates accepted from one local recovery cache.
+pub const ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES: usize = 4_096;
 const ROUTEABILITY_EVIDENCE_KIND_EXACT_DESCRIPTOR: &str = "direct_opaque_route_success";
 const ROUTEABILITY_EVIDENCE_KIND_ROUTE_SURFACE: &str = "direct_opaque_route_surface_success";
 const PEER_ROUTEABILITY_CACHE_MAX_ENTRIES: usize = 4_096;
@@ -308,7 +317,7 @@ const PEER_QUORUM_MIN_VALID_PEERS: usize = 2;
 const PEER_QUORUM_MIN_ROUTEABLE_CHAT_RELAYS: usize = 1;
 const TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS: usize = 2;
 const TWO_HOP_PATH_POLICY_NETWORK_DIVERSE: &str = "distinct_node_and_network_prefix";
-const MAX_ROUTE_DOMAIN_CERTIFICATES: usize = 4_096;
+const MAX_ROUTE_DOMAIN_CERTIFICATES: usize = ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES;
 
 /// Internal selector for signed path-proof cache sections.
 ///
@@ -2455,6 +2464,36 @@ impl PeerStoreImportReport {
     }
 }
 
+/// Aggregate result of restoring independently signed route-domain certificates.
+///
+/// [ROUTE-DOMAIN-CERTIFICATE-RECOVERY 2026-08-03 by Codex] This report is
+/// intentionally identity-blind. Operators can diagnose cache health without
+/// learning subjects, route-domain tokens, attestors, or certificate hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRouteDomainCertificateCacheReport {
+    /// Number of certificate records presented by the bounded local cache.
+    pub total: usize,
+    /// Number of current certificates inserted or upgraded.
+    pub restored: usize,
+    /// Number of certificates already present with the same signed content.
+    pub unchanged: usize,
+    /// Number rejected by bounds, local pins, quorum, signature, or freshness.
+    pub rejected: usize,
+}
+
+impl PeerStoreRouteDomainCertificateCacheReport {
+    /// Empty recovery report.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            total: 0,
+            restored: 0,
+            unchanged: 0,
+            rejected: 0,
+        }
+    }
+}
+
 // ============================================
 // PeerStore
 // ============================================
@@ -2619,8 +2658,9 @@ impl PeerStore {
     /// The certificate must bind an exact locally pinned subject/domain pair
     /// and satisfy the verifier's current attestor quorum. At most one freshest
     /// certificate is retained per subject; stale evidence cannot overwrite a
-    /// longer-lived valid certificate. Evidence is process-local and therefore
-    /// fails closed after restart until a trusted source supplies it again.
+    /// longer-lived valid certificate. Evidence remains process-local unless a
+    /// caller persists the bounded export and reimports it under the same
+    /// current local policy after restart.
     ///
     /// # Errors
     /// Returns a bounded [`RouteDomainCertificateImportError`] when policy,
@@ -2683,6 +2723,88 @@ impl PeerStore {
         }
         certificates.insert(subject_node_id, certificate);
         Ok(true)
+    }
+
+    /// Exports only certificates that still satisfy the current local policy.
+    ///
+    /// The result is deterministic by subject identity and is intended only
+    /// for the host-local peer cache. Public discovery and monitoring surfaces
+    /// must never publish this trust metadata.
+    #[must_use]
+    pub fn export_route_domain_attestation_certificates(
+        &self,
+        now: u64,
+    ) -> Vec<RouteDomainAttestationCertificateV1> {
+        // [ROUTE-DOMAIN-CERTIFICATE-RECOVERY 2026-08-03 by Codex] Revalidate
+        // at export time so expired evidence never gains a fresh cache lease.
+        let policy = self.route_domain_attestor_policy.read();
+        let certificates = self.route_domain_certificates.read();
+        let mut exported = certificates
+            .values()
+            .filter(|certificate| {
+                policy
+                    .pinned_route_domains
+                    .get(&certificate.subject_node_id)
+                    .is_some_and(|expected_domain| *expected_domain == certificate.route_domain)
+                    && certificate
+                        .verify_with_policy_at(
+                            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                            &policy.allowed_attestors,
+                            policy.minimum_attestors,
+                            now,
+                        )
+                        .is_ok()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        exported.sort_unstable_by_key(|certificate| certificate.subject_node_id);
+        exported.truncate(ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES);
+        exported
+    }
+
+    /// Restores a bounded certificate section under the current local policy.
+    ///
+    /// Every certificate is reverified independently. Invalid entries are
+    /// isolated and counted rather than preventing descriptor or proof-cache
+    /// recovery from the same local document.
+    #[must_use]
+    pub fn restore_route_domain_attestation_certificates(
+        &self,
+        certificates: &[RouteDomainAttestationCertificateV1],
+        now: u64,
+    ) -> PeerStoreRouteDomainCertificateCacheReport {
+        let mut report = PeerStoreRouteDomainCertificateCacheReport::empty();
+        report.total = certificates.len();
+        for certificate in certificates
+            .iter()
+            .take(ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES)
+            .cloned()
+        {
+            match self.import_route_domain_attestation_certificate(certificate, now) {
+                Ok(true) => report.restored += 1,
+                Ok(false) => report.unchanged += 1,
+                Err(_) => report.rejected += 1,
+            }
+        }
+        report.rejected = report.rejected.saturating_add(
+            certificates
+                .len()
+                .saturating_sub(ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES),
+        );
+        self.record_audit_event(
+            now,
+            "route_domain_certificate_cache_restore",
+            if report.rejected == 0 {
+                "accepted"
+            } else {
+                "warning"
+            },
+            format!(
+                "total={} restored={} unchanged={} rejected={}",
+                report.total, report.restored, report.unchanged, report.rejected
+            ),
+        );
+        report
     }
 
     fn route_domain_certificate_effective_expiry(
@@ -8704,6 +8826,88 @@ mod tests {
             )
             .unwrap();
         assert!(!store.route_domain_certificate_allows_multi_hop(&subject.public_key_bytes(), now));
+    }
+
+    #[test]
+    fn test_route_domain_certificate_cache_revalidates_across_restart() {
+        // [ROUTE-DOMAIN-CERTIFICATE-RECOVERY 2026-08-03 by Codex] A cache is
+        // only transport. A fresh PeerStore must independently install policy
+        // and verify quorum/freshness before multi-hop becomes eligible.
+        let now = 1_700_025_000;
+        let subject = IdentityKeyPair::generate();
+        let attestor_a = IdentityKeyPair::generate();
+        let attestor_b = IdentityKeyPair::generate();
+        let untrusted_a = IdentityKeyPair::generate();
+        let untrusted_b = IdentityKeyPair::generate();
+        let route_domain = [0x51; 16];
+        let allowed = [attestor_a.public_key_bytes(), attestor_b.public_key_bytes()];
+        let certificate = route_domain_certificate_for(
+            subject.public_key_bytes(),
+            route_domain,
+            now - 2,
+            now + 600,
+            &[&attestor_a, &attestor_b],
+        );
+
+        let source = PeerStore::new();
+        source
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &allowed,
+                2,
+                true,
+            )
+            .unwrap();
+        assert!(source
+            .import_route_domain_attestation_certificate(certificate, now)
+            .unwrap());
+        let exported = source.export_route_domain_attestation_certificates(now);
+        assert_eq!(exported.len(), 1);
+
+        let restored = PeerStore::new();
+        restored
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &allowed,
+                2,
+                true,
+            )
+            .unwrap();
+        let report = restored.restore_route_domain_attestation_certificates(&exported, now);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.unchanged, 0);
+        assert_eq!(report.rejected, 0);
+        assert!(
+            restored.route_domain_certificate_allows_multi_hop(&subject.public_key_bytes(), now)
+        );
+
+        let duplicate = restored.restore_route_domain_attestation_certificates(&exported, now);
+        assert_eq!(duplicate.restored, 0);
+        assert_eq!(duplicate.unchanged, 1);
+        assert_eq!(duplicate.rejected, 0);
+
+        let wrong_policy = PeerStore::new();
+        wrong_policy
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &[
+                    untrusted_a.public_key_bytes(),
+                    untrusted_b.public_key_bytes(),
+                ],
+                2,
+                true,
+            )
+            .unwrap();
+        let rejected = wrong_policy.restore_route_domain_attestation_certificates(&exported, now);
+        assert_eq!(rejected.restored, 0);
+        assert_eq!(rejected.rejected, 1);
+        assert!(!wrong_policy
+            .route_domain_certificate_allows_multi_hop(&subject.public_key_bytes(), now));
+
+        assert!(source
+            .export_route_domain_attestation_certificates(now + 600)
+            .is_empty());
     }
 
     #[test]

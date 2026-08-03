@@ -457,6 +457,9 @@
 //     cooling, skip, and half-open aggregates into signed heartbeat status
 //   v2.8.50-BlockCarrierCircuitBreaker - Added process-only fixed-slot cooldown
 //     and half-open recovery for repeated follower carrier availability faults
+//   v2.8.50-RouteDomainCertificateRecovery - [ROUTE-DOMAIN-CERTIFICATE-RECOVERY
+//     2026-08-03 by Codex] Persist and reverify bounded portable route-domain
+//     certificates without exposing trust metadata on public discovery
 //   v2.8.49-FollowerCertificateTipBinding - Bound readiness heartbeat state to
 //     the exact fully audited local tip
 //   v2.8.48-FollowerCertificateReadiness - Added identity-blind current-policy
@@ -636,6 +639,7 @@ use aeronyx_core::ledger::MemoryRecord;
 use aeronyx_core::protocol::codec::{
     decode_client_hello, encode_data_packet, encode_server_hello, ProtocolCodec,
 };
+use aeronyx_core::protocol::discovery::RouteDomainAttestationCertificateV1;
 use aeronyx_core::protocol::memchain::{
     encode_memchain, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,
 };
@@ -731,6 +735,7 @@ use crate::services::peer_store::{
     PeerStoreDirectoryProofGossipRound, PeerStoreRouteabilityCacheEvidence, PeerStoreStatus,
     PeerStoreTwoHopPathProofEvent, PeerStoreVerifiedClientDeliveryCacheEvidence,
     PeerStoreVerifiedDeliveryWitnessRound, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+    ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES, ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION,
     THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
@@ -1283,6 +1288,12 @@ struct PeerStoreCacheDocument {
     verified_client_delivery_signer_node_id: Option<String>,
     #[serde(default)]
     verified_client_delivery_signature_ed25519: Option<String>,
+    /// Portable certificates remain self-authenticating through their pinned
+    /// attestor signatures; this local-only section adds no host authority.
+    #[serde(default)]
+    route_domain_certificate_schema_version: u16,
+    #[serde(default)]
+    route_domain_certificates: Vec<RouteDomainAttestationCertificateV1>,
 }
 
 /// Aggregate result of one durable peer-cache write.
@@ -1296,6 +1307,7 @@ struct PeerStoreCachePersistReport {
     two_hop_stability_ready: bool,
     three_hop_events: usize,
     three_hop_stability_ready: bool,
+    route_domain_certificates: usize,
     client_deliveries: u64,
     client_delivery_generation: u64,
 }
@@ -1306,6 +1318,7 @@ impl PeerStoreCacheDocument {
         routeability_evidence: Vec<PeerStoreRouteabilityCacheEvidence>,
         two_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
         three_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
+        route_domain_certificates: Vec<RouteDomainAttestationCertificateV1>,
         verified_client_delivery_generation: u64,
         verified_client_delivery_evidence: Option<PeerStoreVerifiedClientDeliveryCacheEvidence>,
         identity: &IdentityKeyPair,
@@ -1329,6 +1342,8 @@ impl PeerStoreCacheDocument {
             verified_client_delivery_evidence,
             verified_client_delivery_signer_node_id: None,
             verified_client_delivery_signature_ed25519: None,
+            route_domain_certificate_schema_version: ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION,
+            route_domain_certificates,
         };
         let signing_bytes = document
             .routeability_evidence_signing_bytes()
@@ -1384,6 +1399,26 @@ impl PeerStoreCacheDocument {
             return Err(format!(
                 "unsupported routeability evidence schema version: {}",
                 document.routeability_evidence_schema_version
+            ));
+        }
+        // [ROUTE-DOMAIN-CERTIFICATE-RECOVERY 2026-08-03 by Codex] Keep the
+        // additive section backward compatible while rejecting count abuse
+        // before any cryptographic work or PeerStore allocation is attempted.
+        let route_domain_certificate_version_valid =
+            (document.route_domain_certificates.is_empty()
+                && document.route_domain_certificate_schema_version == 0)
+                || document.route_domain_certificate_schema_version
+                    == ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION;
+        if !route_domain_certificate_version_valid {
+            return Err(format!(
+                "unsupported route-domain certificate schema version: {}",
+                document.route_domain_certificate_schema_version
+            ));
+        }
+        if document.route_domain_certificates.len() > ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES {
+            return Err(format!(
+                "route-domain certificate cache exceeds {} entries",
+                ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES
             ));
         }
         let proof_version_valid = (document.two_hop_path_proof_events.is_empty()
@@ -10322,6 +10357,9 @@ impl Server {
             .status(now)
             .three_hop_path_proof_history
             .stability_ready;
+        let route_domain_certificates =
+            peer_store.export_route_domain_attestation_certificates(now);
+        let route_domain_certificate_count = route_domain_certificates.len();
         let verified_client_delivery_evidence =
             peer_store.export_verified_client_delivery_cache_evidence(now);
         let verified_client_delivery_count = verified_client_delivery_evidence
@@ -10337,6 +10375,7 @@ impl Server {
             routeability_evidence,
             two_hop_path_proof_events,
             three_hop_path_proof_events,
+            route_domain_certificates,
             verified_client_delivery_generation,
             verified_client_delivery_evidence,
             identity,
@@ -10375,6 +10414,7 @@ impl Server {
             two_hop_stability_ready: two_hop_path_proof_stability_ready,
             three_hop_events: three_hop_path_proof_event_count,
             three_hop_stability_ready: three_hop_path_proof_stability_ready,
+            route_domain_certificates: route_domain_certificate_count,
             client_deliveries: verified_client_delivery_count,
             client_delivery_generation: verified_client_delivery_generation,
         })
@@ -10491,6 +10531,12 @@ impl Server {
         match Self::save_peer_store_cache_snapshot(identity, peer_store, path, now).await {
             Ok(report) => {
                 peer_store.record_cache_save_status(now, "success", "snapshot_persisted");
+                peer_store.record_audit_event(
+                    now,
+                    "route_domain_certificate_cache_persist",
+                    "success",
+                    format!("persisted={}", report.route_domain_certificates),
+                );
                 peer_store.record_two_hop_proof_cache_persisted(
                     now,
                     report.two_hop_events,
@@ -10793,10 +10839,14 @@ impl Server {
                     client_delivery_anchor.two_hop_path_proof_protection_for(&document);
                 let three_hop_proof_rollback_protection =
                     client_delivery_anchor.three_hop_path_proof_protection_for(&document);
+                let route_domain_certificates = (document.route_domain_certificate_schema_version
+                    != 0)
+                    .then_some(document.route_domain_certificates);
                 (
                     document.descriptor_snapshot,
                     Some(document.routeability_evidence),
                     routeability_authentication,
+                    route_domain_certificates,
                     Some(document.two_hop_path_proof_events),
                     two_hop_proof_authentication,
                     Some(document.three_hop_path_proof_events),
@@ -10817,6 +10867,7 @@ impl Server {
                         None,
                         "not_applicable",
                         None,
+                        None,
                         "not_applicable",
                         None,
                         "not_applicable",
@@ -10834,6 +10885,7 @@ impl Server {
             snapshot,
             routeability_evidence,
             routeability_authentication,
+            route_domain_certificates,
             two_hop_proof_events,
             two_hop_proof_authentication,
             three_hop_proof_events,
@@ -10886,6 +10938,22 @@ impl Server {
         } else {
             peer_store.load_bootstrap_snapshot_from_source(&snapshot, now, source_kind)
         };
+        // [ROUTE-DOMAIN-CERTIFICATE-RECOVERY 2026-08-03 by Codex] Restore is
+        // deliberately independent from descriptor/proof sections. Every
+        // record is rechecked against the policy installed before cache load.
+        let route_domain_certificate_report =
+            route_domain_certificates.as_deref().map(|certificates| {
+                peer_store.restore_route_domain_attestation_certificates(certificates, now)
+            });
+        let route_domain_certificates_restored = route_domain_certificate_report
+            .map(|value| value.restored)
+            .unwrap_or(0);
+        let route_domain_certificates_unchanged = route_domain_certificate_report
+            .map(|value| value.unchanged)
+            .unwrap_or(0);
+        let route_domain_certificates_rejected = route_domain_certificate_report
+            .map(|value| value.rejected)
+            .unwrap_or(0);
         let route_report = match (
             routeability_authentication,
             routeability_evidence.as_deref(),
@@ -11099,6 +11167,7 @@ impl Server {
             if report.rejected > 0
                 || route_rejected > 0
                 || route_authentication_rejected
+                || route_domain_certificates_rejected > 0
                 || proof_rejected > 0
                 || proof_authentication_rejected
                 || three_hop_proof_rejected > 0
@@ -11114,7 +11183,7 @@ impl Server {
                 "success"
             },
             format!(
-                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} two_hop_proof_rollback_protection={} three_hop_proof_authentication={} three_hop_proof_restored={} three_hop_proof_rejected={} three_hop_proof_rollback_protection={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
+                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} route_domain_certificates_restored={} route_domain_certificates_unchanged={} route_domain_certificates_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} two_hop_proof_rollback_protection={} three_hop_proof_authentication={} three_hop_proof_restored={} three_hop_proof_rejected={} three_hop_proof_rollback_protection={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
                 report.total,
                 report.inserted,
                 report.unchanged,
@@ -11123,6 +11192,9 @@ impl Server {
                 routeability_authentication,
                 route_restored,
                 route_rejected,
+                route_domain_certificates_restored,
+                route_domain_certificates_unchanged,
+                route_domain_certificates_rejected,
                 two_hop_proof_authentication,
                 proof_restored,
                 proof_rejected,
@@ -11149,6 +11221,9 @@ impl Server {
             routeability_authentication,
             routeability_restored = route_restored,
             routeability_rejected = route_rejected,
+            route_domain_certificates_restored,
+            route_domain_certificates_unchanged,
+            route_domain_certificates_rejected,
             two_hop_proof_authentication,
             two_hop_proof_restored = proof_restored,
             two_hop_proof_rejected = proof_rejected,
@@ -12695,8 +12770,9 @@ mod tests {
         DATA_PLANE_RECV_FAILURE_LIMIT, DIRECTORY_OPERATOR_HTTP_PROFILE,
         DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
         DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, MEMCHAIN_SYNC_HTTP_PROFILE,
-        ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
-        TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT,
+        ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION,
+        THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT,
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
     };
@@ -12716,7 +12792,8 @@ mod tests {
     };
     use aeronyx_core::protocol::discovery::{
         DirectoryCommitmentBlockV1, DirectoryDescriptorCommitmentV1,
-        DirectoryDescriptorInclusionProofV1,
+        DirectoryDescriptorInclusionProofV1, RouteDomainAttestationCertificateV1,
+        RouteDomainAttestationV1,
     };
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
@@ -16874,6 +16951,11 @@ mod tests {
         );
         assert!(document.three_hop_path_proof_events.is_empty());
         assert_eq!(
+            document.route_domain_certificate_schema_version,
+            ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION
+        );
+        assert!(document.route_domain_certificates.is_empty());
+        assert_eq!(
             document.verified_client_delivery_schema_version,
             VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION
         );
@@ -16940,6 +17022,105 @@ mod tests {
 
         let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(anchor_path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_revalidates_route_domain_certificates_after_restart() {
+        // [ROUTE-DOMAIN-CERTIFICATE-RECOVERY 2026-08-03 by Codex] Exercise the
+        // real atomic cache document rather than only the in-memory helpers.
+        // The restored node installs its own policy before accepting evidence.
+        let identity = IdentityKeyPair::generate();
+        let server = Server::new(ServerConfig::default(), identity, None);
+        let now = 1_700_030_000;
+        let subject = IdentityKeyPair::generate();
+        let attestor_a = IdentityKeyPair::generate();
+        let attestor_b = IdentityKeyPair::generate();
+        let route_domain = [0x71; 16];
+        let allowed = [attestor_a.public_key_bytes(), attestor_b.public_key_bytes()];
+        let attestations = [&attestor_a, &attestor_b]
+            .into_iter()
+            .enumerate()
+            .map(|(index, attestor)| {
+                RouteDomainAttestationV1::new_signed(
+                    subject.public_key_bytes(),
+                    route_domain,
+                    now - 2 + u64::try_from(index).unwrap(),
+                    now + 600,
+                    attestor,
+                )
+                .unwrap()
+            })
+            .collect();
+        let certificate = RouteDomainAttestationCertificateV1::new_verified(
+            subject.public_key_bytes(),
+            route_domain,
+            attestations,
+            now,
+        )
+        .unwrap();
+
+        let original = PeerStore::new();
+        original
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &allowed,
+                2,
+                true,
+            )
+            .unwrap();
+        assert!(original
+            .import_route_domain_attestation_certificate(certificate, now)
+            .unwrap());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aeronyx-peer-cache-route-domain-certificate-{unique}.json"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        Server::save_peer_store_cache_snapshot(&server.identity, &original, &path_str, now)
+            .await
+            .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
+        assert_eq!(document.route_domain_certificates.len(), 1);
+
+        let restored = PeerStore::new();
+        restored
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &allowed,
+                2,
+                true,
+            )
+            .unwrap();
+        let _ = Server::import_bootstrap_snapshot_bytes(
+            &restored,
+            "cache",
+            &path_str,
+            &bytes,
+            now + 1,
+            Some(&server.identity),
+        );
+        assert_eq!(
+            restored
+                .export_route_domain_attestation_certificates(now + 1)
+                .len(),
+            1
+        );
+        assert!(restored
+            .status(now + 1)
+            .bootstrap
+            .last_cache_load_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("route_domain_certificates_restored=1")));
+
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ =
+            tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str)).await;
     }
 
     #[tokio::test]

@@ -11,6 +11,9 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.16.0-RouteDomainCertificateRecovery - [ROUTE-DOMAIN-CERTIFICATE-RECOVERY
+//     2026-08-03 by Codex] Re-exported the bounded, identity-blind local cache
+//     recovery report and schema contract
 //   v0.15.0-RouteDomainCertificateIngress - [ROUTE-DOMAIN-CERTIFICATE-INGRESS
 //     2026-08-03 by Codex] Re-exported focused attestor-policy and certificate-
 //     import errors without widening the signed-descriptor error contract
@@ -94,8 +97,9 @@ pub use node_policy::{
     NodePolicySnapshot,
 };
 pub use peer_store::{
-    PeerStore, PeerStoreError, PeerStoreImportReport, PeerStoreSnapshot, PeerStoreStatus,
-    RouteDomainAttestorPolicyError, RouteDomainCertificateImportError,
+    PeerStore, PeerStoreError, PeerStoreImportReport, PeerStoreRouteDomainCertificateCacheReport,
+    PeerStoreSnapshot, PeerStoreStatus, RouteDomainAttestorPolicyError,
+    RouteDomainCertificateImportError,
 };
 pub use routing::RoutingService;
 pub use session::{Session, SessionManager, SessionState};
