@@ -423,6 +423,9 @@
 //     public onion pools can exclude candidates collocated with the entry.
 //
 // Last Modified:
+//   v2.8.67-RouteDomainAttestedSelection - Applies the audited local
+//     attestor/quorum policy to multi-hop probes and live relay selection,
+//     while preserving legacy direct single-hop routing.
 //   v2.8.66-RouteDomainAttestorPolicyHistory - Reconciles the canonical local
 //     attestor/quorum policy before listeners and logs aggregate evidence only.
 //   v2.8.65-OnionEntryAntiAffinity - Injected local entry identity into both
@@ -2909,7 +2912,7 @@ impl Server {
 
         let peer_store = self
             .init_peer_store(chat_relay_runtime_ready, peer_http_clients.control.as_ref())
-            .await;
+            .await?;
         self.publish_memchain_commitment_descriptor_preflight(
             &peer_store,
             peer_http_clients.control.as_ref(),
@@ -5589,7 +5592,7 @@ impl Server {
         &self,
         chat_relay_runtime_ready: bool,
         control_http_client: &reqwest::Client,
-    ) -> Arc<PeerStore> {
+    ) -> Result<Arc<PeerStore>> {
         let peer_store = Arc::new(PeerStore::new());
         peer_store.set_max_peers(Some(self.config.discovery.max_peers));
         peer_store.configure_verified_delivery_witness_requesters(
@@ -5598,6 +5601,31 @@ impl Server {
                 .discovery
                 .verified_delivery_witness_requester_node_id_bytes(),
         );
+        // [ROUTE-DOMAIN-ATTESTED-SELECTION 2026-08-03 by Codex] Install the
+        // verifier-local policy before importing any peer descriptor. Invalid
+        // policy is a startup failure; silently disabling strict mode would be
+        // a privacy downgrade. No trust-root identity is logged here.
+        let route_domains = self
+            .config
+            .discovery
+            .pinned_route_domain_assignments()
+            .into_iter()
+            .map(|assignment| (assignment.node_id, assignment.route_domain))
+            .collect::<Vec<_>>();
+        peer_store
+            .configure_route_domain_attestor_policy(
+                &route_domains,
+                &self.config.discovery.route_domain_attestor_node_id_bytes(),
+                self.config.discovery.route_domain_attestation_min_verified,
+                self.config
+                    .discovery
+                    .require_route_domain_attestations_for_multi_hop,
+            )
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "route-domain attestor policy initialization failed: {error}"
+                ))
+            })?;
         peer_store.configure_bootstrap_status(
             self.config.discovery.enabled,
             self.config.discovery.peer_cache_path.is_some(),
@@ -5623,7 +5651,7 @@ impl Server {
         if !self.config.discovery.enabled {
             info!("[DISCOVERY] Bootstrap disabled");
             peer_store.record_bootstrap_source(now, "config", "skipped", "discovery_enabled=false");
-            return peer_store;
+            return Ok(peer_store);
         }
 
         if let Some(path) = &self.config.discovery.bootstrap_snapshot_path {
@@ -5804,7 +5832,7 @@ impl Server {
                 );
             }
         }
-        peer_store
+        Ok(peer_store)
     }
 
     fn discovery_startup_self_check(config: &ServerConfig) -> (&'static str, String) {
@@ -8786,12 +8814,13 @@ impl Server {
         self_node_id: &[u8; 32],
         now: u64,
     ) -> TwoHopBlindRelayProbeOutcome {
-        let mut middle_candidates = peer_store.route_probe_candidates_with_capability_excluding(
-            NodeCapability::OnionMiddle,
-            now,
-            8,
-            &[*self_node_id],
-        );
+        let mut middle_candidates = peer_store
+            .multi_hop_route_probe_candidates_with_capability_excluding(
+                NodeCapability::OnionMiddle,
+                now,
+                8,
+                &[*self_node_id],
+            );
         Self::prioritize_probe_candidates(peer_store, now, &mut middle_candidates);
         if middle_candidates.is_empty() {
             return TwoHopBlindRelayProbeOutcome::default();
@@ -8805,7 +8834,7 @@ impl Server {
         'candidate_search: for middle in middle_candidates {
             let middle_node_id = middle.node_id();
             let mut terminal_candidates = peer_store
-                .route_probe_candidates_with_capability_excluding(
+                .multi_hop_route_probe_candidates_with_capability_excluding(
                     NodeCapability::ChatRelay,
                     now,
                     8,
@@ -9223,7 +9252,7 @@ impl Server {
         now: u64,
     ) -> TwoHopBlindRelayProbeOutcome {
         let mut first_middle_candidates = peer_store
-            .route_probe_candidates_with_capability_excluding(
+            .multi_hop_route_probe_candidates_with_capability_excluding(
                 NodeCapability::OnionMiddle,
                 now,
                 ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
@@ -9277,7 +9306,7 @@ impl Server {
         'first_middle_search: for first_middle in first_middle_candidates {
             let first_middle_node_id = first_middle.node_id();
             let mut second_middle_candidates = peer_store
-                .route_probe_candidates_with_capability_excluding(
+                .multi_hop_route_probe_candidates_with_capability_excluding(
                     NodeCapability::OnionMiddle,
                     now,
                     ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
@@ -9294,7 +9323,7 @@ impl Server {
             for second_middle in second_middle_candidates {
                 let second_middle_node_id = second_middle.node_id();
                 let mut terminal_candidates = peer_store
-                    .route_probe_candidates_with_capability_excluding(
+                    .multi_hop_route_probe_candidates_with_capability_excluding(
                         NodeCapability::ChatRelay,
                         now,
                         ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
@@ -9973,7 +10002,7 @@ impl Server {
             return AuthenticatedChatOnionRelayOutcome::default();
         };
         let terminal_candidates = peer_store
-            .delivery_receipt_route_candidates_with_capability_excluding(
+            .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
                 now,
                 CHAT_PEER_RELAY_FANOUT_LIMIT,
@@ -10000,7 +10029,7 @@ impl Server {
             excluded_node_ids.push(terminal_node_id);
             excluded_node_ids.extend(used_hop_node_ids.iter().copied());
             let Some(middle) = peer_store
-                .delivery_receipt_route_candidates_with_capability_excluding(
+                .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
                     NodeCapability::OnionMiddle,
                     now,
                     ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
@@ -18455,7 +18484,8 @@ mod tests {
         let peer_http_clients = PeerHttpClients::build(&server.config).unwrap();
         let peer_store = server
             .init_peer_store(false, peer_http_clients.control.as_ref())
-            .await;
+            .await
+            .unwrap();
 
         let store = server
             .init_directory_chain(&peer_store)
@@ -18500,7 +18530,8 @@ mod tests {
         let peer_http_clients = PeerHttpClients::build(&server.config).unwrap();
         let peer_store = server
             .init_peer_store(false, peer_http_clients.control.as_ref())
-            .await;
+            .await
+            .unwrap();
         let path = config.discovery.peer_cache_path.unwrap();
 
         let bytes = tokio::fs::read(&path)
@@ -18611,7 +18642,8 @@ mod tests {
         let peer_http_clients = PeerHttpClients::build(&server.config).unwrap();
         let restored_store = server
             .init_peer_store(false, peer_http_clients.control.as_ref())
-            .await;
+            .await
+            .unwrap();
         let status = restored_store.status(now + 1);
 
         assert!(restored_store

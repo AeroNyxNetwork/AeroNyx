@@ -1053,6 +1053,15 @@ impl DiscoveryConfig {
             }
             normalized_attestors.push(node_id);
         }
+        if normalized_attestors
+            .iter()
+            .any(|attestor| normalized_node_ids.contains(attestor))
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.route_domain_attestor_node_ids",
+                "attestors must not overlap route-domain subjects because self-attestation is invalid",
+            ));
+        }
         if attestor_policy_configured {
             if !self.enabled {
                 return Err(ServerError::config_invalid(
@@ -2411,6 +2420,17 @@ route_domain_attestor_node_ids = ["{attestor}"]
 "#
         );
         assert!(ServerConfig::from_str(&missing_history).is_err());
+
+        let overlapping_subject = format!(
+            r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+pinned_route_domains = {{ "{subject}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }}
+route_domain_attestor_node_ids = ["{subject}"]
+"#
+        );
+        assert!(ServerConfig::from_str(&overlapping_subject).is_err());
 
         let missing_attestors = format!(
             r#"

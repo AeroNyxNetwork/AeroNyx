@@ -38,6 +38,10 @@
 //!   without exposing peer endpoints or user traffic metadata
 //! - Health-ranked route candidates for blind relay preparation, using only
 //!   node-level signed descriptor metadata and never encrypted payload content
+//! - [ROUTE-DOMAIN-ATTESTED-SELECTION 2026-08-03 by Codex] Optional fail-closed
+//!   multi-hop admission under host-local opaque route-domain pins and a
+//!   portable independent-attestor quorum, while preserving direct single-hop
+//!   compatibility and never publishing trust identities or domain tokens
 //! - Blind relay runtime counters and drop reason buckets for nodeboard,
 //!   without exposing encrypted payloads, peer endpoint URLs, or user metadata
 //! - Blind relay audit size buckets so exact encrypted blob sizes do not become
@@ -268,7 +272,8 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aeronyx_core::protocol::discovery::{
-    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, SignedNodeDescriptor,
+    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage,
+    RouteDomainAttestationCertificateV1, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -303,6 +308,7 @@ const PEER_QUORUM_MIN_VALID_PEERS: usize = 2;
 const PEER_QUORUM_MIN_ROUTEABLE_CHAT_RELAYS: usize = 1;
 const TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS: usize = 2;
 const TWO_HOP_PATH_POLICY_NETWORK_DIVERSE: &str = "distinct_node_and_network_prefix";
+const MAX_ROUTE_DOMAIN_CERTIFICATES: usize = 4_096;
 
 /// Internal selector for signed path-proof cache sections.
 ///
@@ -372,6 +378,30 @@ enum EndpointNetworkIdentity {
     Dns(String),
 }
 
+/// Host-local policy for admitting portable route-domain certificates.
+///
+/// [ROUTE-DOMAIN-ATTESTED-SELECTION 2026-08-03 by Codex] This policy is never
+/// serialized into public status. Attestor identities and opaque assignments
+/// are trust input, not discovery metadata, votes, consensus, or Sybil proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerStoreRouteDomainAttestorPolicy {
+    pinned_route_domains: HashMap<[u8; 32], [u8; 16]>,
+    allowed_attestors: Vec<[u8; 32]>,
+    minimum_attestors: usize,
+    strict_multi_hop: bool,
+}
+
+impl Default for PeerStoreRouteDomainAttestorPolicy {
+    fn default() -> Self {
+        Self {
+            pinned_route_domains: HashMap::new(),
+            allowed_attestors: Vec::new(),
+            minimum_attestors: 1,
+            strict_multi_hop: false,
+        }
+    }
+}
+
 // ============================================
 // PeerStoreError
 // ============================================
@@ -396,6 +426,18 @@ pub enum PeerStoreError {
         /// Configured maximum peer count.
         max_peers: usize,
     },
+    /// Local route-domain pins, attestors, threshold, or strict mode are invalid.
+    #[error("route-domain attestor policy is invalid")]
+    InvalidRouteDomainAttestorPolicy,
+    /// A portable route-domain certificate failed local policy verification.
+    #[error("route-domain attestation certificate was rejected")]
+    RouteDomainCertificateRejected,
+    /// A valid but older/weaker certificate cannot replace fresher evidence.
+    #[error("route-domain attestation certificate is stale")]
+    StaleRouteDomainCertificate,
+    /// The bounded process-local certificate cache is full.
+    #[error("route-domain certificate capacity exceeded")]
+    RouteDomainCertificateCapacityExceeded,
 }
 
 // ============================================
@@ -2411,6 +2453,8 @@ pub struct PeerStore {
     route_health: RwLock<HashMap<[u8; 32], PeerRouteHealth>>,
     relay_protection_health: RwLock<HashMap<[u8; 32], PeerRelayProtectionHealth>>,
     delivery_receipt_capability: RwLock<HashMap<[u8; 32], u64>>,
+    route_domain_attestor_policy: RwLock<PeerStoreRouteDomainAttestorPolicy>,
+    route_domain_certificates: RwLock<HashMap<[u8; 32], RouteDomainAttestationCertificateV1>>,
     max_peers: RwLock<Option<usize>>,
     counters: PeerStoreCounters,
     audit_events: RwLock<VecDeque<PeerStoreAuditEvent>>,
@@ -2433,6 +2477,8 @@ impl PeerStore {
             route_health: RwLock::new(HashMap::new()),
             relay_protection_health: RwLock::new(HashMap::new()),
             delivery_receipt_capability: RwLock::new(HashMap::new()),
+            route_domain_attestor_policy: RwLock::new(PeerStoreRouteDomainAttestorPolicy::default()),
+            route_domain_certificates: RwLock::new(HashMap::new()),
             max_peers: RwLock::new(None),
             counters: PeerStoreCounters::new(),
             audit_events: RwLock::new(VecDeque::with_capacity(MAX_AUDIT_EVENTS)),
@@ -2483,6 +2529,188 @@ impl PeerStore {
         self.verified_delivery_witness_requesters
             .read()
             .contains(requester)
+    }
+
+    /// Replaces the exact local route-domain and attestor trust policy.
+    ///
+    /// Policy rotation invalidates all process-local certificates so every
+    /// subject must be re-verified under the new pins. Identical configuration
+    /// is idempotent and preserves valid evidence. This method never publishes
+    /// attestor identities or opaque route-domain tokens.
+    ///
+    /// # Errors
+    /// Returns [`PeerStoreError::InvalidRouteDomainAttestorPolicy`] for zero or
+    /// duplicate identities/tokens, invalid threshold, unsafe strict mode, or
+    /// attestor/subject overlap that would make strict coverage impossible.
+    pub fn configure_route_domain_attestor_policy(
+        &self,
+        pinned_route_domains: &[([u8; 32], [u8; 16])],
+        allowed_attestors: &[[u8; 32]],
+        minimum_attestors: usize,
+        strict_multi_hop: bool,
+    ) -> Result<(), PeerStoreError> {
+        let mut canonical_domains = pinned_route_domains.to_vec();
+        canonical_domains.sort_unstable_by_key(|(node_id, _)| *node_id);
+        let domains_invalid = canonical_domains.len() > MAX_ROUTE_DOMAIN_CERTIFICATES
+            || canonical_domains
+                .iter()
+                .any(|(node_id, domain)| *node_id == [0u8; 32] || *domain == [0u8; 16])
+            || canonical_domains
+                .windows(2)
+                .any(|entries| entries[0].0 == entries[1].0);
+
+        let mut canonical_attestors = allowed_attestors.to_vec();
+        canonical_attestors.sort_unstable();
+        let attestors_invalid = canonical_attestors.len() > 16
+            || canonical_attestors
+                .iter()
+                .any(|node_id| *node_id == [0u8; 32])
+            || canonical_attestors
+                .windows(2)
+                .any(|entries| entries[0] == entries[1])
+            || canonical_attestors.iter().any(|attestor| {
+                canonical_domains
+                    .binary_search_by_key(attestor, |(subject, _)| *subject)
+                    .is_ok()
+            });
+        let empty_policy_invalid =
+            canonical_attestors.is_empty() && (strict_multi_hop || minimum_attestors != 1);
+        let populated_policy_invalid = !canonical_attestors.is_empty()
+            && (minimum_attestors == 0 || minimum_attestors > canonical_attestors.len());
+        if domains_invalid
+            || attestors_invalid
+            || empty_policy_invalid
+            || populated_policy_invalid
+            || (strict_multi_hop && canonical_domains.is_empty())
+        {
+            return Err(PeerStoreError::InvalidRouteDomainAttestorPolicy);
+        }
+
+        let next = PeerStoreRouteDomainAttestorPolicy {
+            pinned_route_domains: canonical_domains.into_iter().collect(),
+            allowed_attestors: canonical_attestors,
+            minimum_attestors,
+            strict_multi_hop,
+        };
+        let mut current = self.route_domain_attestor_policy.write();
+        if *current != next {
+            self.route_domain_certificates.write().clear();
+            *current = next;
+        }
+        Ok(())
+    }
+
+    /// Verifies and retains one portable route-domain certificate.
+    ///
+    /// The certificate must bind an exact locally pinned subject/domain pair
+    /// and satisfy the verifier's current attestor quorum. At most one freshest
+    /// certificate is retained per subject; stale evidence cannot overwrite a
+    /// longer-lived valid certificate. Evidence is process-local and therefore
+    /// fails closed after restart until a trusted source supplies it again.
+    ///
+    /// # Errors
+    /// Returns a bounded [`PeerStoreError`] when policy, certificate, capacity,
+    /// subject/domain binding, signature, expiry, or replacement order fails.
+    pub fn import_route_domain_attestation_certificate(
+        &self,
+        certificate: RouteDomainAttestationCertificateV1,
+        now: u64,
+    ) -> Result<bool, PeerStoreError> {
+        let policy = self.route_domain_attestor_policy.read().clone();
+        let expected_domain = policy
+            .pinned_route_domains
+            .get(&certificate.subject_node_id)
+            .copied()
+            .ok_or(PeerStoreError::RouteDomainCertificateRejected)?;
+        if expected_domain != certificate.route_domain {
+            return Err(PeerStoreError::RouteDomainCertificateRejected);
+        }
+        certificate
+            .verify_with_policy_at(
+                &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                &policy.allowed_attestors,
+                policy.minimum_attestors,
+                now,
+            )
+            .map_err(|_| PeerStoreError::RouteDomainCertificateRejected)?;
+        let new_expiry = Self::route_domain_certificate_effective_expiry(
+            &certificate,
+            &policy.allowed_attestors,
+            policy.minimum_attestors,
+        )
+        .ok_or(PeerStoreError::RouteDomainCertificateRejected)?;
+
+        let subject_node_id = certificate.subject_node_id;
+        let mut certificates = self.route_domain_certificates.write();
+        if let Some(current) = certificates.get(&subject_node_id) {
+            if current.hash() == certificate.hash() {
+                return Ok(false);
+            }
+            let current_valid = current
+                .verify_with_policy_at(
+                    &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                    &policy.allowed_attestors,
+                    policy.minimum_attestors,
+                    now,
+                )
+                .is_ok();
+            let current_expiry = Self::route_domain_certificate_effective_expiry(
+                current,
+                &policy.allowed_attestors,
+                policy.minimum_attestors,
+            )
+            .unwrap_or(0);
+            if current_valid && new_expiry <= current_expiry {
+                return Err(PeerStoreError::StaleRouteDomainCertificate);
+            }
+        } else if certificates.len() >= MAX_ROUTE_DOMAIN_CERTIFICATES {
+            return Err(PeerStoreError::RouteDomainCertificateCapacityExceeded);
+        }
+        certificates.insert(subject_node_id, certificate);
+        Ok(true)
+    }
+
+    fn route_domain_certificate_effective_expiry(
+        certificate: &RouteDomainAttestationCertificateV1,
+        allowed_attestors: &[[u8; 32]],
+        minimum_attestors: usize,
+    ) -> Option<u64> {
+        let mut expiries = certificate
+            .attestations
+            .iter()
+            .filter(|attestation| allowed_attestors.contains(&attestation.attestor_node_id))
+            .map(|attestation| attestation.expires_at)
+            .collect::<Vec<_>>();
+        expiries.sort_unstable_by(|left, right| right.cmp(left));
+        expiries.get(minimum_attestors.checked_sub(1)?).copied()
+    }
+
+    fn route_domain_certificate_allows_multi_hop(
+        &self,
+        subject_node_id: &[u8; 32],
+        now: u64,
+    ) -> bool {
+        let policy = self.route_domain_attestor_policy.read();
+        if !policy.strict_multi_hop {
+            return true;
+        }
+        let Some(expected_domain) = policy.pinned_route_domains.get(subject_node_id) else {
+            return false;
+        };
+        self.route_domain_certificates
+            .read()
+            .get(subject_node_id)
+            .is_some_and(|certificate| {
+                certificate.route_domain == *expected_domain
+                    && certificate
+                        .verify_with_policy_at(
+                            &AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
+                            &policy.allowed_attestors,
+                            policy.minimum_attestors,
+                            now,
+                        )
+                        .is_ok()
+            })
     }
 
     /// Records discovery bootstrap feature flags from local config.
@@ -3473,8 +3701,7 @@ impl PeerStore {
                 Ok(true) => report.inserted += 1,
                 Ok(false) => report.unchanged += 1,
                 Err(PeerStoreError::StaleSequence { .. }) => report.stale += 1,
-                Err(PeerStoreError::VerificationFailed)
-                | Err(PeerStoreError::CapacityExceeded { .. }) => report.rejected += 1,
+                Err(_) => report.rejected += 1,
             }
         }
 
@@ -3510,8 +3737,7 @@ impl PeerStore {
                     Ok(true) => report.inserted += 1,
                     Ok(false) => report.unchanged += 1,
                     Err(PeerStoreError::StaleSequence { .. }) => report.stale += 1,
-                    Err(PeerStoreError::VerificationFailed)
-                    | Err(PeerStoreError::CapacityExceeded { .. }) => report.rejected += 1,
+                    Err(_) => report.rejected += 1,
                 }
                 continue;
             }
@@ -3520,8 +3746,7 @@ impl PeerStore {
                 Ok(true) => report.inserted += 1,
                 Ok(false) => report.unchanged += 1,
                 Err(PeerStoreError::StaleSequence { .. }) => report.stale += 1,
-                Err(PeerStoreError::VerificationFailed)
-                | Err(PeerStoreError::CapacityExceeded { .. }) => report.rejected += 1,
+                Err(_) => report.rejected += 1,
             }
         }
 
@@ -3645,8 +3870,7 @@ impl PeerStore {
             Ok(true) => report.inserted = 1,
             Ok(false) => report.unchanged = 1,
             Err(PeerStoreError::StaleSequence { .. }) => report.stale = 1,
-            Err(PeerStoreError::VerificationFailed)
-            | Err(PeerStoreError::CapacityExceeded { .. }) => report.rejected = 1,
+            Err(_) => report.rejected = 1,
         }
         self.record_import_report(&report, now);
         report
@@ -6215,6 +6439,39 @@ impl PeerStore {
             .collect()
     }
 
+    /// Returns receipt-capable route candidates under the multi-hop policy.
+    ///
+    /// When strict attestation is disabled this is behaviorally identical to
+    /// [`Self::delivery_receipt_route_candidates_with_capability_excluding`].
+    /// In strict mode, filtering happens before the limit so unproven peers
+    /// cannot consume the candidate budget or cause a partial-path fallback.
+    #[must_use]
+    pub fn multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
+        &self,
+        capability: NodeCapability,
+        now: u64,
+        limit: usize,
+        excluded_node_ids: &[[u8; 32]],
+    ) -> Vec<SignedNodeDescriptor> {
+        let capability_evidence = self.delivery_receipt_capability.read();
+        self.scored_route_candidates(capability, now, None, false)
+            .into_iter()
+            .filter(|candidate| {
+                let node_id = candidate.descriptor.node_id();
+                candidate.summary.routeability_ready
+                    && !excluded_node_ids
+                        .iter()
+                        .any(|excluded| *excluded == node_id)
+                    && capability_evidence.get(&node_id).is_some_and(|at| {
+                        *at <= now && now.saturating_sub(*at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+                    })
+                    && self.route_domain_certificate_allows_multi_hop(&node_id, now)
+            })
+            .take(limit)
+            .map(|candidate| candidate.descriptor)
+            .collect()
+    }
+
     /// Returns probe-only route candidates with cooled-down quarantine recovery.
     ///
     /// This method is intentionally narrower than the normal route candidate
@@ -6246,6 +6503,39 @@ impl PeerStore {
                 !excluded_node_ids
                     .iter()
                     .any(|excluded| *excluded == node_id)
+            })
+            .filter(|candidate| {
+                !candidate.summary.route_quarantined
+                    || Self::route_quarantine_recovery_probe_ready(
+                        candidate.summary.route_quarantine_remaining_seconds,
+                    )
+            })
+            .take(limit)
+            .map(|candidate| candidate.descriptor)
+            .collect()
+    }
+
+    /// Returns probe candidates under the current multi-hop attestation gate.
+    ///
+    /// Direct single-hop warmup continues using the legacy probe selector.
+    /// Two/three-hop proofs call this method so strict mode cannot establish
+    /// readiness through a peer lacking current quorum-valid evidence.
+    #[must_use]
+    pub fn multi_hop_route_probe_candidates_with_capability_excluding(
+        &self,
+        capability: NodeCapability,
+        now: u64,
+        limit: usize,
+        excluded_node_ids: &[[u8; 32]],
+    ) -> Vec<SignedNodeDescriptor> {
+        self.scored_route_candidates(capability, now, None, true)
+            .into_iter()
+            .filter(|candidate| {
+                let node_id = candidate.descriptor.node_id();
+                !excluded_node_ids
+                    .iter()
+                    .any(|excluded| *excluded == node_id)
+                    && self.route_domain_certificate_allows_multi_hop(&node_id, now)
             })
             .filter(|candidate| {
                 !candidate.summary.route_quarantined
@@ -6298,12 +6588,20 @@ impl PeerStore {
             false
         }
 
+        let strict_multi_hop = capabilities.len() > 1;
         let candidates_by_hop = capabilities
             .iter()
             .map(|capability| {
                 self.scored_route_candidates(*capability, now, None, false)
                     .into_iter()
                     .filter(|candidate| candidate.summary.routeability_ready)
+                    .filter(|candidate| {
+                        !strict_multi_hop
+                            || self.route_domain_certificate_allows_multi_hop(
+                                &candidate.descriptor.node_id(),
+                                now,
+                            )
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -7989,7 +8287,7 @@ mod tests {
     use super::*;
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::discovery::{
-        NodeCapacity, NodeDescriptor, NodePolicy, SignedNodeDescriptor,
+        NodeCapacity, NodeDescriptor, NodePolicy, RouteDomainAttestationV1, SignedNodeDescriptor,
     };
 
     fn signed_descriptor(sequence: u64, expires_at: u64) -> SignedNodeDescriptor {
@@ -8017,6 +8315,36 @@ mod tests {
         };
         descriptor.policy = NodePolicy::default();
         SignedNodeDescriptor::sign(descriptor, kp).unwrap()
+    }
+
+    fn route_domain_certificate_for(
+        subject_node_id: [u8; 32],
+        route_domain: [u8; 16],
+        issued_at: u64,
+        expires_at: u64,
+        attestors: &[&IdentityKeyPair],
+    ) -> RouteDomainAttestationCertificateV1 {
+        let statements = attestors
+            .iter()
+            .enumerate()
+            .map(|(index, attestor)| {
+                RouteDomainAttestationV1::new_signed(
+                    subject_node_id,
+                    route_domain,
+                    issued_at + u64::try_from(index).unwrap(),
+                    expires_at,
+                    attestor,
+                )
+                .unwrap()
+            })
+            .collect();
+        RouteDomainAttestationCertificateV1::new_verified(
+            subject_node_id,
+            route_domain,
+            statements,
+            issued_at + u64::try_from(attestors.len()).unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -8155,6 +8483,212 @@ mod tests {
         assert_eq!(status.chat_relay[0].routeability_state, "unknown");
         assert!(!status.chat_relay[0].routeability_ready);
         assert!(status.chat_relay[0].score > status.chat_relay[1].score);
+    }
+
+    #[test]
+    fn test_strict_route_domain_attestations_gate_only_multi_hop_selection() {
+        // [ROUTE-DOMAIN-ATTESTED-SELECTION 2026-08-03 by Codex] Strict mode
+        // fails closed for multi-hop routing without changing the established
+        // direct single-hop compatibility path.
+        let store = PeerStore::new();
+        let now = 1_700_010_000;
+        let middle = IdentityKeyPair::generate();
+        let terminal = IdentityKeyPair::generate();
+        let attestor_a = IdentityKeyPair::generate();
+        let attestor_b = IdentityKeyPair::generate();
+        let middle_domain = [0x31; 16];
+        let terminal_domain = [0x32; 16];
+
+        store
+            .configure_route_domain_attestor_policy(
+                &[
+                    (middle.public_key_bytes(), middle_domain),
+                    (terminal.public_key_bytes(), terminal_domain),
+                ],
+                &[attestor_a.public_key_bytes(), attestor_b.public_key_bytes()],
+                2,
+                true,
+            )
+            .unwrap();
+
+        let mut middle_descriptor = signed_descriptor_for(&middle, 1, now + 2_000);
+        middle_descriptor.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle_descriptor.descriptor.public_endpoint =
+            Some("http://198.51.100.20:8422".to_string());
+        middle_descriptor =
+            SignedNodeDescriptor::sign(middle_descriptor.descriptor, &middle).unwrap();
+        let mut terminal_descriptor = signed_descriptor_for(&terminal, 1, now + 2_000);
+        terminal_descriptor.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        terminal_descriptor.descriptor.public_endpoint =
+            Some("http://203.0.113.20:8422".to_string());
+        terminal_descriptor =
+            SignedNodeDescriptor::sign(terminal_descriptor.descriptor, &terminal).unwrap();
+
+        store
+            .upsert_verified_from_source(middle_descriptor, now, "gossip_announce")
+            .unwrap();
+        store
+            .upsert_verified_from_source(terminal_descriptor, now, "gossip_announce")
+            .unwrap();
+        store.record_route_forward_success(&middle.public_key_bytes(), now);
+        store.record_route_forward_success(&terminal.public_key_bytes(), now);
+
+        assert!(store
+            .route_path_with_capabilities_excluding(&[NodeCapability::ChatRelay], now, &[])
+            .is_some());
+        assert!(store
+            .route_path_with_capabilities_excluding(
+                &[NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+                now,
+                &[],
+            )
+            .is_none());
+        assert_eq!(
+            store
+                .route_probe_candidates_with_capability_excluding(
+                    NodeCapability::OnionMiddle,
+                    now,
+                    8,
+                    &[],
+                )
+                .len(),
+            1
+        );
+        assert!(store
+            .multi_hop_route_probe_candidates_with_capability_excluding(
+                NodeCapability::OnionMiddle,
+                now,
+                8,
+                &[],
+            )
+            .is_empty());
+
+        for (subject, route_domain) in [
+            (middle.public_key_bytes(), middle_domain),
+            (terminal.public_key_bytes(), terminal_domain),
+        ] {
+            let certificate = route_domain_certificate_for(
+                subject,
+                route_domain,
+                now - 2,
+                now + 600,
+                &[&attestor_a, &attestor_b],
+            );
+            assert!(store
+                .import_route_domain_attestation_certificate(certificate, now)
+                .unwrap());
+        }
+
+        let path = store
+            .route_path_with_capabilities_excluding(
+                &[NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+                now,
+                &[],
+            )
+            .expect("quorum-valid certificates should unlock the complete route");
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].node_id(), middle.public_key_bytes());
+        assert_eq!(path[1].node_id(), terminal.public_key_bytes());
+        assert_eq!(
+            store
+                .multi_hop_route_probe_candidates_with_capability_excluding(
+                    NodeCapability::OnionMiddle,
+                    now,
+                    8,
+                    &[],
+                )
+                .len(),
+            1
+        );
+
+        assert!(store
+            .route_path_with_capabilities_excluding(
+                &[NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
+                now + 600,
+                &[],
+            )
+            .is_none());
+        assert!(store
+            .route_path_with_capabilities_excluding(&[NodeCapability::ChatRelay], now + 600, &[],)
+            .is_some());
+    }
+
+    #[test]
+    fn test_route_domain_certificate_import_rejects_untrusted_and_stale_evidence() {
+        // [ROUTE-DOMAIN-ATTESTED-SELECTION 2026-08-03 by Codex] Certificate
+        // replacement is monotonic under one policy epoch, while any policy
+        // rotation clears process evidence and requires fresh verification.
+        let store = PeerStore::new();
+        let now = 1_700_020_000;
+        let subject = IdentityKeyPair::generate();
+        let attestor_a = IdentityKeyPair::generate();
+        let attestor_b = IdentityKeyPair::generate();
+        let untrusted = IdentityKeyPair::generate();
+        let replacement_attestor = IdentityKeyPair::generate();
+        let route_domain = [0x41; 16];
+        let allowed = [attestor_a.public_key_bytes(), attestor_b.public_key_bytes()];
+
+        store
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &allowed,
+                2,
+                true,
+            )
+            .unwrap();
+        let untrusted_certificate = route_domain_certificate_for(
+            subject.public_key_bytes(),
+            route_domain,
+            now - 2,
+            now + 900,
+            &[&attestor_a, &untrusted],
+        );
+        assert!(matches!(
+            store.import_route_domain_attestation_certificate(untrusted_certificate, now),
+            Err(PeerStoreError::RouteDomainCertificateRejected)
+        ));
+
+        let current = route_domain_certificate_for(
+            subject.public_key_bytes(),
+            route_domain,
+            now - 2,
+            now + 800,
+            &[&attestor_a, &attestor_b],
+        );
+        assert!(store
+            .import_route_domain_attestation_certificate(current.clone(), now)
+            .unwrap());
+        assert!(!store
+            .import_route_domain_attestation_certificate(current, now)
+            .unwrap());
+
+        let stale = route_domain_certificate_for(
+            subject.public_key_bytes(),
+            route_domain,
+            now - 1,
+            now + 700,
+            &[&attestor_a, &attestor_b],
+        );
+        assert!(matches!(
+            store.import_route_domain_attestation_certificate(stale, now),
+            Err(PeerStoreError::StaleRouteDomainCertificate)
+        ));
+        assert!(store.route_domain_certificate_allows_multi_hop(&subject.public_key_bytes(), now));
+
+        let rotated_allowed = [
+            attestor_a.public_key_bytes(),
+            attestor_b.public_key_bytes(),
+            replacement_attestor.public_key_bytes(),
+        ];
+        store
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &rotated_allowed,
+                2,
+                true,
+            )
+            .unwrap();
+        assert!(!store.route_domain_certificate_allows_multi_hop(&subject.public_key_bytes(), now));
     }
 
     #[test]

@@ -188,6 +188,8 @@
 //!   producer, carrier, endpoint, URL, status code, request, or frame labels.
 //!
 //! ## Last Modified
+//! `v0.32.0-RouteDomainErrorIsolation` - Keeps new route-domain policy and
+//! certificate failures in stable, privacy-safe local admission buckets.
 //! `v0.31.0-DirectoryTransportTelemetry` - Added task-scoped, mutually
 //! exclusive process transport outcomes without changing stable failure codes.
 //! `v0.30.0-RoleSpecificTransportBudgets` - Restored one canonical 10-second
@@ -855,6 +857,18 @@ const fn directory_authenticated_peer_store_error(error: &PeerStoreError) -> &'s
         PeerStoreError::StaleSequence { .. } => "directory_authenticated_admission_stale_sequence",
         PeerStoreError::CapacityExceeded { .. } => {
             "directory_authenticated_admission_peer_capacity_exceeded"
+        }
+        // [ROUTE-DOMAIN-ATTESTED-SELECTION 2026-08-03 by Codex] This
+        // descriptor-admission surface does not import route-domain evidence,
+        // but its exhaustive classification must remain stable as PeerStore
+        // grows. Collapse trust details into non-identifying local buckets.
+        PeerStoreError::InvalidRouteDomainAttestorPolicy => {
+            "directory_authenticated_admission_local_policy_invalid"
+        }
+        PeerStoreError::RouteDomainCertificateRejected
+        | PeerStoreError::StaleRouteDomainCertificate
+        | PeerStoreError::RouteDomainCertificateCapacityExceeded => {
+            "directory_authenticated_admission_route_domain_certificate_rejected"
         }
     }
 }
