@@ -11,6 +11,9 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.15.0-RouteDomainCertificateIngress - [ROUTE-DOMAIN-CERTIFICATE-INGRESS
+//     2026-08-03 by Codex] Re-exported focused attestor-policy and certificate-
+//     import errors without widening the signed-descriptor error contract
 //   v0.14.0-DNSTransactionalStartup - [DNS-STARTUP-READINESS 2026-07-30 by
 //     Codex] Re-exported the pre-bound production DNS startup path while
 //     retaining the legacy spawn API
@@ -69,8 +72,8 @@ pub use directory_chain::{
     DirectoryChainAppendReport, DirectoryChainAudit, DirectoryChainPage, DirectoryChainStore,
     DirectoryChainStoreError,
 };
-pub(crate) use directory_replica::MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE;
 pub(crate) use directory_replica::DirectoryReplicaGossipAnnouncement;
+pub(crate) use directory_replica::MAX_DIRECTORY_REPLICA_INCIDENT_PAGE_SIZE;
 pub use directory_replica::{
     DirectoryObservationCheckpointAppendReport, DirectoryObservationWitnessDecision,
     DirectoryObservationWitnessOutcome, DirectoryObservationWitnessOutcomeCounters,
@@ -92,6 +95,7 @@ pub use node_policy::{
 };
 pub use peer_store::{
     PeerStore, PeerStoreError, PeerStoreImportReport, PeerStoreSnapshot, PeerStoreStatus,
+    RouteDomainAttestorPolicyError, RouteDomainCertificateImportError,
 };
 pub use routing::RoutingService;
 pub use session::{Session, SessionManager, SessionState};

@@ -426,18 +426,32 @@ pub enum PeerStoreError {
         /// Configured maximum peer count.
         max_peers: usize,
     },
+}
+
+/// Errors returned while installing host-local route-domain trust policy.
+///
+/// [ROUTE-DOMAIN-CERTIFICATE-INGRESS 2026-08-03 by Codex] This focused error
+/// type prevents certificate lifecycle concerns from leaking into unrelated
+/// signed-descriptor admission call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RouteDomainAttestorPolicyError {
     /// Local route-domain pins, attestors, threshold, or strict mode are invalid.
     #[error("route-domain attestor policy is invalid")]
-    InvalidRouteDomainAttestorPolicy,
+    InvalidPolicy,
+}
+
+/// Errors returned while importing one portable route-domain certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RouteDomainCertificateImportError {
     /// A portable route-domain certificate failed local policy verification.
     #[error("route-domain attestation certificate was rejected")]
-    RouteDomainCertificateRejected,
+    Rejected,
     /// A valid but older/weaker certificate cannot replace fresher evidence.
     #[error("route-domain attestation certificate is stale")]
-    StaleRouteDomainCertificate,
+    Stale,
     /// The bounded process-local certificate cache is full.
     #[error("route-domain certificate capacity exceeded")]
-    RouteDomainCertificateCapacityExceeded,
+    CapacityExceeded,
 }
 
 // ============================================
@@ -2539,7 +2553,7 @@ impl PeerStore {
     /// attestor identities or opaque route-domain tokens.
     ///
     /// # Errors
-    /// Returns [`PeerStoreError::InvalidRouteDomainAttestorPolicy`] for zero or
+    /// Returns [`RouteDomainAttestorPolicyError::InvalidPolicy`] for zero or
     /// duplicate identities/tokens, invalid threshold, unsafe strict mode, or
     /// attestor/subject overlap that would make strict coverage impossible.
     pub fn configure_route_domain_attestor_policy(
@@ -2548,7 +2562,7 @@ impl PeerStore {
         allowed_attestors: &[[u8; 32]],
         minimum_attestors: usize,
         strict_multi_hop: bool,
-    ) -> Result<(), PeerStoreError> {
+    ) -> Result<(), RouteDomainAttestorPolicyError> {
         let mut canonical_domains = pinned_route_domains.to_vec();
         canonical_domains.sort_unstable_by_key(|(node_id, _)| *node_id);
         let domains_invalid = canonical_domains.len() > MAX_ROUTE_DOMAIN_CERTIFICATES
@@ -2583,7 +2597,7 @@ impl PeerStore {
             || populated_policy_invalid
             || (strict_multi_hop && canonical_domains.is_empty())
         {
-            return Err(PeerStoreError::InvalidRouteDomainAttestorPolicy);
+            return Err(RouteDomainAttestorPolicyError::InvalidPolicy);
         }
 
         let next = PeerStoreRouteDomainAttestorPolicy {
@@ -2609,21 +2623,22 @@ impl PeerStore {
     /// fails closed after restart until a trusted source supplies it again.
     ///
     /// # Errors
-    /// Returns a bounded [`PeerStoreError`] when policy, certificate, capacity,
-    /// subject/domain binding, signature, expiry, or replacement order fails.
+    /// Returns a bounded [`RouteDomainCertificateImportError`] when policy,
+    /// certificate, capacity, subject/domain binding, signature, expiry, or
+    /// replacement order fails.
     pub fn import_route_domain_attestation_certificate(
         &self,
         certificate: RouteDomainAttestationCertificateV1,
         now: u64,
-    ) -> Result<bool, PeerStoreError> {
+    ) -> Result<bool, RouteDomainCertificateImportError> {
         let policy = self.route_domain_attestor_policy.read().clone();
         let expected_domain = policy
             .pinned_route_domains
             .get(&certificate.subject_node_id)
             .copied()
-            .ok_or(PeerStoreError::RouteDomainCertificateRejected)?;
+            .ok_or(RouteDomainCertificateImportError::Rejected)?;
         if expected_domain != certificate.route_domain {
-            return Err(PeerStoreError::RouteDomainCertificateRejected);
+            return Err(RouteDomainCertificateImportError::Rejected);
         }
         certificate
             .verify_with_policy_at(
@@ -2632,13 +2647,13 @@ impl PeerStore {
                 policy.minimum_attestors,
                 now,
             )
-            .map_err(|_| PeerStoreError::RouteDomainCertificateRejected)?;
+            .map_err(|_| RouteDomainCertificateImportError::Rejected)?;
         let new_expiry = Self::route_domain_certificate_effective_expiry(
             &certificate,
             &policy.allowed_attestors,
             policy.minimum_attestors,
         )
-        .ok_or(PeerStoreError::RouteDomainCertificateRejected)?;
+        .ok_or(RouteDomainCertificateImportError::Rejected)?;
 
         let subject_node_id = certificate.subject_node_id;
         let mut certificates = self.route_domain_certificates.write();
@@ -2661,10 +2676,10 @@ impl PeerStore {
             )
             .unwrap_or(0);
             if current_valid && new_expiry <= current_expiry {
-                return Err(PeerStoreError::StaleRouteDomainCertificate);
+                return Err(RouteDomainCertificateImportError::Stale);
             }
         } else if certificates.len() >= MAX_ROUTE_DOMAIN_CERTIFICATES {
-            return Err(PeerStoreError::RouteDomainCertificateCapacityExceeded);
+            return Err(RouteDomainCertificateImportError::CapacityExceeded);
         }
         certificates.insert(subject_node_id, certificate);
         Ok(true)
@@ -8645,7 +8660,7 @@ mod tests {
         );
         assert!(matches!(
             store.import_route_domain_attestation_certificate(untrusted_certificate, now),
-            Err(PeerStoreError::RouteDomainCertificateRejected)
+            Err(RouteDomainCertificateImportError::Rejected)
         ));
 
         let current = route_domain_certificate_for(
@@ -8671,7 +8686,7 @@ mod tests {
         );
         assert!(matches!(
             store.import_route_domain_attestation_certificate(stale, now),
-            Err(PeerStoreError::StaleRouteDomainCertificate)
+            Err(RouteDomainCertificateImportError::Stale)
         ));
         assert!(store.route_domain_certificate_allows_multi_hop(&subject.public_key_bytes(), now));
 

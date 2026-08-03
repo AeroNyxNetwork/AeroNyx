@@ -49,6 +49,10 @@
 //! - [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] Production routers inject
 //!   the local node id and exclude candidates sharing the entry node's coarse
 //!   endpoint network identity before multi-hop readiness is evaluated.
+//! - [ROUTE-DOMAIN-CERTIFICATE-INGRESS 2026-08-03 by Codex] Accepts a tightly
+//!   bounded portable certificate frame from any transport sender, then admits
+//!   it only under the node's exact host-local subject/domain pins and pinned
+//!   independent-attestor quorum.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -111,8 +115,14 @@
 //! - Production callers must use `build_discovery_router_with_local_entry` so
 //!   candidate anti-affinity includes the entry node itself. Legacy builders
 //!   remain for compatibility and explicitly report that this gate is absent.
+//! - Route-domain certificate transport is permissionless but not trusted:
+//!   signatures, exact local subject/domain pins, expiry, and local quorum are
+//!   the authority. Never log or return subject ids, attestors, domain tokens,
+//!   signatures, certificate hashes, or selected routes.
 //!
 //! ## Last Modified
+//! v0.45.0-RouteDomainCertificateIngress - Added bounded, rate-limited,
+//! verifier-local certificate admission without publishing trust metadata
 //! v0.44.0-PinnedRouteDomainAdmission - Added optional fail-closed multi-hop
 //! admission using operator-audited opaque route-domain assignments
 //! v0.43.0-OnionEntryAntiAffinity - Exclude candidates collocated with the
@@ -181,10 +191,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aeronyx_core::protocol::discovery::{
+    decode_route_domain_attestation_certificate,
+    MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES,
+};
 use aeronyx_core::protocol::{
     NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, SignedNodeDescriptor,
 };
 use axum::{
+    body::Bytes,
     extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     response::IntoResponse,
@@ -196,7 +211,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::directory_replica_sync::admit_directory_gossip_descriptor;
 use crate::config::DiscoveryConfig;
-use crate::services::{DirectoryReplicaStore, PeerStore, PeerStoreImportReport, PeerStoreStatus};
+use crate::services::{
+    DirectoryReplicaStore, PeerStore, PeerStoreImportReport, PeerStoreStatus,
+    RouteDomainCertificateImportError,
+};
 
 // ============================================
 // State / Request / Response Types
@@ -209,6 +227,7 @@ const ONION_CANDIDATES_CONTRACT_VERSION: &str = "onion_candidates.v1";
 /// encoding adds overhead, so this public HTTP boundary deliberately allows
 /// 1 MiB while still preventing unbounded allocation from untrusted peers.
 const DISCOVERY_REQUEST_BODY_MAX_BYTES: usize = 1024 * 1024;
+const ROUTE_DOMAIN_CERTIFICATE_RATE_LIMIT_PER_MINUTE: u32 = 60;
 const ONION_CANDIDATES_SOURCE: &str = "rust_discovery_onion_candidates";
 const ONION_CANDIDATES_SELECTION_POLICY: &str =
     "fresh_routeable_signed_chat_relays_with_kem_public_key";
@@ -232,6 +251,7 @@ struct DiscoveryApiState {
     policy: DiscoveryApiPolicy,
     local_capabilities: DiscoveryLocalCapabilityStatus,
     rate_limit: Arc<Mutex<RateLimitState>>,
+    route_domain_certificate_rate_limit: Arc<Mutex<RateLimitState>>,
 }
 
 /// API-facing discovery safety policy.
@@ -269,6 +289,11 @@ impl DiscoveryApiPolicy {
             require_pinned_route_domains_for_multi_hop: config
                 .require_pinned_route_domains_for_multi_hop,
         }
+    }
+
+    fn route_domain_certificate_rate_limit_per_minute(&self) -> u32 {
+        self.gossip_rate_limit_per_minute
+            .clamp(1, ROUTE_DOMAIN_CERTIFICATE_RATE_LIMIT_PER_MINUTE)
     }
 
     fn snapshot_limit(&self, requested: Option<usize>) -> usize {
@@ -630,6 +655,17 @@ pub struct OnionCandidatesResponse {
 pub struct GossipResponse {
     pub applied: PeerStoreImportReport,
     pub response: Option<NodeDiscoveryMessage>,
+}
+
+/// Stable, identity-blind result of one route-domain certificate submission.
+#[derive(Debug, Serialize)]
+struct RouteDomainCertificateImportResponse {
+    /// Whether the frame and its locally pinned attestor quorum were accepted.
+    accepted: bool,
+    /// Whether this request inserted/replaced evidence instead of being idempotent.
+    stored: bool,
+    /// Stable aggregate outcome with no subject, attestor, token, or hash.
+    status: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -2166,10 +2202,17 @@ fn build_discovery_router_state(
         policy,
         local_capabilities,
         rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
+        route_domain_certificate_rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
     };
     Router::new()
         .route("/api/discovery/snapshot", get(snapshot_handler))
         .route("/api/discovery/gossip", post(gossip_handler))
+        .route(
+            "/api/discovery/route-domain-certificate",
+            post(route_domain_certificate_handler).layer(DefaultBodyLimit::max(
+                MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES,
+            )),
+        )
         .route("/api/discovery/status", get(status_handler))
         .route("/api/discovery/summary", get(summary_handler))
         .route("/api/discovery/public-card", get(public_card_handler))
@@ -2907,6 +2950,139 @@ fn onion_candidate_next_action(
     }
 }
 
+/// Imports one portable route-domain certificate under exact host-local pins.
+///
+/// [ROUTE-DOMAIN-CERTIFICATE-INGRESS 2026-08-03 by Codex] The transport sender
+/// is intentionally not authority: any peer may carry the bounded frame, while
+/// only signatures from locally pinned independent attestors count. Responses
+/// and audit events remain identity-blind.
+async fn route_domain_certificate_handler(
+    State(state): State<DiscoveryApiState>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let now = now_secs();
+    let rate_limit = state
+        .policy
+        .route_domain_certificate_rate_limit_per_minute();
+    if !state
+        .route_domain_certificate_rate_limit
+        .lock()
+        .allow(now, rate_limit)
+    {
+        state.peer_store.record_audit_event(
+            now,
+            "route_domain_certificate_import",
+            "rate_limited",
+            "reason=bounded_ingress_limit",
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(RouteDomainCertificateImportResponse {
+                accepted: false,
+                stored: false,
+                status: "rate_limited",
+            }),
+        )
+            .into_response();
+    }
+
+    let certificate = match decode_route_domain_attestation_certificate(&body) {
+        Ok(certificate) => certificate,
+        Err(_) => {
+            state.peer_store.record_audit_event(
+                now,
+                "route_domain_certificate_import",
+                "rejected",
+                "reason=malformed_frame",
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(RouteDomainCertificateImportResponse {
+                    accepted: false,
+                    stored: false,
+                    status: "malformed_certificate",
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match state
+        .peer_store
+        .import_route_domain_attestation_certificate(certificate, now)
+    {
+        Ok(stored) => {
+            let status = if stored { "stored" } else { "already_present" };
+            state.peer_store.record_audit_event(
+                now,
+                "route_domain_certificate_import",
+                "accepted",
+                format!("result={status}"),
+            );
+            (
+                StatusCode::OK,
+                Json(RouteDomainCertificateImportResponse {
+                    accepted: true,
+                    stored,
+                    status,
+                }),
+            )
+                .into_response()
+        }
+        Err(RouteDomainCertificateImportError::Rejected) => {
+            state.peer_store.record_audit_event(
+                now,
+                "route_domain_certificate_import",
+                "rejected",
+                "reason=local_policy_verification_failed",
+            );
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(RouteDomainCertificateImportResponse {
+                    accepted: false,
+                    stored: false,
+                    status: "certificate_rejected",
+                }),
+            )
+                .into_response()
+        }
+        Err(RouteDomainCertificateImportError::Stale) => {
+            state.peer_store.record_audit_event(
+                now,
+                "route_domain_certificate_import",
+                "rejected",
+                "reason=stale_evidence",
+            );
+            (
+                StatusCode::CONFLICT,
+                Json(RouteDomainCertificateImportResponse {
+                    accepted: false,
+                    stored: false,
+                    status: "stale_certificate",
+                }),
+            )
+                .into_response()
+        }
+        Err(RouteDomainCertificateImportError::CapacityExceeded) => {
+            state.peer_store.record_audit_event(
+                now,
+                "route_domain_certificate_import",
+                "rejected",
+                "reason=bounded_cache_capacity",
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(RouteDomainCertificateImportResponse {
+                    accepted: false,
+                    stored: false,
+                    status: "certificate_capacity_reached",
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn gossip_handler(
     State(state): State<DiscoveryApiState>,
     Json(message): Json<NodeDiscoveryMessage>,
@@ -3097,8 +3273,9 @@ mod tests {
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::protocol::discovery::{
         directory_block_range_response_signing_bytes, encode_directory_sync_message,
-        DirectoryCommitmentBlockV1, DirectoryDescriptorCommitmentV1,
-        DirectoryDescriptorInclusionProofV1, DirectorySyncMessage,
+        encode_route_domain_attestation_certificate, DirectoryCommitmentBlockV1,
+        DirectoryDescriptorCommitmentV1, DirectoryDescriptorInclusionProofV1, DirectorySyncMessage,
+        RouteDomainAttestationCertificateV1, RouteDomainAttestationV1,
         AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
     };
     use aeronyx_core::protocol::{
@@ -3125,6 +3302,36 @@ mod tests {
             max_pps: None,
         };
         aeronyx_core::protocol::SignedNodeDescriptor::sign(descriptor, &kp).unwrap()
+    }
+
+    fn route_domain_certificate_for(
+        subject_node_id: [u8; 32],
+        route_domain: [u8; 16],
+        now: u64,
+        attestors: &[&IdentityKeyPair],
+    ) -> RouteDomainAttestationCertificateV1 {
+        let statements = attestors
+            .iter()
+            .enumerate()
+            .map(|(index, attestor)| {
+                RouteDomainAttestationV1::new_signed(
+                    subject_node_id,
+                    route_domain,
+                    now.saturating_sub(2)
+                        + u64::try_from(index).expect("bounded test attestor count"),
+                    now + 600,
+                    attestor,
+                )
+                .unwrap()
+            })
+            .collect();
+        RouteDomainAttestationCertificateV1::new_verified(
+            subject_node_id,
+            route_domain,
+            statements,
+            now,
+        )
+        .unwrap()
     }
 
     fn directory_gossip_fixture(
@@ -4256,6 +4463,218 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn route_domain_certificate_ingress_is_verified_and_idempotent() {
+        // [ROUTE-DOMAIN-CERTIFICATE-INGRESS 2026-08-03 by Codex] The HTTP
+        // sender has no authority; only the configured certificate quorum can
+        // move the process-local route gate.
+        let now = now_secs();
+        let store = Arc::new(PeerStore::new());
+        let subject = IdentityKeyPair::generate();
+        let attestor_a = IdentityKeyPair::generate();
+        let attestor_b = IdentityKeyPair::generate();
+        let route_domain = [0x61; 16];
+        store
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &[attestor_a.public_key_bytes(), attestor_b.public_key_bytes()],
+                2,
+                true,
+            )
+            .unwrap();
+        let certificate = route_domain_certificate_for(
+            subject.public_key_bytes(),
+            route_domain,
+            now,
+            &[&attestor_a, &attestor_b],
+        );
+        let body = encode_route_domain_attestation_certificate(&certificate).unwrap();
+        let app = build_discovery_router(Arc::clone(&store), DiscoveryApiPolicy::default());
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/route-domain-certificate")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["accepted"], true);
+        assert_eq!(first_json["stored"], true);
+        assert_eq!(first_json["status"], "stored");
+
+        let duplicate = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/route-domain-certificate")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body = axum::body::to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let duplicate_json: serde_json::Value = serde_json::from_slice(&duplicate_body).unwrap();
+        assert_eq!(duplicate_json["accepted"], true);
+        assert_eq!(duplicate_json["stored"], false);
+        assert_eq!(duplicate_json["status"], "already_present");
+    }
+
+    #[tokio::test]
+    async fn route_domain_certificate_ingress_rejects_untrusted_malformed_and_oversized_frames() {
+        let now = now_secs();
+        let store = Arc::new(PeerStore::new());
+        let subject = IdentityKeyPair::generate();
+        let attestor_a = IdentityKeyPair::generate();
+        let attestor_b = IdentityKeyPair::generate();
+        let untrusted = IdentityKeyPair::generate();
+        let route_domain = [0x62; 16];
+        store
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &[attestor_a.public_key_bytes(), attestor_b.public_key_bytes()],
+                2,
+                true,
+            )
+            .unwrap();
+        let untrusted_certificate = route_domain_certificate_for(
+            subject.public_key_bytes(),
+            route_domain,
+            now,
+            &[&attestor_a, &untrusted],
+        );
+        let app = build_discovery_router(Arc::clone(&store), DiscoveryApiPolicy::default());
+
+        let untrusted_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/route-domain-certificate")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(
+                        encode_route_domain_attestation_certificate(&untrusted_certificate)
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            untrusted_response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        let malformed_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/route-domain-certificate")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(vec![0u8; 8]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed_response.status(), StatusCode::BAD_REQUEST);
+
+        let oversized_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/route-domain-certificate")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(vec![
+                        0u8;
+                        MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES
+                            + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn route_domain_certificate_ingress_has_an_isolated_rate_budget() {
+        let now = now_secs();
+        let store = Arc::new(PeerStore::new());
+        let subject = IdentityKeyPair::generate();
+        let attestor = IdentityKeyPair::generate();
+        let route_domain = [0x63; 16];
+        store
+            .configure_route_domain_attestor_policy(
+                &[(subject.public_key_bytes(), route_domain)],
+                &[attestor.public_key_bytes()],
+                1,
+                true,
+            )
+            .unwrap();
+        let certificate = route_domain_certificate_for(
+            subject.public_key_bytes(),
+            route_domain,
+            now,
+            &[&attestor],
+        );
+        let body = encode_route_domain_attestation_certificate(&certificate).unwrap();
+        let mut policy = DiscoveryApiPolicy::default();
+        policy.gossip_rate_limit_per_minute = 1;
+        let app = build_discovery_router(Arc::clone(&store), policy);
+
+        for expected in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/discovery/route-domain-certificate")
+                        .header("content-type", "application/octet-stream")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+
+        let gossip_body = serde_json::to_vec(&NodeDiscoveryMessage::SnapshotRequest {
+            requested_at: now,
+            limit: Some(1),
+        })
+        .unwrap();
+        let gossip_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/discovery/gossip")
+                    .header("content-type", "application/json")
+                    .body(Body::from(gossip_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            gossip_response.status(),
+            StatusCode::OK,
+            "certificate abuse must not exhaust the gossip recovery budget"
+        );
     }
 
     #[tokio::test]
@@ -5423,6 +5842,7 @@ mod tests {
             policy: DiscoveryApiPolicy::default(),
             local_capabilities: DiscoveryLocalCapabilityStatus::default(),
             rate_limit,
+            route_domain_certificate_rate_limit: Arc::new(Mutex::new(RateLimitState::new())),
         };
         let response = gossip_handler(
             State(state),
