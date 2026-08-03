@@ -423,6 +423,8 @@
 //     public onion pools can exclude candidates collocated with the entry.
 //
 // Last Modified:
+//   v2.8.66-RouteDomainAttestorPolicyHistory - Reconciles the canonical local
+//     attestor/quorum policy before listeners and logs aggregate evidence only.
 //   v2.8.65-OnionEntryAntiAffinity - Injected local entry identity into both
 //     required discovery listeners without serializing it in public status.
 //   v2.8.64-PathProofRollbackAnchor - Bound two-hop and three-hop proof
@@ -6311,40 +6313,60 @@ impl Server {
             .config
             .discovery
             .require_pinned_route_domains_for_multi_hop;
-        let (store, audit, policy, route_domain_policy) = tokio::task::spawn_blocking(move || {
-            let (store, _) = DirectoryReplicaStore::open(&open_path, local_node_id, observed_at)?;
-            let policy = store.reconcile_observation_witness_policy(
-                &identity,
-                &witness_node_ids,
-                minimum_witnesses,
-                observed_at,
-            )?;
-            let route_domain_policy = store.reconcile_route_domain_policy(
-                &identity,
-                &route_domain_assignments,
-                route_domain_strict,
-                observed_at,
-            )?;
-            let audit = store.audit(observed_at)?;
-            Ok::<_, crate::services::DirectoryReplicaStoreError>((
-                store,
-                audit,
-                policy,
-                route_domain_policy,
-            ))
-        })
-        .await
-        .map_err(|error| {
-            ServerError::startup_failed(format!(
-                "Directory replica store task failed before startup: {}",
-                RuntimeTaskJoinFailureKind::classify(&error).blocking_task_reason()
-            ))
-        })?
-        .map_err(|error| {
-            ServerError::startup_failed(format!(
-                "Directory replica startup audit failed for '{path}': {error}"
-            ))
-        })?;
+        // [ROUTE-DOMAIN-ATTESTOR-HISTORY 2026-08-03 by Codex] Persist the
+        // verifier's local trust roots before route listeners start. Signatures
+        // prove attestor authorship only; no log message exports pin identities.
+        let route_domain_attestors = self.config.discovery.route_domain_attestor_node_id_bytes();
+        let route_domain_attestor_minimum =
+            self.config.discovery.route_domain_attestation_min_verified;
+        let route_domain_attestor_strict = self
+            .config
+            .discovery
+            .require_route_domain_attestations_for_multi_hop;
+        let (store, audit, policy, route_domain_policy, route_domain_attestor_policy) =
+            tokio::task::spawn_blocking(move || {
+                let (store, _) =
+                    DirectoryReplicaStore::open(&open_path, local_node_id, observed_at)?;
+                let policy = store.reconcile_observation_witness_policy(
+                    &identity,
+                    &witness_node_ids,
+                    minimum_witnesses,
+                    observed_at,
+                )?;
+                let route_domain_policy = store.reconcile_route_domain_policy(
+                    &identity,
+                    &route_domain_assignments,
+                    route_domain_strict,
+                    observed_at,
+                )?;
+                let route_domain_attestor_policy = store.reconcile_route_domain_attestor_policy(
+                    &identity,
+                    &route_domain_attestors,
+                    route_domain_attestor_minimum,
+                    route_domain_attestor_strict,
+                    observed_at,
+                )?;
+                let audit = store.audit(observed_at)?;
+                Ok::<_, crate::services::DirectoryReplicaStoreError>((
+                    store,
+                    audit,
+                    policy,
+                    route_domain_policy,
+                    route_domain_attestor_policy,
+                ))
+            })
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "Directory replica store task failed before startup: {}",
+                    RuntimeTaskJoinFailureKind::classify(&error).blocking_task_reason()
+                ))
+            })?
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "Directory replica startup audit failed for '{path}': {error}"
+                ))
+            })?;
         info!(
             producers = audit.producers,
             mirror_producers = audit.mirror_producers,
@@ -6373,6 +6395,16 @@ impl Server {
             route_domain_policy_activated_at = route_domain_policy.activated_at,
             route_domain_policy_assignments = route_domain_policy.assignments,
             route_domain_policy_strict = route_domain_policy.strict_required,
+            route_domain_attestor_policy_appended = route_domain_attestor_policy.appended,
+            route_domain_attestor_policy_epoch = route_domain_attestor_policy.epoch,
+            route_domain_attestor_policy_digest =
+                %hex::encode(route_domain_attestor_policy.policy_digest),
+            route_domain_attestor_policy_activated_at =
+                route_domain_attestor_policy.activated_at,
+            route_domain_attestor_policy_members = route_domain_attestor_policy.attestors,
+            route_domain_attestor_policy_threshold =
+                route_domain_attestor_policy.minimum_attestors,
+            route_domain_attestor_policy_strict = route_domain_attestor_policy.strict_required,
             retry_states = audit.retry_states,
             "[DIRECTORY_REPLICA] Startup audit and local policy reconciliation passed"
         );

@@ -41,6 +41,9 @@
 //! - [ROUTE-DOMAIN-POLICY-HISTORY 2026-08-03 by Codex] Persists canonical
 //!   route-domain pin changes as a separate node-signed, hash-linked history;
 //!   the opaque grouping remains local policy, not an identity or AS proof.
+//! - [ROUTE-DOMAIN-ATTESTOR-HISTORY 2026-08-03 by Codex] Persists canonical
+//!   attestor pins, threshold, and strict-mode changes as an independent signed
+//!   history without exposing trust-root identities in aggregate status.
 //! - Retains opaque policy heads observed by independent nodes and accepted
 //!   signed external anchor receipts without exposing policy member identities.
 //! - Selects only forward-moving, mature, unwitnessed checkpoints for external
@@ -147,6 +150,9 @@
 //!     in the runtime so API presentation cannot drift from service policy.
 //! 23. Preserve witness recovery and carrier terminal-event order independently
 //!     from second-granularity timestamps and verify mutually exclusive totals.
+//! 24. Canonicalize route-domain attestor pins and append a signed policy epoch
+//!     only when pins, threshold, or strict mode change; audit the complete
+//!     local trust-root history before route listeners start.
 //!
 //! ## Privacy Invariant
 //! Replica tables contain only public signed node descriptors, public
@@ -192,6 +198,9 @@
 //! - Witness policy epochs describe only this operator's local evidence target.
 //!   They are not a validator set, vote, quorum, fork choice, consensus, or
 //!   finality, and public status must never expose their full member identities.
+//! - Route-domain attestor epochs are local verification trust roots. They do
+//!   not prove ASN/operator/geographic independence, consensus, honest behavior,
+//!   or Sybil resistance; public status must remain aggregate-only.
 //! - A carrier may export only non-quarantined producer evidence retained in
 //!   this store. The receiver must still verify producer and carrier signatures.
 //! - Public carrier reads must call `audited_mirror_evidence_*`; never use the
@@ -213,6 +222,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.40.0-RouteDomainAttestorPolicyHistory - Added schema v12 canonical signed
+//! local attestor/quorum epochs with atomic migration and startup audit.
 //! v0.39.0-RouteDomainPolicyHistory - Added schema v11 canonical signed local
 //! route-domain policy epochs and fail-closed startup audit/reconciliation.
 //! v0.38.0-WitnessTerminalState - Made witness recovery and carrier health
@@ -319,7 +330,8 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 11;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 12;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V11: i64 = 11;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V10: i64 = 10;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V9: i64 = 9;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V8: i64 = 8;
@@ -344,6 +356,7 @@ const MAX_DIRECTORY_OBSERVATION_WITNESS_BYTES: usize = 2 * 1024;
 const MAX_DIRECTORY_POLICY_ANCHOR_BYTES: usize = 2 * 1024;
 const MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS: usize = 16;
 const MAX_DIRECTORY_ROUTE_DOMAIN_POLICY_ASSIGNMENTS: usize = 256;
+const MAX_DIRECTORY_ROUTE_DOMAIN_ATTESTOR_POLICY_MEMBERS: usize = 16;
 /// Maximum third-party observation certificates retained by one local store.
 pub(crate) const MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS: usize = 4_096;
 const DIRECTORY_OBSERVATION_CERTIFICATE_IMPORT_TIMESTAMP_SKEW_SECS: u64 = 60;
@@ -698,6 +711,18 @@ pub struct DirectoryReplicaAudit {
     pub route_domain_policy_assignments: u64,
     /// Whether current multi-hop selection requires complete pinned coverage.
     pub route_domain_policy_strict: bool,
+    /// Number of audited local route-domain attestor-policy epochs.
+    pub route_domain_attestor_policy_epochs: u64,
+    /// Current local route-domain attestor-policy epoch, or zero before use.
+    pub route_domain_attestor_policy_epoch: u64,
+    /// Timestamp bound into the current route-domain attestor policy.
+    pub route_domain_attestor_policy_activated_at: u64,
+    /// Number of locally pinned route-domain attestors.
+    pub route_domain_attestor_policy_members: u64,
+    /// Locally required distinct valid route-domain attestations.
+    pub route_domain_attestor_policy_threshold: u64,
+    /// Whether current multi-hop selection requires attested route domains.
+    pub route_domain_attestor_policy_strict: bool,
     /// Third-party portable observation certificates in the audited import log.
     pub imported_observation_certificates: u64,
     /// Latest node-signed certificate-import sequence, or zero when empty.
@@ -2785,6 +2810,20 @@ struct StoredRouteDomainPolicyRow {
 }
 
 #[derive(Debug)]
+struct StoredRouteDomainAttestorPolicyRow {
+    epoch: i64,
+    policy_digest: Vec<u8>,
+    previous_policy_digest: Vec<u8>,
+    activated_at: i64,
+    strict_required: i64,
+    attestor_threshold: i64,
+    attestor_count: i64,
+    attestor_node_ids: Vec<u8>,
+    signer_node_id: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct StoredObservationWitnessPolicyAnchorReceiptRow {
     policy_epoch: i64,
     policy_digest: Vec<u8>,
@@ -3093,6 +3132,100 @@ pub(crate) struct DirectoryRouteDomainPolicyReconcileReport {
     pub(crate) strict_required: bool,
 }
 
+/// One node-identity-signed, hash-linked local route-domain attestor policy.
+///
+/// [ROUTE-DOMAIN-ATTESTOR-HISTORY 2026-08-03 by Codex] These identities are
+/// host-local trust roots for validating portable route-domain attestations.
+/// A valid signature proves only authorship under a locally pinned key; this
+/// policy does not prove operator independence, geography, ASN ownership,
+/// consensus, honest behavior, or Sybil resistance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryRouteDomainAttestorPolicyEpoch {
+    epoch: u64,
+    previous_policy_digest: [u8; 32],
+    activated_at: u64,
+    strict_required: bool,
+    attestor_node_ids: Vec<[u8; 32]>,
+    minimum_attestors: usize,
+    signer_node_id: [u8; 32],
+    signature: [u8; 64],
+}
+
+impl DirectoryRouteDomainAttestorPolicyEpoch {
+    fn sign(
+        identity: &IdentityKeyPair,
+        epoch: u64,
+        previous_policy_digest: [u8; 32],
+        activated_at: u64,
+        strict_required: bool,
+        attestor_node_ids: Vec<[u8; 32]>,
+        minimum_attestors: usize,
+    ) -> Result<Self, DirectoryReplicaStoreError> {
+        let mut policy = Self {
+            epoch,
+            previous_policy_digest,
+            activated_at,
+            strict_required,
+            attestor_node_ids,
+            minimum_attestors,
+            signer_node_id: identity.public_key_bytes(),
+            signature: [0u8; 64],
+        };
+        policy.validate_unsigned_fields()?;
+        policy.signature = identity.sign(&policy.signing_bytes());
+        Ok(policy)
+    }
+
+    fn validate_unsigned_fields(&self) -> Result<(), DirectoryReplicaStoreError> {
+        if self.epoch == 0 || self.activated_at == 0 || self.signer_node_id == [0u8; 32] {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor policy contains an invalid sentinel".to_string(),
+            ));
+        }
+        validate_route_domain_attestor_policy_members(
+            &self.attestor_node_ids,
+            self.minimum_attestors,
+            self.strict_required,
+        )
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(200 + self.attestor_node_ids.len() * 32);
+        bytes.extend_from_slice(b"AeroNyx-DirectoryRouteDomainAttestorPolicy-v1");
+        bytes.extend_from_slice(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID);
+        bytes.extend_from_slice(&self.epoch.to_le_bytes());
+        bytes.extend_from_slice(&self.previous_policy_digest);
+        bytes.extend_from_slice(&self.activated_at.to_le_bytes());
+        bytes.push(u8::from(self.strict_required));
+        bytes.extend_from_slice(&(self.minimum_attestors as u64).to_le_bytes());
+        bytes.extend_from_slice(&(self.attestor_node_ids.len() as u64).to_le_bytes());
+        for attestor_node_id in &self.attestor_node_ids {
+            bytes.extend_from_slice(attestor_node_id);
+        }
+        bytes.extend_from_slice(&self.signer_node_id);
+        bytes
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.signing_bytes());
+        hasher.update(self.signature);
+        hasher.finalize().into()
+    }
+}
+
+/// Result of reconciling runtime route-domain attestor pins into local history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DirectoryRouteDomainAttestorPolicyReconcileReport {
+    pub(crate) appended: bool,
+    pub(crate) epoch: u64,
+    pub(crate) policy_digest: [u8; 32],
+    pub(crate) activated_at: u64,
+    pub(crate) attestors: u64,
+    pub(crate) minimum_attestors: u64,
+    pub(crate) strict_required: bool,
+}
+
 /// Privacy-bounded current local policy head exported to pinned witnesses.
 ///
 /// The digest commits to the complete node-signed local policy, while member
@@ -3165,6 +3298,13 @@ struct ObservationWitnessPolicyAudit {
 struct RouteDomainPolicyAudit {
     epochs: u64,
     current: Option<DirectoryRouteDomainPolicyEpoch>,
+    current_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RouteDomainAttestorPolicyAudit {
+    epochs: u64,
+    current: Option<DirectoryRouteDomainAttestorPolicyEpoch>,
     current_digest: [u8; 32],
 }
 
@@ -3528,6 +3668,155 @@ impl DirectoryReplicaStore {
         }
         transaction.commit()?;
         route_domain_policy_report(true, &policy, policy_digest)
+    }
+
+    /// Reconciles validated route-domain attestor pins into signed local history.
+    ///
+    /// The initial disabled policy remains epoch zero. Once enabled, every
+    /// pin-set, threshold, strictness, or disable transition appends a signed,
+    /// hash-linked epoch. This prevents a later configuration edit from
+    /// silently rewriting the local trust-root history used by route selection.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] for malformed pins or thresholds,
+    /// identity mismatch, corrupt history, counter exhaustion, or an atomic
+    /// persistence failure.
+    pub(crate) fn reconcile_route_domain_attestor_policy(
+        &self,
+        identity: &IdentityKeyPair,
+        attestor_node_ids: &[[u8; 32]],
+        minimum_attestors: usize,
+        strict_required: bool,
+        activated_at: u64,
+    ) -> Result<DirectoryRouteDomainAttestorPolicyReconcileReport, DirectoryReplicaStoreError> {
+        if identity.public_key_bytes() != self.local_node_id || activated_at == 0 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor policy identity or timestamp is invalid".to_string(),
+            ));
+        }
+        let canonical_attestors = canonical_route_domain_attestor_policy_members(
+            attestor_node_ids,
+            minimum_attestors,
+            strict_required,
+        )?;
+
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::validate_metadata(&transaction, &self.local_node_id)?;
+        let previous =
+            Self::audit_route_domain_attestor_policies(&transaction, &self.local_node_id)?;
+        if let Some(current) = previous.current.as_ref() {
+            if current.attestor_node_ids == canonical_attestors
+                && current.minimum_attestors == minimum_attestors
+                && current.strict_required == strict_required
+            {
+                transaction.commit()?;
+                return route_domain_attestor_policy_report(
+                    false,
+                    current,
+                    previous.current_digest,
+                );
+            }
+        } else if canonical_attestors.is_empty() && !strict_required && minimum_attestors == 1 {
+            transaction.commit()?;
+            return Ok(DirectoryRouteDomainAttestorPolicyReconcileReport::default());
+        }
+
+        let epoch = previous.epochs.checked_add(1).ok_or_else(|| {
+            DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor policy epoch exhausted".to_string(),
+            )
+        })?;
+        let activated_at = previous
+            .current
+            .as_ref()
+            .map_or(activated_at, |policy| activated_at.max(policy.activated_at));
+        let policy = DirectoryRouteDomainAttestorPolicyEpoch::sign(
+            identity,
+            epoch,
+            previous.current_digest,
+            activated_at,
+            strict_required,
+            canonical_attestors,
+            minimum_attestors,
+        )?;
+        let policy_digest = policy.digest();
+        let attestor_node_ids = policy
+            .attestor_node_ids
+            .iter()
+            .flat_map(|node_id| node_id.iter().copied())
+            .collect::<Vec<_>>();
+        transaction.execute(
+            "INSERT INTO directory_route_domain_attestor_policies
+                (epoch, policy_digest, previous_policy_digest, activated_at,
+                 strict_required, attestor_threshold, attestor_count,
+                 attestor_node_ids, signer_node_id, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                u64_to_i64(policy.epoch, "route-domain attestor policy epoch")?,
+                policy_digest.as_slice(),
+                policy.previous_policy_digest.as_slice(),
+                u64_to_i64(
+                    policy.activated_at,
+                    "route-domain attestor policy activation timestamp"
+                )?,
+                i64::from(policy.strict_required),
+                u64_to_i64(
+                    u64::try_from(policy.minimum_attestors).map_err(|_| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "route-domain attestor threshold exceeds u64".to_string(),
+                        )
+                    })?,
+                    "route-domain attestor policy threshold"
+                )?,
+                u64_to_i64(
+                    u64::try_from(policy.attestor_node_ids.len()).map_err(|_| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "route-domain attestor count exceeds u64".to_string(),
+                        )
+                    })?,
+                    "route-domain attestor policy member count"
+                )?,
+                attestor_node_ids,
+                policy.signer_node_id.as_slice(),
+                policy.signature.as_slice(),
+            ],
+        )?;
+        let previous_head = previous
+            .current
+            .as_ref()
+            .map(|_| previous.current_digest.to_vec());
+        let changed = transaction.execute(
+            "UPDATE directory_replica_meta
+             SET route_domain_attestor_policy_epoch = ?1,
+                 route_domain_attestor_policy_head = ?2
+             WHERE singleton = 1 AND route_domain_attestor_policy_epoch = ?3
+               AND ((?4 IS NULL AND route_domain_attestor_policy_head IS NULL)
+                    OR route_domain_attestor_policy_head = ?4)",
+            params![
+                u64_to_i64(epoch, "route-domain attestor policy epoch")?,
+                policy_digest.as_slice(),
+                u64_to_i64(
+                    previous.epochs,
+                    "previous route-domain attestor policy epoch"
+                )?,
+                previous_head,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor policy head compare-and-swap failed".to_string(),
+            ));
+        }
+        let audited =
+            Self::audit_route_domain_attestor_policies(&transaction, &self.local_node_id)?;
+        if audited.epochs != epoch || audited.current_digest != policy_digest {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor policy post-append audit diverged".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        route_domain_attestor_policy_report(true, &policy, policy_digest)
     }
 
     /// Verifies that the metadata-anchored signed policy head contains the
@@ -7430,6 +7719,164 @@ impl DirectoryReplicaStore {
         Ok(audit)
     }
 
+    fn decode_route_domain_attestor_policy(
+        row: StoredRouteDomainAttestorPolicyRow,
+    ) -> Result<([u8; 32], DirectoryRouteDomainAttestorPolicyEpoch), DirectoryReplicaStoreError>
+    {
+        let epoch = positive_i64_to_u64(row.epoch, "route-domain attestor policy epoch")?;
+        let activated_at = positive_i64_to_u64(
+            row.activated_at,
+            "route-domain attestor policy activation timestamp",
+        )?;
+        let strict_required = match row.strict_required {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "route-domain attestor policy strict flag is malformed".to_string(),
+                ));
+            }
+        };
+        let minimum_attestors = usize::try_from(positive_i64_to_u64(
+            row.attestor_threshold,
+            "route-domain attestor policy threshold",
+        )?)
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor threshold exceeds usize".to_string(),
+            )
+        })?;
+        let attestor_count = usize::try_from(nonnegative_i64_to_u64(
+            row.attestor_count,
+            "route-domain attestor policy member count",
+        )?)
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor count exceeds usize".to_string(),
+            )
+        })?;
+        if attestor_count > MAX_DIRECTORY_ROUTE_DOMAIN_ATTESTOR_POLICY_MEMBERS
+            || row.attestor_node_ids.len() != attestor_count.saturating_mul(32)
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor policy identity blob is malformed".to_string(),
+            ));
+        }
+        let attestor_node_ids = row
+            .attestor_node_ids
+            .chunks_exact(32)
+            .map(|node_id| bytes32(node_id, "route-domain attestor identity"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let policy = DirectoryRouteDomainAttestorPolicyEpoch {
+            epoch,
+            previous_policy_digest: bytes32(
+                &row.previous_policy_digest,
+                "previous route-domain attestor policy digest",
+            )?,
+            activated_at,
+            strict_required,
+            attestor_node_ids,
+            minimum_attestors,
+            signer_node_id: bytes32(&row.signer_node_id, "route-domain attestor policy signer")?,
+            signature: bytes64(&row.signature, "route-domain attestor policy signature")?,
+        };
+        policy.validate_unsigned_fields()?;
+        let stored_digest = bytes32(&row.policy_digest, "route-domain attestor policy digest")?;
+        Ok((stored_digest, policy))
+    }
+
+    fn audit_route_domain_attestor_policies(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+    ) -> Result<RouteDomainAttestorPolicyAudit, DirectoryReplicaStoreError> {
+        let (metadata_epoch, metadata_head) = connection.query_row(
+            "SELECT route_domain_attestor_policy_epoch, route_domain_attestor_policy_head
+             FROM directory_replica_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+        )?;
+        let metadata_epoch = nonnegative_i64_to_u64(
+            metadata_epoch,
+            "replica metadata route-domain attestor policy epoch",
+        )?;
+        let metadata_head = metadata_head
+            .as_deref()
+            .map(|value| bytes32(value, "replica metadata route-domain attestor policy head"))
+            .transpose()?;
+        let mut statement = connection.prepare(
+            "SELECT epoch, policy_digest, previous_policy_digest, activated_at,
+                    strict_required, attestor_threshold, attestor_count,
+                    attestor_node_ids, signer_node_id, signature
+             FROM directory_route_domain_attestor_policies ORDER BY epoch ASC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut audit = RouteDomainAttestorPolicyAudit::default();
+        let mut expected_previous_digest = [0u8; 32];
+        let mut previous_activated_at = 0u64;
+        while let Some(row) = rows.next()? {
+            let stored = StoredRouteDomainAttestorPolicyRow {
+                epoch: row.get(0)?,
+                policy_digest: row.get(1)?,
+                previous_policy_digest: row.get(2)?,
+                activated_at: row.get(3)?,
+                strict_required: row.get(4)?,
+                attestor_threshold: row.get(5)?,
+                attestor_count: row.get(6)?,
+                attestor_node_ids: row.get(7)?,
+                signer_node_id: row.get(8)?,
+                signature: row.get(9)?,
+            };
+            let (stored_digest, policy) = Self::decode_route_domain_attestor_policy(stored)?;
+            let expected_epoch = audit.epochs.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "route-domain attestor policy epoch exhausted".to_string(),
+                )
+            })?;
+            if policy.epoch != expected_epoch
+                || policy.previous_policy_digest != expected_previous_digest
+                || policy.activated_at < previous_activated_at
+                || policy.signer_node_id != *local_node_id
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "route-domain attestor policy history is not canonical".to_string(),
+                ));
+            }
+            IdentityPublicKey::from_bytes(&policy.signer_node_id)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "route-domain attestor policy signer is invalid".to_string(),
+                    )
+                })?
+                .verify(&policy.signing_bytes(), &policy.signature)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "route-domain attestor policy signature is invalid".to_string(),
+                    )
+                })?;
+            if policy.digest() != stored_digest {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "route-domain attestor policy digest is invalid".to_string(),
+                ));
+            }
+            audit.epochs = expected_epoch;
+            expected_previous_digest = stored_digest;
+            previous_activated_at = policy.activated_at;
+            audit.current_digest = stored_digest;
+            audit.current = Some(policy);
+        }
+        drop(rows);
+        drop(statement);
+        if audit.epochs != metadata_epoch
+            || (audit.epochs == 0 && metadata_head.is_some())
+            || (audit.epochs > 0 && metadata_head != Some(audit.current_digest))
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor policy head does not match audited history".to_string(),
+            ));
+        }
+        Ok(audit)
+    }
+
     /// Loads and verifies only the metadata-anchored policy head for bounded
     /// runtime status. Complete history verification remains a startup and
     /// explicit operator-audit responsibility.
@@ -8062,6 +8509,8 @@ impl DirectoryReplicaStore {
         let observation_witness_policies =
             Self::audit_observation_witness_policies(connection, local_node_id)?;
         let route_domain_policies = Self::audit_route_domain_policies(connection, local_node_id)?;
+        let route_domain_attestor_policies =
+            Self::audit_route_domain_attestor_policies(connection, local_node_id)?;
         let observation_witness_remote_policy_anchors =
             Self::audit_remote_observation_policy_anchors(connection, local_node_id, observed_at)?;
         let observation_witness_policy_anchor_receipts = u64::try_from(
@@ -8146,6 +8595,37 @@ impl DirectoryReplicaStore {
                 })?
                 .unwrap_or(0),
             route_domain_policy_strict: route_domain_policies
+                .current
+                .is_some_and(|policy| policy.strict_required),
+            route_domain_attestor_policy_epochs: route_domain_attestor_policies.epochs,
+            route_domain_attestor_policy_epoch: route_domain_attestor_policies.epochs,
+            route_domain_attestor_policy_activated_at: route_domain_attestor_policies
+                .current
+                .as_ref()
+                .map_or(0, |policy| policy.activated_at),
+            route_domain_attestor_policy_members: route_domain_attestor_policies
+                .current
+                .as_ref()
+                .map(|policy| u64::try_from(policy.attestor_node_ids.len()))
+                .transpose()
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "route-domain attestor policy member count exceeds u64".to_string(),
+                    )
+                })?
+                .unwrap_or(0),
+            route_domain_attestor_policy_threshold: route_domain_attestor_policies
+                .current
+                .as_ref()
+                .map(|policy| u64::try_from(policy.minimum_attestors))
+                .transpose()
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "route-domain attestor policy threshold exceeds u64".to_string(),
+                    )
+                })?
+                .unwrap_or(0),
+            route_domain_attestor_policy_strict: route_domain_attestor_policies
                 .current
                 .is_some_and(|policy| policy.strict_required),
             imported_observation_certificates: observation_certificate_imports.imports,
@@ -8259,6 +8739,11 @@ impl DirectoryReplicaStore {
                  route_domain_policy_head BLOB
                      CHECK (route_domain_policy_head IS NULL
                          OR length(route_domain_policy_head) = 32),
+                 route_domain_attestor_policy_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (route_domain_attestor_policy_epoch >= 0),
+                 route_domain_attestor_policy_head BLOB
+                     CHECK (route_domain_attestor_policy_head IS NULL
+                         OR length(route_domain_attestor_policy_head) = 32),
                  certificate_import_sequence INTEGER NOT NULL DEFAULT 0
                      CHECK (certificate_import_sequence >= 0),
                  certificate_import_head BLOB
@@ -8270,6 +8755,10 @@ impl DirectoryReplicaStore {
                          AND route_domain_policy_head IS NULL)
                      OR (route_domain_policy_epoch > 0
                          AND route_domain_policy_head IS NOT NULL)),
+                 CHECK ((route_domain_attestor_policy_epoch = 0
+                         AND route_domain_attestor_policy_head IS NULL)
+                     OR (route_domain_attestor_policy_epoch > 0
+                         AND route_domain_attestor_policy_head IS NOT NULL)),
                  CHECK ((certificate_import_sequence = 0
                          AND certificate_import_head IS NULL)
                      OR (certificate_import_sequence > 0
@@ -8555,6 +9044,25 @@ impl DirectoryReplicaStore {
                  CHECK (length(assignments) = assignment_count * 48),
                  CHECK (strict_required = 0 OR assignment_count > 0)
              );
+             CREATE TABLE IF NOT EXISTS directory_route_domain_attestor_policies (
+                 epoch INTEGER PRIMARY KEY CHECK (epoch > 0),
+                 policy_digest BLOB NOT NULL UNIQUE CHECK (length(policy_digest) = 32),
+                 previous_policy_digest BLOB NOT NULL UNIQUE
+                     CHECK (length(previous_policy_digest) = 32),
+                 activated_at INTEGER NOT NULL CHECK (activated_at > 0),
+                 strict_required INTEGER NOT NULL CHECK (strict_required IN (0, 1)),
+                 attestor_threshold INTEGER NOT NULL
+                     CHECK (attestor_threshold BETWEEN 1 AND 16),
+                 attestor_count INTEGER NOT NULL
+                     CHECK (attestor_count BETWEEN 0 AND 16),
+                 attestor_node_ids BLOB NOT NULL CHECK (length(attestor_node_ids) <= 512),
+                 signer_node_id BLOB NOT NULL CHECK (length(signer_node_id) = 32),
+                 signature BLOB NOT NULL CHECK (length(signature) = 64),
+                 CHECK (length(attestor_node_ids) = attestor_count * 32),
+                 CHECK ((attestor_count = 0 AND attestor_threshold = 1
+                         AND strict_required = 0)
+                     OR (attestor_count > 0 AND attestor_threshold <= attestor_count))
+             );
              CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
                  consecutive_failures INTEGER NOT NULL
@@ -8617,6 +9125,20 @@ impl DirectoryReplicaStore {
                         Self::require_certificate_import_table(transaction)?;
                         Self::require_route_domain_policy_metadata_columns(transaction)?;
                         Self::require_route_domain_policy_table(transaction)?;
+                        Self::require_route_domain_attestor_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_attestor_policy_table(transaction)?;
+                    }
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V11 => {
+                        Self::require_resolution_columns(transaction)?;
+                        Self::require_witness_policy_metadata_columns(transaction)?;
+                        Self::require_mirror_registry_table(transaction)?;
+                        Self::require_certificate_import_metadata_columns(transaction)?;
+                        Self::require_certificate_import_table(transaction)?;
+                        Self::require_route_domain_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_policy_table(transaction)?;
+                        Self::add_route_domain_attestor_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_attestor_policy_table(transaction)?;
+                        Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V10 => {
                         Self::require_resolution_columns(transaction)?;
@@ -8626,6 +9148,8 @@ impl DirectoryReplicaStore {
                         Self::require_certificate_import_table(transaction)?;
                         Self::add_route_domain_policy_metadata_columns(transaction)?;
                         Self::require_route_domain_policy_table(transaction)?;
+                        Self::add_route_domain_attestor_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_attestor_policy_table(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V9 => {
@@ -8636,6 +9160,8 @@ impl DirectoryReplicaStore {
                         Self::require_certificate_import_table(transaction)?;
                         Self::add_route_domain_policy_metadata_columns(transaction)?;
                         Self::require_route_domain_policy_table(transaction)?;
+                        Self::add_route_domain_attestor_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_attestor_policy_table(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V8
@@ -8651,6 +9177,8 @@ impl DirectoryReplicaStore {
                         Self::require_certificate_import_table(transaction)?;
                         Self::add_route_domain_policy_metadata_columns(transaction)?;
                         Self::require_route_domain_policy_table(transaction)?;
+                        Self::add_route_domain_attestor_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_attestor_policy_table(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V1 | DIRECTORY_REPLICA_SCHEMA_VERSION_V2 => {
@@ -8661,6 +9189,8 @@ impl DirectoryReplicaStore {
                         Self::require_certificate_import_table(transaction)?;
                         Self::add_route_domain_policy_metadata_columns(transaction)?;
                         Self::require_route_domain_policy_table(transaction)?;
+                        Self::add_route_domain_attestor_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_attestor_policy_table(transaction)?;
                         transaction.execute(
                             "UPDATE directory_replica_chains AS c
                              SET active_incident_digest = (
@@ -8905,6 +9435,58 @@ impl DirectoryReplicaStore {
         Ok(())
     }
 
+    fn add_route_domain_attestor_policy_metadata_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::metadata_has_column(transaction, "route_domain_attestor_policy_epoch")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_meta
+                 ADD COLUMN route_domain_attestor_policy_epoch INTEGER NOT NULL DEFAULT 0
+                 CHECK (route_domain_attestor_policy_epoch >= 0);",
+            )?;
+        }
+        if !Self::metadata_has_column(transaction, "route_domain_attestor_policy_head")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_meta
+                 ADD COLUMN route_domain_attestor_policy_head BLOB
+                 CHECK (route_domain_attestor_policy_head IS NULL
+                     OR length(route_domain_attestor_policy_head) = 32);",
+            )?;
+        }
+        Self::require_route_domain_attestor_policy_metadata_columns(transaction)
+    }
+
+    fn require_route_domain_attestor_policy_metadata_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::metadata_has_column(transaction, "route_domain_attestor_policy_epoch")?
+            || !Self::metadata_has_column(transaction, "route_domain_attestor_policy_head")?
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema v12 route-domain attestor metadata is missing"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_route_domain_attestor_policy_table(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        let present: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'directory_route_domain_attestor_policies'",
+            [],
+            |row| row.get(0),
+        )?;
+        if present != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema v12 route-domain attestor table is missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn metadata_has_column(
         transaction: &Transaction<'_>,
         expected: &str,
@@ -8936,6 +9518,8 @@ impl DirectoryReplicaStore {
                 "SELECT schema_version, chain_id, local_node_id,
                         witness_policy_epoch, witness_policy_head,
                         route_domain_policy_epoch, route_domain_policy_head,
+                        route_domain_attestor_policy_epoch,
+                        route_domain_attestor_policy_head,
                         certificate_import_sequence, certificate_import_head
                  FROM directory_replica_meta WHERE singleton = 1",
                 [],
@@ -8950,6 +9534,8 @@ impl DirectoryReplicaStore {
                         row.get::<_, Option<Vec<u8>>>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, Option<Vec<u8>>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<Vec<u8>>>(10)?,
                     ))
                 },
             )
@@ -8993,10 +9579,25 @@ impl DirectoryReplicaStore {
                 "directory replica route-domain policy metadata is inconsistent".to_string(),
             ));
         }
-        let certificate_import_sequence =
-            nonnegative_i64_to_u64(metadata.7, "replica metadata certificate import sequence")?;
-        let certificate_import_head = metadata
+        let route_domain_attestor_policy_epoch = nonnegative_i64_to_u64(
+            metadata.7,
+            "replica metadata route-domain attestor policy epoch",
+        )?;
+        let route_domain_attestor_policy_head = metadata
             .8
+            .as_deref()
+            .map(|value| bytes32(value, "replica metadata route-domain attestor policy head"))
+            .transpose()?;
+        if (route_domain_attestor_policy_epoch == 0) != route_domain_attestor_policy_head.is_none()
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica route-domain attestor metadata is inconsistent".to_string(),
+            ));
+        }
+        let certificate_import_sequence =
+            nonnegative_i64_to_u64(metadata.9, "replica metadata certificate import sequence")?;
+        let certificate_import_head = metadata
+            .10
             .as_deref()
             .map(|value| bytes32(value, "replica metadata certificate import head"))
             .transpose()?;
@@ -10972,6 +11573,71 @@ fn route_domain_policy_report(
     })
 }
 
+fn canonical_route_domain_attestor_policy_members(
+    attestor_node_ids: &[[u8; 32]],
+    minimum_attestors: usize,
+    strict_required: bool,
+) -> Result<Vec<[u8; 32]>, DirectoryReplicaStoreError> {
+    let mut canonical = attestor_node_ids.to_vec();
+    canonical.sort_unstable();
+    if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(DirectoryReplicaStoreError::Request(
+            "route-domain attestor policy contains duplicate identities".to_string(),
+        ));
+    }
+    validate_route_domain_attestor_policy_members(&canonical, minimum_attestors, strict_required)?;
+    Ok(canonical)
+}
+
+fn validate_route_domain_attestor_policy_members(
+    attestor_node_ids: &[[u8; 32]],
+    minimum_attestors: usize,
+    strict_required: bool,
+) -> Result<(), DirectoryReplicaStoreError> {
+    let empty_policy_invalid =
+        attestor_node_ids.is_empty() && (strict_required || minimum_attestors != 1);
+    let populated_policy_invalid = !attestor_node_ids.is_empty()
+        && (minimum_attestors == 0 || minimum_attestors > attestor_node_ids.len());
+    if attestor_node_ids.len() > MAX_DIRECTORY_ROUTE_DOMAIN_ATTESTOR_POLICY_MEMBERS
+        || empty_policy_invalid
+        || populated_policy_invalid
+        || attestor_node_ids
+            .iter()
+            .any(|node_id| *node_id == [0u8; 32])
+        || attestor_node_ids.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(DirectoryReplicaStoreError::Request(
+            "route-domain attestor policy members, threshold, or strict mode are invalid"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn route_domain_attestor_policy_report(
+    appended: bool,
+    policy: &DirectoryRouteDomainAttestorPolicyEpoch,
+    policy_digest: [u8; 32],
+) -> Result<DirectoryRouteDomainAttestorPolicyReconcileReport, DirectoryReplicaStoreError> {
+    Ok(DirectoryRouteDomainAttestorPolicyReconcileReport {
+        appended,
+        epoch: policy.epoch,
+        policy_digest,
+        activated_at: policy.activated_at,
+        attestors: u64::try_from(policy.attestor_node_ids.len()).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor policy member count exceeds u64".to_string(),
+            )
+        })?,
+        minimum_attestors: u64::try_from(policy.minimum_attestors).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "route-domain attestor policy threshold exceeds u64".to_string(),
+            )
+        })?,
+        strict_required: policy.strict_required,
+    })
+}
+
 fn validate_incident_kind(kind: &str) -> Result<(), DirectoryReplicaStoreError> {
     if kind.is_empty()
         || kind.len() > MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES
@@ -12224,6 +12890,73 @@ mod tests {
         assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
         assert_eq!(policy_columns, 2);
         assert_eq!(policy_table, "directory_route_domain_policies");
+    }
+
+    #[test]
+    fn schema_v11_is_atomically_migrated_to_v12_route_domain_attestor_history() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x12; 32]).unwrap();
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE directory_route_domain_attestor_policies;
+                 ALTER TABLE directory_replica_meta RENAME TO directory_replica_meta_v12;
+                 CREATE TABLE directory_replica_meta (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL,
+                     chain_id BLOB NOT NULL CHECK (length(chain_id) = 32),
+                     local_node_id BLOB NOT NULL CHECK (length(local_node_id) = 32),
+                     witness_policy_epoch INTEGER NOT NULL DEFAULT 0,
+                     witness_policy_head BLOB,
+                     route_domain_policy_epoch INTEGER NOT NULL DEFAULT 0,
+                     route_domain_policy_head BLOB,
+                     certificate_import_sequence INTEGER NOT NULL DEFAULT 0,
+                     certificate_import_head BLOB
+                 );
+                 INSERT INTO directory_replica_meta
+                     (singleton, schema_version, chain_id, local_node_id,
+                      witness_policy_epoch, witness_policy_head,
+                      route_domain_policy_epoch, route_domain_policy_head,
+                      certificate_import_sequence, certificate_import_head)
+                 SELECT singleton, 11, chain_id, local_node_id,
+                        witness_policy_epoch, witness_policy_head,
+                        route_domain_policy_epoch, route_domain_policy_head,
+                        certificate_import_sequence, certificate_import_head
+                 FROM directory_replica_meta_v12;
+                 DROP TABLE directory_replica_meta_v12;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21).unwrap();
+        assert_eq!(audit.route_domain_attestor_policy_epochs, 0);
+        let connection = store.connection.lock();
+        let (version, policy_columns, policy_table): (i64, i64, String) = connection
+            .query_row(
+                "SELECT m.schema_version,
+                        (SELECT COUNT(*) FROM pragma_table_info('directory_replica_meta')
+                         WHERE name IN (
+                             'route_domain_attestor_policy_epoch',
+                             'route_domain_attestor_policy_head'
+                         )),
+                        t.name
+                 FROM directory_replica_meta m
+                 JOIN sqlite_master t
+                   ON t.type = 'table'
+                  AND t.name = 'directory_route_domain_attestor_policies'
+                 WHERE m.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(policy_columns, 2);
+        assert_eq!(policy_table, "directory_route_domain_attestor_policies");
     }
 
     #[test]
@@ -13948,6 +14681,131 @@ mod tests {
             .unwrap();
         drop(connection);
         assert!(DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 22).is_err());
+    }
+
+    #[test]
+    fn route_domain_attestor_policy_is_canonical_idempotent_and_restart_audited() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let operator = IdentityKeyPair::from_bytes(&[0xd4; 32]).unwrap();
+        let first = [0x31; 32];
+        let second = [0x42; 32];
+        let (store, empty_audit) =
+            DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 20).unwrap();
+        assert_eq!(empty_audit.route_domain_attestor_policy_epochs, 0);
+        let disabled = store
+            .reconcile_route_domain_attestor_policy(&operator, &[], 1, false, NOW + 20)
+            .unwrap();
+        assert_eq!(
+            disabled,
+            DirectoryRouteDomainAttestorPolicyReconcileReport::default()
+        );
+
+        let initial = store
+            .reconcile_route_domain_attestor_policy(&operator, &[second, first], 1, false, NOW + 21)
+            .unwrap();
+        assert!(initial.appended);
+        assert_eq!(initial.epoch, 1);
+        assert_eq!(initial.attestors, 2);
+        assert_eq!(initial.minimum_attestors, 1);
+        let reordered = store
+            .reconcile_route_domain_attestor_policy(&operator, &[first, second], 1, false, NOW + 22)
+            .unwrap();
+        assert!(!reordered.appended);
+        assert_eq!(reordered.policy_digest, initial.policy_digest);
+        assert_eq!(reordered.activated_at, initial.activated_at);
+
+        let strict_quorum = store
+            .reconcile_route_domain_attestor_policy(&operator, &[first, second], 2, true, NOW + 23)
+            .unwrap();
+        assert!(strict_quorum.appended);
+        assert_eq!(strict_quorum.epoch, 2);
+        assert_eq!(strict_quorum.minimum_attestors, 2);
+        assert!(strict_quorum.strict_required);
+        let cleared = store
+            .reconcile_route_domain_attestor_policy(&operator, &[], 1, false, NOW + 24)
+            .unwrap();
+        assert!(cleared.appended);
+        assert_eq!(cleared.epoch, 3);
+        assert_eq!(cleared.attestors, 0);
+        drop(store);
+
+        let (reopened, audit) =
+            DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 25).unwrap();
+        assert_eq!(audit.route_domain_attestor_policy_epochs, 3);
+        assert_eq!(audit.route_domain_attestor_policy_epoch, 3);
+        assert_eq!(audit.route_domain_attestor_policy_activated_at, NOW + 24);
+        assert_eq!(audit.route_domain_attestor_policy_members, 0);
+        assert_eq!(audit.route_domain_attestor_policy_threshold, 1);
+        assert!(!audit.route_domain_attestor_policy_strict);
+        let idempotent = reopened
+            .reconcile_route_domain_attestor_policy(&operator, &[], 1, false, NOW + 26)
+            .unwrap();
+        assert!(!idempotent.appended);
+        assert_eq!(idempotent.epoch, 3);
+        assert_eq!(idempotent.policy_digest, cleared.policy_digest);
+    }
+
+    #[test]
+    fn route_domain_attestor_policy_rejects_invalid_thresholds_and_duplicates() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let operator = IdentityKeyPair::from_bytes(&[0xd5; 32]).unwrap();
+        let attestor = [0x51; 32];
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 20).unwrap();
+        assert!(store
+            .reconcile_route_domain_attestor_policy(&operator, &[attestor], 0, false, NOW + 21)
+            .is_err());
+        assert!(store
+            .reconcile_route_domain_attestor_policy(&operator, &[attestor], 2, true, NOW + 21)
+            .is_err());
+        assert!(store
+            .reconcile_route_domain_attestor_policy(
+                &operator,
+                &[attestor, attestor],
+                1,
+                false,
+                NOW + 21,
+            )
+            .is_err());
+        assert!(store
+            .reconcile_route_domain_attestor_policy(&operator, &[], 1, true, NOW + 21)
+            .is_err());
+    }
+
+    #[test]
+    fn tampered_or_deleted_route_domain_attestor_history_fails_restart_audit() {
+        for delete_table in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let path = temp.path().join("directory.db");
+            let operator = IdentityKeyPair::from_bytes(&[0xd6; 32]).unwrap();
+            let (store, _) =
+                DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 20).unwrap();
+            store
+                .reconcile_route_domain_attestor_policy(&operator, &[[0x61; 32]], 1, true, NOW + 21)
+                .unwrap();
+            drop(store);
+
+            let connection = Connection::open(&path).unwrap();
+            if delete_table {
+                connection
+                    .execute_batch("DROP TABLE directory_route_domain_attestor_policies;")
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        "UPDATE directory_route_domain_attestor_policies
+                         SET signature = ?1 WHERE epoch = 1",
+                        params![vec![0x62u8; 64]],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            assert!(
+                DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 22).is_err()
+            );
+        }
     }
 
     #[test]

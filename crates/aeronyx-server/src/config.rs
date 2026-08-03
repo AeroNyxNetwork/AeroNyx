@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.20.0-RouteDomainAttestors - Added opt-in pinned attestor quorum and
+//! fail-closed certificate requirement for multi-hop route-domain assignments
 //! v0.19.0-PinnedRouteDomains - Added optional fail-closed, operator-audited
 //! opaque route-domain assignments for multi-hop anti-affinity
 //! v0.18.0-DirectoryProofMaturity - Added an automatically safe, operator-
@@ -102,6 +104,7 @@ const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
 const MAX_DIRECTORY_GOSSIP_PROOF_MIN_AGE_SECS: u64 = 48 * 60 * 60;
 const MAX_DISCOVERY_GOSSIP_CONCURRENCY: u16 = 64;
 const MAX_PINNED_ROUTE_DOMAINS: usize = 256;
+const MAX_ROUTE_DOMAIN_ATTESTOR_NODE_IDS: usize = 16;
 
 /// One validated, canonical local route-domain assignment.
 ///
@@ -323,6 +326,26 @@ pub struct DiscoveryConfig {
     /// closed while leaving single-hop encrypted relay behavior available.
     #[serde(default)]
     pub require_pinned_route_domains_for_multi_hop: bool,
+    /// Operator-pinned identities allowed to attest opaque route domains.
+    ///
+    /// [ROUTE-DOMAIN-ATTESTOR-POLICY 2026-08-03 by Codex] These identities
+    /// are local trust anchors, independent of permissionless discovery and
+    /// checkpoint witnesses. A signature proves only one opaque assignment;
+    /// it does not prove ASN, ownership, geography, honest operation, or Sybil
+    /// resistance. Keep this set small, independently reviewed, and private.
+    #[serde(default)]
+    pub route_domain_attestor_node_ids: Vec<String>,
+    /// Minimum currently valid pinned signatures required per assignment.
+    #[serde(default = "DiscoveryConfig::default_route_domain_attestation_min_verified")]
+    pub route_domain_attestation_min_verified: usize,
+    /// Requires quorum-valid route-domain certificates for multi-hop paths.
+    ///
+    /// Default `false` preserves the existing local-pin behavior. Enabling
+    /// this gate also requires strict pinned-domain coverage and a durable
+    /// Directory Chain store; an unavailable or expired certificate fails
+    /// multi-hop selection closed while single-hop relay remains available.
+    #[serde(default)]
+    pub require_route_domain_attestations_for_multi_hop: bool,
     /// Optional discovery control-plane endpoint advertised to other nodes.
     ///
     /// When absent, `network.public_endpoint` is reused. If both are absent,
@@ -395,6 +418,12 @@ impl DiscoveryConfig {
     /// Default independent Directory observation witness threshold.
     #[must_use]
     pub const fn default_directory_observation_witness_min_verified() -> usize {
+        1
+    }
+
+    /// Default independent route-domain attestor threshold.
+    #[must_use]
+    pub const fn default_route_domain_attestation_min_verified() -> usize {
         1
     }
 
@@ -979,6 +1008,88 @@ impl DiscoveryConfig {
             ));
         }
 
+        // [ROUTE-DOMAIN-ATTESTOR-POLICY 2026-08-03 by Codex] Attestor pins
+        // are verifier-local trust roots. Strict syntax, a bounded set, and a
+        // local threshold prevent malformed or duplicate identities from
+        // weakening certificate admission. Configuring the policy requires a
+        // Directory store so later imports and pin changes remain auditable.
+        let attestor_policy_configured = !self.route_domain_attestor_node_ids.is_empty()
+            || self.require_route_domain_attestations_for_multi_hop
+            || self.route_domain_attestation_min_verified
+                != Self::default_route_domain_attestation_min_verified();
+        if self.route_domain_attestor_node_ids.len() > MAX_ROUTE_DOMAIN_ATTESTOR_NODE_IDS {
+            return Err(ServerError::config_invalid(
+                "discovery.route_domain_attestor_node_ids",
+                format!("supports at most {MAX_ROUTE_DOMAIN_ATTESTOR_NODE_IDS} pinned attestors"),
+            ));
+        }
+        let mut normalized_attestors =
+            Vec::<[u8; 32]>::with_capacity(self.route_domain_attestor_node_ids.len());
+        for configured_attestor in &self.route_domain_attestor_node_ids {
+            let value = configured_attestor.trim();
+            let decoded = hex::decode(value).map_err(|_| {
+                ServerError::config_invalid(
+                    "discovery.route_domain_attestor_node_ids",
+                    "entries must be 64-character Ed25519 public keys in hexadecimal",
+                )
+            })?;
+            let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
+                ServerError::config_invalid(
+                    "discovery.route_domain_attestor_node_ids",
+                    "entries must decode to exactly 32 bytes",
+                )
+            })?;
+            if value.len() != 64 || node_id == [0u8; 32] {
+                return Err(ServerError::config_invalid(
+                    "discovery.route_domain_attestor_node_ids",
+                    "entries must be non-zero 64-character Ed25519 public keys",
+                ));
+            }
+            if normalized_attestors.contains(&node_id) {
+                return Err(ServerError::config_invalid(
+                    "discovery.route_domain_attestor_node_ids",
+                    "duplicate attestor identities after hexadecimal normalization are not allowed",
+                ));
+            }
+            normalized_attestors.push(node_id);
+        }
+        if attestor_policy_configured {
+            if !self.enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.route_domain_attestor_node_ids",
+                    "requires discovery.enabled = true",
+                ));
+            }
+            if self.directory_chain_path.is_none() {
+                return Err(ServerError::config_invalid(
+                    "discovery.route_domain_attestor_node_ids",
+                    "requires discovery.directory_chain_path for signed policy and certificate history",
+                ));
+            }
+            if normalized_attestors.is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.route_domain_attestor_node_ids",
+                    "requires at least one pinned attestor",
+                ));
+            }
+            if self.route_domain_attestation_min_verified == 0
+                || self.route_domain_attestation_min_verified > normalized_attestors.len()
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.route_domain_attestation_min_verified",
+                    "must be between one and the number of configured attestors",
+                ));
+            }
+        }
+        if self.require_route_domain_attestations_for_multi_hop
+            && !self.require_pinned_route_domains_for_multi_hop
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.require_route_domain_attestations_for_multi_hop",
+                "requires discovery.require_pinned_route_domains_for_multi_hop = true",
+            ));
+        }
+
         if let Some(endpoint) = &self.public_endpoint {
             if endpoint.trim().is_empty() {
                 return Err(ServerError::config_invalid(
@@ -1067,6 +1178,22 @@ impl DiscoveryConfig {
         assignments
     }
 
+    /// Returns validated route-domain attestor identities in configured order.
+    ///
+    /// Configuration validation rejects malformed or duplicate values. The
+    /// defensive `filter_map` keeps internal callers panic-free when tests or
+    /// embedders construct an unchecked `DiscoveryConfig` directly.
+    #[must_use]
+    pub(crate) fn route_domain_attestor_node_id_bytes(&self) -> Vec<[u8; 32]> {
+        self.route_domain_attestor_node_ids
+            .iter()
+            .filter_map(|value| {
+                let decoded = hex::decode(value.trim()).ok()?;
+                decoded.try_into().ok()
+            })
+            .collect()
+    }
+
     /// Returns validated identities allowed to use this node as a witness.
     #[must_use]
     pub fn verified_delivery_witness_requester_node_id_bytes(&self) -> Vec<[u8; 32]> {
@@ -1147,6 +1274,10 @@ impl Default for DiscoveryConfig {
             denied_peer_ids: Vec::new(),
             pinned_route_domains: BTreeMap::new(),
             require_pinned_route_domains_for_multi_hop: false,
+            route_domain_attestor_node_ids: Vec::new(),
+            route_domain_attestation_min_verified:
+                Self::default_route_domain_attestation_min_verified(),
+            require_route_domain_attestations_for_multi_hop: false,
             public_endpoint: None,
             public_api_listen_addr: None,
             region: None,
@@ -1465,6 +1596,13 @@ mod tests {
         assert!(config.discovery.denied_peer_ids.is_empty());
         assert!(config.discovery.pinned_route_domains.is_empty());
         assert!(!config.discovery.require_pinned_route_domains_for_multi_hop);
+        assert!(config.discovery.route_domain_attestor_node_ids.is_empty());
+        assert_eq!(config.discovery.route_domain_attestation_min_verified, 1);
+        assert!(
+            !config
+                .discovery
+                .require_route_domain_attestations_for_multi_hop
+        );
         assert_eq!(
             config.discovery.descriptor_ttl_secs,
             DiscoveryConfig::default_descriptor_ttl_secs()
@@ -2195,6 +2333,96 @@ pinned_route_domains = {{ "{node_id}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "{up
 "#
         );
         assert!(ServerConfig::from_str(&duplicate_identity).is_err());
+    }
+
+    #[test]
+    fn test_discovery_accepts_route_domain_attestor_quorum() {
+        let subject = "11".repeat(32);
+        let attestor_a = "22".repeat(32);
+        let attestor_b = "33".repeat(32);
+        let toml_str = format!(
+            r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+require_pinned_route_domains_for_multi_hop = true
+pinned_route_domains = {{ "{subject}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }}
+route_domain_attestor_node_ids = ["{attestor_a}", "{attestor_b}"]
+route_domain_attestation_min_verified = 2
+require_route_domain_attestations_for_multi_hop = true
+"#
+        );
+
+        let config = ServerConfig::from_str(&toml_str).unwrap();
+        assert_eq!(
+            config.discovery.route_domain_attestor_node_id_bytes(),
+            vec![[0x22; 32], [0x33; 32]]
+        );
+        assert_eq!(config.discovery.route_domain_attestation_min_verified, 2);
+        assert!(
+            config
+                .discovery
+                .require_route_domain_attestations_for_multi_hop
+        );
+    }
+
+    #[test]
+    fn test_discovery_rejects_unsafe_route_domain_attestor_policy() {
+        let subject = "11".repeat(32);
+        let attestor = "22".repeat(32);
+        let missing_strict_gate = format!(
+            r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+route_domain_attestor_node_ids = ["{attestor}"]
+require_route_domain_attestations_for_multi_hop = true
+"#
+        );
+        assert!(ServerConfig::from_str(&missing_strict_gate).is_err());
+
+        let threshold_exceeds_pins = format!(
+            r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+route_domain_attestor_node_ids = ["{attestor}"]
+route_domain_attestation_min_verified = 2
+"#
+        );
+        assert!(ServerConfig::from_str(&threshold_exceeds_pins).is_err());
+
+        let uppercase_attestor = attestor.to_ascii_uppercase();
+        let duplicate_attestor = format!(
+            r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+route_domain_attestor_node_ids = ["{attestor}", "{uppercase_attestor}"]
+"#
+        );
+        assert!(ServerConfig::from_str(&duplicate_attestor).is_err());
+
+        let missing_history = format!(
+            r#"
+[discovery]
+enabled = true
+route_domain_attestor_node_ids = ["{attestor}"]
+"#
+        );
+        assert!(ServerConfig::from_str(&missing_history).is_err());
+
+        let missing_attestors = format!(
+            r#"
+[discovery]
+enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
+require_pinned_route_domains_for_multi_hop = true
+pinned_route_domains = {{ "{subject}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }}
+require_route_domain_attestations_for_multi_hop = true
+"#
+        );
+        assert!(ServerConfig::from_str(&missing_attestors).is_err());
     }
 
     #[test]
