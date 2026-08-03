@@ -103,6 +103,18 @@ const MAX_DIRECTORY_GOSSIP_PROOF_MIN_AGE_SECS: u64 = 48 * 60 * 60;
 const MAX_DISCOVERY_GOSSIP_CONCURRENCY: u16 = 64;
 const MAX_PINNED_ROUTE_DOMAINS: usize = 256;
 
+/// One validated, canonical local route-domain assignment.
+///
+/// [ROUTE-DOMAIN-POLICY-HISTORY 2026-08-03 by Codex] The opaque 128-bit
+/// token groups nodes that the operator has independently reviewed as sharing
+/// one routing failure domain. It is not an AS proof, operator identity,
+/// network vote, or Sybil-resistance credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PinnedRouteDomainAssignment {
+    pub(crate) node_id: [u8; 32],
+    pub(crate) route_domain: [u8; 16],
+}
+
 // ── Sub-module re-exports (keep callers' use-paths stable) ────────────────
 pub use crate::config_blind_vault::BlindVaultConfig;
 pub use crate::config_chat_relay::ChatRelayConfig;
@@ -960,6 +972,12 @@ impl DiscoveryConfig {
                 "requires discovery.enabled = true",
             ));
         }
+        if self.require_pinned_route_domains_for_multi_hop && self.directory_chain_path.is_none() {
+            return Err(ServerError::config_invalid(
+                "discovery.require_pinned_route_domains_for_multi_hop",
+                "requires discovery.directory_chain_path so the active policy has a signed, restart-audited history",
+            ));
+        }
 
         if let Some(endpoint) = &self.public_endpoint {
             if endpoint.trim().is_empty() {
@@ -1023,6 +1041,30 @@ impl DiscoveryConfig {
                 decoded.try_into().ok()
             })
             .collect()
+    }
+
+    /// Returns validated route-domain assignments in canonical node-id order.
+    ///
+    /// Configuration validation rejects malformed inputs. The defensive
+    /// `filter_map` keeps this internal accessor panic-free for embedders that
+    /// construct an unchecked `DiscoveryConfig` directly.
+    #[must_use]
+    pub(crate) fn pinned_route_domain_assignments(&self) -> Vec<PinnedRouteDomainAssignment> {
+        let mut assignments = self
+            .pinned_route_domains
+            .iter()
+            .filter_map(|(node_id, route_domain)| {
+                let node_id: [u8; 32] = hex::decode(node_id.trim()).ok()?.try_into().ok()?;
+                let route_domain: [u8; 16] =
+                    hex::decode(route_domain.trim()).ok()?.try_into().ok()?;
+                Some(PinnedRouteDomainAssignment {
+                    node_id,
+                    route_domain,
+                })
+            })
+            .collect::<Vec<_>>();
+        assignments.sort_unstable();
+        assignments
     }
 
     /// Returns validated identities allowed to use this node as a witness.
@@ -2080,6 +2122,7 @@ allowed_peer_ids = ["not-a-node-id"]
             r#"
 [discovery]
 enabled = true
+directory_chain_path = "/var/lib/aeronyx/directory-chain.db"
 require_pinned_route_domains_for_multi_hop = true
 pinned_route_domains = {{ "{first_node}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "{second_node}" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }}
 "#
@@ -2088,6 +2131,12 @@ pinned_route_domains = {{ "{first_node}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "
         let config = ServerConfig::from_str(&toml_str).unwrap();
         assert!(config.discovery.require_pinned_route_domains_for_multi_hop);
         assert_eq!(config.discovery.pinned_route_domains.len(), 2);
+        let assignments = config.discovery.pinned_route_domain_assignments();
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].node_id, [0x11; 32]);
+        assert_eq!(assignments[0].route_domain, [0xaa; 16]);
+        assert_eq!(assignments[1].node_id, [0x22; 32]);
+        assert_eq!(assignments[1].route_domain, [0xbb; 16]);
     }
 
     #[test]
@@ -2126,6 +2175,16 @@ pinned_route_domains = {{ "{node_id}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }}
 "#
         );
         assert!(ServerConfig::from_str(&disabled_strict_policy).is_err());
+
+        let missing_policy_history = format!(
+            r#"
+[discovery]
+enabled = true
+require_pinned_route_domains_for_multi_hop = true
+pinned_route_domains = {{ "{node_id}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }}
+"#
+        );
+        assert!(ServerConfig::from_str(&missing_policy_history).is_err());
 
         let uppercase_node_id = node_id.to_ascii_uppercase();
         let duplicate_identity = format!(

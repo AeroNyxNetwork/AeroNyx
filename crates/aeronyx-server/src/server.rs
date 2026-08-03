@@ -6302,7 +6302,16 @@ impl Server {
             .config
             .discovery
             .directory_observation_witness_min_verified;
-        let (store, audit, policy) = tokio::task::spawn_blocking(move || {
+        // [ROUTE-DOMAIN-POLICY-HISTORY 2026-08-03 by Codex] Reconcile the
+        // canonical local routing-diversity policy before any listener starts.
+        // This signed history attests only to local operator configuration; it
+        // is deliberately not described as an AS or operator identity proof.
+        let route_domain_assignments = self.config.discovery.pinned_route_domain_assignments();
+        let route_domain_strict = self
+            .config
+            .discovery
+            .require_pinned_route_domains_for_multi_hop;
+        let (store, audit, policy, route_domain_policy) = tokio::task::spawn_blocking(move || {
             let (store, _) = DirectoryReplicaStore::open(&open_path, local_node_id, observed_at)?;
             let policy = store.reconcile_observation_witness_policy(
                 &identity,
@@ -6310,8 +6319,19 @@ impl Server {
                 minimum_witnesses,
                 observed_at,
             )?;
+            let route_domain_policy = store.reconcile_route_domain_policy(
+                &identity,
+                &route_domain_assignments,
+                route_domain_strict,
+                observed_at,
+            )?;
             let audit = store.audit(observed_at)?;
-            Ok::<_, crate::services::DirectoryReplicaStoreError>((store, audit, policy))
+            Ok::<_, crate::services::DirectoryReplicaStoreError>((
+                store,
+                audit,
+                policy,
+                route_domain_policy,
+            ))
         })
         .await
         .map_err(|error| {
@@ -6347,8 +6367,14 @@ impl Server {
             witness_policy_anchor_receipts =
                 audit.observation_witness_policy_anchor_receipts,
             remote_witness_policy_heads = audit.observation_witness_remote_policy_anchors,
+            route_domain_policy_appended = route_domain_policy.appended,
+            route_domain_policy_epoch = route_domain_policy.epoch,
+            route_domain_policy_digest = %hex::encode(route_domain_policy.policy_digest),
+            route_domain_policy_activated_at = route_domain_policy.activated_at,
+            route_domain_policy_assignments = route_domain_policy.assignments,
+            route_domain_policy_strict = route_domain_policy.strict_required,
             retry_states = audit.retry_states,
-            "[DIRECTORY_REPLICA] Startup audit and witness-policy reconciliation passed"
+            "[DIRECTORY_REPLICA] Startup audit and local policy reconciliation passed"
         );
         Ok(Some(Arc::new(store)))
     }

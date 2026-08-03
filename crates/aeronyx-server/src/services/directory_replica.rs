@@ -38,6 +38,9 @@
 //!   receipts so operators can distinguish unavailable evidence from faults.
 //! - Persists every local witness pin/threshold change as a node-identity-
 //!   signed, hash-linked policy epoch with a metadata-anchored durable head.
+//! - [ROUTE-DOMAIN-POLICY-HISTORY 2026-08-03 by Codex] Persists canonical
+//!   route-domain pin changes as a separate node-signed, hash-linked history;
+//!   the opaque grouping remains local policy, not an identity or AS proof.
 //! - Retains opaque policy heads observed by independent nodes and accepted
 //!   signed external anchor receipts without exposing policy member identities.
 //! - Selects only forward-moving, mature, unwitnessed checkpoints for external
@@ -210,6 +213,8 @@
 //!   caller must also possess the node identity key and database permissions.
 //!
 //! ## Last Modified
+//! v0.39.0-RouteDomainPolicyHistory - Added schema v11 canonical signed local
+//! route-domain policy epochs and fail-closed startup audit/reconciliation.
 //! v0.38.0-WitnessTerminalState - Made witness recovery and carrier health
 //! service-owned, order-preserving, and independently counter-auditable.
 //! v0.37.0-DirectoryTransportLifecycle - Centralized transport health policy,
@@ -287,6 +292,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::config::PinnedRouteDomainAssignment;
+
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::discovery::{
     decode_directory_observation_certificate, decode_directory_sync_message,
@@ -312,7 +319,8 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 
-const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 10;
+const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 11;
+const DIRECTORY_REPLICA_SCHEMA_VERSION_V10: i64 = 10;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V9: i64 = 9;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V8: i64 = 8;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V7: i64 = 7;
@@ -335,6 +343,7 @@ const MAX_DIRECTORY_OBSERVATION_CHECKPOINT_BYTES: u64 = 4 * 1024;
 const MAX_DIRECTORY_OBSERVATION_WITNESS_BYTES: usize = 2 * 1024;
 const MAX_DIRECTORY_POLICY_ANCHOR_BYTES: usize = 2 * 1024;
 const MAX_DIRECTORY_OBSERVATION_WITNESS_POLICY_MEMBERS: usize = 16;
+const MAX_DIRECTORY_ROUTE_DOMAIN_POLICY_ASSIGNMENTS: usize = 256;
 /// Maximum third-party observation certificates retained by one local store.
 pub(crate) const MAX_DIRECTORY_OBSERVATION_CERTIFICATE_IMPORTS: usize = 4_096;
 const DIRECTORY_OBSERVATION_CERTIFICATE_IMPORT_TIMESTAMP_SKEW_SECS: u64 = 60;
@@ -679,6 +688,16 @@ pub struct DirectoryReplicaAudit {
     pub observation_witness_policy_anchor_receipts: u64,
     /// Opaque foreign policy heads this node retains for independent observers.
     pub observation_witness_remote_policy_anchors: u64,
+    /// Number of audited local route-domain policy epochs.
+    pub route_domain_policy_epochs: u64,
+    /// Current local route-domain policy epoch, or zero before first use.
+    pub route_domain_policy_epoch: u64,
+    /// Timestamp bound into the current route-domain policy.
+    pub route_domain_policy_activated_at: u64,
+    /// Number of opaque node-to-domain assignments in the current policy.
+    pub route_domain_policy_assignments: u64,
+    /// Whether current multi-hop selection requires complete pinned coverage.
+    pub route_domain_policy_strict: bool,
     /// Third-party portable observation certificates in the audited import log.
     pub imported_observation_certificates: u64,
     /// Latest node-signed certificate-import sequence, or zero when empty.
@@ -2753,6 +2772,19 @@ struct StoredObservationWitnessPolicyRow {
 }
 
 #[derive(Debug)]
+struct StoredRouteDomainPolicyRow {
+    epoch: i64,
+    policy_digest: Vec<u8>,
+    previous_policy_digest: Vec<u8>,
+    activated_at: i64,
+    strict_required: i64,
+    assignment_count: i64,
+    assignments: Vec<u8>,
+    signer_node_id: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct StoredObservationWitnessPolicyAnchorReceiptRow {
     policy_epoch: i64,
     policy_digest: Vec<u8>,
@@ -2976,6 +3008,91 @@ pub(crate) struct DirectoryObservationWitnessPolicyReconcileReport {
     pub(crate) minimum_witnesses: u64,
 }
 
+/// One node-identity-signed, hash-linked local route-domain policy epoch.
+///
+/// [ROUTE-DOMAIN-POLICY-HISTORY 2026-08-03 by Codex] Assignments are opaque
+/// operator-reviewed failure-domain groups. The signature proves what this
+/// node configured and when; it does not prove legal ownership, ASN identity,
+/// physical independence, honest operation, consensus, or Sybil resistance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryRouteDomainPolicyEpoch {
+    epoch: u64,
+    previous_policy_digest: [u8; 32],
+    activated_at: u64,
+    strict_required: bool,
+    assignments: Vec<PinnedRouteDomainAssignment>,
+    signer_node_id: [u8; 32],
+    signature: [u8; 64],
+}
+
+impl DirectoryRouteDomainPolicyEpoch {
+    fn sign(
+        identity: &IdentityKeyPair,
+        epoch: u64,
+        previous_policy_digest: [u8; 32],
+        activated_at: u64,
+        strict_required: bool,
+        assignments: Vec<PinnedRouteDomainAssignment>,
+    ) -> Result<Self, DirectoryReplicaStoreError> {
+        let mut policy = Self {
+            epoch,
+            previous_policy_digest,
+            activated_at,
+            strict_required,
+            assignments,
+            signer_node_id: identity.public_key_bytes(),
+            signature: [0u8; 64],
+        };
+        policy.validate_unsigned_fields()?;
+        policy.signature = identity.sign(&policy.signing_bytes());
+        Ok(policy)
+    }
+
+    fn validate_unsigned_fields(&self) -> Result<(), DirectoryReplicaStoreError> {
+        if self.epoch == 0 || self.activated_at == 0 || self.signer_node_id == [0u8; 32] {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain policy contains an invalid sentinel".to_string(),
+            ));
+        }
+        validate_route_domain_policy_assignments(&self.assignments, self.strict_required)
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(192 + self.assignments.len() * 48);
+        bytes.extend_from_slice(b"AeroNyx-DirectoryRouteDomainPolicy-v1");
+        bytes.extend_from_slice(&AERONYX_DIRECTORY_MAINNET_CHAIN_ID);
+        bytes.extend_from_slice(&self.epoch.to_le_bytes());
+        bytes.extend_from_slice(&self.previous_policy_digest);
+        bytes.extend_from_slice(&self.activated_at.to_le_bytes());
+        bytes.push(u8::from(self.strict_required));
+        bytes.extend_from_slice(&(self.assignments.len() as u64).to_le_bytes());
+        for assignment in &self.assignments {
+            bytes.extend_from_slice(&assignment.node_id);
+            bytes.extend_from_slice(&assignment.route_domain);
+        }
+        bytes.extend_from_slice(&self.signer_node_id);
+        bytes
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.signing_bytes());
+        hasher.update(self.signature);
+        hasher.finalize().into()
+    }
+}
+
+/// Result of reconciling runtime route-domain pins into signed local history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DirectoryRouteDomainPolicyReconcileReport {
+    pub(crate) appended: bool,
+    pub(crate) epoch: u64,
+    pub(crate) policy_digest: [u8; 32],
+    pub(crate) activated_at: u64,
+    pub(crate) assignments: u64,
+    pub(crate) strict_required: bool,
+}
+
 /// Privacy-bounded current local policy head exported to pinned witnesses.
 ///
 /// The digest commits to the complete node-signed local policy, while member
@@ -3041,6 +3158,13 @@ struct ObservationWitnessAudit {
 struct ObservationWitnessPolicyAudit {
     epochs: u64,
     current: Option<DirectoryObservationWitnessPolicyEpoch>,
+    current_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RouteDomainPolicyAudit {
+    epochs: u64,
+    current: Option<DirectoryRouteDomainPolicyEpoch>,
     current_digest: [u8; 32],
 }
 
@@ -3270,6 +3394,140 @@ impl DirectoryReplicaStore {
                 )
             })?,
         })
+    }
+
+    /// Reconciles validated runtime route-domain pins into signed local history.
+    ///
+    /// The first disabled empty configuration remains epoch zero. After the
+    /// first non-empty policy, later changes, including disabling and clearing
+    /// all assignments, append a new epoch so operators cannot erase policy
+    /// transitions by editing configuration. A full signature/link audit runs
+    /// before and after each append in one immediate transaction.
+    ///
+    /// # Errors
+    /// Returns [`DirectoryReplicaStoreError`] for malformed assignments,
+    /// identity mismatch, corrupt history, timestamp/counter exhaustion, or
+    /// an atomic persistence failure.
+    pub(crate) fn reconcile_route_domain_policy(
+        &self,
+        identity: &IdentityKeyPair,
+        assignments: &[PinnedRouteDomainAssignment],
+        strict_required: bool,
+        activated_at: u64,
+    ) -> Result<DirectoryRouteDomainPolicyReconcileReport, DirectoryReplicaStoreError> {
+        if identity.public_key_bytes() != self.local_node_id || activated_at == 0 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain policy identity or timestamp is invalid".to_string(),
+            ));
+        }
+        let canonical_assignments =
+            canonical_route_domain_policy_assignments(assignments, strict_required)?;
+
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::validate_metadata(&transaction, &self.local_node_id)?;
+        let previous = Self::audit_route_domain_policies(&transaction, &self.local_node_id)?;
+        if let Some(current) = previous.current.as_ref() {
+            if current.assignments == canonical_assignments
+                && current.strict_required == strict_required
+            {
+                transaction.commit()?;
+                return Ok(route_domain_policy_report(
+                    false,
+                    current,
+                    previous.current_digest,
+                )?);
+            }
+        } else if canonical_assignments.is_empty() && !strict_required {
+            transaction.commit()?;
+            return Ok(DirectoryRouteDomainPolicyReconcileReport::default());
+        }
+
+        let epoch = previous.epochs.checked_add(1).ok_or_else(|| {
+            DirectoryReplicaStoreError::Integrity("route-domain policy epoch exhausted".to_string())
+        })?;
+        let activated_at = previous
+            .current
+            .as_ref()
+            .map_or(activated_at, |policy| activated_at.max(policy.activated_at));
+        let policy = DirectoryRouteDomainPolicyEpoch::sign(
+            identity,
+            epoch,
+            previous.current_digest,
+            activated_at,
+            strict_required,
+            canonical_assignments,
+        )?;
+        let policy_digest = policy.digest();
+        let assignments_blob = policy
+            .assignments
+            .iter()
+            .flat_map(|assignment| {
+                assignment
+                    .node_id
+                    .iter()
+                    .chain(assignment.route_domain.iter())
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        transaction.execute(
+            "INSERT INTO directory_route_domain_policies
+                (epoch, policy_digest, previous_policy_digest, activated_at,
+                 strict_required, assignment_count, assignments,
+                 signer_node_id, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                u64_to_i64(policy.epoch, "route-domain policy epoch")?,
+                policy_digest.as_slice(),
+                policy.previous_policy_digest.as_slice(),
+                u64_to_i64(
+                    policy.activated_at,
+                    "route-domain policy activation timestamp"
+                )?,
+                i64::from(policy.strict_required),
+                u64_to_i64(
+                    u64::try_from(policy.assignments.len()).map_err(|_| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "route-domain policy assignment count exceeds u64".to_string(),
+                        )
+                    })?,
+                    "route-domain policy assignment count"
+                )?,
+                assignments_blob,
+                policy.signer_node_id.as_slice(),
+                policy.signature.as_slice(),
+            ],
+        )?;
+        let previous_head = previous
+            .current
+            .as_ref()
+            .map(|_| previous.current_digest.to_vec());
+        let changed = transaction.execute(
+            "UPDATE directory_replica_meta
+             SET route_domain_policy_epoch = ?1, route_domain_policy_head = ?2
+             WHERE singleton = 1 AND route_domain_policy_epoch = ?3
+               AND ((?4 IS NULL AND route_domain_policy_head IS NULL)
+                    OR route_domain_policy_head = ?4)",
+            params![
+                u64_to_i64(epoch, "route-domain policy epoch")?,
+                policy_digest.as_slice(),
+                u64_to_i64(previous.epochs, "previous route-domain policy epoch")?,
+                previous_head,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain policy head compare-and-swap failed".to_string(),
+            ));
+        }
+        let audited = Self::audit_route_domain_policies(&transaction, &self.local_node_id)?;
+        if audited.epochs != epoch || audited.current_digest != policy_digest {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain policy post-append audit diverged".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        route_domain_policy_report(true, &policy, policy_digest)
     }
 
     /// Verifies that the metadata-anchored signed policy head contains the
@@ -7021,6 +7279,157 @@ impl DirectoryReplicaStore {
         Ok(audit)
     }
 
+    fn decode_route_domain_policy(
+        row: StoredRouteDomainPolicyRow,
+    ) -> Result<([u8; 32], DirectoryRouteDomainPolicyEpoch), DirectoryReplicaStoreError> {
+        let epoch = positive_i64_to_u64(row.epoch, "route-domain policy epoch")?;
+        let activated_at =
+            positive_i64_to_u64(row.activated_at, "route-domain policy activation timestamp")?;
+        let strict_required = match row.strict_required {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "route-domain policy strict flag is malformed".to_string(),
+                ));
+            }
+        };
+        let assignment_count = usize::try_from(nonnegative_i64_to_u64(
+            row.assignment_count,
+            "route-domain policy assignment count",
+        )?)
+        .map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "route-domain policy assignment count exceeds usize".to_string(),
+            )
+        })?;
+        if assignment_count > MAX_DIRECTORY_ROUTE_DOMAIN_POLICY_ASSIGNMENTS
+            || row.assignments.len() != assignment_count.saturating_mul(48)
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain policy assignment blob is malformed".to_string(),
+            ));
+        }
+        let assignments = row
+            .assignments
+            .chunks_exact(48)
+            .map(|assignment| {
+                Ok(PinnedRouteDomainAssignment {
+                    node_id: bytes32(&assignment[..32], "route-domain policy node identity")?,
+                    route_domain: assignment[32..].try_into().map_err(|_| {
+                        DirectoryReplicaStoreError::Integrity(
+                            "route-domain policy token is malformed".to_string(),
+                        )
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, DirectoryReplicaStoreError>>()?;
+        let policy = DirectoryRouteDomainPolicyEpoch {
+            epoch,
+            previous_policy_digest: bytes32(
+                &row.previous_policy_digest,
+                "previous route-domain policy digest",
+            )?,
+            activated_at,
+            strict_required,
+            assignments,
+            signer_node_id: bytes32(&row.signer_node_id, "route-domain policy signer")?,
+            signature: bytes64(&row.signature, "route-domain policy signature")?,
+        };
+        policy.validate_unsigned_fields()?;
+        let stored_digest = bytes32(&row.policy_digest, "route-domain policy digest")?;
+        Ok((stored_digest, policy))
+    }
+
+    fn audit_route_domain_policies(
+        connection: &Connection,
+        local_node_id: &[u8; 32],
+    ) -> Result<RouteDomainPolicyAudit, DirectoryReplicaStoreError> {
+        let (metadata_epoch, metadata_head) = connection.query_row(
+            "SELECT route_domain_policy_epoch, route_domain_policy_head
+             FROM directory_replica_meta WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+        )?;
+        let metadata_epoch =
+            nonnegative_i64_to_u64(metadata_epoch, "replica metadata route-domain policy epoch")?;
+        let metadata_head = metadata_head
+            .as_deref()
+            .map(|value| bytes32(value, "replica metadata route-domain policy head"))
+            .transpose()?;
+        let mut statement = connection.prepare(
+            "SELECT epoch, policy_digest, previous_policy_digest, activated_at,
+                    strict_required, assignment_count, assignments,
+                    signer_node_id, signature
+             FROM directory_route_domain_policies ORDER BY epoch ASC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut audit = RouteDomainPolicyAudit::default();
+        let mut expected_previous_digest = [0u8; 32];
+        let mut previous_activated_at = 0u64;
+        while let Some(row) = rows.next()? {
+            let stored = StoredRouteDomainPolicyRow {
+                epoch: row.get(0)?,
+                policy_digest: row.get(1)?,
+                previous_policy_digest: row.get(2)?,
+                activated_at: row.get(3)?,
+                strict_required: row.get(4)?,
+                assignment_count: row.get(5)?,
+                assignments: row.get(6)?,
+                signer_node_id: row.get(7)?,
+                signature: row.get(8)?,
+            };
+            let (stored_digest, policy) = Self::decode_route_domain_policy(stored)?;
+            let expected_epoch = audit.epochs.checked_add(1).ok_or_else(|| {
+                DirectoryReplicaStoreError::Integrity(
+                    "route-domain policy epoch exhausted".to_string(),
+                )
+            })?;
+            if policy.epoch != expected_epoch
+                || policy.previous_policy_digest != expected_previous_digest
+                || policy.activated_at < previous_activated_at
+                || policy.signer_node_id != *local_node_id
+            {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "route-domain policy history is not canonical".to_string(),
+                ));
+            }
+            IdentityPublicKey::from_bytes(&policy.signer_node_id)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "route-domain policy signer is invalid".to_string(),
+                    )
+                })?
+                .verify(&policy.signing_bytes(), &policy.signature)
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "route-domain policy signature is invalid".to_string(),
+                    )
+                })?;
+            if policy.digest() != stored_digest {
+                return Err(DirectoryReplicaStoreError::Integrity(
+                    "route-domain policy digest is invalid".to_string(),
+                ));
+            }
+            audit.epochs = expected_epoch;
+            expected_previous_digest = stored_digest;
+            previous_activated_at = policy.activated_at;
+            audit.current_digest = stored_digest;
+            audit.current = Some(policy);
+        }
+        drop(rows);
+        drop(statement);
+        if audit.epochs != metadata_epoch
+            || (audit.epochs == 0 && metadata_head.is_some())
+            || (audit.epochs > 0 && metadata_head != Some(audit.current_digest))
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "route-domain policy head does not match audited history".to_string(),
+            ));
+        }
+        Ok(audit)
+    }
+
     /// Loads and verifies only the metadata-anchored policy head for bounded
     /// runtime status. Complete history verification remains a startup and
     /// explicit operator-audit responsibility.
@@ -7652,6 +8061,7 @@ impl DirectoryReplicaStore {
         let mirror_producers = Self::audit_mirror_registry(connection, local_node_id)?;
         let observation_witness_policies =
             Self::audit_observation_witness_policies(connection, local_node_id)?;
+        let route_domain_policies = Self::audit_route_domain_policies(connection, local_node_id)?;
         let observation_witness_remote_policy_anchors =
             Self::audit_remote_observation_policy_anchors(connection, local_node_id, observed_at)?;
         let observation_witness_policy_anchor_receipts = u64::try_from(
@@ -7718,6 +8128,26 @@ impl DirectoryReplicaStore {
                 .unwrap_or(0),
             observation_witness_policy_anchor_receipts,
             observation_witness_remote_policy_anchors,
+            route_domain_policy_epochs: route_domain_policies.epochs,
+            route_domain_policy_epoch: route_domain_policies.epochs,
+            route_domain_policy_activated_at: route_domain_policies
+                .current
+                .as_ref()
+                .map_or(0, |policy| policy.activated_at),
+            route_domain_policy_assignments: route_domain_policies
+                .current
+                .as_ref()
+                .map(|policy| u64::try_from(policy.assignments.len()))
+                .transpose()
+                .map_err(|_| {
+                    DirectoryReplicaStoreError::Integrity(
+                        "route-domain policy assignment count exceeds u64".to_string(),
+                    )
+                })?
+                .unwrap_or(0),
+            route_domain_policy_strict: route_domain_policies
+                .current
+                .is_some_and(|policy| policy.strict_required),
             imported_observation_certificates: observation_certificate_imports.imports,
             imported_observation_certificate_sequence: observation_certificate_imports.imports,
             imported_observation_certificate_head: observation_certificate_imports.head,
@@ -7824,6 +8254,11 @@ impl DirectoryReplicaStore {
                      CHECK (witness_policy_epoch >= 0),
                  witness_policy_head BLOB
                      CHECK (witness_policy_head IS NULL OR length(witness_policy_head) = 32),
+                 route_domain_policy_epoch INTEGER NOT NULL DEFAULT 0
+                     CHECK (route_domain_policy_epoch >= 0),
+                 route_domain_policy_head BLOB
+                     CHECK (route_domain_policy_head IS NULL
+                         OR length(route_domain_policy_head) = 32),
                  certificate_import_sequence INTEGER NOT NULL DEFAULT 0
                      CHECK (certificate_import_sequence >= 0),
                  certificate_import_head BLOB
@@ -7831,6 +8266,10 @@ impl DirectoryReplicaStore {
                          OR length(certificate_import_head) = 32),
                  CHECK ((witness_policy_epoch = 0 AND witness_policy_head IS NULL)
                      OR (witness_policy_epoch > 0 AND witness_policy_head IS NOT NULL)),
+                 CHECK ((route_domain_policy_epoch = 0
+                         AND route_domain_policy_head IS NULL)
+                     OR (route_domain_policy_epoch > 0
+                         AND route_domain_policy_head IS NOT NULL)),
                  CHECK ((certificate_import_sequence = 0
                          AND certificate_import_head IS NULL)
                      OR (certificate_import_sequence > 0
@@ -8101,6 +8540,21 @@ impl DirectoryReplicaStore {
                  ON directory_observation_certificate_imports(
                      observer, checkpoint_sequence DESC
                  );
+             CREATE TABLE IF NOT EXISTS directory_route_domain_policies (
+                 epoch INTEGER PRIMARY KEY CHECK (epoch > 0),
+                 policy_digest BLOB NOT NULL UNIQUE CHECK (length(policy_digest) = 32),
+                 previous_policy_digest BLOB NOT NULL UNIQUE
+                     CHECK (length(previous_policy_digest) = 32),
+                 activated_at INTEGER NOT NULL CHECK (activated_at > 0),
+                 strict_required INTEGER NOT NULL CHECK (strict_required IN (0, 1)),
+                 assignment_count INTEGER NOT NULL
+                     CHECK (assignment_count BETWEEN 0 AND 256),
+                 assignments BLOB NOT NULL CHECK (length(assignments) <= 12288),
+                 signer_node_id BLOB NOT NULL CHECK (length(signer_node_id) = 32),
+                 signature BLOB NOT NULL CHECK (length(signature) = 64),
+                 CHECK (length(assignments) = assignment_count * 48),
+                 CHECK (strict_required = 0 OR assignment_count > 0)
+             );
              CREATE TABLE IF NOT EXISTS directory_replica_retry_state (
                  producer BLOB PRIMARY KEY CHECK (length(producer) = 32),
                  consecutive_failures INTEGER NOT NULL
@@ -8161,6 +8615,18 @@ impl DirectoryReplicaStore {
                         Self::require_mirror_registry_table(transaction)?;
                         Self::require_certificate_import_metadata_columns(transaction)?;
                         Self::require_certificate_import_table(transaction)?;
+                        Self::require_route_domain_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_policy_table(transaction)?;
+                    }
+                    DIRECTORY_REPLICA_SCHEMA_VERSION_V10 => {
+                        Self::require_resolution_columns(transaction)?;
+                        Self::require_witness_policy_metadata_columns(transaction)?;
+                        Self::require_mirror_registry_table(transaction)?;
+                        Self::require_certificate_import_metadata_columns(transaction)?;
+                        Self::require_certificate_import_table(transaction)?;
+                        Self::add_route_domain_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_policy_table(transaction)?;
+                        Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V9 => {
                         Self::require_resolution_columns(transaction)?;
@@ -8168,6 +8634,8 @@ impl DirectoryReplicaStore {
                         Self::require_mirror_registry_table(transaction)?;
                         Self::add_certificate_import_metadata_columns(transaction)?;
                         Self::require_certificate_import_table(transaction)?;
+                        Self::add_route_domain_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_policy_table(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V8
@@ -8181,6 +8649,8 @@ impl DirectoryReplicaStore {
                         Self::require_mirror_registry_table(transaction)?;
                         Self::add_certificate_import_metadata_columns(transaction)?;
                         Self::require_certificate_import_table(transaction)?;
+                        Self::add_route_domain_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_policy_table(transaction)?;
                         Self::set_schema_version(transaction, version)?;
                     }
                     DIRECTORY_REPLICA_SCHEMA_VERSION_V1 | DIRECTORY_REPLICA_SCHEMA_VERSION_V2 => {
@@ -8189,6 +8659,8 @@ impl DirectoryReplicaStore {
                         Self::require_mirror_registry_table(transaction)?;
                         Self::add_certificate_import_metadata_columns(transaction)?;
                         Self::require_certificate_import_table(transaction)?;
+                        Self::add_route_domain_policy_metadata_columns(transaction)?;
+                        Self::require_route_domain_policy_table(transaction)?;
                         transaction.execute(
                             "UPDATE directory_replica_chains AS c
                              SET active_incident_digest = (
@@ -8382,6 +8854,57 @@ impl DirectoryReplicaStore {
         Ok(())
     }
 
+    fn add_route_domain_policy_metadata_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::metadata_has_column(transaction, "route_domain_policy_epoch")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_meta
+                 ADD COLUMN route_domain_policy_epoch INTEGER NOT NULL DEFAULT 0
+                 CHECK (route_domain_policy_epoch >= 0);",
+            )?;
+        }
+        if !Self::metadata_has_column(transaction, "route_domain_policy_head")? {
+            transaction.execute_batch(
+                "ALTER TABLE directory_replica_meta
+                 ADD COLUMN route_domain_policy_head BLOB
+                 CHECK (route_domain_policy_head IS NULL
+                     OR length(route_domain_policy_head) = 32);",
+            )?;
+        }
+        Self::require_route_domain_policy_metadata_columns(transaction)
+    }
+
+    fn require_route_domain_policy_metadata_columns(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        if !Self::metadata_has_column(transaction, "route_domain_policy_epoch")?
+            || !Self::metadata_has_column(transaction, "route_domain_policy_head")?
+        {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema v11 route-domain policy metadata is missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_route_domain_policy_table(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), DirectoryReplicaStoreError> {
+        let present: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'directory_route_domain_policies'",
+            [],
+            |row| row.get(0),
+        )?;
+        if present != 1 {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica schema v11 route-domain policy table is missing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn metadata_has_column(
         transaction: &Transaction<'_>,
         expected: &str,
@@ -8412,6 +8935,7 @@ impl DirectoryReplicaStore {
             .query_row(
                 "SELECT schema_version, chain_id, local_node_id,
                         witness_policy_epoch, witness_policy_head,
+                        route_domain_policy_epoch, route_domain_policy_head,
                         certificate_import_sequence, certificate_import_head
                  FROM directory_replica_meta WHERE singleton = 1",
                 [],
@@ -8424,6 +8948,8 @@ impl DirectoryReplicaStore {
                         row.get::<_, Option<Vec<u8>>>(4)?,
                         row.get::<_, i64>(5)?,
                         row.get::<_, Option<Vec<u8>>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<Vec<u8>>>(8)?,
                     ))
                 },
             )
@@ -8455,10 +8981,22 @@ impl DirectoryReplicaStore {
                 "directory replica witness policy metadata is inconsistent".to_string(),
             ));
         }
-        let certificate_import_sequence =
-            nonnegative_i64_to_u64(metadata.5, "replica metadata certificate import sequence")?;
-        let certificate_import_head = metadata
+        let route_domain_policy_epoch =
+            nonnegative_i64_to_u64(metadata.5, "replica metadata route-domain policy epoch")?;
+        let route_domain_policy_head = metadata
             .6
+            .as_deref()
+            .map(|value| bytes32(value, "replica metadata route-domain policy head"))
+            .transpose()?;
+        if (route_domain_policy_epoch == 0) != route_domain_policy_head.is_none() {
+            return Err(DirectoryReplicaStoreError::Integrity(
+                "directory replica route-domain policy metadata is inconsistent".to_string(),
+            ));
+        }
+        let certificate_import_sequence =
+            nonnegative_i64_to_u64(metadata.7, "replica metadata certificate import sequence")?;
+        let certificate_import_head = metadata
+            .8
             .as_deref()
             .map(|value| bytes32(value, "replica metadata certificate import head"))
             .transpose()?;
@@ -10377,6 +10915,63 @@ fn validate_observation_witness_policy_members(
     Ok(())
 }
 
+fn canonical_route_domain_policy_assignments(
+    assignments: &[PinnedRouteDomainAssignment],
+    strict_required: bool,
+) -> Result<Vec<PinnedRouteDomainAssignment>, DirectoryReplicaStoreError> {
+    let mut canonical = assignments.to_vec();
+    canonical.sort_unstable();
+    if canonical
+        .windows(2)
+        .any(|pair| pair[0].node_id == pair[1].node_id)
+    {
+        return Err(DirectoryReplicaStoreError::Request(
+            "route-domain policy contains duplicate node identities".to_string(),
+        ));
+    }
+    validate_route_domain_policy_assignments(&canonical, strict_required)?;
+    Ok(canonical)
+}
+
+fn validate_route_domain_policy_assignments(
+    assignments: &[PinnedRouteDomainAssignment],
+    strict_required: bool,
+) -> Result<(), DirectoryReplicaStoreError> {
+    if assignments.len() > MAX_DIRECTORY_ROUTE_DOMAIN_POLICY_ASSIGNMENTS
+        || (strict_required && assignments.is_empty())
+        || assignments.iter().any(|assignment| {
+            assignment.node_id == [0u8; 32] || assignment.route_domain == [0u8; 16]
+        })
+        || assignments
+            .windows(2)
+            .any(|pair| pair[0].node_id >= pair[1].node_id)
+    {
+        return Err(DirectoryReplicaStoreError::Request(
+            "route-domain policy assignments or strict mode are invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn route_domain_policy_report(
+    appended: bool,
+    policy: &DirectoryRouteDomainPolicyEpoch,
+    policy_digest: [u8; 32],
+) -> Result<DirectoryRouteDomainPolicyReconcileReport, DirectoryReplicaStoreError> {
+    Ok(DirectoryRouteDomainPolicyReconcileReport {
+        appended,
+        epoch: policy.epoch,
+        policy_digest,
+        activated_at: policy.activated_at,
+        assignments: u64::try_from(policy.assignments.len()).map_err(|_| {
+            DirectoryReplicaStoreError::Integrity(
+                "route-domain policy assignment count exceeds u64".to_string(),
+            )
+        })?,
+        strict_required: policy.strict_required,
+    })
+}
+
 fn validate_incident_kind(kind: &str) -> Result<(), DirectoryReplicaStoreError> {
     if kind.is_empty()
         || kind.len() > MAX_DIRECTORY_REPLICA_INCIDENT_KIND_BYTES
@@ -11560,6 +12155,75 @@ mod tests {
         assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
         assert_eq!(import_columns, 2);
         assert_eq!(import_table, "directory_observation_certificate_imports");
+    }
+
+    #[test]
+    fn schema_v10_is_atomically_migrated_to_v11_route_domain_history() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let local = IdentityKeyPair::from_bytes(&[0x10; 32]).unwrap();
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 20).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE directory_route_domain_policies;
+                 ALTER TABLE directory_replica_meta RENAME TO directory_replica_meta_v11;
+                 CREATE TABLE directory_replica_meta (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL,
+                     chain_id BLOB NOT NULL CHECK (length(chain_id) = 32),
+                     local_node_id BLOB NOT NULL CHECK (length(local_node_id) = 32),
+                     witness_policy_epoch INTEGER NOT NULL DEFAULT 0
+                         CHECK (witness_policy_epoch >= 0),
+                     witness_policy_head BLOB
+                         CHECK (witness_policy_head IS NULL
+                             OR length(witness_policy_head) = 32),
+                     certificate_import_sequence INTEGER NOT NULL DEFAULT 0
+                         CHECK (certificate_import_sequence >= 0),
+                     certificate_import_head BLOB
+                         CHECK (certificate_import_head IS NULL
+                             OR length(certificate_import_head) = 32)
+                 );
+                 INSERT INTO directory_replica_meta
+                     (singleton, schema_version, chain_id, local_node_id,
+                      witness_policy_epoch, witness_policy_head,
+                      certificate_import_sequence, certificate_import_head)
+                 SELECT singleton, 10, chain_id, local_node_id,
+                        witness_policy_epoch, witness_policy_head,
+                        certificate_import_sequence, certificate_import_head
+                 FROM directory_replica_meta_v11;
+                 DROP TABLE directory_replica_meta_v11;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let (store, audit) =
+            DirectoryReplicaStore::open(&path, local.public_key_bytes(), NOW + 21).unwrap();
+        assert_eq!(audit.route_domain_policy_epochs, 0);
+        let connection = store.connection.lock();
+        let (version, policy_columns, policy_table): (i64, i64, String) = connection
+            .query_row(
+                "SELECT m.schema_version,
+                        (SELECT COUNT(*) FROM pragma_table_info('directory_replica_meta')
+                         WHERE name IN (
+                             'route_domain_policy_epoch',
+                             'route_domain_policy_head'
+                         )),
+                        t.name
+                 FROM directory_replica_meta m
+                 JOIN sqlite_master t
+                   ON t.type = 'table'
+                  AND t.name = 'directory_route_domain_policies'
+                 WHERE m.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(version, DIRECTORY_REPLICA_SCHEMA_VERSION);
+        assert_eq!(policy_columns, 2);
+        assert_eq!(policy_table, "directory_route_domain_policies");
     }
 
     #[test]
@@ -13166,6 +13830,124 @@ mod tests {
             idempotent_after_restart.policy_digest,
             rotation.policy_digest
         );
+    }
+
+    #[test]
+    fn route_domain_policy_is_canonical_idempotent_and_restart_audited() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let operator = IdentityKeyPair::from_bytes(&[0xd1; 32]).unwrap();
+        let first = PinnedRouteDomainAssignment {
+            node_id: [0x11; 32],
+            route_domain: [0xa1; 16],
+        };
+        let second = PinnedRouteDomainAssignment {
+            node_id: [0x22; 32],
+            route_domain: [0xb2; 16],
+        };
+        let (store, empty_audit) =
+            DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 20).unwrap();
+        assert_eq!(empty_audit.route_domain_policy_epochs, 0);
+        let disabled = store
+            .reconcile_route_domain_policy(&operator, &[], false, NOW + 20)
+            .unwrap();
+        assert_eq!(
+            disabled,
+            DirectoryRouteDomainPolicyReconcileReport::default()
+        );
+
+        let initial = store
+            .reconcile_route_domain_policy(&operator, &[second, first], false, NOW + 21)
+            .unwrap();
+        assert!(initial.appended);
+        assert_eq!(initial.epoch, 1);
+        assert_eq!(initial.assignments, 2);
+        assert!(!initial.strict_required);
+        let reordered = store
+            .reconcile_route_domain_policy(&operator, &[first, second], false, NOW + 22)
+            .unwrap();
+        assert!(!reordered.appended);
+        assert_eq!(reordered.policy_digest, initial.policy_digest);
+        assert_eq!(reordered.activated_at, initial.activated_at);
+
+        let strict = store
+            .reconcile_route_domain_policy(&operator, &[first, second], true, NOW + 23)
+            .unwrap();
+        assert!(strict.appended);
+        assert_eq!(strict.epoch, 2);
+        assert!(strict.strict_required);
+        let cleared = store
+            .reconcile_route_domain_policy(&operator, &[], false, NOW + 24)
+            .unwrap();
+        assert!(cleared.appended);
+        assert_eq!(cleared.epoch, 3);
+        assert_eq!(cleared.assignments, 0);
+        drop(store);
+
+        let (reopened, audit) =
+            DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 25).unwrap();
+        assert_eq!(audit.route_domain_policy_epochs, 3);
+        assert_eq!(audit.route_domain_policy_epoch, 3);
+        assert_eq!(audit.route_domain_policy_activated_at, NOW + 24);
+        assert_eq!(audit.route_domain_policy_assignments, 0);
+        assert!(!audit.route_domain_policy_strict);
+        let idempotent = reopened
+            .reconcile_route_domain_policy(&operator, &[], false, NOW + 26)
+            .unwrap();
+        assert!(!idempotent.appended);
+        assert_eq!(idempotent.epoch, 3);
+        assert_eq!(idempotent.policy_digest, cleared.policy_digest);
+    }
+
+    #[test]
+    fn tampered_route_domain_policy_signature_fails_restart_audit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let operator = IdentityKeyPair::from_bytes(&[0xd2; 32]).unwrap();
+        let assignment = PinnedRouteDomainAssignment {
+            node_id: [0x33; 32],
+            route_domain: [0xc3; 16],
+        };
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 20).unwrap();
+        store
+            .reconcile_route_domain_policy(&operator, &[assignment], true, NOW + 21)
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE directory_route_domain_policies SET signature = ?1 WHERE epoch = 1",
+                params![vec![0x44u8; 64]],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 22).is_err());
+    }
+
+    #[test]
+    fn deleted_route_domain_policy_table_cannot_reset_anchored_history() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory.db");
+        let operator = IdentityKeyPair::from_bytes(&[0xd3; 32]).unwrap();
+        let assignment = PinnedRouteDomainAssignment {
+            node_id: [0x55; 32],
+            route_domain: [0xe5; 16],
+        };
+        let (store, _) =
+            DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 20).unwrap();
+        store
+            .reconcile_route_domain_policy(&operator, &[assignment], true, NOW + 21)
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE directory_route_domain_policies;")
+            .unwrap();
+        drop(connection);
+        assert!(DirectoryReplicaStore::open(&path, operator.public_key_bytes(), NOW + 22).is_err());
     }
 
     #[test]
