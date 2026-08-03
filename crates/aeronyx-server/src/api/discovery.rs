@@ -113,6 +113,8 @@
 //!   remain for compatibility and explicitly report that this gate is absent.
 //!
 //! ## Last Modified
+//! v0.44.0-PinnedRouteDomainAdmission - Added optional fail-closed multi-hop
+//! admission using operator-audited opaque route-domain assignments
 //! v0.43.0-OnionEntryAntiAffinity - Exclude candidates collocated with the
 //! local entry node without exposing the local node id or endpoint.
 //! v0.42.0-OnionDiversityAwarePool - Preserve a valid lower-ranked diverse
@@ -175,7 +177,7 @@
 //! v0.1.0-DiscoveryPhase5 - Initial discovery snapshot/gossip HTTP API
 // ============================================================================
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -239,6 +241,10 @@ pub struct DiscoveryApiPolicy {
     gossip_rate_limit_per_minute: u32,
     allowed_peer_ids: HashSet<String>,
     denied_peer_ids: HashSet<String>,
+    /// Operator-audited local assignments. Opaque values are process-only and
+    /// must never be serialized by discovery APIs.
+    pinned_route_domains: HashMap<String, String>,
+    require_pinned_route_domains_for_multi_hop: bool,
 }
 
 impl DiscoveryApiPolicy {
@@ -250,6 +256,18 @@ impl DiscoveryApiPolicy {
             gossip_rate_limit_per_minute: config.gossip_rate_limit_per_minute,
             allowed_peer_ids: normalize_peer_ids(&config.allowed_peer_ids),
             denied_peer_ids: normalize_peer_ids(&config.denied_peer_ids),
+            pinned_route_domains: config
+                .pinned_route_domains
+                .iter()
+                .map(|(node_id, domain)| {
+                    (
+                        node_id.trim().to_ascii_lowercase(),
+                        domain.trim().to_ascii_lowercase(),
+                    )
+                })
+                .collect(),
+            require_pinned_route_domains_for_multi_hop: config
+                .require_pinned_route_domains_for_multi_hop,
         }
     }
 
@@ -282,6 +300,12 @@ impl DiscoveryApiPolicy {
         }
         self.allowed_peer_ids.is_empty() || self.allowed_peer_ids.contains(&node_id)
     }
+
+    fn pinned_route_domain(&self, node_id: &[u8; 32]) -> Option<&str> {
+        self.pinned_route_domains
+            .get(&hex::encode(node_id))
+            .map(String::as_str)
+    }
 }
 
 impl Default for DiscoveryApiPolicy {
@@ -291,6 +315,8 @@ impl Default for DiscoveryApiPolicy {
             gossip_rate_limit_per_minute: DiscoveryConfig::default_gossip_rate_limit_per_minute(),
             allowed_peer_ids: HashSet::new(),
             denied_peer_ids: HashSet::new(),
+            pinned_route_domains: HashMap::new(),
+            require_pinned_route_domains_for_multi_hop: false,
         }
     }
 }
@@ -373,6 +399,8 @@ struct OnionRequestedPathGates {
     candidate_pool_ready: bool,
     network_diversity_required: bool,
     network_diversity_ready: bool,
+    pinned_route_domain_required: bool,
+    pinned_route_domain_ready: bool,
     runtime_proof_required: bool,
     runtime_proof_ready: bool,
     restart_continuity_required: bool,
@@ -383,6 +411,7 @@ impl OnionRequestedPathGates {
     fn ready(self) -> bool {
         self.candidate_pool_ready
             && (!self.network_diversity_required || self.network_diversity_ready)
+            && (!self.pinned_route_domain_required || self.pinned_route_domain_ready)
             && (!self.runtime_proof_required || self.runtime_proof_ready)
             && (!self.restart_continuity_required || self.restart_continuity_ready)
     }
@@ -513,6 +542,17 @@ pub struct OnionCandidatesResponse {
     /// coarse endpoint network identity.
     #[serde(default)]
     pub local_entry_network_diversity_enforced: bool,
+    /// Whether complete operator-pinned route-domain coverage is required for
+    /// this requested multi-hop path.
+    #[serde(default)]
+    pub requested_pinned_route_domain_required: bool,
+    /// Whether the local entry and a complete remote-hop subset have distinct,
+    /// operator-audited opaque route-domain assignments.
+    #[serde(default)]
+    pub requested_pinned_route_domain_ready: bool,
+    /// Whether the local entry resolved to an operator-pinned route domain.
+    #[serde(default)]
+    pub local_entry_pinned_route_domain_enforced: bool,
     /// Whether this requested path requires matching runtime delivery proof.
     pub requested_runtime_proof_required: bool,
     /// Whether the matching runtime delivery proof gate currently passes.
@@ -565,6 +605,10 @@ pub struct OnionCandidatesResponse {
     /// Coarse endpoint anti-affinity policy enforced before multi-hop admission.
     #[serde(default)]
     pub network_diversity_policy: String,
+    /// Operator-pinned route-domain policy. Opaque assignment values are never
+    /// included in this public response.
+    #[serde(default)]
+    pub pinned_route_domain_policy: String,
     /// Privacy-safe region diversity policy for client-side path builders.
     pub region_diversity_policy: String,
     /// Product-facing rule: users choose a privacy level, not raw node ids.
@@ -709,6 +753,8 @@ struct DiscoveryPolicyStatus {
     allow_list_enabled: bool,
     allowed_peer_count: usize,
     denied_peer_count: usize,
+    pinned_route_domain_count: usize,
+    require_pinned_route_domains_for_multi_hop: bool,
     snapshot_default_public_only: bool,
     private_descriptors_hidden_by_default: bool,
 }
@@ -2173,6 +2219,11 @@ async fn onion_candidates_handler(
     let limit = state.policy.snapshot_limit(query.limit);
     let requested_privacy_mode = OnionPrivacyMode::from_query(query.privacy_mode.as_deref());
     let requested_hops = normalize_requested_hops(requested_privacy_mode, query.hops);
+    let pinned_route_domain_required =
+        requested_hops >= 2 && state.policy.require_pinned_route_domains_for_multi_hop;
+    let local_pinned_route_domain = state
+        .local_node_id
+        .and_then(|node_id| state.policy.pinned_route_domain(&node_id));
     let local_descriptor = state
         .local_node_id
         .and_then(|node_id| state.peer_store.get_valid(&node_id, now));
@@ -2214,6 +2265,20 @@ async fn onion_candidates_handler(
             }) {
                 return None;
             }
+            // [PINNED-ROUTE-DOMAINS 2026-08-03 by Codex] Known same-domain
+            // entry/candidate pairs are excluded even before strict rollout.
+            // Strict mode additionally requires complete remote coverage; the
+            // local-entry coverage check remains a separate fail-closed gate.
+            let candidate_route_domain = state.policy.pinned_route_domain(&node_id);
+            if local_pinned_route_domain
+                .zip(candidate_route_domain)
+                .is_some_and(|(local, candidate)| local == candidate)
+            {
+                return None;
+            }
+            if pinned_route_domain_required && candidate_route_domain.is_none() {
+                return None;
+            }
             Some((descriptor, kem_public, public_endpoint))
         })
         .enumerate()
@@ -2238,8 +2303,14 @@ async fn onion_candidates_handler(
     // weights above belong to the full eligible pool and remain unchanged.
     // Preserve a diverse requested path before applying a small response
     // limit, then let the client independently choose the actual route.
-    let candidates =
-        select_onion_candidate_response_pool(eligible_candidates, limit, requested_hops as usize);
+    let eligible_candidate_count = eligible_candidates.len();
+    let candidates = select_onion_candidate_response_pool_with_policy(
+        eligible_candidates,
+        limit,
+        requested_hops as usize,
+        &state.policy,
+        pinned_route_domain_required,
+    );
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
     let min_candidates_for_requested_hops = requested_hops as usize;
     // [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] Legacy builders have no
@@ -2249,12 +2320,25 @@ async fn onion_candidates_handler(
     let local_entry_context_ready = state.local_node_id.is_none() || local_descriptor.is_some();
     let requested_network_diversity_ready = local_entry_context_ready
         && onion_candidate_network_diversity_ready(&candidates, min_candidates_for_requested_hops);
+    let local_entry_pinned_route_domain_enforced =
+        state.local_node_id.is_some() && local_pinned_route_domain.is_some();
+    let requested_pinned_route_domain_ready = !pinned_route_domain_required
+        || (local_entry_pinned_route_domain_enforced
+            && onion_candidate_route_diversity_ready(
+                &candidates,
+                min_candidates_for_requested_hops,
+                &state.policy,
+                true,
+            ));
     let peer_status = state.peer_store.status(now);
     let requested_path_gates = onion_requested_path_gates(
         &peer_status,
         requested_hops,
-        candidates.len() >= min_candidates_for_requested_hops,
+        limit >= min_candidates_for_requested_hops
+            && eligible_candidate_count >= min_candidates_for_requested_hops,
         requested_network_diversity_ready,
+        pinned_route_domain_required,
+        requested_pinned_route_domain_ready,
     );
     let requested_path_ready = requested_path_gates.ready();
     let two_hop_network_diversity_ready = local_entry_context_ready
@@ -2266,8 +2350,18 @@ async fn onion_candidates_handler(
         && onion_requested_path_gates(
             &peer_status,
             2,
-            candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+            limit >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+                && eligible_candidate_count >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
             two_hop_network_diversity_ready,
+            state.policy.require_pinned_route_domains_for_multi_hop,
+            !state.policy.require_pinned_route_domains_for_multi_hop
+                || (local_entry_pinned_route_domain_enforced
+                    && onion_candidate_route_diversity_ready(
+                        &candidates,
+                        ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+                        &state.policy,
+                        true,
+                    )),
         )
         .ready();
     let recommended_hops = recommended_onion_hops(
@@ -2315,6 +2409,10 @@ async fn onion_candidates_handler(
         requested_network_diversity_required: requested_path_gates.network_diversity_required,
         requested_network_diversity_ready: requested_path_gates.network_diversity_ready,
         local_entry_network_diversity_enforced: local_descriptor.is_some(),
+        requested_pinned_route_domain_required: requested_path_gates
+            .pinned_route_domain_required,
+        requested_pinned_route_domain_ready: requested_path_gates.pinned_route_domain_ready,
+        local_entry_pinned_route_domain_enforced,
         requested_runtime_proof_required: requested_path_gates.runtime_proof_required,
         requested_runtime_proof_ready: requested_path_gates.runtime_proof_ready,
         requested_restart_continuity_required: requested_path_gates
@@ -2334,6 +2432,17 @@ async fn onion_candidates_handler(
             (_, true) => "required_against_local_entry_and_pairwise_ipv4_24_ipv6_48_or_distinct_dns_hostnames; not_operator_or_as_proof",
             (true, false) => "local_entry_descriptor_unavailable_fail_closed; required_pairwise_ipv4_24_ipv6_48_or_distinct_dns_hostnames; not_operator_or_as_proof",
             (false, false) => "required_pairwise_ipv4_24_ipv6_48_or_distinct_dns_hostnames; legacy_local_entry_context_unavailable; not_operator_or_as_proof",
+        }
+        .to_string(),
+        pinned_route_domain_policy: if state
+            .policy
+            .require_pinned_route_domains_for_multi_hop
+        {
+            "required_for_multi_hop; operator_audited_local_opaque_assignments; distinct_entry_and_remote_domains; not_permissionless_consensus_as_proof_or_sybil_resistance"
+        } else if state.policy.pinned_route_domains.is_empty() {
+            "disabled_backward_compatible; coarse_endpoint_anti_affinity_only"
+        } else {
+            "best_effort_known_same_domain_exclusion; incomplete_assignments_allowed; not_permissionless_consensus_as_proof_or_sybil_resistance"
         }
         .to_string(),
         region_diversity_policy:
@@ -2359,6 +2468,8 @@ fn onion_requested_path_gates(
     requested_hops: u8,
     candidate_pool_ready: bool,
     network_diversity_ready: bool,
+    pinned_route_domain_required: bool,
+    pinned_route_domain_ready: bool,
 ) -> OnionRequestedPathGates {
     let network_diversity_required = requested_hops >= 2;
     let runtime_proof_required = requested_hops >= 2;
@@ -2393,6 +2504,8 @@ fn onion_requested_path_gates(
         candidate_pool_ready,
         network_diversity_required,
         network_diversity_ready,
+        pinned_route_domain_required,
+        pinned_route_domain_ready,
         runtime_proof_required,
         runtime_proof_ready,
         restart_continuity_required,
@@ -2405,15 +2518,41 @@ fn onion_requested_path_gates(
 /// [ONION-NETWORK-DIVERSITY 2026-08-03 by Codex] This bounded backtracking
 /// search shares the internal path planner's endpoint anti-affinity rule. It
 /// returns only one aggregate decision and never exposes the selected subset.
-fn onion_candidate_network_diverse_subset_indices(
+fn onion_candidates_are_route_diverse(
+    left: &OnionRelayCandidate,
+    right: &OnionRelayCandidate,
+    policy: &DiscoveryApiPolicy,
+    require_pinned_route_domains: bool,
+) -> bool {
+    if !PeerStore::route_endpoints_are_network_diverse(
+        &left.signed_descriptor,
+        &right.signed_descriptor,
+    ) {
+        return false;
+    }
+
+    match (
+        policy.pinned_route_domain(&left.signed_descriptor.node_id()),
+        policy.pinned_route_domain(&right.signed_descriptor.node_id()),
+    ) {
+        (Some(left), Some(right)) => left != right,
+        _ => !require_pinned_route_domains,
+    }
+}
+
+fn onion_candidate_route_diverse_subset_indices(
     candidates: &[OnionRelayCandidate],
     required_hops: usize,
+    policy: &DiscoveryApiPolicy,
+    require_pinned_route_domains: bool,
 ) -> Option<Vec<usize>> {
     fn search(
         candidates: &[OnionRelayCandidate],
         start: usize,
         remaining: usize,
         selected: &mut Vec<usize>,
+        policy: &DiscoveryApiPolicy,
+        require_pinned_route_domains: bool,
     ) -> bool {
         if remaining == 0 {
             return true;
@@ -2424,16 +2563,32 @@ fn onion_candidate_network_diverse_subset_indices(
 
         for index in start..candidates.len() {
             let candidate = &candidates[index];
+            if require_pinned_route_domains
+                && policy
+                    .pinned_route_domain(&candidate.signed_descriptor.node_id())
+                    .is_none()
+            {
+                continue;
+            }
             if selected.iter().any(|selected_index| {
-                !PeerStore::route_endpoints_are_network_diverse(
-                    &candidate.signed_descriptor,
-                    &candidates[*selected_index].signed_descriptor,
+                !onion_candidates_are_route_diverse(
+                    candidate,
+                    &candidates[*selected_index],
+                    policy,
+                    require_pinned_route_domains,
                 )
             }) {
                 continue;
             }
             selected.push(index);
-            if search(candidates, index + 1, remaining - 1, selected) {
+            if search(
+                candidates,
+                index + 1,
+                remaining - 1,
+                selected,
+                policy,
+                require_pinned_route_domains,
+            ) {
                 return true;
             }
             selected.pop();
@@ -2448,11 +2603,30 @@ fn onion_candidate_network_diverse_subset_indices(
         return None;
     }
     let mut selected = Vec::with_capacity(required_hops);
-    if search(candidates, 0, required_hops, &mut selected) {
+    if search(
+        candidates,
+        0,
+        required_hops,
+        &mut selected,
+        policy,
+        require_pinned_route_domains,
+    ) {
         Some(selected)
     } else {
         None
     }
+}
+
+fn onion_candidate_network_diverse_subset_indices(
+    candidates: &[OnionRelayCandidate],
+    required_hops: usize,
+) -> Option<Vec<usize>> {
+    onion_candidate_route_diverse_subset_indices(
+        candidates,
+        required_hops,
+        &DiscoveryApiPolicy::default(),
+        false,
+    )
 }
 
 fn onion_candidate_network_diversity_ready(
@@ -2460,6 +2634,21 @@ fn onion_candidate_network_diversity_ready(
     required_hops: usize,
 ) -> bool {
     onion_candidate_network_diverse_subset_indices(candidates, required_hops).is_some()
+}
+
+fn onion_candidate_route_diversity_ready(
+    candidates: &[OnionRelayCandidate],
+    required_hops: usize,
+    policy: &DiscoveryApiPolicy,
+    require_pinned_route_domains: bool,
+) -> bool {
+    onion_candidate_route_diverse_subset_indices(
+        candidates,
+        required_hops,
+        policy,
+        require_pinned_route_domains,
+    )
+    .is_some()
 }
 
 /// Produces the bounded public pool without hiding a valid diverse path.
@@ -2471,24 +2660,52 @@ fn onion_candidate_network_diversity_ready(
 /// three-hop request that is not diverse-ready, a diverse two-hop subset is
 /// preserved as the safe fallback. This is pool construction, not server-side
 /// route selection; no chosen path, route id, or client metadata is exposed.
+#[cfg(test)]
 fn select_onion_candidate_response_pool(
     candidates: Vec<OnionRelayCandidate>,
     limit: usize,
     requested_hops: usize,
 ) -> Vec<OnionRelayCandidate> {
+    select_onion_candidate_response_pool_with_policy(
+        candidates,
+        limit,
+        requested_hops,
+        &DiscoveryApiPolicy::default(),
+        false,
+    )
+}
+
+fn select_onion_candidate_response_pool_with_policy(
+    candidates: Vec<OnionRelayCandidate>,
+    limit: usize,
+    requested_hops: usize,
+    policy: &DiscoveryApiPolicy,
+    require_pinned_route_domains: bool,
+) -> Vec<OnionRelayCandidate> {
     if candidates.len() <= limit {
-        return candidates;
+        if !require_pinned_route_domains {
+            return candidates;
+        }
     }
 
     let requested_subset = (requested_hops >= 2 && limit >= requested_hops)
-        .then(|| onion_candidate_network_diverse_subset_indices(&candidates, requested_hops))
+        .then(|| {
+            onion_candidate_route_diverse_subset_indices(
+                &candidates,
+                requested_hops,
+                policy,
+                require_pinned_route_domains,
+            )
+        })
         .flatten();
     let fallback_subset = (requested_hops > ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
         && limit >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES)
         .then(|| {
-            onion_candidate_network_diverse_subset_indices(
+            onion_candidate_route_diverse_subset_indices(
                 &candidates,
                 ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+                policy,
+                require_pinned_route_domains,
             )
         })
         .flatten();
@@ -2506,7 +2723,20 @@ fn select_onion_candidate_response_pool(
         if selected.len() >= limit {
             break;
         }
-        if !included[index] {
+        if !included[index]
+            && (!require_pinned_route_domains
+                || (policy
+                    .pinned_route_domain(&candidate.signed_descriptor.node_id())
+                    .is_some()
+                    && selected.iter().all(|selected_candidate| {
+                        onion_candidates_are_route_diverse(
+                            &candidate,
+                            selected_candidate,
+                            policy,
+                            true,
+                        )
+                    })))
+        {
             selected.push(candidate);
         }
     }
@@ -2542,10 +2772,12 @@ fn onion_candidate_pool_status(
     required_candidates: usize,
     gates: OnionRequestedPathGates,
 ) -> &'static str {
-    if !gates.candidate_pool_ready {
-        if limit < required_candidates {
-            "client_limited"
-        } else if candidate_count == 0 {
+    if limit < required_candidates {
+        "client_limited"
+    } else if gates.pinned_route_domain_required && !gates.pinned_route_domain_ready {
+        "routing_domain_limited"
+    } else if !gates.candidate_pool_ready {
+        if candidate_count == 0 {
             "empty"
         } else {
             "warming"
@@ -2587,12 +2819,14 @@ fn onion_candidate_fallback_reason(
     required_candidates: usize,
     gates: OnionRequestedPathGates,
 ) -> &'static str {
-    if !gates.candidate_pool_ready && limit < required_candidates {
+    if limit < required_candidates {
         if required_candidates == ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
             "client_limit_below_two_hop_minimum"
         } else {
             "client_limit_below_requested_hops"
         }
+    } else if gates.pinned_route_domain_required && !gates.pinned_route_domain_ready {
+        "requested_path_pinned_route_domain_not_ready"
     } else if !gates.candidate_pool_ready && candidate_count == 0 {
         "no_routeable_candidates"
     } else if !gates.candidate_pool_ready
@@ -2631,6 +2865,9 @@ fn onion_candidate_readiness_reason(
         "client_limit_below_requested_hops" => "client_limit_blocks_requested_hops",
         "no_routeable_candidates" => "waiting_for_routeable_kem_relays",
         "single_routeable_candidate" => "waiting_for_second_routeable_kem_relay",
+        "requested_path_pinned_route_domain_not_ready" => {
+            "waiting_for_operator_audited_route_domain_coverage"
+        }
         "requested_path_network_diversity_not_ready" => "waiting_for_network_diverse_onion_relays",
         "requested_path_runtime_proof_not_ready" => {
             "waiting_for_stable_requested_path_runtime_proof"
@@ -2649,6 +2886,12 @@ fn onion_candidate_next_action(
 ) -> &'static str {
     if requested_path_ready {
         "build a weighted-random onion path with fresh distinct candidates"
+    } else if recommended_hops == 2
+        && fallback_reason == "requested_path_pinned_route_domain_not_ready"
+    {
+        "use the audited two-hop fallback until a distinct pinned third route domain is available"
+    } else if fallback_reason == "requested_path_pinned_route_domain_not_ready" {
+        "use standard encrypted relay fallback until pinned route-domain coverage is complete"
     } else if recommended_hops == 2
         && fallback_reason == "requested_path_network_diversity_not_ready"
     {
@@ -2800,6 +3043,10 @@ async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<Discover
             allow_list_enabled: !state.policy.allowed_peer_ids.is_empty(),
             allowed_peer_count: state.policy.allowed_peer_ids.len(),
             denied_peer_count: state.policy.denied_peer_ids.len(),
+            pinned_route_domain_count: state.policy.pinned_route_domains.len(),
+            require_pinned_route_domains_for_multi_hop: state
+                .policy
+                .require_pinned_route_domains_for_multi_hop,
             snapshot_default_public_only: true,
             private_descriptors_hidden_by_default: true,
         },
@@ -3693,6 +3940,175 @@ mod tests {
             .candidates
             .iter()
             .all(|candidate| !candidate.public_endpoint.starts_with("https://192.0.2.")));
+    }
+
+    #[tokio::test]
+    async fn test_strict_pinned_route_domains_preserve_distinct_high_privacy_pool() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let local = signed_routeable_chat_descriptor(1, now + 300, "https://10.0.0.5:8422");
+        let local_node_id = local.node_id();
+        store.upsert_verified(local, now).unwrap();
+
+        let remotes = [
+            signed_routeable_chat_descriptor(1, now + 300, "https://192.0.2.10:8422"),
+            signed_routeable_chat_descriptor(1, now + 300, "https://198.51.100.10:8422"),
+            signed_routeable_chat_descriptor(1, now + 300, "https://203.0.113.10:8422"),
+            signed_routeable_chat_descriptor(1, now + 300, "https://198.18.0.10:8422"),
+        ];
+        let remote_node_ids = remotes
+            .iter()
+            .map(SignedNodeDescriptor::node_id)
+            .collect::<Vec<_>>();
+        for remote in remotes {
+            let node_id = remote.node_id();
+            store.upsert_verified(remote, now).unwrap();
+            store.record_route_forward_success(&node_id, now);
+        }
+        record_stable_path_proof(store.as_ref(), now, 3);
+
+        let mut config = DiscoveryConfig::default();
+        config.require_pinned_route_domains_for_multi_hop = true;
+        config.pinned_route_domains.insert(
+            hex::encode(local_node_id),
+            "11111111111111111111111111111111".to_string(),
+        );
+        for (node_id, domain) in remote_node_ids.iter().copied().zip([
+            "22222222222222222222222222222222",
+            "22222222222222222222222222222222",
+            "33333333333333333333333333333333",
+            "44444444444444444444444444444444",
+        ]) {
+            config
+                .pinned_route_domains
+                .insert(hex::encode(node_id), domain.to_string());
+        }
+        let policy = DiscoveryApiPolicy::from_config(&config);
+
+        let app = build_discovery_router_with_local_entry(
+            store,
+            policy,
+            DiscoveryLocalCapabilityStatus::default(),
+            None,
+            local_node_id,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?privacy_mode=high&limit=4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        // [PINNED-ROUTE-DOMAINS 2026-08-03 by Codex] Four routeable remote
+        // nodes exist, but two share one audited failure domain. Strict mode
+        // emits only a pairwise-distinct three-hop pool, keeps the path ready,
+        // and never discloses the opaque local assignment tokens.
+        assert_eq!(parsed.count, 3);
+        assert!(parsed.requested_pinned_route_domain_required);
+        assert!(parsed.requested_pinned_route_domain_ready);
+        assert!(parsed.local_entry_pinned_route_domain_enforced);
+        assert!(parsed.requested_network_diversity_ready);
+        assert!(parsed.requested_path_ready);
+        assert_eq!(parsed.route_plan, "three_hop_onion_path");
+        assert!(parsed
+            .pinned_route_domain_policy
+            .contains("operator_audited_local_opaque_assignments"));
+        assert_eq!(
+            parsed
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.node_id == hex::encode(remote_node_ids[0])
+                        || candidate.node_id == hex::encode(remote_node_ids[1])
+                })
+                .count(),
+            1
+        );
+        let encoded = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!encoded.contains("11111111111111111111111111111111"));
+        assert!(!encoded.contains("22222222222222222222222222222222"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_pinned_route_domains_fail_closed_without_local_entry_assignment() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let local = signed_routeable_chat_descriptor(1, now + 300, "https://10.0.1.5:8422");
+        let local_node_id = local.node_id();
+        store.upsert_verified(local, now).unwrap();
+
+        let remotes = [
+            signed_routeable_chat_descriptor(1, now + 300, "https://192.0.2.10:8422"),
+            signed_routeable_chat_descriptor(1, now + 300, "https://198.51.100.10:8422"),
+            signed_routeable_chat_descriptor(1, now + 300, "https://203.0.113.10:8422"),
+        ];
+        let mut config = DiscoveryConfig::default();
+        config.require_pinned_route_domains_for_multi_hop = true;
+        for (remote, domain) in remotes.into_iter().zip([
+            "55555555555555555555555555555555",
+            "66666666666666666666666666666666",
+            "77777777777777777777777777777777",
+        ]) {
+            let node_id = remote.node_id();
+            config
+                .pinned_route_domains
+                .insert(hex::encode(node_id), domain.to_string());
+            store.upsert_verified(remote, now).unwrap();
+            store.record_route_forward_success(&node_id, now);
+        }
+        record_stable_path_proof(store.as_ref(), now, 3);
+
+        let app = build_discovery_router_with_local_entry(
+            store,
+            DiscoveryApiPolicy::from_config(&config),
+            DiscoveryLocalCapabilityStatus::default(),
+            None,
+            local_node_id,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?privacy_mode=high&limit=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed.count, 3);
+        assert!(parsed.requested_candidate_pool_ready);
+        assert!(parsed.requested_pinned_route_domain_required);
+        assert!(!parsed.local_entry_pinned_route_domain_enforced);
+        assert!(!parsed.requested_pinned_route_domain_ready);
+        assert!(!parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 1);
+        assert_eq!(parsed.pool_status, "routing_domain_limited");
+        assert_eq!(
+            parsed.fallback_reason,
+            "requested_path_pinned_route_domain_not_ready"
+        );
+        assert_eq!(
+            parsed.readiness_reason,
+            "waiting_for_operator_audited_route_domain_coverage"
+        );
+        assert_eq!(parsed.route_plan, "standard_relay_fallback");
     }
 
     #[tokio::test]

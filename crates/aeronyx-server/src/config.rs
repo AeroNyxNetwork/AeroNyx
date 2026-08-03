@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.19.0-PinnedRouteDomains - Added optional fail-closed, operator-audited
+//! opaque route-domain assignments for multi-hop anti-affinity
 //! v0.18.0-DirectoryProofMaturity - Added an automatically safe, operator-
 //! configurable minimum age for outbound Directory gossip proofs
 //! v0.17.0-DiscoveryGossipIsolation - Added bounded outbound gossip concurrency
@@ -83,6 +85,7 @@
 //! v0.9.0-DiscoveryGossipBackpressure — Added outbound gossip jitter/backpressure controls
 //! v0.8.0-DiscoveryPublicApi — Added optional public-only discovery listener
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 
@@ -98,6 +101,7 @@ const MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS: usize = 16;
 const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
 const MAX_DIRECTORY_GOSSIP_PROOF_MIN_AGE_SECS: u64 = 48 * 60 * 60;
 const MAX_DISCOVERY_GOSSIP_CONCURRENCY: u16 = 64;
+const MAX_PINNED_ROUTE_DOMAINS: usize = 256;
 
 // ── Sub-module re-exports (keep callers' use-paths stable) ────────────────
 pub use crate::config_blind_vault::BlindVaultConfig;
@@ -286,6 +290,27 @@ pub struct DiscoveryConfig {
     /// Optional deny-list of peer node ids as lowercase/uppercase hex.
     #[serde(default)]
     pub denied_peer_ids: Vec<String>,
+    /// Operator-audited opaque route-domain pins keyed by node id.
+    ///
+    /// [PINNED-ROUTE-DOMAINS 2026-08-03 by Codex] Each key is one 32-byte
+    /// Ed25519 node id in hexadecimal. Each value is a random 128-bit domain
+    /// token encoded as 32 hexadecimal characters. Nodes assigned the same
+    /// token are treated as one administrative/routing failure domain during
+    /// multi-hop admission. Tokens stay local and must not contain operator,
+    /// provider, geography, or ownership names.
+    ///
+    /// These pins are reviewed local policy, not peer self-attestation,
+    /// permissionless consensus, autonomous-system proof, or Sybil resistance.
+    #[serde(default)]
+    pub pinned_route_domains: BTreeMap<String, String>,
+    /// Requires complete pinned route-domain coverage for every multi-hop path.
+    ///
+    /// Default `false` preserves mixed-version behavior. When enabled, the
+    /// local entry and every remote hop must have a pin, and no two hops may
+    /// share a token. Missing coverage fails requested multi-hop readiness
+    /// closed while leaving single-hop encrypted relay behavior available.
+    #[serde(default)]
+    pub require_pinned_route_domains_for_multi_hop: bool,
     /// Optional discovery control-plane endpoint advertised to other nodes.
     ///
     /// When absent, `network.public_endpoint` is reused. If both are absent,
@@ -863,6 +888,79 @@ impl DiscoveryConfig {
             }
         }
 
+        // [PINNED-ROUTE-DOMAINS 2026-08-03 by Codex] Route-domain pins are
+        // operator-reviewed local trust input. Strict identity/token syntax
+        // keeps normalization deterministic and prevents labels from leaking
+        // operator or infrastructure names into logs and future API surfaces.
+        if self.pinned_route_domains.len() > MAX_PINNED_ROUTE_DOMAINS {
+            return Err(ServerError::config_invalid(
+                "discovery.pinned_route_domains",
+                format!("supports at most {MAX_PINNED_ROUTE_DOMAINS} node assignments"),
+            ));
+        }
+        let mut normalized_node_ids =
+            Vec::<[u8; 32]>::with_capacity(self.pinned_route_domains.len());
+        for (configured_node_id, configured_domain) in &self.pinned_route_domains {
+            let node_id_text = configured_node_id.trim();
+            let decoded = hex::decode(node_id_text).map_err(|_| {
+                ServerError::config_invalid(
+                    "discovery.pinned_route_domains",
+                    "keys must be 64-character Ed25519 public keys in hexadecimal",
+                )
+            })?;
+            let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
+                ServerError::config_invalid(
+                    "discovery.pinned_route_domains",
+                    "keys must decode to exactly 32 bytes",
+                )
+            })?;
+            if node_id_text.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
+                return Err(ServerError::config_invalid(
+                    "discovery.pinned_route_domains",
+                    "keys must be non-zero 64-character Ed25519 public keys",
+                ));
+            }
+            if normalized_node_ids.contains(&node_id) {
+                return Err(ServerError::config_invalid(
+                    "discovery.pinned_route_domains",
+                    "duplicate node identities after hexadecimal normalization are not allowed",
+                ));
+            }
+            normalized_node_ids.push(node_id);
+
+            let domain = configured_domain.trim();
+            if domain.len() != 32 || !domain.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                return Err(ServerError::config_invalid(
+                    "discovery.pinned_route_domains",
+                    "values must be opaque 128-bit route-domain tokens encoded as 32 hexadecimal characters",
+                ));
+            }
+            let domain_bytes = hex::decode(domain).map_err(|_| {
+                ServerError::config_invalid(
+                    "discovery.pinned_route_domains",
+                    "values must be valid hexadecimal route-domain tokens",
+                )
+            })?;
+            if domain_bytes.iter().all(|byte| *byte == 0) {
+                return Err(ServerError::config_invalid(
+                    "discovery.pinned_route_domains",
+                    "route-domain tokens must not be all zero",
+                ));
+            }
+        }
+        if self.require_pinned_route_domains_for_multi_hop && self.pinned_route_domains.is_empty() {
+            return Err(ServerError::config_invalid(
+                "discovery.require_pinned_route_domains_for_multi_hop",
+                "requires at least one discovery.pinned_route_domains assignment",
+            ));
+        }
+        if self.require_pinned_route_domains_for_multi_hop && !self.enabled {
+            return Err(ServerError::config_invalid(
+                "discovery.require_pinned_route_domains_for_multi_hop",
+                "requires discovery.enabled = true",
+            ));
+        }
+
         if let Some(endpoint) = &self.public_endpoint {
             if endpoint.trim().is_empty() {
                 return Err(ServerError::config_invalid(
@@ -1005,6 +1103,8 @@ impl Default for DiscoveryConfig {
             gossip_rate_limit_per_minute: Self::default_gossip_rate_limit_per_minute(),
             allowed_peer_ids: Vec::new(),
             denied_peer_ids: Vec::new(),
+            pinned_route_domains: BTreeMap::new(),
+            require_pinned_route_domains_for_multi_hop: false,
             public_endpoint: None,
             public_api_listen_addr: None,
             region: None,
@@ -1321,6 +1421,8 @@ mod tests {
         );
         assert!(config.discovery.allowed_peer_ids.is_empty());
         assert!(config.discovery.denied_peer_ids.is_empty());
+        assert!(config.discovery.pinned_route_domains.is_empty());
+        assert!(!config.discovery.require_pinned_route_domains_for_multi_hop);
         assert_eq!(
             config.discovery.descriptor_ttl_secs,
             DiscoveryConfig::default_descriptor_ttl_secs()
@@ -1968,6 +2070,72 @@ enabled = true
 allowed_peer_ids = ["not-a-node-id"]
 "#;
         assert!(ServerConfig::from_str(bad_peer_id).is_err());
+    }
+
+    #[test]
+    fn test_discovery_accepts_opaque_pinned_route_domains() {
+        let first_node = "11".repeat(32);
+        let second_node = "22".repeat(32);
+        let toml_str = format!(
+            r#"
+[discovery]
+enabled = true
+require_pinned_route_domains_for_multi_hop = true
+pinned_route_domains = {{ "{first_node}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "{second_node}" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }}
+"#
+        );
+
+        let config = ServerConfig::from_str(&toml_str).unwrap();
+        assert!(config.discovery.require_pinned_route_domains_for_multi_hop);
+        assert_eq!(config.discovery.pinned_route_domains.len(), 2);
+    }
+
+    #[test]
+    fn test_discovery_rejects_unsafe_pinned_route_domain_policy() {
+        let missing_assignments = r#"
+[discovery]
+enabled = true
+require_pinned_route_domains_for_multi_hop = true
+"#;
+        assert!(ServerConfig::from_str(missing_assignments).is_err());
+
+        let node_id = "11".repeat(32);
+        let named_domain = format!(
+            r#"
+[discovery]
+enabled = true
+pinned_route_domains = {{ "{node_id}" = "cloud-provider-a" }}
+"#
+        );
+        assert!(ServerConfig::from_str(&named_domain).is_err());
+
+        let zero_domain = format!(
+            r#"
+[discovery]
+enabled = true
+pinned_route_domains = {{ "{node_id}" = "00000000000000000000000000000000" }}
+"#
+        );
+        assert!(ServerConfig::from_str(&zero_domain).is_err());
+
+        let disabled_strict_policy = format!(
+            r#"
+[discovery]
+require_pinned_route_domains_for_multi_hop = true
+pinned_route_domains = {{ "{node_id}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }}
+"#
+        );
+        assert!(ServerConfig::from_str(&disabled_strict_policy).is_err());
+
+        let uppercase_node_id = node_id.to_ascii_uppercase();
+        let duplicate_identity = format!(
+            r#"
+[discovery]
+enabled = true
+pinned_route_domains = {{ "{node_id}" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "{uppercase_node_id}" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }}
+"#
+        );
+        assert!(ServerConfig::from_str(&duplicate_identity).is_err());
     }
 
     #[test]
