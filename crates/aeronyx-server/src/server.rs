@@ -307,6 +307,9 @@
 // 118. [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Requires receipt v2 and a
 //      purpose-separated opaque payload commitment before synthetic or real
 //      App onion delivery becomes verified; legacy receipts remain forwardable.
+// 119. [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex] Separates the
+//      unsigned v2 bootstrap hint from process-local verified route authority;
+//      three-hop probes require fresh v2 evidence for every selected relay.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -426,6 +429,8 @@
 //     public onion pools can exclude candidates collocated with the entry.
 //
 // Last Modified:
+//   v2.8.70-PurposeBoundReceiptNegotiation - Prevented v1-only relay framing
+//     from authorizing or being penalized by v2 multi-hop delivery probes.
 //   v2.8.69-PurposeBoundReceipt - Prevented cross-workload relay-proof reuse
 //     without exposing the route-purpose label to intermediary nodes.
 //   v2.8.68-BlindVaultReplicaCapability - Added rollout-gated, runtime-honest
@@ -859,6 +864,9 @@ const PUBLIC_IP_RESPONSE_MAX_BYTES: usize = 256;
 const DISCOVERY_GOSSIP_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 /// Capability negotiation reads only the compact public discovery summary.
 const DISCOVERY_NEGOTIATION_SUMMARY_MAX_BYTES: usize = 64 * 1024;
+/// [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex] Unsigned capability
+/// hints must never stall route proof or legacy fallback.
+const DISCOVERY_NEGOTIATION_HINT_TIMEOUT: Duration = Duration::from_secs(2);
 /// At most two producer-diverse alternates follow exact-evidence misses.
 const DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT: usize = 3;
 
@@ -911,6 +919,10 @@ struct DiscoveryNegotiationFeatures {
     /// than one middle hop. Missing means legacy/unsupported.
     #[serde(default)]
     multihop_delivery_receipt_v1: bool,
+    /// Whether current terminal ACKs commit to both payload and canonical
+    /// route purpose. Missing means v1-only/unsupported.
+    #[serde(default)]
+    purpose_bound_delivery_receipt_v2: bool,
 }
 
 /// Terminal result for optional Directory-authenticated proof transmission.
@@ -8507,9 +8519,13 @@ impl Server {
         Ok(summary.protocol_features)
     }
 
-    /// Returns true only when a signed descriptor's public endpoint explicitly
-    /// advertises multihop terminal-receipt support.
-    async fn peer_supports_multihop_delivery_receipt(
+    /// Returns true only when a signed descriptor's public endpoint advertises
+    /// purpose-bound version-2 terminal receipts.
+    ///
+    /// [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex] The summary is
+    /// an unsigned bootstrap hint. It can suppress an optional v2 probe, but it
+    /// never populates route-authority evidence; only a verified v2 receipt can.
+    async fn peer_advertises_purpose_bound_delivery_receipt(
         client: &reqwest::Client,
         endpoint: &str,
     ) -> bool {
@@ -8520,8 +8536,53 @@ impl Server {
         };
         Self::peer_discovery_negotiation_features(client, &summary_url)
             .await
-            .map(|features| features.multihop_delivery_receipt_v1)
+            .map(|features| {
+                features.multihop_delivery_receipt_v1 && features.purpose_bound_delivery_receipt_v2
+            })
             .unwrap_or(false)
+    }
+
+    /// Returns candidates with fresh verified v2 evidence or an explicit v2
+    /// bootstrap hint. Cryptographic process-local evidence wins and avoids an
+    /// unnecessary unsigned network request. Input health order is preserved
+    /// by `buffered`; negotiation cannot become a hidden route-ranking signal.
+    async fn purpose_bound_delivery_receipt_advertisers(
+        client: &reqwest::Client,
+        peer_store: &PeerStore,
+        candidates: &[SignedNodeDescriptor],
+        now: u64,
+    ) -> HashSet<[u8; 32]> {
+        let mut supported = candidates
+            .iter()
+            .map(SignedNodeDescriptor::node_id)
+            .filter(|node_id| {
+                peer_store.has_fresh_purpose_bound_delivery_receipt_capability(node_id, now)
+            })
+            .collect::<HashSet<_>>();
+        let unknown = candidates
+            .iter()
+            .filter(|candidate| !supported.contains(&candidate.node_id()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let advertised = futures::stream::iter(unknown)
+            .map(|candidate| async move {
+                let advertised = match candidate.descriptor.public_endpoint.as_deref() {
+                    Some(endpoint) => tokio::time::timeout(
+                        DISCOVERY_NEGOTIATION_HINT_TIMEOUT,
+                        Self::peer_advertises_purpose_bound_delivery_receipt(client, endpoint),
+                    )
+                    .await
+                    .unwrap_or(false),
+                    None => false,
+                };
+                advertised.then(|| candidate.node_id())
+            })
+            .buffered(ONION_ROUTE_SELECTION_CANDIDATE_LIMIT)
+            .filter_map(|node_id| async move { node_id })
+            .collect::<HashSet<_>>()
+            .await;
+        supported.extend(advertised);
+        supported
     }
 
     /// Runs one peer exchange under a total lifetime budget.
@@ -8881,6 +8942,17 @@ impl Server {
             return TwoHopBlindRelayProbeOutcome::default();
         }
 
+        // [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex] This set is
+        // only a bootstrap optimization. Legacy candidates remain in the loop
+        // for control-plane reachability; they are excluded only from the v2
+        // terminal-delivery attempt that can establish App route authority.
+        let purpose_bound_middle_advertisers = Self::purpose_bound_delivery_receipt_advertisers(
+            client,
+            peer_store,
+            &middle_candidates,
+            now,
+        )
+        .await;
         let middle_candidate_count = middle_candidates.len();
         let mut attempted = false;
         let mut network_diversity_blocked = false;
@@ -8906,6 +8978,18 @@ impl Server {
             if terminal_candidates.is_empty() {
                 continue;
             }
+            let purpose_bound_terminal_advertisers =
+                if purpose_bound_middle_advertisers.contains(&middle_node_id) {
+                    Self::purpose_bound_delivery_receipt_advertisers(
+                        client,
+                        peer_store,
+                        &terminal_candidates,
+                        now,
+                    )
+                    .await
+                } else {
+                    HashSet::new()
+                };
 
             'terminal_candidates: for terminal in terminal_candidates {
                 if request_count >= TWO_HOP_PROBE_REQUEST_LIMIT {
@@ -8950,19 +9034,21 @@ impl Server {
 
                 // Milestone 2 probe: prefer a real onion-wrapped ChatEnvelope
                 // delivery over the older onward-envelope control-plane probe.
-                // The middle hop peels exactly one layer and forwards the next
-                // onion layer; the terminal hop must decode the final
-                // ChatEnvelope and hand it to ChatRelay store-and-forward before
-                // ACKing. The payload remains opaque and synthetic, and no
-                // route id, receiver, endpoint, or ciphertext is reported.
-                if let Some((request, payload_commitment)) =
-                    Self::build_two_hop_onion_delivery_probe_request(
-                        identity,
-                        self_node_id,
-                        &middle,
-                        &terminal,
-                        now,
-                    )
+                // Both participants must advertise v2 before this optional
+                // request. The signed receipt remains the sole authority.
+                let purpose_bound_probe_allowed =
+                    purpose_bound_terminal_advertisers.contains(&terminal_node_id);
+                if let Some((request, payload_commitment)) = purpose_bound_probe_allowed
+                    .then(|| {
+                        Self::build_two_hop_onion_delivery_probe_request(
+                            identity,
+                            self_node_id,
+                            &middle,
+                            &terminal,
+                            now,
+                        )
+                    })
+                    .flatten()
                 {
                     request_count = request_count.saturating_add(1);
                     match client.post(&url).json(&request).send().await {
@@ -8984,10 +9070,14 @@ impl Server {
                                             now,
                                         ) =>
                                 {
-                                    peer_store
-                                        .record_delivery_receipt_capability(&middle_node_id, now);
-                                    peer_store
-                                        .record_delivery_receipt_capability(&terminal_node_id, now);
+                                    peer_store.record_purpose_bound_delivery_receipt_capability(
+                                        &middle_node_id,
+                                        now,
+                                    );
+                                    peer_store.record_purpose_bound_delivery_receipt_capability(
+                                        &terminal_node_id,
+                                        now,
+                                    );
                                     peer_store
                                         .record_blind_relay_two_hop_probe_result_with_context(
                                             now,
@@ -9096,7 +9186,7 @@ impl Server {
                             peer_store.record_route_forward_failure(&middle_node_id, now, reason);
                         }
                     }
-                } else {
+                } else if purpose_bound_probe_allowed {
                     peer_store.record_blind_relay_two_hop_probe_result_with_context(
                         now,
                         false,
@@ -9306,8 +9396,13 @@ impl Server {
         self_node_id: &[u8; 32],
         now: u64,
     ) -> TwoHopBlindRelayProbeOutcome {
+        // [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex] Three-hop
+        // proof is layered on top of successful two-hop v2 evidence. Every
+        // participant must have recently carried a cryptographically verified,
+        // purpose-bound receipt; unsigned summary hints cannot authorize this
+        // higher-hop probe or cause a legacy peer to receive failure penalties.
         let mut first_middle_candidates = peer_store
-            .multi_hop_route_probe_candidates_with_capability_excluding(
+            .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
                 NodeCapability::OnionMiddle,
                 now,
                 ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
@@ -9318,41 +9413,6 @@ impl Server {
             return TwoHopBlindRelayProbeOutcome::default();
         }
 
-        // [THREE-HOP-FEATURE-NEGOTIATION 2026-08-02 by Codex] Only the first
-        // middle must understand a terminal receipt signed by a non-adjacent
-        // downstream node. Legacy nodes omit the additive summary field and
-        // therefore remain valid two-hop relays without receiving false 502
-        // penalties from this optional three-hop probe. Candidate fan-out is
-        // bounded by the existing route selection limit.
-        let unnegotiated_candidate_count = first_middle_candidates.len();
-        let negotiated_candidates = futures::stream::iter(first_middle_candidates)
-            .map(|candidate| async move {
-                let supported = match candidate.descriptor.public_endpoint.as_deref() {
-                    Some(endpoint) => {
-                        Self::peer_supports_multihop_delivery_receipt(client, endpoint).await
-                    }
-                    None => false,
-                };
-                supported.then_some(candidate)
-            })
-            // Preserve the health-ranked input order even when later feature
-            // requests complete first; negotiation must not become routing.
-            .buffered(ONION_ROUTE_SELECTION_CANDIDATE_LIMIT)
-            .collect::<Vec<_>>()
-            .await;
-        let mut first_middle_candidates = negotiated_candidates
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        if first_middle_candidates.is_empty() {
-            trace!(
-                candidate_count = unnegotiated_candidate_count,
-                "[DISCOVERY] Three-hop probe deferred until a first middle advertises multihop receipt support"
-            );
-            return TwoHopBlindRelayProbeOutcome::default();
-        }
-        Self::prioritize_probe_candidates(peer_store, now, &mut first_middle_candidates);
-
         let first_middle_candidate_count = first_middle_candidates.len();
         let mut attempted = false;
         let mut network_diversity_blocked = false;
@@ -9361,7 +9421,7 @@ impl Server {
         'first_middle_search: for first_middle in first_middle_candidates {
             let first_middle_node_id = first_middle.node_id();
             let mut second_middle_candidates = peer_store
-                .multi_hop_route_probe_candidates_with_capability_excluding(
+                .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
                     NodeCapability::OnionMiddle,
                     now,
                     ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
@@ -9378,7 +9438,7 @@ impl Server {
             for second_middle in second_middle_candidates {
                 let second_middle_node_id = second_middle.node_id();
                 let mut terminal_candidates = peer_store
-                    .multi_hop_route_probe_candidates_with_capability_excluding(
+                    .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
                         NodeCapability::ChatRelay,
                         now,
                         ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
@@ -9490,7 +9550,9 @@ impl Server {
                                         terminal_node_id,
                                     ] {
                                         peer_store
-                                            .record_delivery_receipt_capability(&node_id, now);
+                                            .record_purpose_bound_delivery_receipt_capability(
+                                                &node_id, now,
+                                            );
                                     }
                                     peer_store
                                         .record_blind_relay_three_hop_probe_result_with_context(
@@ -10156,8 +10218,14 @@ impl Server {
                                 ) =>
                         {
                             accepted = accepted.saturating_add(1);
-                            peer_store.record_delivery_receipt_capability(&middle_node_id, now);
-                            peer_store.record_delivery_receipt_capability(&terminal_node_id, now);
+                            peer_store.record_purpose_bound_delivery_receipt_capability(
+                                &middle_node_id,
+                                now,
+                            );
+                            peer_store.record_purpose_bound_delivery_receipt_capability(
+                                &terminal_node_id,
+                                now,
+                            );
                             peer_store.record_route_forward_success(&middle_node_id, now);
                             peer_store.record_route_forward_success(&terminal_node_id, now);
                             peer_store.record_verified_client_onion_delivery(now);
@@ -14527,15 +14595,27 @@ mod tests {
             descriptor.capabilities = capabilities;
             SignedNodeDescriptor::sign(descriptor, identity).unwrap()
         };
+        let first_middle_is_entry =
+            first_middle_identity.public_key_bytes() < second_middle_identity.public_key_bytes();
+        let first_middle_host = if first_middle_is_entry {
+            "127.0.0.1"
+        } else {
+            "127.0.1.1"
+        };
+        let second_middle_host = if first_middle_is_entry {
+            "127.0.1.1"
+        } else {
+            "127.0.0.1"
+        };
         let first_middle = signed_descriptor(
             &first_middle_identity,
-            format!("http://127.0.0.1:{relay_port}"),
+            format!("http://{first_middle_host}:{relay_port}"),
             vec![NodeCapability::OnionMiddle],
             "three-hop-first",
         );
         let second_middle = signed_descriptor(
             &second_middle_identity,
-            format!("http://127.0.1.1:{relay_port}"),
+            format!("http://{second_middle_host}:{relay_port}"),
             vec![NodeCapability::OnionMiddle],
             "three-hop-second",
         );
@@ -14555,7 +14635,8 @@ mod tests {
                 get(|| async {
                     Json(serde_json::json!({
                         "protocol_features": {
-                            "multihop_delivery_receipt_v1": true
+                            "multihop_delivery_receipt_v1": true,
+                            "purpose_bound_delivery_receipt_v2": true
                         }
                     }))
                 }),
@@ -14610,10 +14691,44 @@ mod tests {
 
         let store = PeerStore::new();
         for descriptor in [first_middle, second_middle, terminal] {
+            let node_id = descriptor.node_id();
             store.upsert_verified(descriptor, now).unwrap();
+            store.record_route_forward_success(&node_id, now);
+            store.record_purpose_bound_delivery_receipt_capability(&node_id, now);
         }
-        // [THREE-HOP-PROBE-TEST-DETERMINISM 2026-08-02 by Codex] Loopback
-        // network-diversity aliases must never be routed through host proxies.
+        let proven_middles = store
+            .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
+                NodeCapability::OnionMiddle,
+                now,
+                8,
+                &[self_node_id],
+            );
+        let proven_terminals = store
+            .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
+                NodeCapability::ChatRelay,
+                now,
+                8,
+                &[self_node_id],
+            );
+        assert_eq!(proven_middles.len(), 2);
+        assert_eq!(proven_terminals.len(), 1);
+        assert!(PeerStore::route_endpoints_are_network_diverse(
+            &proven_middles[0],
+            &proven_middles[1],
+        ));
+        assert!(proven_middles.iter().all(|middle| {
+            PeerStore::route_endpoints_are_network_diverse(middle, &proven_terminals[0])
+        }));
+        assert!(proven_middles.iter().all(|middle| {
+            middle
+                .descriptor
+                .public_endpoint
+                .as_deref()
+                .is_some_and(|endpoint| Server::blind_relay_probe_url(endpoint).is_some())
+        }));
+        // [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex] Keep three
+        // distinct /24 identities while binding the deterministic score/tie
+        // winner to the reachable listener. Later hops are onion-encapsulated.
         let test_client = reqwest::Client::builder().no_proxy().build().unwrap();
         let outcome = Server::probe_three_hop_blind_relay_path(
             &test_client,
@@ -14646,7 +14761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn three_hop_probe_defers_legacy_first_middle_without_route_penalty() {
+    async fn three_hop_probe_defers_unproven_first_middle_without_route_penalty() {
         let now = 1_800_000_300;
         let source_identity = IdentityKeyPair::generate();
         let middle_identity = IdentityKeyPair::generate();
@@ -14660,11 +14775,12 @@ mod tests {
             .route(
                 "/api/discovery/summary",
                 get(|| async {
-                    // [THREE-HOP-FEATURE-NEGOTIATION 2026-08-02 by Codex]
-                    // Missing additive fields model a valid legacy runtime.
+                    // [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex]
+                    // v1 framing alone must not authorize a v2 three-hop path.
                     Json(serde_json::json!({
                         "protocol_features": {
-                            "legacy_descriptor_gossip_v1": true
+                            "legacy_descriptor_gossip_v1": true,
+                            "multihop_delivery_receipt_v1": true
                         }
                     }))
                 }),
@@ -14865,8 +14981,8 @@ mod tests {
         store.upsert_verified(terminal_descriptor, now).unwrap();
         store.record_route_forward_success(&middle_node_id, now);
         store.record_route_forward_success(&terminal_node_id, now);
-        store.record_delivery_receipt_capability(&middle_node_id, now);
-        store.record_delivery_receipt_capability(&terminal_node_id, now);
+        store.record_purpose_bound_delivery_receipt_capability(&middle_node_id, now);
+        store.record_purpose_bound_delivery_receipt_capability(&terminal_node_id, now);
 
         let outcome = Server::relay_authenticated_chat_over_onion_paths(
             Some(&reqwest::Client::new()),
@@ -14944,7 +15060,7 @@ mod tests {
         store.upsert_verified(terminal, now).unwrap();
         for node_id in [middle_node_id, terminal_node_id] {
             store.record_route_forward_success(&node_id, now);
-            store.record_delivery_receipt_capability(&node_id, now);
+            store.record_purpose_bound_delivery_receipt_capability(&node_id, now);
         }
 
         let outcome = Server::relay_authenticated_chat_over_onion_paths(
@@ -15801,50 +15917,22 @@ mod tests {
             NodeCapability::ChatRelay,
             "receipt-terminal",
         );
-        let receipt_middle_template = signed_descriptor(
-            &receipt_middle_identity,
-            "https://receipt-middle.test".to_string(),
-            NodeCapability::OnionMiddle,
-            "receipt-middle",
-        );
         let self_node_id = source_identity.public_key_bytes();
-        let (expected_request, payload_commitment) =
-            Server::build_two_hop_onion_delivery_probe_request(
-                &source_identity,
-                &self_node_id,
-                &receipt_middle_template,
-                &terminal,
-                now,
-            )
-            .expect("receipt-capable test route should build");
-        let expected_route_id = expected_request.envelope.route_id;
-        let expected_payload = encode_envelope(&Server::synthetic_two_hop_probe_chat_envelope(
-            &source_identity,
-            &self_node_id,
-            &receipt_middle_template.node_id(),
-            &terminal.node_id(),
-            expected_route_id,
-            now,
-        ))
-        .expect("encode expected synthetic terminal payload");
-        assert_eq!(
-            payload_commitment,
-            BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
-                &expected_payload,
-                OnionRoutePurpose::MessageRelay,
-            )
-        );
-        let delivery_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
-            expected_route_id,
-            &expected_payload,
-            OnionRoutePurpose::MessageRelay,
-            now,
-            &terminal_identity,
-        );
 
         let legacy_requests = Arc::new(AtomicUsize::new(0));
         let legacy_requests_for_handler = Arc::clone(&legacy_requests);
-        let legacy_router = Router::new().route(
+        let legacy_router = Router::new()
+            .route(
+                "/api/discovery/summary",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "protocol_features": {
+                            "multihop_delivery_receipt_v1": true
+                        }
+                    }))
+                }),
+            )
+            .route(
             "/api/chat/peer/blind-relay",
             post(move |Json(request): Json<PeerBlindRelayRequest>| {
                 let requests = Arc::clone(&legacy_requests_for_handler);
@@ -15870,14 +15958,43 @@ mod tests {
 
         let receipt_requests = Arc::new(AtomicUsize::new(0));
         let receipt_requests_for_handler = Arc::clone(&receipt_requests);
-        let receipt_router = Router::new().route(
+        let receipt_probe_source = source_identity.clone();
+        let receipt_terminal_identity = terminal_identity.clone();
+        let receipt_terminal_node_id = terminal.node_id();
+        let receipt_router = Router::new()
+            .route(
+                "/api/discovery/summary",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "protocol_features": {
+                            "multihop_delivery_receipt_v1": true,
+                            "purpose_bound_delivery_receipt_v2": true
+                        }
+                    }))
+                }),
+            )
+            .route(
             "/api/chat/peer/blind-relay",
             post(move |Json(request): Json<PeerBlindRelayRequest>| {
                 let requests = Arc::clone(&receipt_requests_for_handler);
-                let receipt = delivery_receipt.clone();
+                    let synthetic_chat = Server::synthetic_two_hop_probe_chat_envelope(
+                        &receipt_probe_source,
+                        &self_node_id,
+                        &request.envelope.next_hop,
+                        &receipt_terminal_node_id,
+                        request.envelope.route_id,
+                        now,
+                    );
+                    let encoded_chat = encode_envelope(&synthetic_chat).unwrap();
+                    let receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
+                        request.envelope.route_id,
+                        &encoded_chat,
+                        OnionRoutePurpose::MessageRelay,
+                        now,
+                        &receipt_terminal_identity,
+                    );
                 async move {
                     requests.fetch_add(1, AtomicOrdering::SeqCst);
-                    assert_eq!(request.envelope.route_id, expected_route_id);
                     Json(PeerBlindRelayResponse {
                         accepted: true,
                         terminal: false,
@@ -15918,8 +16035,11 @@ mod tests {
         for descriptor in [legacy_middle.clone(), terminal.clone()] {
             legacy_store.upsert_verified(descriptor, now).unwrap();
         }
+        legacy_store
+            .record_purpose_bound_delivery_receipt_capability(&receipt_terminal_node_id, now);
+        let test_client = reqwest::Client::builder().no_proxy().build().unwrap();
         let legacy_outcome = Server::probe_two_hop_blind_relay_path(
-            &reqwest::Client::new(),
+            &test_client,
             &legacy_store,
             &source_identity,
             &self_node_id,
@@ -15942,13 +16062,14 @@ mod tests {
         for descriptor in [legacy_middle, receipt_middle, terminal] {
             store.upsert_verified(descriptor, now).unwrap();
         }
+        store.record_purpose_bound_delivery_receipt_capability(&receipt_terminal_node_id, now);
         // Coverage ordering tries unknown peers first. Mark only the modern
         // middle as proven so this test deterministically exercises the legacy
         // ACK before the signed-receipt route.
         store.record_route_forward_success(&receipt_middle_id, now);
 
         let outcome = Server::probe_two_hop_blind_relay_path(
-            &reqwest::Client::new(),
+            &test_client,
             &store,
             &source_identity,
             &self_node_id,
@@ -15959,7 +16080,7 @@ mod tests {
         assert!(outcome.attempted);
         assert!(outcome.route_accepted);
         assert!(outcome.terminal_delivery_verified);
-        assert_eq!(legacy_requests.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(legacy_requests.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(receipt_requests.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(
             store
@@ -17713,7 +17834,7 @@ mod tests {
         assert!(!status.blind_relay_quality.real_relay_ready);
 
         for node_id in [middle.node_id(), terminal.node_id()] {
-            restored_store.record_delivery_receipt_capability(&node_id, now + 6);
+            restored_store.record_purpose_bound_delivery_receipt_capability(&node_id, now + 6);
         }
         assert!(
             restored_store

@@ -151,6 +151,9 @@
 //! - External delivery-cache witness rounds expose aggregate continuity status
 //!   and can clear only restored delivery readiness before listeners, without
 //!   retaining witness identities, opaque digests, or traffic metadata
+//! - [PURPOSE-BOUND-RECEIPT-EVIDENCE 2026-08-10 by Codex] Keeps v2
+//!   purpose-bound receipt interoperability as process-local, freshness-bounded
+//!   evidence; legacy v1 receipt framing never authorizes App onion routes
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -182,6 +185,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.75.0-PurposeBoundReceiptEvidence - Made the v2-only route authority
+//! explicit while preserving public status and legacy method compatibility
 //! v0.74.0-BlindVaultReplicaCapability - Bound the append-only anonymous
 //! ciphertext replica capability into routeability evidence fingerprints
 //! v0.73.0-RouteDomainCertificateRecovery - Persist only currently valid
@@ -1418,7 +1423,7 @@ pub struct PeerStoreBlindRelayQualityStatus {
     /// Seconds since the last verified client delivery receipt, when known.
     #[serde(default)]
     pub last_verified_client_onion_delivery_age_seconds: Option<u64>,
-    /// Number of currently fresh peers proven to carry signed delivery receipts.
+    /// Number of fresh peers proven to carry purpose-bound v2 delivery receipts.
     #[serde(default)]
     pub delivery_receipt_capable_peers: usize,
     /// Whether this process has fresh accepted terminal or forwarded relay work.
@@ -2507,7 +2512,7 @@ pub struct PeerStore {
     peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
     route_health: RwLock<HashMap<[u8; 32], PeerRouteHealth>>,
     relay_protection_health: RwLock<HashMap<[u8; 32], PeerRelayProtectionHealth>>,
-    delivery_receipt_capability: RwLock<HashMap<[u8; 32], u64>>,
+    purpose_bound_delivery_receipt_capability: RwLock<HashMap<[u8; 32], u64>>,
     route_domain_attestor_policy: RwLock<PeerStoreRouteDomainAttestorPolicy>,
     route_domain_certificates: RwLock<HashMap<[u8; 32], RouteDomainAttestationCertificateV1>>,
     max_peers: RwLock<Option<usize>>,
@@ -2531,7 +2536,7 @@ impl PeerStore {
             peer_runtime: RwLock::new(HashMap::new()),
             route_health: RwLock::new(HashMap::new()),
             relay_protection_health: RwLock::new(HashMap::new()),
-            delivery_receipt_capability: RwLock::new(HashMap::new()),
+            purpose_bound_delivery_receipt_capability: RwLock::new(HashMap::new()),
             route_domain_attestor_policy: RwLock::new(PeerStoreRouteDomainAttestorPolicy::default()),
             route_domain_certificates: RwLock::new(HashMap::new()),
             max_peers: RwLock::new(None),
@@ -4380,24 +4385,51 @@ impl PeerStore {
     }
 
     /// Records that a verified peer participated in a route carrying a valid
-    /// terminal-signed delivery receipt.
+    /// purpose-bound version-2 terminal delivery receipt.
     ///
     /// The node id is process-private selection state. Public status exposes
     /// only a fresh aggregate count; no route id, endpoint, receipt, payload
     /// commitment, sender, receiver, message id, or social-graph edge is kept.
-    pub fn record_delivery_receipt_capability(&self, node_id: &[u8; 32], now: u64) {
+    pub fn record_purpose_bound_delivery_receipt_capability(&self, node_id: &[u8; 32], now: u64) {
         if self.get_valid(node_id, now).is_none() {
             return;
         }
-        self.delivery_receipt_capability
+        self.purpose_bound_delivery_receipt_capability
             .write()
             .insert(*node_id, now);
         self.record_audit_event(
             now,
-            "blind_relay_receipt_capability",
+            "blind_relay_purpose_bound_receipt_capability",
             "accepted",
-            "fresh_signed_delivery_receipt".to_string(),
+            "fresh_purpose_bound_delivery_receipt_v2".to_string(),
         );
+    }
+
+    /// Backward-compatible alias for callers compiled against the v1 method
+    /// name. Callers must pass only evidence that has already satisfied the v2
+    /// purpose-bound verifier; this method does not inspect receipt bytes.
+    pub fn record_delivery_receipt_capability(&self, node_id: &[u8; 32], now: u64) {
+        self.record_purpose_bound_delivery_receipt_capability(node_id, now);
+    }
+
+    /// [PURPOSE-BOUND-RECEIPT-EVIDENCE 2026-08-10 by Codex] Returns whether
+    /// this process has fresh cryptographic v2 evidence for a currently valid
+    /// peer. This is stronger than an unsigned discovery hint and is
+    /// intentionally cleared by process restart.
+    #[must_use]
+    pub fn has_fresh_purpose_bound_delivery_receipt_capability(
+        &self,
+        node_id: &[u8; 32],
+        now: u64,
+    ) -> bool {
+        self.get_valid(node_id, now).is_some()
+            && self
+                .purpose_bound_delivery_receipt_capability
+                .read()
+                .get(node_id)
+                .is_some_and(|at| {
+                    *at <= now && now.saturating_sub(*at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
+                })
     }
 
     /// Records one authenticated App/client-originated onion delivery whose
@@ -6548,7 +6580,7 @@ impl PeerStore {
             .collect()
     }
 
-    /// Returns routeable peers that recently proved signed delivery-receipt
+    /// Returns routeable peers that recently proved purpose-bound v2 receipt
     /// interoperability, after applying capability and exclusion policy.
     ///
     /// This gate is intentionally process-local and freshness-bounded. It
@@ -6563,7 +6595,7 @@ impl PeerStore {
         limit: usize,
         excluded_node_ids: &[[u8; 32]],
     ) -> Vec<SignedNodeDescriptor> {
-        let capability_evidence = self.delivery_receipt_capability.read();
+        let capability_evidence = self.purpose_bound_delivery_receipt_capability.read();
         self.scored_route_candidates(capability, now, None, false)
             .into_iter()
             .filter(|candidate| {
@@ -6581,7 +6613,7 @@ impl PeerStore {
             .collect()
     }
 
-    /// Returns receipt-capable route candidates under the multi-hop policy.
+    /// Returns purpose-bound v2 receipt-capable candidates under multi-hop policy.
     ///
     /// When strict attestation is disabled this is behaviorally identical to
     /// [`Self::delivery_receipt_route_candidates_with_capability_excluding`].
@@ -6595,7 +6627,7 @@ impl PeerStore {
         limit: usize,
         excluded_node_ids: &[[u8; 32]],
     ) -> Vec<SignedNodeDescriptor> {
-        let capability_evidence = self.delivery_receipt_capability.read();
+        let capability_evidence = self.purpose_bound_delivery_receipt_capability.read();
         self.scored_route_candidates(capability, now, None, false)
             .into_iter()
             .filter(|candidate| {
@@ -6995,7 +7027,7 @@ impl PeerStore {
         let three_hop_path_proof_history = self.three_hop_path_proof_history(now);
         let runtime = self.counters.snapshot();
         let delivery_receipt_capable_peers = self
-            .delivery_receipt_capability
+            .purpose_bound_delivery_receipt_capability
             .read()
             .values()
             .filter(|at| {
@@ -10977,7 +11009,8 @@ mod tests {
         let store = PeerStore::new();
         store.upsert_verified(descriptor, now).unwrap();
         store.record_route_forward_success(&node_id, now + 1);
-        store.record_delivery_receipt_capability(&node_id, now + 2);
+        store.record_purpose_bound_delivery_receipt_capability(&node_id, now + 2);
+        assert!(store.has_fresh_purpose_bound_delivery_receipt_capability(&node_id, now + 3));
 
         let candidates = store.delivery_receipt_route_candidates_with_capability_excluding(
             NodeCapability::ChatRelay,
@@ -11005,6 +11038,7 @@ mod tests {
             .is_empty());
 
         let stale_at = now + 2 + PEER_ROUTEABILITY_STALE_AFTER_SECS + 1;
+        assert!(!store.has_fresh_purpose_bound_delivery_receipt_capability(&node_id, stale_at));
         assert!(store
             .delivery_receipt_route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
@@ -11139,7 +11173,7 @@ mod tests {
             let node_id = descriptor.node_id();
             store.upsert_verified(descriptor, now).unwrap();
             store.record_route_forward_success(&node_id, now);
-            store.record_delivery_receipt_capability(&node_id, now);
+            store.record_purpose_bound_delivery_receipt_capability(&node_id, now);
         }
 
         let fresh = store.status(now + 10).blind_relay_quality;

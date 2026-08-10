@@ -56,6 +56,9 @@
 //! - [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Separates ordinary encrypted
 //!   message terminals from admitted Blind Vault ciphertext replicas without
 //!   changing the legacy candidate query or exposing a selected route.
+//! - [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex] Advertises v2
+//!   purpose-bound terminal receipt support as an unsigned bootstrap hint;
+//!   route authority still requires a fresh cryptographically verified receipt.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -100,6 +103,9 @@
 //! - Protocol feature fields are unsigned compatibility hints only. They may
 //!   suppress an optional probe, but must never grant route trust or replace
 //!   terminal signature and payload-commitment verification.
+//! - `multihop_delivery_receipt_v1` means the node understands propagated
+//!   receipt framing. `purpose_bound_delivery_receipt_v2` means current
+//!   terminals sign workload-separated commitments. Never infer v2 from v1.
 //! - Candidate count alone must never make a multi-hop path ready. Keep
 //!   `requested_path_ready` gated by the matching two-hop or three-hop runtime
 //!   proof and signed restart-continuity decision.
@@ -131,6 +137,8 @@
 //!   only live admission policy and must not fork the shared wire contract.
 //!
 //! ## Last Modified
+//! v0.48.0-PurposeBoundReceiptNegotiation - Advertise v2 receipt semantics
+//! separately from legacy multi-hop receipt framing
 //! v0.47.0-CoreRoutePurposeContract - Consumed the shared onion purpose
 //! protocol contract and advertised its canonical values for negotiation
 //! v0.46.0-OnionRoutePurpose - Added fail-closed, terminal-capability-aware
@@ -2002,6 +2010,10 @@ pub fn discovery_summary_response(
             // unsigned transport hint only. A successful path still requires
             // the terminal's signed, route-bound delivery receipt.
             "multihop_delivery_receipt_v1": true,
+            // [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex] Keep v2
+            // separate from v1 so a legacy relay cannot be selected for a
+            // workload-bound proof merely because it understands ACK framing.
+            "purpose_bound_delivery_receipt_v2": true,
             // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Canonical values come
             // from aeronyx-core so all implementations negotiate one contract.
             "onion_route_purpose_v1": true,
@@ -5573,6 +5585,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            parsed["protocol_features"]["purpose_bound_delivery_receipt_v2"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
             parsed["protocol_features"]["onion_route_purpose_v1"].as_bool(),
             Some(true)
         );
@@ -5925,8 +5941,8 @@ mod tests {
 
         store.upsert_verified(middle, now).unwrap();
         store.upsert_verified(terminal, now).unwrap();
-        store.record_delivery_receipt_capability(&middle_node_id, now);
-        store.record_delivery_receipt_capability(&terminal_node_id, now);
+        store.record_purpose_bound_delivery_receipt_capability(&middle_node_id, now);
+        store.record_purpose_bound_delivery_receipt_capability(&terminal_node_id, now);
         store.record_blind_relay_terminal(now, 2, 128);
         store.record_blind_relay_forwarded(now, 1);
         store.record_blind_relay_two_hop_probe_result_with_context(
