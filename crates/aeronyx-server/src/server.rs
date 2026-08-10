@@ -4507,6 +4507,9 @@ impl Server {
                     Arc::clone(&peer_store),
                     Arc::clone(&node_identity),
                     Arc::clone(&peer_http_client),
+                    blind_vault_public_api_enabled
+                        .then(|| blind_vault.clone())
+                        .flatten(),
                 ))
                 // Local/VPN-only operator smoke trigger. The public discovery API
                 // intentionally does not expose this route; it actively sends a
@@ -4933,6 +4936,13 @@ impl Server {
         // capability truth coupled to the actual peer-route prerequisites.
         let witness_carrier_route_enabled =
             directory_chain_store.is_some() && directory_replica_store.is_some();
+        // [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] Anonymous onion
+        // writes share the same explicit public API gate as direct Blind Vault
+        // requests. Initializing local maintenance storage alone must never
+        // make it reachable through the Internet-facing peer listener.
+        let blind_vault_for_onion = blind_vault_public_api_enabled
+            .then(|| blind_vault.clone())
+            .flatten();
         let app = build_discovery_router_with_local_entry(
             Arc::clone(&peer_store),
             discovery_api_policy,
@@ -4947,6 +4957,7 @@ impl Server {
             Arc::clone(&peer_store),
             Arc::clone(&node_identity),
             peer_http_client,
+            blind_vault_for_onion,
         ))
         .merge(build_directory_replica_status_router_with_witness_carrier(
             directory_replica_store.clone(),

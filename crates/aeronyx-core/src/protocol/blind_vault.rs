@@ -108,6 +108,18 @@ const FRAME_KIND_PULL_RESPONSE: u8 = 8;
 const FRAME_KIND_BLIND_LEASE_ADMISSION: u8 = 9;
 const FRAME_KIND_BLIND_ISSUER_DIRECTORY: u8 = 10;
 
+/// Returns whether an opaque payload declares the Blind Vault wire format.
+///
+/// [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] This intentionally checks
+/// only the fixed magic prefix. Callers must still use
+/// [`decode_blind_vault_frame`] and fail closed when the remainder is malformed;
+/// falling back to another protocol after seeing this prefix would create a
+/// parser-confusion boundary at an onion terminal.
+#[must_use]
+pub fn is_blind_vault_frame(bytes: &[u8]) -> bool {
+    bytes.starts_with(&FRAME_MAGIC)
+}
+
 /// Initial blind-vault wire version. This version is independent of the VPN
 /// transport and legacy chat-envelope versions.
 pub const BLIND_VAULT_PROTOCOL_VERSION: u16 = 1;
@@ -1860,8 +1872,24 @@ mod tests {
 
         let encoded =
             encode_blind_vault_frame(&BlindVaultFrame::Put(put.clone())).expect("encode put");
+        assert!(is_blind_vault_frame(&encoded));
         let decoded = decode_blind_vault_frame(&encoded).expect("decode put");
         assert_eq!(decoded, BlindVaultFrame::Put(put));
+    }
+
+    #[test]
+    fn blind_vault_magic_detection_does_not_accept_other_or_truncated_protocols() {
+        // [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] Onion terminal
+        // dispatch must distinguish a declared Blind Vault frame from legacy
+        // chat bytes before decoding, without treating a short prefix as valid.
+        assert!(!is_blind_vault_frame(b""));
+        assert!(!is_blind_vault_frame(b"ANB"));
+        assert!(!is_blind_vault_frame(b"ANMC\x00\x01"));
+        assert!(is_blind_vault_frame(b"ANBV"));
+        assert!(matches!(
+            decode_blind_vault_frame(b"ANBV"),
+            Err(BlindVaultError::TruncatedFrame)
+        ));
     }
 
     #[test]

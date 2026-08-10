@@ -19,6 +19,9 @@
 //!   offline or all local routes are stale
 //! - Returns a terminal-signed receipt bound to the exact opaque payload after
 //!   successful onion terminal store-and-forward; middle hops only propagate it
+//! - [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] Accepts a bounded,
+//!   signed Blind Vault `Put` frame as an alternative onion terminal payload,
+//!   reusing the existing anonymous lease, quota, TTL, and idempotency service
 //! - [MULTIHOP-RECEIPT-VALIDATION 2026-08-01 by Codex] Validates terminal ACKs
 //!   against the immediate next hop while allowing a forwarded ACK to carry a
 //!   valid downstream terminal receipt through three-hop and longer paths
@@ -28,6 +31,8 @@
 //!   and bounded envelope encoding
 //! - aeronyx-core/src/protocol/memchain.rs: wraps envelope for client delivery
 //! - aeronyx-server/src/services/chat_relay.rs: pending queue and dedup logic
+//! - aeronyx-server/src/services/blind_vault.rs: anonymous encrypted-object
+//!   persistence for receiver-independent store-and-forward
 //! - aeronyx-server/src/services/peer_store.rs: verified node descriptors for
 //!   next-hop routing
 //! - aeronyx-server/src/services/session.rs: active receiver sessions
@@ -114,8 +119,15 @@
 //!   fields. Intermediates verify route, freshness, and signature, but only the
 //!   source knows the complete route and final payload commitment and can
 //!   therefore enforce the final terminal/payload binding.
+//! - Blind Vault's detailed storage receipt contains stable replica-local lease
+//!   metadata and therefore must not be exposed in a multi-hop JSON ACK. The
+//!   existing delivery receipt is signed only after `BlindVaultService::put`
+//!   succeeds and is bound to the exact encoded Put frame; the source can prove
+//!   replica acceptance without revealing the lease or object to middle hops.
 //!
 //! ## Last Modified
+//! v0.29.0-BlindVaultOnionDispatch - Persist signed anonymous Blind Vault Put
+//! frames at onion terminals without exposing lease/object metadata in ACKs
 //! v0.28.0-MultihopReceiptValidation - Keep direct-terminal signer checks while
 //! accepting valid downstream terminal receipts propagated through longer paths
 //! v0.27.0-PeerEndpointPolicy - Enforce canonical public-IP-only next-hop URLs
@@ -165,7 +177,9 @@ use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::discovery::SignedNodeDescriptor;
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer};
-use aeronyx_core::protocol::{DataPacket, NodeCapability};
+use aeronyx_core::protocol::{
+    decode_blind_vault_frame, is_blind_vault_frame, BlindVaultFrame, DataPacket, NodeCapability,
+};
 use aeronyx_transport::traits::Transport;
 use aeronyx_transport::UdpTransport;
 use axum::{
@@ -186,7 +200,7 @@ use crate::api::{
 };
 use crate::services::chat_relay::ChatRelayError;
 use crate::services::peer_store::PeerStore;
-use crate::services::{ChatRelayService, Session, SessionManager};
+use crate::services::{ChatRelayService, Session, SessionManager, SharedBlindVaultService};
 
 // ============================================
 // Constants
@@ -285,6 +299,9 @@ const BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
 #[derive(Clone)]
 struct ChatPeerState {
     chat_relay: Option<Arc<ChatRelayService>>,
+    /// Optional anonymous ciphertext store used only for declared Blind Vault
+    /// terminal frames. Absence is fail-closed and never falls back to chat.
+    blind_vault: Option<SharedBlindVaultService>,
     sessions: Arc<SessionManager>,
     udp: Arc<UdpTransport>,
     peer_store: Arc<PeerStore>,
@@ -609,6 +626,9 @@ enum BlindRelayError {
 
     #[error("onion layer peel failed")]
     OnionPeelFailed,
+
+    #[error("onion terminal payload rejected")]
+    OnionTerminalPayloadRejected,
 }
 
 impl BlindRelayError {
@@ -621,7 +641,8 @@ impl BlindRelayError {
             | Self::TimestampExpired
             | Self::TimestampInFuture
             | Self::RouteLoop
-            | Self::OnionPeelFailed => StatusCode::BAD_REQUEST,
+            | Self::OnionPeelFailed
+            | Self::OnionTerminalPayloadRejected => StatusCode::BAD_REQUEST,
             Self::RateLimited | Self::Quarantined => StatusCode::TOO_MANY_REQUESTS,
             Self::NoRoute | Self::InvalidEndpoint => StatusCode::BAD_GATEWAY,
             Self::ForwardFailed => StatusCode::BAD_GATEWAY,
@@ -643,6 +664,7 @@ impl BlindRelayError {
             Self::InvalidEndpoint => "invalid_endpoint",
             Self::ForwardFailed => "forward_failed",
             Self::OnionPeelFailed => "onion_peel_failed",
+            Self::OnionTerminalPayloadRejected => "onion_terminal_payload_rejected",
         }
     }
 }
@@ -683,9 +705,11 @@ pub fn build_chat_peer_router(
     peer_store: Arc<PeerStore>,
     node_identity: Arc<IdentityKeyPair>,
     http_client: Arc<reqwest::Client>,
+    blind_vault: Option<SharedBlindVaultService>,
 ) -> Router {
     let state = ChatPeerState {
         chat_relay,
+        blind_vault,
         sessions,
         udp,
         peer_store,
@@ -1119,26 +1143,18 @@ async fn process_onion_blind_relay(
     };
 
     match peel.next_hop {
-        // Terminal hop: `inner` is the delivered payload (a ChatEnvelope).
+        // Terminal hop: `inner` is either a legacy ChatEnvelope or one signed
+        // Blind Vault Put frame. The fixed protocol magic selects the parser;
+        // declared-but-malformed Blind Vault bytes never fall back to chat.
         None => {
             let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment(&peel.inner);
-            let inner_envelope = decode_envelope(&peel.inner).map_err(|_| {
-                forget_blind_relay_route(&state, &envelope.route_id);
-                reject_blind_relay_previous_hop(
-                    &state,
-                    previous_hop_node_id,
-                    now,
-                    "onion_terminal_decode_failed",
-                );
-                BlindRelayError::OnionPeelFailed
-            })?;
 
-            // Deliver via the existing zero-knowledge chat relay store-and-forward.
-            // This is a hard ACK boundary for Milestone 2: a terminal onion hop
-            // may only return accepted=true after the existing relay path has
-            // either delivered online or stored the encrypted envelope pending.
-            // The coarse rejection bucket avoids leaking payload or receiver data.
-            if let Err(error) = process_peer_relay(state.clone(), inner_envelope).await {
+            // [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] This is the hard
+            // terminal ACK boundary for both delivery models. A successful
+            // peel is insufficient: chat must reach its pending queue, while a
+            // Blind Vault Put must pass its signature, lease, quota, TTL,
+            // idempotency, and durable SQLite transaction before we sign ACK.
+            if let Err(error) = deliver_onion_terminal_payload(&state, &peel.inner, now).await {
                 forget_blind_relay_route(&state, &envelope.route_id);
                 debug!(
                     reason = error.reason_bucket(),
@@ -1148,9 +1164,9 @@ async fn process_onion_blind_relay(
                     &state,
                     previous_hop_node_id,
                     now,
-                    "onion_terminal_relay_failed",
+                    "onion_terminal_delivery_failed",
                 );
-                return Err(BlindRelayError::ForwardFailed);
+                return Err(error);
             }
 
             record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
@@ -1315,6 +1331,41 @@ async fn process_onion_blind_relay(
             })
         }
     }
+}
+
+/// Persists one terminal onion payload without widening what middle hops can
+/// observe. The terminal necessarily learns the replica-local Blind Vault
+/// lease used for storage, but neither the sender/receiver identity nor the
+/// ciphertext plaintext exists in the Put frame.
+async fn deliver_onion_terminal_payload(
+    state: &ChatPeerState,
+    payload: &[u8],
+    now_secs: u64,
+) -> Result<(), BlindRelayError> {
+    if is_blind_vault_frame(payload) {
+        let frame = decode_blind_vault_frame(payload)
+            .map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
+        let BlindVaultFrame::Put(request) = frame else {
+            // Lease admission, pull, delete, issuer, and response frames retain
+            // their dedicated bounded client API. The relay path is append-only.
+            return Err(BlindRelayError::OnionTerminalPayloadRejected);
+        };
+        let vault = state
+            .blind_vault
+            .as_ref()
+            .ok_or(BlindRelayError::ForwardFailed)?;
+        vault
+            .put(&request, now_secs.saturating_mul(1_000))
+            .map_err(|_| BlindRelayError::ForwardFailed)?;
+        return Ok(());
+    }
+
+    let envelope =
+        decode_envelope(payload).map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
+    process_peer_relay(state.clone(), envelope)
+        .await
+        .map(|_| ())
+        .map_err(|_| BlindRelayError::ForwardFailed)
 }
 
 async fn process_onion_middle_blind_relay(
@@ -1660,8 +1711,7 @@ fn validate_downstream_delivery_receipt(
     {
         return Err("receipt_timestamp_in_future");
     }
-    if observed_at.saturating_sub(receipt.delivered_at)
-        > BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
+    if observed_at.saturating_sub(receipt.delivered_at) > BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
     {
         return Err("receipt_timestamp_expired");
     }
@@ -1984,9 +2034,13 @@ mod tests {
     use super::*;
 
     use aeronyx_core::crypto::IdentityKeyPair;
+    use aeronyx_core::protocol::blind_vault::{
+        BlindVaultAdmissionTicket, BlindVaultLeaseAdmissionRequest,
+    };
     use aeronyx_core::protocol::chat::ChatContentType;
     use aeronyx_core::protocol::{
-        NodeCapability, NodeCapacity, NodeDescriptor, SignedNodeDescriptor,
+        encode_blind_vault_frame, BlindVaultFrame, BlindVaultLeaseCreateRequest,
+        BlindVaultPutRequest, NodeCapability, NodeCapacity, NodeDescriptor, SignedNodeDescriptor,
     };
     use aeronyx_transport::UdpTransport;
     use axum::body::Body;
@@ -1996,7 +2050,10 @@ mod tests {
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
-    use crate::config::ChatRelayConfig;
+    use sha2::{Digest, Sha256};
+
+    use crate::config::{BlindVaultConfig, ChatRelayConfig};
+    use crate::services::{BlindVaultLeaseProvisionOutcome, BlindVaultService};
 
     fn signed_envelope() -> ChatEnvelope {
         let kp = IdentityKeyPair::generate();
@@ -2085,12 +2142,8 @@ mod tests {
         let route_id = [0xe5; 16];
         let immediate_middle = IdentityKeyPair::generate();
         let downstream_terminal = IdentityKeyPair::generate();
-        let mut receipt = BlindRelayDeliveryReceipt::accepted(
-            route_id,
-            [0xf6; 32],
-            now,
-            &downstream_terminal,
-        );
+        let mut receipt =
+            BlindRelayDeliveryReceipt::accepted(route_id, [0xf6; 32], now, &downstream_terminal);
         receipt.payload_commitment[0] ^= 0xff;
         let ack = PeerBlindRelayResponse {
             accepted: true,
@@ -2134,6 +2187,75 @@ mod tests {
             .unwrap(),
         );
         (relay, path)
+    }
+
+    fn temp_blind_vault_with_put(
+        node_identity: &IdentityKeyPair,
+        now_ms: u64,
+    ) -> (
+        tempfile::TempDir,
+        Arc<BlindVaultService>,
+        BlindVaultPutRequest,
+    ) {
+        // [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] Use the production
+        // admission and mutation pipeline in relay tests. Bypassing lease
+        // provisioning would miss signature, quota, expiry, and authority
+        // regressions at the protocol boundary this feature is meant to join.
+        let directory = tempfile::tempdir().expect("blind vault temp directory");
+        let issuer = IdentityKeyPair::generate();
+        let config = BlindVaultConfig {
+            enabled: true,
+            public_api_enabled: true,
+            admission_issuer_public_keys: vec![hex::encode(issuer.public_key_bytes())],
+            db_path: directory
+                .path()
+                .join("blind-vault.db")
+                .display()
+                .to_string(),
+            ..BlindVaultConfig::default()
+        };
+        let service = Arc::new(
+            BlindVaultService::new(config, node_identity.clone()).expect("blind vault service"),
+        );
+        let write_key = IdentityKeyPair::generate();
+        let admin_key = IdentityKeyPair::generate();
+        let lease_id = [0x61; 32];
+        let mut lease = BlindVaultLeaseCreateRequest::new(
+            lease_id,
+            [0x62; 16],
+            write_key.public_key_bytes(),
+            admin_key.public_key_bytes(),
+            Sha256::digest([0x63; 32]).into(),
+            now_ms + 24 * 60 * 60 * 1_000,
+        );
+        lease.sign(&admin_key).expect("sign anonymous lease");
+        let mut admission = BlindVaultAdmissionTicket::new(
+            [0x64; 32],
+            issuer.public_key_bytes(),
+            now_ms.saturating_sub(1_000),
+            now_ms + 60 * 60 * 1_000,
+            2 * 24 * 60 * 60 * 1_000,
+        );
+        admission.sign(&issuer).expect("sign admission ticket");
+        assert_eq!(
+            service
+                .provision_lease_with_admission(
+                    &BlindVaultLeaseAdmissionRequest { admission, lease },
+                    now_ms,
+                )
+                .expect("provision anonymous lease"),
+            BlindVaultLeaseProvisionOutcome::Created
+        );
+
+        let mut put = BlindVaultPutRequest::new(
+            lease_id,
+            [0x65; 32],
+            [0x66; 16],
+            vec![0xa5; 4 * 1024],
+            now_ms + 60 * 60 * 1_000,
+        );
+        put.sign(&write_key);
+        (directory, service, put)
     }
 
     fn signed_chat_relay_peer_descriptor_for(
@@ -2261,6 +2383,7 @@ mod tests {
             peer_store,
             node_identity,
             http_client,
+            None,
         );
         let body = serde_json::to_vec(&PeerChatRelayRequest { envelope }).unwrap();
         let response = app
@@ -2297,6 +2420,7 @@ mod tests {
             Arc::clone(&peer_store),
             Arc::new(IdentityKeyPair::generate()),
             Arc::new(reqwest::Client::new()),
+            None,
         );
 
         let peer_response = app
@@ -2360,6 +2484,7 @@ mod tests {
             Arc::clone(&peer_store),
             node_identity,
             http_client,
+            None,
         );
         let body = serde_json::to_vec(&PeerBlindRelayRequest {
             envelope,
@@ -2408,6 +2533,7 @@ mod tests {
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -2458,6 +2584,7 @@ mod tests {
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -2511,6 +2638,7 @@ mod tests {
         let (relay, path) = temp_chat_relay("onion-terminal");
         let state = ChatPeerState {
             chat_relay: Some(Arc::clone(&relay)),
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -2574,6 +2702,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn onion_terminal_persists_anonymous_blind_vault_put_idempotently() {
+        use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+        let source = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let now_ms = now.saturating_mul(1_000);
+        let (_directory, vault, put) = temp_blind_vault_with_put(node_identity.as_ref(), now_ms);
+        let encoded_put =
+            encode_blind_vault_frame(&BlindVaultFrame::Put(put)).expect("encode vault put");
+        let state = ChatPeerState {
+            chat_relay: None,
+            blind_vault: Some(Arc::clone(&vault)),
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+
+        let make_envelope = |route_id| {
+            build_onion_envelope(
+                &[OnionHop {
+                    node_id: node_identity.public_key_bytes(),
+                    kem_pub: crate::services::onion_keys::current_public_key(),
+                }],
+                &encoded_put,
+                route_id,
+                4,
+                now,
+                &source,
+            )
+            .expect("build vault terminal onion")
+        };
+        let first_route = [0x67; 16];
+        let result = process_peer_blind_relay(
+            state.clone(),
+            PeerBlindRelayRequest {
+                envelope: make_envelope(first_route),
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await
+        .expect("signed anonymous put should reach Blind Vault");
+
+        assert!(result.accepted);
+        assert!(result.terminal);
+        assert!(!result.forwarded);
+        assert_eq!(result.reason.as_deref(), Some("onion_terminal_delivered"));
+        result
+            .delivery_receipt
+            .as_ref()
+            .expect("vault acceptance must return a route-safe terminal receipt")
+            .verify_expected(
+                &first_route,
+                &BlindRelayDeliveryReceipt::payload_commitment(&encoded_put),
+                &node_identity.public_key_bytes(),
+            )
+            .expect("receipt must bind exact encoded put without exposing lease metadata");
+        let public_ack = serde_json::to_string(&result).expect("serialize terminal ACK");
+        assert!(!public_ack.contains("lease_id"));
+        assert!(!public_ack.contains("object_id"));
+        assert!(!public_ack.contains("ciphertext"));
+
+        let status = vault.status(now_ms + 1).expect("vault status after put");
+        assert_eq!(status.live_objects, 1);
+        assert_eq!(status.live_ciphertext_bytes, 4 * 1024);
+
+        // A source may rebuild a route after losing the first ACK. Blind Vault
+        // handles the exact Put idempotently even when the relay route differs.
+        process_peer_blind_relay(
+            state.clone(),
+            PeerBlindRelayRequest {
+                envelope: make_envelope([0x68; 16]),
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await
+        .expect("same immutable put through a fresh route should be idempotent");
+        assert_eq!(
+            vault
+                .status(now_ms + 2)
+                .expect("vault status after retry")
+                .live_objects,
+            1
+        );
+
+        assert!(matches!(
+            deliver_onion_terminal_payload(&state, b"ANBV", now).await,
+            Err(BlindRelayError::OnionTerminalPayloadRejected)
+        ));
+    }
+
+    #[tokio::test]
     async fn onion_terminal_requires_chat_relay_delivery_before_ack() {
         use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
 
@@ -2584,6 +2814,7 @@ mod tests {
         let abuse_guard = Arc::new(Mutex::new(BlindRelayAbuseGuard::default()));
         let failed_state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -2623,6 +2854,7 @@ mod tests {
         let (relay, path) = temp_chat_relay("onion-terminal-retry-after-relay-failure");
         let retry_state = ChatPeerState {
             chat_relay: Some(Arc::clone(&relay)),
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -2671,6 +2903,7 @@ mod tests {
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -2762,6 +2995,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -2963,6 +3197,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3054,6 +3289,7 @@ mod tests {
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store,
@@ -3099,6 +3335,7 @@ mod tests {
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3213,6 +3450,7 @@ mod tests {
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3323,6 +3561,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3422,6 +3661,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3541,6 +3781,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3622,6 +3863,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3711,6 +3953,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3799,6 +4042,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3893,6 +4137,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
@@ -3992,6 +4237,7 @@ mod tests {
 
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             peer_store: Arc::clone(&peer_store),
