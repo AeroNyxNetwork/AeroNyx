@@ -133,6 +133,10 @@
 //! - [MIRROR-CAPABILITY 2026-07-24 by Codex] New capability variants must be
 //!   appended, never reordered. Advertise `DirectoryMirrorCarrier` only after
 //!   the operator has enabled the staged mixed-version rollout gate.
+//! - [BLIND-VAULT-REPLICA-CAPABILITY 2026-08-10 by Codex] `BlindVaultReplica`
+//!   is append-only and rollout-gated. It means the signed peer endpoint can
+//!   accept admitted anonymous ciphertext replicas; it does not assert data
+//!   possession, availability, trust, operator independence, or consensus.
 //! - [BOUNDED-DISCOVERY-CODEC 2026-07-24 by Codex] Discovery and Directory
 //!   Sync frames are canonical control-plane messages. Keep strict trailing
 //!   rejection and the complete-input size preflight in the shared codec.
@@ -144,6 +148,8 @@
 //!   general discovery metadata.
 //!
 //! ## Last Modified
+//! v0.22.0-BlindVaultReplicaCapability - Added an append-only, rollout-gated
+//! anonymous ciphertext replica capability without changing prior discriminants
 //! v0.21.0-RouteDomainAttestation - Added bounded portable route-domain
 //! attestations, pinned-quorum verification, and strict framed codecs
 //! v0.20.0-DirectoryAuthenticatedGossipWire - Added an append-only compact
@@ -370,6 +376,11 @@ pub enum NodeCapability {
     /// upgrade decoders before operators enable advertisement because an old
     /// binary cannot decode a capability variant it does not know.
     DirectoryMirrorCarrier,
+    /// Admitted node-blind ciphertext replica reachable through the peer API.
+    ///
+    /// This transport hint does not prove that any particular lease or object
+    /// exists and grants no producer, witness, consensus, or finality role.
+    BlindVaultReplica,
 }
 
 // ============================================
@@ -3788,7 +3799,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_mirror_carrier_capability_is_appended_and_signature_bound() {
+    fn staged_capabilities_are_appended_and_signature_bound() {
         // [MIRROR-CAPABILITY 2026-07-24 by Codex] Existing enum positions are
         // part of the bincode wire contract. Appending the staged capability
         // keeps OnionMiddle at 4 and assigns the new carrier role to 5.
@@ -3800,12 +3811,19 @@ mod tests {
             bincode::serialize(&NodeCapability::DirectoryMirrorCarrier).unwrap(),
             5u32.to_le_bytes()
         );
+        assert_eq!(
+            bincode::serialize(&NodeCapability::BlindVaultReplica).unwrap(),
+            6u32.to_le_bytes()
+        );
 
         let identity = IdentityKeyPair::generate();
         let mut descriptor = descriptor_for(&identity);
         descriptor
             .capabilities
             .push(NodeCapability::DirectoryMirrorCarrier);
+        descriptor
+            .capabilities
+            .push(NodeCapability::BlindVaultReplica);
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
         assert!(signed.verify_at(1_700_000_100).is_ok());
 
@@ -3821,6 +3839,10 @@ mod tests {
             .descriptor
             .capabilities
             .contains(&NodeCapability::DirectoryMirrorCarrier));
+        assert!(descriptor
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::BlindVaultReplica));
         assert!(descriptor.verify_at(1_700_000_100).is_ok());
     }
 

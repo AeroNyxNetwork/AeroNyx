@@ -124,8 +124,12 @@
 //!   existing delivery receipt is signed only after `BlindVaultService::put`
 //!   succeeds and is bound to the exact encoded Put frame; the source can prove
 //!   replica acceptance without revealing the lease or object to middle hops.
+//! - Blind Vault terminal failures expose only permanent rejection, replica
+//!   capacity, or temporary unavailability. Never forward service errors.
 //!
 //! ## Last Modified
+//! v0.30.0-BlindVaultRetryClass - Stop retrying permanently invalid anonymous
+//! writes while preserving coarse capacity and availability failover signals
 //! v0.29.0-BlindVaultOnionDispatch - Persist signed anonymous Blind Vault Put
 //! frames at onion terminals without exposing lease/object metadata in ACKs
 //! v0.28.0-MultihopReceiptValidation - Keep direct-terminal signer checks while
@@ -200,7 +204,10 @@ use crate::api::{
 };
 use crate::services::chat_relay::ChatRelayError;
 use crate::services::peer_store::PeerStore;
-use crate::services::{ChatRelayService, Session, SessionManager, SharedBlindVaultService};
+use crate::services::{
+    BlindVaultPutFailureClass, BlindVaultServiceError, ChatRelayService, Session, SessionManager,
+    SharedBlindVaultService,
+};
 
 // ============================================
 // Constants
@@ -629,6 +636,12 @@ enum BlindRelayError {
 
     #[error("onion terminal payload rejected")]
     OnionTerminalPayloadRejected,
+
+    #[error("onion terminal replica capacity exhausted")]
+    OnionTerminalCapacityExhausted,
+
+    #[error("downstream blind relay rejected request")]
+    DownstreamRejected,
 }
 
 impl BlindRelayError {
@@ -642,7 +655,9 @@ impl BlindRelayError {
             | Self::TimestampInFuture
             | Self::RouteLoop
             | Self::OnionPeelFailed
-            | Self::OnionTerminalPayloadRejected => StatusCode::BAD_REQUEST,
+            | Self::OnionTerminalPayloadRejected
+            | Self::DownstreamRejected => StatusCode::BAD_REQUEST,
+            Self::OnionTerminalCapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
             Self::RateLimited | Self::Quarantined => StatusCode::TOO_MANY_REQUESTS,
             Self::NoRoute | Self::InvalidEndpoint => StatusCode::BAD_GATEWAY,
             Self::ForwardFailed => StatusCode::BAD_GATEWAY,
@@ -665,6 +680,8 @@ impl BlindRelayError {
             Self::ForwardFailed => "forward_failed",
             Self::OnionPeelFailed => "onion_peel_failed",
             Self::OnionTerminalPayloadRejected => "onion_terminal_payload_rejected",
+            Self::OnionTerminalCapacityExhausted => "onion_terminal_capacity_exhausted",
+            Self::DownstreamRejected => "downstream_rejected",
         }
     }
 }
@@ -1356,7 +1373,7 @@ async fn deliver_onion_terminal_payload(
             .ok_or(BlindRelayError::ForwardFailed)?;
         vault
             .put(&request, now_secs.saturating_mul(1_000))
-            .map_err(|_| BlindRelayError::ForwardFailed)?;
+            .map_err(|error| map_blind_vault_put_error(&error))?;
         return Ok(());
     }
 
@@ -1366,6 +1383,17 @@ async fn deliver_onion_terminal_payload(
         .await
         .map(|_| ())
         .map_err(|_| BlindRelayError::ForwardFailed)
+}
+
+fn map_blind_vault_put_error(error: &BlindVaultServiceError) -> BlindRelayError {
+    // [BLIND-VAULT-RETRY-CLASS 2026-08-10 by Codex] The relay must make a
+    // useful retry decision without forwarding replica-local state. Every
+    // authorization, signature, lease, and object conflict shares one bucket.
+    match error.put_failure_class() {
+        BlindVaultPutFailureClass::Rejected => BlindRelayError::OnionTerminalPayloadRejected,
+        BlindVaultPutFailureClass::Capacity => BlindRelayError::OnionTerminalCapacityExhausted,
+        BlindVaultPutFailureClass::Unavailable => BlindRelayError::ForwardFailed,
+    }
 }
 
 async fn process_onion_middle_blind_relay(
@@ -1804,6 +1832,40 @@ async fn forward_blind_relay_with_retry(
             Ok(response) => {
                 let status = response.status();
                 let reason = format!("http_{}", status.as_u16());
+                let declared_reason = if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    decode_bounded_json_response::<PeerBlindRelayResponse>(
+                        response,
+                        PEER_ACK_RESPONSE_MAX_BYTES,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|body| body.reason)
+                } else {
+                    None
+                };
+                if let Some(error) =
+                    non_retryable_downstream_error(status, declared_reason.as_deref())
+                {
+                    // [BLIND-VAULT-RETRY-CLASS 2026-08-10 by Codex] Preserve
+                    // only transport-level retry semantics across middle hops.
+                    // Only one bounded stable capacity reason is recognized;
+                    // no lease/object detail or arbitrary downstream error is
+                    // propagated.
+                    debug!(
+                        attempt,
+                        status = %status,
+                        "[BLIND_RELAY] Next-hop returned terminal non-retryable status"
+                    );
+                    state.peer_store.record_route_forward_failure(
+                        &next_hop,
+                        now,
+                        error.reason_bucket(),
+                    );
+                    state
+                        .peer_store
+                        .record_blind_relay_rejected(now, error.reason_bucket());
+                    return Err(error);
+                }
                 if attempt < MAX_BLIND_RELAY_FORWARD_ATTEMPTS
                     && is_retryable_blind_relay_status(status)
                 {
@@ -1881,6 +1943,24 @@ async fn forward_blind_relay_with_retry(
     }
 
     Err(BlindRelayError::ForwardFailed)
+}
+
+fn non_retryable_downstream_error(
+    status: reqwest::StatusCode,
+    declared_reason: Option<&str>,
+) -> Option<BlindRelayError> {
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && declared_reason == Some("onion_terminal_capacity_exhausted")
+    {
+        // [BLIND-VAULT-RETRY-CLASS 2026-08-10 by Codex] Only the exact bounded
+        // peer error contract marks deterministic capacity. An unknown proxy
+        // 503 remains retryable instead of being misclassified as lease state.
+        return Some(BlindRelayError::OnionTerminalCapacityExhausted);
+    }
+    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Some(BlindRelayError::DownstreamRejected);
+    }
+    None
 }
 
 fn is_retryable_blind_relay_status(status: reqwest::StatusCode) -> bool {
@@ -2363,6 +2443,46 @@ mod tests {
             map_pending_store_error(&oversized),
             ChatPeerRelayError::EnvelopeTooLarge { size: 65_537 }
         ));
+    }
+
+    #[test]
+    fn blind_vault_put_errors_preserve_retry_semantics_without_state_details() {
+        assert!(matches!(
+            map_blind_vault_put_error(&BlindVaultServiceError::LeaseNotFound),
+            BlindRelayError::OnionTerminalPayloadRejected
+        ));
+        assert!(matches!(
+            map_blind_vault_put_error(&BlindVaultServiceError::QuotaExceeded),
+            BlindRelayError::OnionTerminalCapacityExhausted
+        ));
+        assert!(matches!(
+            map_blind_vault_put_error(&BlindVaultServiceError::Disabled),
+            BlindRelayError::ForwardFailed
+        ));
+        assert_eq!(
+            BlindRelayError::OnionTerminalCapacityExhausted.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(matches!(
+            non_retryable_downstream_error(reqwest::StatusCode::BAD_REQUEST, None),
+            Some(BlindRelayError::DownstreamRejected)
+        ));
+        assert!(matches!(
+            non_retryable_downstream_error(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                Some("onion_terminal_capacity_exhausted")
+            ),
+            Some(BlindRelayError::OnionTerminalCapacityExhausted)
+        ));
+        assert!(non_retryable_downstream_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            Some("proxy_unavailable")
+        )
+        .is_none());
+        assert!(
+            non_retryable_downstream_error(reqwest::StatusCode::TOO_MANY_REQUESTS, None).is_none()
+        );
+        assert!(non_retryable_downstream_error(reqwest::StatusCode::BAD_GATEWAY, None).is_none());
     }
 
     #[tokio::test]

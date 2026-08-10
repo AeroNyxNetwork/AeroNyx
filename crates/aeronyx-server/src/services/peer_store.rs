@@ -182,6 +182,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.74.0-BlindVaultReplicaCapability - Bound the append-only anonymous
+//! ciphertext replica capability into routeability evidence fingerprints
 //! v0.73.0-RouteDomainCertificateRecovery - Persist only currently valid
 //! route-domain certificates and reverify each record after restart
 //! v0.72.0-PathProofClockGuard - Ignore future-dated path proofs and fail
@@ -6282,6 +6284,9 @@ impl PeerStore {
                 // role distinct so enabling it invalidates stale routeability
                 // evidence bound to an older signed transport surface.
                 NodeCapability::DirectoryMirrorCarrier => 6,
+                // [BLIND-VAULT-REPLICA-CAPABILITY 2026-08-10 by Codex] Keep
+                // this appended role distinct in routeability evidence.
+                NodeCapability::BlindVaultReplica => 7,
             })
             .collect::<Vec<_>>();
         capabilities.sort_unstable();
@@ -7678,6 +7683,7 @@ impl PeerStore {
             NodeCapability::AgentRelay => "agent_relay",
             NodeCapability::OnionMiddle => "onion_middle",
             NodeCapability::DirectoryMirrorCarrier => "directory_mirror_carrier",
+            NodeCapability::BlindVaultReplica => "blind_vault_replica",
         }
     }
 

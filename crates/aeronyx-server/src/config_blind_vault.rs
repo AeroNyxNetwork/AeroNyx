@@ -13,6 +13,8 @@
 //!   admission lifetime, deletion tombstones, and maintenance work.
 //! - Keeps public routes fail-closed unless at least one V1 Ed25519 issuer,
 //!   static V2 RSA epoch, or V2 update authority is explicitly pinned.
+//! - Keeps signed replica discovery advertisement behind a separate staged
+//!   mixed-version rollout gate.
 //! - Bounds the freshness of authority-signed runtime issuer generations.
 //! - Validates that one corrupted or malicious lease cannot consume unbounded
 //!   storage or request work.
@@ -33,7 +35,9 @@
 //!   replace them with account, wallet, device, or application allowlists.
 //! - Keep byte/count limits finite even on official nodes.
 //!
-//! Last Modified: v1.3.0-BlindVaultIssuerAuthority - Added pinned Ed25519
+//! Last Modified: v1.4.0-BlindVaultReplicaCapability - Added a default-off
+//! signed discovery rollout gate with fail-closed prerequisite validation.
+//! v1.3.0-BlindVaultIssuerAuthority - Added pinned Ed25519
 //! authorities and bounded freshness for authenticated runtime issuer updates.
 //! v1.2.0-BlindVaultBlindAdmission - Added bounded RSA epoch
 //! policies for unlinkable V2 admission.
@@ -97,6 +101,12 @@ pub struct BlindVaultConfig {
     /// both explicitly configured. Storage initialization alone remains local.
     #[serde(default)]
     pub public_api_enabled: bool,
+    /// [BLIND-VAULT-REPLICA-CAPABILITY 2026-08-10 by Codex] Advertises the
+    /// append-only `BlindVaultReplica` discovery capability.
+    /// Keep false until every discovery decoder in the intended mesh supports
+    /// the new enum variant.
+    #[serde(default)]
+    pub advertise_replica: bool,
     /// Operator-pinned Ed25519 issuer public keys, encoded as 64 hex digits.
     /// Tickets carry no account or application identity.
     #[serde(default)]
@@ -196,6 +206,12 @@ impl BlindVaultConfig {
             return Err(invalid(
                 "public_api_enabled",
                 "requires blind_vault.enabled=true",
+            ));
+        }
+        if self.advertise_replica && !self.public_api_enabled {
+            return Err(invalid(
+                "advertise_replica",
+                "requires blind_vault.public_api_enabled=true",
             ));
         }
         if !self.enabled {
@@ -419,6 +435,17 @@ impl BlindVaultConfig {
     pub const fn blind_issuer_update_max_age_ms(&self) -> u64 {
         self.blind_issuer_update_max_age_secs.saturating_mul(1_000)
     }
+
+    /// Returns whether local configuration is safe to advertise as a public
+    /// anonymous ciphertext replica. Runtime listener and relay readiness must
+    /// still be checked by the server.
+    #[must_use]
+    pub fn replica_advertisement_configured(&self) -> bool {
+        // [BLIND-VAULT-REPLICA-CAPABILITY 2026-08-10 by Codex] Reuse complete
+        // validation so malformed or missing issuer policy can never appear in
+        // a signed descriptor constructed by a test or embedded server.
+        self.advertise_replica && self.enabled && self.public_api_enabled && self.validate().is_ok()
+    }
 }
 
 impl Default for BlindVaultConfig {
@@ -426,6 +453,7 @@ impl Default for BlindVaultConfig {
         Self {
             enabled: false,
             public_api_enabled: false,
+            advertise_replica: false,
             admission_issuer_public_keys: Vec::new(),
             blind_issuer_update_authority_public_keys: Vec::new(),
             blind_issuer_update_max_age_secs: Self::default_blind_issuer_update_max_age_secs(),
@@ -483,6 +511,7 @@ mod tests {
     fn default_is_disabled_and_bounded() {
         let config = BlindVaultConfig::default();
         assert!(!config.enabled);
+        assert!(!config.advertise_replica);
         assert!(config.max_object_ttl_secs <= config.max_lease_ttl_secs);
         assert!(config.max_bytes_per_lease >= LARGEST_PROTOCOL_OBJECT_BYTES);
         config.validate().expect("disabled defaults remain valid");
@@ -537,6 +566,37 @@ mod tests {
             ..valid
         };
         assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn replica_advertisement_requires_the_public_admitted_service() {
+        let disabled = BlindVaultConfig {
+            advertise_replica: true,
+            ..BlindVaultConfig::default()
+        };
+        assert!(disabled.validate().is_err());
+
+        let issuer =
+            aeronyx_core::crypto::keys::IdentityKeyPair::from_bytes(&[29; 32]).expect("issuer key");
+        let enabled = BlindVaultConfig {
+            enabled: true,
+            public_api_enabled: true,
+            advertise_replica: true,
+            admission_issuer_public_keys: vec![hex::encode(issuer.public_key_bytes())],
+            ..BlindVaultConfig::default()
+        };
+        enabled
+            .validate()
+            .expect("advertised replica has every local prerequisite");
+        assert!(enabled.replica_advertisement_configured());
+    }
+
+    #[test]
+    fn legacy_toml_defaults_replica_advertisement_to_false() {
+        let parsed: BlindVaultConfig = toml::from_str("enabled = false\n")
+            .expect("legacy Blind Vault configuration remains readable");
+        assert!(!parsed.advertise_replica);
+        assert!(!parsed.replica_advertisement_configured());
     }
 
     // [BLIND-VAULT-ISSUER-AUTHORITY 2026-07-23 by Codex] A node may bootstrap

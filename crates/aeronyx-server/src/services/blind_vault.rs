@@ -21,6 +21,7 @@
 //! - Capability-gated bounded recovery pages with encrypted snapshot cursors.
 //! - Administration-key object deletion with signed node receipts.
 //! - Transactional per-lease count/byte quotas and bounded expiry cleanup.
+//! - Stable privacy-safe mutation failure classes for multi-hop retry policy.
 //!
 //! ## Dependencies
 //! - `aeronyx_core::protocol::blind_vault`: stable signed wire contracts.
@@ -59,7 +60,10 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.8.0-BlindVaultAuthPipeline - Moved client signature
+//! Last Modified: v1.9.0-BlindVaultPutFailureClass - Separated permanent
+//! request rejection, replica capacity, and retryable service availability
+//! without exposing lease or object state.
+//! v1.8.0-BlindVaultAuthPipeline - Moved client signature
 //! verification outside SQLite write transactions and added authority
 //! revalidation at the atomic mutation boundary.
 //! v1.7.0-BlindVaultIssuerAuthority - Added pinned authority
@@ -320,6 +324,61 @@ pub enum BlindVaultServiceError {
     /// Timestamp could not be represented safely by SQLite.
     #[error("blind vault timestamp is outside the supported range")]
     TimestampOutOfRange,
+}
+
+/// Privacy-safe retry class for an anonymous ciphertext Put failure.
+///
+/// This classification intentionally does not preserve lease, object,
+/// signature, or database details. Multi-hop relays may use it to decide
+/// whether another terminal is useful without becoming a storage-state oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultPutFailureClass {
+    /// The signed request cannot succeed unchanged and must not be retried.
+    Rejected,
+    /// This replica cannot accept more ciphertext under the current lease.
+    Capacity,
+    /// The replica is disabled, unhealthy, or temporarily unavailable.
+    Unavailable,
+}
+
+impl BlindVaultServiceError {
+    /// Returns the coarse retry class for a Put failure.
+    #[must_use]
+    pub const fn put_failure_class(&self) -> BlindVaultPutFailureClass {
+        // [BLIND-VAULT-RETRY-CLASS 2026-08-10 by Codex] Keep this exhaustive:
+        // adding a service error must force an explicit retry/privacy decision.
+        match self {
+            Self::Protocol(_)
+            | Self::LeaseNotFound
+            | Self::LeaseExpired
+            | Self::LeaseConflict
+            | Self::ObjectConflict
+            | Self::RequestConflict
+            | Self::ObjectDeleted
+            | Self::ReadUnauthorized
+            | Self::InvalidPullCursor
+            | Self::AdmissionIssuerRejected
+            | Self::AdmissionProofRejected
+            | Self::AdmissionSpent
+            | Self::ObjectNotFound
+            | Self::TimestampOutOfRange => BlindVaultPutFailureClass::Rejected,
+            Self::QuotaExceeded => BlindVaultPutFailureClass::Capacity,
+            Self::Disabled
+            | Self::Sqlite(_)
+            | Self::Filesystem
+            | Self::PullCursorEncryptionFailed
+            | Self::AdmissionUnavailable
+            | Self::AdmissionConfigurationInvalid
+            | Self::IssuerDirectoryAuthorityRejected
+            | Self::IssuerDirectoryUpdateRejected
+            | Self::IssuerDirectoryRollback
+            | Self::IssuerDirectoryGenerationConflict
+            | Self::IssuerDirectoryContinuity
+            | Self::IssuerDirectoryNoActiveEpoch
+            | Self::IssuerDirectoryGenerationOutOfRange
+            | Self::CorruptState => BlindVaultPutFailureClass::Unavailable,
+        }
+    }
 }
 
 /// Dedicated anonymous encrypted-object storage service.
@@ -2636,6 +2695,22 @@ mod tests {
                 .expect("status")
                 .live_objects,
             0
+        );
+    }
+
+    #[test]
+    fn put_failure_classes_are_coarse_and_retry_safe() {
+        assert_eq!(
+            BlindVaultServiceError::LeaseNotFound.put_failure_class(),
+            BlindVaultPutFailureClass::Rejected
+        );
+        assert_eq!(
+            BlindVaultServiceError::QuotaExceeded.put_failure_class(),
+            BlindVaultPutFailureClass::Capacity
+        );
+        assert_eq!(
+            BlindVaultServiceError::Disabled.put_failure_class(),
+            BlindVaultPutFailureClass::Unavailable
         );
     }
 }

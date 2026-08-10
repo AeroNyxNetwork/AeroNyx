@@ -423,6 +423,8 @@
 //     public onion pools can exclude candidates collocated with the entry.
 //
 // Last Modified:
+//   v2.8.68-BlindVaultReplicaCapability - Added rollout-gated, runtime-honest
+//     signed advertisement for admitted anonymous ciphertext replicas.
 //   v2.8.67-RouteDomainAttestedSelection - Applies the audited local
 //     attestor/quorum policy to multi-hop probes and live relay selection,
 //     while preserving legacy direct single-hop routing.
@@ -10703,6 +10705,17 @@ impl Server {
         {
             capabilities.push(NodeCapability::DirectoryMirrorCarrier);
         }
+        // [BLIND-VAULT-REPLICA-CAPABILITY 2026-08-10 by Codex] This appended
+        // wire variant remains operator-gated during mixed-version rollout.
+        // Re-check the full runtime transport surface so a node never signs a
+        // capability that its public peer listener cannot actually serve.
+        if config.blind_vault.replica_advertisement_configured()
+            && config.memchain.is_chat_relay_enabled()
+            && chat_relay_runtime_ready
+            && advertises_peer_api
+        {
+            capabilities.push(NodeCapability::BlindVaultReplica);
+        }
         if config.memchain.is_enabled() {
             capabilities.push(NodeCapability::EncryptedStorage);
         }
@@ -15378,6 +15391,35 @@ mod tests {
             .descriptor
             .capabilities
             .contains(&NodeCapability::DirectoryMirrorCarrier));
+    }
+
+    #[test]
+    fn blind_vault_replica_capability_is_rollout_gated_and_runtime_honest() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.public_endpoint = Some("https://node.example.com".to_string());
+        config.discovery.public_api_listen_addr = Some("0.0.0.0:8422".parse().unwrap());
+        config.memchain.chat_relay.enabled = true;
+        config.blind_vault.enabled = true;
+        config.blind_vault.public_api_enabled = true;
+        let issuer = IdentityKeyPair::from_bytes(&[31; 32]).expect("issuer key");
+        config.blind_vault.admission_issuer_public_keys =
+            vec![hex::encode(issuer.public_key_bytes())];
+
+        let capabilities = Server::discovery_capabilities_for_runtime(&config, true);
+        assert!(!capabilities.contains(&NodeCapability::BlindVaultReplica));
+
+        config.blind_vault.advertise_replica = true;
+        let advertised = Server::discovery_capabilities_for_runtime(&config, true);
+        assert!(advertised.contains(&NodeCapability::BlindVaultReplica));
+        assert!(advertised.contains(&NodeCapability::ChatRelay));
+
+        let relay_unavailable = Server::discovery_capabilities_for_runtime(&config, false);
+        assert!(!relay_unavailable.contains(&NodeCapability::BlindVaultReplica));
+
+        config.discovery.public_api_listen_addr = None;
+        let private = Server::discovery_capabilities_for_runtime(&config, true);
+        assert!(!private.contains(&NodeCapability::BlindVaultReplica));
     }
 
     #[test]

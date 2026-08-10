@@ -222,6 +222,11 @@ enabled = false
 # pinned issuer/update-authority key. V1 Ed25519 bearer tickets remain
 # compatible; new deployments should use rotating V2 RFC 9474 RSA issuers.
 public_api_enabled = false
+# [BLIND-VAULT-REPLICA-CAPABILITY 2026-08-10 by Codex] Append-only signed
+# discovery capability. Keep false until the intended mesh
+# has upgraded its discovery decoders, then enable only on publicly reachable
+# replicas whose admitted API is already healthy.
+advertise_replica = false
 admission_issuer_public_keys = []
 # [BLIND-VAULT-ISSUER-AUTHORITY 2026-07-23 by Codex] These Ed25519 keys may
 # sign complete public V2 issuer generations. The authority private key stays

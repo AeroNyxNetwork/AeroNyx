@@ -11,6 +11,8 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //
 // Last Modified:
+//   v0.17.0-BlindVaultPutFailureClass - Re-exported the privacy-safe retry
+//     classification used by multi-hop anonymous ciphertext delivery
 //   v0.16.0-RouteDomainCertificateRecovery - [ROUTE-DOMAIN-CERTIFICATE-RECOVERY
 //     2026-08-03 by Codex] Re-exported the bounded, identity-blind local cache
 //     recovery report and schema contract
@@ -64,10 +66,13 @@ pub mod wallet_routes;
 // Re-export primary types
 // [BLIND-VAULT-ISSUER-RUNTIME 2026-07-23 by Codex] Keep the authenticated
 // control-plane contract on the public services boundary.
+// [BLIND-VAULT-RETRY-CLASS 2026-08-10 by Codex] Relay/API boundaries consume
+// the service-owned coarse class instead of matching storage internals twice.
 pub use blind_vault::{
     BlindVaultCleanupReport, BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus,
-    BlindVaultLeaseProvisionOutcome, BlindVaultPullPage, BlindVaultService, BlindVaultServiceError,
-    BlindVaultStatus, BlindVaultStoredObject, SharedBlindVaultService,
+    BlindVaultLeaseProvisionOutcome, BlindVaultPullPage, BlindVaultPutFailureClass,
+    BlindVaultService, BlindVaultServiceError, BlindVaultStatus, BlindVaultStoredObject,
+    SharedBlindVaultService,
 };
 pub use chat_relay::{derive_node_secret, ChatRelayService};
 pub use deny_list::{DenyList, DenyReason};
