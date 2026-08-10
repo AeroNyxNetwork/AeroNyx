@@ -53,6 +53,9 @@
 //!   bounded portable certificate frame from any transport sender, then admits
 //!   it only under the node's exact host-local subject/domain pins and pinned
 //!   independent-attestor quorum.
+//! - [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Separates ordinary encrypted
+//!   message terminals from admitted Blind Vault ciphertext replicas without
+//!   changing the legacy candidate query or exposing a selected route.
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: message and snapshot types
@@ -119,8 +122,14 @@
 //!   signatures, exact local subject/domain pins, expiry, and local quorum are
 //!   the authority. Never log or return subject ids, attestors, domain tokens,
 //!   signatures, certificate hashes, or selected routes.
+//! - A purpose-aware response is only a candidate contract. For
+//!   `blind_vault_put`, at least one candidate in the complete diverse subset
+//!   must carry `BlindVaultReplica` in its original signed descriptor. Never
+//!   infer terminal eligibility from a flattened JSON field alone.
 //!
 //! ## Last Modified
+//! v0.46.0-OnionRoutePurpose - Added fail-closed, terminal-capability-aware
+//! candidate admission for anonymous Blind Vault ciphertext writes
 //! v0.45.0-RouteDomainCertificateIngress - Added bounded, rate-limited,
 //! verifier-local certificate admission without publishing trust metadata
 //! v0.44.0-PinnedRouteDomainAdmission - Added optional fail-closed multi-hop
@@ -231,6 +240,8 @@ const ROUTE_DOMAIN_CERTIFICATE_RATE_LIMIT_PER_MINUTE: u32 = 60;
 const ONION_CANDIDATES_SOURCE: &str = "rust_discovery_onion_candidates";
 const ONION_CANDIDATES_SELECTION_POLICY: &str =
     "fresh_routeable_signed_chat_relays_with_kem_public_key";
+const ONION_REQUIRED_CAPABILITIES: [NodeCapability; 2] =
+    [NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
 const ONION_CANDIDATES_REFRESH_AFTER_SECONDS: u64 = 300;
 const ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS: u64 = 1_800;
 const ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES: usize = 2;
@@ -391,6 +402,10 @@ struct SnapshotQuery {
 #[derive(Debug, Deserialize)]
 struct OnionCandidatesQuery {
     limit: Option<usize>,
+    /// Optional route purpose. Omitted keeps the historical message-relay
+    /// contract. Unknown values fail closed instead of silently downgrading a
+    /// storage request into ordinary message delivery.
+    purpose: Option<String>,
     /// Optional product privacy mode requested by the client.
     ///
     /// Stable values are `standard`, `enhanced`, and `high`. Unknown values
@@ -412,6 +427,18 @@ enum OnionPrivacyMode {
     High,
 }
 
+/// Client-declared purpose for terminal-role admission.
+///
+/// [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] The purpose never selects a node.
+/// It changes only the signed capability required of at least one terminal in
+/// the eligible candidate subset. Unknown input remains explicit and unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnionRoutePurpose {
+    MessageRelay,
+    BlindVaultPut,
+    Unsupported,
+}
+
 /// Internal fail-closed gates for the path requested by an App or SDK.
 ///
 /// [ONION-PATH-ADMISSION 2026-08-02 by Codex] Candidate availability,
@@ -421,6 +448,8 @@ enum OnionPrivacyMode {
 /// only and must never carry selected relays or route metadata.
 #[derive(Debug, Clone, Copy)]
 struct OnionRequestedPathGates {
+    purpose_supported: bool,
+    terminal_capability_ready: bool,
     candidate_pool_ready: bool,
     network_diversity_required: bool,
     network_diversity_ready: bool,
@@ -432,13 +461,105 @@ struct OnionRequestedPathGates {
     restart_continuity_ready: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OnionPurposeAdmission {
+    supported: bool,
+    terminal_capability_ready: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OnionRequirementGate {
+    required: bool,
+    ready: bool,
+}
+
+/// [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Named admission inputs prevent
+/// purpose and policy booleans from being reordered accidentally at the
+/// two-hop and three-hop call sites.
+#[derive(Debug, Clone, Copy)]
+struct OnionCandidateAdmissionInput {
+    purpose: OnionPurposeAdmission,
+    candidate_pool_ready: bool,
+    network_diversity_ready: bool,
+    pinned_route_domain: OnionRequirementGate,
+}
+
 impl OnionRequestedPathGates {
-    fn ready(self) -> bool {
-        self.candidate_pool_ready
+    const fn ready(self) -> bool {
+        self.purpose_supported
+            && self.terminal_capability_ready
+            && self.candidate_pool_ready
             && (!self.network_diversity_required || self.network_diversity_ready)
             && (!self.pinned_route_domain_required || self.pinned_route_domain_ready)
             && (!self.runtime_proof_required || self.runtime_proof_ready)
             && (!self.restart_continuity_required || self.restart_continuity_ready)
+    }
+}
+
+impl OnionRoutePurpose {
+    fn from_query(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or("message_relay")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "message" | "message_relay" | "message-relay" | "chat" => Self::MessageRelay,
+            "blind_vault" | "blind-vault" | "blind_vault_put" | "blind-vault-put" => {
+                Self::BlindVaultPut
+            }
+            _ => Self::Unsupported,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MessageRelay => "message_relay",
+            Self::BlindVaultPut => "blind_vault_put",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    const fn is_supported(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+
+    const fn specialized_terminal_capability(self) -> Option<NodeCapability> {
+        match self {
+            Self::BlindVaultPut => Some(NodeCapability::BlindVaultReplica),
+            Self::MessageRelay | Self::Unsupported => None,
+        }
+    }
+
+    fn terminal_required_capabilities(self) -> Vec<NodeCapability> {
+        if !self.is_supported() {
+            return Vec::new();
+        }
+        let mut capabilities = onion_required_capabilities();
+        if let Some(capability) = self.specialized_terminal_capability() {
+            capabilities.push(capability);
+        }
+        capabilities
+    }
+
+    fn terminal_candidate_matches(self, candidate: &OnionRelayCandidate) -> bool {
+        self.is_supported()
+            && ONION_REQUIRED_CAPABILITIES.iter().all(|required| {
+                candidate
+                    .signed_descriptor
+                    .descriptor
+                    .capabilities
+                    .contains(required)
+            })
+            && self
+                .specialized_terminal_capability()
+                .map_or(true, |required| {
+                    candidate
+                        .signed_descriptor
+                        .descriptor
+                        .capabilities
+                        .contains(&required)
+                })
     }
 }
 
@@ -456,7 +577,7 @@ impl OnionPrivacyMode {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
             Self::Enhanced => "enhanced",
@@ -464,7 +585,7 @@ impl OnionPrivacyMode {
         }
     }
 
-    fn default_hops(self) -> u8 {
+    const fn default_hops(self) -> u8 {
         match self {
             Self::Standard => 1,
             Self::Enhanced => 2,
@@ -514,7 +635,15 @@ pub struct OnionRelayCandidate {
 }
 
 fn onion_required_capabilities() -> Vec<NodeCapability> {
-    vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle]
+    ONION_REQUIRED_CAPABILITIES.to_vec()
+}
+
+fn default_onion_route_purpose() -> String {
+    OnionRoutePurpose::MessageRelay.as_str().to_string()
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Response for `GET /api/discovery/onion-candidates`.
@@ -533,6 +662,24 @@ pub struct OnionCandidatesResponse {
     /// the existing `onion_candidates.v1` response for older clients.
     #[serde(default = "onion_required_capabilities")]
     pub required_capabilities: Vec<NodeCapability>,
+    /// Normalized terminal purpose requested by the client.
+    #[serde(default = "default_onion_route_purpose")]
+    pub requested_purpose: String,
+    /// Whether the requested purpose is implemented by this contract.
+    #[serde(default = "default_true")]
+    pub requested_purpose_supported: bool,
+    /// Signed capabilities required of the terminal selected by the client.
+    /// Middle relays need only `required_capabilities`.
+    #[serde(default = "onion_required_capabilities")]
+    pub terminal_required_capabilities: Vec<NodeCapability>,
+    /// Number of returned candidates whose original signed descriptor satisfies
+    /// the complete terminal capability contract.
+    #[serde(default)]
+    pub terminal_candidate_count: usize,
+    /// Whether at least one returned candidate can serve as the requested
+    /// terminal. Older responses default true for backward compatibility.
+    #[serde(default = "default_true")]
+    pub requested_terminal_capability_ready: bool,
     /// Number of candidates returned.
     pub count: usize,
     /// Minimum unique candidates required for a client-planned two-hop path.
@@ -593,16 +740,18 @@ pub struct OnionCandidatesResponse {
     pub fallback_required: bool,
     /// Aggregate requested-path maturity bucket.
     ///
-    /// Stable values are `ready`, `diversity_limited`, `proof_warming`,
-    /// `continuity_warming`, `warming`, `empty`, or `client_limited`.
+    /// Stable values include `ready`, `unsupported_purpose`, `terminal_limited`,
+    /// `diversity_limited`, `proof_warming`, `continuity_warming`, `warming`,
+    /// `empty`, or `client_limited`.
     /// This lets App, nodeboard, backend aggregation, and AI-agent runbooks
     /// distinguish a usable pool from a partial pool without inspecting
     /// individual relay metadata.
     pub pool_status: String,
     /// Privacy-safe route plan recommendation for clients.
     ///
-    /// Stable values are `three_hop_onion_path`, `two_hop_onion_path`,
-    /// `single_hop_encrypted_relay`, or `standard_relay_fallback`.
+    /// Stable values include `three_hop_onion_path`, `two_hop_onion_path`,
+    /// `single_hop_encrypted_relay`, `standard_relay_fallback`,
+    /// `defer_specialized_delivery`, or `reject_unsupported_purpose`.
     /// The server never returns route ids, selected path ids, receiver
     /// identities, payload metadata, or client information here.
     pub route_plan: String,
@@ -2260,6 +2409,8 @@ async fn onion_candidates_handler(
 ) -> Json<OnionCandidatesResponse> {
     let now = now_secs();
     let limit = state.policy.snapshot_limit(query.limit);
+    let requested_purpose = OnionRoutePurpose::from_query(query.purpose.as_deref());
+    let specialized_terminal_capability = requested_purpose.specialized_terminal_capability();
     let requested_privacy_mode = OnionPrivacyMode::from_query(query.privacy_mode.as_deref());
     let requested_hops = normalize_requested_hops(requested_privacy_mode, query.hops);
     let pinned_route_domain_required =
@@ -2347,72 +2498,114 @@ async fn onion_candidates_handler(
     // Preserve a diverse requested path before applying a small response
     // limit, then let the client independently choose the actual route.
     let eligible_candidate_count = eligible_candidates.len();
-    let candidates = select_onion_candidate_response_pool_with_policy(
+    let candidates = select_onion_candidate_response_pool_with_policy_and_terminal(
         eligible_candidates,
         limit,
         requested_hops as usize,
         &state.policy,
         pinned_route_domain_required,
+        specialized_terminal_capability,
     );
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
     let min_candidates_for_requested_hops = requested_hops as usize;
+    let terminal_candidate_count = candidates
+        .iter()
+        .filter(|candidate| requested_purpose.terminal_candidate_matches(candidate))
+        .count();
+    let requested_terminal_capability_ready = terminal_candidate_count > 0;
+    // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] The legacy message purpose has
+    // no terminal role beyond the base candidate contract. Its empty-pool
+    // state must therefore remain `no_routeable_candidates`; only a purpose
+    // with an additional signed terminal capability uses the new terminal
+    // readiness gate.
+    let terminal_capability_gate_ready =
+        specialized_terminal_capability.is_none() || requested_terminal_capability_ready;
+    let purpose_admission = OnionPurposeAdmission {
+        supported: requested_purpose.is_supported(),
+        terminal_capability_ready: terminal_capability_gate_ready,
+    };
     // [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] Legacy builders have no
     // entry context and retain their historical pairwise behavior. Production
     // builders inject an id and fail multi-hop readiness closed until its
     // signed descriptor can be resolved and used for entry anti-affinity.
     let local_entry_context_ready = state.local_node_id.is_none() || local_descriptor.is_some();
     let requested_network_diversity_ready = local_entry_context_ready
-        && onion_candidate_network_diversity_ready(&candidates, min_candidates_for_requested_hops);
+        && onion_candidate_route_diversity_ready_for_terminal(
+            &candidates,
+            min_candidates_for_requested_hops,
+            &DiscoveryApiPolicy::default(),
+            false,
+            specialized_terminal_capability,
+        );
     let local_entry_pinned_route_domain_enforced =
         state.local_node_id.is_some() && local_pinned_route_domain.is_some();
     let requested_pinned_route_domain_ready = !pinned_route_domain_required
         || (local_entry_pinned_route_domain_enforced
-            && onion_candidate_route_diversity_ready(
+            && onion_candidate_route_diversity_ready_for_terminal(
                 &candidates,
                 min_candidates_for_requested_hops,
                 &state.policy,
                 true,
+                specialized_terminal_capability,
             ));
     let peer_status = state.peer_store.status(now);
     let requested_path_gates = onion_requested_path_gates(
         &peer_status,
         requested_hops,
-        limit >= min_candidates_for_requested_hops
-            && eligible_candidate_count >= min_candidates_for_requested_hops,
-        requested_network_diversity_ready,
-        pinned_route_domain_required,
-        requested_pinned_route_domain_ready,
+        OnionCandidateAdmissionInput {
+            purpose: purpose_admission,
+            candidate_pool_ready: limit >= min_candidates_for_requested_hops
+                && eligible_candidate_count >= min_candidates_for_requested_hops,
+            network_diversity_ready: requested_network_diversity_ready,
+            pinned_route_domain: OnionRequirementGate {
+                required: pinned_route_domain_required,
+                ready: requested_pinned_route_domain_ready,
+            },
+        },
     );
     let requested_path_ready = requested_path_gates.ready();
     let two_hop_network_diversity_ready = local_entry_context_ready
-        && onion_candidate_network_diversity_ready(
+        && onion_candidate_route_diversity_ready_for_terminal(
             &candidates,
             ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+            &DiscoveryApiPolicy::default(),
+            false,
+            specialized_terminal_capability,
         );
     let two_hop_fallback_ready = requested_hops > 2
         && onion_requested_path_gates(
             &peer_status,
             2,
-            limit >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
-                && eligible_candidate_count >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
-            two_hop_network_diversity_ready,
-            state.policy.require_pinned_route_domains_for_multi_hop,
-            !state.policy.require_pinned_route_domains_for_multi_hop
-                || (local_entry_pinned_route_domain_enforced
-                    && onion_candidate_route_diversity_ready(
-                        &candidates,
-                        ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
-                        &state.policy,
-                        true,
-                    )),
+            OnionCandidateAdmissionInput {
+                purpose: purpose_admission,
+                candidate_pool_ready: limit >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+                    && eligible_candidate_count >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+                network_diversity_ready: two_hop_network_diversity_ready,
+                pinned_route_domain: OnionRequirementGate {
+                    required: state.policy.require_pinned_route_domains_for_multi_hop,
+                    ready: !state.policy.require_pinned_route_domains_for_multi_hop
+                        || (local_entry_pinned_route_domain_enforced
+                            && onion_candidate_route_diversity_ready_for_terminal(
+                                &candidates,
+                                ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
+                                &state.policy,
+                                true,
+                                specialized_terminal_capability,
+                            )),
+                },
+            },
         )
         .ready();
-    let recommended_hops = recommended_onion_hops(
-        candidates.len(),
-        requested_hops,
-        requested_path_ready,
-        two_hop_fallback_ready,
-    );
+    let recommended_hops = if requested_purpose.is_supported() && terminal_capability_gate_ready {
+        recommended_onion_hops(
+            candidates.len(),
+            requested_hops,
+            requested_path_ready,
+            two_hop_fallback_ready,
+        )
+    } else {
+        0
+    };
     let fallback_reason = onion_candidate_fallback_reason(
         candidates.len(),
         limit,
@@ -2425,8 +2618,12 @@ async fn onion_candidates_handler(
         min_candidates_for_requested_hops,
         requested_path_gates,
     );
-    let route_plan =
-        onion_candidate_route_plan(requested_path_ready, requested_hops, recommended_hops);
+    let route_plan = onion_candidate_route_plan(
+        requested_path_ready,
+        requested_hops,
+        recommended_hops,
+        fallback_reason,
+    );
     let readiness_reason = onion_candidate_readiness_reason(
         candidates.len(),
         limit,
@@ -2441,6 +2638,11 @@ async fn onion_candidates_handler(
         contract_version: ONION_CANDIDATES_CONTRACT_VERSION.to_string(),
         source: ONION_CANDIDATES_SOURCE.to_string(),
         required_capabilities: onion_required_capabilities(),
+        requested_purpose: requested_purpose.as_str().to_string(),
+        requested_purpose_supported: requested_purpose.is_supported(),
+        terminal_required_capabilities: requested_purpose.terminal_required_capabilities(),
+        terminal_candidate_count,
+        requested_terminal_capability_ready,
         count: candidates.len(),
         min_candidates_for_two_hop: ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
         two_hop_ready,
@@ -2509,10 +2711,7 @@ fn normalize_requested_hops(mode: OnionPrivacyMode, requested: Option<u8>) -> u8
 fn onion_requested_path_gates(
     status: &PeerStoreStatus,
     requested_hops: u8,
-    candidate_pool_ready: bool,
-    network_diversity_ready: bool,
-    pinned_route_domain_required: bool,
-    pinned_route_domain_ready: bool,
+    admission: OnionCandidateAdmissionInput,
 ) -> OnionRequestedPathGates {
     let network_diversity_required = requested_hops >= 2;
     let runtime_proof_required = requested_hops >= 2;
@@ -2544,11 +2743,13 @@ fn onion_requested_path_gates(
     };
 
     OnionRequestedPathGates {
-        candidate_pool_ready,
+        purpose_supported: admission.purpose.supported,
+        terminal_capability_ready: admission.purpose.terminal_capability_ready,
+        candidate_pool_ready: admission.candidate_pool_ready,
         network_diversity_required,
-        network_diversity_ready,
-        pinned_route_domain_required,
-        pinned_route_domain_ready,
+        network_diversity_ready: admission.network_diversity_ready,
+        pinned_route_domain_required: admission.pinned_route_domain.required,
+        pinned_route_domain_ready: admission.pinned_route_domain.ready,
         runtime_proof_required,
         runtime_proof_ready,
         restart_continuity_required,
@@ -2583,31 +2784,85 @@ fn onion_candidates_are_route_diverse(
     }
 }
 
+#[cfg(test)]
 fn onion_candidate_route_diverse_subset_indices(
     candidates: &[OnionRelayCandidate],
     required_hops: usize,
     policy: &DiscoveryApiPolicy,
     require_pinned_route_domains: bool,
 ) -> Option<Vec<usize>> {
+    onion_candidate_route_diverse_subset_indices_for_terminal(
+        candidates,
+        required_hops,
+        policy,
+        require_pinned_route_domains,
+        None,
+    )
+}
+
+fn onion_candidate_supports_specialized_terminal(
+    candidate: &OnionRelayCandidate,
+    specialized_terminal_capability: Option<NodeCapability>,
+) -> bool {
+    specialized_terminal_capability.map_or(true, |required| {
+        candidate
+            .signed_descriptor
+            .descriptor
+            .capabilities
+            .contains(&required)
+    })
+}
+
+#[derive(Clone, Copy)]
+struct OnionTerminalSubsetPolicy<'a> {
+    route_policy: &'a DiscoveryApiPolicy,
+    require_pinned_route_domains: bool,
+    specialized_terminal_capability: Option<NodeCapability>,
+}
+
+/// Finds a diverse candidate subset that includes the required terminal role.
+///
+/// [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] A generic diverse subset is not
+/// sufficient for encrypted storage: the terminal-capable node must itself be
+/// inside that subset. This remains bounded by the existing candidate limit
+/// and returns indices only to the in-process pool constructor.
+fn onion_candidate_route_diverse_subset_indices_for_terminal(
+    candidates: &[OnionRelayCandidate],
+    required_hops: usize,
+    policy: &DiscoveryApiPolicy,
+    require_pinned_route_domains: bool,
+    specialized_terminal_capability: Option<NodeCapability>,
+) -> Option<Vec<usize>> {
     fn search(
         candidates: &[OnionRelayCandidate],
         start: usize,
         remaining: usize,
         selected: &mut Vec<usize>,
-        policy: &DiscoveryApiPolicy,
-        require_pinned_route_domains: bool,
+        subset_policy: OnionTerminalSubsetPolicy<'_>,
+        terminal_satisfied: bool,
     ) -> bool {
         if remaining == 0 {
-            return true;
+            return terminal_satisfied;
         }
         if candidates.len().saturating_sub(start) < remaining {
+            return false;
+        }
+        if !terminal_satisfied
+            && !candidates[start..].iter().any(|candidate| {
+                onion_candidate_supports_specialized_terminal(
+                    candidate,
+                    subset_policy.specialized_terminal_capability,
+                )
+            })
+        {
             return false;
         }
 
         for index in start..candidates.len() {
             let candidate = &candidates[index];
-            if require_pinned_route_domains
-                && policy
+            if subset_policy.require_pinned_route_domains
+                && subset_policy
+                    .route_policy
                     .pinned_route_domain(&candidate.signed_descriptor.node_id())
                     .is_none()
             {
@@ -2617,20 +2872,24 @@ fn onion_candidate_route_diverse_subset_indices(
                 !onion_candidates_are_route_diverse(
                     candidate,
                     &candidates[*selected_index],
-                    policy,
-                    require_pinned_route_domains,
+                    subset_policy.route_policy,
+                    subset_policy.require_pinned_route_domains,
                 )
             }) {
                 continue;
             }
+            let candidate_satisfies_terminal = onion_candidate_supports_specialized_terminal(
+                candidate,
+                subset_policy.specialized_terminal_capability,
+            );
             selected.push(index);
             if search(
                 candidates,
                 index + 1,
                 remaining - 1,
                 selected,
-                policy,
-                require_pinned_route_domains,
+                subset_policy,
+                terminal_satisfied || candidate_satisfies_terminal,
             ) {
                 return true;
             }
@@ -2639,8 +2898,13 @@ fn onion_candidate_route_diverse_subset_indices(
         false
     }
 
+    let subset_policy = OnionTerminalSubsetPolicy {
+        route_policy: policy,
+        require_pinned_route_domains,
+        specialized_terminal_capability,
+    };
     if required_hops == 0 {
-        return Some(Vec::new());
+        return specialized_terminal_capability.is_none().then(Vec::new);
     }
     if candidates.len() < required_hops {
         return None;
@@ -2651,8 +2915,8 @@ fn onion_candidate_route_diverse_subset_indices(
         0,
         required_hops,
         &mut selected,
-        policy,
-        require_pinned_route_domains,
+        subset_policy,
+        specialized_terminal_capability.is_none(),
     ) {
         Some(selected)
     } else {
@@ -2660,6 +2924,7 @@ fn onion_candidate_route_diverse_subset_indices(
     }
 }
 
+#[cfg(test)]
 fn onion_candidate_network_diverse_subset_indices(
     candidates: &[OnionRelayCandidate],
     required_hops: usize,
@@ -2672,6 +2937,7 @@ fn onion_candidate_network_diverse_subset_indices(
     )
 }
 
+#[cfg(test)]
 fn onion_candidate_network_diversity_ready(
     candidates: &[OnionRelayCandidate],
     required_hops: usize,
@@ -2679,17 +2945,19 @@ fn onion_candidate_network_diversity_ready(
     onion_candidate_network_diverse_subset_indices(candidates, required_hops).is_some()
 }
 
-fn onion_candidate_route_diversity_ready(
+fn onion_candidate_route_diversity_ready_for_terminal(
     candidates: &[OnionRelayCandidate],
     required_hops: usize,
     policy: &DiscoveryApiPolicy,
     require_pinned_route_domains: bool,
+    specialized_terminal_capability: Option<NodeCapability>,
 ) -> bool {
-    onion_candidate_route_diverse_subset_indices(
+    onion_candidate_route_diverse_subset_indices_for_terminal(
         candidates,
         required_hops,
         policy,
         require_pinned_route_domains,
+        specialized_terminal_capability,
     )
     .is_some()
 }
@@ -2718,6 +2986,7 @@ fn select_onion_candidate_response_pool(
     )
 }
 
+#[cfg(test)]
 fn select_onion_candidate_response_pool_with_policy(
     candidates: Vec<OnionRelayCandidate>,
     limit: usize,
@@ -2725,38 +2994,84 @@ fn select_onion_candidate_response_pool_with_policy(
     policy: &DiscoveryApiPolicy,
     require_pinned_route_domains: bool,
 ) -> Vec<OnionRelayCandidate> {
-    if candidates.len() <= limit {
-        if !require_pinned_route_domains {
-            return candidates;
-        }
+    select_onion_candidate_response_pool_with_policy_and_terminal(
+        candidates,
+        limit,
+        requested_hops,
+        policy,
+        require_pinned_route_domains,
+        None,
+    )
+}
+
+fn select_onion_candidate_response_pool_with_policy_and_terminal(
+    candidates: Vec<OnionRelayCandidate>,
+    limit: usize,
+    requested_hops: usize,
+    policy: &DiscoveryApiPolicy,
+    require_pinned_route_domains: bool,
+    specialized_terminal_capability: Option<NodeCapability>,
+) -> Vec<OnionRelayCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if candidates.len() <= limit && !require_pinned_route_domains {
+        return candidates;
     }
 
-    let requested_subset = (requested_hops >= 2 && limit >= requested_hops)
+    let requested_subset = ((requested_hops >= 2 || specialized_terminal_capability.is_some())
+        && limit >= requested_hops)
         .then(|| {
-            onion_candidate_route_diverse_subset_indices(
+            onion_candidate_route_diverse_subset_indices_for_terminal(
                 &candidates,
                 requested_hops,
                 policy,
                 require_pinned_route_domains,
+                specialized_terminal_capability,
             )
         })
         .flatten();
     let fallback_subset = (requested_hops > ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
         && limit >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES)
         .then(|| {
-            onion_candidate_route_diverse_subset_indices(
+            onion_candidate_route_diverse_subset_indices_for_terminal(
                 &candidates,
                 ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
                 policy,
                 require_pinned_route_domains,
+                specialized_terminal_capability,
             )
         })
         .flatten();
-    let preferred_indices = requested_subset.or(fallback_subset).unwrap_or_default();
+    // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Preserve one healthy
+    // specialized terminal even when the requested multi-hop subset is not
+    // yet mature. This keeps purpose readiness observable under a small client
+    // limit; route gates still defer delivery until the requested path is safe.
+    let terminal_fallback = specialized_terminal_capability.and_then(|_| {
+        candidates
+            .iter()
+            .position(|candidate| {
+                onion_candidate_supports_specialized_terminal(
+                    candidate,
+                    specialized_terminal_capability,
+                ) && (!require_pinned_route_domains
+                    || policy
+                        .pinned_route_domain(&candidate.signed_descriptor.node_id())
+                        .is_some())
+            })
+            .map(|index| vec![index])
+    });
+    let preferred_indices = requested_subset
+        .or(fallback_subset)
+        .or(terminal_fallback)
+        .unwrap_or_default();
 
     let mut selected = Vec::with_capacity(limit.min(candidates.len()));
     let mut included = vec![false; candidates.len()];
     for index in preferred_indices {
+        if selected.len() >= limit {
+            break;
+        }
         if let Some(candidate) = candidates.get(index) {
             included[index] = true;
             selected.push(candidate.clone());
@@ -2815,7 +3130,11 @@ fn onion_candidate_pool_status(
     required_candidates: usize,
     gates: OnionRequestedPathGates,
 ) -> &'static str {
-    if limit < required_candidates {
+    if !gates.purpose_supported {
+        "unsupported_purpose"
+    } else if !gates.terminal_capability_ready {
+        "terminal_limited"
+    } else if limit < required_candidates {
         "client_limited"
     } else if gates.pinned_route_domain_required && !gates.pinned_route_domain_ready {
         "routing_domain_limited"
@@ -2840,8 +3159,13 @@ fn onion_candidate_route_plan(
     requested_path_ready: bool,
     requested_hops: u8,
     recommended_hops: u8,
+    fallback_reason: &str,
 ) -> &'static str {
-    if !requested_path_ready && requested_hops > 2 && recommended_hops == 2 {
+    if fallback_reason == "unsupported_route_purpose" {
+        "reject_unsupported_purpose"
+    } else if fallback_reason == "requested_terminal_capability_not_ready" {
+        "defer_specialized_delivery"
+    } else if !requested_path_ready && requested_hops > 2 && recommended_hops == 2 {
         "two_hop_onion_path"
     } else if !requested_path_ready {
         "standard_relay_fallback"
@@ -2862,7 +3186,11 @@ fn onion_candidate_fallback_reason(
     required_candidates: usize,
     gates: OnionRequestedPathGates,
 ) -> &'static str {
-    if limit < required_candidates {
+    if !gates.purpose_supported {
+        "unsupported_route_purpose"
+    } else if !gates.terminal_capability_ready {
+        "requested_terminal_capability_not_ready"
+    } else if limit < required_candidates {
         if required_candidates == ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES {
             "client_limit_below_two_hop_minimum"
         } else {
@@ -2904,6 +3232,10 @@ fn onion_candidate_readiness_reason(
                 "requested_onion_candidate_pool_ready"
             }
         }
+        "unsupported_route_purpose" => "requested_route_purpose_is_not_supported",
+        "requested_terminal_capability_not_ready" => {
+            "waiting_for_routeable_signed_terminal_capability"
+        }
         "client_limit_below_two_hop_minimum" => "client_limit_blocks_two_hop_pool",
         "client_limit_below_requested_hops" => "client_limit_blocks_requested_hops",
         "no_routeable_candidates" => "waiting_for_routeable_kem_relays",
@@ -2927,7 +3259,11 @@ fn onion_candidate_next_action(
     recommended_hops: u8,
     fallback_reason: &str,
 ) -> &'static str {
-    if requested_path_ready {
+    if fallback_reason == "unsupported_route_purpose" {
+        "reject the unsupported route purpose without sending the payload"
+    } else if fallback_reason == "requested_terminal_capability_not_ready" {
+        "keep the ciphertext queued locally and refresh until an admitted terminal is routeable"
+    } else if requested_path_ready {
         "build a weighted-random onion path with fresh distinct candidates"
     } else if recommended_hops == 2
         && fallback_reason == "requested_path_pinned_route_domain_not_ready"
@@ -3414,6 +3750,15 @@ mod tests {
         expires_at: u64,
         endpoint: &str,
     ) -> SignedNodeDescriptor {
+        signed_routeable_chat_descriptor_with_capabilities(sequence, expires_at, endpoint, &[])
+    }
+
+    fn signed_routeable_chat_descriptor_with_capabilities(
+        sequence: u64,
+        expires_at: u64,
+        endpoint: &str,
+        additional_capabilities: &[NodeCapability],
+    ) -> SignedNodeDescriptor {
         let kp = IdentityKeyPair::generate();
         let issued_at = now_secs().saturating_sub(1);
         let mut descriptor = NodeDescriptor::new(
@@ -3430,6 +3775,11 @@ mod tests {
             NodeCapability::ChatRelay,
             NodeCapability::OnionMiddle,
         ];
+        for capability in additional_capabilities {
+            if !descriptor.capabilities.contains(capability) {
+                descriptor.capabilities.push(*capability);
+            }
+        }
         descriptor.capacity = NodeCapacity {
             max_sessions: 128,
             max_bps: Some(500_000_000),
@@ -3440,7 +3790,20 @@ mod tests {
     }
 
     fn onion_candidate_for_test(endpoint: &str, rank: usize) -> OnionRelayCandidate {
-        let signed_descriptor = signed_routeable_chat_descriptor(1, now_secs() + 300, endpoint);
+        onion_candidate_for_test_with_capabilities(endpoint, rank, &[])
+    }
+
+    fn onion_candidate_for_test_with_capabilities(
+        endpoint: &str,
+        rank: usize,
+        additional_capabilities: &[NodeCapability],
+    ) -> OnionRelayCandidate {
+        let signed_descriptor = signed_routeable_chat_descriptor_with_capabilities(
+            1,
+            now_secs() + 300,
+            endpoint,
+            additional_capabilities,
+        );
         let descriptor = &signed_descriptor.descriptor;
         OnionRelayCandidate {
             node_id: hex::encode(signed_descriptor.node_id()),
@@ -3636,6 +3999,14 @@ mod tests {
             parsed.required_capabilities,
             vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle]
         );
+        assert_eq!(parsed.requested_purpose, "message_relay");
+        assert!(parsed.requested_purpose_supported);
+        assert_eq!(
+            parsed.terminal_required_capabilities,
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle]
+        );
+        assert_eq!(parsed.terminal_candidate_count, 1);
+        assert!(parsed.requested_terminal_capability_ready);
         assert_eq!(parsed.selection_policy, ONION_CANDIDATES_SELECTION_POLICY);
         assert_eq!(
             parsed.candidate_verification,
@@ -4086,6 +4457,137 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn test_bounded_onion_pool_preserves_signed_specialized_terminal() {
+        let candidates = vec![
+            onion_candidate_for_test("https://192.0.2.10:8422", 0),
+            onion_candidate_for_test("https://198.51.100.10:8422", 1),
+            onion_candidate_for_test_with_capabilities(
+                "https://203.0.113.10:8422",
+                2,
+                &[NodeCapability::BlindVaultReplica],
+            ),
+        ];
+
+        let selected = select_onion_candidate_response_pool_with_policy_and_terminal(
+            candidates,
+            2,
+            2,
+            &DiscoveryApiPolicy::default(),
+            false,
+            Some(NodeCapability::BlindVaultReplica),
+        );
+
+        // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] A healthier generic pair
+        // must not hide the only signed storage terminal under a small limit.
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().any(|candidate| {
+            candidate.public_endpoint == "https://203.0.113.10:8422"
+                && candidate
+                    .signed_descriptor
+                    .descriptor
+                    .capabilities
+                    .contains(&NodeCapability::BlindVaultReplica)
+        }));
+        assert!(onion_candidate_route_diversity_ready_for_terminal(
+            &selected,
+            2,
+            &DiscoveryApiPolicy::default(),
+            false,
+            Some(NodeCapability::BlindVaultReplica),
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_onion_candidates_route_purpose_fails_closed_without_terminal() {
+        let store = Arc::new(PeerStore::new());
+        let now = now_secs();
+        let descriptor =
+            signed_routeable_chat_descriptor(1, now + 300, "https://198.51.100.10:8422");
+        let node_id = descriptor.node_id();
+        store.upsert_verified(descriptor, now).unwrap();
+        store.record_route_forward_success(&node_id, now);
+        let app = build_discovery_router(store, DiscoveryApiPolicy::default());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?purpose=blind_vault_put&hops=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.requested_purpose, "blind_vault_put");
+        assert!(parsed.requested_purpose_supported);
+        assert!(parsed
+            .terminal_required_capabilities
+            .contains(&NodeCapability::BlindVaultReplica));
+        assert_eq!(parsed.terminal_candidate_count, 0);
+        assert!(!parsed.requested_terminal_capability_ready);
+        assert!(!parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 0);
+        assert_eq!(parsed.pool_status, "terminal_limited");
+        assert_eq!(parsed.route_plan, "defer_specialized_delivery");
+        assert_eq!(
+            parsed.fallback_reason,
+            "requested_terminal_capability_not_ready"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates?purpose=unknown_storage_mode")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.requested_purpose, "unsupported");
+        assert!(!parsed.requested_purpose_supported);
+        assert!(parsed.terminal_required_capabilities.is_empty());
+        assert!(!parsed.requested_path_ready);
+        assert_eq!(parsed.recommended_hops, 0);
+        assert_eq!(parsed.pool_status, "unsupported_purpose");
+        assert_eq!(parsed.route_plan, "reject_unsupported_purpose");
+        assert_eq!(parsed.fallback_reason, "unsupported_route_purpose");
+
+        let empty_app =
+            build_discovery_router(Arc::new(PeerStore::new()), DiscoveryApiPolicy::default());
+        let response = empty_app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/discovery/onion-candidates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: OnionCandidatesResponse = serde_json::from_slice(&body).unwrap();
+        // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] The additive purpose gate
+        // must preserve the legacy message-relay diagnosis for an empty pool.
+        assert_eq!(parsed.requested_purpose, "message_relay");
+        assert!(!parsed.requested_terminal_capability_ready);
+        assert_eq!(parsed.pool_status, "empty");
+        assert_eq!(parsed.fallback_reason, "no_routeable_candidates");
     }
 
     #[tokio::test]
