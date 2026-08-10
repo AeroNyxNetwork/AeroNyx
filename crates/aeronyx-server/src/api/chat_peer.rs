@@ -132,8 +132,13 @@
 //! - Receipt v2 purpose separation must stay inside the opaque commitment.
 //!   Do not add a clear workload label to the propagated ACK: low-cardinality
 //!   route purpose would become visible metadata at every middle hop.
+//! - [ROUTE-SUCCESS-SURFACE-BINDING 2026-08-10 by Codex] Successful next-hop
+//!   forwarding must be recorded against the exact descriptor used to build
+//!   the request URL; a concurrent endpoint/KEM rotation must fail closed.
 //!
 //! ## Last Modified
+//! v0.32.0-RouteSuccessSurfaceBinding - Bound next-hop success observations to
+//! the exact signed descriptor used for each opaque forward
 //! v0.31.0-PurposeBoundReceipt - Sign terminal workload into opaque receipt v2 commitments
 //! v0.30.0-BlindVaultRetryClass - Stop retrying permanently invalid anonymous
 //! writes while preserving coarse capacity and availability failover signals
@@ -1106,9 +1111,9 @@ async fn process_peer_blind_relay(
         return Err(error);
     }
 
-    state
+    let _ = state
         .peer_store
-        .record_route_forward_success(&next_hop, now);
+        .record_route_forward_success_for_descriptor(&descriptor, now);
     record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
     state
         .peer_store
@@ -1344,9 +1349,9 @@ async fn process_onion_blind_relay(
                 }
             };
 
-            state
+            let _ = state
                 .peer_store
-                .record_route_forward_success(&next_hop, now);
+                .record_route_forward_success_for_descriptor(&descriptor, now);
             record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
             state
                 .peer_store
@@ -1529,9 +1534,9 @@ async fn process_onion_middle_blind_relay(
         }
     };
 
-    state
+    let _ = state
         .peer_store
-        .record_route_forward_success(&next_hop, now);
+        .record_route_forward_success_for_descriptor(&descriptor, now);
     record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
     state
         .peer_store

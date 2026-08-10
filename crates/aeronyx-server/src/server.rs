@@ -313,6 +313,9 @@
 // 120. [RECEIPT-EVIDENCE-SURFACE-BINDING 2026-08-10 by Codex] Records v2
 //      receipt authority against the exact signed descriptors used by each
 //      verified route so concurrent endpoint/KEM rotation fails closed.
+// 121. [ROUTE-SUCCESS-SURFACE-BINDING 2026-08-10 by Codex] Binds successful
+//      probe and encrypted-forward observations to the signed descriptor used
+//      for the request so stale endpoints cannot authorize a rotated route.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -432,6 +435,8 @@
 //     public onion pools can exclude candidates collocated with the entry.
 //
 // Last Modified:
+//   v2.8.72-RouteSuccessSurfaceBinding - Bound probe and live forward success
+//     to the selected signed route surface instead of node identity alone.
 //   v2.8.71-ReceiptEvidenceSurfaceBinding - Bound verified receipt evidence to
 //     the selected signed route descriptors instead of node identity alone.
 //   v2.8.70-PurposeBoundReceiptNegotiation - Prevented v1-only relay framing
@@ -8894,7 +8899,8 @@ impl Server {
                 {
                     Ok(ack) if ack.accepted => {
                         peer_store.record_blind_relay_probe_result(now, true, "accepted");
-                        peer_store.record_route_forward_success(&next_hop, now);
+                        let _ = peer_store
+                            .record_route_forward_success_for_descriptor(&candidate, now);
                     }
                     Ok(_ack) => {
                         peer_store.record_blind_relay_probe_result(now, false, "ack_rejected");
@@ -9095,7 +9101,8 @@ impl Server {
                                             2,
                                             1,
                                         );
-                                    peer_store.record_route_forward_success(&middle_node_id, now);
+                                    let _ = peer_store
+                                        .record_route_forward_success_for_descriptor(&middle, now);
                                     return TwoHopBlindRelayProbeOutcome {
                                         attempted: true,
                                         route_accepted: true,
@@ -9115,7 +9122,8 @@ impl Server {
                                         middle_candidate_count,
                                         terminal_candidate_count,
                                     ));
-                                    peer_store.record_route_forward_success(&middle_node_id, now);
+                                    let _ = peer_store
+                                        .record_route_forward_success_for_descriptor(&middle, now);
                                     continue 'terminal_candidates;
                                 }
                                 Ok(_ack) => {
@@ -9273,7 +9281,8 @@ impl Server {
                                     middle_candidate_count,
                                     terminal_candidate_count,
                                 ));
-                                peer_store.record_route_forward_success(&middle_node_id, now);
+                                let _ = peer_store
+                                    .record_route_forward_success_for_descriptor(&middle, now);
                                 continue 'terminal_candidates;
                             }
                             Ok(_ack) => {
@@ -9568,8 +9577,10 @@ impl Server {
                                             3,
                                             2,
                                         );
-                                    peer_store
-                                        .record_route_forward_success(&first_middle_node_id, now);
+                                    let _ = peer_store.record_route_forward_success_for_descriptor(
+                                        &first_middle,
+                                        now,
+                                    );
                                     return TwoHopBlindRelayProbeOutcome {
                                         attempted: true,
                                         route_accepted: true,
@@ -10230,8 +10241,10 @@ impl Server {
                                 .record_purpose_bound_delivery_receipt_capability_for_descriptor(
                                     &terminal, now,
                                 );
-                            peer_store.record_route_forward_success(&middle_node_id, now);
-                            peer_store.record_route_forward_success(&terminal_node_id, now);
+                            let _ = peer_store
+                                .record_route_forward_success_for_descriptor(&middle, now);
+                            let _ = peer_store
+                                .record_route_forward_success_for_descriptor(&terminal, now);
                             peer_store.record_verified_client_onion_delivery(now);
                         }
                         Ok(_) => {
@@ -10346,7 +10359,8 @@ impl Server {
                     {
                         Ok(ack) if ack.accepted => {
                             accepted += 1;
-                            peer_store.record_route_forward_success(&peer_node_id, now);
+                            let _ =
+                                peer_store.record_route_forward_success_for_descriptor(&peer, now);
                         }
                         Ok(_ack) => {
                             let reason = "peer_relay_ack_rejected".to_string();

@@ -191,6 +191,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.78.0-RouteSuccessSurfaceBinding - Bound successful forward evidence to
+//! the exact signed route surface used for the outbound request
 //! v0.77.0-ReceiptEvidenceSurfaceBinding - Bound every purpose-separated v2
 //! receipt observation to the exact signed route surface used by the caller
 //! v0.76.0-ReceiptEvidenceLifecycle - Revoked purpose-bound receipt authority
@@ -4420,6 +4422,38 @@ impl PeerStore {
         );
     }
 
+    /// Runs one evidence write only while the caller's exact signed route
+    /// surface remains current in this store.
+    ///
+    /// [ROUTE-OBSERVATION-SURFACE-BINDING 2026-08-10 by Codex] The peer read
+    /// lock is intentionally held through `observe`. A concurrent descriptor
+    /// upgrade must therefore complete before this comparison (and reject an
+    /// obsolete observation) or afterwards (and invalidate the observation).
+    fn with_current_verified_route_surface<R>(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+        observe: impl FnOnce([u8; 32], String) -> R,
+    ) -> Result<R, &'static str> {
+        let node_id = descriptor.node_id();
+        let expected_fingerprint = descriptor
+            .verify_at(now)
+            .ok()
+            .and_then(|_| Self::descriptor_routeability_surface_fingerprint(descriptor))
+            .ok_or("invalid_expected_route_surface")?;
+
+        let peers = self.peers.read();
+        let current_fingerprint = peers
+            .get(&node_id)
+            .filter(|current| current.verify_at(now).is_ok())
+            .and_then(Self::descriptor_routeability_surface_fingerprint);
+        if current_fingerprint.as_deref() != Some(expected_fingerprint.as_str()) {
+            return Err("route_surface_mismatch");
+        }
+
+        Ok(observe(node_id, expected_fingerprint))
+    }
+
     /// Records that one exact signed peer route surface participated in a
     /// route carrying a valid purpose-bound version-2 terminal receipt.
     ///
@@ -4436,51 +4470,30 @@ impl PeerStore {
         descriptor: &SignedNodeDescriptor,
         now: u64,
     ) -> bool {
-        let node_id = descriptor.node_id();
-        let expected_fingerprint = if descriptor.verify_at(now).is_ok() {
-            Self::descriptor_routeability_surface_fingerprint(descriptor)
-        } else {
-            None
-        };
-        let Some(expected_fingerprint) = expected_fingerprint else {
+        let result = self.with_current_verified_route_surface(
+            descriptor,
+            now,
+            |node_id, route_surface_fingerprint_sha256| {
+                self.purpose_bound_delivery_receipt_capability
+                    .write()
+                    .insert(
+                        node_id,
+                        PurposeBoundDeliveryReceiptEvidence {
+                            observed_at: now,
+                            route_surface_fingerprint_sha256,
+                        },
+                    );
+            },
+        );
+        if let Err(reason) = result {
             self.record_audit_event(
                 now,
                 "blind_relay_purpose_bound_receipt_capability",
                 "rejected",
-                "invalid_expected_route_surface".to_string(),
-            );
-            return false;
-        };
-
-        // Hold the peer read lock through the evidence write. A concurrent
-        // descriptor upgrade must either happen first (and fail this match) or
-        // happen afterwards (and remove this evidence during invalidation).
-        let peers = self.peers.read();
-        let current_surface_matches = peers
-            .get(&node_id)
-            .filter(|current| current.verify_at(now).is_ok())
-            .and_then(Self::descriptor_routeability_surface_fingerprint)
-            .is_some_and(|fingerprint| fingerprint == expected_fingerprint);
-        if !current_surface_matches {
-            drop(peers);
-            self.record_audit_event(
-                now,
-                "blind_relay_purpose_bound_receipt_capability",
-                "rejected",
-                "route_surface_mismatch".to_string(),
+                reason.to_string(),
             );
             return false;
         }
-        self.purpose_bound_delivery_receipt_capability
-            .write()
-            .insert(
-                node_id,
-                PurposeBoundDeliveryReceiptEvidence {
-                    observed_at: now,
-                    route_surface_fingerprint_sha256: expected_fingerprint,
-                },
-            );
-        drop(peers);
         self.record_audit_event(
             now,
             "blind_relay_purpose_bound_receipt_capability",
@@ -4723,20 +4736,65 @@ impl PeerStore {
         self.record_audit_event(now, "blind_relay_quarantine", "limited", detail);
     }
 
-    /// Records successful opaque node-to-node forwarding to a verified next hop.
+    /// Records successful opaque node-to-node forwarding on one exact signed
+    /// route surface.
+    ///
+    /// [ROUTE-SUCCESS-SURFACE-BINDING 2026-08-10 by Codex] Callers must pass
+    /// the descriptor whose endpoint/KEM/capabilities were used by the actual
+    /// request. A concurrent route-surface rotation rejects this observation;
+    /// sequence/TTL-only descriptor refreshes remain compatible.
+    #[must_use]
+    pub fn record_route_forward_success_for_descriptor(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        let node_id = descriptor.node_id();
+        let result = self.with_current_verified_route_surface(
+            descriptor,
+            now,
+            |observed_node_id, route_fingerprint| {
+                let mut route_health = self.route_health.write();
+                let health = route_health.entry(observed_node_id).or_default();
+                health.success_count = health.success_count.saturating_add(1);
+                health.consecutive_failures = 0;
+                health.last_success_at = Some(now);
+                health.last_success_route_fingerprint_sha256 = Some(route_fingerprint);
+                health.quarantine_until = None;
+            },
+        );
+        if let Err(reason) = result {
+            self.record_audit_event(
+                now,
+                "blind_relay_route_health",
+                "rejected",
+                format!(
+                    "node_prefix={} result=ignored reason={reason}",
+                    hex::encode(&node_id[..4])
+                ),
+            );
+            return false;
+        }
+
+        self.record_audit_event(
+            now,
+            "blind_relay_route_health",
+            "accepted",
+            format!("node_prefix={} result=success", hex::encode(&node_id[..4])),
+        );
+        true
+    }
+
+    /// Backward-compatible node-id recorder. New route code must call
+    /// [`Self::record_route_forward_success_for_descriptor`] with the exact
+    /// descriptor whose route surface carried the successful request.
     ///
     /// The key is retained only inside this process for route health scoring.
     /// Public status exposes only a short prefix and aggregate counters. Never
     /// pass route ids, encrypted blobs, client identifiers, endpoint URLs, or
     /// payload-derived details into this method.
     pub fn record_route_forward_success(&self, node_id: &[u8; 32], now: u64) {
-        let route_fingerprint = self
-            .peers
-            .read()
-            .get(node_id)
-            .filter(|descriptor| descriptor.verify_at(now).is_ok())
-            .and_then(Self::descriptor_routeability_surface_fingerprint);
-        let Some(route_fingerprint) = route_fingerprint else {
+        let Some(descriptor) = self.get_valid(node_id, now) else {
             self.record_audit_event(
                 now,
                 "blind_relay_route_health",
@@ -4748,22 +4806,7 @@ impl PeerStore {
             );
             return;
         };
-
-        {
-            let mut route_health = self.route_health.write();
-            let health = route_health.entry(*node_id).or_default();
-            health.success_count = health.success_count.saturating_add(1);
-            health.consecutive_failures = 0;
-            health.last_success_at = Some(now);
-            health.last_success_route_fingerprint_sha256 = Some(route_fingerprint);
-            health.quarantine_until = None;
-        }
-        self.record_audit_event(
-            now,
-            "blind_relay_route_health",
-            "accepted",
-            format!("node_prefix={} result=success", hex::encode(&node_id[..4])),
-        );
+        let _ = self.record_route_forward_success_for_descriptor(&descriptor, now);
     }
 
     /// Records failed opaque node-to-node forwarding to a verified next hop.
@@ -8607,6 +8650,7 @@ mod tests {
     use aeronyx_core::protocol::discovery::{
         NodeCapacity, NodeDescriptor, NodePolicy, RouteDomainAttestationV1, SignedNodeDescriptor,
     };
+    use std::sync::{Arc, Barrier};
 
     fn signed_descriptor(sequence: u64, expires_at: u64) -> SignedNodeDescriptor {
         let kp = IdentityKeyPair::generate();
@@ -9282,6 +9326,96 @@ mod tests {
         // surface must be probed; a prior role's success cannot be inherited.
         assert!(!store.is_routeable_now(&node_id, now + 41));
         assert!(!store.has_fresh_purpose_bound_delivery_receipt_capability(&node_id, now + 41));
+    }
+
+    #[test]
+    fn test_route_success_rejects_non_current_route_surface() {
+        let now = 1_700_000_100;
+        let identity = IdentityKeyPair::generate();
+        let mut original = signed_descriptor_for(&identity, 7, now + 4_000);
+        original.descriptor.public_endpoint = Some("https://route-a.example".to_string());
+        original = SignedNodeDescriptor::sign(original.descriptor, &identity).unwrap();
+        let node_id = original.node_id();
+
+        let store = PeerStore::new();
+        store.upsert_verified(original.clone(), now).unwrap();
+
+        let mut rotated_body = original.descriptor.clone();
+        rotated_body.sequence = 8;
+        rotated_body.issued_at = now + 20;
+        rotated_body.expires_at = now + 4_020;
+        rotated_body.public_endpoint = Some("https://route-b.example".to_string());
+        let rotated = SignedNodeDescriptor::sign(rotated_body, &identity).unwrap();
+        store.upsert_verified(rotated.clone(), now + 20).unwrap();
+
+        assert!(!store.record_route_forward_success_for_descriptor(&original, now + 21));
+        assert!(!store.is_routeable_now(&node_id, now + 21));
+        assert!(store.record_route_forward_success_for_descriptor(&rotated, now + 22));
+        assert!(store.is_routeable_now(&node_id, now + 22));
+
+        let mut refreshed_body = rotated.descriptor.clone();
+        refreshed_body.sequence = 9;
+        refreshed_body.issued_at = now + 30;
+        refreshed_body.expires_at = now + 4_030;
+        let refreshed = SignedNodeDescriptor::sign(refreshed_body, &identity).unwrap();
+        store.upsert_verified(refreshed, now + 30).unwrap();
+
+        // Sequence/validity refreshes preserve the same signed routing surface.
+        assert!(store.record_route_forward_success_for_descriptor(&rotated, now + 31));
+        assert!(store.is_routeable_now(&node_id, now + 31));
+    }
+
+    #[test]
+    fn test_route_success_and_surface_rotation_are_atomic() {
+        let now = 1_700_000_100;
+        let identity = IdentityKeyPair::generate();
+        let mut original = signed_descriptor_for(&identity, 7, now + 4_000);
+        original.descriptor.public_endpoint = Some("https://route-a.example".to_string());
+        original = SignedNodeDescriptor::sign(original.descriptor, &identity).unwrap();
+        let node_id = original.node_id();
+
+        let mut rotated_body = original.descriptor.clone();
+        rotated_body.sequence = 8;
+        rotated_body.issued_at = now + 20;
+        rotated_body.expires_at = now + 4_020;
+        rotated_body.public_endpoint = Some("https://route-b.example".to_string());
+        let rotated = SignedNodeDescriptor::sign(rotated_body, &identity).unwrap();
+
+        let store = Arc::new(PeerStore::new());
+        store.upsert_verified(original.clone(), now).unwrap();
+        let start = Arc::new(Barrier::new(3));
+
+        // [ROUTE-SUCCESS-SURFACE-BINDING 2026-08-10 by Codex] Race the old
+        // route observation against the signed route rotation. Either the old
+        // write is rejected, or the later rotation invalidates it.
+        let observer_store = Arc::clone(&store);
+        let observer_start = Arc::clone(&start);
+        let observer = std::thread::spawn(move || {
+            observer_start.wait();
+            observer_store.record_route_forward_success_for_descriptor(&original, now + 21)
+        });
+
+        let writer_store = Arc::clone(&store);
+        let writer_start = Arc::clone(&start);
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            writer_store.upsert_verified(rotated, now + 20).unwrap();
+        });
+
+        start.wait();
+        let _ = observer.join().unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(
+            store
+                .get_valid(&node_id, now + 21)
+                .unwrap()
+                .descriptor
+                .public_endpoint
+                .as_deref(),
+            Some("https://route-b.example")
+        );
+        assert!(!store.is_routeable_now(&node_id, now + 21));
     }
 
     #[test]
