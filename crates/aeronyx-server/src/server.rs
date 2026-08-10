@@ -310,6 +310,9 @@
 // 119. [PURPOSE-BOUND-RECEIPT-NEGOTIATION 2026-08-10 by Codex] Separates the
 //      unsigned v2 bootstrap hint from process-local verified route authority;
 //      three-hop probes require fresh v2 evidence for every selected relay.
+// 120. [RECEIPT-EVIDENCE-SURFACE-BINDING 2026-08-10 by Codex] Records v2
+//      receipt authority against the exact signed descriptors used by each
+//      verified route so concurrent endpoint/KEM rotation fails closed.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -429,6 +432,8 @@
 //     public onion pools can exclude candidates collocated with the entry.
 //
 // Last Modified:
+//   v2.8.71-ReceiptEvidenceSurfaceBinding - Bound verified receipt evidence to
+//     the selected signed route descriptors instead of node identity alone.
 //   v2.8.70-PurposeBoundReceiptNegotiation - Prevented v1-only relay framing
 //     from authorizing or being penalized by v2 multi-hop delivery probes.
 //   v2.8.69-PurposeBoundReceipt - Prevented cross-workload relay-proof reuse
@@ -9070,14 +9075,16 @@ impl Server {
                                             now,
                                         ) =>
                                 {
-                                    peer_store.record_purpose_bound_delivery_receipt_capability(
-                                        &middle_node_id,
-                                        now,
-                                    );
-                                    peer_store.record_purpose_bound_delivery_receipt_capability(
-                                        &terminal_node_id,
-                                        now,
-                                    );
+                                    let _ = peer_store
+                                        .record_purpose_bound_delivery_receipt_capability_for_descriptor(
+                                            &middle,
+                                            now,
+                                        );
+                                    let _ = peer_store
+                                        .record_purpose_bound_delivery_receipt_capability_for_descriptor(
+                                            &terminal,
+                                            now,
+                                        );
                                     peer_store
                                         .record_blind_relay_two_hop_probe_result_with_context(
                                             now,
@@ -9544,14 +9551,11 @@ impl Server {
                                             now,
                                         ) =>
                                 {
-                                    for node_id in [
-                                        first_middle_node_id,
-                                        second_middle_node_id,
-                                        terminal_node_id,
-                                    ] {
-                                        peer_store
-                                            .record_purpose_bound_delivery_receipt_capability(
-                                                &node_id, now,
+                                    for descriptor in [&first_middle, &second_middle, &terminal] {
+                                        let _ = peer_store
+                                            .record_purpose_bound_delivery_receipt_capability_for_descriptor(
+                                                descriptor,
+                                                now,
                                             );
                                     }
                                     peer_store
@@ -10218,14 +10222,14 @@ impl Server {
                                 ) =>
                         {
                             accepted = accepted.saturating_add(1);
-                            peer_store.record_purpose_bound_delivery_receipt_capability(
-                                &middle_node_id,
-                                now,
-                            );
-                            peer_store.record_purpose_bound_delivery_receipt_capability(
-                                &terminal_node_id,
-                                now,
-                            );
+                            let _ = peer_store
+                                .record_purpose_bound_delivery_receipt_capability_for_descriptor(
+                                    &middle, now,
+                                );
+                            let _ = peer_store
+                                .record_purpose_bound_delivery_receipt_capability_for_descriptor(
+                                    &terminal, now,
+                                );
                             peer_store.record_route_forward_success(&middle_node_id, now);
                             peer_store.record_route_forward_success(&terminal_node_id, now);
                             peer_store.record_verified_client_onion_delivery(now);

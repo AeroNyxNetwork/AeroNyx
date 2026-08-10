@@ -157,6 +157,9 @@
 //! - [RECEIPT-EVIDENCE-LIFECYCLE 2026-08-10 by Codex] Binds v2 receipt
 //!   authority to the current signed route surface and excludes invalid peers
 //!   from readiness counts, candidate selection, and capability queries
+//! - [RECEIPT-EVIDENCE-SURFACE-BINDING 2026-08-10 by Codex] Stores the signed
+//!   route-surface fingerprint beside every v2 receipt observation so a
+//!   concurrent endpoint/KEM/capability rotation cannot inherit old authority
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -188,6 +191,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.77.0-ReceiptEvidenceSurfaceBinding - Bound every purpose-separated v2
+//! receipt observation to the exact signed route surface used by the caller
 //! v0.76.0-ReceiptEvidenceLifecycle - Revoked purpose-bound receipt authority
 //! on route-surface rotation and removed invalid peers from readiness counts
 //! v0.75.0-PurposeBoundReceiptEvidence - Made the v2-only route authority
@@ -1750,6 +1755,18 @@ struct PeerRouteHealth {
     last_quarantine_reason: Option<String>,
 }
 
+/// Process-local proof that one signed route surface carried a valid,
+/// purpose-bound version-2 terminal receipt.
+///
+/// The fingerprint contains no plaintext, route id, endpoint string, payload
+/// commitment, sender, receiver, or social-graph edge. It prevents receipt
+/// authority from crossing an endpoint, capability, policy, or KEM rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PurposeBoundDeliveryReceiptEvidence {
+    observed_at: u64,
+    route_surface_fingerprint_sha256: String,
+}
+
 /// Signed-route-surface-bound successful routeability evidence stored only in
 /// the local peer cache for warm restart recovery.
 ///
@@ -2517,7 +2534,8 @@ pub struct PeerStore {
     peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
     route_health: RwLock<HashMap<[u8; 32], PeerRouteHealth>>,
     relay_protection_health: RwLock<HashMap<[u8; 32], PeerRelayProtectionHealth>>,
-    purpose_bound_delivery_receipt_capability: RwLock<HashMap<[u8; 32], u64>>,
+    purpose_bound_delivery_receipt_capability:
+        RwLock<HashMap<[u8; 32], PurposeBoundDeliveryReceiptEvidence>>,
     route_domain_attestor_policy: RwLock<PeerStoreRouteDomainAttestorPolicy>,
     route_domain_certificates: RwLock<HashMap<[u8; 32], RouteDomainAttestationCertificateV1>>,
     max_peers: RwLock<Option<usize>>,
@@ -4402,25 +4420,85 @@ impl PeerStore {
         );
     }
 
-    /// Records that a verified peer participated in a route carrying a valid
-    /// purpose-bound version-2 terminal delivery receipt.
+    /// Records that one exact signed peer route surface participated in a
+    /// route carrying a valid purpose-bound version-2 terminal receipt.
     ///
     /// The node id is process-private selection state. Public status exposes
     /// only a fresh aggregate count; no route id, endpoint, receipt, payload
     /// commitment, sender, receiver, message id, or social-graph edge is kept.
-    pub fn record_purpose_bound_delivery_receipt_capability(&self, node_id: &[u8; 32], now: u64) {
-        if self.get_valid(node_id, now).is_none() {
-            return;
+    ///
+    /// [RECEIPT-EVIDENCE-SURFACE-BINDING 2026-08-10 by Codex] The caller must
+    /// pass the descriptor actually used by the verified route. The write is
+    /// accepted only while that route surface is still current in this store.
+    #[must_use]
+    pub fn record_purpose_bound_delivery_receipt_capability_for_descriptor(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        let node_id = descriptor.node_id();
+        let expected_fingerprint = if descriptor.verify_at(now).is_ok() {
+            Self::descriptor_routeability_surface_fingerprint(descriptor)
+        } else {
+            None
+        };
+        let Some(expected_fingerprint) = expected_fingerprint else {
+            self.record_audit_event(
+                now,
+                "blind_relay_purpose_bound_receipt_capability",
+                "rejected",
+                "invalid_expected_route_surface".to_string(),
+            );
+            return false;
+        };
+
+        // Hold the peer read lock through the evidence write. A concurrent
+        // descriptor upgrade must either happen first (and fail this match) or
+        // happen afterwards (and remove this evidence during invalidation).
+        let peers = self.peers.read();
+        let current_surface_matches = peers
+            .get(&node_id)
+            .filter(|current| current.verify_at(now).is_ok())
+            .and_then(Self::descriptor_routeability_surface_fingerprint)
+            .is_some_and(|fingerprint| fingerprint == expected_fingerprint);
+        if !current_surface_matches {
+            drop(peers);
+            self.record_audit_event(
+                now,
+                "blind_relay_purpose_bound_receipt_capability",
+                "rejected",
+                "route_surface_mismatch".to_string(),
+            );
+            return false;
         }
         self.purpose_bound_delivery_receipt_capability
             .write()
-            .insert(*node_id, now);
+            .insert(
+                node_id,
+                PurposeBoundDeliveryReceiptEvidence {
+                    observed_at: now,
+                    route_surface_fingerprint_sha256: expected_fingerprint,
+                },
+            );
+        drop(peers);
         self.record_audit_event(
             now,
             "blind_relay_purpose_bound_receipt_capability",
             "accepted",
             "fresh_purpose_bound_delivery_receipt_v2".to_string(),
         );
+        true
+    }
+
+    /// Backward-compatible node-id recorder. New route code must call
+    /// [`Self::record_purpose_bound_delivery_receipt_capability_for_descriptor`]
+    /// with the exact descriptor that carried the verified receipt.
+    pub fn record_purpose_bound_delivery_receipt_capability(&self, node_id: &[u8; 32], now: u64) {
+        let Some(descriptor) = self.get_valid(node_id, now) else {
+            return;
+        };
+        let _ =
+            self.record_purpose_bound_delivery_receipt_capability_for_descriptor(&descriptor, now);
     }
 
     /// Backward-compatible alias for callers compiled against the v1 method
@@ -4434,6 +4512,16 @@ impl PeerStore {
         at <= now && now.saturating_sub(at) <= PEER_ROUTEABILITY_STALE_AFTER_SECS
     }
 
+    fn purpose_bound_delivery_receipt_evidence_matches_descriptor(
+        evidence: &PurposeBoundDeliveryReceiptEvidence,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        Self::purpose_bound_delivery_receipt_evidence_is_fresh(evidence.observed_at, now)
+            && Self::descriptor_routeability_surface_fingerprint(descriptor)
+                .is_some_and(|fingerprint| fingerprint == evidence.route_surface_fingerprint_sha256)
+    }
+
     /// [PURPOSE-BOUND-RECEIPT-EVIDENCE 2026-08-10 by Codex] Returns whether
     /// this process has fresh cryptographic v2 evidence for a currently valid
     /// peer. This is stronger than an unsigned discovery hint and is
@@ -4444,12 +4532,21 @@ impl PeerStore {
         node_id: &[u8; 32],
         now: u64,
     ) -> bool {
-        self.get_valid(node_id, now).is_some()
-            && self
-                .purpose_bound_delivery_receipt_capability
-                .read()
-                .get(node_id)
-                .is_some_and(|at| Self::purpose_bound_delivery_receipt_evidence_is_fresh(*at, now))
+        let peers = self.peers.read();
+        let Some(descriptor) = peers
+            .get(node_id)
+            .filter(|descriptor| descriptor.verify_at(now).is_ok())
+        else {
+            return false;
+        };
+        self.purpose_bound_delivery_receipt_capability
+            .read()
+            .get(node_id)
+            .is_some_and(|evidence| {
+                Self::purpose_bound_delivery_receipt_evidence_matches_descriptor(
+                    evidence, descriptor, now,
+                )
+            })
     }
 
     /// Counts only fresh v2 evidence attached to descriptors that are valid at
@@ -4463,11 +4560,13 @@ impl PeerStore {
         let capability_evidence = self.purpose_bound_delivery_receipt_capability.read();
         capability_evidence
             .iter()
-            .filter(|(node_id, at)| {
-                peers
-                    .get(*node_id)
-                    .is_some_and(|descriptor| descriptor.verify_at(now).is_ok())
-                    && Self::purpose_bound_delivery_receipt_evidence_is_fresh(**at, now)
+            .filter(|(node_id, evidence)| {
+                peers.get(*node_id).is_some_and(|descriptor| {
+                    descriptor.verify_at(now).is_ok()
+                        && Self::purpose_bound_delivery_receipt_evidence_matches_descriptor(
+                            evidence, descriptor, now,
+                        )
+                })
             })
             .count()
     }
@@ -6645,8 +6744,12 @@ impl PeerStore {
                     && !excluded_node_ids
                         .iter()
                         .any(|excluded| *excluded == node_id)
-                    && capability_evidence.get(&node_id).is_some_and(|at| {
-                        Self::purpose_bound_delivery_receipt_evidence_is_fresh(*at, now)
+                    && capability_evidence.get(&node_id).is_some_and(|evidence| {
+                        Self::purpose_bound_delivery_receipt_evidence_matches_descriptor(
+                            evidence,
+                            &candidate.descriptor,
+                            now,
+                        )
                     })
             })
             .take(limit)
@@ -6678,8 +6781,12 @@ impl PeerStore {
                     && !excluded_node_ids
                         .iter()
                         .any(|excluded| *excluded == node_id)
-                    && capability_evidence.get(&node_id).is_some_and(|at| {
-                        Self::purpose_bound_delivery_receipt_evidence_is_fresh(*at, now)
+                    && capability_evidence.get(&node_id).is_some_and(|evidence| {
+                        Self::purpose_bound_delivery_receipt_evidence_matches_descriptor(
+                            evidence,
+                            &candidate.descriptor,
+                            now,
+                        )
                     })
                     && self.route_domain_certificate_allows_multi_hop(&node_id, now)
             })
@@ -9175,6 +9282,53 @@ mod tests {
         // surface must be probed; a prior role's success cannot be inherited.
         assert!(!store.is_routeable_now(&node_id, now + 41));
         assert!(!store.has_fresh_purpose_bound_delivery_receipt_capability(&node_id, now + 41));
+    }
+
+    #[test]
+    fn test_receipt_evidence_rejects_non_current_route_surface() {
+        let now = 1_700_000_100;
+        let identity = IdentityKeyPair::generate();
+        let mut original = signed_descriptor_for(&identity, 7, now + 4_000);
+        original.descriptor.public_endpoint = Some("https://route-a.example".to_string());
+        original.descriptor.capabilities =
+            vec![NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+        original = SignedNodeDescriptor::sign(original.descriptor, &identity).unwrap();
+        let node_id = original.node_id();
+
+        let store = PeerStore::new();
+        store.upsert_verified(original.clone(), now).unwrap();
+
+        let mut rotated_body = original.descriptor.clone();
+        rotated_body.sequence = 8;
+        rotated_body.issued_at = now + 10;
+        rotated_body.expires_at = now + 4_010;
+        rotated_body.public_endpoint = Some("https://route-b.example".to_string());
+        let rotated = SignedNodeDescriptor::sign(rotated_body, &identity).unwrap();
+        store.upsert_verified(rotated.clone(), now + 10).unwrap();
+
+        // [RECEIPT-EVIDENCE-SURFACE-BINDING 2026-08-10 by Codex] A receipt
+        // verified against the old route cannot authorize the rotated route,
+        // even though both descriptors have the same stable node identity.
+        assert!(!store
+            .record_purpose_bound_delivery_receipt_capability_for_descriptor(&original, now + 11,));
+        assert!(!store.has_fresh_purpose_bound_delivery_receipt_capability(&node_id, now + 11));
+
+        assert!(store
+            .record_purpose_bound_delivery_receipt_capability_for_descriptor(&rotated, now + 12,));
+        assert!(store.has_fresh_purpose_bound_delivery_receipt_capability(&node_id, now + 13));
+
+        let mut refreshed_body = rotated.descriptor.clone();
+        refreshed_body.sequence = 9;
+        refreshed_body.issued_at = now + 20;
+        refreshed_body.expires_at = now + 4_020;
+        let refreshed = SignedNodeDescriptor::sign(refreshed_body, &identity).unwrap();
+        store.upsert_verified(refreshed, now + 20).unwrap();
+
+        // Sequence/TTL-only refreshes retain the same signed route surface, so
+        // an otherwise current observation remains valid across normal leases.
+        assert!(store
+            .record_purpose_bound_delivery_receipt_capability_for_descriptor(&rotated, now + 21,));
+        assert!(store.has_fresh_purpose_bound_delivery_receipt_capability(&node_id, now + 22));
     }
 
     #[test]
