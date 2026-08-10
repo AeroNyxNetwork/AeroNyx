@@ -67,8 +67,13 @@
 //! - A relay's X25519 *public* key is NOT derivable from its Ed25519 `node_id`
 //!   (the X25519 secret is `SHA512(ed_secret)[..32]`), so it MUST be published
 //!   in the node descriptor. See `discovery::NodeDescriptor::kem_public`.
+//! - [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Route-purpose strings are a
+//!   public protocol contract. Parse them through [`OnionRoutePurpose`] rather
+//!   than duplicating aliases in an App, SDK, agent, or server implementation.
+//!   Unknown values must fail closed instead of silently becoming chat routes.
 //!
 //! ## Last Modified
+//! v1.1.0-RoutePurposeContract — Added stable, capability-aware route purposes
 //! v1.0.0-OnionV1 — Initial layered onion construction over the blind relay frame
 
 use hkdf::Hkdf;
@@ -81,6 +86,7 @@ use zeroize::Zeroize;
 use crate::crypto::keys::{E2eSession, EphemeralKeyPair, IdentityKeyPair};
 use crate::error::CoreError;
 use crate::protocol::chat::BlindRelayEnvelope;
+use crate::protocol::discovery::NodeCapability;
 
 // ============================================
 // Constants
@@ -101,6 +107,13 @@ pub const KEM_ALG_X25519: u8 = 1;
 /// field and this module can adopt it without a wire break.
 pub const KEM_ALG_XWING: u8 = 2;
 
+/// Canonical route-purpose values supported by onion candidate contracts.
+///
+/// The order is stable for deterministic capability responses. Compatibility
+/// aliases accepted by [`OnionRoutePurpose::from_wire_value`] are deliberately
+/// absent so new integrations emit only canonical values.
+pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 2] = ["message_relay", "blind_vault_put"];
+
 /// Fixed layer header length: magic(2) + eph_pub(32) + nonce(24).
 const LAYER_HEADER_LEN: usize = 2 + 32 + 24;
 
@@ -111,6 +124,60 @@ const MAX_ONION_PAYLOAD_BYTES: usize = 256 * 1024;
 // ============================================
 // Types
 // ============================================
+
+/// Terminal workload carried by an onion route.
+///
+/// [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] This enum standardizes purpose
+/// negotiation across nodes, Apps, SDKs, and autonomous agents. It is not
+/// serialized with a Rust enum representation: callers must emit [`Self::as_str`]
+/// and parse untrusted input with [`Self::from_wire_value`] so unknown future
+/// purposes fail closed on older implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OnionRoutePurpose {
+    /// End-to-end encrypted message delivery through blind relay terminals.
+    MessageRelay,
+    /// Anonymous durable ciphertext write to a Blind Vault replica terminal.
+    BlindVaultPut,
+}
+
+impl OnionRoutePurpose {
+    /// Parses a canonical purpose or a backward-compatible legacy alias.
+    ///
+    /// Returns `None` for blank or unknown input. Callers must preserve that
+    /// unsupported state rather than defaulting it to [`Self::MessageRelay`].
+    #[must_use]
+    pub fn from_wire_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "message" | "message_relay" | "message-relay" | "chat" => Some(Self::MessageRelay),
+            "blind_vault" | "blind-vault" | "blind_vault_put" | "blind-vault-put" => {
+                Some(Self::BlindVaultPut)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the canonical, language-neutral wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MessageRelay => ONION_ROUTE_PURPOSE_VALUES[0],
+            Self::BlindVaultPut => ONION_ROUTE_PURPOSE_VALUES[1],
+        }
+    }
+
+    /// Returns the additional signed capability required of the terminal.
+    ///
+    /// Every middle relay remains governed by the base onion capability
+    /// contract. This method describes only workload-specific terminal role
+    /// admission and never trusts flattened API projections.
+    #[must_use]
+    pub const fn specialized_terminal_capability(self) -> Option<NodeCapability> {
+        match self {
+            Self::MessageRelay => None,
+            Self::BlindVaultPut => Some(NodeCapability::BlindVaultReplica),
+        }
+    }
+}
 
 /// One hop on an onion path: the relay's node id plus its published KEM key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,6 +458,51 @@ fn decode_payload(bytes: &[u8]) -> Result<OnionHopPayload, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_purpose_normalizes_canonical_values_and_legacy_aliases() {
+        for value in ["message_relay", "message", "message-relay", "chat"] {
+            assert_eq!(
+                OnionRoutePurpose::from_wire_value(value),
+                Some(OnionRoutePurpose::MessageRelay)
+            );
+        }
+        for value in [
+            "blind_vault_put",
+            "blind_vault",
+            "blind-vault",
+            "blind-vault-put",
+        ] {
+            assert_eq!(
+                OnionRoutePurpose::from_wire_value(value),
+                Some(OnionRoutePurpose::BlindVaultPut)
+            );
+        }
+        assert_eq!(
+            OnionRoutePurpose::from_wire_value("  BLIND_VAULT_PUT  "),
+            Some(OnionRoutePurpose::BlindVaultPut)
+        );
+        assert_eq!(OnionRoutePurpose::MessageRelay.as_str(), "message_relay");
+        assert_eq!(OnionRoutePurpose::BlindVaultPut.as_str(), "blind_vault_put");
+    }
+
+    #[test]
+    fn route_purpose_rejects_unknown_values_and_declares_terminal_role() {
+        assert_eq!(OnionRoutePurpose::from_wire_value(""), None);
+        assert_eq!(OnionRoutePurpose::from_wire_value("future_workload"), None);
+        assert_eq!(
+            OnionRoutePurpose::MessageRelay.specialized_terminal_capability(),
+            None
+        );
+        assert_eq!(
+            OnionRoutePurpose::BlindVaultPut.specialized_terminal_capability(),
+            Some(NodeCapability::BlindVaultReplica)
+        );
+        assert_eq!(
+            ONION_ROUTE_PURPOSE_VALUES,
+            ["message_relay", "blind_vault_put"]
+        );
+    }
 
     fn hop_keypair() -> (IdentityKeyPair, OnionHop) {
         let identity = IdentityKeyPair::generate();

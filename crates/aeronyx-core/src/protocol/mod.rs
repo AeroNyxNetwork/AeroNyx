@@ -22,6 +22,8 @@
 //!   object protocol for encrypted contact-vault and optional message-archive
 //!   segments. Its outer metadata deliberately carries no account identity,
 //!   correspondent, application namespace, or public-chain commitment.
+//! - v1.1.0-OnionRoutePurpose: Standardized onion terminal-workload purpose
+//!   negotiation for Rust nodes, Apps, SDKs, and autonomous agents.
 //!
 //! ## Main Functionality
 //!
@@ -54,6 +56,8 @@
 //! - [BLIND-VAULT-WIRE 2026-07-22 by Codex] The `blind_vault` protocol is
 //!   independent from MemChain indexing and legacy chat routing. Never add an
 //!   owner/sender/receiver/namespace field to its outer wire structures.
+//! - [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Use the core route-purpose
+//!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial protocol definitions
@@ -66,6 +70,7 @@
 //! v0.3.0-DiscoveryPhase4 - Re-exported discovery gossip message helpers
 //! v1.0.0-BlindVaultWire - Added anonymous encrypted durable-object contract
 //! v1.1.0-BlindVaultLease - Added anonymous lease and signed deletion contract
+//! v1.1.0-OnionRoutePurpose - Added stable onion route-purpose negotiation
 
 pub mod auth;
 pub mod blind_vault;
@@ -101,7 +106,7 @@ pub use memchain::{
 };
 pub use messages::{ClientHello, DataPacket, MessageType, ServerHello};
 pub use onion::{
-    build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel, KEM_ALG_X25519,
-    KEM_ALG_XWING, ONION_MAGIC, ONION_SALT,
+    build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel, OnionRoutePurpose,
+    KEM_ALG_X25519, KEM_ALG_XWING, ONION_MAGIC, ONION_ROUTE_PURPOSE_VALUES, ONION_SALT,
 };
 pub use version::{ProtocolVersion, CURRENT_PROTOCOL_VERSION};

@@ -126,8 +126,13 @@
 //!   `blind_vault_put`, at least one candidate in the complete diverse subset
 //!   must carry `BlindVaultReplica` in its original signed descriptor. Never
 //!   infer terminal eligibility from a flattened JSON field alone.
+//! - [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Purpose parsing and specialized
+//!   terminal capability semantics live in `aeronyx-core`. This server owns
+//!   only live admission policy and must not fork the shared wire contract.
 //!
 //! ## Last Modified
+//! v0.47.0-CoreRoutePurposeContract - Consumed the shared onion purpose
+//! protocol contract and advertised its canonical values for negotiation
 //! v0.46.0-OnionRoutePurpose - Added fail-closed, terminal-capability-aware
 //! candidate admission for anonymous Blind Vault ciphertext writes
 //! v0.45.0-RouteDomainCertificateIngress - Added bounded, rate-limited,
@@ -205,7 +210,8 @@ use aeronyx_core::protocol::discovery::{
     MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES,
 };
 use aeronyx_core::protocol::{
-    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, SignedNodeDescriptor,
+    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, OnionRoutePurpose,
+    SignedNodeDescriptor, ONION_ROUTE_PURPOSE_VALUES,
 };
 use axum::{
     body::Bytes,
@@ -427,18 +433,6 @@ enum OnionPrivacyMode {
     High,
 }
 
-/// Client-declared purpose for terminal-role admission.
-///
-/// [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] The purpose never selects a node.
-/// It changes only the signed capability required of at least one terminal in
-/// the eligible candidate subset. Unknown input remains explicit and unusable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OnionRoutePurpose {
-    MessageRelay,
-    BlindVaultPut,
-    Unsupported,
-}
-
 /// Internal fail-closed gates for the path requested by an App or SDK.
 ///
 /// [ONION-PATH-ADMISSION 2026-08-02 by Codex] Candidate availability,
@@ -493,73 +487,6 @@ impl OnionRequestedPathGates {
             && (!self.pinned_route_domain_required || self.pinned_route_domain_ready)
             && (!self.runtime_proof_required || self.runtime_proof_ready)
             && (!self.restart_continuity_required || self.restart_continuity_ready)
-    }
-}
-
-impl OnionRoutePurpose {
-    fn from_query(value: Option<&str>) -> Self {
-        match value
-            .unwrap_or("message_relay")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "message" | "message_relay" | "message-relay" | "chat" => Self::MessageRelay,
-            "blind_vault" | "blind-vault" | "blind_vault_put" | "blind-vault-put" => {
-                Self::BlindVaultPut
-            }
-            _ => Self::Unsupported,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::MessageRelay => "message_relay",
-            Self::BlindVaultPut => "blind_vault_put",
-            Self::Unsupported => "unsupported",
-        }
-    }
-
-    const fn is_supported(self) -> bool {
-        !matches!(self, Self::Unsupported)
-    }
-
-    const fn specialized_terminal_capability(self) -> Option<NodeCapability> {
-        match self {
-            Self::BlindVaultPut => Some(NodeCapability::BlindVaultReplica),
-            Self::MessageRelay | Self::Unsupported => None,
-        }
-    }
-
-    fn terminal_required_capabilities(self) -> Vec<NodeCapability> {
-        if !self.is_supported() {
-            return Vec::new();
-        }
-        let mut capabilities = onion_required_capabilities();
-        if let Some(capability) = self.specialized_terminal_capability() {
-            capabilities.push(capability);
-        }
-        capabilities
-    }
-
-    fn terminal_candidate_matches(self, candidate: &OnionRelayCandidate) -> bool {
-        self.is_supported()
-            && ONION_REQUIRED_CAPABILITIES.iter().all(|required| {
-                candidate
-                    .signed_descriptor
-                    .descriptor
-                    .capabilities
-                    .contains(required)
-            })
-            && self
-                .specialized_terminal_capability()
-                .map_or(true, |required| {
-                    candidate
-                        .signed_descriptor
-                        .descriptor
-                        .capabilities
-                        .contains(&required)
-                })
     }
 }
 
@@ -636,6 +563,53 @@ pub struct OnionRelayCandidate {
 
 fn onion_required_capabilities() -> Vec<NodeCapability> {
     ONION_REQUIRED_CAPABILITIES.to_vec()
+}
+
+/// Resolves an optional query value without turning an unknown explicit value
+/// into the default message workload.
+fn onion_route_purpose_from_query(value: Option<&str>) -> Option<OnionRoutePurpose> {
+    match value {
+        Some(value) => OnionRoutePurpose::from_wire_value(value),
+        None => Some(OnionRoutePurpose::MessageRelay),
+    }
+}
+
+fn onion_route_purpose_name(purpose: Option<OnionRoutePurpose>) -> &'static str {
+    purpose.map_or("unsupported", OnionRoutePurpose::as_str)
+}
+
+fn onion_terminal_required_capabilities(purpose: Option<OnionRoutePurpose>) -> Vec<NodeCapability> {
+    let Some(purpose) = purpose else {
+        return Vec::new();
+    };
+    let mut capabilities = onion_required_capabilities();
+    if let Some(capability) = purpose.specialized_terminal_capability() {
+        capabilities.push(capability);
+    }
+    capabilities
+}
+
+fn onion_terminal_candidate_matches(
+    purpose: Option<OnionRoutePurpose>,
+    candidate: &OnionRelayCandidate,
+) -> bool {
+    purpose.is_some()
+        && ONION_REQUIRED_CAPABILITIES.iter().all(|required| {
+            candidate
+                .signed_descriptor
+                .descriptor
+                .capabilities
+                .contains(required)
+        })
+        && purpose
+            .and_then(OnionRoutePurpose::specialized_terminal_capability)
+            .map_or(true, |required| {
+                candidate
+                    .signed_descriptor
+                    .descriptor
+                    .capabilities
+                    .contains(&required)
+            })
 }
 
 fn default_onion_route_purpose() -> String {
@@ -2028,6 +2002,10 @@ pub fn discovery_summary_response(
             // unsigned transport hint only. A successful path still requires
             // the terminal's signed, route-bound delivery receipt.
             "multihop_delivery_receipt_v1": true,
+            // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Canonical values come
+            // from aeronyx-core so all implementations negotiate one contract.
+            "onion_route_purpose_v1": true,
+            "onion_route_purposes": ONION_ROUTE_PURPOSE_VALUES,
         }),
         status: status_bucket,
         stage: stage_bucket,
@@ -2409,8 +2387,9 @@ async fn onion_candidates_handler(
 ) -> Json<OnionCandidatesResponse> {
     let now = now_secs();
     let limit = state.policy.snapshot_limit(query.limit);
-    let requested_purpose = OnionRoutePurpose::from_query(query.purpose.as_deref());
-    let specialized_terminal_capability = requested_purpose.specialized_terminal_capability();
+    let requested_purpose = onion_route_purpose_from_query(query.purpose.as_deref());
+    let specialized_terminal_capability =
+        requested_purpose.and_then(OnionRoutePurpose::specialized_terminal_capability);
     let requested_privacy_mode = OnionPrivacyMode::from_query(query.privacy_mode.as_deref());
     let requested_hops = normalize_requested_hops(requested_privacy_mode, query.hops);
     let pinned_route_domain_required =
@@ -2510,7 +2489,7 @@ async fn onion_candidates_handler(
     let min_candidates_for_requested_hops = requested_hops as usize;
     let terminal_candidate_count = candidates
         .iter()
-        .filter(|candidate| requested_purpose.terminal_candidate_matches(candidate))
+        .filter(|candidate| onion_terminal_candidate_matches(requested_purpose, candidate))
         .count();
     let requested_terminal_capability_ready = terminal_candidate_count > 0;
     // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] The legacy message purpose has
@@ -2521,7 +2500,7 @@ async fn onion_candidates_handler(
     let terminal_capability_gate_ready =
         specialized_terminal_capability.is_none() || requested_terminal_capability_ready;
     let purpose_admission = OnionPurposeAdmission {
-        supported: requested_purpose.is_supported(),
+        supported: requested_purpose.is_some(),
         terminal_capability_ready: terminal_capability_gate_ready,
     };
     // [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] Legacy builders have no
@@ -2596,7 +2575,7 @@ async fn onion_candidates_handler(
             },
         )
         .ready();
-    let recommended_hops = if requested_purpose.is_supported() && terminal_capability_gate_ready {
+    let recommended_hops = if requested_purpose.is_some() && terminal_capability_gate_ready {
         recommended_onion_hops(
             candidates.len(),
             requested_hops,
@@ -2638,9 +2617,9 @@ async fn onion_candidates_handler(
         contract_version: ONION_CANDIDATES_CONTRACT_VERSION.to_string(),
         source: ONION_CANDIDATES_SOURCE.to_string(),
         required_capabilities: onion_required_capabilities(),
-        requested_purpose: requested_purpose.as_str().to_string(),
-        requested_purpose_supported: requested_purpose.is_supported(),
-        terminal_required_capabilities: requested_purpose.terminal_required_capabilities(),
+        requested_purpose: onion_route_purpose_name(requested_purpose).to_string(),
+        requested_purpose_supported: requested_purpose.is_some(),
+        terminal_required_capabilities: onion_terminal_required_capabilities(requested_purpose),
         terminal_candidate_count,
         requested_terminal_capability_ready,
         count: candidates.len(),
@@ -5592,6 +5571,14 @@ mod tests {
         assert_eq!(
             parsed["protocol_features"]["multihop_delivery_receipt_v1"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            parsed["protocol_features"]["onion_route_purpose_v1"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["protocol_features"]["onion_route_purposes"],
+            serde_json::json!(["message_relay", "blind_vault_put"])
         );
         assert_eq!(parsed["local_capability"]["status"].as_str(), Some("ready"));
         assert_eq!(
