@@ -19,6 +19,9 @@
 //!   offline or all local routes are stale
 //! - Returns a terminal-signed receipt bound to the exact opaque payload after
 //!   successful onion terminal store-and-forward; middle hops only propagate it
+//! - [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Signs receipt v2 with a
+//!   purpose-separated opaque payload commitment after terminal acceptance;
+//!   v1 remains signature-verifiable for rolling-upgrade relay compatibility
 //! - [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] Accepts a bounded,
 //!   signed Blind Vault `Put` frame as an alternative onion terminal payload,
 //!   reusing the existing anonymous lease, quota, TTL, and idempotency service
@@ -126,8 +129,12 @@
 //!   replica acceptance without revealing the lease or object to middle hops.
 //! - Blind Vault terminal failures expose only permanent rejection, replica
 //!   capacity, or temporary unavailability. Never forward service errors.
+//! - Receipt v2 purpose separation must stay inside the opaque commitment.
+//!   Do not add a clear workload label to the propagated ACK: low-cardinality
+//!   route purpose would become visible metadata at every middle hop.
 //!
 //! ## Last Modified
+//! v0.31.0-PurposeBoundReceipt - Sign terminal workload into opaque receipt v2 commitments
 //! v0.30.0-BlindVaultRetryClass - Stop retrying permanently invalid anonymous
 //! writes while preserving coarse capacity and availability failover signals
 //! v0.29.0-BlindVaultOnionDispatch - Persist signed anonymous Blind Vault Put
@@ -180,7 +187,7 @@ use aeronyx_core::protocol::chat::{
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::discovery::SignedNodeDescriptor;
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
-use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer};
+use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer, OnionRoutePurpose};
 use aeronyx_core::protocol::{
     decode_blind_vault_frame, is_blind_vault_frame, BlindVaultFrame, DataPacket, NodeCapability,
 };
@@ -1164,27 +1171,29 @@ async fn process_onion_blind_relay(
         // Blind Vault Put frame. The fixed protocol magic selects the parser;
         // declared-but-malformed Blind Vault bytes never fall back to chat.
         None => {
-            let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment(&peel.inner);
-
             // [BLIND-VAULT-ONION-DISPATCH 2026-08-10 by Codex] This is the hard
             // terminal ACK boundary for both delivery models. A successful
             // peel is insufficient: chat must reach its pending queue, while a
             // Blind Vault Put must pass its signature, lease, quota, TTL,
             // idempotency, and durable SQLite transaction before we sign ACK.
-            if let Err(error) = deliver_onion_terminal_payload(&state, &peel.inner, now).await {
-                forget_blind_relay_route(&state, &envelope.route_id);
-                debug!(
-                    reason = error.reason_bucket(),
-                    "[BLIND_RELAY] Onion terminal delivery failed"
-                );
-                reject_blind_relay_previous_hop(
-                    &state,
-                    previous_hop_node_id,
-                    now,
-                    "onion_terminal_delivery_failed",
-                );
-                return Err(error);
-            }
+            let route_purpose = match deliver_onion_terminal_payload(&state, &peel.inner, now).await
+            {
+                Ok(purpose) => purpose,
+                Err(error) => {
+                    forget_blind_relay_route(&state, &envelope.route_id);
+                    debug!(
+                        reason = error.reason_bucket(),
+                        "[BLIND_RELAY] Onion terminal delivery failed"
+                    );
+                    reject_blind_relay_previous_hop(
+                        &state,
+                        previous_hop_node_id,
+                        now,
+                        "onion_terminal_delivery_failed",
+                    );
+                    return Err(error);
+                }
+            };
 
             record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
             state.peer_store.record_blind_relay_terminal(
@@ -1192,9 +1201,14 @@ async fn process_onion_blind_relay(
                 envelope.ttl,
                 envelope.encrypted_blob.len(),
             );
-            let delivery_receipt = BlindRelayDeliveryReceipt::accepted(
+            // [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Sign v2 only after
+            // the selected terminal workload has crossed its durable acceptance
+            // boundary. The purpose is committed with the opaque payload hash,
+            // not returned as relay-visible metadata.
+            let delivery_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
                 envelope.route_id,
-                payload_commitment,
+                &peel.inner,
+                route_purpose,
                 now,
                 state.node_identity.as_ref(),
             );
@@ -1358,7 +1372,7 @@ async fn deliver_onion_terminal_payload(
     state: &ChatPeerState,
     payload: &[u8],
     now_secs: u64,
-) -> Result<(), BlindRelayError> {
+) -> Result<OnionRoutePurpose, BlindRelayError> {
     if is_blind_vault_frame(payload) {
         let frame = decode_blind_vault_frame(payload)
             .map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
@@ -1374,14 +1388,14 @@ async fn deliver_onion_terminal_payload(
         vault
             .put(&request, now_secs.saturating_mul(1_000))
             .map_err(|error| map_blind_vault_put_error(&error))?;
-        return Ok(());
+        return Ok(OnionRoutePurpose::BlindVaultPut);
     }
 
     let envelope =
         decode_envelope(payload).map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
     process_peer_relay(state.clone(), envelope)
         .await
-        .map(|_| ())
+        .map(|_| OnionRoutePurpose::MessageRelay)
         .map_err(|_| BlindRelayError::ForwardFailed)
 }
 
@@ -2802,12 +2816,13 @@ mod tests {
             .delivery_receipt
             .as_ref()
             .expect("terminal onion delivery must return a signed receipt")
-            .verify_expected(
+            .verify_expected_for_purpose(
                 &[0x55u8; 16],
-                &BlindRelayDeliveryReceipt::payload_commitment(&inner),
+                &inner,
+                OnionRoutePurpose::MessageRelay,
                 &node_identity.public_key_bytes(),
             )
-            .expect("receipt must bind the exact terminal payload and node");
+            .expect("receipt must bind the exact terminal payload, purpose, and node");
         let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
         assert_eq!(blind_stats.terminal, 1);
         assert_eq!(blind_stats.rejected, 0);
@@ -2881,12 +2896,13 @@ mod tests {
             .delivery_receipt
             .as_ref()
             .expect("vault acceptance must return a route-safe terminal receipt")
-            .verify_expected(
+            .verify_expected_for_purpose(
                 &first_route,
-                &BlindRelayDeliveryReceipt::payload_commitment(&encoded_put),
+                &encoded_put,
+                OnionRoutePurpose::BlindVaultPut,
                 &node_identity.public_key_bytes(),
             )
-            .expect("receipt must bind exact encoded put without exposing lease metadata");
+            .expect("receipt must bind exact encoded put and purpose without exposing metadata");
         let public_ack = serde_json::to_string(&result).expect("serialize terminal ACK");
         assert!(!public_ack.contains("lease_id"));
         assert!(!public_ack.contains("object_id"));
@@ -3263,9 +3279,10 @@ mod tests {
                     if terminal_relay_for_request.store_pending(&inner).is_err() {
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
-                    let delivery_receipt = BlindRelayDeliveryReceipt::accepted(
+                    let delivery_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
                         request.envelope.route_id,
-                        BlindRelayDeliveryReceipt::payload_commitment(&peel.inner),
+                        &peel.inner,
+                        OnionRoutePurpose::MessageRelay,
                         now_secs(),
                         &terminal_receipt_identity,
                     );
@@ -3369,12 +3386,13 @@ mod tests {
             .delivery_receipt
             .as_ref()
             .expect("middle hop must propagate the terminal receipt")
-            .verify_expected(
+            .verify_expected_for_purpose(
                 &route_id,
-                &BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat),
+                &encoded_chat,
+                OnionRoutePurpose::MessageRelay,
                 &terminal_node_id,
             )
-            .expect("propagated receipt must retain terminal binding");
+            .expect("propagated receipt must retain terminal purpose binding");
 
         let previous_hops = terminal_previous_hops.lock().unwrap();
         assert_eq!(

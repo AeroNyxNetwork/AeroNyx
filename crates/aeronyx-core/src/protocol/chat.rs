@@ -62,11 +62,16 @@
 //! - `BlindRelayDeliveryReceipt`: terminal-signed proof that an exact opaque
 //!   payload reached the store-and-forward acceptance boundary. The receipt
 //!   contains no sender, receiver, endpoint, online-state, or plaintext data.
+//! - [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Receipt v2 commits to both
+//!   the opaque terminal payload and its canonical route purpose without
+//!   exposing a purpose field to middle relays. Receipt v1 remains verifiable
+//!   for mixed-version forwarding, but cannot prove workload separation.
 //! - [BOUNDED-WIRE-CODEC 2026-07-23 by Codex] Chat and blind-relay encoders
 //!   share the same byte ceilings as their decoders. Keep legacy small trailing
 //!   bytes only for `ChatEnvelope`; blind-relay frames remain canonical.
 //!
 //! ## Last Modified
+//! v1.4.0-PurposeBoundReceipt - Bound terminal receipts to route purpose with a v2 domain
 //! v1.3.0-BoundedWireCodec - Symmetric frame limits and padded-input rejection
 //! v1.2.0-BlindRelayDeliveryReceipt - Added terminal-signed opaque delivery receipt
 //! v1.1.0-BlindRelayEnvelope — Added opaque node-to-node relay envelope skeleton
@@ -78,6 +83,7 @@ use sha2::{Digest, Sha256};
 use crate::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use crate::error::CoreError;
 use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
+use crate::protocol::onion::OnionRoutePurpose;
 
 // ============================================
 // Deserialisation size limit
@@ -90,10 +96,16 @@ const MAX_ENVELOPE_BYTES: u64 = 128 * 1024; // 128 KB
 const MAX_BLIND_RELAY_ENVELOPE_BYTES: u64 = 256 * 1024; // 256 KB opaque relay frame cap
 const MAX_BLIND_RELAY_BLOB_BYTES: usize = 192 * 1024; // media/file bytes must use blob storage
 const BLIND_RELAY_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-v1";
-const BLIND_RELAY_DELIVERY_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-DeliveryReceipt-v1";
+const BLIND_RELAY_DELIVERY_RECEIPT_V1_SIGNING_DOMAIN: &[u8] =
+    b"AeroNyx-BlindRelay-DeliveryReceipt-v1";
+const BLIND_RELAY_DELIVERY_RECEIPT_V2_SIGNING_DOMAIN: &[u8] =
+    b"AeroNyx-BlindRelay-DeliveryReceipt-v2";
+const BLIND_RELAY_PURPOSE_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-PurposeCommitment-v1";
 
 /// Initial signed blind-relay terminal receipt version.
 pub const BLIND_RELAY_DELIVERY_RECEIPT_VERSION: u8 = 1;
+/// Purpose-bound terminal receipt version used by current nodes.
+pub const BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION: u8 = 2;
 /// Terminal accepted the opaque payload into online or durable pending delivery.
 pub const BLIND_RELAY_DELIVERY_ACCEPTED: u8 = 1;
 
@@ -414,8 +426,10 @@ pub struct BlindRelayDeliveryReceipt {
     pub version: u8,
     /// Random route correlation id supplied by the source for this route.
     pub route_id: [u8; 16],
-    /// SHA-256 commitment to the exact terminal payload bytes. For chat this
-    /// payload is still the sender's end-to-end encrypted `ChatEnvelope`.
+    /// Versioned SHA-256 commitment to the terminal payload. Version 1 hashes
+    /// the exact bytes. Version 2 domain-separates the payload hash by route
+    /// purpose, preventing one accepted payload proof from being reinterpreted
+    /// as a different terminal workload.
     pub payload_commitment: [u8; 32],
     /// Ed25519 identity of the terminal node that accepted the payload.
     pub terminal_node_id: [u8; 32],
@@ -429,7 +443,10 @@ pub struct BlindRelayDeliveryReceipt {
 }
 
 impl BlindRelayDeliveryReceipt {
-    /// Creates and signs a successful terminal receipt.
+    /// Creates and signs a legacy version-1 terminal receipt.
+    ///
+    /// Kept for mixed-version compatibility and test fixtures. New terminal
+    /// delivery code must use [`Self::accepted_for_purpose`].
     #[must_use]
     pub fn accepted(
         route_id: [u8; 16],
@@ -450,19 +467,66 @@ impl BlindRelayDeliveryReceipt {
         receipt
     }
 
+    /// Creates a purpose-bound version-2 terminal receipt.
+    ///
+    /// [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] The purpose is folded into
+    /// the commitment together with the opaque payload hash. It is not emitted
+    /// as a low-entropy field that middle relays could inspect or classify.
+    #[must_use]
+    pub fn accepted_for_purpose(
+        route_id: [u8; 16],
+        payload: &[u8],
+        purpose: OnionRoutePurpose,
+        delivered_at: u64,
+        terminal: &IdentityKeyPair,
+    ) -> Self {
+        let mut receipt = Self {
+            version: BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION,
+            route_id,
+            payload_commitment: Self::payload_commitment_for_purpose(payload, purpose),
+            terminal_node_id: terminal.public_key_bytes(),
+            delivered_at,
+            disposition: BLIND_RELAY_DELIVERY_ACCEPTED,
+            signature: [0u8; 64],
+        };
+        receipt.signature = terminal.sign(&receipt.signing_data());
+        receipt
+    }
+
     /// Returns the SHA-256 commitment used by terminal and source verification.
     #[must_use]
     pub fn payload_commitment(payload: &[u8]) -> [u8; 32] {
         Sha256::digest(payload).into()
     }
 
+    /// Returns the version-2 commitment for one opaque payload and purpose.
+    ///
+    /// The nested payload hash keeps the signing input fixed-size. Including
+    /// the canonical purpose length makes the byte contract unambiguous if the
+    /// public purpose namespace grows in future protocol versions.
+    #[must_use]
+    pub fn payload_commitment_for_purpose(payload: &[u8], purpose: OnionRoutePurpose) -> [u8; 32] {
+        let purpose = purpose.as_str().as_bytes();
+        let payload_hash = Self::payload_commitment(payload);
+        let mut hasher = Sha256::new();
+        hasher.update(BLIND_RELAY_PURPOSE_COMMITMENT_DOMAIN);
+        hasher.update([u8::try_from(purpose.len()).expect("route purpose must fit in u8")]);
+        hasher.update(purpose);
+        hasher.update(payload_hash);
+        hasher.finalize().into()
+    }
+
     /// Builds canonical domain-separated receipt signing bytes.
     #[must_use]
     pub fn signing_data(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(
-            BLIND_RELAY_DELIVERY_RECEIPT_SIGNING_DOMAIN.len() + 1 + 16 + 32 + 32 + 8 + 1,
-        );
-        data.extend_from_slice(BLIND_RELAY_DELIVERY_RECEIPT_SIGNING_DOMAIN);
+        let signing_domain = match self.version {
+            BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION => {
+                BLIND_RELAY_DELIVERY_RECEIPT_V2_SIGNING_DOMAIN
+            }
+            _ => BLIND_RELAY_DELIVERY_RECEIPT_V1_SIGNING_DOMAIN,
+        };
+        let mut data = Vec::with_capacity(signing_domain.len() + 1 + 16 + 32 + 32 + 8 + 1);
+        data.extend_from_slice(signing_domain);
         data.push(self.version);
         data.extend_from_slice(&self.route_id);
         data.extend_from_slice(&self.payload_commitment);
@@ -474,7 +538,9 @@ impl BlindRelayDeliveryReceipt {
 
     /// Verifies version, disposition, and the terminal Ed25519 signature.
     pub fn verify_signature(&self) -> Result<(), CoreError> {
-        if self.version != BLIND_RELAY_DELIVERY_RECEIPT_VERSION {
+        if self.version != BLIND_RELAY_DELIVERY_RECEIPT_VERSION
+            && self.version != BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION
+        {
             return Err(CoreError::malformed(
                 "blind relay delivery receipt: unsupported version",
             ));
@@ -505,6 +571,30 @@ impl BlindRelayDeliveryReceipt {
             ));
         }
         Ok(())
+    }
+
+    /// Verifies a version-2 receipt against the exact payload and route purpose.
+    ///
+    /// Legacy version-1 receipts deliberately fail this stronger check: their
+    /// signatures remain valid for transport compatibility, but they do not
+    /// provide workload-domain separation.
+    pub fn verify_expected_for_purpose(
+        &self,
+        route_id: &[u8; 16],
+        payload: &[u8],
+        purpose: OnionRoutePurpose,
+        terminal_node_id: &[u8; 32],
+    ) -> Result<(), CoreError> {
+        if self.version != BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION {
+            return Err(CoreError::malformed(
+                "blind relay delivery receipt: route purpose is not bound",
+            ));
+        }
+        self.verify_expected(
+            route_id,
+            &Self::payload_commitment_for_purpose(payload, purpose),
+            terminal_node_id,
+        )
     }
 }
 
@@ -1015,6 +1105,80 @@ mod tests {
         receipt.delivered_at = receipt.delivered_at.saturating_add(1);
 
         assert!(receipt.verify_signature().is_err());
+    }
+
+    #[test]
+    fn test_purpose_bound_receipt_verifies_only_for_exact_workload() {
+        let terminal = IdentityKeyPair::generate();
+        let route_id = [0x61u8; 16];
+        let payload = b"opaque terminal workload";
+        let receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
+            route_id,
+            payload,
+            OnionRoutePurpose::MessageRelay,
+            1_700_000_300,
+            &terminal,
+        );
+
+        assert_eq!(
+            receipt.version,
+            BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION
+        );
+        assert!(receipt.verify_signature().is_ok());
+        assert!(receipt
+            .verify_expected_for_purpose(
+                &route_id,
+                payload,
+                OnionRoutePurpose::MessageRelay,
+                &terminal.public_key_bytes(),
+            )
+            .is_ok());
+        assert!(receipt
+            .verify_expected_for_purpose(
+                &route_id,
+                payload,
+                OnionRoutePurpose::BlindVaultPut,
+                &terminal.public_key_bytes(),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_purpose_commitment_separates_same_payload_across_workloads() {
+        let payload = b"same opaque bytes";
+        assert_ne!(
+            BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
+                payload,
+                OnionRoutePurpose::MessageRelay,
+            ),
+            BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
+                payload,
+                OnionRoutePurpose::BlindVaultPut,
+            )
+        );
+    }
+
+    #[test]
+    fn test_legacy_receipt_remains_verifiable_but_cannot_prove_purpose() {
+        let terminal = IdentityKeyPair::generate();
+        let route_id = [0x71u8; 16];
+        let payload = b"legacy opaque payload";
+        let receipt = BlindRelayDeliveryReceipt::accepted(
+            route_id,
+            BlindRelayDeliveryReceipt::payload_commitment(payload),
+            1_700_000_400,
+            &terminal,
+        );
+
+        assert!(receipt.verify_signature().is_ok());
+        assert!(receipt
+            .verify_expected_for_purpose(
+                &route_id,
+                payload,
+                OnionRoutePurpose::MessageRelay,
+                &terminal.public_key_bytes(),
+            )
+            .is_err());
     }
 
     // ── MediaPointer ──

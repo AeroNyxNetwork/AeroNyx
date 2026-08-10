@@ -304,6 +304,9 @@
 //      multihop terminal-receipt support before selecting the first middle of
 //      a synthetic three-hop route, preventing rolling-upgrade incompatibility
 //      from becoming false route-health failure evidence.
+// 118. [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Requires receipt v2 and a
+//      purpose-separated opaque payload commitment before synthetic or real
+//      App onion delivery becomes verified; legacy receipts remain forwardable.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -423,6 +426,8 @@
 //     public onion pools can exclude candidates collocated with the entry.
 //
 // Last Modified:
+//   v2.8.69-PurposeBoundReceipt - Prevented cross-workload relay-proof reuse
+//     without exposing the route-purpose label to intermediary nodes.
 //   v2.8.68-BlindVaultReplicaCapability - Added rollout-gated, runtime-honest
 //     signed advertisement for admitted anonymous ciphertext replicas.
 //   v2.8.67-RouteDomainAttestedSelection - Applies the audited local
@@ -628,6 +633,7 @@ use aeronyx_core::protocol::auth::{
 };
 use aeronyx_core::protocol::chat::{
     encode_envelope, BlindRelayDeliveryReceipt, BlindRelayEnvelope, ChatContentType, ChatEnvelope,
+    BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -648,7 +654,8 @@ use aeronyx_core::protocol::memchain::{
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
     build_onion_envelope, DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability,
-    NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, OnionHop, SignedNodeDescriptor,
+    NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, OnionHop, OnionRoutePurpose,
+    SignedNodeDescriptor,
 };
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
@@ -9736,7 +9743,14 @@ impl Server {
             return None;
         }
         let encoded_chat = encode_envelope(chat_envelope).ok()?;
-        let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat);
+        // [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] The source computes the
+        // same opaque v2 commitment as the terminal. The purpose is not sent as
+        // relay metadata, and a storage receipt cannot satisfy this message
+        // route even when route identifiers are accidentally reused.
+        let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
+            &encoded_chat,
+            OnionRoutePurpose::MessageRelay,
+        );
         let path = path_descriptors
             .iter()
             .map(|descriptor| {
@@ -9770,8 +9784,9 @@ impl Server {
         let Some(receipt) = receipt else {
             return false;
         };
-        receipt.delivered_at
-            <= now.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
+        receipt.version == BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION
+            && receipt.delivered_at
+                <= now.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
             && now.saturating_sub(receipt.delivered_at) <= BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
             && receipt
                 .verify_expected(route_id, payload_commitment, terminal_node_id)
@@ -12822,7 +12837,7 @@ mod tests {
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
         NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
-        SignedNodeDescriptor,
+        OnionRoutePurpose, SignedNodeDescriptor,
     };
     use axum::{
         http::StatusCode,
@@ -14347,7 +14362,10 @@ mod tests {
         let encoded_chat = encode_envelope(&synthetic_chat).unwrap();
         assert_eq!(
             payload_commitment,
-            BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat)
+            BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
+                &encoded_chat,
+                OnionRoutePurpose::MessageRelay,
+            )
         );
     }
 
@@ -14440,7 +14458,10 @@ mod tests {
         let encoded_chat = encode_envelope(&synthetic_chat).unwrap();
         assert_eq!(
             payload_commitment,
-            BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat)
+            BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
+                &encoded_chat,
+                OnionRoutePurpose::MessageRelay,
+            )
         );
     }
 
@@ -14563,11 +14584,10 @@ mod tests {
                         now,
                     );
                     let encoded_chat = encode_envelope(&synthetic_chat).unwrap();
-                    let payload_commitment =
-                        BlindRelayDeliveryReceipt::payload_commitment(&encoded_chat);
-                    let receipt = BlindRelayDeliveryReceipt::accepted(
+                    let receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
                         request.envelope.route_id,
-                        payload_commitment,
+                        &encoded_chat,
+                        OnionRoutePurpose::MessageRelay,
                         now,
                         &terminal_identity,
                     );
@@ -14701,10 +14721,18 @@ mod tests {
         let now = 1_800_000_000;
         let terminal = IdentityKeyPair::generate();
         let route_id = [0x31; 16];
-        let payload_commitment =
-            BlindRelayDeliveryReceipt::payload_commitment(b"opaque terminal payload");
-        let receipt =
-            BlindRelayDeliveryReceipt::accepted(route_id, payload_commitment, now, &terminal);
+        let payload = b"opaque terminal payload";
+        let payload_commitment = BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
+            payload,
+            OnionRoutePurpose::MessageRelay,
+        );
+        let receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
+            route_id,
+            payload,
+            OnionRoutePurpose::MessageRelay,
+            now,
+            &terminal,
+        );
 
         assert!(Server::verified_delivery_receipt(
             Some(&receipt),
@@ -14741,6 +14769,20 @@ mod tests {
             &terminal.public_key_bytes(),
             now + BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS + 1,
         ));
+
+        let legacy_receipt = BlindRelayDeliveryReceipt::accepted(
+            route_id,
+            BlindRelayDeliveryReceipt::payload_commitment(payload),
+            now,
+            &terminal,
+        );
+        assert!(!Server::verified_delivery_receipt(
+            Some(&legacy_receipt),
+            &route_id,
+            &payload_commitment,
+            &terminal.public_key_bytes(),
+            now + 1,
+        ));
     }
 
     #[tokio::test]
@@ -14764,14 +14806,15 @@ mod tests {
             signature: [0u8; 64],
         };
         envelope.signature = chat_sender.sign(&envelope.sign_data());
-        let payload_commitment =
-            BlindRelayDeliveryReceipt::payload_commitment(&encode_envelope(&envelope).unwrap());
+        let encoded_envelope = encode_envelope(&envelope).unwrap();
+        let terminal_payload = encoded_envelope.clone();
 
         let terminal_receipt_identity = terminal_identity.clone();
         let relay = Router::new().route(
             "/api/chat/peer/blind-relay",
             post(move |Json(request): Json<PeerBlindRelayRequest>| {
                 let terminal_receipt_identity = terminal_receipt_identity.clone();
+                let terminal_payload = terminal_payload.clone();
                 async move {
                     Json(PeerBlindRelayResponse {
                         accepted: true,
@@ -14779,9 +14822,10 @@ mod tests {
                         forwarded: true,
                         ttl_remaining: 1,
                         reason: Some("onion_forwarded".to_string()),
-                        delivery_receipt: Some(BlindRelayDeliveryReceipt::accepted(
+                        delivery_receipt: Some(BlindRelayDeliveryReceipt::accepted_for_purpose(
                             request.envelope.route_id,
-                            payload_commitment,
+                            &terminal_payload,
+                            OnionRoutePurpose::MessageRelay,
                             unix_now_secs(),
                             &terminal_receipt_identity,
                         )),
@@ -15774,9 +15818,26 @@ mod tests {
             )
             .expect("receipt-capable test route should build");
         let expected_route_id = expected_request.envelope.route_id;
-        let delivery_receipt = BlindRelayDeliveryReceipt::accepted(
+        let expected_payload = encode_envelope(&Server::synthetic_two_hop_probe_chat_envelope(
+            &source_identity,
+            &self_node_id,
+            &receipt_middle_template.node_id(),
+            &terminal.node_id(),
             expected_route_id,
+            now,
+        ))
+        .expect("encode expected synthetic terminal payload");
+        assert_eq!(
             payload_commitment,
+            BlindRelayDeliveryReceipt::payload_commitment_for_purpose(
+                &expected_payload,
+                OnionRoutePurpose::MessageRelay,
+            )
+        );
+        let delivery_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
+            expected_route_id,
+            &expected_payload,
+            OnionRoutePurpose::MessageRelay,
             now,
             &terminal_identity,
         );
