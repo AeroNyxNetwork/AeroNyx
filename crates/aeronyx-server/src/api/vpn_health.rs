@@ -60,6 +60,9 @@
 //! historical `aeronyx-server` unit name. This keeps single-node deployments
 //! backward compatible while avoiding false failures on isolated regional or
 //! multi-instance units such as `aeronyx-server-jp1.service`.
+//! [SYSTEMD-CHILD-ISOLATION 2026-08-11 by Codex] Local health commands use the
+//! crate-owned isolated process factory so they cannot inherit readiness,
+//! watchdog, or socket-activation authority from the Rust service process.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -71,11 +74,11 @@ use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
 use crate::config::ServerConfig;
 use crate::handlers::packet::{PacketHandler, PacketRuntimeStatus};
+use crate::isolated_child_command;
 use crate::management::integrity;
 use crate::services::session::CLIENT_LIVENESS_TIMEOUT_SECS;
 use crate::services::{
@@ -1813,7 +1816,7 @@ async fn collect_service_manager_status(service_name: &str) -> ServiceManagerSta
     // browsing history, voucher secrets, client public IPs, or wallet traffic.
     let result = timeout(
         CHECK_TIMEOUT,
-        TokioCommand::new("systemctl")
+        isolated_child_command("systemctl")
             .args([
                 "show",
                 service_name,
@@ -2570,7 +2573,7 @@ async fn collect_disk_path_capacity(path: &'static str) -> DiskPathCapacityStatu
 
     let Ok(command_result) = timeout(
         CHECK_TIMEOUT,
-        TokioCommand::new("df")
+        isolated_child_command("df")
             .arg("-P")
             .arg("-B1")
             .arg(path)
@@ -3281,7 +3284,7 @@ async fn run_command(
     args: &[&str],
     limit: Duration,
 ) -> std::result::Result<String, String> {
-    let fut = TokioCommand::new(program).args(args).output();
+    let fut = isolated_child_command(program).args(args).output();
     let output = timeout(limit, fut)
         .await
         .map_err(|_| format!("{} timed out", program))?

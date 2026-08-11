@@ -15,6 +15,9 @@
 //!   config.rs via pub use re-exports.
 //! - v1.0.0-BlindVaultService: Added an independent, default-off Blind Vault
 //!   configuration module for anonymous encrypted durable objects.
+//! - [SYSTEMD-CHILD-ISOLATION 2026-08-11 by Codex] Added one process factory
+//!   that strips inherited systemd readiness, watchdog, and socket-activation
+//!   authority from every operating-system child spawned by the node.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial server library
@@ -25,6 +28,8 @@
 //! v1.0.0-MultiTenant - MinerScheduler added to miner module;
 //!                      config sub-modules declared at crate root
 //! v1.0.0-BlindVaultService - Added bounded Blind Vault configuration
+//! v2.8.42-SystemdChildIsolation - Prevent child processes from inheriting
+//!                                  service-manager protocol authority
 
 #![warn(missing_docs)]
 #![warn(clippy::all)]
@@ -63,3 +68,63 @@ pub use server::Server;
 
 // Re-export management types
 pub use management::{ManagementClient, ManagementConfig};
+
+/// Environment variables that confer systemd service-manager protocol access.
+///
+/// [SYSTEMD-CHILD-ISOLATION 2026-08-11 by Codex] The Rust node is the only
+/// process permitted to report readiness or watchdog state. It also does not
+/// delegate socket activation to commands used for health collection or node
+/// operations. Keeping this policy at the crate boundary prevents individual
+/// command call sites from silently forgetting one of these variables.
+const SYSTEMD_CHILD_AUTHORITY_ENV: [&str; 6] = [
+    "NOTIFY_SOCKET",
+    "WATCHDOG_PID",
+    "WATCHDOG_USEC",
+    "LISTEN_PID",
+    "LISTEN_FDS",
+    "LISTEN_FDNAMES",
+];
+
+/// Creates a Tokio child command without inherited systemd protocol authority.
+///
+/// Ordinary configuration environment variables remain available to preserve
+/// backward compatibility. All long-lived server subprocesses must be created
+/// through this function so only the Rust main process can signal readiness.
+pub(crate) fn isolated_child_command(
+    program: impl AsRef<std::ffi::OsStr>,
+) -> tokio::process::Command {
+    let mut command = std::process::Command::new(program);
+    strip_systemd_child_authority(&mut command);
+    tokio::process::Command::from(command)
+}
+
+fn strip_systemd_child_authority(command: &mut std::process::Command) {
+    for variable in SYSTEMD_CHILD_AUTHORITY_ENV {
+        command.env_remove(variable);
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use std::collections::HashMap;
+
+    use super::{strip_systemd_child_authority, SYSTEMD_CHILD_AUTHORITY_ENV};
+
+    #[test]
+    fn child_processes_explicitly_remove_systemd_authority() {
+        let mut command = std::process::Command::new("test-only-command");
+        strip_systemd_child_authority(&mut command);
+
+        let environment: HashMap<_, _> = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(ToOwned::to_owned)))
+            .collect();
+        for variable in SYSTEMD_CHILD_AUTHORITY_ENV {
+            assert_eq!(
+                environment.get(std::ffi::OsStr::new(variable)),
+                Some(&None),
+                "{variable} must be explicitly removed from child environments"
+            );
+        }
+    }
+}

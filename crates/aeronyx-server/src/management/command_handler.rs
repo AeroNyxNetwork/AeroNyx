@@ -12,6 +12,8 @@
 //! - v1.5.0: removed legacy non-VPN agent lifecycle command dispatch. The node
 //!   now accepts only VPN operations commands from the centralized control
 //!   plane.
+//! - [SYSTEMD-CHILD-ISOLATION 2026-08-11 by Codex] Routes every node-operation
+//!   subprocess through the crate-owned environment isolation boundary.
 //!
 //! ## Main Functionality
 //! - `CommandHandler`: Background async task that consumes commands
@@ -50,6 +52,7 @@
 //! v1.3.0 - Initial command pipeline
 //! v1.5.0 - VPN-only operations dispatch
 //! v1.6.0 - Added two_hop_smoke aggregate relay proof command
+//! v1.7.0 - Removed inherited systemd authority from operation subprocesses
 //! ============================================
 
 use std::collections::HashSet;
@@ -57,7 +60,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -65,6 +67,7 @@ use tracing::{debug, info, warn};
 use super::client::ManagementClient;
 use super::models::{Command, CommandExecutionStatus, CommandStatusReport};
 use super::reporter::{SessionEventSender, SessionQuality};
+use crate::isolated_child_command;
 use crate::services::{DenyList, DenyReason, NodePolicyRuntime, SessionManager};
 use aeronyx_common::types::SessionId;
 
@@ -1108,7 +1111,7 @@ fn json_str<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> 
 async fn run_readonly_command(program: &str, args: &[&str]) -> String {
     let output = timeout(
         VPN_COMMAND_TIMEOUT,
-        TokioCommand::new(program).args(args).output(),
+        isolated_child_command(program).args(args).output(),
     )
     .await;
 
@@ -1147,7 +1150,7 @@ async fn schedule_service_restart(command_id: &str, service_name: &str) -> Resul
 
     let systemd_run = timeout(
         VPN_COMMAND_TIMEOUT,
-        TokioCommand::new("systemd-run")
+        isolated_child_command("systemd-run")
             .args([
                 "--unit",
                 &unit,
@@ -1192,7 +1195,7 @@ async fn schedule_service_restart(command_id: &str, service_name: &str) -> Resul
 
     let fallback = timeout(
         VPN_COMMAND_TIMEOUT,
-        TokioCommand::new("sh")
+        isolated_child_command("sh")
             .arg("-c")
             .arg("nohup sh -c 'sleep 3; /bin/systemctl restart aeronyx-server' >/dev/null 2>&1 &")
             .status(),
@@ -1215,7 +1218,7 @@ async fn schedule_service_restart(command_id: &str, service_name: &str) -> Resul
 async fn ensure_systemd_service_loaded(service_name: &str) -> Result<(), String> {
     let show = timeout(
         VPN_COMMAND_TIMEOUT,
-        TokioCommand::new("systemctl")
+        isolated_child_command("systemctl")
             .args(["show", service_name, "--property=LoadState", "--value"])
             .output(),
     )
@@ -1253,7 +1256,7 @@ async fn ensure_systemd_service_loaded(service_name: &str) -> Result<(), String>
 async fn service_load_state_summary(service_name: &str) -> String {
     let show = timeout(
         VPN_COMMAND_TIMEOUT,
-        TokioCommand::new("systemctl")
+        isolated_child_command("systemctl")
             .args(["show", service_name, "--property=LoadState", "--value"])
             .output(),
     )
