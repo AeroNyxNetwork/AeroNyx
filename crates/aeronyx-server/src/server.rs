@@ -863,6 +863,20 @@ struct AuthenticatedChatOnionRelayOutcome {
     verified_receipts: usize,
 }
 
+/// Whether an onion-route failure can safely affect first-hop reputation.
+///
+/// [ONION-FAILURE-ATTRIBUTION 2026-08-11 by Codex] HTTP transport, status,
+/// and malformed first-hop responses are observable at the selected endpoint.
+/// A missing or invalid terminal receipt is different: the source cannot tell
+/// whether the middle, a later hop, or the terminal caused it. Treating that
+/// ambiguous evidence as a first-hop fault lets a malicious downstream node
+/// degrade or quarantine an honest middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnionRouteFailureAttribution {
+    FirstHop,
+    EndToEnd,
+}
+
 impl AuthenticatedChatOnionRelayOutcome {
     #[must_use]
     fn delivered(self) -> bool {
@@ -9641,10 +9655,12 @@ impl Server {
                                             3,
                                             2,
                                         );
-                                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                    let _ = Self::record_onion_route_failure(
+                                        peer_store,
                                         &first_middle,
                                         observed_at,
                                         "delivery_receipt_invalid",
+                                        OnionRouteFailureAttribution::EndToEnd,
                                     );
                                 }
                                 Ok(_ack) => {
@@ -9658,10 +9674,12 @@ impl Server {
                                             3,
                                             2,
                                         );
-                                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                    let _ = Self::record_onion_route_failure(
+                                        peer_store,
                                         &first_middle,
                                         observed_at,
                                         "onion_ack_rejected",
+                                        OnionRouteFailureAttribution::FirstHop,
                                     );
                                 }
                                 Err(error) => {
@@ -9676,10 +9694,12 @@ impl Server {
                                             3,
                                             2,
                                         );
-                                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                    let _ = Self::record_onion_route_failure(
+                                        peer_store,
                                         &first_middle,
                                         observed_at,
                                         &reason,
+                                        OnionRouteFailureAttribution::FirstHop,
                                     );
                                 }
                             }
@@ -9697,10 +9717,12 @@ impl Server {
                                 3,
                                 2,
                             );
-                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                            let _ = Self::record_onion_route_failure(
+                                peer_store,
                                 &first_middle,
                                 observed_at,
                                 reason,
+                                OnionRouteFailureAttribution::FirstHop,
                             );
                         }
                         Err(error) => {
@@ -9723,10 +9745,12 @@ impl Server {
                                 3,
                                 2,
                             );
-                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                            let _ = Self::record_onion_route_failure(
+                                peer_store,
                                 &first_middle,
                                 observed_at,
                                 reason,
+                                OnionRouteFailureAttribution::FirstHop,
                             );
                         }
                     }
@@ -9915,6 +9939,34 @@ impl Server {
             && receipt
                 .verify_expected(route_id, payload_commitment, terminal_node_id)
                 .is_ok()
+    }
+
+    /// Applies route-health penalties only when the source observed evidence
+    /// attributable to the selected first-hop endpoint.
+    ///
+    /// Aggregate probe/chat outcomes are recorded by the caller in both cases;
+    /// this helper controls only node-specific reputation. Reasons must remain
+    /// stable privacy-safe buckets and must never contain route or user data.
+    #[must_use]
+    fn record_onion_route_failure(
+        peer_store: &PeerStore,
+        first_hop: &SignedNodeDescriptor,
+        observed_at: u64,
+        reason: impl Into<String>,
+        attribution: OnionRouteFailureAttribution,
+    ) -> bool {
+        let reason = reason.into();
+        match attribution {
+            OnionRouteFailureAttribution::FirstHop => peer_store
+                .record_route_forward_failure_for_descriptor(first_hop, observed_at, reason),
+            OnionRouteFailureAttribution::EndToEnd => {
+                debug!(
+                    reason = %reason,
+                    "[CHAT_RELAY] Onion route failure left unattributed"
+                );
+                false
+            }
+        }
     }
 
     fn synthetic_two_hop_probe_chat_envelope(
@@ -10286,10 +10338,12 @@ impl Server {
                             ) {
                                 last_failure_reason =
                                     Some("onion_delivery_receipt_rejected".to_string());
-                                let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                let _ = Self::record_onion_route_failure(
+                                    peer_store,
                                     &middle,
                                     observed_at,
                                     "delivery_receipt_rejected",
+                                    OnionRouteFailureAttribution::EndToEnd,
                                 );
                             } else if peer_store.record_verified_client_onion_route_delivery(
                                 &middle,
@@ -10306,20 +10360,24 @@ impl Server {
                             let observed_at = unix_now_secs();
                             last_failure_reason =
                                 Some("onion_delivery_receipt_rejected".to_string());
-                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                            let _ = Self::record_onion_route_failure(
+                                peer_store,
                                 &middle,
                                 observed_at,
                                 "delivery_receipt_rejected",
+                                OnionRouteFailureAttribution::FirstHop,
                             );
                         }
                         Err(error) => {
                             let observed_at = unix_now_secs();
                             let reason = format!("onion_delivery_ack_{}", error.as_str());
                             last_failure_reason = Some(reason.clone());
-                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                            let _ = Self::record_onion_route_failure(
+                                peer_store,
                                 &middle,
                                 observed_at,
                                 reason,
+                                OnionRouteFailureAttribution::FirstHop,
                             );
                         }
                     }
@@ -10328,20 +10386,24 @@ impl Server {
                     let observed_at = unix_now_secs();
                     let reason = format!("onion_delivery_http_{}", response.status().as_u16());
                     last_failure_reason = Some(reason.clone());
-                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                    let _ = Self::record_onion_route_failure(
+                        peer_store,
                         &middle,
                         observed_at,
                         reason,
+                        OnionRouteFailureAttribution::FirstHop,
                     );
                 }
                 Err(error) => {
                     let observed_at = unix_now_secs();
                     let reason = Self::classify_reqwest_error("onion_delivery_request", &error);
                     last_failure_reason = Some(reason.clone());
-                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                    let _ = Self::record_onion_route_failure(
+                        peer_store,
                         &middle,
                         observed_at,
                         reason,
+                        OnionRouteFailureAttribution::FirstHop,
                     );
                 }
             }
@@ -15111,6 +15173,91 @@ mod tests {
             quality.evidence_mode,
             "verified_client_onion_delivery_receipt"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_terminal_receipt_does_not_poison_first_hop_reputation() {
+        let now = unix_now_secs();
+        let source = IdentityKeyPair::generate();
+        let middle_identity = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+        let middle_node_id = middle_identity.public_key_bytes();
+        let terminal_node_id = terminal_identity.public_key_bytes();
+
+        let relay = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(|| async {
+                Json(PeerBlindRelayResponse {
+                    accepted: true,
+                    terminal: false,
+                    forwarded: true,
+                    ttl_remaining: 1,
+                    reason: Some("onion_forwarded".to_string()),
+                    delivery_receipt: None,
+                })
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let middle_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let relay_server = tokio::spawn(async move {
+            axum::serve(listener, relay).await.unwrap();
+        });
+
+        let mut middle = NodeDescriptor::new(
+            middle_node_id,
+            now,
+            now,
+            now + 300,
+            "unattributed-receipt-middle",
+        )
+        .with_x25519_kem(middle_identity.x25519_public_key_bytes());
+        middle.public_endpoint = Some(middle_endpoint);
+        middle.capabilities = vec![NodeCapability::OnionMiddle];
+        let middle = SignedNodeDescriptor::sign(middle, &middle_identity).unwrap();
+
+        let mut terminal = NodeDescriptor::new(
+            terminal_node_id,
+            now,
+            now,
+            now + 300,
+            "unattributed-receipt-terminal",
+        )
+        .with_x25519_kem(terminal_identity.x25519_public_key_bytes());
+        terminal.public_endpoint = Some("http://127.0.1.1:9".to_string());
+        terminal.capabilities = vec![NodeCapability::ChatRelay];
+        let terminal = SignedNodeDescriptor::sign(terminal, &terminal_identity).unwrap();
+
+        let store = PeerStore::new();
+        for descriptor in [middle, terminal] {
+            let node_id = descriptor.node_id();
+            store.upsert_verified(descriptor, now).unwrap();
+            store.record_route_forward_success(&node_id, now);
+            store.record_purpose_bound_delivery_receipt_capability(&node_id, now);
+        }
+
+        let outcome = Server::relay_authenticated_chat_over_onion_paths(
+            Some(&reqwest::Client::new()),
+            None,
+            &store,
+            &source,
+            &source.public_key_bytes(),
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+        relay_server.abort();
+        let _ = relay_server.await;
+
+        assert_eq!(outcome.attempted_paths, 1);
+        assert_eq!(outcome.verified_receipts, 0);
+        let row = store
+            .route_candidate_status(unix_now_secs())
+            .onion_middle
+            .into_iter()
+            .find(|row| row.node_id_prefix == hex::encode(&middle_node_id[..4]))
+            .expect("middle must remain visible in route diagnostics");
+        assert_eq!(row.route_health, "healthy");
+        assert_eq!(row.route_consecutive_failures, 0);
+        assert_eq!(row.last_route_failure_reason, None);
     }
 
     #[tokio::test]
