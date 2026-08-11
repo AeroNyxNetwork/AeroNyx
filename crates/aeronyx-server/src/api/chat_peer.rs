@@ -141,6 +141,9 @@
 //! - A successful downstream ACK must describe exactly one completed action:
 //!   terminal acceptance or onward forwarding. `accepted=true` without either
 //!   action is not delivery evidence and must never improve route reputation.
+//! - A structurally valid peer-declared failure proves only that the immediate
+//!   transport responded. Without a signed hop-failure receipt, it must not
+//!   become node-specific reputation evidence for any downstream participant.
 //! - Blind Vault's detailed storage receipt contains stable replica-local lease
 //!   metadata and therefore must not be exposed in a multi-hop JSON ACK. The
 //!   existing delivery receipt is signed only after `BlindVaultService::put`
@@ -166,6 +169,8 @@
 //!   bounded independently from the live route map to prevent stale-entry DoS.
 //!
 //! ## Last Modified
+//! v0.37.0-DownstreamFailureAttribution - Keep valid peer-declared downstream
+//! failures out of immediate-next-hop reputation while preserving retry classes
 //! v0.36.0-RelayAckStateMachine - Require successful downstream ACKs to prove
 //! exactly one terminal or forwarding disposition before recording success
 //! v0.35.0-ReplayGenerationCompaction - Make same-second route reuse safe and
@@ -2098,31 +2103,32 @@ async fn forward_blind_relay_with_retry(
             Ok(response) => {
                 let status = response.status();
                 let reason = format!("http_{}", status.as_u16());
-                let declared_reason = if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                    decode_bounded_json_response::<PeerBlindRelayResponse>(
-                        response,
-                        PEER_ACK_RESPONSE_MAX_BYTES,
-                    )
-                    .await
-                    .ok()
-                    .and_then(|body| body.reason)
-                } else {
-                    None
-                };
+                let declared_response = decode_bounded_json_response::<PeerBlindRelayResponse>(
+                    response,
+                    PEER_ACK_RESPONSE_MAX_BYTES,
+                )
+                .await
+                .ok();
                 let observed_at = blind_relay_response_observed_at(now, &request_started_at);
                 if let Some(error) =
-                    non_retryable_downstream_error(status, declared_reason.as_deref())
+                    peer_declared_downstream_error(status, declared_response.as_ref())
                 {
-                    // [BLIND-VAULT-RETRY-CLASS 2026-08-10 by Codex] Preserve
-                    // only transport-level retry semantics across middle hops.
-                    // Only one bounded stable capacity reason is recognized;
-                    // no lease/object detail or arbitrary downstream error is
-                    // propagated.
+                    // [DOWNSTREAM-FAILURE-ATTRIBUTION 2026-08-11 by Codex]
+                    // A valid bounded error ACK proves the immediate endpoint
+                    // responded, but its unsigned claim cannot identify which
+                    // deeper hop failed. Preserve coarse retry semantics and
+                    // aggregate observability without poisoning route health.
                     debug!(
                         attempt,
                         status = %status,
-                        "[BLIND_RELAY] Next-hop returned terminal non-retryable status"
+                        "[BLIND_RELAY] Peer-declared downstream failure left unattributed"
                     );
+                    state
+                        .peer_store
+                        .record_blind_relay_rejected(observed_at, error.reason_bucket());
+                    return Err(error);
+                }
+                if let Some(error) = non_retryable_downstream_status_error(status) {
                     let _ = state
                         .peer_store
                         .record_route_forward_failure_for_descriptor(
@@ -2231,10 +2237,25 @@ async fn forward_blind_relay_with_retry(
     Err(BlindRelayError::ForwardFailed)
 }
 
-fn non_retryable_downstream_error(
+/// Classifies only a bounded, well-shaped peer protocol error response.
+///
+/// The response remains unsigned and therefore never grants blame authority.
+/// This classifier controls retry/propagation only; callers must not mutate
+/// node-specific reputation from its result.
+fn peer_declared_downstream_error(
     status: reqwest::StatusCode,
-    declared_reason: Option<&str>,
+    response: Option<&PeerBlindRelayResponse>,
 ) -> Option<BlindRelayError> {
+    let response = response?;
+    if response.accepted
+        || response.terminal
+        || response.forwarded
+        || response.ttl_remaining != 0
+        || response.delivery_receipt.is_some()
+    {
+        return None;
+    }
+    let declared_reason = response.reason.as_deref();
     if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
         && declared_reason == Some("onion_terminal_capacity_exhausted")
     {
@@ -2243,6 +2264,25 @@ fn non_retryable_downstream_error(
         // 503 remains retryable instead of being misclassified as lease state.
         return Some(BlindRelayError::OnionTerminalCapacityExhausted);
     }
+    if status == reqwest::StatusCode::BAD_GATEWAY
+        && matches!(
+            declared_reason,
+            Some("forward_failed" | "no_route" | "invalid_endpoint")
+        )
+    {
+        return Some(BlindRelayError::ForwardFailed);
+    }
+    if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Some(BlindRelayError::DownstreamRejected);
+    }
+    None
+}
+
+/// Classifies a bare HTTP status with no trustworthy protocol error shape.
+///
+/// Unlike a decoded peer response, this is direct endpoint failure evidence
+/// and may therefore contribute to immediate-next-hop route health.
+fn non_retryable_downstream_status_error(status: reqwest::StatusCode) -> Option<BlindRelayError> {
     if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Some(BlindRelayError::DownstreamRejected);
     }
@@ -2836,7 +2876,7 @@ mod tests {
     }
 
     #[test]
-    fn blind_vault_put_errors_preserve_retry_semantics_without_state_details() {
+    fn downstream_errors_preserve_retry_semantics_without_granting_blame_authority() {
         assert!(matches!(
             map_blind_vault_put_error(&BlindVaultServiceError::LeaseNotFound),
             BlindRelayError::OnionTerminalPayloadRejected
@@ -2869,26 +2909,58 @@ mod tests {
             BlindRelayError::ReplayCapacity.reason_bucket(),
             "replay_capacity"
         );
+        let failure_ack = |reason: &str| PeerBlindRelayResponse {
+            accepted: false,
+            terminal: false,
+            forwarded: false,
+            ttl_remaining: 0,
+            reason: Some(reason.to_string()),
+            delivery_receipt: None,
+        };
+        // [DOWNSTREAM-FAILURE-ATTRIBUTION 2026-08-11 by Codex] Valid protocol
+        // errors preserve only coarse control flow. Bare statuses remain the
+        // separate direct-endpoint evidence path used by route health.
         assert!(matches!(
-            non_retryable_downstream_error(reqwest::StatusCode::BAD_REQUEST, None),
-            Some(BlindRelayError::DownstreamRejected)
-        ));
-        assert!(matches!(
-            non_retryable_downstream_error(
+            peer_declared_downstream_error(
                 reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                Some("onion_terminal_capacity_exhausted")
+                Some(&failure_ack("onion_terminal_capacity_exhausted"))
             ),
             Some(BlindRelayError::OnionTerminalCapacityExhausted)
         ));
-        assert!(non_retryable_downstream_error(
+        assert!(matches!(
+            peer_declared_downstream_error(
+                reqwest::StatusCode::BAD_GATEWAY,
+                Some(&failure_ack("forward_failed")),
+            ),
+            Some(BlindRelayError::ForwardFailed)
+        ));
+        assert!(matches!(
+            peer_declared_downstream_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                Some(&failure_ack("downstream_rejected")),
+            ),
+            Some(BlindRelayError::DownstreamRejected)
+        ));
+        assert!(peer_declared_downstream_error(
             reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            Some("proxy_unavailable")
+            Some(&failure_ack("proxy_unavailable")),
         )
         .is_none());
+        let mut malformed_success = failure_ack("forward_failed");
+        malformed_success.accepted = true;
+        assert!(peer_declared_downstream_error(
+            reqwest::StatusCode::BAD_GATEWAY,
+            Some(&malformed_success),
+        )
+        .is_none());
+        assert!(matches!(
+            non_retryable_downstream_status_error(reqwest::StatusCode::BAD_REQUEST),
+            Some(BlindRelayError::DownstreamRejected)
+        ));
         assert!(
-            non_retryable_downstream_error(reqwest::StatusCode::TOO_MANY_REQUESTS, None).is_none()
+            non_retryable_downstream_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS).is_none()
         );
-        assert!(non_retryable_downstream_error(reqwest::StatusCode::BAD_GATEWAY, None).is_none());
+        assert!(non_retryable_downstream_status_error(reqwest::StatusCode::BAD_GATEWAY).is_none());
     }
 
     #[tokio::test]
@@ -4917,6 +4989,112 @@ mod tests {
         assert!(peer_store.recent_audit_events().iter().all(|event| {
             event.action != "blind_relay_route_health"
                 || !event.detail.contains("reason=routeability_not_ready")
+        }));
+    }
+
+    #[tokio::test]
+    async fn peer_declared_downstream_failure_does_not_poison_next_hop_reputation() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_route = Arc::clone(&attempts);
+        let next_hop_app = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(_request): Json<PeerBlindRelayRequest>| {
+                let attempts_for_request = Arc::clone(&attempts_for_route);
+                async move {
+                    attempts_for_request.fetch_add(1, AtomicOrdering::SeqCst);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(PeerBlindRelayResponse {
+                            accepted: false,
+                            terminal: false,
+                            forwarded: false,
+                            ttl_remaining: 0,
+                            reason: Some("forward_failed".to_string()),
+                            delivery_receipt: None,
+                        }),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, next_hop_app).await.unwrap();
+        });
+
+        let now = now_secs();
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let next_hop_identity = IdentityKeyPair::generate();
+        let next_hop_node_id = next_hop_identity.public_key_bytes();
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(
+                signed_chat_relay_peer_descriptor_for(&next_hop_identity, endpoint, now, now + 300),
+                now,
+                "gossip_snapshot",
+            )
+            .unwrap();
+        peer_store.record_route_forward_success(&next_hop_node_id, now);
+
+        let state = ChatPeerState {
+            chat_relay: None,
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity,
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x59u8; 16],
+            next_hop: next_hop_node_id,
+            ttl: 2,
+            encrypted_blob: b"opaque encrypted relay bytes".to_vec(),
+            timestamp: now,
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+
+        let result = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await;
+
+        server.abort();
+
+        assert!(matches!(result, Err(BlindRelayError::ForwardFailed)));
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+        let blind_stats = peer_store.status(now + 5).runtime.blind_relay;
+        assert_eq!(blind_stats.forwarded, 0);
+        assert_eq!(blind_stats.rejected, 1);
+        assert_eq!(blind_stats.forward_failed, 1);
+
+        let route_status = peer_store.route_candidate_status(now + 5);
+        let route_row = route_status
+            .chat_relay
+            .iter()
+            .find(|row| row.node_id_prefix == hex::encode(&next_hop_node_id[..4]))
+            .expect("chat relay row should remain visible");
+        // [DOWNSTREAM-FAILURE-ATTRIBUTION 2026-08-11 by Codex] The peer was
+        // reachable and returned a valid bounded error ACK. That is an
+        // end-to-end failure signal, not proof that this route surface failed.
+        assert!(route_row.routeability_ready);
+        assert_eq!(route_row.route_failure_count, 0);
+        assert_eq!(route_row.route_consecutive_failures, 0);
+        assert!(route_row.last_route_failure_reason.is_none());
+        assert!(!route_row.route_quarantined);
+        assert!(peer_store.recent_audit_events().iter().all(|event| {
+            event.action != "blind_relay_route_health" || event.outcome != "rejected"
         }));
     }
 
