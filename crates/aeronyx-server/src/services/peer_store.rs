@@ -4607,6 +4607,210 @@ impl PeerStore {
         self.client_delivery_cache_notify.notify_one();
     }
 
+    /// Commits route-health and receipt-capability evidence for one complete
+    /// signed path, then publishes the caller's aggregate success marker.
+    ///
+    /// [ATOMIC-MULTIHOP-PROOF-EVIDENCE 2026-08-11 by Codex] Every hop is
+    /// role-checked and fingerprinted before the peer snapshot is locked. The
+    /// same snapshot is then held through route-health, receipt-capability,
+    /// and aggregate-proof publication, so an in-flight descriptor rotation
+    /// cannot leave a successful path proof backed by only part of the route.
+    /// Lock order is peers -> route health -> receipt capability -> aggregate.
+    fn commit_verified_route_delivery_evidence<R>(
+        &self,
+        route: &[(&SignedNodeDescriptor, NodeCapability)],
+        now: u64,
+        publish: impl FnOnce() -> R,
+    ) -> Result<(Vec<[u8; 32]>, R), &'static str> {
+        if route.len() < 2 {
+            return Err("insufficient_route_hops");
+        }
+
+        let mut seen_node_ids = HashSet::with_capacity(route.len());
+        let mut expected_surfaces = Vec::with_capacity(route.len());
+        for (descriptor, required_capability) in route {
+            let node_id = descriptor.node_id();
+            if !seen_node_ids.insert(node_id) {
+                return Err("duplicate_route_hop");
+            }
+            if !descriptor
+                .descriptor
+                .capabilities
+                .contains(required_capability)
+            {
+                return Err("route_role_mismatch");
+            }
+            let fingerprint = descriptor
+                .verify_at(now)
+                .ok()
+                .and_then(|_| Self::descriptor_routeability_surface_fingerprint(descriptor))
+                .ok_or("invalid_expected_route_surface")?;
+            expected_surfaces.push((node_id, fingerprint));
+        }
+
+        let published = {
+            let peers = self.peers.read();
+            let surfaces_are_current =
+                expected_surfaces
+                    .iter()
+                    .all(|(node_id, expected_fingerprint)| {
+                        peers
+                            .get(node_id)
+                            .filter(|descriptor| descriptor.verify_at(now).is_ok())
+                            .and_then(Self::descriptor_routeability_surface_fingerprint)
+                            .is_some_and(|current| current == *expected_fingerprint)
+                    });
+            if !surfaces_are_current {
+                return Err("route_surface_mismatch");
+            }
+
+            let mut route_health = self.route_health.write();
+            for (node_id, fingerprint) in &expected_surfaces {
+                let health = route_health.entry(*node_id).or_default();
+                health.success_count = health.success_count.saturating_add(1);
+                health.consecutive_failures = 0;
+                health.last_success_at = Some(now);
+                health.last_success_route_fingerprint_sha256 = Some(fingerprint.clone());
+                health.quarantine_until = None;
+            }
+
+            let mut receipt_capability = self.purpose_bound_delivery_receipt_capability.write();
+            for (node_id, fingerprint) in &expected_surfaces {
+                receipt_capability.insert(
+                    *node_id,
+                    PurposeBoundDeliveryReceiptEvidence {
+                        observed_at: now,
+                        route_surface_fingerprint_sha256: fingerprint.clone(),
+                    },
+                );
+            }
+
+            // Publish last: readers may observe an older conservative state,
+            // never a success marker without its supporting route evidence.
+            publish()
+        };
+
+        let node_ids = expected_surfaces
+            .into_iter()
+            .map(|(node_id, _)| node_id)
+            .collect();
+        Ok((node_ids, published))
+    }
+
+    /// Records a terminal-signed synthetic two-hop delivery proof only while
+    /// the complete route remains current at the response observation time.
+    #[must_use]
+    pub fn record_verified_two_hop_probe_delivery(
+        &self,
+        middle: &SignedNodeDescriptor,
+        terminal: &SignedNodeDescriptor,
+        now: u64,
+        middle_candidate_count: usize,
+        terminal_candidate_count: usize,
+    ) -> bool {
+        self.record_verified_synthetic_probe_delivery(
+            &[
+                (middle, NodeCapability::OnionMiddle),
+                (terminal, NodeCapability::ChatRelay),
+            ],
+            now,
+            middle_candidate_count,
+            terminal_candidate_count,
+            2,
+            1,
+        )
+    }
+
+    /// Records a terminal-signed synthetic three-hop delivery proof only while
+    /// all two middle surfaces and the terminal surface remain current.
+    #[must_use]
+    pub fn record_verified_three_hop_probe_delivery(
+        &self,
+        first_middle: &SignedNodeDescriptor,
+        second_middle: &SignedNodeDescriptor,
+        terminal: &SignedNodeDescriptor,
+        now: u64,
+        middle_candidate_count: usize,
+        terminal_candidate_count: usize,
+    ) -> bool {
+        self.record_verified_synthetic_probe_delivery(
+            &[
+                (first_middle, NodeCapability::OnionMiddle),
+                (second_middle, NodeCapability::OnionMiddle),
+                (terminal, NodeCapability::ChatRelay),
+            ],
+            now,
+            middle_candidate_count,
+            terminal_candidate_count,
+            3,
+            2,
+        )
+    }
+
+    fn record_verified_synthetic_probe_delivery(
+        &self,
+        route: &[(&SignedNodeDescriptor, NodeCapability)],
+        now: u64,
+        middle_candidate_count: usize,
+        terminal_candidate_count: usize,
+        entry_ttl: u8,
+        onward_ttl: u8,
+    ) -> bool {
+        let hop_count = route.len() as u8;
+        let result = self.commit_verified_route_delivery_evidence(route, now, || {
+            if hop_count == 3 {
+                self.record_blind_relay_three_hop_probe_result_with_context(
+                    now,
+                    true,
+                    "onion_terminal_delivered",
+                    middle_candidate_count,
+                    terminal_candidate_count,
+                    entry_ttl,
+                    onward_ttl,
+                );
+            } else {
+                self.record_blind_relay_two_hop_probe_result_with_context(
+                    now,
+                    true,
+                    "onion_terminal_delivered",
+                    middle_candidate_count,
+                    terminal_candidate_count,
+                    entry_ttl,
+                    onward_ttl,
+                );
+            }
+        });
+
+        let (node_ids, ()) = match result {
+            Ok(committed) => committed,
+            Err(reason) => {
+                self.record_audit_event(
+                    now,
+                    "blind_relay_path_proof_evidence",
+                    "rejected",
+                    format!("hop_count={hop_count} reason={reason}"),
+                );
+                return false;
+            }
+        };
+
+        for node_id in node_ids {
+            self.record_audit_event(
+                now,
+                "blind_relay_route_health",
+                "accepted",
+                format!("node_prefix={} result=success", hex::encode(&node_id[..4])),
+            );
+            self.record_audit_event(
+                now,
+                "blind_relay_purpose_bound_receipt_capability",
+                "accepted",
+                "fresh_purpose_bound_delivery_receipt_v2".to_string(),
+            );
+        }
+        true
+    }
+
     /// Commits one verified two-hop client delivery against a single current
     /// signed route snapshot.
     ///
@@ -4627,35 +4831,16 @@ impl PeerStore {
         terminal: &SignedNodeDescriptor,
         now: u64,
     ) -> bool {
-        let middle_node_id = middle.node_id();
-        let terminal_node_id = terminal.node_id();
-        let expected_surfaces = if middle_node_id == terminal_node_id {
-            Err("duplicate_route_hop")
-        } else if !middle
-            .descriptor
-            .capabilities
-            .contains(&NodeCapability::OnionMiddle)
-            || !terminal
-                .descriptor
-                .capabilities
-                .contains(&NodeCapability::ChatRelay)
-        {
-            Err("route_role_mismatch")
-        } else {
-            middle
-                .verify_at(now)
-                .ok()
-                .and_then(|_| Self::descriptor_routeability_surface_fingerprint(middle))
-                .zip(
-                    terminal
-                        .verify_at(now)
-                        .ok()
-                        .and_then(|_| Self::descriptor_routeability_surface_fingerprint(terminal)),
-                )
-                .ok_or("invalid_expected_route_surface")
-        };
-        let (middle_fingerprint, terminal_fingerprint) = match expected_surfaces {
-            Ok(surfaces) => surfaces,
+        let result = self.commit_verified_route_delivery_evidence(
+            &[
+                (middle, NodeCapability::OnionMiddle),
+                (terminal, NodeCapability::ChatRelay),
+            ],
+            now,
+            || self.record_verified_client_onion_delivery_aggregate(now),
+        );
+        let (node_ids, ()) = match result {
+            Ok(committed) => committed,
             Err(reason) => {
                 self.record_audit_event(
                     now,
@@ -4667,67 +4852,7 @@ impl PeerStore {
             }
         };
 
-        {
-            let peers = self.peers.read();
-            let surfaces_are_current = [
-                (middle_node_id, middle_fingerprint.as_str()),
-                (terminal_node_id, terminal_fingerprint.as_str()),
-            ]
-            .into_iter()
-            .all(|(node_id, expected_fingerprint)| {
-                peers
-                    .get(&node_id)
-                    .filter(|descriptor| descriptor.verify_at(now).is_ok())
-                    .and_then(Self::descriptor_routeability_surface_fingerprint)
-                    .is_some_and(|current| current == expected_fingerprint)
-            });
-            if !surfaces_are_current {
-                drop(peers);
-                self.record_audit_event(
-                    now,
-                    "blind_relay_client_delivery_receipt",
-                    "rejected",
-                    "route_surface_mismatch".to_string(),
-                );
-                return false;
-            }
-
-            let mut route_health = self.route_health.write();
-            for (node_id, fingerprint) in [
-                (middle_node_id, middle_fingerprint.clone()),
-                (terminal_node_id, terminal_fingerprint.clone()),
-            ] {
-                let health = route_health.entry(node_id).or_default();
-                health.success_count = health.success_count.saturating_add(1);
-                health.consecutive_failures = 0;
-                health.last_success_at = Some(now);
-                health.last_success_route_fingerprint_sha256 = Some(fingerprint);
-                health.quarantine_until = None;
-            }
-
-            let mut receipt_capability = self.purpose_bound_delivery_receipt_capability.write();
-            receipt_capability.insert(
-                middle_node_id,
-                PurposeBoundDeliveryReceiptEvidence {
-                    observed_at: now,
-                    route_surface_fingerprint_sha256: middle_fingerprint,
-                },
-            );
-            receipt_capability.insert(
-                terminal_node_id,
-                PurposeBoundDeliveryReceiptEvidence {
-                    observed_at: now,
-                    route_surface_fingerprint_sha256: terminal_fingerprint,
-                },
-            );
-
-            // Publish the aggregate counter last. Status readers can therefore
-            // observe an older conservative state, never a delivery whose
-            // supporting route evidence has not been committed yet.
-            self.record_verified_client_onion_delivery_aggregate(now);
-        }
-
-        for node_id in [middle_node_id, terminal_node_id] {
+        for node_id in node_ids {
             self.record_audit_event(
                 now,
                 "blind_relay_route_health",
@@ -9653,6 +9778,94 @@ mod tests {
         assert!(store.is_routeable_now(&middle_node_id, now + 22));
         assert!(store.is_routeable_now(&terminal_node_id, now + 22));
         assert!(store.take_client_delivery_cache_dirty());
+    }
+
+    #[test]
+    fn test_verified_synthetic_probe_path_evidence_is_all_or_nothing() {
+        let now = 1_700_000_100;
+        let first_identity = IdentityKeyPair::generate();
+        let second_identity = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+
+        let mut first = signed_descriptor_for(&first_identity, 7, now + 4_000);
+        first.descriptor.public_endpoint = Some("https://first.example".to_string());
+        first.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        first = SignedNodeDescriptor::sign(first.descriptor, &first_identity).unwrap();
+
+        let mut second = signed_descriptor_for(&second_identity, 7, now + 4_000);
+        second.descriptor.public_endpoint = Some("https://second-a.example".to_string());
+        second.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        second = SignedNodeDescriptor::sign(second.descriptor, &second_identity).unwrap();
+
+        let mut terminal = signed_descriptor_for(&terminal_identity, 7, now + 4_000);
+        terminal.descriptor.public_endpoint = Some("https://terminal.example".to_string());
+        terminal.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        terminal = SignedNodeDescriptor::sign(terminal.descriptor, &terminal_identity).unwrap();
+
+        let first_node_id = first.node_id();
+        let second_node_id = second.node_id();
+        let terminal_node_id = terminal.node_id();
+        let store = PeerStore::new();
+        for descriptor in [first.clone(), second.clone(), terminal.clone()] {
+            store.upsert_verified(descriptor, now).unwrap();
+        }
+
+        let mut rotated_second_body = second.descriptor.clone();
+        rotated_second_body.sequence = 8;
+        rotated_second_body.issued_at = now + 20;
+        rotated_second_body.expires_at = now + 4_020;
+        rotated_second_body.public_endpoint = Some("https://second-b.example".to_string());
+        let rotated_second =
+            SignedNodeDescriptor::sign(rotated_second_body, &second_identity).unwrap();
+        store
+            .upsert_verified(rotated_second.clone(), now + 20)
+            .unwrap();
+
+        // [ATOMIC-MULTIHOP-PROOF-EVIDENCE 2026-08-11 by Codex] A rotation of
+        // any hop rejects the whole proof. No unchanged hop receives partial
+        // health/capability credit and no success enters admission history.
+        assert!(!store.record_verified_three_hop_probe_delivery(
+            &first,
+            &second,
+            &terminal,
+            now + 21,
+            2,
+            1,
+        ));
+        let rejected = store.status(now + 21);
+        assert_eq!(rejected.three_hop_path_proof_history.attempted, 0);
+        assert_eq!(
+            rejected.blind_relay_quality.delivery_receipt_capable_peers,
+            0
+        );
+        for node_id in [first_node_id, second_node_id, terminal_node_id] {
+            assert!(!store.is_routeable_now(&node_id, now + 21));
+        }
+
+        assert!(store.record_verified_three_hop_probe_delivery(
+            &first,
+            &rotated_second,
+            &terminal,
+            now + 22,
+            2,
+            1,
+        ));
+        let accepted = store.status(now + 22);
+        assert_eq!(accepted.three_hop_path_proof_history.attempted, 1);
+        assert_eq!(accepted.three_hop_path_proof_history.succeeded, 1);
+        assert_eq!(
+            accepted
+                .three_hop_path_proof_history
+                .message_delivery_successes,
+            1
+        );
+        assert_eq!(
+            accepted.blind_relay_quality.delivery_receipt_capable_peers,
+            3
+        );
+        for node_id in [first_node_id, second_node_id, terminal_node_id] {
+            assert!(store.is_routeable_now(&node_id, now + 22));
+        }
     }
 
     #[test]

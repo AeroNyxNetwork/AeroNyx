@@ -632,7 +632,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -9084,8 +9084,15 @@ impl Server {
                     .flatten()
                 {
                     request_count = request_count.saturating_add(1);
+                    let request_started_at = Instant::now();
                     match client.post(&url).json(&request).send().await {
                         Ok(response) if response.status().is_success() => {
+                            // [MULTIHOP-PROOF-RESPONSE-TIME 2026-08-11 by Codex]
+                            // Bind verification to response observation rather
+                            // than the earlier route-selection snapshot. The
+                            // elapsed projection preserves injected test clocks.
+                            let observed_at =
+                                now.saturating_add(request_started_at.elapsed().as_secs());
                             match decode_bounded_json_response::<PeerBlindRelayResponse>(
                                 response,
                                 PEER_ACK_RESPONSE_MAX_BYTES,
@@ -9100,36 +9107,25 @@ impl Server {
                                             &request.envelope.route_id,
                                             &payload_commitment,
                                             &terminal_node_id,
-                                            now,
+                                            observed_at,
                                         ) =>
                                 {
-                                    let _ = peer_store
-                                        .record_purpose_bound_delivery_receipt_capability_for_descriptor(
-                                            &middle,
-                                            now,
-                                        );
-                                    let _ = peer_store
-                                        .record_purpose_bound_delivery_receipt_capability_for_descriptor(
-                                            &terminal,
-                                            now,
-                                        );
-                                    peer_store
-                                        .record_blind_relay_two_hop_probe_result_with_context(
-                                            now,
-                                            true,
-                                            "onion_terminal_delivered",
-                                            middle_candidate_count,
-                                            terminal_candidate_count,
-                                            2,
-                                            1,
-                                        );
-                                    let _ = peer_store
-                                        .record_route_forward_success_for_descriptor(&middle, now);
-                                    return TwoHopBlindRelayProbeOutcome {
-                                        attempted: true,
-                                        route_accepted: true,
-                                        terminal_delivery_verified: true,
-                                    };
+                                    if peer_store.record_verified_two_hop_probe_delivery(
+                                        &middle,
+                                        &terminal,
+                                        observed_at,
+                                        middle_candidate_count,
+                                        terminal_candidate_count,
+                                    ) {
+                                        return TwoHopBlindRelayProbeOutcome {
+                                            attempted: true,
+                                            route_accepted: true,
+                                            terminal_delivery_verified: true,
+                                        };
+                                    }
+                                    // A real receipt cannot authorize a path
+                                    // whose signed surface rotated in flight.
+                                    continue 'terminal_candidates;
                                 }
                                 Ok(ack) if ack.accepted && ack.forwarded => {
                                     // Mixed-version nodes can still prove the
@@ -9144,14 +9140,16 @@ impl Server {
                                         middle_candidate_count,
                                         terminal_candidate_count,
                                     ));
-                                    let _ = peer_store
-                                        .record_route_forward_success_for_descriptor(&middle, now);
+                                    let _ = peer_store.record_route_forward_success_for_descriptor(
+                                        &middle,
+                                        observed_at,
+                                    );
                                     continue 'terminal_candidates;
                                 }
                                 Ok(_ack) => {
                                     peer_store
                                         .record_blind_relay_two_hop_probe_result_with_context(
-                                            now,
+                                            observed_at,
                                             false,
                                             "onion_ack_rejected",
                                             middle_candidate_count,
@@ -9161,7 +9159,7 @@ impl Server {
                                         );
                                     let _ = peer_store.record_route_forward_failure_for_descriptor(
                                         &middle,
-                                        now,
+                                        observed_at,
                                         "onion_ack_rejected",
                                     );
                                 }
@@ -9173,7 +9171,7 @@ impl Server {
                                     );
                                     peer_store
                                         .record_blind_relay_two_hop_probe_result_with_context(
-                                            now,
+                                            observed_at,
                                             false,
                                             &reason,
                                             middle_candidate_count,
@@ -9182,15 +9180,19 @@ impl Server {
                                             1,
                                         );
                                     let _ = peer_store.record_route_forward_failure_for_descriptor(
-                                        &middle, now, &reason,
+                                        &middle,
+                                        observed_at,
+                                        &reason,
                                     );
                                 }
                             }
                         }
                         Ok(response) => {
+                            let observed_at =
+                                now.saturating_add(request_started_at.elapsed().as_secs());
                             let reason = format!("onion_http_{}", response.status().as_u16());
                             peer_store.record_blind_relay_two_hop_probe_result_with_context(
-                                now,
+                                observed_at,
                                 false,
                                 &reason,
                                 middle_candidate_count,
@@ -9198,10 +9200,15 @@ impl Server {
                                 2,
                                 1,
                             );
-                            let _ = peer_store
-                                .record_route_forward_failure_for_descriptor(&middle, now, reason);
+                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                &middle,
+                                observed_at,
+                                reason,
+                            );
                         }
                         Err(error) => {
+                            let observed_at =
+                                now.saturating_add(request_started_at.elapsed().as_secs());
                             let reason = Self::classify_reqwest_error(
                                 "two_hop_onion_delivery_probe",
                                 &error,
@@ -9211,7 +9218,7 @@ impl Server {
                                 "[DISCOVERY] Two-hop onion delivery probe failed"
                             );
                             peer_store.record_blind_relay_two_hop_probe_result_with_context(
-                                now,
+                                observed_at,
                                 false,
                                 &reason,
                                 middle_candidate_count,
@@ -9219,8 +9226,11 @@ impl Server {
                                 2,
                                 1,
                             );
-                            let _ = peer_store
-                                .record_route_forward_failure_for_descriptor(&middle, now, reason);
+                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                &middle,
+                                observed_at,
+                                reason,
+                            );
                         }
                     }
                 } else if purpose_bound_probe_allowed {
@@ -9563,8 +9573,11 @@ impl Server {
                     };
                     request_count = request_count.saturating_add(1);
 
+                    let request_started_at = Instant::now();
                     match client.post(&url).json(&request).send().await {
                         Ok(response) if response.status().is_success() => {
+                            let observed_at =
+                                now.saturating_add(request_started_at.elapsed().as_secs());
                             match decode_bounded_json_response::<PeerBlindRelayResponse>(
                                 response,
                                 PEER_ACK_RESPONSE_MAX_BYTES,
@@ -9579,40 +9592,29 @@ impl Server {
                                             &request.envelope.route_id,
                                             &payload_commitment,
                                             &terminal_node_id,
-                                            now,
+                                            observed_at,
                                         ) =>
                                 {
-                                    for descriptor in [&first_middle, &second_middle, &terminal] {
-                                        let _ = peer_store
-                                            .record_purpose_bound_delivery_receipt_capability_for_descriptor(
-                                                descriptor,
-                                                now,
-                                            );
-                                    }
-                                    peer_store
-                                        .record_blind_relay_three_hop_probe_result_with_context(
-                                            now,
-                                            true,
-                                            "onion_terminal_delivered",
-                                            effective_middle_candidate_count,
-                                            terminal_candidate_count,
-                                            3,
-                                            2,
-                                        );
-                                    let _ = peer_store.record_route_forward_success_for_descriptor(
+                                    if peer_store.record_verified_three_hop_probe_delivery(
                                         &first_middle,
-                                        now,
-                                    );
-                                    return TwoHopBlindRelayProbeOutcome {
-                                        attempted: true,
-                                        route_accepted: true,
-                                        terminal_delivery_verified: true,
-                                    };
+                                        &second_middle,
+                                        &terminal,
+                                        observed_at,
+                                        effective_middle_candidate_count,
+                                        terminal_candidate_count,
+                                    ) {
+                                        return TwoHopBlindRelayProbeOutcome {
+                                            attempted: true,
+                                            route_accepted: true,
+                                            terminal_delivery_verified: true,
+                                        };
+                                    }
+                                    continue;
                                 }
                                 Ok(ack) if ack.accepted && ack.forwarded => {
                                     peer_store
                                         .record_blind_relay_three_hop_probe_result_with_context(
-                                            now,
+                                            observed_at,
                                             false,
                                             "onion_receipt_unverified",
                                             effective_middle_candidate_count,
@@ -9622,14 +9624,14 @@ impl Server {
                                         );
                                     let _ = peer_store.record_route_forward_failure_for_descriptor(
                                         &first_middle,
-                                        now,
+                                        observed_at,
                                         "delivery_receipt_invalid",
                                     );
                                 }
                                 Ok(_ack) => {
                                     peer_store
                                         .record_blind_relay_three_hop_probe_result_with_context(
-                                            now,
+                                            observed_at,
                                             false,
                                             "onion_ack_rejected",
                                             effective_middle_candidate_count,
@@ -9639,7 +9641,7 @@ impl Server {
                                         );
                                     let _ = peer_store.record_route_forward_failure_for_descriptor(
                                         &first_middle,
-                                        now,
+                                        observed_at,
                                         "onion_ack_rejected",
                                     );
                                 }
@@ -9647,7 +9649,7 @@ impl Server {
                                     let reason = format!("onion_ack_{}", error.as_str());
                                     peer_store
                                         .record_blind_relay_three_hop_probe_result_with_context(
-                                            now,
+                                            observed_at,
                                             false,
                                             &reason,
                                             effective_middle_candidate_count,
@@ -9657,16 +9659,18 @@ impl Server {
                                         );
                                     let _ = peer_store.record_route_forward_failure_for_descriptor(
                                         &first_middle,
-                                        now,
+                                        observed_at,
                                         &reason,
                                     );
                                 }
                             }
                         }
                         Ok(response) => {
+                            let observed_at =
+                                now.saturating_add(request_started_at.elapsed().as_secs());
                             let reason = format!("onion_http_{}", response.status().as_u16());
                             peer_store.record_blind_relay_three_hop_probe_result_with_context(
-                                now,
+                                observed_at,
                                 false,
                                 &reason,
                                 effective_middle_candidate_count,
@@ -9676,11 +9680,13 @@ impl Server {
                             );
                             let _ = peer_store.record_route_forward_failure_for_descriptor(
                                 &first_middle,
-                                now,
+                                observed_at,
                                 reason,
                             );
                         }
                         Err(error) => {
+                            let observed_at =
+                                now.saturating_add(request_started_at.elapsed().as_secs());
                             let reason = Self::classify_reqwest_error(
                                 "three_hop_onion_delivery_probe",
                                 &error,
@@ -9690,7 +9696,7 @@ impl Server {
                                 "[DISCOVERY] Three-hop onion delivery probe failed"
                             );
                             peer_store.record_blind_relay_three_hop_probe_result_with_context(
-                                now,
+                                observed_at,
                                 false,
                                 &reason,
                                 effective_middle_candidate_count,
@@ -9700,7 +9706,7 @@ impl Server {
                             );
                             let _ = peer_store.record_route_forward_failure_for_descriptor(
                                 &first_middle,
-                                now,
+                                observed_at,
                                 reason,
                             );
                         }
@@ -16134,23 +16140,23 @@ mod tests {
                 }),
             )
             .route(
-            "/api/chat/peer/blind-relay",
-            post(move |Json(request): Json<PeerBlindRelayRequest>| {
-                let requests = Arc::clone(&legacy_requests_for_handler);
-                async move {
-                    requests.fetch_add(1, AtomicOrdering::SeqCst);
-                    let legacy_fallback = request.onward_envelope.is_some();
-                    Json(PeerBlindRelayResponse {
-                        accepted: legacy_fallback,
-                        terminal: false,
-                        forwarded: legacy_fallback,
-                        ttl_remaining: 1,
-                        reason: (!legacy_fallback).then(|| "legacy_only".to_string()),
-                        delivery_receipt: None,
-                    })
-                }
-            }),
-        );
+                "/api/chat/peer/blind-relay",
+                post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                    let requests = Arc::clone(&legacy_requests_for_handler);
+                    async move {
+                        requests.fetch_add(1, AtomicOrdering::SeqCst);
+                        let legacy_fallback = request.onward_envelope.is_some();
+                        Json(PeerBlindRelayResponse {
+                            accepted: legacy_fallback,
+                            terminal: false,
+                            forwarded: legacy_fallback,
+                            ttl_remaining: 1,
+                            reason: (!legacy_fallback).then(|| "legacy_only".to_string()),
+                            delivery_receipt: None,
+                        })
+                    }
+                }),
+            );
         let legacy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let legacy_address = legacy_listener.local_addr().unwrap();
         let legacy_server = tokio::spawn(async move {
@@ -16175,9 +16181,9 @@ mod tests {
                 }),
             )
             .route(
-            "/api/chat/peer/blind-relay",
-            post(move |Json(request): Json<PeerBlindRelayRequest>| {
-                let requests = Arc::clone(&receipt_requests_for_handler);
+                "/api/chat/peer/blind-relay",
+                post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                    let requests = Arc::clone(&receipt_requests_for_handler);
                     let synthetic_chat = Server::synthetic_two_hop_probe_chat_envelope(
                         &receipt_probe_source,
                         &self_node_id,
@@ -16194,19 +16200,19 @@ mod tests {
                         now,
                         &receipt_terminal_identity,
                     );
-                async move {
-                    requests.fetch_add(1, AtomicOrdering::SeqCst);
-                    Json(PeerBlindRelayResponse {
-                        accepted: true,
-                        terminal: false,
-                        forwarded: true,
-                        ttl_remaining: 1,
-                        reason: None,
-                        delivery_receipt: Some(receipt),
-                    })
-                }
-            }),
-        );
+                    async move {
+                        requests.fetch_add(1, AtomicOrdering::SeqCst);
+                        Json(PeerBlindRelayResponse {
+                            accepted: true,
+                            terminal: false,
+                            forwarded: true,
+                            ttl_remaining: 1,
+                            reason: None,
+                            delivery_receipt: Some(receipt),
+                        })
+                    }
+                }),
+            );
         let receipt_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let receipt_address = receipt_listener.local_addr().unwrap();
         let receipt_server = tokio::spawn(async move {
