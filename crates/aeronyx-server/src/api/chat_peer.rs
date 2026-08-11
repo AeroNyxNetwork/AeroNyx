@@ -31,6 +31,12 @@
 //! - [RELAY-RESPONSE-OBSERVATION-TIME 2026-08-11 by Codex] Carries the actual
 //!   response-observation time out of retry handling so receipt freshness and
 //!   route-health evidence never reuse a stale request-ingress timestamp
+//! - [DURABLE-TERMINAL-REPLAY-WINDOW 2026-08-11 by Codex] Starts terminal
+//!   receipt and replay retention at durable acceptance, while generation-tags
+//!   replay queue entries so a forgotten route cannot evict a newer reuse
+//! - [REPLAY-GENERATION-COMPACTION 2026-08-11 by Codex] Uses unique local
+//!   generations instead of second-resolution timestamps for replay eviction,
+//!   and compacts stale generations under a strict memory bound
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -141,8 +147,19 @@
 //! - [RELAY-RESPONSE-OBSERVATION-TIME 2026-08-11 by Codex] Retry completion,
 //!   receipt freshness, previous-hop success, and route-health evidence must
 //!   use one projected response-observation time returned by the forwarder.
+//! - [DURABLE-TERMINAL-REPLAY-WINDOW 2026-08-11 by Codex] Replay eviction must
+//!   compare the queued generation with the current route entry;
+//!   terminal receipts and replay retention begin only after durable success.
+//! - [REPLAY-GENERATION-COMPACTION 2026-08-11 by Codex] A replay queue entry
+//!   must carry a unique process-local generation. Timestamps are not unique:
+//!   fail/retry can reuse one route id within the same second. Keep the queue
+//!   bounded independently from the live route map to prevent stale-entry DoS.
 //!
 //! ## Last Modified
+//! v0.35.0-ReplayGenerationCompaction - Make same-second route reuse safe and
+//! bound stale replay generations independently from live route capacity
+//! v0.34.0-DurableTerminalReplayWindow - Bind terminal receipt time to durable
+//! acceptance and make replay-cache eviction generation-safe
 //! v0.33.0-RelayResponseObservationTime - Bind retry ACK validation and route
 //! evidence to response time rather than request-ingress time
 //! v0.32.0-RouteSuccessSurfaceBinding - Bound next-hop success observations to
@@ -283,6 +300,9 @@ const BLIND_RELAY_RETRY_JITTER_MS: u64 = 35;
 /// replay amplification without becoming a durable route history.
 const MAX_BLIND_RELAY_SEEN_ROUTES: usize = 8192;
 
+/// Maximum live and stale generations retained by the replay eviction queue.
+const MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS: usize = MAX_BLIND_RELAY_SEEN_ROUTES * 2;
+
 /// Replay cache horizon for blind relay route ids.
 const BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS: u64 = 10 * 60;
 
@@ -339,32 +359,96 @@ struct ChatPeerState {
     blind_relay_abuse_guard: Arc<Mutex<BlindRelayAbuseGuard>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy)]
+struct BlindRelayRouteReplayEntry {
+    observed_at: u64,
+    generation: u64,
+}
+
+#[derive(Default)]
 struct BlindRelayRouteReplayCache {
-    seen: HashMap<[u8; 16], u64>,
-    order: VecDeque<[u8; 16]>,
+    seen: HashMap<[u8; 16], BlindRelayRouteReplayEntry>,
+    order: VecDeque<([u8; 16], u64)>,
+    monotonic_observed_at: u64,
+    generation_counter: u64,
 }
 
 impl BlindRelayRouteReplayCache {
     fn observe(&mut self, route_id: [u8; 16], now: u64) -> bool {
+        let now = self.normalize_observation_time(now);
         self.evict_expired(now);
         if self.seen.contains_key(&route_id) {
             return true;
         }
 
-        self.seen.insert(route_id, now);
-        self.order.push_back(route_id);
+        let generation = self.allocate_generation();
+        self.seen.insert(
+            route_id,
+            BlindRelayRouteReplayEntry {
+                observed_at: now,
+                generation,
+            },
+        );
+        self.order.push_back((route_id, generation));
         self.evict_over_capacity();
+        self.compact_stale_generations_if_needed();
         false
     }
 
+    /// Moves one accepted route's replay horizon to its completion boundary.
+    ///
+    /// [DURABLE-TERMINAL-REPLAY-WINDOW 2026-08-11 by Codex] The old queue
+    /// entry remains as a harmless stale generation. Eviction removes a route
+    /// only when the queued generation still matches the current map value.
+    fn mark_completed(&mut self, route_id: &[u8; 16], now: u64) {
+        let now = self.normalize_observation_time(now);
+        let Some(current) = self.seen.get(route_id).copied() else {
+            return;
+        };
+        if current.observed_at >= now {
+            return;
+        }
+        let generation = self.allocate_generation();
+        self.seen.insert(
+            *route_id,
+            BlindRelayRouteReplayEntry {
+                observed_at: now,
+                generation,
+            },
+        );
+        self.order.push_back((*route_id, generation));
+        self.evict_expired(now);
+        self.evict_over_capacity();
+        self.compact_stale_generations_if_needed();
+    }
+
+    fn normalize_observation_time(&mut self, now: u64) -> u64 {
+        self.monotonic_observed_at = self.monotonic_observed_at.max(now);
+        self.monotonic_observed_at
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        // Generation zero is reserved for the `Default` state. Exhausting the
+        // full u64 space in one process is infeasible; skipping zero also keeps
+        // wrap behavior deterministic in fuzzing and model tests.
+        self.generation_counter = self.generation_counter.wrapping_add(1);
+        if self.generation_counter == 0 {
+            self.generation_counter = 1;
+        }
+        self.generation_counter
+    }
+
     fn evict_expired(&mut self, now: u64) {
-        while let Some(route_id) = self.order.front().copied() {
-            let Some(first_seen_at) = self.seen.get(&route_id).copied() else {
+        while let Some((route_id, queued_generation)) = self.order.front().copied() {
+            let Some(current) = self.seen.get(&route_id).copied() else {
                 self.order.pop_front();
                 continue;
             };
-            if now.saturating_sub(first_seen_at) <= BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS {
+            if current.generation != queued_generation {
+                self.order.pop_front();
+                continue;
+            }
+            if now.saturating_sub(current.observed_at) <= BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS {
                 break;
             }
             self.order.pop_front();
@@ -374,16 +458,35 @@ impl BlindRelayRouteReplayCache {
 
     fn evict_over_capacity(&mut self) {
         while self.seen.len() > MAX_BLIND_RELAY_SEEN_ROUTES {
-            if let Some(route_id) = self.order.pop_front() {
-                self.seen.remove(&route_id);
-            } else {
+            let Some((route_id, queued_generation)) = self.order.pop_front() else {
                 break;
+            };
+            if self
+                .seen
+                .get(&route_id)
+                .is_some_and(|entry| entry.generation == queued_generation)
+            {
+                self.seen.remove(&route_id);
             }
         }
     }
 
     fn forget(&mut self, route_id: &[u8; 16]) {
         self.seen.remove(route_id);
+        self.compact_stale_generations_if_needed();
+    }
+
+    fn compact_stale_generations_if_needed(&mut self) {
+        if self.order.len() <= MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS {
+            return;
+        }
+
+        let seen = &self.seen;
+        self.order.retain(|(route_id, generation)| {
+            seen.get(route_id)
+                .is_some_and(|entry| entry.generation == *generation)
+        });
+        debug_assert!(self.order.len() <= self.seen.len());
     }
 }
 
@@ -971,6 +1074,7 @@ async fn process_peer_blind_relay(
     request: PeerBlindRelayRequest,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     let now = now_secs();
+    let route_started_at = Instant::now();
     let previous_hop_node_id = request.previous_hop_node_id;
     let onward_descriptor_hint = request.onward_descriptor_hint;
     let envelope = request.envelope;
@@ -994,7 +1098,14 @@ async fn process_peer_blind_relay(
         // (terminal) or forward the inner layer to the revealed next hop. Legacy
         // opaque blobs (no onion magic) fall through to the existing behavior.
         if is_onion_blob(&envelope.encrypted_blob) {
-            return process_onion_blind_relay(state, previous_hop_node_id, envelope, now).await;
+            return process_onion_blind_relay(
+                state,
+                previous_hop_node_id,
+                envelope,
+                now,
+                &route_started_at,
+            )
+            .await;
         }
         if let Some(onward_envelope) = request.onward_envelope {
             return process_onion_middle_blind_relay(
@@ -1004,6 +1115,7 @@ async fn process_peer_blind_relay(
                 onward_envelope,
                 onward_descriptor_hint,
                 now,
+                &route_started_at,
             )
             .await;
         }
@@ -1101,6 +1213,7 @@ async fn process_peer_blind_relay(
     let forwarded_onward_descriptor_hint = onward_descriptor_hint;
     let ttl_remaining = forwarded_envelope.ttl;
 
+    let forward_started_at = blind_relay_response_observed_at(now, &route_started_at);
     let observed_at = match forward_blind_relay_with_retry(
         &state,
         &url,
@@ -1111,7 +1224,7 @@ async fn process_peer_blind_relay(
             onward_envelope: forwarded_onward_envelope,
             onward_descriptor_hint: forwarded_onward_descriptor_hint,
         },
-        now,
+        forward_started_at,
     )
     .await
     {
@@ -1122,6 +1235,7 @@ async fn process_peer_blind_relay(
         }
     };
 
+    mark_blind_relay_route_completed(&state, &envelope.route_id, observed_at);
     let _ = state
         .peer_store
         .record_route_forward_success_for_descriptor(&descriptor, observed_at);
@@ -1155,6 +1269,7 @@ async fn process_onion_blind_relay(
     previous_hop_node_id: [u8; 32],
     envelope: BlindRelayEnvelope,
     now: u64,
+    route_started_at: &Instant,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     let self_node_id = state.node_identity.public_key_bytes();
 
@@ -1196,6 +1311,7 @@ async fn process_onion_blind_relay(
             {
                 Ok(purpose) => purpose,
                 Err(error) => {
+                    let failed_at = blind_relay_response_observed_at(now, route_started_at);
                     forget_blind_relay_route(&state, &envelope.route_id);
                     debug!(
                         reason = error.reason_bucket(),
@@ -1204,16 +1320,18 @@ async fn process_onion_blind_relay(
                     reject_blind_relay_previous_hop(
                         &state,
                         previous_hop_node_id,
-                        now,
+                        failed_at,
                         "onion_terminal_delivery_failed",
                     );
                     return Err(error);
                 }
             };
 
-            record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
+            let accepted_at = blind_relay_response_observed_at(now, route_started_at);
+            mark_blind_relay_route_completed(&state, &envelope.route_id, accepted_at);
+            record_blind_relay_previous_hop_success(&state, previous_hop_node_id, accepted_at);
             state.peer_store.record_blind_relay_terminal(
-                now,
+                accepted_at,
                 envelope.ttl,
                 envelope.encrypted_blob.len(),
             );
@@ -1225,7 +1343,7 @@ async fn process_onion_blind_relay(
                 envelope.route_id,
                 &peel.inner,
                 route_purpose,
-                now,
+                accepted_at,
                 state.node_identity.as_ref(),
             );
             Ok(PeerBlindRelayResponse {
@@ -1323,6 +1441,7 @@ async fn process_onion_blind_relay(
             .sign_with(state.node_identity.as_ref());
             let ttl_remaining = forwarded_envelope.ttl;
 
+            let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
             let next_hop_forward = match forward_blind_relay_with_retry(
                 &state,
                 &url,
@@ -1333,7 +1452,7 @@ async fn process_onion_blind_relay(
                     onward_envelope: None,
                     onward_descriptor_hint: None,
                 },
-                now,
+                forward_started_at,
             )
             .await
             {
@@ -1346,6 +1465,7 @@ async fn process_onion_blind_relay(
             let observed_at = next_hop_forward.observed_at;
             let next_hop_ack = next_hop_forward.response;
 
+            mark_blind_relay_route_completed(&state, &envelope.route_id, observed_at);
             let _ = state
                 .peer_store
                 .record_route_forward_success_for_descriptor(&descriptor, observed_at);
@@ -1419,6 +1539,7 @@ async fn process_onion_middle_blind_relay(
     onward_envelope: BlindRelayEnvelope,
     onward_descriptor_hint: Option<SignedNodeDescriptor>,
     now: u64,
+    route_started_at: &Instant,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     validate_blind_relay_envelope(&onward_envelope, &previous_hop_node_id, now).map_err(
         |error| {
@@ -1496,6 +1617,7 @@ async fn process_onion_middle_blind_relay(
         .sign_with(state.node_identity.as_ref());
     let ttl_remaining = forwarded_envelope.ttl;
 
+    let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
     let next_hop_forward = match forward_blind_relay_with_retry(
         &state,
         &url,
@@ -1506,7 +1628,7 @@ async fn process_onion_middle_blind_relay(
             onward_envelope: None,
             onward_descriptor_hint: None,
         },
-        now,
+        forward_started_at,
     )
     .await
     {
@@ -1519,6 +1641,7 @@ async fn process_onion_middle_blind_relay(
     let observed_at = next_hop_forward.observed_at;
     let next_hop_ack = next_hop_forward.response;
 
+    mark_blind_relay_route_completed(&state, &outer_envelope.route_id, observed_at);
     let _ = state
         .peer_store
         .record_route_forward_success_for_descriptor(&descriptor, observed_at);
@@ -1578,6 +1701,14 @@ fn forget_blind_relay_route(state: &ChatPeerState, route_id: &[u8; 16]) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     seen_routes.forget(route_id);
+}
+
+fn mark_blind_relay_route_completed(state: &ChatPeerState, route_id: &[u8; 16], now: u64) {
+    let mut seen_routes = state
+        .blind_relay_seen_routes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen_routes.mark_completed(route_id, now);
 }
 
 fn check_blind_relay_previous_hop_allowed(
@@ -3605,6 +3736,72 @@ mod tests {
         assert!(cache.observe(route_id, 1_800_000_001));
         cache.forget(&route_id);
         assert!(!cache.observe(route_id, 1_800_000_002));
+    }
+
+    #[test]
+    fn blind_relay_replay_cache_eviction_preserves_new_route_generation() {
+        // [DURABLE-TERMINAL-REPLAY-WINDOW 2026-08-11 by Codex] A failed route
+        // leaves a stale queue generation after `forget`. Reusing that route id
+        // must not let capacity eviction remove its newer live generation
+        // before an older independent route.
+        let mut cache = BlindRelayRouteReplayCache::default();
+        let reused_route = [0x91u8; 16];
+        let older_live_route = [0x92u8; 16];
+        let now = 1_800_000_000;
+
+        assert!(!cache.observe(reused_route, now));
+        assert!(!cache.observe(older_live_route, now));
+        cache.forget(&reused_route);
+        assert!(!cache.observe(reused_route, now));
+
+        for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES.saturating_sub(1) {
+            let mut route_id = [0x93u8; 16];
+            route_id[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
+            assert!(!cache.observe(route_id, now));
+        }
+
+        assert!(cache.observe(reused_route, now));
+        assert!(!cache.observe(older_live_route, now));
+    }
+
+    #[test]
+    fn blind_relay_replay_cache_bounds_same_second_failed_generations() {
+        // [REPLAY-GENERATION-COMPACTION 2026-08-11 by Codex] Second-resolution
+        // timestamps cannot distinguish a failed attempt from its immediate
+        // retry. Unique generations preserve the retry while bounded
+        // compaction prevents an active queue prefix from retaining unlimited
+        // stale attempts.
+        let mut cache = BlindRelayRouteReplayCache::default();
+        let live_route = [0x95u8; 16];
+        let retried_route = [0x96u8; 16];
+        let now = 1_800_000_000;
+
+        assert!(!cache.observe(live_route, now));
+        for _ in 0..=MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS {
+            assert!(!cache.observe(retried_route, now));
+            cache.forget(&retried_route);
+        }
+
+        assert!(cache.order.len() <= MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS);
+        assert!(cache.observe(live_route, now));
+        assert!(!cache.observe(retried_route, now));
+        assert!(cache.observe(retried_route, now));
+    }
+
+    #[test]
+    fn blind_relay_replay_cache_starts_window_at_route_completion() {
+        let mut cache = BlindRelayRouteReplayCache::default();
+        let route_id = [0x94u8; 16];
+        let started_at = 1_800_000_000;
+        let completed_at = started_at + BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS;
+
+        assert!(!cache.observe(route_id, started_at));
+        cache.mark_completed(&route_id, completed_at);
+        assert!(cache.observe(route_id, completed_at + 1));
+        assert!(!cache.observe(
+            route_id,
+            completed_at + BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS + 1,
+        ));
     }
 
     #[test]
