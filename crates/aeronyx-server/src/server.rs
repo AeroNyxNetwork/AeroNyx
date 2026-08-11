@@ -442,8 +442,13 @@
 //   - [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] Publish fine-grained wire
 //     features only through backward-compatible signed descriptor metadata.
 //     Do not add a closed `NodeCapability` variant for response framing.
+//   - [SIGNED-RECEIPT-NEGOTIATION 2026-08-11 by Codex] Prefer the signed
+//     purpose-bound receipt probe claim over the legacy unsigned summary so a
+//     network intermediary cannot suppress v2 probing with a false negative.
 //
 // Last Modified:
+//   v2.8.75-SignedReceiptNegotiation - Bound purpose-receipt probe eligibility
+//     to signed descriptors while retaining the legacy summary fallback.
 //   v2.8.74-SignedProtocolFeatures - Advertised authenticated hop-local failure
 //     receipts without changing descriptor schema or capability discriminants;
 //     registered the dormant self-descriptor privacy regression test.
@@ -8581,9 +8586,11 @@ impl Server {
     }
 
     /// Returns candidates with fresh verified v2 evidence or an explicit v2
-    /// bootstrap hint. Cryptographic process-local evidence wins and avoids an
-    /// unnecessary unsigned network request. Input health order is preserved
-    /// by `buffered`; negotiation cannot become a hidden route-ranking signal.
+    /// bootstrap claim. Cryptographic process-local evidence and the exact
+    /// signed descriptor both avoid an unnecessary unsigned network request.
+    /// The legacy summary remains a compatibility hint only. Input health order
+    /// is preserved by `buffered`; negotiation cannot become a hidden
+    /// route-ranking signal.
     async fn purpose_bound_delivery_receipt_advertisers(
         client: &reqwest::Client,
         peer_store: &PeerStore,
@@ -8592,10 +8599,19 @@ impl Server {
     ) -> HashSet<[u8; 32]> {
         let mut supported = candidates
             .iter()
-            .map(SignedNodeDescriptor::node_id)
-            .filter(|node_id| {
-                peer_store.has_fresh_purpose_bound_delivery_receipt_capability(node_id, now)
+            .filter(|candidate| {
+                // [SIGNED-RECEIPT-NEGOTIATION 2026-08-11 by Codex] A signed
+                // claim grants only permission to send the optional v2 probe.
+                // The returned receipt remains the sole route-authority proof.
+                candidate
+                    .descriptor
+                    .advertises_protocol_feature(NodeProtocolFeature::PurposeBoundDeliveryReceiptV2)
+                    || peer_store.has_fresh_purpose_bound_delivery_receipt_capability(
+                        &candidate.node_id(),
+                        now,
+                    )
             })
+            .map(SignedNodeDescriptor::node_id)
             .collect::<HashSet<_>>();
         let unknown = candidates
             .iter()
@@ -10898,7 +10914,10 @@ impl Server {
             expires_at,
             env!("CARGO_PKG_VERSION"),
         )
-        .with_protocol_features([NodeProtocolFeature::BlindRelayFailureReceiptV1]);
+        .with_protocol_features([
+            NodeProtocolFeature::BlindRelayFailureReceiptV1,
+            NodeProtocolFeature::PurposeBoundDeliveryReceiptV2,
+        ]);
 
         descriptor.public_endpoint = config
             .discovery
@@ -14643,6 +14662,42 @@ mod tests {
         .is_none());
     }
 
+    #[tokio::test]
+    async fn signed_purpose_receipt_feature_is_probe_eligible_without_unsigned_summary() {
+        let now = 1_800_000_000;
+        let identity = IdentityKeyPair::generate();
+        // [SIGNED-RECEIPT-NEGOTIATION 2026-08-11 by Codex] No public endpoint
+        // is intentional: consulting the legacy summary would make this peer
+        // ineligible, while its signature-protected claim must be sufficient
+        // to authorize only the optional probe attempt.
+        let descriptor = NodeDescriptor::new(
+            identity.public_key_bytes(),
+            now,
+            now,
+            now + 300,
+            "signed-purpose-receipt-peer",
+        )
+        .with_protocol_features([NodeProtocolFeature::PurposeBoundDeliveryReceiptV2]);
+        let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
+        let node_id = signed.node_id();
+        let store = PeerStore::new();
+        store.upsert_verified(signed.clone(), now).unwrap();
+
+        let supported = Server::purpose_bound_delivery_receipt_advertisers(
+            &reqwest::Client::new(),
+            &store,
+            &[signed],
+            now,
+        )
+        .await;
+
+        assert_eq!(supported, std::collections::HashSet::from([node_id]));
+        assert!(
+            !store.has_fresh_purpose_bound_delivery_receipt_capability(&node_id, now),
+            "a descriptor claim must not be promoted to verified receipt evidence"
+        );
+    }
+
     #[test]
     fn three_hop_onion_delivery_probe_builds_three_sealed_relay_layers() {
         let source = IdentityKeyPair::generate();
@@ -15614,6 +15669,9 @@ mod tests {
         assert!(signed
             .descriptor
             .advertises_protocol_feature(NodeProtocolFeature::BlindRelayFailureReceiptV1));
+        assert!(signed
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::PurposeBoundDeliveryReceiptV2));
         assert_eq!(
             signed.descriptor.capacity.max_sessions,
             server.config.max_sessions() as u32

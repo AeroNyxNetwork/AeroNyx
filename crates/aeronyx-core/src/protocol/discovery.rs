@@ -155,6 +155,8 @@
 //!   they never grant routing, trust, consensus, or finality authority.
 //!
 //! ## Last Modified
+//! v0.24.0-SignedReceiptNegotiation - Added a descriptor-bound purpose-receipt
+//! probe feature while retaining unsigned-summary fallback for legacy nodes
 //! v0.23.0-SignedProtocolFeatures - Added backward-compatible signed feature
 //! negotiation without changing descriptor schema or capability discriminants
 //! v0.22.0-BlindVaultReplicaCapability - Added an append-only, rollout-gated
@@ -377,17 +379,25 @@ pub enum NodeProtocolFeature {
     /// Handled blind-relay protocol failures carry an immediate-hop signed
     /// `BlindRelayFailureReceipt` bound to the exact request and reason.
     BlindRelayFailureReceiptV1,
+    /// The node can return purpose-bound version-2 terminal delivery receipts.
+    /// This claim authorizes a probe only; route authority still requires a
+    /// successfully verified receipt from the selected terminal.
+    PurposeBoundDeliveryReceiptV2,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 1] = [Self::BlindRelayFailureReceiptV1];
+    pub const ALL: [Self; 2] = [
+        Self::BlindRelayFailureReceiptV1,
+        Self::PurposeBoundDeliveryReceiptV2,
+    ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
     #[must_use]
     pub const fn semver_build_token(self) -> &'static str {
         match self {
             Self::BlindRelayFailureReceiptV1 => "anpf1-brfr1",
+            Self::PurposeBoundDeliveryReceiptV2 => "anpf1-pbdr2",
         }
     }
 }
@@ -3946,12 +3956,18 @@ mod tests {
     #[test]
     fn signed_protocol_features_preserve_schema_and_detect_downgrade() {
         let identity = IdentityKeyPair::generate();
-        let feature = NodeProtocolFeature::BlindRelayFailureReceiptV1;
-        let descriptor = descriptor_for(&identity).with_protocol_features([feature, feature]);
+        let failure_receipt = NodeProtocolFeature::BlindRelayFailureReceiptV1;
+        let purpose_receipt = NodeProtocolFeature::PurposeBoundDeliveryReceiptV2;
+        let descriptor = descriptor_for(&identity).with_protocol_features([
+            purpose_receipt,
+            failure_receipt,
+            purpose_receipt,
+        ]);
 
         assert_eq!(descriptor.schema_version, NODE_DESCRIPTOR_SCHEMA_VERSION);
-        assert_eq!(descriptor.software_version, "test+anpf1-brfr1");
-        assert!(descriptor.advertises_protocol_feature(feature));
+        assert_eq!(descriptor.software_version, "test+anpf1-brfr1.anpf1-pbdr2");
+        assert!(descriptor.advertises_protocol_feature(failure_receipt));
+        assert!(descriptor.advertises_protocol_feature(purpose_receipt));
 
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
         let encoded = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {
@@ -3963,7 +3979,12 @@ mod tests {
             panic!("unexpected discovery message variant");
         };
         assert!(descriptor.verify_at(1_700_000_100).is_ok());
-        assert!(descriptor.descriptor.advertises_protocol_feature(feature));
+        assert!(descriptor
+            .descriptor
+            .advertises_protocol_feature(failure_receipt));
+        assert!(descriptor
+            .descriptor
+            .advertises_protocol_feature(purpose_receipt));
 
         let mut stripped = signed;
         stripped.descriptor.software_version = "test".to_string();
