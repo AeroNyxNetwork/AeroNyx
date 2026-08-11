@@ -316,6 +316,9 @@
 // 121. [ROUTE-SUCCESS-SURFACE-BINDING 2026-08-10 by Codex] Binds successful
 //      probe and encrypted-forward observations to the signed descriptor used
 //      for the request so stale endpoints cannot authorize a rotated route.
+// 122. [CLIENT-DELIVERY-ATOMIC-ROUTE-EVIDENCE 2026-08-11 by Codex] Validates
+//      receipt freshness at response time and commits real two-hop delivery
+//      only while both selected signed route surfaces remain current together.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -415,6 +418,9 @@
 //   - A middle-hop ACK is not terminal-authenticated routeability evidence.
 //     Startup warm-up must probe each candidate directly and remain bounded;
 //     never mark a terminal healthy solely because a middle claims forwarding.
+//   - Real client-delivery evidence must use PeerStore's atomic two-hop route
+//     transition. Never publish the aggregate count after separately updating
+//     middle and terminal capability or route-health state.
 //   - Public Directory Replica status must remain aggregate-only. Never expose
 //     full producer identities, endpoints, descriptors, routes, or user data.
 //   - Multi-page Directory Replica catch-up must reserve the worst-case next
@@ -435,6 +441,8 @@
 //     public onion pools can exclude candidates collocated with the entry.
 //
 // Last Modified:
+//   v2.8.73-ClientDeliveryAtomicRouteEvidence - Bound live terminal receipts,
+//     route success, and capability evidence to one current signed path state.
 //   v2.8.72-RouteSuccessSurfaceBinding - Bound probe and live forward success
 //     to the selected signed route surface instead of node identity alone.
 //   v2.8.71-ReceiptEvidenceSurfaceBinding - Bound verified receipt evidence to
@@ -10235,60 +10243,81 @@ impl Server {
                     )
                     .await
                     {
-                        Ok(ack)
-                            if ack.accepted
-                                && ack.forwarded
-                                && Self::verified_delivery_receipt(
-                                    ack.delivery_receipt.as_ref(),
-                                    &route_id,
-                                    &payload_commitment,
-                                    &terminal_node_id,
-                                    now,
-                                ) =>
-                        {
-                            accepted = accepted.saturating_add(1);
-                            let _ = peer_store
-                                .record_purpose_bound_delivery_receipt_capability_for_descriptor(
-                                    &middle, now,
+                        Ok(ack) if ack.accepted && ack.forwarded => {
+                            // [CLIENT-DELIVERY-ATOMIC-ROUTE-EVIDENCE 2026-08-11 by Codex]
+                            // Validate freshness at response observation time,
+                            // not request-selection time, then commit both hop
+                            // surfaces and the aggregate delivery as one state
+                            // transition. A concurrent descriptor rotation is
+                            // a conservative retry/fallback signal, not route
+                            // failure evidence against either replacement.
+                            let observed_at = unix_now_secs();
+                            if !Self::verified_delivery_receipt(
+                                ack.delivery_receipt.as_ref(),
+                                &route_id,
+                                &payload_commitment,
+                                &terminal_node_id,
+                                observed_at,
+                            ) {
+                                last_failure_reason =
+                                    Some("onion_delivery_receipt_rejected".to_string());
+                                let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                    &middle,
+                                    observed_at,
+                                    "delivery_receipt_rejected",
                                 );
-                            let _ = peer_store
-                                .record_purpose_bound_delivery_receipt_capability_for_descriptor(
-                                    &terminal, now,
-                                );
-                            let _ = peer_store
-                                .record_route_forward_success_for_descriptor(&middle, now);
-                            let _ = peer_store
-                                .record_route_forward_success_for_descriptor(&terminal, now);
-                            peer_store.record_verified_client_onion_delivery(now);
+                            } else if peer_store.record_verified_client_onion_route_delivery(
+                                &middle,
+                                &terminal,
+                                observed_at,
+                            ) {
+                                accepted = accepted.saturating_add(1);
+                            } else {
+                                last_failure_reason =
+                                    Some("onion_delivery_route_surface_changed".to_string());
+                            }
                         }
                         Ok(_) => {
+                            let observed_at = unix_now_secs();
                             last_failure_reason =
                                 Some("onion_delivery_receipt_rejected".to_string());
                             let _ = peer_store.record_route_forward_failure_for_descriptor(
                                 &middle,
-                                now,
+                                observed_at,
                                 "delivery_receipt_rejected",
                             );
                         }
                         Err(error) => {
+                            let observed_at = unix_now_secs();
                             let reason = format!("onion_delivery_ack_{}", error.as_str());
                             last_failure_reason = Some(reason.clone());
-                            let _ = peer_store
-                                .record_route_forward_failure_for_descriptor(&middle, now, reason);
+                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                &middle,
+                                observed_at,
+                                reason,
+                            );
                         }
                     }
                 }
                 Ok(response) => {
+                    let observed_at = unix_now_secs();
                     let reason = format!("onion_delivery_http_{}", response.status().as_u16());
                     last_failure_reason = Some(reason.clone());
-                    let _ = peer_store
-                        .record_route_forward_failure_for_descriptor(&middle, now, reason);
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &middle,
+                        observed_at,
+                        reason,
+                    );
                 }
                 Err(error) => {
+                    let observed_at = unix_now_secs();
                     let reason = Self::classify_reqwest_error("onion_delivery_request", &error);
                     last_failure_reason = Some(reason.clone());
-                    let _ = peer_store
-                        .record_route_forward_failure_for_descriptor(&middle, now, reason);
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &middle,
+                        observed_at,
+                        reason,
+                    );
                 }
             }
         }
@@ -15057,6 +15086,128 @@ mod tests {
             quality.evidence_mode,
             "verified_client_onion_delivery_receipt"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_chat_rejects_receipt_after_terminal_surface_rotation() {
+        let now = unix_now_secs();
+        let source = IdentityKeyPair::generate();
+        let chat_sender = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+        let terminal_node_id = terminal_identity.public_key_bytes();
+        let middle_identity = IdentityKeyPair::generate();
+        let middle_node_id = middle_identity.public_key_bytes();
+
+        let mut envelope = ChatEnvelope {
+            message_id: [0x45; 16],
+            sender: chat_sender.public_key_bytes(),
+            receiver: [0x46; 32],
+            timestamp: now,
+            ciphertext: b"opaque app ciphertext during rotation".to_vec(),
+            nonce: [0x47; 24],
+            content_type: ChatContentType::Text,
+            signature: [0u8; 64],
+        };
+        envelope.signature = chat_sender.sign(&envelope.sign_data());
+        let terminal_payload = encode_envelope(&envelope).unwrap();
+
+        let mut terminal_descriptor = NodeDescriptor::new(
+            terminal_node_id,
+            now,
+            now,
+            now + 300,
+            "test-receipt-terminal-a",
+        )
+        .with_x25519_kem(terminal_identity.x25519_public_key_bytes());
+        terminal_descriptor.public_endpoint = Some("http://127.0.1.1:9".to_string());
+        terminal_descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        let terminal_descriptor =
+            SignedNodeDescriptor::sign(terminal_descriptor, &terminal_identity).unwrap();
+
+        let mut rotated_terminal_body = terminal_descriptor.descriptor.clone();
+        rotated_terminal_body.sequence = terminal_descriptor.sequence().saturating_add(1);
+        rotated_terminal_body.public_endpoint = Some("http://127.0.2.1:9".to_string());
+        let rotated_terminal =
+            SignedNodeDescriptor::sign(rotated_terminal_body, &terminal_identity).unwrap();
+
+        let store = Arc::new(PeerStore::new());
+        store
+            .upsert_verified(terminal_descriptor.clone(), now)
+            .unwrap();
+        store.record_route_forward_success(&terminal_node_id, now);
+        store.record_purpose_bound_delivery_receipt_capability(&terminal_node_id, now);
+
+        let terminal_receipt_identity = terminal_identity.clone();
+        let store_for_request = Arc::clone(&store);
+        let relay = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                let terminal_receipt_identity = terminal_receipt_identity.clone();
+                let terminal_payload = terminal_payload.clone();
+                let rotated_terminal = rotated_terminal.clone();
+                let store_for_request = Arc::clone(&store_for_request);
+                async move {
+                    // [CLIENT-DELIVERY-ATOMIC-ROUTE-EVIDENCE 2026-08-11 by Codex]
+                    // Simulate a signed endpoint rotation after route selection
+                    // but before the old route's valid receipt reaches source.
+                    store_for_request
+                        .upsert_verified(rotated_terminal, unix_now_secs())
+                        .unwrap();
+                    Json(PeerBlindRelayResponse {
+                        accepted: true,
+                        terminal: false,
+                        forwarded: true,
+                        ttl_remaining: 1,
+                        reason: Some("onion_forwarded".to_string()),
+                        delivery_receipt: Some(BlindRelayDeliveryReceipt::accepted_for_purpose(
+                            request.envelope.route_id,
+                            &terminal_payload,
+                            OnionRoutePurpose::MessageRelay,
+                            unix_now_secs(),
+                            &terminal_receipt_identity,
+                        )),
+                    })
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let middle_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let relay_server = tokio::spawn(async move {
+            axum::serve(listener, relay).await.unwrap();
+        });
+
+        let mut middle_descriptor =
+            NodeDescriptor::new(middle_node_id, now, now, now + 300, "test-receipt-middle")
+                .with_x25519_kem(middle_identity.x25519_public_key_bytes());
+        middle_descriptor.public_endpoint = Some(middle_endpoint);
+        middle_descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        let middle_descriptor =
+            SignedNodeDescriptor::sign(middle_descriptor, &middle_identity).unwrap();
+        store
+            .upsert_verified(middle_descriptor.clone(), now)
+            .unwrap();
+        store.record_route_forward_success(&middle_node_id, now);
+        store.record_purpose_bound_delivery_receipt_capability(&middle_node_id, now);
+
+        let outcome = Server::relay_authenticated_chat_over_onion_paths(
+            Some(&reqwest::Client::new()),
+            None,
+            store.as_ref(),
+            &source,
+            &source.public_key_bytes(),
+            &envelope,
+        )
+        .await;
+        relay_server.abort();
+
+        assert_eq!(outcome.attempted_paths, 1);
+        assert_eq!(outcome.verified_receipts, 0);
+        assert!(!outcome.delivered());
+        let quality = store.status(unix_now_secs()).blind_relay_quality;
+        assert_eq!(quality.verified_client_onion_deliveries, 0);
+        assert_eq!(quality.delivery_receipt_capable_peers, 1);
+        assert!(!quality.real_relay_ready);
+        assert!(!store.take_client_delivery_cache_dirty());
     }
 
     #[tokio::test]

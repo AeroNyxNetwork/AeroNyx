@@ -160,6 +160,9 @@
 //! - [RECEIPT-EVIDENCE-SURFACE-BINDING 2026-08-10 by Codex] Stores the signed
 //!   route-surface fingerprint beside every v2 receipt observation so a
 //!   concurrent endpoint/KEM/capability rotation cannot inherit old authority
+//! - [CLIENT-DELIVERY-ATOMIC-ROUTE-EVIDENCE 2026-08-11 by Codex] Commits both
+//!   hop capabilities, both route successes, and the aggregate real-delivery
+//!   counter only while one coherent signed two-hop snapshot remains current
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -191,6 +194,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.79.0-ClientDeliveryAtomicRouteEvidence - Made real two-hop receipt
+//! evidence an all-or-nothing signed-route state transition
 //! v0.78.0-RouteSuccessSurfaceBinding - Bound successful forward evidence to
 //! the exact signed route surface used for the outbound request
 //! v0.77.0-ReceiptEvidenceSurfaceBinding - Bound every purpose-separated v2
@@ -4590,7 +4595,7 @@ impl PeerStore {
     /// This deliberately records only an aggregate count and timestamp. It
     /// never stores receipt bytes, route ids, peer ids, payload commitments,
     /// sender/receiver keys, message ids, endpoints, or ciphertext.
-    pub fn record_verified_client_onion_delivery(&self, now: u64) {
+    fn record_verified_client_onion_delivery_aggregate(&self, now: u64) {
         self.counters
             .verified_client_onion_deliveries
             .fetch_add(1, Ordering::Relaxed);
@@ -4600,6 +4605,157 @@ impl PeerStore {
         self.client_delivery_cache_dirty
             .store(true, Ordering::Release);
         self.client_delivery_cache_notify.notify_one();
+    }
+
+    /// Commits one verified two-hop client delivery against a single current
+    /// signed route snapshot.
+    ///
+    /// [CLIENT-DELIVERY-ATOMIC-ROUTE-EVIDENCE 2026-08-11 by Codex] A terminal
+    /// receipt is useful only if the exact middle and terminal route surfaces
+    /// that carried it are still current together. Holding the peer read lock
+    /// through every positive evidence write prevents descriptor rotation from
+    /// leaving a partial capability pair or an aggregate delivery unsupported
+    /// by one coherent signed path. Lock order remains peers -> route health ->
+    /// receipt capability, matching surface invalidation and avoiding inversion.
+    ///
+    /// The receipt bytes, route id, payload commitment, endpoints, sender,
+    /// receiver, and message id remain outside this store.
+    #[must_use]
+    pub fn record_verified_client_onion_route_delivery(
+        &self,
+        middle: &SignedNodeDescriptor,
+        terminal: &SignedNodeDescriptor,
+        now: u64,
+    ) -> bool {
+        let middle_node_id = middle.node_id();
+        let terminal_node_id = terminal.node_id();
+        let expected_surfaces = if middle_node_id == terminal_node_id {
+            Err("duplicate_route_hop")
+        } else if !middle
+            .descriptor
+            .capabilities
+            .contains(&NodeCapability::OnionMiddle)
+            || !terminal
+                .descriptor
+                .capabilities
+                .contains(&NodeCapability::ChatRelay)
+        {
+            Err("route_role_mismatch")
+        } else {
+            middle
+                .verify_at(now)
+                .ok()
+                .and_then(|_| Self::descriptor_routeability_surface_fingerprint(middle))
+                .zip(
+                    terminal
+                        .verify_at(now)
+                        .ok()
+                        .and_then(|_| Self::descriptor_routeability_surface_fingerprint(terminal)),
+                )
+                .ok_or("invalid_expected_route_surface")
+        };
+        let (middle_fingerprint, terminal_fingerprint) = match expected_surfaces {
+            Ok(surfaces) => surfaces,
+            Err(reason) => {
+                self.record_audit_event(
+                    now,
+                    "blind_relay_client_delivery_receipt",
+                    "rejected",
+                    reason.to_string(),
+                );
+                return false;
+            }
+        };
+
+        {
+            let peers = self.peers.read();
+            let surfaces_are_current = [
+                (middle_node_id, middle_fingerprint.as_str()),
+                (terminal_node_id, terminal_fingerprint.as_str()),
+            ]
+            .into_iter()
+            .all(|(node_id, expected_fingerprint)| {
+                peers
+                    .get(&node_id)
+                    .filter(|descriptor| descriptor.verify_at(now).is_ok())
+                    .and_then(Self::descriptor_routeability_surface_fingerprint)
+                    .is_some_and(|current| current == expected_fingerprint)
+            });
+            if !surfaces_are_current {
+                drop(peers);
+                self.record_audit_event(
+                    now,
+                    "blind_relay_client_delivery_receipt",
+                    "rejected",
+                    "route_surface_mismatch".to_string(),
+                );
+                return false;
+            }
+
+            let mut route_health = self.route_health.write();
+            for (node_id, fingerprint) in [
+                (middle_node_id, middle_fingerprint.clone()),
+                (terminal_node_id, terminal_fingerprint.clone()),
+            ] {
+                let health = route_health.entry(node_id).or_default();
+                health.success_count = health.success_count.saturating_add(1);
+                health.consecutive_failures = 0;
+                health.last_success_at = Some(now);
+                health.last_success_route_fingerprint_sha256 = Some(fingerprint);
+                health.quarantine_until = None;
+            }
+
+            let mut receipt_capability = self.purpose_bound_delivery_receipt_capability.write();
+            receipt_capability.insert(
+                middle_node_id,
+                PurposeBoundDeliveryReceiptEvidence {
+                    observed_at: now,
+                    route_surface_fingerprint_sha256: middle_fingerprint,
+                },
+            );
+            receipt_capability.insert(
+                terminal_node_id,
+                PurposeBoundDeliveryReceiptEvidence {
+                    observed_at: now,
+                    route_surface_fingerprint_sha256: terminal_fingerprint,
+                },
+            );
+
+            // Publish the aggregate counter last. Status readers can therefore
+            // observe an older conservative state, never a delivery whose
+            // supporting route evidence has not been committed yet.
+            self.record_verified_client_onion_delivery_aggregate(now);
+        }
+
+        for node_id in [middle_node_id, terminal_node_id] {
+            self.record_audit_event(
+                now,
+                "blind_relay_route_health",
+                "accepted",
+                format!("node_prefix={} result=success", hex::encode(&node_id[..4])),
+            );
+            self.record_audit_event(
+                now,
+                "blind_relay_purpose_bound_receipt_capability",
+                "accepted",
+                "fresh_purpose_bound_delivery_receipt_v2".to_string(),
+            );
+        }
+        self.record_audit_event(
+            now,
+            "blind_relay_client_delivery_receipt",
+            "accepted",
+            "terminal_signature_verified".to_string(),
+        );
+        true
+    }
+
+    /// Backward-compatible aggregate recorder for cache and migration tests.
+    /// Production relay paths must use
+    /// [`Self::record_verified_client_onion_route_delivery`] so delivery,
+    /// capability, and route-health evidence share one signed path snapshot.
+    pub fn record_verified_client_onion_delivery(&self, now: u64) {
+        self.record_verified_client_onion_delivery_aggregate(now);
         self.record_audit_event(
             now,
             "blind_relay_client_delivery_receipt",
@@ -9421,6 +9577,82 @@ mod tests {
         // Sequence/validity refreshes preserve the same signed routing surface.
         assert!(store.record_route_forward_success_for_descriptor(&rotated, now + 31));
         assert!(store.is_routeable_now(&node_id, now + 31));
+    }
+
+    #[test]
+    fn test_verified_client_delivery_route_evidence_is_all_or_nothing() {
+        let now = 1_700_000_100;
+        let middle_identity = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+
+        let mut middle = signed_descriptor_for(&middle_identity, 7, now + 4_000);
+        middle.descriptor.public_endpoint = Some("https://middle-a.example".to_string());
+        middle.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle = SignedNodeDescriptor::sign(middle.descriptor, &middle_identity).unwrap();
+        let middle_node_id = middle.node_id();
+
+        let mut terminal = signed_descriptor_for(&terminal_identity, 7, now + 4_000);
+        terminal.descriptor.public_endpoint = Some("https://terminal-a.example".to_string());
+        terminal.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        terminal = SignedNodeDescriptor::sign(terminal.descriptor, &terminal_identity).unwrap();
+        let terminal_node_id = terminal.node_id();
+
+        let store = PeerStore::new();
+        store.upsert_verified(middle.clone(), now).unwrap();
+        store.upsert_verified(terminal.clone(), now).unwrap();
+
+        let mut rotated_terminal_body = terminal.descriptor.clone();
+        rotated_terminal_body.sequence = 8;
+        rotated_terminal_body.issued_at = now + 20;
+        rotated_terminal_body.expires_at = now + 4_020;
+        rotated_terminal_body.public_endpoint = Some("https://terminal-b.example".to_string());
+        let rotated_terminal =
+            SignedNodeDescriptor::sign(rotated_terminal_body, &terminal_identity).unwrap();
+        store
+            .upsert_verified(rotated_terminal.clone(), now + 20)
+            .unwrap();
+
+        // [CLIENT-DELIVERY-ATOMIC-ROUTE-EVIDENCE 2026-08-11 by Codex] One
+        // rotated hop rejects the entire receipt transition. The unchanged
+        // middle must not receive partial capability or route-success credit.
+        assert!(!store.record_verified_client_onion_route_delivery(&middle, &terminal, now + 21,));
+        let rejected = store.status(now + 21);
+        assert_eq!(
+            rejected
+                .runtime
+                .blind_relay
+                .verified_client_onion_deliveries,
+            0
+        );
+        assert_eq!(
+            rejected.blind_relay_quality.delivery_receipt_capable_peers,
+            0
+        );
+        assert!(!store.is_routeable_now(&middle_node_id, now + 21));
+        assert!(!store.is_routeable_now(&terminal_node_id, now + 21));
+        assert!(!store.take_client_delivery_cache_dirty());
+
+        assert!(store.record_verified_client_onion_route_delivery(
+            &middle,
+            &rotated_terminal,
+            now + 22,
+        ));
+        let accepted = store.status(now + 22);
+        assert_eq!(
+            accepted
+                .runtime
+                .blind_relay
+                .verified_client_onion_deliveries,
+            1
+        );
+        assert_eq!(
+            accepted.blind_relay_quality.delivery_receipt_capable_peers,
+            2
+        );
+        assert!(accepted.blind_relay_quality.real_relay_ready);
+        assert!(store.is_routeable_now(&middle_node_id, now + 22));
+        assert!(store.is_routeable_now(&terminal_node_id, now + 22));
+        assert!(store.take_client_delivery_cache_dirty());
     }
 
     #[test]
