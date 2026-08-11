@@ -4607,20 +4607,19 @@ impl PeerStore {
         self.client_delivery_cache_notify.notify_one();
     }
 
-    /// Commits route-health and receipt-capability evidence for one complete
-    /// signed path, then publishes the caller's aggregate success marker.
+    /// Runs one evidence transition while a complete signed route is current.
     ///
     /// [ATOMIC-MULTIHOP-PROOF-EVIDENCE 2026-08-11 by Codex] Every hop is
     /// role-checked and fingerprinted before the peer snapshot is locked. The
-    /// same snapshot is then held through route-health, receipt-capability,
-    /// and aggregate-proof publication, so an in-flight descriptor rotation
-    /// cannot leave a successful path proof backed by only part of the route.
-    /// Lock order is peers -> route health -> receipt capability -> aggregate.
-    fn commit_verified_route_delivery_evidence<R>(
+    /// snapshot remains locked through `commit`, so descriptor rotation can
+    /// occur either before the comparison (and reject stale evidence) or after
+    /// the entire transition. Callers preserve lock order by taking only
+    /// route-health, receipt-capability, and aggregate locks inside `commit`.
+    fn with_current_verified_route_path<R>(
         &self,
         route: &[(&SignedNodeDescriptor, NodeCapability)],
         now: u64,
-        publish: impl FnOnce() -> R,
+        commit: impl FnOnce(&[([u8; 32], String)]) -> R,
     ) -> Result<(Vec<[u8; 32]>, R), &'static str> {
         if route.len() < 2 {
             return Err("insufficient_route_hops");
@@ -4648,7 +4647,7 @@ impl PeerStore {
             expected_surfaces.push((node_id, fingerprint));
         }
 
-        let published = {
+        let committed = {
             let peers = self.peers.read();
             let surfaces_are_current =
                 expected_surfaces
@@ -4664,8 +4663,30 @@ impl PeerStore {
                 return Err("route_surface_mismatch");
             }
 
+            commit(&expected_surfaces)
+        };
+
+        let node_ids = expected_surfaces
+            .into_iter()
+            .map(|(node_id, _)| node_id)
+            .collect();
+        Ok((node_ids, committed))
+    }
+
+    /// Commits route-health and receipt-capability evidence for one complete
+    /// signed path, then publishes the caller's aggregate success marker.
+    ///
+    /// The peer snapshot is held through all positive writes. Lock order is
+    /// peers -> route health -> receipt capability -> aggregate.
+    fn commit_verified_route_delivery_evidence<R>(
+        &self,
+        route: &[(&SignedNodeDescriptor, NodeCapability)],
+        now: u64,
+        publish: impl FnOnce() -> R,
+    ) -> Result<(Vec<[u8; 32]>, R), &'static str> {
+        self.with_current_verified_route_path(route, now, |expected_surfaces| {
             let mut route_health = self.route_health.write();
-            for (node_id, fingerprint) in &expected_surfaces {
+            for (node_id, fingerprint) in expected_surfaces {
                 let health = route_health.entry(*node_id).or_default();
                 health.success_count = health.success_count.saturating_add(1);
                 health.consecutive_failures = 0;
@@ -4675,7 +4696,7 @@ impl PeerStore {
             }
 
             let mut receipt_capability = self.purpose_bound_delivery_receipt_capability.write();
-            for (node_id, fingerprint) in &expected_surfaces {
+            for (node_id, fingerprint) in expected_surfaces {
                 receipt_capability.insert(
                     *node_id,
                     PurposeBoundDeliveryReceiptEvidence {
@@ -4688,13 +4709,77 @@ impl PeerStore {
             // Publish last: readers may observe an older conservative state,
             // never a success marker without its supporting route evidence.
             publish()
-        };
+        })
+    }
 
-        let node_ids = expected_surfaces
-            .into_iter()
-            .map(|(node_id, _)| node_id)
-            .collect();
-        Ok((node_ids, published))
+    /// Records a legacy two-hop control-plane ACK without upgrading it to
+    /// terminal-delivery or receipt-capability evidence.
+    ///
+    /// [LEGACY-CONTROL-PROOF-SURFACE-BINDING 2026-08-11 by Codex] The exact
+    /// middle and terminal descriptors carried by the request must still be
+    /// current together. Only the directly observed middle receives route
+    /// health credit; the unsigned terminal claim never receives delivery
+    /// receipt capability and cannot unlock authenticated App routing.
+    #[must_use]
+    pub fn record_verified_two_hop_control_probe(
+        &self,
+        middle: &SignedNodeDescriptor,
+        terminal: &SignedNodeDescriptor,
+        now: u64,
+        middle_candidate_count: usize,
+        terminal_candidate_count: usize,
+    ) -> bool {
+        let middle_node_id = middle.node_id();
+        let result = self.with_current_verified_route_path(
+            &[
+                (middle, NodeCapability::OnionMiddle),
+                (terminal, NodeCapability::ChatRelay),
+            ],
+            now,
+            |expected_surfaces| {
+                let (middle_node_id, middle_fingerprint) = &expected_surfaces[0];
+                let mut route_health = self.route_health.write();
+                let health = route_health.entry(*middle_node_id).or_default();
+                health.success_count = health.success_count.saturating_add(1);
+                health.consecutive_failures = 0;
+                health.last_success_at = Some(now);
+                health.last_success_route_fingerprint_sha256 = Some(middle_fingerprint.clone());
+                health.quarantine_until = None;
+
+                self.record_blind_relay_two_hop_probe_result_with_context(
+                    now,
+                    true,
+                    "legacy_control_forwarded",
+                    middle_candidate_count,
+                    terminal_candidate_count,
+                    2,
+                    1,
+                );
+            },
+        );
+
+        let (_, ()) = match result {
+            Ok(committed) => committed,
+            Err(reason) => {
+                self.record_audit_event(
+                    now,
+                    "blind_relay_control_path_proof_evidence",
+                    "rejected",
+                    format!("hop_count=2 reason={reason}"),
+                );
+                return false;
+            }
+        };
+        self.record_audit_event(
+            now,
+            "blind_relay_route_health",
+            "accepted",
+            format!(
+                "node_prefix={} result=success",
+                hex::encode(&middle_node_id[..4])
+            ),
+        );
+        true
     }
 
     /// Records a terminal-signed synthetic two-hop delivery proof only while
@@ -9866,6 +9951,75 @@ mod tests {
         for node_id in [first_node_id, second_node_id, terminal_node_id] {
             assert!(store.is_routeable_now(&node_id, now + 22));
         }
+    }
+
+    #[test]
+    fn test_legacy_control_probe_binds_both_surfaces_without_receipt_upgrade() {
+        let now = 1_700_000_100;
+        let middle_identity = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+
+        let mut middle = signed_descriptor_for(&middle_identity, 7, now + 4_000);
+        middle.descriptor.public_endpoint = Some("https://middle.example".to_string());
+        middle.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle = SignedNodeDescriptor::sign(middle.descriptor, &middle_identity).unwrap();
+
+        let mut terminal = signed_descriptor_for(&terminal_identity, 7, now + 4_000);
+        terminal.descriptor.public_endpoint = Some("https://terminal-a.example".to_string());
+        terminal.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        terminal = SignedNodeDescriptor::sign(terminal.descriptor, &terminal_identity).unwrap();
+
+        let middle_node_id = middle.node_id();
+        let terminal_node_id = terminal.node_id();
+        let store = PeerStore::new();
+        store.upsert_verified(middle.clone(), now).unwrap();
+        store.upsert_verified(terminal.clone(), now).unwrap();
+
+        let mut rotated_terminal_body = terminal.descriptor.clone();
+        rotated_terminal_body.sequence = 8;
+        rotated_terminal_body.issued_at = now + 20;
+        rotated_terminal_body.expires_at = now + 4_020;
+        rotated_terminal_body.public_endpoint = Some("https://terminal-b.example".to_string());
+        let rotated_terminal =
+            SignedNodeDescriptor::sign(rotated_terminal_body, &terminal_identity).unwrap();
+        store
+            .upsert_verified(rotated_terminal.clone(), now + 20)
+            .unwrap();
+
+        // [LEGACY-CONTROL-PROOF-SURFACE-BINDING 2026-08-11 by Codex] A stale
+        // terminal invalidates the full compatibility proof before any middle
+        // health or proof-history success is published.
+        assert!(!store.record_verified_two_hop_control_probe(&middle, &terminal, now + 21, 2, 1,));
+        let rejected = store.status(now + 21);
+        assert_eq!(rejected.two_hop_path_proof_history.attempted, 0);
+        assert_eq!(
+            rejected.blind_relay_quality.delivery_receipt_capable_peers,
+            0
+        );
+        assert!(!store.is_routeable_now(&middle_node_id, now + 21));
+
+        assert!(store.record_verified_two_hop_control_probe(
+            &middle,
+            &rotated_terminal,
+            now + 22,
+            2,
+            1,
+        ));
+        let accepted = store.status(now + 22);
+        assert_eq!(accepted.two_hop_path_proof_history.succeeded, 1);
+        assert_eq!(
+            accepted
+                .two_hop_path_proof_history
+                .latest_reason_bucket
+                .as_deref(),
+            Some("legacy_control_forwarded")
+        );
+        assert_eq!(
+            accepted.blind_relay_quality.delivery_receipt_capable_peers,
+            0
+        );
+        assert!(store.is_routeable_now(&middle_node_id, now + 22));
+        assert!(!store.is_routeable_now(&terminal_node_id, now + 22));
     }
 
     #[test]

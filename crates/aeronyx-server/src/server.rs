@@ -8989,7 +8989,7 @@ impl Server {
         let middle_candidate_count = middle_candidates.len();
         let mut attempted = false;
         let mut network_diversity_blocked = false;
-        let mut legacy_delivery_context = None;
+        let mut legacy_delivery_contexts = Vec::with_capacity(TWO_HOP_PROBE_REQUEST_LIMIT);
         let mut request_count = 0usize;
         'candidate_search: for middle in middle_candidates {
             let middle_node_id = middle.node_id();
@@ -9136,14 +9136,13 @@ impl Server {
                                     // fallback, then continue the bounded search
                                     // so one legacy peer cannot hide a newer,
                                     // receipt-capable path after restart.
-                                    legacy_delivery_context.get_or_insert((
+                                    legacy_delivery_contexts.push((
+                                        middle.clone(),
+                                        terminal.clone(),
                                         middle_candidate_count,
                                         terminal_candidate_count,
-                                    ));
-                                    let _ = peer_store.record_route_forward_success_for_descriptor(
-                                        &middle,
                                         observed_at,
-                                    );
+                                    ));
                                     continue 'terminal_candidates;
                                 }
                                 Ok(_ack) => {
@@ -9295,8 +9294,11 @@ impl Server {
                     onward_descriptor_hint: Some(terminal.clone()),
                 };
 
+                let request_started_at = Instant::now();
                 match client.post(&url).json(&request).send().await {
                     Ok(response) if response.status().is_success() => {
+                        let observed_at =
+                            now.saturating_add(request_started_at.elapsed().as_secs());
                         match decode_bounded_json_response::<PeerBlindRelayResponse>(
                             response,
                             PEER_ACK_RESPONSE_MAX_BYTES,
@@ -9309,17 +9311,18 @@ impl Server {
                                 // delivery receipt. Keep it as fallback evidence
                                 // and continue the bounded candidate search so an
                                 // older peer cannot mask a receipt-capable path.
-                                legacy_delivery_context.get_or_insert((
+                                legacy_delivery_contexts.push((
+                                    middle.clone(),
+                                    terminal.clone(),
                                     middle_candidate_count,
                                     terminal_candidate_count,
+                                    observed_at,
                                 ));
-                                let _ = peer_store
-                                    .record_route_forward_success_for_descriptor(&middle, now);
                                 continue 'terminal_candidates;
                             }
                             Ok(_ack) => {
                                 peer_store.record_blind_relay_two_hop_probe_result_with_context(
-                                    now,
+                                    observed_at,
                                     false,
                                     "ack_rejected",
                                     middle_candidate_count,
@@ -9329,7 +9332,7 @@ impl Server {
                                 );
                                 let _ = peer_store.record_route_forward_failure_for_descriptor(
                                     &middle,
-                                    now,
+                                    observed_at,
                                     "ack_rejected",
                                 );
                             }
@@ -9340,7 +9343,7 @@ impl Server {
                                     "[DISCOVERY] Two-hop blind relay proof ACK rejected"
                                 );
                                 peer_store.record_blind_relay_two_hop_probe_result_with_context(
-                                    now,
+                                    observed_at,
                                     false,
                                     &reason,
                                     middle_candidate_count,
@@ -9349,15 +9352,19 @@ impl Server {
                                     1,
                                 );
                                 let _ = peer_store.record_route_forward_failure_for_descriptor(
-                                    &middle, now, &reason,
+                                    &middle,
+                                    observed_at,
+                                    &reason,
                                 );
                             }
                         }
                     }
                     Ok(response) => {
+                        let observed_at =
+                            now.saturating_add(request_started_at.elapsed().as_secs());
                         let reason = format!("http_{}", response.status().as_u16());
                         peer_store.record_blind_relay_two_hop_probe_result_with_context(
-                            now,
+                            observed_at,
                             false,
                             &reason,
                             middle_candidate_count,
@@ -9365,10 +9372,15 @@ impl Server {
                             2,
                             1,
                         );
-                        let _ = peer_store
-                            .record_route_forward_failure_for_descriptor(&middle, now, reason);
+                        let _ = peer_store.record_route_forward_failure_for_descriptor(
+                            &middle,
+                            observed_at,
+                            reason,
+                        );
                     }
                     Err(error) => {
+                        let observed_at =
+                            now.saturating_add(request_started_at.elapsed().as_secs());
                         let reason =
                             Self::classify_reqwest_error("two_hop_blind_relay_probe", &error);
                         debug!(
@@ -9376,7 +9388,7 @@ impl Server {
                             "[DISCOVERY] Two-hop blind relay proof failed"
                         );
                         peer_store.record_blind_relay_two_hop_probe_result_with_context(
-                            now,
+                            observed_at,
                             false,
                             &reason,
                             middle_candidate_count,
@@ -9384,28 +9396,35 @@ impl Server {
                             2,
                             1,
                         );
-                        let _ = peer_store
-                            .record_route_forward_failure_for_descriptor(&middle, now, reason);
+                        let _ = peer_store.record_route_forward_failure_for_descriptor(
+                            &middle,
+                            observed_at,
+                            reason,
+                        );
                     }
                 }
             }
         }
 
-        if let Some((middle_candidates, terminal_candidates)) = legacy_delivery_context {
-            peer_store.record_blind_relay_two_hop_probe_result_with_context(
-                now,
-                true,
-                "legacy_control_forwarded",
+        // [LEGACY-CONTROL-PROOF-SURFACE-BINDING 2026-08-11 by Codex] Try the
+        // newest bounded fallback first. A delayed ACK may prove only the exact
+        // descriptors it carried; it cannot authorize a replacement surface.
+        for (middle, terminal, middle_candidates, terminal_candidates, observed_at) in
+            legacy_delivery_contexts.into_iter().rev()
+        {
+            if peer_store.record_verified_two_hop_control_probe(
+                &middle,
+                &terminal,
+                observed_at,
                 middle_candidates,
                 terminal_candidates,
-                2,
-                1,
-            );
-            return TwoHopBlindRelayProbeOutcome {
-                attempted: true,
-                route_accepted: true,
-                terminal_delivery_verified: false,
-            };
+            ) {
+                return TwoHopBlindRelayProbeOutcome {
+                    attempted: true,
+                    route_accepted: true,
+                    terminal_delivery_verified: false,
+                };
+            }
         }
 
         if !attempted {
