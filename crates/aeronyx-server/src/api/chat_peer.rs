@@ -28,6 +28,9 @@
 //! - [MULTIHOP-RECEIPT-VALIDATION 2026-08-01 by Codex] Validates terminal ACKs
 //!   against the immediate next hop while allowing a forwarded ACK to carry a
 //!   valid downstream terminal receipt through three-hop and longer paths
+//! - [RELAY-RESPONSE-OBSERVATION-TIME 2026-08-11 by Codex] Carries the actual
+//!   response-observation time out of retry handling so receipt freshness and
+//!   route-health evidence never reuse a stale request-ingress timestamp
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -135,8 +138,13 @@
 //! - [ROUTE-SUCCESS-SURFACE-BINDING 2026-08-10 by Codex] Successful next-hop
 //!   forwarding must be recorded against the exact descriptor used to build
 //!   the request URL; a concurrent endpoint/KEM rotation must fail closed.
+//! - [RELAY-RESPONSE-OBSERVATION-TIME 2026-08-11 by Codex] Retry completion,
+//!   receipt freshness, previous-hop success, and route-health evidence must
+//!   use one projected response-observation time returned by the forwarder.
 //!
 //! ## Last Modified
+//! v0.33.0-RelayResponseObservationTime - Bind retry ACK validation and route
+//! evidence to response time rather than request-ingress time
 //! v0.32.0-RouteSuccessSurfaceBinding - Bound next-hop success observations to
 //! the exact signed descriptor used for each opaque forward
 //! v0.31.0-PurposeBoundReceipt - Sign terminal workload into opaque receipt v2 commitments
@@ -178,7 +186,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{atomic::AtomicUsize, Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use aeronyx_core::crypto::transport::{
@@ -582,6 +590,16 @@ pub struct PeerBlindRelayResponse {
     /// must not infer sender, receiver, online state, or payload contents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_receipt: Option<BlindRelayDeliveryReceipt>,
+}
+
+/// Internal result of one accepted next-hop relay round.
+///
+/// The observation timestamp is deliberately process-local and never enters
+/// the peer wire contract. Callers use it for every success-side state write,
+/// keeping receipt verification and route evidence on one clock snapshot.
+struct BlindRelayForwardOutcome {
+    response: PeerBlindRelayResponse,
+    observed_at: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1083,7 +1101,7 @@ async fn process_peer_blind_relay(
     let forwarded_onward_descriptor_hint = onward_descriptor_hint;
     let ttl_remaining = forwarded_envelope.ttl;
 
-    if let Err(error) = forward_blind_relay_with_retry(
+    let observed_at = match forward_blind_relay_with_retry(
         &state,
         &url,
         &descriptor,
@@ -1097,17 +1115,20 @@ async fn process_peer_blind_relay(
     )
     .await
     {
-        forget_blind_relay_route(&state, &envelope.route_id);
-        return Err(error);
-    }
+        Ok(outcome) => outcome.observed_at,
+        Err(error) => {
+            forget_blind_relay_route(&state, &envelope.route_id);
+            return Err(error);
+        }
+    };
 
     let _ = state
         .peer_store
-        .record_route_forward_success_for_descriptor(&descriptor, now);
-    record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
+        .record_route_forward_success_for_descriptor(&descriptor, observed_at);
+    record_blind_relay_previous_hop_success(&state, previous_hop_node_id, observed_at);
     state
         .peer_store
-        .record_blind_relay_forwarded(now, ttl_remaining);
+        .record_blind_relay_forwarded(observed_at, ttl_remaining);
 
     Ok(PeerBlindRelayResponse {
         accepted: true,
@@ -1302,7 +1323,7 @@ async fn process_onion_blind_relay(
             .sign_with(state.node_identity.as_ref());
             let ttl_remaining = forwarded_envelope.ttl;
 
-            let next_hop_ack = match forward_blind_relay_with_retry(
+            let next_hop_forward = match forward_blind_relay_with_retry(
                 &state,
                 &url,
                 &descriptor,
@@ -1322,14 +1343,16 @@ async fn process_onion_blind_relay(
                     return Err(error);
                 }
             };
+            let observed_at = next_hop_forward.observed_at;
+            let next_hop_ack = next_hop_forward.response;
 
             let _ = state
                 .peer_store
-                .record_route_forward_success_for_descriptor(&descriptor, now);
-            record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
+                .record_route_forward_success_for_descriptor(&descriptor, observed_at);
+            record_blind_relay_previous_hop_success(&state, previous_hop_node_id, observed_at);
             state
                 .peer_store
-                .record_blind_relay_forwarded(now, ttl_remaining);
+                .record_blind_relay_forwarded(observed_at, ttl_remaining);
 
             Ok(PeerBlindRelayResponse {
                 accepted: true,
@@ -1473,7 +1496,7 @@ async fn process_onion_middle_blind_relay(
         .sign_with(state.node_identity.as_ref());
     let ttl_remaining = forwarded_envelope.ttl;
 
-    let next_hop_ack = match forward_blind_relay_with_retry(
+    let next_hop_forward = match forward_blind_relay_with_retry(
         &state,
         &url,
         &descriptor,
@@ -1493,14 +1516,16 @@ async fn process_onion_middle_blind_relay(
             return Err(error);
         }
     };
+    let observed_at = next_hop_forward.observed_at;
+    let next_hop_ack = next_hop_forward.response;
 
     let _ = state
         .peer_store
-        .record_route_forward_success_for_descriptor(&descriptor, now);
-    record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
+        .record_route_forward_success_for_descriptor(&descriptor, observed_at);
+    record_blind_relay_previous_hop_success(&state, previous_hop_node_id, observed_at);
     state
         .peer_store
-        .record_blind_relay_forwarded(now, ttl_remaining);
+        .record_blind_relay_forwarded(observed_at, ttl_remaining);
 
     Ok(PeerBlindRelayResponse {
         accepted: true,
@@ -1733,32 +1758,44 @@ fn validate_downstream_delivery_receipt(
     Ok(())
 }
 
+/// Projects a monotonic request duration onto the caller's Unix timestamp.
+///
+/// [RELAY-RESPONSE-OBSERVATION-TIME 2026-08-11 by Codex] Tests and recovery
+/// probes inject a stable Unix base. `Instant` supplies elapsed time without
+/// depending on wall-clock jumps, while saturation keeps failure handling
+/// total even near the integer boundary.
+fn blind_relay_response_observed_at(started_at: u64, started: &Instant) -> u64 {
+    started_at.saturating_add(started.elapsed().as_secs())
+}
+
 async fn forward_blind_relay_with_retry(
     state: &ChatPeerState,
     url: &str,
     descriptor: &SignedNodeDescriptor,
     request: PeerBlindRelayRequest,
     now: u64,
-) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
     // [ROUTE-FAILURE-SURFACE-BINDING 2026-08-11 by Codex] Keep the exact
     // descriptor that selected `url` through every retry. A delayed response
     // can then update health only if the signed route surface is still current.
     let next_hop = descriptor.node_id();
+    let request_started_at = Instant::now();
     for attempt in 1..=MAX_BLIND_RELAY_FORWARD_ATTEMPTS {
         match state.http_client.post(url).json(&request).send().await {
             Ok(response) if response.status().is_success() => {
-                match decode_bounded_json_response::<PeerBlindRelayResponse>(
+                let ack = decode_bounded_json_response::<PeerBlindRelayResponse>(
                     response,
                     PEER_ACK_RESPONSE_MAX_BYTES,
                 )
-                .await
-                {
+                .await;
+                let observed_at = blind_relay_response_observed_at(now, &request_started_at);
+                match ack {
                     Ok(ack) if ack.accepted => {
                         if let Err(reason) = validate_downstream_delivery_receipt(
                             &ack,
                             &request.envelope.route_id,
                             &next_hop,
-                            now,
+                            observed_at,
                         ) {
                             debug!(
                                 attempt,
@@ -1769,20 +1806,24 @@ async fn forward_blind_relay_with_retry(
                                 .peer_store
                                 .record_route_forward_failure_for_descriptor(
                                     descriptor,
-                                    now,
+                                    observed_at,
                                     "delivery_receipt_invalid",
                                 );
-                            state
-                                .peer_store
-                                .record_blind_relay_rejected(now, "delivery_receipt_invalid");
+                            state.peer_store.record_blind_relay_rejected(
+                                observed_at,
+                                "delivery_receipt_invalid",
+                            );
                             return Err(BlindRelayError::ForwardFailed);
                         }
                         if attempt > 1 {
                             state
                                 .peer_store
-                                .record_blind_relay_retry_succeeded(now, attempt);
+                                .record_blind_relay_retry_succeeded(observed_at, attempt);
                         }
-                        return Ok(ack);
+                        return Ok(BlindRelayForwardOutcome {
+                            response: ack,
+                            observed_at,
+                        });
                     }
                     Ok(_ack) => {
                         debug!(
@@ -1801,17 +1842,21 @@ async fn forward_blind_relay_with_retry(
 
                 if attempt > 1 {
                     state.peer_store.record_blind_relay_retry_exhausted(
-                        now,
+                        observed_at,
                         attempt,
                         "forward_failed",
                     );
                 }
                 let _ = state
                     .peer_store
-                    .record_route_forward_failure_for_descriptor(descriptor, now, "forward_failed");
+                    .record_route_forward_failure_for_descriptor(
+                        descriptor,
+                        observed_at,
+                        "forward_failed",
+                    );
                 state
                     .peer_store
-                    .record_blind_relay_rejected(now, "forward_failed");
+                    .record_blind_relay_rejected(observed_at, "forward_failed");
                 return Err(BlindRelayError::ForwardFailed);
             }
             Ok(response) => {
@@ -1828,6 +1873,7 @@ async fn forward_blind_relay_with_retry(
                 } else {
                     None
                 };
+                let observed_at = blind_relay_response_observed_at(now, &request_started_at);
                 if let Some(error) =
                     non_retryable_downstream_error(status, declared_reason.as_deref())
                 {
@@ -1845,12 +1891,12 @@ async fn forward_blind_relay_with_retry(
                         .peer_store
                         .record_route_forward_failure_for_descriptor(
                             descriptor,
-                            now,
+                            observed_at,
                             error.reason_bucket(),
                         );
                     state
                         .peer_store
-                        .record_blind_relay_rejected(now, error.reason_bucket());
+                        .record_blind_relay_rejected(observed_at, error.reason_bucket());
                     return Err(error);
                 }
                 if attempt < MAX_BLIND_RELAY_FORWARD_ATTEMPTS
@@ -1858,7 +1904,7 @@ async fn forward_blind_relay_with_retry(
                 {
                     state
                         .peer_store
-                        .record_blind_relay_retry_attempt(now, &reason);
+                        .record_blind_relay_retry_attempt(observed_at, &reason);
                     debug!(
                         attempt,
                         status = %status,
@@ -1879,23 +1925,32 @@ async fn forward_blind_relay_with_retry(
                     "[BLIND_RELAY] Next-hop returned non-success"
                 );
                 if attempt > 1 {
-                    state
-                        .peer_store
-                        .record_blind_relay_retry_exhausted(now, attempt, &reason);
+                    state.peer_store.record_blind_relay_retry_exhausted(
+                        observed_at,
+                        attempt,
+                        &reason,
+                    );
                 }
                 let _ = state
                     .peer_store
-                    .record_route_forward_failure_for_descriptor(descriptor, now, reason.clone());
-                state.peer_store.record_blind_relay_rejected(now, reason);
+                    .record_route_forward_failure_for_descriptor(
+                        descriptor,
+                        observed_at,
+                        reason.clone(),
+                    );
+                state
+                    .peer_store
+                    .record_blind_relay_rejected(observed_at, reason);
                 return Err(BlindRelayError::ForwardFailed);
             }
             Err(error) => {
+                let observed_at = blind_relay_response_observed_at(now, &request_started_at);
                 let reason = classify_reqwest_error("blind_relay_request", &error);
                 if attempt < MAX_BLIND_RELAY_FORWARD_ATTEMPTS && is_retryable_reqwest_error(&error)
                 {
                     state
                         .peer_store
-                        .record_blind_relay_retry_attempt(now, &reason);
+                        .record_blind_relay_retry_attempt(observed_at, &reason);
                     debug!(
                         attempt,
                         reason = %reason,
@@ -1916,14 +1971,22 @@ async fn forward_blind_relay_with_retry(
                     "[BLIND_RELAY] Next-hop forward failed"
                 );
                 if attempt > 1 {
-                    state
-                        .peer_store
-                        .record_blind_relay_retry_exhausted(now, attempt, &reason);
+                    state.peer_store.record_blind_relay_retry_exhausted(
+                        observed_at,
+                        attempt,
+                        &reason,
+                    );
                 }
                 let _ = state
                     .peer_store
-                    .record_route_forward_failure_for_descriptor(descriptor, now, reason.clone());
-                state.peer_store.record_blind_relay_rejected(now, reason);
+                    .record_route_forward_failure_for_descriptor(
+                        descriptor,
+                        observed_at,
+                        reason.clone(),
+                    );
+                state
+                    .peer_store
+                    .record_blind_relay_rejected(observed_at, reason);
                 return Err(BlindRelayError::ForwardFailed);
             }
         }
@@ -2136,6 +2199,49 @@ mod tests {
         };
         envelope.signature = kp.sign(&envelope.sign_data());
         envelope
+    }
+
+    #[test]
+    fn delayed_receipt_validation_uses_response_observation_time() {
+        // [RELAY-RESPONSE-OBSERVATION-TIME 2026-08-11 by Codex] A valid ACK
+        // produced after a long request must be compared with response time,
+        // not the stale ingress timestamp. Backdating only the monotonic test
+        // clock keeps this regression deterministic and fast.
+        let started_at = 1_800_000_000u64;
+        let request_started_at = Instant::now() - Duration::from_secs(31);
+        let observed_at = blind_relay_response_observed_at(started_at, &request_started_at);
+        assert!(observed_at >= started_at + 31);
+
+        let terminal = IdentityKeyPair::generate();
+        let terminal_node_id = terminal.public_key_bytes();
+        let route_id = [0x81u8; 16];
+        let payload = b"opaque delayed message relay payload";
+        let ack = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 0,
+            reason: Some("onion_terminal_delivered".to_string()),
+            delivery_receipt: Some(BlindRelayDeliveryReceipt::accepted_for_purpose(
+                route_id,
+                payload,
+                OnionRoutePurpose::MessageRelay,
+                started_at + 31,
+                &terminal,
+            )),
+        };
+
+        assert_eq!(
+            validate_downstream_delivery_receipt(&ack, &route_id, &terminal_node_id, started_at,),
+            Err("receipt_timestamp_in_future")
+        );
+        assert!(validate_downstream_delivery_receipt(
+            &ack,
+            &route_id,
+            &terminal_node_id,
+            observed_at,
+        )
+        .is_ok());
     }
 
     #[test]
