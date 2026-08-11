@@ -47,6 +47,8 @@
 //!   current portable route-domain certificates
 //! - Blind relay runtime counters and drop reason buckets for nodeboard,
 //!   without exposing encrypted payloads, peer endpoint URLs, or user metadata
+//! - [SIGNED-FAILURE-RECEIPT 2026-08-11 by Codex] Counts invalid hop-local
+//!   failure receipts as forward failures without retaining signed material
 //! - Blind relay audit size buckets so exact encrypted blob sizes do not become
 //!   traffic fingerprints in nodeboard or heartbeat diagnostics
 //! - Per-peer node-to-node route health feedback so failed next hops are
@@ -194,6 +196,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.80.0-SignedFailureReceipt - Classify invalid authenticated failure ACKs
+//! without storing route, receipt, endpoint, or payload material
 //! v0.79.0-ClientDeliveryAtomicRouteEvidence - Made real two-hop receipt
 //! evidence an all-or-nothing signed-route state transition
 //! v0.78.0-RouteSuccessSurfaceBinding - Bound successful forward evidence to
@@ -5045,7 +5049,10 @@ impl PeerStore {
                     .blind_relay_invalid_endpoint
                     .fetch_add(1, Ordering::Relaxed);
             }
-            "request_failed" | "forward_failed" | "delivery_receipt_invalid" => {
+            "request_failed"
+            | "forward_failed"
+            | "delivery_receipt_invalid"
+            | "failure_receipt_invalid" => {
                 self.counters
                     .blind_relay_forward_failed
                     .fetch_add(1, Ordering::Relaxed);

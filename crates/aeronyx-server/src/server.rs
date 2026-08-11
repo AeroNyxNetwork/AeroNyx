@@ -14847,6 +14847,7 @@ mod tests {
                             ttl_remaining: 1,
                             reason: Some("onion_forwarded".to_string()),
                             delivery_receipt: Some(receipt),
+                            failure_receipt: None,
                         })
                     }
                 }),
@@ -15111,6 +15112,7 @@ mod tests {
                             unix_now_secs(),
                             &terminal_receipt_identity,
                         )),
+                        failure_receipt: None,
                     })
                 }
             }),
@@ -15194,6 +15196,7 @@ mod tests {
                     ttl_remaining: 1,
                     reason: Some("onion_forwarded".to_string()),
                     delivery_receipt: None,
+                    failure_receipt: None,
                 })
             }),
         );
@@ -15338,6 +15341,7 @@ mod tests {
                             unix_now_secs(),
                             &terminal_receipt_identity,
                         )),
+                        failure_receipt: None,
                     })
                 }
             }),
@@ -16195,6 +16199,7 @@ mod tests {
                         ttl_remaining: 1,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        failure_receipt: None,
                     })
                 }
             }),
@@ -16319,6 +16324,7 @@ mod tests {
                             ttl_remaining: 1,
                             reason: (!legacy_fallback).then(|| "legacy_only".to_string()),
                             delivery_receipt: None,
+                            failure_receipt: None,
                         })
                     }
                 }),
@@ -16375,6 +16381,7 @@ mod tests {
                             ttl_remaining: 1,
                             reason: None,
                             delivery_receipt: Some(receipt),
+                            failure_receipt: None,
                         })
                     }
                 }),

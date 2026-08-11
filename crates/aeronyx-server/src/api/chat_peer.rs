@@ -19,6 +19,8 @@
 //!   offline or all local routes are stale
 //! - Returns a terminal-signed receipt bound to the exact opaque payload after
 //!   successful onion terminal store-and-forward; middle hops only propagate it
+//! - [SIGNED-FAILURE-RECEIPT 2026-08-11 by Codex] Signs hop-local failure ACKs
+//!   against the exact request while keeping deeper onion topology hidden
 //! - [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Signs receipt v2 with a
 //!   purpose-separated opaque payload commitment after terminal acceptance;
 //!   v1 remains signature-verifiable for rolling-upgrade relay compatibility
@@ -142,8 +144,10 @@
 //!   terminal acceptance or onward forwarding. `accepted=true` without either
 //!   action is not delivery evidence and must never improve route reputation.
 //! - A structurally valid peer-declared failure proves only that the immediate
-//!   transport responded. Without a signed hop-failure receipt, it must not
-//!   become node-specific reputation evidence for any downstream participant.
+//!   transport responded. A failure receipt authenticates only that immediate
+//!   response; it must not become blame evidence for a deeper participant.
+//!   Invalid, stale, replayed, or wrong-signer receipts are direct protocol
+//!   failure evidence against the immediate next-hop route surface.
 //! - Blind Vault's detailed storage receipt contains stable replica-local lease
 //!   metadata and therefore must not be exposed in a multi-hop JSON ACK. The
 //!   existing delivery receipt is signed only after `BlindVaultService::put`
@@ -169,6 +173,8 @@
 //!   bounded independently from the live route map to prevent stale-entry DoS.
 //!
 //! ## Last Modified
+//! v0.38.0-SignedFailureReceipt - Authenticate exact hop-local failure ACKs
+//! without exposing deeper onion topology or breaking legacy peers
 //! v0.37.0-DownstreamFailureAttribution - Keep valid peer-declared downstream
 //! failures out of immediate-next-hop reputation while preserving retry classes
 //! v0.36.0-RelayAckStateMachine - Require successful downstream ACKs to prove
@@ -229,7 +235,7 @@ use aeronyx_core::crypto::transport::{
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::chat::{
     decode_envelope, encode_blind_relay_envelope, encode_envelope, BlindRelayDeliveryReceipt,
-    BlindRelayEnvelope, ChatEnvelope,
+    BlindRelayEnvelope, BlindRelayFailureReceipt, ChatEnvelope,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::discovery::SignedNodeDescriptor;
@@ -355,6 +361,10 @@ const BLIND_RELAY_MAX_FUTURE_SKEW_SECS: u64 = 120;
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
 /// Delivery receipt future skew is intentionally tighter than relay-frame skew.
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
+/// Signed failure ACKs use the same short replay horizon as success receipts.
+const BLIND_RELAY_FAILURE_RECEIPT_MAX_AGE_SECS: u64 = 120;
+/// Failure receipts tolerate only bounded peer clock skew.
+const BLIND_RELAY_FAILURE_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 // ============================================
 // State / Request / Response Types
@@ -810,6 +820,12 @@ pub struct PeerBlindRelayResponse {
     /// must not infer sender, receiver, online state, or payload contents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_receipt: Option<BlindRelayDeliveryReceipt>,
+    /// Optional immediate-hop signature over a coarse failure response.
+    ///
+    /// The receipt authenticates this responder and exact opaque request only;
+    /// it never identifies or assigns blame to a deeper onion participant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_receipt: Option<BlindRelayFailureReceipt>,
 }
 
 /// Internal result of one accepted next-hop relay round.
@@ -1070,6 +1086,7 @@ async fn peer_blind_relay_request_gate(
                 ttl_remaining: 0,
                 reason: Some("backpressure".to_string()),
                 delivery_receipt: None,
+                failure_receipt: None,
             }),
         )
             .into_response();
@@ -1101,20 +1118,35 @@ async fn peer_blind_relay_handler(
     State(state): State<ChatPeerState>,
     Json(request): Json<PeerBlindRelayRequest>,
 ) -> impl IntoResponse {
+    let failure_route_id = request.envelope.route_id;
+    let failure_request_commitment =
+        BlindRelayFailureReceipt::request_commitment(&request.envelope);
+    let node_identity = Arc::clone(&state.node_identity);
     match process_peer_blind_relay(state, request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(error) => (
-            error.status_code(),
-            Json(PeerBlindRelayResponse {
-                accepted: false,
-                terminal: false,
-                forwarded: false,
-                ttl_remaining: 0,
-                reason: Some(error.reason_bucket().to_string()),
-                delivery_receipt: None,
-            }),
-        )
-            .into_response(),
+        Err(error) => {
+            let reason = error.reason_bucket();
+            let failure_receipt = BlindRelayFailureReceipt::failed(
+                failure_route_id,
+                failure_request_commitment,
+                reason,
+                now_secs(),
+                node_identity.as_ref(),
+            );
+            (
+                error.status_code(),
+                Json(PeerBlindRelayResponse {
+                    accepted: false,
+                    terminal: false,
+                    forwarded: false,
+                    ttl_remaining: 0,
+                    reason: Some(reason.to_string()),
+                    delivery_receipt: None,
+                    failure_receipt: Some(failure_receipt),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1258,6 +1290,7 @@ async fn process_peer_blind_relay(
             ttl_remaining: envelope.ttl,
             reason: Some("terminal_next_hop".to_string()),
             delivery_receipt: None,
+            failure_receipt: None,
         };
         route_lease.complete(now, response.clone());
         record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
@@ -1362,6 +1395,7 @@ async fn process_peer_blind_relay(
         ttl_remaining,
         reason: Some("forwarded".to_string()),
         delivery_receipt: None,
+        failure_receipt: None,
     };
     route_lease.complete(observed_at, response.clone());
     let _ = state
@@ -1462,6 +1496,7 @@ async fn process_onion_blind_relay(
                 ttl_remaining: envelope.ttl,
                 reason: Some("onion_terminal_delivered".to_string()),
                 delivery_receipt: Some(delivery_receipt),
+                failure_receipt: None,
             };
             route_lease.complete(accepted_at, response.clone());
             record_blind_relay_previous_hop_success(&state, previous_hop_node_id, accepted_at);
@@ -1578,6 +1613,7 @@ async fn process_onion_blind_relay(
                 ttl_remaining,
                 reason: Some("onion_forwarded".to_string()),
                 delivery_receipt: next_hop_ack.delivery_receipt,
+                failure_receipt: None,
             };
             route_lease.complete(observed_at, response.clone());
             let _ = state
@@ -1753,6 +1789,7 @@ async fn process_onion_middle_blind_relay(
         ttl_remaining,
         reason: Some("onion_middle_forwarded".to_string()),
         delivery_receipt: next_hop_ack.delivery_receipt,
+        failure_receipt: None,
     };
     route_lease.complete(observed_at, response.clone());
     let _ = state
@@ -1969,6 +2006,9 @@ fn validate_downstream_delivery_receipt(
     if ack.terminal == ack.forwarded {
         return Err("invalid_ack_shape");
     }
+    if ack.failure_receipt.is_some() {
+        return Err("unexpected_failure_receipt");
+    }
 
     let Some(receipt) = ack.delivery_receipt.as_ref() else {
         // Legacy peers may omit receipts. Keep wire compatibility; callers
@@ -1997,6 +2037,36 @@ fn validate_downstream_delivery_receipt(
     }
 
     Ok(())
+}
+
+/// Verifies an optional immediate-hop failure receipt without widening blame.
+///
+/// `Ok(false)` is the explicit rolling-upgrade path for legacy peers. A valid
+/// receipt proves only that `immediate_next_hop` returned this exact coarse
+/// response for this exact opaque request. It cannot identify which deeper hop
+/// caused an end-to-end failure and must not be used for downstream blame.
+fn validate_downstream_failure_receipt(
+    ack: &PeerBlindRelayResponse,
+    request: &PeerBlindRelayRequest,
+    immediate_next_hop: &[u8; 32],
+    observed_at: u64,
+) -> Result<bool, &'static str> {
+    let Some(receipt) = ack.failure_receipt.as_ref() else {
+        return Ok(false);
+    };
+    let reason = ack.reason.as_deref().ok_or("failure_reason_missing")?;
+    if receipt.failed_at
+        > observed_at.saturating_add(BLIND_RELAY_FAILURE_RECEIPT_MAX_FUTURE_SKEW_SECS)
+    {
+        return Err("failure_receipt_timestamp_in_future");
+    }
+    if observed_at.saturating_sub(receipt.failed_at) > BLIND_RELAY_FAILURE_RECEIPT_MAX_AGE_SECS {
+        return Err("failure_receipt_timestamp_expired");
+    }
+    receipt
+        .verify_expected(&request.envelope, reason, immediate_next_hop)
+        .map_err(|_| "failure_receipt_binding_invalid")?;
+    Ok(true)
 }
 
 /// Projects a monotonic request duration onto the caller's Unix timestamp.
@@ -2110,17 +2180,46 @@ async fn forward_blind_relay_with_retry(
                 .await
                 .ok();
                 let observed_at = blind_relay_response_observed_at(now, &request_started_at);
-                if let Some(error) =
-                    peer_declared_downstream_error(status, declared_response.as_ref())
-                {
+                if let (Some(error), Some(declared_ack)) = (
+                    peer_declared_downstream_error(status, declared_response.as_ref()),
+                    declared_response.as_ref(),
+                ) {
+                    let receipt_authenticated = match validate_downstream_failure_receipt(
+                        declared_ack,
+                        &request,
+                        &next_hop,
+                        observed_at,
+                    ) {
+                        Ok(authenticated) => authenticated,
+                        Err(reason) => {
+                            debug!(
+                                attempt,
+                                reason,
+                                "[BLIND_RELAY] Next-hop failure receipt verification failed"
+                            );
+                            let _ = state
+                                .peer_store
+                                .record_route_forward_failure_for_descriptor(
+                                    descriptor,
+                                    observed_at,
+                                    "failure_receipt_invalid",
+                                );
+                            state.peer_store.record_blind_relay_rejected(
+                                observed_at,
+                                "failure_receipt_invalid",
+                            );
+                            return Err(BlindRelayError::ForwardFailed);
+                        }
+                    };
                     // [DOWNSTREAM-FAILURE-ATTRIBUTION 2026-08-11 by Codex]
                     // A valid bounded error ACK proves the immediate endpoint
-                    // responded, but its unsigned claim cannot identify which
-                    // deeper hop failed. Preserve coarse retry semantics and
-                    // aggregate observability without poisoning route health.
+                    // responded. Signed and legacy forms alike cannot identify
+                    // which deeper hop failed. Preserve coarse retry semantics
+                    // and aggregate observability without poisoning route health.
                     debug!(
                         attempt,
                         status = %status,
+                        receipt_authenticated,
                         "[BLIND_RELAY] Peer-declared downstream failure left unattributed"
                     );
                     state
@@ -2239,9 +2338,11 @@ async fn forward_blind_relay_with_retry(
 
 /// Classifies only a bounded, well-shaped peer protocol error response.
 ///
-/// The response remains unsigned and therefore never grants blame authority.
-/// This classifier controls retry/propagation only; callers must not mutate
-/// node-specific reputation from its result.
+/// [SIGNED-FAILURE-RECEIPT 2026-08-11 by Codex] This classifier validates only
+/// the bounded error state and transport class. The caller separately verifies
+/// an optional immediate-hop signature. Signed and legacy responses alike
+/// never grant blame authority for a deeper onion hop, so classification alone
+/// must not mutate node-specific reputation.
 fn peer_declared_downstream_error(
     status: reqwest::StatusCode,
     response: Option<&PeerBlindRelayResponse>,
@@ -2505,6 +2606,7 @@ mod tests {
                 started_at + 31,
                 &terminal,
             )),
+            failure_receipt: None,
         };
 
         assert_eq!(
@@ -2543,6 +2645,7 @@ mod tests {
                 now,
                 &downstream_terminal,
             )),
+            failure_receipt: None,
         };
 
         validate_downstream_delivery_receipt(
@@ -2572,6 +2675,7 @@ mod tests {
                 now,
                 &wrong_terminal,
             )),
+            failure_receipt: None,
         };
 
         assert_eq!(
@@ -2601,6 +2705,7 @@ mod tests {
             ttl_remaining: 1,
             reason: None,
             delivery_receipt: None,
+            failure_receipt: None,
         };
 
         assert_eq!(
@@ -2647,6 +2752,136 @@ mod tests {
     }
 
     #[test]
+    fn signed_failure_receipt_is_exact_fresh_and_legacy_compatible() {
+        let now = 1_800_000_200;
+        let previous_hop = IdentityKeyPair::generate();
+        let responder = IdentityKeyPair::generate();
+        let other_responder = IdentityKeyPair::generate();
+        let envelope = BlindRelayEnvelope {
+            route_id: [0xb1; 16],
+            next_hop: responder.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: b"opaque failure receipt request".to_vec(),
+            timestamp: now,
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+        let request = PeerBlindRelayRequest {
+            envelope: envelope.clone(),
+            previous_hop_node_id: previous_hop.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let signed_receipt = |failed_at, signer: &IdentityKeyPair| {
+            BlindRelayFailureReceipt::failed(
+                envelope.route_id,
+                BlindRelayFailureReceipt::request_commitment(&envelope),
+                "forward_failed",
+                failed_at,
+                signer,
+            )
+        };
+        let failure_ack = |receipt| PeerBlindRelayResponse {
+            accepted: false,
+            terminal: false,
+            forwarded: false,
+            ttl_remaining: 0,
+            reason: Some("forward_failed".to_string()),
+            delivery_receipt: None,
+            failure_receipt: receipt,
+        };
+
+        let authenticated = failure_ack(Some(signed_receipt(now, &responder)));
+        assert_eq!(
+            validate_downstream_failure_receipt(
+                &authenticated,
+                &request,
+                &responder.public_key_bytes(),
+                now,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            validate_downstream_failure_receipt(
+                &failure_ack(None),
+                &request,
+                &responder.public_key_bytes(),
+                now,
+            ),
+            Ok(false),
+            "missing receipt remains the explicit mixed-version path"
+        );
+        let legacy_ack: PeerBlindRelayResponse = serde_json::from_value(serde_json::json!({
+            "accepted": false,
+            "terminal": false,
+            "forwarded": false,
+            "ttl_remaining": 0,
+            "reason": "forward_failed"
+        }))
+        .expect("legacy ACK without receipt fields must remain decodable");
+        assert!(legacy_ack.delivery_receipt.is_none());
+        assert!(legacy_ack.failure_receipt.is_none());
+
+        let mut reason_substitution = authenticated.clone();
+        reason_substitution.reason = Some("no_route".to_string());
+        assert_eq!(
+            validate_downstream_failure_receipt(
+                &reason_substitution,
+                &request,
+                &responder.public_key_bytes(),
+                now,
+            ),
+            Err("failure_receipt_binding_invalid")
+        );
+        assert_eq!(
+            validate_downstream_failure_receipt(
+                &failure_ack(Some(signed_receipt(now, &other_responder))),
+                &request,
+                &responder.public_key_bytes(),
+                now,
+            ),
+            Err("failure_receipt_binding_invalid")
+        );
+        assert_eq!(
+            validate_downstream_failure_receipt(
+                &failure_ack(Some(signed_receipt(
+                    now - BLIND_RELAY_FAILURE_RECEIPT_MAX_AGE_SECS - 1,
+                    &responder,
+                ))),
+                &request,
+                &responder.public_key_bytes(),
+                now,
+            ),
+            Err("failure_receipt_timestamp_expired")
+        );
+        assert_eq!(
+            validate_downstream_failure_receipt(
+                &failure_ack(Some(signed_receipt(
+                    now + BLIND_RELAY_FAILURE_RECEIPT_MAX_FUTURE_SKEW_SECS + 1,
+                    &responder,
+                ))),
+                &request,
+                &responder.public_key_bytes(),
+                now,
+            ),
+            Err("failure_receipt_timestamp_in_future")
+        );
+
+        let mut contradictory_success = authenticated;
+        contradictory_success.accepted = true;
+        contradictory_success.terminal = true;
+        assert_eq!(
+            validate_downstream_delivery_receipt(
+                &contradictory_success,
+                &envelope.route_id,
+                &responder.public_key_bytes(),
+                now,
+            ),
+            Err("unexpected_failure_receipt")
+        );
+    }
+
+    #[test]
     fn forwarded_ack_rejects_tampered_downstream_receipt() {
         let now = 1_800_000_100;
         let route_id = [0xe5; 16];
@@ -2662,6 +2897,7 @@ mod tests {
             ttl_remaining: 1,
             reason: Some("onion_forwarded".to_string()),
             delivery_receipt: Some(receipt),
+            failure_receipt: None,
         };
 
         assert_eq!(
@@ -2916,6 +3152,7 @@ mod tests {
             ttl_remaining: 0,
             reason: Some(reason.to_string()),
             delivery_receipt: None,
+            failure_receipt: None,
         };
         // [DOWNSTREAM-FAILURE-ATTRIBUTION 2026-08-11 by Codex] Valid protocol
         // errors preserve only coarse control flow. Bare statuses remain the
@@ -3122,6 +3359,62 @@ mod tests {
             .recent_audit_events()
             .iter()
             .any(|event| event.action == "blind_relay_terminal"));
+    }
+
+    #[tokio::test]
+    async fn blind_relay_handler_signs_exact_failure_response() {
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let node_id = node_identity.public_key_bytes();
+        let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
+        let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let now = now_secs();
+        let request = PeerBlindRelayRequest {
+            envelope: BlindRelayEnvelope {
+                route_id: [0x42u8; 16],
+                next_hop: node_id,
+                ttl: 2,
+                encrypted_blob: b"opaque expired failure request".to_vec(),
+                timestamp: now - BLIND_RELAY_MAX_ENVELOPE_AGE_SECS - 1,
+                signature: [0u8; 64],
+            }
+            .sign_with(&previous_hop),
+            previous_hop_node_id: previous_hop.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let app = build_chat_peer_router(
+            None,
+            sessions,
+            udp,
+            Arc::new(PeerStore::new()),
+            node_identity,
+            Arc::new(reqwest::Client::new()),
+            None,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/blind-relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: PeerBlindRelayResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.reason.as_deref(), Some("timestamp_expired"));
+        assert!(parsed.failure_receipt.is_some());
+        assert_eq!(
+            validate_downstream_failure_receipt(&parsed, &request, &node_id, now_secs()),
+            Ok(true)
+        );
     }
 
     #[tokio::test]
@@ -3563,6 +3856,7 @@ mod tests {
                         ttl_remaining: 2,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        failure_receipt: None,
                     })
                     .into_response()
                 }
@@ -3762,6 +4056,7 @@ mod tests {
                         ttl_remaining: request.envelope.ttl,
                         reason: Some("onion_terminal_delivered".to_string()),
                         delivery_receipt: Some(delivery_receipt),
+                        failure_receipt: None,
                     })
                     .into_response()
                 }
@@ -4033,6 +4328,7 @@ mod tests {
             ttl_remaining: 1,
             reason: Some("forwarded".to_string()),
             delivery_receipt: None,
+            failure_receipt: None,
         };
         BlindRelayRouteLease::new(Arc::clone(&seen_routes), route_id)
             .complete(started_at + 2, response.clone());
@@ -4063,6 +4359,7 @@ mod tests {
             ttl_remaining: 1,
             reason: Some("forwarded".to_string()),
             delivery_receipt: None,
+            failure_receipt: None,
         };
 
         assert_eq!(
@@ -4200,6 +4497,7 @@ mod tests {
             ttl_remaining: 1,
             reason: Some("onion_terminal_delivered".to_string()),
             delivery_receipt: Some(delivery_receipt),
+            failure_receipt: None,
         };
 
         assert_eq!(
@@ -4423,6 +4721,7 @@ mod tests {
                             ttl_remaining: 1,
                             reason: Some("terminal_next_hop".to_string()),
                             delivery_receipt: None,
+                            failure_receipt: None,
                         })
                         .into_response()
                     }
@@ -4519,6 +4818,7 @@ mod tests {
                         ttl_remaining: 0,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        failure_receipt: None,
                     })
                     .into_response()
                 }
@@ -4645,6 +4945,7 @@ mod tests {
                         ttl_remaining: 1,
                         reason: Some("relay_unavailable".to_string()),
                         delivery_receipt: None,
+                        failure_receipt: None,
                     })
                 }
             }),
@@ -4906,6 +5207,7 @@ mod tests {
                         ttl_remaining: 1,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        failure_receipt: None,
                     })
                 }
             }),
@@ -4996,12 +5298,22 @@ mod tests {
     async fn peer_declared_downstream_failure_does_not_poison_next_hop_reputation() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_for_route = Arc::clone(&attempts);
+        let next_hop_identity = Arc::new(IdentityKeyPair::generate());
+        let next_hop_identity_for_route = Arc::clone(&next_hop_identity);
         let next_hop_app = Router::new().route(
             "/api/chat/peer/blind-relay",
-            post(move |Json(_request): Json<PeerBlindRelayRequest>| {
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
                 let attempts_for_request = Arc::clone(&attempts_for_route);
+                let next_hop_identity = Arc::clone(&next_hop_identity_for_route);
                 async move {
                     attempts_for_request.fetch_add(1, AtomicOrdering::SeqCst);
+                    let failure_receipt = BlindRelayFailureReceipt::failed(
+                        request.envelope.route_id,
+                        BlindRelayFailureReceipt::request_commitment(&request.envelope),
+                        "forward_failed",
+                        now_secs(),
+                        next_hop_identity.as_ref(),
+                    );
                     (
                         StatusCode::BAD_GATEWAY,
                         Json(PeerBlindRelayResponse {
@@ -5011,6 +5323,7 @@ mod tests {
                             ttl_remaining: 0,
                             reason: Some("forward_failed".to_string()),
                             delivery_receipt: None,
+                            failure_receipt: Some(failure_receipt),
                         }),
                     )
                 }
@@ -5025,12 +5338,16 @@ mod tests {
         let now = now_secs();
         let previous_hop = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
-        let next_hop_identity = IdentityKeyPair::generate();
         let next_hop_node_id = next_hop_identity.public_key_bytes();
         let peer_store = Arc::new(PeerStore::new());
         peer_store
             .upsert_verified_from_source(
-                signed_chat_relay_peer_descriptor_for(&next_hop_identity, endpoint, now, now + 300),
+                signed_chat_relay_peer_descriptor_for(
+                    next_hop_identity.as_ref(),
+                    endpoint,
+                    now,
+                    now + 300,
+                ),
                 now,
                 "gossip_snapshot",
             )
@@ -5096,6 +5413,118 @@ mod tests {
         assert!(peer_store.recent_audit_events().iter().all(|event| {
             event.action != "blind_relay_route_health" || event.outcome != "rejected"
         }));
+    }
+
+    #[tokio::test]
+    async fn invalid_failure_receipt_penalizes_immediate_next_hop_protocol() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_route = Arc::clone(&attempts);
+        let wrong_signer = Arc::new(IdentityKeyPair::generate());
+        let wrong_signer_for_route = Arc::clone(&wrong_signer);
+        let next_hop_app = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(request): Json<PeerBlindRelayRequest>| {
+                let attempts_for_request = Arc::clone(&attempts_for_route);
+                let wrong_signer = Arc::clone(&wrong_signer_for_route);
+                async move {
+                    attempts_for_request.fetch_add(1, AtomicOrdering::SeqCst);
+                    let receipt = BlindRelayFailureReceipt::failed(
+                        request.envelope.route_id,
+                        BlindRelayFailureReceipt::request_commitment(&request.envelope),
+                        "forward_failed",
+                        now_secs(),
+                        wrong_signer.as_ref(),
+                    );
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(PeerBlindRelayResponse {
+                            accepted: false,
+                            terminal: false,
+                            forwarded: false,
+                            ttl_remaining: 0,
+                            reason: Some("forward_failed".to_string()),
+                            delivery_receipt: None,
+                            failure_receipt: Some(receipt),
+                        }),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, next_hop_app).await.unwrap();
+        });
+
+        let now = now_secs();
+        let current_node = Arc::new(IdentityKeyPair::generate());
+        let next_hop_identity = IdentityKeyPair::generate();
+        let next_hop_node_id = next_hop_identity.public_key_bytes();
+        let descriptor = signed_chat_relay_peer_descriptor_for(
+            &next_hop_identity,
+            endpoint.clone(),
+            now,
+            now + 300,
+        );
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(descriptor.clone(), now, "gossip_snapshot")
+            .unwrap();
+        peer_store.record_route_forward_success(&next_hop_node_id, now);
+        let state = ChatPeerState {
+            chat_relay: None,
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&current_node),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let request = PeerBlindRelayRequest {
+            envelope: BlindRelayEnvelope {
+                route_id: [0x6au8; 16],
+                next_hop: next_hop_node_id,
+                ttl: 1,
+                encrypted_blob: b"opaque invalid failure receipt request".to_vec(),
+                timestamp: now,
+                signature: [0u8; 64],
+            }
+            .sign_with(current_node.as_ref()),
+            previous_hop_node_id: current_node.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+
+        let result = forward_blind_relay_with_retry(
+            &state,
+            &blind_peer_relay_url(&endpoint).unwrap(),
+            &descriptor,
+            request,
+            now,
+        )
+        .await;
+        server.abort();
+
+        assert!(matches!(result, Err(BlindRelayError::ForwardFailed)));
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+        let blind_stats = peer_store.status(now + 5).runtime.blind_relay;
+        assert_eq!(blind_stats.rejected, 1);
+        assert_eq!(blind_stats.forward_failed, 1);
+        let route_status = peer_store.route_candidate_status(now + 5);
+        let route_row = route_status
+            .chat_relay
+            .iter()
+            .find(|row| row.node_id_prefix == hex::encode(&next_hop_node_id[..4]))
+            .expect("chat relay row should remain visible");
+        assert_eq!(route_row.route_failure_count, 1);
+        assert_eq!(route_row.route_consecutive_failures, 1);
+        assert_eq!(
+            route_row.last_route_failure_reason.as_deref(),
+            Some("failure_receipt_invalid")
+        );
     }
 
     #[tokio::test]
@@ -5203,6 +5632,7 @@ mod tests {
                         ttl_remaining: 1,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        failure_receipt: None,
                     })
                 },
             ),

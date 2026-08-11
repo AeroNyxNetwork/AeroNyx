@@ -62,6 +62,9 @@
 //! - `BlindRelayDeliveryReceipt`: terminal-signed proof that an exact opaque
 //!   payload reached the store-and-forward acceptance boundary. The receipt
 //!   contains no sender, receiver, endpoint, online-state, or plaintext data.
+//! - [SIGNED-FAILURE-RECEIPT 2026-08-11 by Codex] `BlindRelayFailureReceipt`
+//!   authenticates one immediate hop's coarse failure ACK against the exact
+//!   opaque request. It never identifies deeper hops or reveals payload data.
 //! - [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Receipt v2 commits to both
 //!   the opaque terminal payload and its canonical route purpose without
 //!   exposing a purpose field to middle relays. Receipt v1 remains verifiable
@@ -71,6 +74,7 @@
 //!   bytes only for `ChatEnvelope`; blind-relay frames remain canonical.
 //!
 //! ## Last Modified
+//! v1.5.0-SignedFailureReceipt - Authenticate hop-local failure ACKs without exposing route topology
 //! v1.4.0-PurposeBoundReceipt - Bound terminal receipts to route purpose with a v2 domain
 //! v1.3.0-BoundedWireCodec - Symmetric frame limits and padded-input rejection
 //! v1.2.0-BlindRelayDeliveryReceipt - Added terminal-signed opaque delivery receipt
@@ -101,11 +105,17 @@ const BLIND_RELAY_DELIVERY_RECEIPT_V1_SIGNING_DOMAIN: &[u8] =
 const BLIND_RELAY_DELIVERY_RECEIPT_V2_SIGNING_DOMAIN: &[u8] =
     b"AeroNyx-BlindRelay-DeliveryReceipt-v2";
 const BLIND_RELAY_PURPOSE_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-PurposeCommitment-v1";
+const BLIND_RELAY_FAILURE_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-FailureReceipt-v1";
+const BLIND_RELAY_FAILURE_REQUEST_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx-BlindRelay-FailureRequest-v1";
+const BLIND_RELAY_FAILURE_REASON_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-FailureReason-v1";
 
 /// Initial signed blind-relay terminal receipt version.
 pub const BLIND_RELAY_DELIVERY_RECEIPT_VERSION: u8 = 1;
 /// Purpose-bound terminal receipt version used by current nodes.
 pub const BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION: u8 = 2;
+/// Initial hop-local signed blind-relay failure receipt version.
+pub const BLIND_RELAY_FAILURE_RECEIPT_VERSION: u8 = 1;
 /// Terminal accepted the opaque payload into online or durable pending delivery.
 pub const BLIND_RELAY_DELIVERY_ACCEPTED: u8 = 1;
 
@@ -595,6 +605,131 @@ impl BlindRelayDeliveryReceipt {
             &Self::payload_commitment_for_purpose(payload, purpose),
             terminal_node_id,
         )
+    }
+}
+
+// ============================================
+// BlindRelayFailureReceipt
+// ============================================
+
+/// Immediate-hop signature over one coarse blind-relay failure response.
+///
+/// [SIGNED-FAILURE-RECEIPT 2026-08-11 by Codex] This receipt authenticates
+/// only the node that returned the response to its direct previous hop. It is
+/// deliberately not a blame certificate for a deeper onion hop: exposing that
+/// identity would let upstream relays reconstruct private route topology.
+/// Request and reason commitments keep the signed surface fixed-size and bind
+/// it to the exact opaque request without returning payload-derived bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindRelayFailureReceipt {
+    /// Failure receipt schema version.
+    pub version: u8,
+    /// Random route correlation id from the exact failed request.
+    pub route_id: [u8; 16],
+    /// Domain-separated commitment to the request envelope's signed fields.
+    pub request_commitment: [u8; 32],
+    /// Ed25519 identity of the immediate node returning this failure.
+    pub responder_node_id: [u8; 32],
+    /// Unix timestamp when this node completed the failed attempt.
+    pub failed_at: u64,
+    /// Domain-separated commitment to the coarse public reason bucket.
+    pub reason_commitment: [u8; 32],
+    /// Ed25519 signature over [`Self::signing_data`].
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindRelayFailureReceipt {
+    /// Creates and signs a failure receipt bound to one precomputed request.
+    ///
+    /// Callers can compute `request_commitment` before moving a large opaque
+    /// request into async processing, avoiding a payload clone on every relay.
+    #[must_use]
+    pub fn failed(
+        route_id: [u8; 16],
+        request_commitment: [u8; 32],
+        reason: &str,
+        failed_at: u64,
+        responder: &IdentityKeyPair,
+    ) -> Self {
+        let mut receipt = Self {
+            version: BLIND_RELAY_FAILURE_RECEIPT_VERSION,
+            route_id,
+            request_commitment,
+            responder_node_id: responder.public_key_bytes(),
+            failed_at,
+            reason_commitment: Self::reason_commitment(reason),
+            signature: [0u8; 64],
+        };
+        receipt.signature = responder.sign(&receipt.signing_data());
+        receipt
+    }
+
+    /// Commits to the exact route fields and opaque payload hash already
+    /// covered by the previous hop's envelope signature.
+    #[must_use]
+    pub fn request_commitment(envelope: &BlindRelayEnvelope) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(BLIND_RELAY_FAILURE_REQUEST_COMMITMENT_DOMAIN);
+        hasher.update(envelope.signing_data());
+        hasher.finalize().into()
+    }
+
+    /// Commits to one public coarse reason without making variable-length
+    /// strings part of the failure receipt's canonical signing layout.
+    #[must_use]
+    pub fn reason_commitment(reason: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(BLIND_RELAY_FAILURE_REASON_COMMITMENT_DOMAIN);
+        hasher.update(reason.as_bytes());
+        hasher.finalize().into()
+    }
+
+    /// Builds canonical, domain-separated failure receipt signing bytes.
+    #[must_use]
+    pub fn signing_data(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(
+            BLIND_RELAY_FAILURE_RECEIPT_SIGNING_DOMAIN.len() + 1 + 16 + 32 + 32 + 8 + 32,
+        );
+        data.extend_from_slice(BLIND_RELAY_FAILURE_RECEIPT_SIGNING_DOMAIN);
+        data.push(self.version);
+        data.extend_from_slice(&self.route_id);
+        data.extend_from_slice(&self.request_commitment);
+        data.extend_from_slice(&self.responder_node_id);
+        data.extend_from_slice(&self.failed_at.to_le_bytes());
+        data.extend_from_slice(&self.reason_commitment);
+        data
+    }
+
+    /// Verifies the schema version and responder Ed25519 signature.
+    pub fn verify_signature(&self) -> Result<(), CoreError> {
+        if self.version != BLIND_RELAY_FAILURE_RECEIPT_VERSION {
+            return Err(CoreError::malformed(
+                "blind relay failure receipt: unsupported version",
+            ));
+        }
+        let responder = IdentityPublicKey::from_bytes(&self.responder_node_id)?;
+        responder.verify(&self.signing_data(), &self.signature)
+    }
+
+    /// Verifies signature, request, reason, and immediate responder binding.
+    pub fn verify_expected(
+        &self,
+        envelope: &BlindRelayEnvelope,
+        reason: &str,
+        responder_node_id: &[u8; 32],
+    ) -> Result<(), CoreError> {
+        self.verify_signature()?;
+        if self.route_id != envelope.route_id
+            || self.request_commitment != Self::request_commitment(envelope)
+            || &self.responder_node_id != responder_node_id
+            || self.reason_commitment != Self::reason_commitment(reason)
+        {
+            return Err(CoreError::malformed(
+                "blind relay failure receipt: response binding mismatch",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1179,6 +1314,74 @@ mod tests {
                 &terminal.public_key_bytes(),
             )
             .is_err());
+    }
+
+    #[test]
+    fn test_blind_relay_failure_receipt_binds_request_reason_and_responder() {
+        let previous_hop = IdentityKeyPair::generate();
+        let responder = IdentityKeyPair::generate();
+        let request = make_blind_envelope(&previous_hop);
+        let receipt = BlindRelayFailureReceipt::failed(
+            request.route_id,
+            BlindRelayFailureReceipt::request_commitment(&request),
+            "forward_failed",
+            1_700_000_500,
+            &responder,
+        );
+
+        assert_eq!(receipt.version, BLIND_RELAY_FAILURE_RECEIPT_VERSION);
+        assert!(receipt.verify_signature().is_ok());
+        assert!(receipt
+            .verify_expected(&request, "forward_failed", &responder.public_key_bytes(),)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_blind_relay_failure_receipt_rejects_replay_and_reason_substitution() {
+        let previous_hop = IdentityKeyPair::generate();
+        let responder = IdentityKeyPair::generate();
+        let request = make_blind_envelope(&previous_hop);
+        let receipt = BlindRelayFailureReceipt::failed(
+            request.route_id,
+            BlindRelayFailureReceipt::request_commitment(&request),
+            "forward_failed",
+            1_700_000_500,
+            &responder,
+        );
+        let mut replayed_request = request.clone();
+        replayed_request.encrypted_blob[0] ^= 0x01;
+
+        assert!(receipt
+            .verify_expected(
+                &replayed_request,
+                "forward_failed",
+                &responder.public_key_bytes(),
+            )
+            .is_err());
+        assert!(receipt
+            .verify_expected(&request, "no_route", &responder.public_key_bytes())
+            .is_err());
+    }
+
+    #[test]
+    fn test_blind_relay_failure_receipt_rejects_signer_and_field_tampering() {
+        let previous_hop = IdentityKeyPair::generate();
+        let responder = IdentityKeyPair::generate();
+        let other = IdentityKeyPair::generate();
+        let request = make_blind_envelope(&previous_hop);
+        let mut receipt = BlindRelayFailureReceipt::failed(
+            request.route_id,
+            BlindRelayFailureReceipt::request_commitment(&request),
+            "forward_failed",
+            1_700_000_500,
+            &responder,
+        );
+
+        assert!(receipt
+            .verify_expected(&request, "forward_failed", &other.public_key_bytes())
+            .is_err());
+        receipt.failed_at = receipt.failed_at.saturating_add(1);
+        assert!(receipt.verify_signature().is_err());
     }
 
     // ── MediaPointer ──
