@@ -138,6 +138,9 @@
 //!   fields. Intermediates verify route, freshness, and signature, but only the
 //!   source knows the complete route and final payload commitment and can
 //!   therefore enforce the final terminal/payload binding.
+//! - A successful downstream ACK must describe exactly one completed action:
+//!   terminal acceptance or onward forwarding. `accepted=true` without either
+//!   action is not delivery evidence and must never improve route reputation.
 //! - Blind Vault's detailed storage receipt contains stable replica-local lease
 //!   metadata and therefore must not be exposed in a multi-hop JSON ACK. The
 //!   existing delivery receipt is signed only after `BlindVaultService::put`
@@ -163,6 +166,8 @@
 //!   bounded independently from the live route map to prevent stale-entry DoS.
 //!
 //! ## Last Modified
+//! v0.36.0-RelayAckStateMachine - Require successful downstream ACKs to prove
+//! exactly one terminal or forwarding disposition before recording success
 //! v0.35.0-ReplayGenerationCompaction - Make same-second route reuse safe and
 //! bound stale replay generations independently from live route capacity
 //! v0.34.0-DurableTerminalReplayWindow - Bind terminal receipt time to durable
@@ -1932,7 +1937,7 @@ fn blind_relay_reason_counts_toward_quarantine(reason: &str) -> bool {
     )
 }
 
-/// Validates the portion of a downstream delivery receipt visible at this hop.
+/// Validates the downstream success state and receipt surface visible at this hop.
 ///
 /// [MULTIHOP-RECEIPT-VALIDATION 2026-08-01 by Codex] A direct terminal ACK must
 /// be signed by `immediate_next_hop`. A forwarded ACK may carry a receipt from a
@@ -1947,7 +1952,16 @@ fn validate_downstream_delivery_receipt(
     immediate_next_hop: &[u8; 32],
     observed_at: u64,
 ) -> Result<(), &'static str> {
-    if ack.terminal && ack.forwarded {
+    // [RELAY-ACK-STATE-MACHINE 2026-08-11 by Codex] Treat the response as a
+    // protocol state transition, not a collection of independent booleans.
+    // A malicious peer previously could return `accepted=true` with neither
+    // terminal delivery nor forwarding and still receive route-success credit
+    // whenever it omitted the optional legacy receipt. XOR keeps old receipt-
+    // less terminal/forwarded ACKs compatible while rejecting false evidence.
+    if !ack.accepted {
+        return Err("ack_not_accepted");
+    }
+    if ack.terminal == ack.forwarded {
         return Err("invalid_ack_shape");
     }
 
@@ -1957,9 +1971,6 @@ fn validate_downstream_delivery_receipt(
         return Ok(());
     };
 
-    if !ack.terminal && !ack.forwarded {
-        return Err("receipt_without_delivery");
-    }
     if &receipt.route_id != route_id {
         return Err("receipt_route_mismatch");
     }
@@ -2532,6 +2543,67 @@ mod tests {
             ),
             Err("terminal_receipt_signer_mismatch")
         );
+    }
+
+    #[test]
+    fn downstream_success_ack_requires_exactly_one_delivery_disposition() {
+        // [RELAY-ACK-STATE-MACHINE 2026-08-11 by Codex] Receipt-less ACKs stay
+        // valid for mixed-version peers only when their state proves one real
+        // terminal or forwarding action. No-op and contradictory success
+        // shapes must fail before they can become route-health evidence.
+        let now = 1_800_000_100;
+        let route_id = [0xd5; 16];
+        let immediate_next_hop = IdentityKeyPair::generate().public_key_bytes();
+        let ack = |accepted, terminal, forwarded| PeerBlindRelayResponse {
+            accepted,
+            terminal,
+            forwarded,
+            ttl_remaining: 1,
+            reason: None,
+            delivery_receipt: None,
+        };
+
+        assert_eq!(
+            validate_downstream_delivery_receipt(
+                &ack(true, false, false),
+                &route_id,
+                &immediate_next_hop,
+                now,
+            ),
+            Err("invalid_ack_shape")
+        );
+        assert_eq!(
+            validate_downstream_delivery_receipt(
+                &ack(true, true, true),
+                &route_id,
+                &immediate_next_hop,
+                now,
+            ),
+            Err("invalid_ack_shape")
+        );
+        assert_eq!(
+            validate_downstream_delivery_receipt(
+                &ack(false, false, false),
+                &route_id,
+                &immediate_next_hop,
+                now,
+            ),
+            Err("ack_not_accepted")
+        );
+        assert!(validate_downstream_delivery_receipt(
+            &ack(true, true, false),
+            &route_id,
+            &immediate_next_hop,
+            now,
+        )
+        .is_ok());
+        assert!(validate_downstream_delivery_receipt(
+            &ack(true, false, true),
+            &route_id,
+            &immediate_next_hop,
+            now,
+        )
+        .is_ok());
     }
 
     #[test]
