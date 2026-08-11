@@ -439,8 +439,14 @@
 //   - [ONION-ENTRY-ANTI-AFFINITY 2026-08-03 by Codex] Required production
 //     discovery routers receive the local node id as private runtime context so
 //     public onion pools can exclude candidates collocated with the entry.
+//   - [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] Publish fine-grained wire
+//     features only through backward-compatible signed descriptor metadata.
+//     Do not add a closed `NodeCapability` variant for response framing.
 //
 // Last Modified:
+//   v2.8.74-SignedProtocolFeatures - Advertised authenticated hop-local failure
+//     receipts without changing descriptor schema or capability discriminants;
+//     registered the dormant self-descriptor privacy regression test.
 //   v2.8.73-ClientDeliveryAtomicRouteEvidence - Bound live terminal receipts,
 //     route success, and capability evidence to one current signed path state.
 //   v2.8.72-RouteSuccessSurfaceBinding - Bound probe and live forward success
@@ -677,8 +683,8 @@ use aeronyx_core::protocol::memchain::{
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
     build_onion_envelope, DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability,
-    NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, OnionHop, OnionRoutePurpose,
-    SignedNodeDescriptor,
+    NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature, OnionHop,
+    OnionRoutePurpose, SignedNodeDescriptor,
 };
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
@@ -10882,13 +10888,17 @@ impl Server {
     ) -> Result<SignedNodeDescriptor> {
         let ttl = config.discovery.descriptor_ttl_secs;
         let expires_at = now.saturating_add(ttl);
+        // [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] The exact feature
+        // token is covered by the existing descriptor signature and remains a
+        // valid opaque version string to pre-feature decoders.
         let mut descriptor = NodeDescriptor::new(
             identity.public_key_bytes(),
             now,
             now,
             expires_at,
             env!("CARGO_PKG_VERSION"),
-        );
+        )
+        .with_protocol_features([NodeProtocolFeature::BlindRelayFailureReceiptV1]);
 
         descriptor.public_endpoint = config
             .discovery
@@ -13071,7 +13081,7 @@ mod tests {
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
         NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
-        OnionRoutePurpose, SignedNodeDescriptor,
+        NodeProtocolFeature, OnionRoutePurpose, SignedNodeDescriptor,
     };
     use axum::{
         http::StatusCode,
@@ -15560,6 +15570,10 @@ mod tests {
         );
     }
 
+    // [SELF-DESCRIPTOR-TEST-REGISTRATION 2026-08-11 by Codex] This regression
+    // test previously lacked `#[test]`, so its privacy and signature assertions
+    // compiled but never executed.
+    #[test]
     fn self_discovery_descriptor_uses_privacy_safe_public_metadata() {
         let mut config = ServerConfig::default();
         config.discovery.enabled = true;
@@ -15597,6 +15611,9 @@ mod tests {
             .descriptor
             .capabilities
             .contains(&NodeCapability::PrivacyRelay));
+        assert!(signed
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::BlindRelayFailureReceiptV1));
         assert_eq!(
             signed.descriptor.capacity.max_sessions,
             server.config.max_sessions() as u32

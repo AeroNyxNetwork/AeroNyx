@@ -24,6 +24,8 @@
 //!   correspondent, application namespace, or public-chain commitment.
 //! - v1.1.0-OnionRoutePurpose: Standardized onion terminal-workload purpose
 //!   negotiation for Rust nodes, Apps, SDKs, and autonomous agents.
+//! - [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] Re-exported signed,
+//!   backward-compatible node wire-feature negotiation.
 //!
 //! ## Main Functionality
 //!
@@ -71,6 +73,7 @@
 //! v1.0.0-BlindVaultWire - Added anonymous encrypted durable-object contract
 //! v1.1.0-BlindVaultLease - Added anonymous lease and signed deletion contract
 //! v1.1.0-OnionRoutePurpose - Added stable onion route-purpose negotiation
+//! v1.2.0-SignedProtocolFeatures - Re-exported descriptor-bound feature tokens
 
 pub mod auth;
 pub mod blind_vault;
@@ -97,8 +100,8 @@ pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, 
 pub use codec::{Codec, ProtocolCodec};
 pub use discovery::{
     decode_discovery_message, encode_discovery_message, NodeBootstrapSnapshot, NodeCapability,
-    NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, SignedNodeDescriptor,
-    NODE_BOOTSTRAP_SNAPSHOT_SCHEMA_VERSION, NODE_DESCRIPTOR_SCHEMA_VERSION,
+    NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature,
+    SignedNodeDescriptor, NODE_BOOTSTRAP_SNAPSHOT_SCHEMA_VERSION, NODE_DESCRIPTOR_SCHEMA_VERSION,
 };
 pub use memchain::{
     decode_memchain, encode_memchain, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,

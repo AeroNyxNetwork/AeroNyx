@@ -21,6 +21,9 @@
 //!   successful onion terminal store-and-forward; middle hops only propagate it
 //! - [SIGNED-FAILURE-RECEIPT 2026-08-11 by Codex] Signs hop-local failure ACKs
 //!   against the exact request while keeping deeper onion topology hidden
+//! - [FAILURE-RECEIPT-ANTI-DOWNGRADE 2026-08-11 by Codex] Requires the signed
+//!   failure receipt when the exact next-hop descriptor advertises support,
+//!   while preserving the legacy path for peers that do not advertise it
 //! - [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Signs receipt v2 with a
 //!   purpose-separated opaque payload commitment after terminal acceptance;
 //!   v1 remains signature-verifiable for rolling-upgrade relay compatibility
@@ -148,6 +151,11 @@
 //!   response; it must not become blame evidence for a deeper participant.
 //!   Invalid, stale, replayed, or wrong-signer receipts are direct protocol
 //!   failure evidence against the immediate next-hop route surface.
+//! - [FAILURE-RECEIPT-ANTI-DOWNGRADE 2026-08-11 by Codex] A next hop that
+//!   advertises `BlindRelayFailureReceiptV1` in its signed descriptor must not
+//!   omit the receipt from a handled protocol failure. Treat omission as a
+//!   direct downgrade violation against that exact route surface. Peers without
+//!   the advertisement remain on the explicit mixed-version compatibility path.
 //! - Blind Vault's detailed storage receipt contains stable replica-local lease
 //!   metadata and therefore must not be exposed in a multi-hop JSON ACK. The
 //!   existing delivery receipt is signed only after `BlindVaultService::put`
@@ -173,6 +181,8 @@
 //!   bounded independently from the live route map to prevent stale-entry DoS.
 //!
 //! ## Last Modified
+//! v0.39.0-FailureReceiptAntiDowngrade - Enforce signed failure receipts for
+//! descriptor-negotiated peers while preserving legacy relay compatibility
 //! v0.38.0-SignedFailureReceipt - Authenticate exact hop-local failure ACKs
 //! without exposing deeper onion topology or breaking legacy peers
 //! v0.37.0-DownstreamFailureAttribution - Keep valid peer-declared downstream
@@ -238,7 +248,7 @@ use aeronyx_core::protocol::chat::{
     BlindRelayEnvelope, BlindRelayFailureReceipt, ChatEnvelope,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
-use aeronyx_core::protocol::discovery::SignedNodeDescriptor;
+use aeronyx_core::protocol::discovery::{NodeProtocolFeature, SignedNodeDescriptor};
 use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer, OnionRoutePurpose};
 use aeronyx_core::protocol::{
@@ -2050,9 +2060,14 @@ fn validate_downstream_failure_receipt(
     request: &PeerBlindRelayRequest,
     immediate_next_hop: &[u8; 32],
     observed_at: u64,
+    receipt_required: bool,
 ) -> Result<bool, &'static str> {
     let Some(receipt) = ack.failure_receipt.as_ref() else {
-        return Ok(false);
+        return if receipt_required {
+            Err("failure_receipt_required")
+        } else {
+            Ok(false)
+        };
     };
     let reason = ack.reason.as_deref().ok_or("failure_reason_missing")?;
     if receipt.failed_at
@@ -2090,6 +2105,12 @@ async fn forward_blind_relay_with_retry(
     // descriptor that selected `url` through every retry. A delayed response
     // can then update health only if the signed route surface is still current.
     let next_hop = descriptor.node_id();
+    // [FAILURE-RECEIPT-ANTI-DOWNGRADE 2026-08-11 by Codex] Negotiate from the
+    // exact signed descriptor that selected this URL. An attacker cannot strip
+    // this token without invalidating the descriptor signature.
+    let failure_receipt_required = descriptor
+        .descriptor
+        .advertises_protocol_feature(NodeProtocolFeature::BlindRelayFailureReceiptV1);
     let request_started_at = Instant::now();
     for attempt in 1..=MAX_BLIND_RELAY_FORWARD_ATTEMPTS {
         match state.http_client.post(url).json(&request).send().await {
@@ -2189,6 +2210,7 @@ async fn forward_blind_relay_with_retry(
                         &request,
                         &next_hop,
                         observed_at,
+                        failure_receipt_required,
                     ) {
                         Ok(authenticated) => authenticated,
                         Err(reason) => {
@@ -2197,17 +2219,21 @@ async fn forward_blind_relay_with_retry(
                                 reason,
                                 "[BLIND_RELAY] Next-hop failure receipt verification failed"
                             );
+                            let failure_bucket = if reason == "failure_receipt_required" {
+                                "failure_receipt_downgrade"
+                            } else {
+                                "failure_receipt_invalid"
+                            };
                             let _ = state
                                 .peer_store
                                 .record_route_forward_failure_for_descriptor(
                                     descriptor,
                                     observed_at,
-                                    "failure_receipt_invalid",
+                                    failure_bucket,
                                 );
-                            state.peer_store.record_blind_relay_rejected(
-                                observed_at,
-                                "failure_receipt_invalid",
-                            );
+                            state
+                                .peer_store
+                                .record_blind_relay_rejected(observed_at, failure_bucket);
                             return Err(BlindRelayError::ForwardFailed);
                         }
                     };
@@ -2798,6 +2824,7 @@ mod tests {
                 &request,
                 &responder.public_key_bytes(),
                 now,
+                false,
             ),
             Ok(true)
         );
@@ -2807,9 +2834,21 @@ mod tests {
                 &request,
                 &responder.public_key_bytes(),
                 now,
+                false,
             ),
             Ok(false),
             "missing receipt remains the explicit mixed-version path"
+        );
+        assert_eq!(
+            validate_downstream_failure_receipt(
+                &failure_ack(None),
+                &request,
+                &responder.public_key_bytes(),
+                now,
+                true,
+            ),
+            Err("failure_receipt_required"),
+            "an advertised receipt cannot be silently downgraded"
         );
         let legacy_ack: PeerBlindRelayResponse = serde_json::from_value(serde_json::json!({
             "accepted": false,
@@ -2830,6 +2869,7 @@ mod tests {
                 &request,
                 &responder.public_key_bytes(),
                 now,
+                false,
             ),
             Err("failure_receipt_binding_invalid")
         );
@@ -2839,6 +2879,7 @@ mod tests {
                 &request,
                 &responder.public_key_bytes(),
                 now,
+                false,
             ),
             Err("failure_receipt_binding_invalid")
         );
@@ -2851,6 +2892,7 @@ mod tests {
                 &request,
                 &responder.public_key_bytes(),
                 now,
+                false,
             ),
             Err("failure_receipt_timestamp_expired")
         );
@@ -2863,6 +2905,7 @@ mod tests {
                 &request,
                 &responder.public_key_bytes(),
                 now,
+                false,
             ),
             Err("failure_receipt_timestamp_in_future")
         );
@@ -3412,7 +3455,7 @@ mod tests {
         assert_eq!(parsed.reason.as_deref(), Some("timestamp_expired"));
         assert!(parsed.failure_receipt.is_some());
         assert_eq!(
-            validate_downstream_failure_receipt(&parsed, &request, &node_id, now_secs()),
+            validate_downstream_failure_receipt(&parsed, &request, &node_id, now_secs(), true),
             Ok(true)
         );
     }
@@ -5413,6 +5456,112 @@ mod tests {
         assert!(peer_store.recent_audit_events().iter().all(|event| {
             event.action != "blind_relay_route_health" || event.outcome != "rejected"
         }));
+    }
+
+    #[tokio::test]
+    async fn advertised_failure_receipt_omission_penalizes_exact_next_hop_surface() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_route = Arc::clone(&attempts);
+        let next_hop_app = Router::new().route(
+            "/api/chat/peer/blind-relay",
+            post(move |Json(_request): Json<PeerBlindRelayRequest>| {
+                let attempts_for_request = Arc::clone(&attempts_for_route);
+                async move {
+                    attempts_for_request.fetch_add(1, AtomicOrdering::SeqCst);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(PeerBlindRelayResponse {
+                            accepted: false,
+                            terminal: false,
+                            forwarded: false,
+                            ttl_remaining: 0,
+                            reason: Some("forward_failed".to_string()),
+                            delivery_receipt: None,
+                            failure_receipt: None,
+                        }),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, next_hop_app).await.unwrap();
+        });
+
+        let now = now_secs();
+        let current_node = Arc::new(IdentityKeyPair::generate());
+        let next_hop_identity = IdentityKeyPair::generate();
+        let next_hop_node_id = next_hop_identity.public_key_bytes();
+        let legacy_descriptor = signed_chat_relay_peer_descriptor_for(
+            &next_hop_identity,
+            endpoint.clone(),
+            now,
+            now + 300,
+        );
+        let advertised_descriptor = SignedNodeDescriptor::sign(
+            legacy_descriptor
+                .descriptor
+                .with_protocol_features([NodeProtocolFeature::BlindRelayFailureReceiptV1]),
+            &next_hop_identity,
+        )
+        .unwrap();
+        let peer_store = Arc::new(PeerStore::new());
+        peer_store
+            .upsert_verified_from_source(advertised_descriptor.clone(), now, "gossip_snapshot")
+            .unwrap();
+        peer_store.record_route_forward_success(&next_hop_node_id, now);
+        let state = ChatPeerState {
+            chat_relay: None,
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&current_node),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let request = PeerBlindRelayRequest {
+            envelope: BlindRelayEnvelope {
+                route_id: [0x6bu8; 16],
+                next_hop: next_hop_node_id,
+                ttl: 1,
+                encrypted_blob: b"opaque downgraded failure receipt request".to_vec(),
+                timestamp: now,
+                signature: [0u8; 64],
+            }
+            .sign_with(current_node.as_ref()),
+            previous_hop_node_id: current_node.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+
+        let result = forward_blind_relay_with_retry(
+            &state,
+            &blind_peer_relay_url(&endpoint).unwrap(),
+            &advertised_descriptor,
+            request,
+            now,
+        )
+        .await;
+        server.abort();
+
+        assert!(matches!(result, Err(BlindRelayError::ForwardFailed)));
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+        let route_status = peer_store.route_candidate_status(now + 5);
+        let route_row = route_status
+            .chat_relay
+            .iter()
+            .find(|row| row.node_id_prefix == hex::encode(&next_hop_node_id[..4]))
+            .expect("chat relay row should remain visible");
+        assert_eq!(route_row.route_failure_count, 1);
+        assert_eq!(route_row.route_consecutive_failures, 1);
+        assert_eq!(
+            route_row.last_route_failure_reason.as_deref(),
+            Some("failure_receipt_downgrade")
+        );
     }
 
     #[tokio::test]

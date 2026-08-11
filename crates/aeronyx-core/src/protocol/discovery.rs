@@ -12,6 +12,7 @@
 //! - `NodeDescriptor`: canonical node metadata signed by the node identity key
 //! - `SignedNodeDescriptor`: descriptor plus Ed25519 signature
 //! - `NodeCapability`: protocol-level capability flags
+//! - `NodeProtocolFeature`: backward-compatible signed wire-feature negotiation
 //! - `NodePolicy`: public relay policy hints, including no-exit default
 //! - `NodeCapacity`: coarse capacity hints for peer selection
 //! - `NodeBootstrapSnapshot`: JSON-friendly bootstrap list of signed descriptors
@@ -146,8 +147,16 @@
 //!   geography, legal ownership, honest behavior, consensus, or Sybil
 //!   resistance. Keep attestor pins local and never publish domain mappings as
 //!   general discovery metadata.
+//! - [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] Fine-grained wire features
+//!   use exact SemVer build-metadata tokens inside the already signed
+//!   `software_version` field. Do not add them to `NodeCapability`: older
+//!   bincode decoders reject unknown enum variants and would partition a
+//!   mixed-version fleet. Feature tokens negotiate response contracts only;
+//!   they never grant routing, trust, consensus, or finality authority.
 //!
 //! ## Last Modified
+//! v0.23.0-SignedProtocolFeatures - Added backward-compatible signed feature
+//! negotiation without changing descriptor schema or capability discriminants
 //! v0.22.0-BlindVaultReplicaCapability - Added an append-only, rollout-gated
 //! anonymous ciphertext replica capability without changing prior discriminants
 //! v0.21.0-RouteDomainAttestation - Added bounded portable route-domain
@@ -353,6 +362,37 @@ mod serde_bytes64 {
 }
 
 // ============================================
+// NodeProtocolFeature
+// ============================================
+
+/// Fine-grained peer wire features negotiated through signed descriptors.
+///
+/// [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] These values deliberately do
+/// not serialize as `NodeCapability` variants. Each feature maps to an exact,
+/// valid SemVer build-metadata identifier inside `software_version`, preserving
+/// the schema-v2 bincode layout for old nodes while keeping the advertisement
+/// covered by the descriptor signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeProtocolFeature {
+    /// Handled blind-relay protocol failures carry an immediate-hop signed
+    /// `BlindRelayFailureReceipt` bound to the exact request and reason.
+    BlindRelayFailureReceiptV1,
+}
+
+impl NodeProtocolFeature {
+    /// Features understood by this binary, in stable negotiation order.
+    pub const ALL: [Self; 1] = [Self::BlindRelayFailureReceiptV1];
+
+    /// Exact SemVer build-metadata identifier used on the signed wire.
+    #[must_use]
+    pub const fn semver_build_token(self) -> &'static str {
+        match self {
+            Self::BlindRelayFailureReceiptV1 => "anpf1-brfr1",
+        }
+    }
+}
+
+// ============================================
 // NodeCapability
 // ============================================
 
@@ -550,6 +590,63 @@ impl NodeDescriptor {
         self.kem_alg = 1;
         self.kem_public = kem_public;
         self
+    }
+
+    /// Adds signed, backward-compatible protocol feature advertisements.
+    ///
+    /// Existing SemVer build metadata is preserved. Feature tokens are sorted
+    /// and deduplicated so the same feature set has one stable representation.
+    /// Old nodes continue to decode the unchanged descriptor schema and simply
+    /// treat the result as an opaque software-version string.
+    #[must_use]
+    pub fn with_protocol_features(
+        mut self,
+        features: impl IntoIterator<Item = NodeProtocolFeature>,
+    ) -> Self {
+        let mut requested = features
+            .into_iter()
+            .map(NodeProtocolFeature::semver_build_token)
+            .collect::<Vec<_>>();
+        requested.sort_unstable();
+        requested.dedup();
+        if requested.is_empty() {
+            return self;
+        }
+
+        let (release, existing_build) = self.software_version.split_once('+').map_or_else(
+            || (self.software_version.clone(), None),
+            |(release, build)| (release.to_string(), Some(build.to_string())),
+        );
+        let mut build_identifiers = existing_build
+            .as_deref()
+            .into_iter()
+            .flat_map(|metadata| metadata.split('.'))
+            .filter(|identifier| !identifier.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for token in requested {
+            if !build_identifiers
+                .iter()
+                .any(|identifier| identifier == token)
+            {
+                build_identifiers.push(token.to_string());
+            }
+        }
+        self.software_version = format!("{release}+{}", build_identifiers.join("."));
+        self
+    }
+
+    /// Returns whether this signed descriptor advertises one exact wire feature.
+    #[must_use]
+    pub fn advertises_protocol_feature(&self, feature: NodeProtocolFeature) -> bool {
+        self.software_version
+            .split_once('+')
+            .map(|(_, metadata)| {
+                metadata
+                    .split('.')
+                    .any(|identifier| identifier == feature.semver_build_token())
+            })
+            .unwrap_or(false)
     }
 
     /// Returns the published X25519 KEM key if this node advertises one
@@ -3844,6 +3941,51 @@ mod tests {
             .capabilities
             .contains(&NodeCapability::BlindVaultReplica));
         assert!(descriptor.verify_at(1_700_000_100).is_ok());
+    }
+
+    #[test]
+    fn signed_protocol_features_preserve_schema_and_detect_downgrade() {
+        let identity = IdentityKeyPair::generate();
+        let feature = NodeProtocolFeature::BlindRelayFailureReceiptV1;
+        let descriptor = descriptor_for(&identity).with_protocol_features([feature, feature]);
+
+        assert_eq!(descriptor.schema_version, NODE_DESCRIPTOR_SCHEMA_VERSION);
+        assert_eq!(descriptor.software_version, "test+anpf1-brfr1");
+        assert!(descriptor.advertises_protocol_feature(feature));
+
+        let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
+        let encoded = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {
+            descriptor: signed.clone(),
+        })
+        .unwrap();
+        let decoded = decode_discovery_message(&encoded).unwrap();
+        let NodeDiscoveryMessage::DescriptorAnnounce { descriptor } = decoded else {
+            panic!("unexpected discovery message variant");
+        };
+        assert!(descriptor.verify_at(1_700_000_100).is_ok());
+        assert!(descriptor.descriptor.advertises_protocol_feature(feature));
+
+        let mut stripped = signed;
+        stripped.descriptor.software_version = "test".to_string();
+        assert!(stripped.verify_at(1_700_000_100).is_err());
+    }
+
+    #[test]
+    fn protocol_features_preserve_existing_semver_build_metadata() {
+        let identity = IdentityKeyPair::generate();
+        let descriptor = NodeDescriptor::new(
+            identity.public_key_bytes(),
+            1,
+            1_700_000_000,
+            1_700_003_600,
+            "1.2.3-rc.1+git.abc",
+        )
+        .with_protocol_features([NodeProtocolFeature::BlindRelayFailureReceiptV1]);
+
+        assert_eq!(
+            descriptor.software_version,
+            "1.2.3-rc.1+git.abc.anpf1-brfr1"
+        );
     }
 
     #[test]

@@ -49,6 +49,9 @@
 //!   without exposing encrypted payloads, peer endpoint URLs, or user metadata
 //! - [SIGNED-FAILURE-RECEIPT 2026-08-11 by Codex] Counts invalid hop-local
 //!   failure receipts as forward failures without retaining signed material
+//! - [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] Binds recognized signed
+//!   wire-feature advertisements into route-surface evidence without changing
+//!   hashes for legacy descriptors that advertise no feature token
 //! - Blind relay audit size buckets so exact encrypted blob sizes do not become
 //!   traffic fingerprints in nodeboard or heartbeat diagnostics
 //! - Per-peer node-to-node route health feedback so failed next hops are
@@ -196,6 +199,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.81.0-SignedProtocolFeatures - Bound negotiated response contracts into
+//! route-surface fingerprints while preserving legacy cache compatibility
 //! v0.80.0-SignedFailureReceipt - Classify invalid authenticated failure ACKs
 //! without storing route, receipt, endpoint, or payload material
 //! v0.79.0-ClientDeliveryAtomicRouteEvidence - Made real two-hop receipt
@@ -305,7 +310,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aeronyx_core::protocol::discovery::{
-    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage,
+    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, NodeProtocolFeature,
     RouteDomainAttestationCertificateV1, SignedNodeDescriptor, AERONYX_DIRECTORY_MAINNET_CHAIN_ID,
 };
 use parking_lot::RwLock;
@@ -6948,6 +6953,18 @@ impl PeerStore {
         hasher.update([u8::from(descriptor.descriptor.policy.allows_public_exit)]);
         hasher.update([descriptor.descriptor.kem_alg]);
         hasher.update(descriptor.descriptor.kem_public);
+        // [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] Append only present,
+        // recognized feature tokens. Legacy descriptors therefore retain their
+        // historical v1 fingerprint, while enabling a response contract forces
+        // fresh route evidence and cannot inherit success from the old surface.
+        for feature in NodeProtocolFeature::ALL {
+            if descriptor.descriptor.advertises_protocol_feature(feature) {
+                let token = feature.semver_build_token();
+                hasher.update(b"\0aeronyx-protocol-feature:");
+                hasher.update(u64::try_from(token.len()).ok()?.to_be_bytes());
+                hasher.update(token.as_bytes());
+            }
+        }
         Some(hex::encode(hasher.finalize()))
     }
 
@@ -9752,11 +9769,27 @@ mod tests {
             .push(NodeCapability::DirectoryMirrorCarrier);
         let capability_changed =
             SignedNodeDescriptor::sign(capability_changed_body, &peer_kp).unwrap();
-        store.upsert_verified(capability_changed, now + 40).unwrap();
+        store
+            .upsert_verified(capability_changed.clone(), now + 40)
+            .unwrap();
         // [MIRROR-CAPABILITY 2026-07-24 by Codex] A newly advertised carrier
         // surface must be probed; a prior role's success cannot be inherited.
         assert!(!store.is_routeable_now(&node_id, now + 41));
         assert!(!store.has_fresh_purpose_bound_delivery_receipt_capability(&node_id, now + 41));
+
+        store.record_route_forward_success(&node_id, now + 42);
+        let mut feature_changed_body = capability_changed.descriptor;
+        feature_changed_body.sequence = 11;
+        feature_changed_body.issued_at = now + 50;
+        feature_changed_body.expires_at = now + 4_050;
+        feature_changed_body = feature_changed_body
+            .with_protocol_features([NodeProtocolFeature::BlindRelayFailureReceiptV1]);
+        let feature_changed = SignedNodeDescriptor::sign(feature_changed_body, &peer_kp).unwrap();
+        store.upsert_verified(feature_changed, now + 50).unwrap();
+        assert!(
+            !store.is_routeable_now(&node_id, now + 51),
+            "a negotiated response contract requires a fresh route probe"
+        );
     }
 
     #[test]
