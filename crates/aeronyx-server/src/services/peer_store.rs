@@ -4809,24 +4809,82 @@ impl PeerStore {
         let _ = self.record_route_forward_success_for_descriptor(&descriptor, now);
     }
 
-    /// Records failed opaque node-to-node forwarding to a verified next hop.
+    /// Records failed opaque node-to-node forwarding on one exact signed route
+    /// surface.
+    ///
+    /// [ROUTE-FAILURE-SURFACE-BINDING 2026-08-11 by Codex] Callers must pass the
+    /// descriptor whose endpoint/KEM/capabilities were used by the request. If
+    /// that route surface rotated while the request was in flight, the stale
+    /// failure is rejected instead of penalizing the replacement endpoint.
+    /// Existing identity-level failure and quarantine history still survives a
+    /// later descriptor rotation, preventing sequence churn from evading local
+    /// abuse isolation.
     ///
     /// The reason must be a stable coarse bucket such as `request_failed` or
     /// `http_502`; no endpoint URL, route id, ciphertext, receiver, or client
     /// traffic metadata may be recorded here.
+    #[must_use]
+    pub fn record_route_forward_failure_for_descriptor(
+        &self,
+        descriptor: &SignedNodeDescriptor,
+        now: u64,
+        reason: impl Into<String>,
+    ) -> bool {
+        let reason = reason.into();
+        let node_id = descriptor.node_id();
+        let result = self.with_current_verified_route_surface(
+            descriptor,
+            now,
+            |observed_node_id, _route_fingerprint| {
+                self.record_route_forward_failure_for_node(&observed_node_id, now, &reason);
+            },
+        );
+        if let Err(rejection_reason) = result {
+            self.record_audit_event(
+                now,
+                "blind_relay_route_health",
+                "rejected",
+                format!(
+                    "node_prefix={} result=ignored reason={rejection_reason}",
+                    hex::encode(&node_id[..4])
+                ),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Backward-compatible node-id recorder. New route code must call
+    /// [`Self::record_route_forward_failure_for_descriptor`] with the exact
+    /// descriptor whose route surface carried the failed request.
     pub fn record_route_forward_failure(
         &self,
         node_id: &[u8; 32],
         now: u64,
         reason: impl Into<String>,
     ) {
-        let reason = reason.into();
+        let Some(descriptor) = self.get_valid(node_id, now) else {
+            self.record_audit_event(
+                now,
+                "blind_relay_route_health",
+                "rejected",
+                format!(
+                    "node_prefix={} result=ignored reason=missing_verified_route_surface",
+                    hex::encode(&node_id[..4])
+                ),
+            );
+            return;
+        };
+        let _ = self.record_route_forward_failure_for_descriptor(&descriptor, now, reason);
+    }
+
+    fn record_route_forward_failure_for_node(&self, node_id: &[u8; 32], now: u64, reason: &str) {
         let mut route_health = self.route_health.write();
         let health = route_health.entry(*node_id).or_default();
         health.failure_count = health.failure_count.saturating_add(1);
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         health.last_failure_at = Some(now);
-        health.last_failure_reason = Some(reason.clone());
+        health.last_failure_reason = Some(reason.to_string());
         let starts_new_quarantine = health.consecutive_failures
             >= PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD
             && health
@@ -9363,6 +9421,62 @@ mod tests {
         // Sequence/validity refreshes preserve the same signed routing surface.
         assert!(store.record_route_forward_success_for_descriptor(&rotated, now + 31));
         assert!(store.is_routeable_now(&node_id, now + 31));
+    }
+
+    #[test]
+    fn test_route_failure_rejects_non_current_route_surface() {
+        let now = 1_700_000_100;
+        let identity = IdentityKeyPair::generate();
+        let mut original = signed_descriptor_for(&identity, 7, now + 4_000);
+        original.descriptor.public_endpoint = Some("https://route-a.example".to_string());
+        original = SignedNodeDescriptor::sign(original.descriptor, &identity).unwrap();
+        let node_id = original.node_id();
+
+        let store = PeerStore::new();
+        store.upsert_verified(original.clone(), now).unwrap();
+
+        let mut rotated_body = original.descriptor.clone();
+        rotated_body.sequence = 8;
+        rotated_body.issued_at = now + 20;
+        rotated_body.expires_at = now + 4_020;
+        rotated_body.public_endpoint = Some("https://route-b.example".to_string());
+        let rotated = SignedNodeDescriptor::sign(rotated_body, &identity).unwrap();
+        store.upsert_verified(rotated.clone(), now + 20).unwrap();
+        assert!(store.record_route_forward_success_for_descriptor(&rotated, now + 21));
+
+        // [ROUTE-FAILURE-SURFACE-BINDING 2026-08-11 by Codex] A delayed
+        // failure from route A must not poison route B or start its quarantine.
+        for observed_at in [now + 22, now + 23, now + 24] {
+            assert!(!store.record_route_forward_failure_for_descriptor(
+                &original,
+                observed_at,
+                "request_failed",
+            ));
+        }
+        let health = store.route_health.read();
+        let route_health = health.get(&node_id).unwrap();
+        assert_eq!(route_health.failure_count, 0);
+        assert_eq!(route_health.consecutive_failures, 0);
+        assert!(route_health.quarantine_until.is_none());
+        drop(health);
+        assert!(store.is_routeable_now(&node_id, now + 24));
+
+        let mut refreshed_body = rotated.descriptor.clone();
+        refreshed_body.sequence = 9;
+        refreshed_body.issued_at = now + 30;
+        refreshed_body.expires_at = now + 4_030;
+        let refreshed = SignedNodeDescriptor::sign(refreshed_body, &identity).unwrap();
+        store.upsert_verified(refreshed, now + 30).unwrap();
+
+        // A sequence/validity-only refresh preserves the same route surface.
+        for observed_at in [now + 31, now + 32, now + 33] {
+            assert!(store.record_route_forward_failure_for_descriptor(
+                &rotated,
+                observed_at,
+                "request_failed",
+            ));
+        }
+        assert!(store.is_route_quarantined_now(&node_id, now + 33));
     }
 
     #[test]

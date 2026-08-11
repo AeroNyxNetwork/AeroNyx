@@ -1039,18 +1039,14 @@ async fn process_peer_blind_relay(
         .capabilities
         .contains(&NodeCapability::ChatRelay)
     {
-        state.peer_store.record_route_forward_failure(
-            &next_hop,
-            now,
-            "missing_chat_relay_capability",
-        );
+        // [ROUTE-HEALTH-REMOTE-POISONING 2026-08-11 by Codex] A remote
+        // previous hop can choose this target. Preflight rejection is therefore
+        // not next-hop failure evidence; only a real outbound request may
+        // mutate that peer's route health. The requester is rejected below.
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         return Err(BlindRelayError::NoRoute);
     }
     if !used_descriptor_hint && !state.peer_store.is_routeable_now(&next_hop, now) {
-        state
-            .peer_store
-            .record_route_forward_failure(&next_hop, now, "routeability_not_ready");
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         return Err(BlindRelayError::NoRoute);
     }
@@ -1060,16 +1056,10 @@ async fn process_peer_blind_relay(
         .public_endpoint
         .as_deref()
         .ok_or_else(|| {
-            state
-                .peer_store
-                .record_route_forward_failure(&next_hop, now, "missing_endpoint");
             reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "missing_endpoint");
             BlindRelayError::InvalidEndpoint
         })?;
     let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
-        state
-            .peer_store
-            .record_route_forward_failure(&next_hop, now, "invalid_endpoint");
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "invalid_endpoint");
         BlindRelayError::InvalidEndpoint
     })?;
@@ -1096,7 +1086,7 @@ async fn process_peer_blind_relay(
     if let Err(error) = forward_blind_relay_with_retry(
         &state,
         &url,
-        next_hop,
+        &descriptor,
         PeerBlindRelayRequest {
             envelope: forwarded_envelope,
             previous_hop_node_id: self_node_id,
@@ -1259,11 +1249,6 @@ async fn process_onion_blind_relay(
                 .capabilities
                 .contains(&NodeCapability::ChatRelay)
             {
-                state.peer_store.record_route_forward_failure(
-                    &next_hop,
-                    now,
-                    "missing_chat_relay_capability",
-                );
                 forget_blind_relay_route(&state, &envelope.route_id);
                 reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
                 return Err(BlindRelayError::NoRoute);
@@ -1274,9 +1259,6 @@ async fn process_onion_blind_relay(
             // the hard stop for peers under local route quarantine; forward
             // errors below will still feed route health without logging payloads.
             if state.peer_store.is_route_quarantined_now(&next_hop, now) {
-                state
-                    .peer_store
-                    .record_route_forward_failure(&next_hop, now, "route_quarantined");
                 forget_blind_relay_route(&state, &envelope.route_id);
                 reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
                 return Err(BlindRelayError::NoRoute);
@@ -1287,11 +1269,6 @@ async fn process_onion_blind_relay(
                 .public_endpoint
                 .as_deref()
                 .ok_or_else(|| {
-                    state.peer_store.record_route_forward_failure(
-                        &next_hop,
-                        now,
-                        "missing_endpoint",
-                    );
                     forget_blind_relay_route(&state, &envelope.route_id);
                     reject_blind_relay_previous_hop(
                         &state,
@@ -1302,9 +1279,6 @@ async fn process_onion_blind_relay(
                     BlindRelayError::InvalidEndpoint
                 })?;
             let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
-                state
-                    .peer_store
-                    .record_route_forward_failure(&next_hop, now, "invalid_endpoint");
                 forget_blind_relay_route(&state, &envelope.route_id);
                 reject_blind_relay_previous_hop(
                     &state,
@@ -1331,7 +1305,7 @@ async fn process_onion_blind_relay(
             let next_hop_ack = match forward_blind_relay_with_retry(
                 &state,
                 &url,
-                next_hop,
+                &descriptor,
                 PeerBlindRelayRequest {
                     envelope: forwarded_envelope,
                     previous_hop_node_id: self_node_id,
@@ -1463,18 +1437,10 @@ async fn process_onion_middle_blind_relay(
         .capabilities
         .contains(&NodeCapability::ChatRelay)
     {
-        state.peer_store.record_route_forward_failure(
-            &next_hop,
-            now,
-            "missing_chat_relay_capability",
-        );
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         return Err(BlindRelayError::NoRoute);
     }
     if !used_descriptor_hint && !state.peer_store.is_routeable_now(&next_hop, now) {
-        state
-            .peer_store
-            .record_route_forward_failure(&next_hop, now, "routeability_not_ready");
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "no_route");
         return Err(BlindRelayError::NoRoute);
     }
@@ -1484,16 +1450,10 @@ async fn process_onion_middle_blind_relay(
         .public_endpoint
         .as_deref()
         .ok_or_else(|| {
-            state
-                .peer_store
-                .record_route_forward_failure(&next_hop, now, "missing_endpoint");
             reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "missing_endpoint");
             BlindRelayError::InvalidEndpoint
         })?;
     let url = blind_peer_relay_url(endpoint).ok_or_else(|| {
-        state
-            .peer_store
-            .record_route_forward_failure(&next_hop, now, "invalid_endpoint");
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "invalid_endpoint");
         BlindRelayError::InvalidEndpoint
     })?;
@@ -1516,7 +1476,7 @@ async fn process_onion_middle_blind_relay(
     let next_hop_ack = match forward_blind_relay_with_retry(
         &state,
         &url,
-        next_hop,
+        &descriptor,
         PeerBlindRelayRequest {
             envelope: forwarded_envelope,
             previous_hop_node_id: self_node_id,
@@ -1776,10 +1736,14 @@ fn validate_downstream_delivery_receipt(
 async fn forward_blind_relay_with_retry(
     state: &ChatPeerState,
     url: &str,
-    next_hop: [u8; 32],
+    descriptor: &SignedNodeDescriptor,
     request: PeerBlindRelayRequest,
     now: u64,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    // [ROUTE-FAILURE-SURFACE-BINDING 2026-08-11 by Codex] Keep the exact
+    // descriptor that selected `url` through every retry. A delayed response
+    // can then update health only if the signed route surface is still current.
+    let next_hop = descriptor.node_id();
     for attempt in 1..=MAX_BLIND_RELAY_FORWARD_ATTEMPTS {
         match state.http_client.post(url).json(&request).send().await {
             Ok(response) if response.status().is_success() => {
@@ -1801,11 +1765,13 @@ async fn forward_blind_relay_with_retry(
                                 reason,
                                 "[BLIND_RELAY] Next-hop delivery receipt verification failed"
                             );
-                            state.peer_store.record_route_forward_failure(
-                                &next_hop,
-                                now,
-                                "delivery_receipt_invalid",
-                            );
+                            let _ = state
+                                .peer_store
+                                .record_route_forward_failure_for_descriptor(
+                                    descriptor,
+                                    now,
+                                    "delivery_receipt_invalid",
+                                );
                             state
                                 .peer_store
                                 .record_blind_relay_rejected(now, "delivery_receipt_invalid");
@@ -1840,9 +1806,9 @@ async fn forward_blind_relay_with_retry(
                         "forward_failed",
                     );
                 }
-                state
+                let _ = state
                     .peer_store
-                    .record_route_forward_failure(&next_hop, now, "forward_failed");
+                    .record_route_forward_failure_for_descriptor(descriptor, now, "forward_failed");
                 state
                     .peer_store
                     .record_blind_relay_rejected(now, "forward_failed");
@@ -1875,11 +1841,13 @@ async fn forward_blind_relay_with_retry(
                         status = %status,
                         "[BLIND_RELAY] Next-hop returned terminal non-retryable status"
                     );
-                    state.peer_store.record_route_forward_failure(
-                        &next_hop,
-                        now,
-                        error.reason_bucket(),
-                    );
+                    let _ = state
+                        .peer_store
+                        .record_route_forward_failure_for_descriptor(
+                            descriptor,
+                            now,
+                            error.reason_bucket(),
+                        );
                     state
                         .peer_store
                         .record_blind_relay_rejected(now, error.reason_bucket());
@@ -1915,9 +1883,9 @@ async fn forward_blind_relay_with_retry(
                         .peer_store
                         .record_blind_relay_retry_exhausted(now, attempt, &reason);
                 }
-                state
+                let _ = state
                     .peer_store
-                    .record_route_forward_failure(&next_hop, now, reason.clone());
+                    .record_route_forward_failure_for_descriptor(descriptor, now, reason.clone());
                 state.peer_store.record_blind_relay_rejected(now, reason);
                 return Err(BlindRelayError::ForwardFailed);
             }
@@ -1952,9 +1920,9 @@ async fn forward_blind_relay_with_retry(
                         .peer_store
                         .record_blind_relay_retry_exhausted(now, attempt, &reason);
                 }
-                state
+                let _ = state
                     .peer_store
-                    .record_route_forward_failure(&next_hop, now, reason.clone());
+                    .record_route_forward_failure_for_descriptor(descriptor, now, reason.clone());
                 state.peer_store.record_blind_relay_rejected(now, reason);
                 return Err(BlindRelayError::ForwardFailed);
             }
@@ -4230,17 +4198,18 @@ mod tests {
             .iter()
             .find(|row| row.node_id_prefix == hex::encode(&next_hop_node_id[..4]))
             .expect("chat relay row should remain visible");
-        assert_eq!(route_row.routeability_state, "unreachable");
+        // [ROUTE-HEALTH-REMOTE-POISONING 2026-08-11 by Codex] This request was
+        // rejected before any outbound attempt. It must not let an untrusted
+        // previous hop manufacture failure or quarantine evidence for a peer.
+        assert_eq!(route_row.routeability_state, "unknown");
         assert!(!route_row.routeability_ready);
-        assert_eq!(
-            route_row.last_route_failure_reason.as_deref(),
-            Some("routeability_not_ready")
-        );
-        assert!(peer_store.recent_audit_events().iter().any(|event| {
-            event.action == "blind_relay_route_health"
-                && event.outcome == "rejected"
-                && event.detail.contains("reason=routeability_not_ready")
-                && !event.detail.contains("opaque encrypted relay bytes")
+        assert_eq!(route_row.route_failure_count, 0);
+        assert_eq!(route_row.route_consecutive_failures, 0);
+        assert!(route_row.last_route_failure_reason.is_none());
+        assert!(!route_row.route_quarantined);
+        assert!(peer_store.recent_audit_events().iter().all(|event| {
+            event.action != "blind_relay_route_health"
+                || !event.detail.contains("reason=routeability_not_ready")
         }));
     }
 

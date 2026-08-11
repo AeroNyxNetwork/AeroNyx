@@ -8864,12 +8864,20 @@ impl Server {
         let next_hop = candidate.node_id();
         let Some(endpoint) = candidate.descriptor.public_endpoint.as_deref() else {
             peer_store.record_blind_relay_probe_result(now, false, "missing_endpoint");
-            peer_store.record_route_forward_failure(&next_hop, now, "missing_endpoint");
+            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                &candidate,
+                now,
+                "missing_endpoint",
+            );
             return;
         };
         let Some(url) = Self::blind_relay_probe_url(endpoint) else {
             peer_store.record_blind_relay_probe_result(now, false, "invalid_endpoint");
-            peer_store.record_route_forward_failure(&next_hop, now, "invalid_endpoint");
+            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                &candidate,
+                now,
+                "invalid_endpoint",
+            );
             return;
         };
 
@@ -8890,37 +8898,42 @@ impl Server {
         };
 
         match client.post(url).json(&request).send().await {
-            Ok(response) if response.status().is_success() => {
-                match decode_bounded_json_response::<PeerBlindRelayResponse>(
-                    response,
-                    PEER_ACK_RESPONSE_MAX_BYTES,
-                )
-                .await
-                {
-                    Ok(ack) if ack.accepted => {
-                        peer_store.record_blind_relay_probe_result(now, true, "accepted");
-                        let _ = peer_store
-                            .record_route_forward_success_for_descriptor(&candidate, now);
-                    }
-                    Ok(_ack) => {
-                        peer_store.record_blind_relay_probe_result(now, false, "ack_rejected");
-                        peer_store.record_route_forward_failure(&next_hop, now, "ack_rejected");
-                    }
-                    Err(error) => {
-                        debug!(
-                            reason = error.as_str(),
-                            "[DISCOVERY] Blind relay probe ACK rejected"
-                        );
-                        let reason = format!("ack_{}", error.as_str());
-                        peer_store.record_blind_relay_probe_result(now, false, &reason);
-                        peer_store.record_route_forward_failure(&next_hop, now, &reason);
-                    }
+            Ok(response) if response.status().is_success() => match decode_bounded_json_response::<
+                PeerBlindRelayResponse,
+            >(
+                response,
+                PEER_ACK_RESPONSE_MAX_BYTES,
+            )
+            .await
+            {
+                Ok(ack) if ack.accepted => {
+                    peer_store.record_blind_relay_probe_result(now, true, "accepted");
+                    let _ = peer_store.record_route_forward_success_for_descriptor(&candidate, now);
                 }
-            }
+                Ok(_ack) => {
+                    peer_store.record_blind_relay_probe_result(now, false, "ack_rejected");
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &candidate,
+                        now,
+                        "ack_rejected",
+                    );
+                }
+                Err(error) => {
+                    debug!(
+                        reason = error.as_str(),
+                        "[DISCOVERY] Blind relay probe ACK rejected"
+                    );
+                    let reason = format!("ack_{}", error.as_str());
+                    peer_store.record_blind_relay_probe_result(now, false, &reason);
+                    let _ = peer_store
+                        .record_route_forward_failure_for_descriptor(&candidate, now, &reason);
+                }
+            },
             Ok(response) => {
                 let reason = format!("http_{}", response.status().as_u16());
                 peer_store.record_blind_relay_probe_result(now, false, &reason);
-                peer_store.record_route_forward_failure(&next_hop, now, reason);
+                let _ =
+                    peer_store.record_route_forward_failure_for_descriptor(&candidate, now, reason);
             }
             Err(error) => {
                 let reason = Self::classify_reqwest_error("blind_relay_probe", &error);
@@ -8929,7 +8942,8 @@ impl Server {
                     "[DISCOVERY] Blind relay probe failed"
                 );
                 peer_store.record_blind_relay_probe_result(now, false, &reason);
-                peer_store.record_route_forward_failure(&next_hop, now, reason);
+                let _ =
+                    peer_store.record_route_forward_failure_for_descriptor(&candidate, now, reason);
             }
         }
     }
@@ -9018,8 +9032,8 @@ impl Server {
                         2,
                         1,
                     );
-                    peer_store.record_route_forward_failure(
-                        &middle_node_id,
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &middle,
                         now,
                         "missing_endpoint",
                     );
@@ -9035,8 +9049,8 @@ impl Server {
                         2,
                         1,
                     );
-                    peer_store.record_route_forward_failure(
-                        &middle_node_id,
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &middle,
                         now,
                         "invalid_endpoint",
                     );
@@ -9137,8 +9151,8 @@ impl Server {
                                             2,
                                             1,
                                         );
-                                    peer_store.record_route_forward_failure(
-                                        &middle_node_id,
+                                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                        &middle,
                                         now,
                                         "onion_ack_rejected",
                                     );
@@ -9159,10 +9173,8 @@ impl Server {
                                             2,
                                             1,
                                         );
-                                    peer_store.record_route_forward_failure(
-                                        &middle_node_id,
-                                        now,
-                                        &reason,
+                                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                        &middle, now, &reason,
                                     );
                                 }
                             }
@@ -9178,7 +9190,8 @@ impl Server {
                                 2,
                                 1,
                             );
-                            peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                            let _ = peer_store
+                                .record_route_forward_failure_for_descriptor(&middle, now, reason);
                         }
                         Err(error) => {
                             let reason = Self::classify_reqwest_error(
@@ -9198,7 +9211,8 @@ impl Server {
                                 2,
                                 1,
                             );
-                            peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                            let _ = peer_store
+                                .record_route_forward_failure_for_descriptor(&middle, now, reason);
                         }
                     }
                 } else if purpose_bound_probe_allowed {
@@ -9295,8 +9309,8 @@ impl Server {
                                     2,
                                     1,
                                 );
-                                peer_store.record_route_forward_failure(
-                                    &middle_node_id,
+                                let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                    &middle,
                                     now,
                                     "ack_rejected",
                                 );
@@ -9316,10 +9330,8 @@ impl Server {
                                     2,
                                     1,
                                 );
-                                peer_store.record_route_forward_failure(
-                                    &middle_node_id,
-                                    now,
-                                    &reason,
+                                let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                    &middle, now, &reason,
                                 );
                             }
                         }
@@ -9335,7 +9347,8 @@ impl Server {
                             2,
                             1,
                         );
-                        peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                        let _ = peer_store
+                            .record_route_forward_failure_for_descriptor(&middle, now, reason);
                     }
                     Err(error) => {
                         let reason =
@@ -9353,7 +9366,8 @@ impl Server {
                             2,
                             1,
                         );
-                        peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                        let _ = peer_store
+                            .record_route_forward_failure_for_descriptor(&middle, now, reason);
                     }
                 }
             }
@@ -9486,8 +9500,8 @@ impl Server {
                         3,
                         2,
                     );
-                    peer_store.record_route_forward_failure(
-                        &first_middle_node_id,
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &first_middle,
                         now,
                         "missing_endpoint",
                     );
@@ -9504,8 +9518,8 @@ impl Server {
                         3,
                         2,
                     );
-                    peer_store.record_route_forward_failure(
-                        &first_middle_node_id,
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &first_middle,
                         now,
                         "invalid_endpoint",
                     );
@@ -9598,8 +9612,8 @@ impl Server {
                                             3,
                                             2,
                                         );
-                                    peer_store.record_route_forward_failure(
-                                        &first_middle_node_id,
+                                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                        &first_middle,
                                         now,
                                         "delivery_receipt_invalid",
                                     );
@@ -9615,8 +9629,8 @@ impl Server {
                                             3,
                                             2,
                                         );
-                                    peer_store.record_route_forward_failure(
-                                        &first_middle_node_id,
+                                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                        &first_middle,
                                         now,
                                         "onion_ack_rejected",
                                     );
@@ -9633,8 +9647,8 @@ impl Server {
                                             3,
                                             2,
                                         );
-                                    peer_store.record_route_forward_failure(
-                                        &first_middle_node_id,
+                                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                        &first_middle,
                                         now,
                                         &reason,
                                     );
@@ -9652,8 +9666,8 @@ impl Server {
                                 3,
                                 2,
                             );
-                            peer_store.record_route_forward_failure(
-                                &first_middle_node_id,
+                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                &first_middle,
                                 now,
                                 reason,
                             );
@@ -9676,8 +9690,8 @@ impl Server {
                                 3,
                                 2,
                             );
-                            peer_store.record_route_forward_failure(
-                                &first_middle_node_id,
+                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                &first_middle,
                                 now,
                                 reason,
                             );
@@ -10250,8 +10264,8 @@ impl Server {
                         Ok(_) => {
                             last_failure_reason =
                                 Some("onion_delivery_receipt_rejected".to_string());
-                            peer_store.record_route_forward_failure(
-                                &middle_node_id,
+                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                &middle,
                                 now,
                                 "delivery_receipt_rejected",
                             );
@@ -10259,19 +10273,22 @@ impl Server {
                         Err(error) => {
                             let reason = format!("onion_delivery_ack_{}", error.as_str());
                             last_failure_reason = Some(reason.clone());
-                            peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                            let _ = peer_store
+                                .record_route_forward_failure_for_descriptor(&middle, now, reason);
                         }
                     }
                 }
                 Ok(response) => {
                     let reason = format!("onion_delivery_http_{}", response.status().as_u16());
                     last_failure_reason = Some(reason.clone());
-                    peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                    let _ = peer_store
+                        .record_route_forward_failure_for_descriptor(&middle, now, reason);
                 }
                 Err(error) => {
                     let reason = Self::classify_reqwest_error("onion_delivery_request", &error);
                     last_failure_reason = Some(reason.clone());
-                    peer_store.record_route_forward_failure(&middle_node_id, now, reason);
+                    let _ = peer_store
+                        .record_route_forward_failure_for_descriptor(&middle, now, reason);
                 }
             }
         }
@@ -10330,13 +10347,20 @@ impl Server {
             .into_iter()
             .filter(|peer| peer_store.is_routeable_now(&peer.node_id(), now))
         {
-            let peer_node_id = peer.node_id();
             let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
-                peer_store.record_route_forward_failure(&peer_node_id, now, "missing_endpoint");
+                let _ = peer_store.record_route_forward_failure_for_descriptor(
+                    &peer,
+                    now,
+                    "missing_endpoint",
+                );
                 continue;
             };
             let Some(url) = Self::chat_peer_relay_url(endpoint) else {
-                peer_store.record_route_forward_failure(&peer_node_id, now, "invalid_endpoint");
+                let _ = peer_store.record_route_forward_failure_for_descriptor(
+                    &peer,
+                    now,
+                    "invalid_endpoint",
+                );
                 continue;
             };
 
@@ -10364,8 +10388,8 @@ impl Server {
                         }
                         Ok(_ack) => {
                             let reason = "peer_relay_ack_rejected".to_string();
-                            peer_store.record_route_forward_failure(
-                                &peer_node_id,
+                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                &peer,
                                 now,
                                 reason.clone(),
                             );
@@ -10374,8 +10398,8 @@ impl Server {
                         }
                         Err(error) => {
                             let reason = format!("peer_relay_ack_{}", error.as_str());
-                            peer_store.record_route_forward_failure(
-                                &peer_node_id,
+                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                &peer,
                                 now,
                                 reason.clone(),
                             );
@@ -10389,7 +10413,11 @@ impl Server {
                 }
                 Ok(response) => {
                     let reason = format!("peer_relay_http_{}", response.status().as_u16());
-                    peer_store.record_route_forward_failure(&peer_node_id, now, reason.clone());
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &peer,
+                        now,
+                        reason.clone(),
+                    );
                     last_failure_reason = Some(reason);
                     debug!(
                         status = %response.status(),
@@ -10398,7 +10426,11 @@ impl Server {
                 }
                 Err(error) => {
                     let reason = Self::classify_reqwest_error("peer_relay_request", &error);
-                    peer_store.record_route_forward_failure(&peer_node_id, now, reason.clone());
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &peer,
+                        now,
+                        reason.clone(),
+                    );
                     last_failure_reason = Some(reason);
                     debug!(
                         reason = Self::classify_reqwest_error("peer_relay_request", &error),
