@@ -40,7 +40,8 @@
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - matched_json is computed BEFORE the index-mode early-return (borrow-after-move).
-//! - mpi_recall_detail uses extract_owner() (same as all handlers).
+//! - Owner/storage/vector context uses typed Axum extractors. Missing middleware
+//!   context must remain a contained HTTP error under release `panic=abort`.
 //! - Synthetic IDs (graph_*, bm25_*) in index results are silently skipped
 //!   by /recall/detail.
 //! - Context filter (Step 4.1) calls get_active_records_by_context() which
@@ -61,18 +62,21 @@
 //!                          recall: keyword evidence was dropped for records
 //!                          already surfaced by the vector path, and BM25 vs
 //!                          vector scores are incommensurable → fuse by rank
+//! v2.5.6+TypedContext  - Typed owner/storage/vector extraction without request
+//!                         extension panics; preserves Local-mode fallback.
 //!
 //! ## Last Modified
 //! v2.5.4+BlindRRF - 🔧 blind hybrid recall rank fusion (vector ⊕ keyword)
 //! v2.5.5+SessionBound - [RECALL-SESSION-CACHE 2026-07-29 by Codex]
 //!                         Owner-isolated, bounded session centroid history.
+//! v2.5.6+TypedContext - [RECALL-TYPED-CONTEXT 2026-08-12 by Codex]
+//!                         Request context failures are contained HTTP errors.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::http::Request;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{body::Body, extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -86,7 +90,7 @@ use crate::services::memchain::{
 };
 
 use super::mpi::{
-    estimate_tokens, extract_owner, now_secs, parse_layer, MpiState,
+    estimate_tokens, now_secs, parse_layer, AuthenticatedOwner, MpiState,
     MAX_RECALL_EMBEDDING_DIMENSIONS, MAX_RECALL_SESSION_ID_BYTES,
 };
 
@@ -99,21 +103,25 @@ pub use crate::services::memchain::reranker::RERANK_TOP_N;
 // Helper: extract storage + vector_index from Extensions (v1.0.1-SaaSFix)
 // ============================================
 
-/// Extract Arc<MemoryStorage> from request Extensions (SaaS) or fall back to
+/// Resolve Arc<MemoryStorage> from request Extensions (SaaS) or fall back to
 /// state.storage (Local). Returns None if neither is available.
-fn get_storage(req: &Request<axum::body::Body>, state: &MpiState) -> Option<Arc<MemoryStorage>> {
-    req.extensions()
-        .get::<Arc<MemoryStorage>>()
-        .cloned()
+fn get_storage(
+    storage: Option<Extension<Arc<MemoryStorage>>>,
+    state: &MpiState,
+) -> Option<Arc<MemoryStorage>> {
+    storage
+        .map(|Extension(storage)| storage)
         .or_else(|| state.storage.clone())
 }
 
-/// Extract Arc<VectorIndex> from request Extensions (SaaS) or fall back to
+/// Resolve Arc<VectorIndex> from request Extensions (SaaS) or fall back to
 /// state.vector_index (Local). Returns None if neither is available.
-fn get_vector_index(req: &Request<axum::body::Body>, state: &MpiState) -> Option<Arc<VectorIndex>> {
-    req.extensions()
-        .get::<Arc<VectorIndex>>()
-        .cloned()
+fn get_vector_index(
+    vector_index: Option<Extension<Arc<VectorIndex>>>,
+    state: &MpiState,
+) -> Option<Arc<VectorIndex>> {
+    vector_index
+        .map(|Extension(vector_index)| vector_index)
         .or_else(|| state.vector_index.clone())
 }
 
@@ -160,14 +168,16 @@ const RRF_SCALE: f64 = 10.0;
 
 pub async fn mpi_recall(
     State(state): State<Arc<MpiState>>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    storage: Option<Extension<Arc<MemoryStorage>>>,
+    vector_index: Option<Extension<Arc<VectorIndex>>>,
+    body: Body,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
     let owner_hex = auth.owner_hex();
 
     // v1.0.1-SaaSFix: extract storage and vector_index from Extensions
-    let storage = match get_storage(&req, &state) {
+    let storage = match get_storage(storage, &state) {
         Some(s) => s,
         None => {
             return (
@@ -177,7 +187,7 @@ pub async fn mpi_recall(
                 .into_response()
         }
     };
-    let vector_index = match get_vector_index(&req, &state) {
+    let vector_index = match get_vector_index(vector_index, &state) {
         Some(v) => v,
         None => {
             return (
@@ -188,7 +198,7 @@ pub async fn mpi_recall(
         }
     };
 
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
             return (
@@ -1094,13 +1104,14 @@ pub struct DetailRequest {
 /// Max 20 record_ids per request.
 pub async fn mpi_recall_detail(
     State(state): State<Arc<MpiState>>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    storage: Option<Extension<Arc<MemoryStorage>>>,
+    body: Body,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
 
     // v1.0.1-SaaSFix: extract storage from Extensions
-    let storage = match get_storage(&req, &state) {
+    let storage = match get_storage(storage, &state) {
         Some(s) => s,
         None => {
             return (
@@ -1111,7 +1122,7 @@ pub async fn mpi_recall_detail(
         }
     };
 
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
             return (
@@ -1205,4 +1216,127 @@ pub async fn mpi_recall_detail(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::mpi::SessionEmbeddingCache;
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use axum::http::Request;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use tower::ServiceExt;
+
+    fn make_test_state() -> (MpiState, AuthenticatedOwner) {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let vector_index = Arc::new(VectorIndex::new());
+        let identity = IdentityKeyPair::generate();
+        let owner = identity.public_key_bytes();
+        let state = MpiState::local(
+            storage,
+            vector_index,
+            identity,
+            RwLock::new(HashMap::new()),
+            AtomicBool::new(true),
+            Arc::new(RwLock::new(HashMap::new())),
+            0.0,
+            false,
+            RwLock::new(SessionEmbeddingCache::default()),
+            RwLock::new(None),
+            owner,
+            None,
+            None,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        (state, AuthenticatedOwner::Local { owner })
+    }
+
+    #[tokio::test]
+    async fn typed_recall_context_contains_missing_middleware_without_panicking() {
+        // [RECALL-TYPED-CONTEXT 2026-08-12 by Codex] Broken router wiring must
+        // be rejected as HTTP 500 and never reach an extension `expect` under
+        // release `panic=abort`.
+        let (state, _) = make_test_state();
+        let state = Arc::new(state);
+        let missing_auth = axum::Router::new()
+            .route("/recall", axum::routing::post(mpi_recall))
+            .route("/recall/detail", axum::routing::post(mpi_recall_detail))
+            .with_state(state);
+
+        for uri in ["/recall", "/recall/detail"] {
+            let response = missing_auth
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_recall_context_preserves_local_fallback_and_missing_store_errors() {
+        let (state, auth) = make_test_state();
+        let state_storage = state.storage.as_ref().unwrap();
+        let state_vector = state.vector_index.as_ref().unwrap();
+        assert!(Arc::ptr_eq(
+            &get_storage(None, &state).expect("local storage fallback"),
+            state_storage,
+        ));
+        assert!(Arc::ptr_eq(
+            &get_vector_index(None, &state).expect("local vector fallback"),
+            state_vector,
+        ));
+
+        let mut missing_storage_state = state;
+        missing_storage_state.storage = None;
+        let missing_storage = axum::Router::new()
+            .route("/recall", axum::routing::post(mpi_recall))
+            .layer(Extension(auth.clone()))
+            .with_state(Arc::new(missing_storage_state));
+        let response = missing_storage
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (mut missing_vector_state, _) = make_test_state();
+        missing_vector_state.vector_index = None;
+        let missing_vector = axum::Router::new()
+            .route("/recall", axum::routing::post(mpi_recall))
+            .layer(Extension(auth))
+            .with_state(Arc::new(missing_vector_state));
+        let response = missing_vector
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/recall")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

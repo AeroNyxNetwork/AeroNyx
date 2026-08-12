@@ -36,6 +36,8 @@
 //! v2.0.0-AuthServerNonce   - Added stateless `/api/auth/challenge` and
 //!                            replay-safe `/api/auth/token/v2`; legacy token
 //!                            endpoint and Local mode remain unchanged.
+//! v2.6.1+TypedContext      - Removed the obsolete panic-based handler owner
+//!                            helper after all handlers adopted Axum extractors.
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - unified_auth_middleware MUST be applied to all routes via route_layer.
@@ -60,8 +62,12 @@
 //! - [RECALL-SESSION-CACHE 2026-07-29 by Codex] Session embedding history is
 //!   owner-scoped, content-blind, dimension-bounded, and globally capacity
 //!   bounded. Never key it by a caller-provided session string alone.
+//! - [MPI-TYPED-CONTEXT 2026-08-12 by Codex] Handler authentication context
+//!   must use typed `Extension<AuthenticatedOwner>` extraction so missing
+//!   middleware is contained as an HTTP rejection under release `panic=abort`.
 //!
 //! ## Last Modified
+//! v2.6.1+TypedContext - Removed the unused panic-based owner extraction helper
 //! v2.6.0+BoundedRecallSessions - Owner-isolated bounded session centroid cache
 //! v2.5.2+Provenance  - +2 routes (patch record, provenance); 29→31
 //! v2.5.3+ArtifactChain - +1 route (/artifacts/search); 31→32
@@ -553,16 +559,6 @@ pub struct BaselineSnapshot {
     pub positive_rate: f32,
     pub sample_size: usize,
     pub frozen_at: i64,
-}
-
-// ============================================
-// Shared Helpers
-// ============================================
-
-pub(crate) fn extract_owner<B>(req: &Request<B>) -> &AuthenticatedOwner {
-    req.extensions()
-        .get::<AuthenticatedOwner>()
-        .expect("[BUG] AuthenticatedOwner not set — unified_auth_middleware must be applied")
 }
 
 pub(crate) fn parse_layer(s: &str) -> Option<MemoryLayer> {
