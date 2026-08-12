@@ -53,8 +53,13 @@
 //!   cast to u64. An early i64->u64 cast on a negative value causes panic.
 //! - reload_config() is atomic: either new config fully replaces the old,
 //!   or the old config is preserved on parse error.
+//! - [ADMIN-TYPED-JSON 2026-08-12 by Codex] Return strongly typed `Json<T>`
+//!   responses directly. Axum owns serialization failure handling; do not
+//!   reintroduce unchecked `serde_json::to_value` request panic paths.
 //!
 //! ## Last Modified
+//! v1.0.2-TypedJson - Removed redundant fallible response conversions and
+//!                    made all admin handler serialization panic-free.
 //! v1.0.1-Fix - VolumeStatus serialization fix; days_to_ymd overflow guard;
 //!              MT2: pool stats now return real config values from MpiState.
 // ============================================
@@ -214,13 +219,12 @@ pub async fn admin_volumes(State(state): State<Arc<MpiState>>) -> impl IntoRespo
         })
         .collect();
 
-    Json(
-        serde_json::to_value(VolumesResponse {
-            volumes,
-            total_users,
-        })
-        .unwrap(),
-    )
+    // [ADMIN-TYPED-JSON 2026-08-12 by Codex] Preserve the response schema while
+    // delegating serialization errors to Axum's `Json<T>` response handling.
+    Json(VolumesResponse {
+        volumes,
+        total_users,
+    })
     .into_response()
 }
 
@@ -248,28 +252,22 @@ pub async fn admin_volumes_reload(State(state): State<Arc<MpiState>>) -> impl In
                 Err(_) => 0,
             };
             info!(volumes_count, "[ADMIN] volumes.toml reloaded");
-            Json(
-                serde_json::to_value(ReloadResponse {
-                    status: "ok",
-                    message: None,
-                    volumes_count,
-                })
-                .unwrap(),
-            )
+            Json(ReloadResponse {
+                status: "ok",
+                message: None,
+                volumes_count,
+            })
             .into_response()
         }
         Err(e) => {
             tracing::warn!(error = %e, "[ADMIN] volumes.toml reload failed");
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(
-                    serde_json::to_value(ReloadResponse {
-                        status: "error",
-                        message: Some(e.to_string()),
-                        volumes_count: 0,
-                    })
-                    .unwrap(),
-                ),
+                Json(ReloadResponse {
+                    status: "error",
+                    message: Some(e.to_string()),
+                    volumes_count: 0,
+                }),
             )
                 .into_response()
         }
@@ -308,7 +306,7 @@ pub async fn admin_pool_stats(State(state): State<Arc<MpiState>>) -> impl IntoRe
         },
     };
 
-    Json(serde_json::to_value(response).unwrap()).into_response()
+    Json(response).into_response()
 }
 
 /// `GET /api/admin/usage?period=2026-03`
@@ -368,18 +366,15 @@ pub async fn admin_usage(
         })
         .collect();
 
-    Json(
-        serde_json::to_value(UsageResponse {
-            period: period_label,
-            since,
-            until,
-            total_input_tokens: total_input,
-            total_output_tokens: total_output,
-            total_calls,
-            by_owner,
-        })
-        .unwrap(),
-    )
+    Json(UsageResponse {
+        period: period_label,
+        since,
+        until,
+        total_input_tokens: total_input,
+        total_output_tokens: total_output,
+        total_calls,
+        by_owner,
+    })
     .into_response()
 }
 
@@ -515,6 +510,40 @@ fn ymd_to_days(year: i32, month: u32, day: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_admin_responses_preserve_wire_contract() {
+        // [ADMIN-TYPED-JSON 2026-08-12 by Codex] Guard the field names and
+        // optional-message behavior used by nodeboard while handlers return
+        // these structures directly through Axum's `Json<T>` implementation.
+        let reload = serde_json::to_value(ReloadResponse {
+            status: "ok",
+            message: None,
+            volumes_count: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            reload,
+            serde_json::json!({
+                "status": "ok",
+                "volumes_count": 3,
+            })
+        );
+
+        let pool = serde_json::to_value(PoolStatsResponse {
+            storage_pool: StoragePoolStats {
+                active_connections: 2,
+                max_connections: 100,
+                idle_timeout_secs: 60,
+            },
+            vector_pool: VectorPoolStats {
+                active_connections: 1,
+            },
+        })
+        .unwrap();
+        assert_eq!(pool["storage_pool"]["max_connections"], 100);
+        assert_eq!(pool["vector_pool"]["active_connections"], 1);
+    }
 
     // -- Time range resolution --------------------------------------------
 
