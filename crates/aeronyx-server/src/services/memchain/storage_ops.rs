@@ -75,6 +75,9 @@
 //!   membership against the follower's current local witness pins
 //! - v2.8.59-FollowerEffectiveReadiness: derives one fail-closed follower
 //!   readiness state from block convergence and exact-tip certificate policy
+//! - [MEMCHAIN-CHAIN-LEASE 2026-08-12 by Codex] Scopes witness-side
+//!   coordinator exclusivity and monotonic epochs to the chain across key
+//!   rotation while safely normalizing legacy per-identity rows
 //! - [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Runs signed local-anchor
 //!   writes through one privacy-safe blocking worker boundary.
 //!
@@ -355,7 +358,7 @@ pub enum RecordCoordinatorLeaseGrantOutcome {
     },
     /// The witness chain advanced or changed before the lease transaction.
     TipMismatch,
-    /// A different process instance still owns the durable lease.
+    /// A different coordinator identity or process still owns the chain lease.
     Contended,
 }
 
@@ -3834,13 +3837,16 @@ impl MemoryStorage {
         Ok(outcome)
     }
 
-    /// Atomically grants or renews one durable witness-side coordinator lease.
+    /// Atomically grants or renews one durable witness-side chain lease.
     ///
-    /// A different instance cannot replace an unexpired row. The short
-    /// handover grace prevents a new process from starting at the exact expiry
-    /// boundary while the previous coordinator is applying its safety margin.
-    /// The row stores no endpoint, host identity, process id, user data, or
-    /// block payload.
+    /// [MEMCHAIN-CHAIN-LEASE 2026-08-12 by Codex] Lease ownership is scoped to
+    /// the chain, not merely to a coordinator identity. This prevents old and
+    /// replacement coordinator keys from holding overlapping leases during an
+    /// identity handover. A successful grant also normalizes legacy per-key
+    /// rows to one durable row while retaining a chain-wide monotonic epoch.
+    /// The short handover grace prevents takeover at the exact expiry boundary.
+    /// No endpoint, host identity, process id, user data, or block payload is
+    /// stored.
     ///
     /// # Errors
     ///
@@ -3894,59 +3900,105 @@ impl MemoryStorage {
         if persisted_tip != (expected_tip_height, *expected_tip_hash) {
             return Ok(RecordCoordinatorLeaseGrantOutcome::TipMismatch);
         }
-        let existing = tx
-            .query_row(
-                "SELECT chain_id, instance_id, lease_epoch, lease_expires_at, updated_at
-                 FROM record_coordinator_leases WHERE coordinator=?1",
-                params![coordinator.as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| format!("read coordinator lease: {error}"))?;
+        let existing = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT coordinator, chain_id, instance_id, lease_epoch,
+                            lease_expires_at, updated_at
+                     FROM record_coordinator_leases
+                     WHERE chain_id=?1 OR coordinator=?2",
+                )
+                .map_err(|error| format!("prepare coordinator chain leases: {error}"))?;
+            let rows = statement
+                .query_map(
+                    params![chain_id.as_slice(), coordinator.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|error| format!("read coordinator chain leases: {error}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("decode coordinator chain leases: {error}"))?
+        };
 
-        let lease_epoch =
-            if let Some((stored_chain, stored_instance, epoch, stored_expiry, stored_updated_at)) =
-            existing
+        let mut maximum_epoch = None::<u64>;
+        let mut matching_epoch = None::<u64>;
+        for (
+            stored_coordinator,
+            stored_chain,
+            stored_instance,
+            epoch,
+            stored_expiry,
+            stored_updated_at,
+        ) in existing
         {
-            if stored_chain.as_slice() != chain_id {
+            let stored_coordinator: [u8; 32] =
+                stored_coordinator.try_into().map_err(|value: Vec<u8>| {
+                    format!("coordinator lease identity length {}", value.len())
+                })?;
+            let stored_chain: [u8; 32] = stored_chain.try_into().map_err(|value: Vec<u8>| {
+                format!("coordinator lease chain id length {}", value.len())
+            })?;
+            let stored_instance: [u8; 32] =
+                stored_instance.try_into().map_err(|value: Vec<u8>| {
+                    format!("coordinator lease instance id length {}", value.len())
+                })?;
+
+            if stored_coordinator == *coordinator && stored_chain != *chain_id {
                 return Err("coordinator lease chain id mismatch".to_string());
             }
+            if stored_chain != *chain_id {
+                continue;
+            }
+
             let epoch = u64::try_from(epoch)
                 .map_err(|_| "coordinator lease epoch is invalid".to_string())?;
             let stored_expiry = u64::try_from(stored_expiry)
                 .map_err(|_| "coordinator lease expiry is invalid".to_string())?;
-                let stored_updated_at = u64::try_from(stored_updated_at)
-                    .map_err(|_| "coordinator lease update time is invalid".to_string())?;
-                let explicitly_released = stored_expiry <= stored_updated_at;
-                if stored_instance.as_slice() == instance_id && explicitly_released {
-                    return Ok(RecordCoordinatorLeaseGrantOutcome::Contended);
-                }
-            if stored_instance.as_slice() != instance_id
-                    && !explicitly_released
-                    && now < stored_expiry.saturating_add(COORDINATOR_LEASE_HANDOVER_GRACE_SECS)
+            let stored_updated_at = u64::try_from(stored_updated_at)
+                .map_err(|_| "coordinator lease update time is invalid".to_string())?;
+            maximum_epoch = Some(maximum_epoch.map_or(epoch, |current| current.max(epoch)));
+
+            let same_holder = stored_coordinator == *coordinator && stored_instance == *instance_id;
+            let explicitly_released = stored_expiry <= stored_updated_at;
+            if same_holder && explicitly_released {
+                return Ok(RecordCoordinatorLeaseGrantOutcome::Contended);
+            }
+            if !same_holder
+                && !explicitly_released
+                && now < stored_expiry.saturating_add(COORDINATOR_LEASE_HANDOVER_GRACE_SECS)
             {
                 return Ok(RecordCoordinatorLeaseGrantOutcome::Contended);
             }
-            if stored_instance.as_slice() == instance_id {
-                epoch
-            } else {
-                epoch
-                    .checked_add(1)
-                    .ok_or_else(|| "coordinator lease epoch exhausted".to_string())?
+            if same_holder {
+                matching_epoch = Some(epoch);
             }
-        } else {
-            1
+        }
+
+        let lease_epoch = match (matching_epoch, maximum_epoch) {
+            (Some(holder_epoch), Some(maximum_epoch)) if holder_epoch == maximum_epoch => {
+                holder_epoch
+            }
+            (_, Some(maximum_epoch)) => maximum_epoch
+                .checked_add(1)
+                .ok_or_else(|| "coordinator lease epoch exhausted".to_string())?,
+            (_, None) => 1,
         };
         let lease_epoch_i64 = i64::try_from(lease_epoch)
             .map_err(|_| "coordinator lease epoch is outside SQLite range".to_string())?;
+        tx.execute(
+            "DELETE FROM record_coordinator_leases
+             WHERE chain_id=?1 AND coordinator<>?2",
+            params![chain_id.as_slice(), coordinator.as_slice()],
+        )
+        .map_err(|error| format!("normalize coordinator chain leases: {error}"))?;
         tx.execute(
             "INSERT INTO record_coordinator_leases
                 (coordinator, chain_id, instance_id, lease_epoch, lease_expires_at, updated_at)
@@ -7691,6 +7743,193 @@ mod tests {
                 .unwrap(),
             RecordCoordinatorLeaseReleaseOutcome::NotHolder
         );
+    }
+
+    #[tokio::test]
+    async fn test_witness_coordinator_lease_is_exclusive_across_coordinator_identities() {
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("witness-chain-lease.db");
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let first_coordinator = [0x41; 32];
+        let first_instance = [0x42; 32];
+        let second_coordinator = [0x51; 32];
+        let second_instance = [0x52; 32];
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &first_coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    2_000,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 1,
+                lease_expires_at: 2_060,
+            }
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &second_coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    2_020,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+        assert_eq!(
+            storage
+                .release_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &first_coordinator,
+                    &first_instance,
+                    2_021,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseReleaseOutcome::Released {
+                lease_epoch: 1,
+                released_at: 2_021,
+            }
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &second_coordinator,
+                    &second_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    2_022,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 2,
+                lease_expires_at: 2_082,
+            }
+        );
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &first_coordinator,
+                    &first_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    2_023,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Contended
+        );
+
+        let conn = storage.conn.lock().await;
+        let row_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM record_coordinator_leases WHERE chain_id=?1",
+                params![chain_id.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "a chain must retain exactly one lease row");
+        let stored_coordinator = conn
+            .query_row(
+                "SELECT coordinator FROM record_coordinator_leases WHERE chain_id=?1",
+                params![chain_id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        assert_eq!(stored_coordinator.as_slice(), second_coordinator.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_witness_coordinator_lease_normalizes_legacy_rows_with_chain_wide_epoch() {
+        let chain_id = AERONYX_MEMCHAIN_MAINNET_CHAIN_ID;
+        let first_coordinator = [0x61_u8; 32];
+        let second_coordinator = [0x62_u8; 32];
+        let replacement_coordinator = [0x63; 32];
+        let replacement_instance = [0x64; 32];
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        {
+            let conn = storage.conn.lock().await;
+            conn.execute(
+                "INSERT INTO record_coordinator_leases
+                    (coordinator, chain_id, instance_id, lease_epoch,
+                     lease_expires_at, updated_at)
+                 VALUES (?1, ?2, ?3, 4, 100, 100)",
+                params![
+                    first_coordinator.as_slice(),
+                    chain_id.as_slice(),
+                    [0x71_u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO record_coordinator_leases
+                    (coordinator, chain_id, instance_id, lease_epoch,
+                     lease_expires_at, updated_at)
+                 VALUES (?1, ?2, ?3, 7, 120, 110)",
+                params![
+                    second_coordinator.as_slice(),
+                    chain_id.as_slice(),
+                    [0x72_u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &chain_id,
+                    &replacement_coordinator,
+                    &replacement_instance,
+                    0,
+                    &GENESIS_PREV_HASH,
+                    200,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted {
+                lease_epoch: 8,
+                lease_expires_at: 260,
+            }
+        );
+
+        let conn = storage.conn.lock().await;
+        let (row_count, stored_coordinator, stored_epoch) = conn
+            .query_row(
+                "SELECT COUNT(*), coordinator, lease_epoch
+                 FROM record_coordinator_leases WHERE chain_id=?1",
+                params![chain_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row_count, 1);
+        assert_eq!(stored_coordinator.as_slice(), replacement_coordinator.as_slice());
+        assert_eq!(stored_epoch, 8);
     }
 
     #[tokio::test]
