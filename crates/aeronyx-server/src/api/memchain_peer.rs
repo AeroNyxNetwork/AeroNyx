@@ -20,6 +20,8 @@
 //! - Bincode `MemChainMessage` request/response with the existing magic byte.
 //! - Signed discovery-peer admission, timestamp freshness, stateful-request
 //!   replay protection, shared per-peer rate limiting, and bounded pagination.
+//! - Monotonic per-peer abuse windows remain stable across NTP and wall-clock
+//!   corrections while signed-frame freshness continues to use Unix time.
 //! - Idempotent signed tip hints may be retried within that shared rate limit;
 //!   they only coalesce a follower wake-up and never mutate canonical state.
 //! - Coordinator delivery uses a three-peer, three-attempt in-memory retry
@@ -158,6 +160,8 @@
 //!   Never expose it in production or bypass final-hop SSRF validation.
 //!
 //! ## Last Modified
+//! v2.8.58-MonotonicPeerRateLimit - Detached node-to-node abuse windows from
+//!   wall-clock minutes and added deterministic rollback/boundary coverage.
 //! v2.8.57-CertificatePersistenceTruth - Report verified-but-unpersisted follower evidence honestly.
 //! v2.8.54-CertificateCarrierRecovery - Unified fail-closed certificate carrier recovery.
 //! v2.8.53-TypedCarrierCircuit - Isolated block and certificate circuit domains.
@@ -262,6 +266,8 @@ const MAX_RESPONSE_BODY_BYTES: usize = 512 * 1024;
 const MAX_BLOCKS_PER_RESPONSE: usize = 16;
 const MAX_BLOCKS_PER_RESPONSE_WIRE: u16 = 16;
 const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
+const PEER_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const PEER_RATE_LIMIT_RETENTION: Duration = Duration::from_secs(120);
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 const REPLAY_RETENTION_SECS: u64 = 120;
 const MAX_PINNED_WITNESSES_PER_ROUND: usize = 3;
@@ -871,10 +877,19 @@ struct PeerRequestGuard {
     seen_requests: HashMap<([u8; 32], [u8; 16]), u64>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct PeerRateWindow {
-    minute: u64,
+    started_at: Instant,
     used: u32,
+}
+
+impl PeerRateWindow {
+    const fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            used: 0,
+        }
+    }
 }
 
 impl PeerRequestGuard {
@@ -883,13 +898,21 @@ impl PeerRequestGuard {
             .retain(|_, seen_at| now.saturating_sub(*seen_at) <= REPLAY_RETENTION_SECS);
     }
 
-    fn admit_rate_limited(&mut self, requester: [u8; 32], now: u64) -> bool {
-        let minute = now / 60;
-        self.rate_windows
-            .retain(|_, window| window.minute >= minute.saturating_sub(1));
-        let window = self.rate_windows.entry(requester).or_default();
-        if window.minute != minute {
-            *window = PeerRateWindow { minute, used: 0 };
+    // [MEMCHAIN-PEER-MONOTONIC-RATE 2026-08-12 by Codex] Authentication
+    // freshness intentionally uses Unix time, but elapsed abuse-control
+    // windows must use Instant so NTP corrections cannot reset peer budgets.
+    fn admit_rate_limited_at(&mut self, requester: [u8; 32], now: Instant) -> bool {
+        self.rate_windows.retain(|_, window| {
+            now.checked_duration_since(window.started_at)
+                .is_none_or(|elapsed| elapsed < PEER_RATE_LIMIT_RETENTION)
+        });
+        let window = self
+            .rate_windows
+            .entry(requester)
+            .or_insert_with(|| PeerRateWindow::new(now));
+        let elapsed = now.checked_duration_since(window.started_at);
+        if elapsed.is_some_and(|elapsed| elapsed >= PEER_RATE_LIMIT_WINDOW) {
+            *window = PeerRateWindow::new(now);
         }
         if window.used >= MAX_REQUESTS_PER_PEER_PER_MINUTE {
             return false;
@@ -900,8 +923,18 @@ impl PeerRequestGuard {
 
     /// Admits a stateful request exactly once inside the replay-retention window.
     fn admit(&mut self, requester: [u8; 32], request_id: [u8; 16], now: u64) -> bool {
-        self.prune_replay_requests(now);
-        if !self.admit_rate_limited(requester, now) {
+        self.admit_at(requester, request_id, now, Instant::now())
+    }
+
+    fn admit_at(
+        &mut self,
+        requester: [u8; 32],
+        request_id: [u8; 16],
+        wall_now: u64,
+        monotonic_now: Instant,
+    ) -> bool {
+        self.prune_replay_requests(wall_now);
+        if !self.admit_rate_limited_at(requester, monotonic_now) {
             return false;
         }
         // Rejected replay attempts consume the same abuse budget as valid
@@ -909,14 +942,24 @@ impl PeerRequestGuard {
         if self.seen_requests.contains_key(&(requester, request_id)) {
             return false;
         }
-        self.seen_requests.insert((requester, request_id), now);
+        self.seen_requests
+            .insert((requester, request_id), wall_now);
         true
     }
 
     /// Admits an authenticated, idempotent scheduling hint within the shared cap.
     fn admit_idempotent_hint(&mut self, requester: [u8; 32], now: u64) -> bool {
-        self.prune_replay_requests(now);
-        self.admit_rate_limited(requester, now)
+        self.admit_idempotent_hint_at(requester, now, Instant::now())
+    }
+
+    fn admit_idempotent_hint_at(
+        &mut self,
+        requester: [u8; 32],
+        wall_now: u64,
+        monotonic_now: Instant,
+    ) -> bool {
+        self.prune_replay_requests(wall_now);
+        self.admit_rate_limited_at(requester, monotonic_now)
     }
 }
 
@@ -7475,30 +7518,74 @@ mod tests {
     #[test]
     fn peer_guard_rejects_replay_and_enforces_rate_limit() {
         let peer = [0x11; 32];
-        let now = 1_700_000_000;
+        let wall_now = 1_700_000_000;
+        let monotonic_now = Instant::now();
         let mut guard = PeerRequestGuard::default();
-        assert!(guard.admit(peer, [0x01; 16], now));
-        assert!(!guard.admit(peer, [0x01; 16], now));
+        assert!(guard.admit_at(peer, [0x01; 16], wall_now, monotonic_now));
+        assert!(!guard.admit_at(peer, [0x01; 16], wall_now, monotonic_now));
         for value in 2..MAX_REQUESTS_PER_PEER_PER_MINUTE {
             let mut request_id = [0u8; 16];
             request_id[..4].copy_from_slice(&value.to_le_bytes());
-            assert!(guard.admit(peer, request_id, now));
+            assert!(guard.admit_at(peer, request_id, wall_now, monotonic_now));
         }
-        assert!(!guard.admit(peer, [0xFF; 16], now));
-        assert!(guard.admit(peer, [0xFF; 16], now + 61));
+        assert!(!guard.admit_at(peer, [0xFF; 16], wall_now, monotonic_now));
+        assert!(guard.admit_at(
+            peer,
+            [0xFF; 16],
+            wall_now + 61,
+            monotonic_now + PEER_RATE_LIMIT_WINDOW,
+        ));
+    }
+
+    #[test]
+    fn peer_guard_wall_clock_corrections_cannot_reset_rate_budget() {
+        let peer = [0x12; 32];
+        let wall_now = 1_700_000_000;
+        let monotonic_now = Instant::now();
+        let mut guard = PeerRequestGuard::default();
+
+        for value in 0..MAX_REQUESTS_PER_PEER_PER_MINUTE {
+            let mut request_id = [0u8; 16];
+            request_id[..4].copy_from_slice(&value.to_le_bytes());
+            assert!(guard.admit_at(peer, request_id, wall_now, monotonic_now));
+        }
+
+        assert!(!guard.admit_at(
+            peer,
+            [0xFE; 16],
+            wall_now.saturating_sub(3_600),
+            monotonic_now,
+        ));
+        assert!(!guard.admit_at(
+            peer,
+            [0xFD; 16],
+            wall_now + 3_600,
+            monotonic_now,
+        ));
+        assert!(guard.admit_at(
+            peer,
+            [0xFC; 16],
+            wall_now + 3_600,
+            monotonic_now + PEER_RATE_LIMIT_WINDOW,
+        ));
     }
 
     #[test]
     fn peer_guard_allows_idempotent_hint_retries_within_shared_rate_limit() {
         let peer = [0x22; 32];
-        let now = 1_700_000_000;
+        let wall_now = 1_700_000_000;
+        let monotonic_now = Instant::now();
         let mut guard = PeerRequestGuard::default();
 
         for _ in 0..MAX_REQUESTS_PER_PEER_PER_MINUTE {
-            assert!(guard.admit_idempotent_hint(peer, now));
+            assert!(guard.admit_idempotent_hint_at(peer, wall_now, monotonic_now));
         }
-        assert!(!guard.admit_idempotent_hint(peer, now));
-        assert!(guard.admit_idempotent_hint(peer, now + 61));
+        assert!(!guard.admit_idempotent_hint_at(peer, wall_now, monotonic_now));
+        assert!(guard.admit_idempotent_hint_at(
+            peer,
+            wall_now,
+            monotonic_now + PEER_RATE_LIMIT_WINDOW,
+        ));
     }
 
     #[test]
