@@ -51,6 +51,9 @@
 //! - [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] One fail-closed
 //!   blocking-worker boundary preserves the existing protocol response while
 //!   recording only a static operation role and fixed join-failure category.
+//! - [DIRECTORY-AUDIT-ADMISSION 2026-08-12 by Codex] Expensive authenticated
+//!   chain audits share one fail-fast process permit. Concurrent peers receive
+//!   a retryable fixed bucket instead of exhausting Tokio's blocking pool.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` only when `DirectoryChainStore` is configured.
@@ -118,8 +121,13 @@
 //!   availability is never producer, checkpoint, witness, or policy authority.
 //! - Never format a blocking worker's raw `JoinError`; Tokio panic payloads may
 //!   contain filesystem, descriptor, or other internal process material.
+//! - Keep the audit admission fail-fast. Queueing permissionless history audits
+//!   would retain unbounded request futures and turn peer traffic into memory
+//!   pressure even though the blocking worker count remains bounded.
 //!
 //! ## Last Modified
+//! v0.17.0-AuditAdmission - Added process-wide fail-fast admission for
+//! expensive authenticated Directory audit workers.
 //! v0.16.0-BlockingWorkerBoundary - Centralized all Directory peer blocking
 //! worker joins behind privacy-safe, fail-closed diagnostics.
 //! v0.15.0-ReplicaDescriptorInclusionProof - Added registry-gated carrier
@@ -153,7 +161,7 @@
 // ============================================
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -230,10 +238,27 @@ const WITNESS_CARRIER_CAPABILITY_COOLDOWN_SECS: u64 = 300;
 const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
 /// Global budget bounds aggregate pressure from permissionless verified peers.
 const MAX_DIRECTORY_REQUESTS_GLOBAL_PER_MINUTE: u32 = 512;
+/// Only one full-history audit may consume CPU at a time in this process.
+///
+/// [DIRECTORY-AUDIT-ADMISSION 2026-08-12 by Codex] Directory stores already
+/// serialize each SQLite namespace, while independent public routes can still
+/// schedule multiple cryptographic history walks on Tokio's blocking pool.
+/// One permit preserves VPN and relay capacity on small commercial nodes.
+#[cfg(not(test))]
+const MAX_DIRECTORY_AUDITS_IN_FLIGHT: usize = 1;
+// [DIRECTORY-AUDIT-ADMISSION 2026-08-12 by Codex] Router tests execute
+// independent in-memory nodes concurrently. The injected one-permit test below
+// verifies production admission without coupling those otherwise isolated
+// nodes through this process-global test binary.
+#[cfg(test)]
+const MAX_DIRECTORY_AUDITS_IN_FLIGHT: usize = 512;
 /// Accepted signed request clock skew in either direction.
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Stateful request ids remain rejected for this duration.
 const REPLAY_RETENTION_SECS: u64 = 120;
+
+static DIRECTORY_AUDIT_ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_DIRECTORY_AUDITS_IN_FLIGHT)));
 
 /// Complete bounded result of one witness-target request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2352,7 +2377,36 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    match tokio::task::spawn_blocking(worker).await {
+    run_directory_chain_blocking_with_admission(
+        Arc::clone(&DIRECTORY_AUDIT_ADMISSION),
+        operation,
+        worker,
+    )
+    .await
+}
+
+async fn run_directory_chain_blocking_with_admission<T, F>(
+    admission: Arc<Semaphore>,
+    operation: &'static str,
+    worker: F,
+) -> Result<T, Response>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    // [DIRECTORY-AUDIT-ADMISSION 2026-08-12 by Codex] Acquire before
+    // `spawn_blocking`: rejected work never occupies the blocking queue. The
+    // owned permit moves into the worker and is released on return or unwind.
+    let permit = admission.try_acquire_owned().map_err(|_| {
+        debug!(operation, "[DIRECTORY_CHAIN] Audit admission busy");
+        protocol_error(StatusCode::SERVICE_UNAVAILABLE, "audit_busy")
+    })?;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        worker()
+    })
+    .await
+    {
         Ok(result) => Ok(result),
         Err(error) => {
             warn!(
@@ -2648,6 +2702,51 @@ mod tests {
         assert!(!body
             .windows(b"sensitive-directory-worker-payload".len())
             .any(|window| window == b"sensitive-directory-worker-payload"));
+    }
+
+    #[tokio::test]
+    async fn blocking_worker_admission_rejects_concurrent_audits_without_queueing() {
+        use std::sync::mpsc;
+
+        let admission = Arc::new(Semaphore::new(1));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_admission = Arc::clone(&admission);
+        let first = tokio::spawn(async move {
+            run_directory_chain_blocking_with_admission(
+                first_admission,
+                "test_long_audit",
+                move || {
+                    entered_tx.send(()).expect("announce worker entry");
+                    release_rx.recv().expect("release first worker");
+                    7u8
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().expect("first worker entered"))
+            .await
+            .expect("entry wait task");
+
+        let response = run_directory_chain_blocking_with_admission(
+            Arc::clone(&admission),
+            "test_rejected_audit",
+            || 9u8,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("admission response body");
+        assert_eq!(&body[..], b"audit_busy");
+
+        release_tx.send(()).expect("release first audit");
+        assert_eq!(
+            first.await.expect("first task join").expect("first audit"),
+            7
+        );
+        assert_eq!(admission.available_permits(), 1);
     }
 
     #[test]
