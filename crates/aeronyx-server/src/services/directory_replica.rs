@@ -220,8 +220,13 @@
 //! - Never expose [`DirectoryReplicaStore::resolve_quarantine`] through the
 //!   peer or public HTTP routers. It belongs only to the host-local CLI, whose
 //!   caller must also possess the node identity key and database permissions.
+//! - [DIRECTORY-AUDIT-OWNERSHIP 2026-08-12 by Codex] Public and local peer
+//!   listeners must obtain their audit permit from the shared process runtime.
+//!   Never create one independent admission gate per listener.
 //!
 //! ## Last Modified
+//! v0.41.0-DirectoryAuditOwnership - Moved the full-history audit admission
+//! permit into the shared process runtime so listeners share one CPU boundary.
 //! v0.40.0-RouteDomainAttestorPolicyHistory - Added schema v12 canonical signed
 //! local attestor/quorum epochs with atomic migration and startup audit.
 //! v0.39.0-RouteDomainPolicyHistory - Added schema v11 canonical signed local
@@ -301,6 +306,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::config::PinnedRouteDomainAssignment;
@@ -329,6 +335,7 @@ use rusqlite::{
     TransactionBehavior,
 };
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 const DIRECTORY_REPLICA_SCHEMA_VERSION: i64 = 12;
 const DIRECTORY_REPLICA_SCHEMA_VERSION_V11: i64 = 11;
@@ -346,6 +353,8 @@ const MAX_DIRECTORY_BLOCK_BYTES: u64 = 64 * 1024;
 const MAX_DIRECTORY_DESCRIPTOR_OBJECT_BYTES: u64 = 32 * 1024;
 const MAX_DIRECTORY_SYNC_EVIDENCE_BYTES: usize = 512 * 1024;
 const DIRECTORY_REPLICA_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// One shared full-history audit protects CPU without weakening verification.
+const MAX_DIRECTORY_AUDITS_IN_FLIGHT: usize = 1;
 const RESPONSE_TIMESTAMP_SKEW_SECS: u64 = 60;
 const MAX_DIRECTORY_REPLICA_FAILURE_REASON_BYTES: usize = 96;
 const DIRECTORY_REPLICA_CONVERGENCE_WINDOW_BLOCKS: u64 = 32;
@@ -2190,9 +2199,23 @@ pub struct DirectoryReplicaSyncRuntime {
     observation_witness_recovery: Mutex<DirectoryObservationWitnessRecoverySnapshot>,
     observation_witness_carrier: Mutex<DirectoryObservationWitnessCarrierSnapshot>,
     full_node_mirror: Mutex<DirectoryFullNodeMirrorRuntimeSnapshot>,
+    directory_audit_admission: OnceLock<Arc<Semaphore>>,
 }
 
 impl DirectoryReplicaSyncRuntime {
+    /// Returns the process-shared fail-fast admission gate for history audits.
+    ///
+    /// [DIRECTORY-AUDIT-OWNERSHIP 2026-08-12 by Codex] Both public and local
+    /// routers are built from this runtime. Lazy initialization keeps
+    /// compatibility constructors cheap while ensuring their production
+    /// clones converge on exactly one permit.
+    pub(crate) fn directory_audit_admission(&self) -> Arc<Semaphore> {
+        Arc::clone(
+            self.directory_audit_admission
+                .get_or_init(|| Arc::new(Semaphore::new(MAX_DIRECTORY_AUDITS_IN_FLIGHT))),
+        )
+    }
+
     /// Records exactly one completed coordinator-owned transport outcome.
     ///
     /// The caller has already reduced the exchange to a privacy-safe class;

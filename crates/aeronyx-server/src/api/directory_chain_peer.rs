@@ -52,8 +52,9 @@
 //!   blocking-worker boundary preserves the existing protocol response while
 //!   recording only a static operation role and fixed join-failure category.
 //! - [DIRECTORY-AUDIT-ADMISSION 2026-08-12 by Codex] Expensive authenticated
-//!   chain audits share one fail-fast process permit. Concurrent peers receive
-//!   a retryable fixed bucket instead of exhausting Tokio's blocking pool.
+//!   chain audits share one runtime-owned fail-fast permit across public and
+//!   local listeners. Concurrent peers receive a retryable fixed bucket instead
+//!   of exhausting Tokio's blocking pool.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` only when `DirectoryChainStore` is configured.
@@ -126,6 +127,8 @@
 //!   pressure even though the blocking worker count remains bounded.
 //!
 //! ## Last Modified
+//! v0.17.1-AuditOwnership - Bound public and local listener admission to the
+//! same shared `DirectoryReplicaSyncRuntime` resource.
 //! v0.17.0-AuditAdmission - Added process-wide fail-fast admission for
 //! expensive authenticated Directory audit workers.
 //! v0.16.0-BlockingWorkerBoundary - Centralized all Directory peer blocking
@@ -161,7 +164,7 @@
 // ============================================
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -238,27 +241,10 @@ const WITNESS_CARRIER_CAPABILITY_COOLDOWN_SECS: u64 = 300;
 const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
 /// Global budget bounds aggregate pressure from permissionless verified peers.
 const MAX_DIRECTORY_REQUESTS_GLOBAL_PER_MINUTE: u32 = 512;
-/// Only one full-history audit may consume CPU at a time in this process.
-///
-/// [DIRECTORY-AUDIT-ADMISSION 2026-08-12 by Codex] Directory stores already
-/// serialize each SQLite namespace, while independent public routes can still
-/// schedule multiple cryptographic history walks on Tokio's blocking pool.
-/// One permit preserves VPN and relay capacity on small commercial nodes.
-#[cfg(not(test))]
-const MAX_DIRECTORY_AUDITS_IN_FLIGHT: usize = 1;
-// [DIRECTORY-AUDIT-ADMISSION 2026-08-12 by Codex] Router tests execute
-// independent in-memory nodes concurrently. The injected one-permit test below
-// verifies production admission without coupling those otherwise isolated
-// nodes through this process-global test binary.
-#[cfg(test)]
-const MAX_DIRECTORY_AUDITS_IN_FLIGHT: usize = 512;
 /// Accepted signed request clock skew in either direction.
 const REQUEST_TIMESTAMP_SKEW_SECS: u64 = 60;
 /// Stateful request ids remain rejected for this duration.
 const REPLAY_RETENTION_SECS: u64 = 120;
-
-static DIRECTORY_AUDIT_ADMISSION: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_DIRECTORY_AUDITS_IN_FLIGHT)));
 
 /// Complete bounded result of one witness-target request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +414,7 @@ struct DirectoryChainPeerState {
     pinned_peers: Arc<HashSet<[u8; 32]>>,
     allow_public_mirror_reads: bool,
     guard: Arc<Mutex<DirectoryPeerRequestGuard>>,
+    audit_admission: Arc<Semaphore>,
     runtime: Arc<DirectoryReplicaSyncRuntime>,
     witness_carrier: Arc<WitnessCarrierRuntime>,
 }
@@ -566,6 +553,7 @@ fn build_directory_chain_peer_router_with_replica_runtime_and_transport(
     runtime: Arc<DirectoryReplicaSyncRuntime>,
     witness_carrier: Arc<WitnessCarrierRuntime>,
 ) -> Router {
+    let audit_admission = runtime.directory_audit_admission();
     let state = DirectoryChainPeerState {
         store,
         replica_store,
@@ -574,6 +562,7 @@ fn build_directory_chain_peer_router_with_replica_runtime_and_transport(
         pinned_peers: Arc::new(pinned_peer_ids.into_iter().collect()),
         allow_public_mirror_reads,
         guard: Arc::new(Mutex::new(DirectoryPeerRequestGuard::default())),
+        audit_admission,
         runtime,
         witness_carrier,
     };
@@ -764,14 +753,17 @@ async fn tip_handler(State(state): State<DirectoryChainPeerState>, body: Bytes) 
     }
 
     let store = Arc::clone(&state.store);
-    let audit =
-        match run_directory_chain_blocking("producer_tip_audit", move || store.audited_tip(now))
-            .await
-        {
-            Ok(Ok(audit)) => audit,
-            Ok(Err(error)) => return store_error_response(&error),
-            Err(response) => return response,
-        };
+    let audit = match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "producer_tip_audit",
+        move || store.audited_tip(now),
+    )
+    .await
+    {
+        Ok(Ok(audit)) => audit,
+        Ok(Err(error)) => return store_error_response(&error),
+        Err(response) => return response,
+    };
     let responder = state.identity.public_key_bytes();
     let response_timestamp = now_secs();
     let response_signing_bytes = directory_tip_response_signing_bytes(
@@ -847,9 +839,11 @@ async fn block_range_handler(
     }
 
     let store = Arc::clone(&state.store);
-    let page = match run_directory_chain_blocking("producer_block_range_audit", move || {
-        store.audited_block_page(from_height, limit, now)
-    })
+    let page = match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "producer_block_range_audit",
+        move || store.audited_block_page(from_height, limit, now),
+    )
     .await
     {
         Ok(Ok(page)) => page,
@@ -944,17 +938,18 @@ async fn descriptor_objects_handler(
 
     let store = Arc::clone(&state.store);
     let requested_hashes = descriptor_hashes.clone();
-    let objects =
-        match run_directory_chain_blocking("producer_descriptor_objects_audit", move || {
-            store.audited_descriptor_objects(&requested_hashes, now)
-        })
-        .await
-        {
-            Ok(Ok(Some(objects))) => objects,
-            Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "object_not_found"),
-            Ok(Err(error)) => return store_error_response(&error),
-            Err(response) => return response,
-        };
+    let objects = match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "producer_descriptor_objects_audit",
+        move || store.audited_descriptor_objects(&requested_hashes, now),
+    )
+    .await
+    {
+        Ok(Ok(Some(objects))) => objects,
+        Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "object_not_found"),
+        Ok(Err(error)) => return store_error_response(&error),
+        Err(response) => return response,
+    };
     let responder = state.identity.public_key_bytes();
     let response_timestamp = now_secs();
     let response_signing_bytes = directory_descriptor_objects_response_signing_bytes(
@@ -1029,17 +1024,18 @@ async fn descriptor_inclusion_proof_handler(
     }
 
     let store = Arc::clone(&state.store);
-    let proof =
-        match run_directory_chain_blocking("producer_descriptor_inclusion_proof_audit", move || {
-            store.audited_descriptor_inclusion_proof(&descriptor_hash, &block_hash, now)
-        })
-        .await
-        {
-            Ok(Ok(Some(proof))) => proof,
-            Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "proof_not_found"),
-            Ok(Err(error)) => return store_error_response(&error),
-            Err(response) => return response,
-        };
+    let proof = match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "producer_descriptor_inclusion_proof_audit",
+        move || store.audited_descriptor_inclusion_proof(&descriptor_hash, &block_hash, now),
+    )
+    .await
+    {
+        Ok(Ok(Some(proof))) => proof,
+        Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "proof_not_found"),
+        Ok(Err(error)) => return store_error_response(&error),
+        Err(response) => return response,
+    };
     let responder = state.identity.public_key_bytes();
     if proof
         .verify_at(&chain_id, &responder, &block_hash, now)
@@ -1095,13 +1091,17 @@ async fn audited_replica_page_for_request(
             "replica_store_disabled",
         ));
     };
-    match run_directory_chain_blocking("replica_block_range_audit", move || {
-        if producer_is_pinned {
-            store.audited_evidence_page(&producer, from_height, limit, observed_at)
-        } else {
-            store.audited_mirror_evidence_page(&producer, from_height, limit, observed_at)
-        }
-    })
+    match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "replica_block_range_audit",
+        move || {
+            if producer_is_pinned {
+                store.audited_evidence_page(&producer, from_height, limit, observed_at)
+            } else {
+                store.audited_mirror_evidence_page(&producer, from_height, limit, observed_at)
+            }
+        },
+    )
     .await
     {
         Ok(Ok(page)) if page.tip_height > 0 => Ok(page),
@@ -1130,17 +1130,25 @@ async fn audited_replica_objects_for_request(
             "replica_store_disabled",
         ));
     };
-    match run_directory_chain_blocking("replica_descriptor_objects_audit", move || {
-        if producer_is_pinned {
-            store.audited_evidence_descriptor_objects(&producer, &descriptor_hashes, observed_at)
-        } else {
-            store.audited_mirror_evidence_descriptor_objects(
-                &producer,
-                &descriptor_hashes,
-                observed_at,
-            )
-        }
-    })
+    match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "replica_descriptor_objects_audit",
+        move || {
+            if producer_is_pinned {
+                store.audited_evidence_descriptor_objects(
+                    &producer,
+                    &descriptor_hashes,
+                    observed_at,
+                )
+            } else {
+                store.audited_mirror_evidence_descriptor_objects(
+                    &producer,
+                    &descriptor_hashes,
+                    observed_at,
+                )
+            }
+        },
+    )
     .await
     {
         Ok(Ok(Some(objects))) => Ok(objects),
@@ -1173,23 +1181,27 @@ async fn audited_replica_descriptor_proof_for_request(
             "replica_store_disabled",
         ));
     };
-    match run_directory_chain_blocking("replica_descriptor_inclusion_proof_audit", move || {
-        if producer_is_pinned {
-            store.audited_evidence_descriptor_inclusion_proof(
-                &producer,
-                &descriptor_hash,
-                &block_hash,
-                observed_at,
-            )
-        } else {
-            store.audited_mirror_evidence_descriptor_inclusion_proof(
-                &producer,
-                &descriptor_hash,
-                &block_hash,
-                observed_at,
-            )
-        }
-    })
+    match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "replica_descriptor_inclusion_proof_audit",
+        move || {
+            if producer_is_pinned {
+                store.audited_evidence_descriptor_inclusion_proof(
+                    &producer,
+                    &descriptor_hash,
+                    &block_hash,
+                    observed_at,
+                )
+            } else {
+                store.audited_mirror_evidence_descriptor_inclusion_proof(
+                    &producer,
+                    &descriptor_hash,
+                    &block_hash,
+                    observed_at,
+                )
+            }
+        },
+    )
     .await
     {
         Ok(Ok(Some(proof))) => Ok(proof),
@@ -2081,9 +2093,11 @@ async fn observation_policy_anchor_handler(
         return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "replica_store_disabled");
     };
     let anchor_request = message.clone();
-    let decision = match run_directory_chain_blocking("observation_policy_anchor", move || {
-        store.persist_remote_observation_witness_policy_anchor(&anchor_request, now)
-    })
+    let decision = match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "observation_policy_anchor",
+        move || store.persist_remote_observation_witness_policy_anchor(&anchor_request, now),
+    )
     .await
     {
         Ok(Ok(decision)) => decision,
@@ -2175,8 +2189,10 @@ async fn observation_certificate_handler(
     };
     let mut eligible_witnesses = state.pinned_peers.iter().copied().collect::<Vec<_>>();
     eligible_witnesses.sort_unstable();
-    let certificate =
-        match run_directory_chain_blocking("observation_certificate_audit", move || {
+    let certificate = match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "observation_certificate_audit",
+        move || {
             let snapshot = store.status_snapshot()?;
             let minimum_witnesses = usize::try_from(snapshot.observation_witness_policy_threshold)
                 .unwrap_or(usize::MAX);
@@ -2188,19 +2204,20 @@ async fn observation_certificate_handler(
                 minimum_witnesses,
                 now,
             )
-        })
-        .await
-        {
-            Ok(Ok(Some(certificate))) => certificate,
-            Ok(Ok(None)) => {
-                return protocol_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "observation_certificate_unavailable",
-                )
-            }
-            Ok(Err(error)) => return replica_store_error_response(&error),
-            Err(response) => return response,
-        };
+        },
+    )
+    .await
+    {
+        Ok(Ok(Some(certificate))) => certificate,
+        Ok(Ok(None)) => {
+            return protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "observation_certificate_unavailable",
+            )
+        }
+        Ok(Err(error)) => return replica_store_error_response(&error),
+        Err(response) => return response,
+    };
     let certificate_frame = match encode_directory_observation_certificate(&certificate) {
         Ok(frame) if frame.len() <= MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES => frame,
         Ok(_) => {
@@ -2270,9 +2287,11 @@ async fn independently_evaluate_checkpoint(
         ));
     };
     let chain_store = Arc::clone(&state.store);
-    match run_directory_chain_blocking("local_producer_witness_audit", move || {
-        chain_store.audit(now)
-    })
+    match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "local_producer_witness_audit",
+        move || chain_store.audit(now),
+    )
     .await
     {
         Ok(Ok(_)) => {}
@@ -2286,9 +2305,11 @@ async fn independently_evaluate_checkpoint(
         Err(response) => return Err(response),
     }
     let checkpoint = checkpoint.clone();
-    match run_directory_chain_blocking("observation_witness_recomputation", move || {
-        replica_store.evaluate_observation_checkpoint_witness(&checkpoint, now)
-    })
+    match run_directory_chain_blocking(
+        Arc::clone(&state.audit_admission),
+        "observation_witness_recomputation",
+        move || replica_store.evaluate_observation_checkpoint_witness(&checkpoint, now),
+    )
     .await
     {
         Ok(Ok(decision)) => Ok(decision),
@@ -2370,6 +2391,7 @@ fn protocol_error(status: StatusCode, code: &'static str) -> Response {
 /// `audit_task_failed` protocol bucket while logs receive only the shared fixed
 /// category, never the potentially payload-bearing raw `JoinError`.
 async fn run_directory_chain_blocking<T, F>(
+    admission: Arc<Semaphore>,
     operation: &'static str,
     worker: F,
 ) -> Result<T, Response>
@@ -2377,12 +2399,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    run_directory_chain_blocking_with_admission(
-        Arc::clone(&DIRECTORY_AUDIT_ADMISSION),
-        operation,
-        worker,
-    )
-    .await
+    run_directory_chain_blocking_with_admission(admission, operation, worker).await
 }
 
 async fn run_directory_chain_blocking_with_admission<T, F>(
@@ -2688,11 +2705,12 @@ mod tests {
     async fn blocking_worker_failure_preserves_privacy_safe_protocol_bucket() {
         // [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] A panic payload
         // must never become part of the authenticated peer API response.
-        let response = run_directory_chain_blocking("test_audit", || {
-            panic!("test-only-sensitive-directory-worker-payload");
-        })
-        .await
-        .unwrap_err();
+        let response =
+            run_directory_chain_blocking(Arc::new(Semaphore::new(1)), "test_audit", || {
+                panic!("test-only-sensitive-directory-worker-payload");
+            })
+            .await
+            .unwrap_err();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), 1_024)
@@ -2747,6 +2765,22 @@ mod tests {
             7
         );
         assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[test]
+    fn runtime_owns_one_audit_gate_and_isolates_independent_nodes() {
+        // [DIRECTORY-AUDIT-OWNERSHIP 2026-08-12 by Codex] Listener routers
+        // sharing one node runtime must compete for one permit, while another
+        // in-process node runtime must not inherit that node's admission state.
+        let first_runtime = DirectoryReplicaSyncRuntime::default();
+        let first_public = first_runtime.directory_audit_admission();
+        let first_local = first_runtime.directory_audit_admission();
+        let second_node = DirectoryReplicaSyncRuntime::default().directory_audit_admission();
+
+        assert!(Arc::ptr_eq(&first_public, &first_local));
+        assert!(!Arc::ptr_eq(&first_public, &second_node));
+        assert_eq!(first_public.available_permits(), 1);
+        assert_eq!(second_node.available_permits(), 1);
     }
 
     #[test]
