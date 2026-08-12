@@ -328,6 +328,9 @@
 // 125. [KEEPALIVE-SHUTDOWN-COOPERATION 2026-08-12 by Codex] Reuses the
 //      interruptible startup delay for VPN keepalive probes so an idle node
 //      never waits out the fixed thirty-second warm-up during service stop.
+// 126. [PEER-CACHE-DIRTY-RECOVERY 2026-08-12 by Codex] Restores the pending
+//      delivery-evidence dirty state when atomic peer-cache persistence fails,
+//      preventing one failed write from acknowledging data it never stored.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -462,6 +465,8 @@
 //     operations; adding another await requires adding the same checkpoint.
 //
 // Last Modified:
+//   v2.8.79-PeerCacheDirtyRecovery - Kept verified delivery evidence pending
+//     after peer-cache write failures and added a regression test.
 //   v2.8.78-KeepaliveShutdownCooperation - Made the VPN keepalive warm-up
 //     observe shutdown instead of requiring supervisor cancellation.
 //   v2.8.77-BackgroundShutdownCooperation - Made traffic startup delay
@@ -6354,7 +6359,16 @@ impl Server {
             );
         }
 
-        Self::persist_peer_store_cache_once(identity, peer_store, path, now).await?;
+        if let Err(error) =
+            Self::persist_peer_store_cache_once(identity, peer_store, path, now).await
+        {
+            // [PEER-CACHE-DIRTY-RECOVERY 2026-08-12 by Codex] The persistence
+            // task claims the dirty bit immediately before exporting. A failed
+            // atomic write did not acknowledge that evidence, so retain it for
+            // a later bounded retry instead of waiting for another receipt.
+            peer_store.mark_client_delivery_cache_dirty();
+            return Err(error);
+        }
         if witnesses_configured {
             let decision = Self::reconcile_peer_cache_delivery_witnesses(
                 identity,
@@ -19533,6 +19547,42 @@ mod tests {
         assert!(status.stability.restart_recovery_configured);
 
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_write_failure_rearms_delivery_evidence() {
+        // [PEER-CACHE-DIRTY-RECOVERY 2026-08-12 by Codex] Reproduce the
+        // persistence-task order: claim the pending evidence first, then make
+        // the atomic write fail because its parent path is not a directory.
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let peer_store = PeerStore::new();
+        peer_store.mark_client_delivery_cache_dirty();
+        assert!(peer_store.take_client_delivery_cache_dirty());
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let non_directory_parent =
+            std::env::temp_dir().join(format!("aeronyx-peer-cache-write-failure-{unique}"));
+        tokio::fs::write(&non_directory_parent, b"not a directory")
+            .await
+            .unwrap();
+        let path = non_directory_parent.join("peer-cache.json");
+        let result = Server::persist_peer_store_cache_with_delivery_witnesses(
+            &server.identity,
+            &peer_store,
+            &server.config.discovery,
+            &reqwest::Client::new(),
+            &path.to_string_lossy(),
+            1_800_040_000,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(peer_store.take_client_delivery_cache_dirty());
+        tokio::fs::remove_file(non_directory_parent).await.unwrap();
     }
 
     #[tokio::test]
