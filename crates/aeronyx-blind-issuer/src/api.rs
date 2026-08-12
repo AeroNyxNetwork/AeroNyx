@@ -1377,6 +1377,25 @@ mod tests {
                 .await
                 .expect("backend completion should not time out")
                 .expect("backend operation completed");
+
+            // [BLIND-ISSUER-TEST-RACE 2026-08-12 by Codex] The backend emits
+            // `completed` before the spawn-blocking closure drops its cloned
+            // in-flight guard. Wait on the aggregate operator contract rather
+            // than racing an immediate retry against that final guard drop.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if operational_snapshot(&self.router, &self.authorization)
+                        .await
+                        .in_flight
+                        == 0
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("in-flight capacity should be released after backend completion");
         }
     }
 
