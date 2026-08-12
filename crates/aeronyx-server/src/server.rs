@@ -322,6 +322,9 @@
 // 123. [DIRECTORY-SHUTDOWN-DURABILITY 2026-08-12 by Codex] Gives the
 //      non-cancellable Directory Chain blocking reconciliation enough bounded
 //      shutdown time to finish below the service manager stop deadline.
+// 124. [BACKGROUND-SHUTDOWN-COOPERATION 2026-08-12 by Codex] Makes initial
+//      traffic waits interruptible and adds shutdown checkpoints around each
+//      bounded discovery gossip stage instead of relying on forced aborts.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -451,8 +454,13 @@
 //   - [DIRECTORY-SHUTDOWN-DURABILITY 2026-08-12 by Codex] Keep the Directory
 //     persistence grace below systemd `TimeoutStopSec`. Its blocking SQLite
 //     reconciliation cannot be cancelled safely after it has started.
+//   - [BACKGROUND-SHUTDOWN-COOPERATION 2026-08-12 by Codex] Every long initial
+//     delay and multi-stage gossip round must observe shutdown between bounded
+//     operations; adding another await requires adding the same checkpoint.
 //
 // Last Modified:
+//   v2.8.77-BackgroundShutdownCooperation - Made traffic startup delay
+//     interruptible and bounded discovery shutdown at stage boundaries.
 //   v2.8.76-DirectoryShutdownDurability - Added a bounded, service-manager-safe
 //     grace window for the final signed Directory Chain reconciliation.
 //   v2.8.75-SignedReceiptNegotiation - Bound purpose-receipt probe eligibility
@@ -8033,7 +8041,7 @@ impl Server {
             let mut last_blind_relay_probe_at = 0u64;
             let mut last_two_hop_blind_relay_probe_at = 0u64;
             let mut last_three_hop_blind_relay_probe_at = 0u64;
-            loop {
+            'gossip: loop {
                 if run_immediately {
                     run_immediately = false;
                     peer_store.record_gossip_schedule(unix_now_secs(), false, 0, 0);
@@ -8185,6 +8193,7 @@ impl Server {
                     Vec::new()
                 } else if let Some(store) = directory_replica_store.as_ref() {
                     let store = Arc::clone(store);
+                    let proof_shutdown = Arc::clone(&shutdown);
                     // [DIRECTORY-GOSSIP-PUBLISH 2026-07-27 by Codex] Divide by
                     // the cadence so common intervals (for example, 60
                     // seconds) do not preserve the same modulo forever.
@@ -8193,6 +8202,13 @@ impl Server {
                         let mut announcements =
                             Vec::with_capacity(DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT);
                         for offset in 0..DIRECTORY_GOSSIP_PROOF_CANDIDATE_LIMIT {
+                            // [BACKGROUND-SHUTDOWN-COOPERATION 2026-08-12 by Codex]
+                            // A running blocking audit cannot be preempted, but
+                            // shutdown must prevent the next complete producer
+                            // audit from starting.
+                            if proof_shutdown.load(Ordering::Acquire) {
+                                break;
+                            }
                             let candidate = store.audited_live_descriptor_gossip_announcement(
                                 now,
                                 directory_proof_min_age_secs,
@@ -8233,6 +8249,9 @@ impl Server {
                 } else {
                     Vec::new()
                 };
+                if shutdown.load(Ordering::Acquire) {
+                    break 'gossip;
+                }
 
                 let gossip_started_at = tokio::time::Instant::now();
                 let concurrency_limit = usize::from(config.discovery.gossip_concurrency_limit);
@@ -8301,6 +8320,9 @@ impl Server {
                         .last_failure_reason
                         .map(DiscoveryGossipFailure::bucket),
                 );
+                if shutdown.load(Ordering::Acquire) {
+                    break 'gossip;
+                }
                 if chat_relay_runtime_ready && gossip_round.succeeded > 0 {
                     let probe_now = unix_now_secs();
                     let probe_cooldown_secs = Self::blind_relay_probe_cooldown_secs_for_status(
@@ -8327,6 +8349,9 @@ impl Server {
                             max_candidates,
                         )
                         .await;
+                        if shutdown.load(Ordering::Acquire) {
+                            break 'gossip;
+                        }
                         if probes_started > 0 {
                             last_blind_relay_probe_at = probe_now;
                         }
@@ -8352,6 +8377,9 @@ impl Server {
                             probe_now,
                         )
                         .await;
+                        if shutdown.load(Ordering::Acquire) {
+                            break 'gossip;
+                        }
                         if outcome.attempted {
                             last_two_hop_blind_relay_probe_at = probe_now;
                         }
@@ -8374,6 +8402,9 @@ impl Server {
                                 probe_now,
                             )
                             .await;
+                            if shutdown.load(Ordering::Acquire) {
+                                break 'gossip;
+                            }
                             if three_hop_outcome.attempted {
                                 last_three_hop_blind_relay_probe_at = probe_now;
                             }
@@ -12600,7 +12631,18 @@ impl Server {
         let mut rx = self.shutdown_tx.subscribe();
         let interval_secs = interval_secs.clamp(10, 300);
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            // [BACKGROUND-SHUTDOWN-COOPERATION 2026-08-12 by Codex] A plain
+            // startup sleep kept this task alive for up to five minutes after
+            // SIGTERM. Treat any receiver completion as shutdown; a closed
+            // broadcast means the process owner has disappeared as well.
+            if Self::runtime_delay_interrupted_by_shutdown(
+                &mut rx,
+                Duration::from_secs(interval_secs),
+            )
+            .await
+            {
+                return;
+            }
             let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {
                 tokio::select! {
@@ -12909,7 +12951,22 @@ impl Server {
             // while retaining room beneath the deployed 30-second systemd stop
             // ceiling for listener and transport cleanup.
             "directory-chain-persistence" => Duration::from_secs(20),
+            // One in-progress Directory proof audit cannot be cancelled by
+            // Tokio after entering the blocking pool. Shutdown checkpoints
+            // prevent the round from starting another bounded network/probe
+            // stage after that audit completes.
+            "discovery-gossip" => Duration::from_secs(24),
             _ => Duration::from_secs(5),
+        }
+    }
+
+    async fn runtime_delay_interrupted_by_shutdown(
+        shutdown_rx: &mut broadcast::Receiver<()>,
+        delay: Duration,
+    ) -> bool {
+        tokio::select! {
+            _ = shutdown_rx.recv() => true,
+            _ = tokio::time::sleep(delay) => false,
         }
     }
 
@@ -13774,9 +13831,33 @@ mod tests {
             Duration::from_secs(20)
         );
         assert_eq!(
+            Server::runtime_task_shutdown_grace("discovery-gossip"),
+            Duration::from_secs(24)
+        );
+        assert_eq!(
             Server::runtime_task_shutdown_grace("udp"),
             Duration::from_secs(5)
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_delay_observes_shutdown_before_deadline() {
+        // [BACKGROUND-SHUTDOWN-COOPERATION 2026-08-12 by Codex] Initial
+        // background-task delays must not force the shutdown supervisor to
+        // abort an otherwise idle task.
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let waiter = tokio::spawn(async move {
+            Server::runtime_delay_interrupted_by_shutdown(&mut shutdown_rx, Duration::from_secs(60))
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        shutdown_tx.send(()).expect("deliver shutdown signal");
+        let interrupted = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("interruptible delay timed out")
+            .expect("interruptible delay task failed");
+        assert!(interrupted);
     }
 
     #[tokio::test]
