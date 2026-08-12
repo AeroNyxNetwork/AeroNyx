@@ -319,6 +319,9 @@
 // 122. [CLIENT-DELIVERY-ATOMIC-ROUTE-EVIDENCE 2026-08-11 by Codex] Validates
 //      receipt freshness at response time and commits real two-hop delivery
 //      only while both selected signed route surfaces remain current together.
+// 123. [DIRECTORY-SHUTDOWN-DURABILITY 2026-08-12 by Codex] Gives the
+//      non-cancellable Directory Chain blocking reconciliation enough bounded
+//      shutdown time to finish below the service manager stop deadline.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -445,8 +448,13 @@
 //   - [SIGNED-RECEIPT-NEGOTIATION 2026-08-11 by Codex] Prefer the signed
 //     purpose-bound receipt probe claim over the legacy unsigned summary so a
 //     network intermediary cannot suppress v2 probing with a false negative.
+//   - [DIRECTORY-SHUTDOWN-DURABILITY 2026-08-12 by Codex] Keep the Directory
+//     persistence grace below systemd `TimeoutStopSec`. Its blocking SQLite
+//     reconciliation cannot be cancelled safely after it has started.
 //
 // Last Modified:
+//   v2.8.76-DirectoryShutdownDurability - Added a bounded, service-manager-safe
+//     grace window for the final signed Directory Chain reconciliation.
 //   v2.8.75-SignedReceiptNegotiation - Bound purpose-receipt probe eligibility
 //     to signed descriptors while retaining the legacy summary fallback.
 //   v2.8.74-SignedProtocolFeatures - Advertised authenticated hop-local failure
@@ -12889,13 +12897,19 @@ impl Server {
     }
 
     fn runtime_task_shutdown_grace(name: &str) -> Duration {
-        // The coordinator lease task may finish one bounded renewal and one
-        // bounded release round before exit. Other tasks retain the historical
-        // five-second shutdown budget.
-        if name == "memchain-coordinator-lease" {
-            Duration::from_secs(12)
-        } else {
-            Duration::from_secs(5)
+        match name {
+            // The coordinator lease task may finish one bounded renewal and
+            // one bounded release round before exit.
+            "memchain-coordinator-lease" => Duration::from_secs(12),
+            // [DIRECTORY-SHUTDOWN-DURABILITY 2026-08-12 by Codex] The final
+            // append performs a complete signed-prefix audit in `spawn_blocking`.
+            // Tokio cannot cancel a running blocking closure, so aborting its
+            // async owner after the generic five seconds only detaches active
+            // SQLite work. Twenty seconds covers the measured large-node audit
+            // while retaining room beneath the deployed 30-second systemd stop
+            // ceiling for listener and transport cleanup.
+            "directory-chain-persistence" => Duration::from_secs(20),
+            _ => Duration::from_secs(5),
         }
     }
 
@@ -13754,6 +13768,10 @@ mod tests {
         assert_eq!(
             Server::runtime_task_shutdown_grace("memchain-coordinator-lease"),
             Duration::from_secs(12)
+        );
+        assert_eq!(
+            Server::runtime_task_shutdown_grace("directory-chain-persistence"),
+            Duration::from_secs(20)
         );
         assert_eq!(
             Server::runtime_task_shutdown_grace("udp"),
