@@ -70,6 +70,9 @@
 //   - [FOLLOWER-EFFECTIVE-READINESS 2026-07-30 by Codex] Composite follower
 //     readiness is fail-closed across block convergence and current-tip
 //     certificate policy. It remains aggregate operational evidence only.
+//   - [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] HTTP client creation is
+//     a fallible process boundary. Callers must propagate the build error;
+//     never restore a constructor panic or start partial management workers.
 //
 // Last Modified:
 //   v1.0.0         - Initial implementation
@@ -108,6 +111,8 @@
 //   v2.8.59        - Added fail-closed composite follower readiness
 //   v2.9.0         - [NODE-REGISTRATION-PROFILE 2026-08-02 by Codex] Added
 //                    optional policy-safe first-registration metadata
+//   v2.9.1         - [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Made the
+//                    HTTP client constructor fallible and panic-free
 //   v1.0.0-Membership - TrafficDelta, UserPermission, extended heartbeat
 // ============================================
 
@@ -615,18 +620,32 @@ pub struct ManagementClient {
 }
 
 impl ManagementClient {
-    pub fn new(config: ManagementConfig, identity: IdentityKeyPair) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(config.request_timeout_secs))
-            .build()
-            .expect("Failed to create HTTP client");
+    /// Build a management client with the configured request timeout.
+    ///
+    /// Construction is fallible because `reqwest` may reject the process TLS
+    /// or connector configuration. The server treats that as a typed startup
+    /// failure before any management worker is spawned.
+    pub fn new(
+        config: ManagementConfig,
+        identity: IdentityKeyPair,
+    ) -> std::result::Result<Self, reqwest::Error> {
+        let http = Self::build_http_client(config.request_timeout_secs)?;
         let binary_hash = super::integrity::compute_binary_hash();
-        Self {
+        Ok(Self {
             config,
             http,
             identity,
             binary_hash,
-        }
+        })
+    }
+
+    fn build_http_client(request_timeout_secs: u64) -> std::result::Result<Client, reqwest::Error> {
+        // [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Keep connector
+        // construction isolated from executable integrity hashing so the
+        // fallible startup boundary can be tested quickly and deterministically.
+        Client::builder()
+            .timeout(Duration::from_secs(request_timeout_secs))
+            .build()
     }
 
     pub fn node_id(&self) -> String {
@@ -1002,6 +1021,17 @@ impl std::fmt::Debug for ManagementClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn management_http_client_builder_returns_initialized_connector() {
+        // [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Keep the public
+        // constructor's connector boundary fallible without hashing the large
+        // test executable on every focused or full-suite run.
+        let client =
+            ManagementClient::build_http_client(ManagementConfig::default().request_timeout_secs);
+
+        assert!(client.is_ok());
+    }
 
     #[test]
     fn commitment_heartbeat_contracts_exclude_sensitive_fields() {

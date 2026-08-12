@@ -31,6 +31,8 @@
 //! - [REGISTRATION-CODE-STDIN 2026-08-02 by Codex] Accept bounded registration
 //!   codes from standard input so installers do not expose one-time credentials
 //!   through process command lines; the legacy `--code` flag remains compatible.
+//! - [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Propagate management HTTP
+//!   client initialization errors from node registration instead of panicking.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -51,6 +53,8 @@
 //! pull, exact response verification, local trust policy, and freshness gate
 //! v1.8.0-NodeOnboarding - Add policy-safe node registration metadata
 //! v1.9.0-RegistrationCodeStdin - Add bounded secret-safe registration input
+//! v1.10.0-ManagementClientStartup - Fail registration cleanly when the
+//! management HTTP client cannot initialize
 
 use std::fs::File;
 use std::io::{BufRead, Read};
@@ -503,7 +507,11 @@ async fn cmd_register(
         mgmt_config.cms_url = url;
     }
 
-    let client = ManagementClient::new(mgmt_config.clone(), identity);
+    // [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Registration is a CLI
+    // transaction: connector initialization must return an actionable error
+    // before any remote request or local registration record is created.
+    let client = ManagementClient::new(mgmt_config.clone(), identity)
+        .context("Failed to initialize management HTTP client")?;
     let registration_profile = NodeRegistrationProfile {
         name: normalize_registration_name(node_name)?,
         port: Some(config.listen_addr().port()),

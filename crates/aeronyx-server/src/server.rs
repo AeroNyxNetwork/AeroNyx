@@ -340,6 +340,9 @@
 // 129. [MINER-STARTUP-ERROR 2026-08-12 by Codex] Propagates SaaS miner stub
 //      resource failures through the normal typed startup transaction instead
 //      of panicking after required node resources have already been acquired.
+// 130. [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Treats management HTTP
+//      client construction as a typed startup boundary before spawning any
+//      management worker, preventing a panic or partial control plane.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -474,6 +477,8 @@
 //     operations; adding another await requires adding the same checkpoint.
 //
 // Last Modified:
+//   v2.8.83-ManagementClientStartup - Made management HTTP client creation
+//     fail-closed through ServerError before worker startup.
 //   v2.8.82-MinerStartupError - Made SaaS miner scheduler construction
 //     fail-closed through ServerError instead of process panic.
 //   v2.8.81-FailClosedShutdownSignals - Removed production panic paths from
@@ -3228,7 +3233,7 @@ impl Server {
                 chat_relay.clone(),
                 chat_relay_enabled,
             )
-            .await;
+            .await?;
         for (name, task) in management_tasks {
             tasks.push((
                 name,
@@ -5175,13 +5180,22 @@ impl Server {
         memchain_storage: Option<Arc<MemoryStorage>>,
         chat_relay: Option<Arc<ChatRelayService>>,
         chat_relay_enabled: bool,
-    ) -> ManagementRuntime {
+    ) -> Result<ManagementRuntime> {
         info!("Initializing management reporting...");
 
-        let mgmt_client = Arc::new(ManagementClient::new(
-            self.config.management.clone(),
-            self.identity.clone(),
-        ));
+        // [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Build the shared
+        // connector before spawning workers. A connector/TLS initialization
+        // failure must unwind the server startup transaction, not panic or
+        // leave only a subset of management tasks alive.
+        let mgmt_client = Arc::new(
+            ManagementClient::new(self.config.management.clone(), self.identity.clone()).map_err(
+                |error| {
+                    ServerError::startup_failed(format!(
+                        "management HTTP client initialization failed: {error}"
+                    ))
+                },
+            )?,
+        );
         info!("Node ID: {}", mgmt_client.node_id());
 
         let public_ip = self.resolve_public_ip().await;
@@ -5678,14 +5692,14 @@ impl Server {
         });
 
         info!("[MANAGEMENT] Reporting started");
-        ManagementRuntime {
+        Ok(ManagementRuntime {
             session_events: session_event_sender,
             tasks: [
                 ("management-command-handler", command_handler_task),
                 ("management-heartbeat", heartbeat_task),
                 ("management-session-reporter", session_reporter_task),
             ],
-        }
+        })
     }
 
     // ============================================
