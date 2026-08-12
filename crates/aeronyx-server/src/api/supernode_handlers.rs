@@ -9,14 +9,19 @@
 //! v2.5.2+Pagination        - offset param + has_more in response.
 //! v1.0.1-SaaSFix          - Extract storage from Extensions instead of state.storage
 //!                            (state.storage is None in SaaS mode → would panic).
+//! v1.0.2-TypedContext      - Replaced request-based owner/storage lookups with
+//!                            typed Axum extractors and preserved local fallback.
 //!
 //! ⚠️ Important Notes for Next Developer:
 //! - All endpoints enforce local-only access via `AuthenticatedOwner::is_remote()`.
 //! - GET /supernode/health uses HTTP HEAD to check reachability only — no LLM quota.
-//! - storage is extracted from request Extensions (injected by unified_auth_middleware).
-//!   Never access state.storage directly.
+//! - Storage prefers request Extensions (injected by unified_auth_middleware), then
+//!   falls back to Local-mode state. Never unwrap `state.storage` directly.
+//! - [SUPERNODE-TYPED-CONTEXT 2026-08-12 by Codex] Missing authentication
+//!   context is an Axum rejection and must never trigger release `panic=abort`.
 //!
 //! ## Last Modified
+//! v1.0.2-TypedContext - Typed owner/storage extraction across all six endpoints.
 //! v1.0.1-SaaSFix - Extract storage from Extensions for SaaS compatibility.
 // ============================================
 
@@ -24,23 +29,25 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::api::mpi::{extract_owner, MpiState};
+use crate::api::mpi::{AuthenticatedOwner, MpiState};
 use crate::services::memchain::{LlmRouter, MemoryStorage};
 
 // ============================================
 // Helper: extract storage from Extensions (v1.0.1-SaaSFix)
 // ============================================
 
-fn get_storage(req: &Request<axum::body::Body>, state: &MpiState) -> Option<Arc<MemoryStorage>> {
-    req.extensions()
-        .get::<Arc<MemoryStorage>>()
-        .cloned()
+fn get_storage(
+    storage: Option<Extension<Arc<MemoryStorage>>>,
+    state: &MpiState,
+) -> Option<Arc<MemoryStorage>> {
+    storage
+        .map(|Extension(storage)| storage)
         .or_else(|| state.storage.clone())
 }
 
@@ -245,9 +252,9 @@ fn row_to_summary(t: &crate::services::memchain::CognitiveTaskRow) -> TaskSummar
 pub async fn supernode_list_tasks(
     State(state): State<Arc<MpiState>>,
     Query(params): Query<TaskListParams>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    storage: Option<Extension<Arc<MemoryStorage>>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     if auth.is_remote() {
         return local_only().into_response();
     }
@@ -255,7 +262,7 @@ pub async fn supernode_list_tasks(
         return supernode_disabled().into_response();
     }
 
-    let storage = match get_storage(&req, &state) {
+    let storage = match get_storage(storage, &state) {
         Some(s) => s,
         None => return storage_unavailable().into_response(),
     };
@@ -299,9 +306,9 @@ pub async fn supernode_list_tasks(
 pub async fn supernode_task_detail(
     State(state): State<Arc<MpiState>>,
     Path(task_id): Path<i64>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    storage: Option<Extension<Arc<MemoryStorage>>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     if auth.is_remote() {
         return local_only().into_response();
     }
@@ -309,7 +316,7 @@ pub async fn supernode_task_detail(
         return supernode_disabled().into_response();
     }
 
-    let storage = match get_storage(&req, &state) {
+    let storage = match get_storage(storage, &state) {
         Some(s) => s,
         None => return storage_unavailable().into_response(),
     };
@@ -354,9 +361,9 @@ pub async fn supernode_task_detail(
 pub async fn supernode_retry_task(
     State(state): State<Arc<MpiState>>,
     Path(task_id): Path<i64>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    storage: Option<Extension<Arc<MemoryStorage>>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     if auth.is_remote() {
         return local_only().into_response();
     }
@@ -364,7 +371,7 @@ pub async fn supernode_retry_task(
         return supernode_disabled().into_response();
     }
 
-    let storage = match get_storage(&req, &state) {
+    let storage = match get_storage(storage, &state) {
         Some(s) => s,
         None => return storage_unavailable().into_response(),
     };
@@ -428,9 +435,9 @@ pub async fn supernode_retry_task(
 pub async fn supernode_cancel_task(
     State(state): State<Arc<MpiState>>,
     Path(task_id): Path<i64>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    storage: Option<Extension<Arc<MemoryStorage>>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     if auth.is_remote() {
         return local_only().into_response();
     }
@@ -438,7 +445,7 @@ pub async fn supernode_cancel_task(
         return supernode_disabled().into_response();
     }
 
-    let storage = match get_storage(&req, &state) {
+    let storage = match get_storage(storage, &state) {
         Some(s) => s,
         None => return storage_unavailable().into_response(),
     };
@@ -520,9 +527,9 @@ pub async fn supernode_cancel_task(
 pub async fn supernode_usage(
     State(state): State<Arc<MpiState>>,
     Query(params): Query<UsageParams>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    storage: Option<Extension<Arc<MemoryStorage>>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     if auth.is_remote() {
         return local_only().into_response();
     }
@@ -530,7 +537,7 @@ pub async fn supernode_usage(
         return supernode_disabled().into_response();
     }
 
-    let storage = match get_storage(&req, &state) {
+    let storage = match get_storage(storage, &state) {
         Some(s) => s,
         None => return storage_unavailable().into_response(),
     };
@@ -626,9 +633,9 @@ pub async fn supernode_usage(
 
 pub async fn supernode_health(
     State(state): State<Arc<MpiState>>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    storage: Option<Extension<Arc<MemoryStorage>>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     if auth.is_remote() {
         return local_only().into_response();
     }
@@ -647,7 +654,7 @@ pub async fn supernode_health(
         }
     };
 
-    let storage = match get_storage(&req, &state) {
+    let storage = match get_storage(storage, &state) {
         Some(s) => s,
         None => return storage_unavailable().into_response(),
     };
@@ -739,6 +746,99 @@ pub async fn supernode_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::mpi::SessionEmbeddingCache;
+    use crate::services::memchain::VectorIndex;
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use axum::body::Body;
+    use axum::http::Request;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use tower::ServiceExt;
+
+    fn make_test_state() -> (Arc<MpiState>, AuthenticatedOwner, Arc<MemoryStorage>) {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let vector_index = Arc::new(VectorIndex::new());
+        let identity = IdentityKeyPair::generate();
+        let owner = identity.public_key_bytes();
+        let state = MpiState::local(
+            Arc::clone(&storage),
+            vector_index,
+            identity,
+            RwLock::new(HashMap::new()),
+            AtomicBool::new(true),
+            Arc::new(RwLock::new(HashMap::new())),
+            0.0,
+            false,
+            RwLock::new(SessionEmbeddingCache::default()),
+            RwLock::new(None),
+            owner,
+            None,
+            None,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        (
+            Arc::new(state),
+            AuthenticatedOwner::Local { owner },
+            storage,
+        )
+    }
+
+    #[tokio::test]
+    async fn typed_context_preserves_storage_fallback_and_remote_privacy_gate() {
+        // [SUPERNODE-TYPED-CONTEXT 2026-08-12 by Codex] Local deployments
+        // retain their state-backed store, while malformed middleware wiring
+        // is contained by Axum and remote callers cannot probe configuration.
+        let (state, _local_auth, state_storage) = make_test_state();
+        let resolved = get_storage(None, &state).expect("local state storage must remain usable");
+        assert!(Arc::ptr_eq(&resolved, &state_storage));
+
+        let extension_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let resolved = get_storage(Some(Extension(Arc::clone(&extension_storage))), &state)
+            .expect("request-scoped storage must remain usable");
+        assert!(Arc::ptr_eq(&resolved, &extension_storage));
+
+        let missing_auth = axum::Router::new()
+            .route("/health", axum::routing::get(supernode_health))
+            .with_state(Arc::clone(&state));
+        let response = missing_auth
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let remote_auth = AuthenticatedOwner::Remote {
+            owner: state.owner_key,
+            owner_hex: hex::encode(state.owner_key),
+        };
+        let remote = axum::Router::new()
+            .route("/health", axum::routing::get(supernode_health))
+            .layer(Extension(remote_auth))
+            .with_state(state);
+        let response = remote
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 
     #[test]
     fn test_unix_days_for_date_known_values() {
