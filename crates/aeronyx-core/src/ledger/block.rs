@@ -17,6 +17,8 @@
 //! - v2.7.0-BlockSync: Added the signed, chain-scoped
 //!   `RecordCommitmentBlockV1`. It synchronises only opaque record IDs and
 //!   never embeds memory payloads, owners, tags, or embeddings.
+//! - v2.8.13-AuthorityHandover: Added a replayable, dual-signed coordinator
+//!   authority transition proof without changing the V1 block hash contract.
 //!
 //! ## Main Functionality
 //! - `BlockHeader`: height, timestamp, prev_block_hash, merkle_root, block_type
@@ -54,11 +56,16 @@
 //! - `RecordCommitmentBlockV1` is the distributed integrity contract.
 //!   Do not add full `MemoryRecord` fields to it; owner-authorised sealed
 //!   payload replication is a separate protocol.
+//! - `RecordCoordinatorHandoverV1` is an independent control-plane proof.
+//!   Never mutate historical commitment headers to encode authority changes;
+//!   cold followers need the unchanged block hash plus the complete handover
+//!   history to verify the proposer authorised at each height.
 //!
 //! ## Last Modified
 //! v0.5.0 - Initial Block and BlockHeader for Miner integration
 //! v2.1.0 - 🌟 Added RecordBlock + BLOCK_TYPE_MEMORY for MRS-1
 //! v2.7.0-BlockSync - Added signed node-blind commitment blocks.
+//! v2.8.13-AuthorityHandover - Added dual-signed coordinator handover proofs.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -103,6 +110,9 @@ pub const AERONYX_MEMCHAIN_MAINNET_CHAIN_ID: [u8; 32] = [
 /// First version of the node-blind commitment block contract.
 pub const RECORD_COMMITMENT_BLOCK_VERSION_V1: u16 = 1;
 
+/// First version of the replayable coordinator handover contract.
+pub const RECORD_COORDINATOR_HANDOVER_VERSION_V1: u16 = 1;
+
 /// Hard upper bound for commitments in one synchronised block.
 ///
 /// At 32 bytes per commitment this keeps a block payload below 9 KiB before
@@ -110,6 +120,258 @@ pub const RECORD_COMMITMENT_BLOCK_VERSION_V1: u16 = 1;
 /// fragmentation. Full memory records are deliberately never part of this
 /// structure.
 pub const MAX_RECORD_COMMITMENTS_PER_BLOCK: usize = 256;
+
+// ============================================
+// RecordCoordinatorHandoverV1 — Replayable Authority History
+// ============================================
+
+/// Canonical authority transition metadata signed by both coordinators.
+///
+/// [COORDINATOR-HANDOVER 2026-08-12 by Codex] This object is deliberately
+/// separate from [`RecordCommitmentHeaderV1`]. That preserves every historical
+/// block hash while giving cold followers enough evidence to select the valid
+/// proposer for each height. The transition is anchored to the exact previous
+/// tip so it cannot be replayed onto a divergent prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordCoordinatorHandoverHeaderV1 {
+    /// Wire and hashing contract version.
+    pub protocol_version: u16,
+    /// Prevents a handover from being replayed across networks.
+    pub chain_id: [u8; 32],
+    /// Positive, strictly increasing authority generation.
+    pub authority_epoch: u64,
+    /// First commitment block height the next coordinator may propose.
+    pub activation_height: u64,
+    /// Hash at `activation_height - 1`, binding this proof to one prefix.
+    pub previous_tip_hash: [u8; 32],
+    /// Coordinator authorised before `activation_height`.
+    pub previous_coordinator: [u8; 32],
+    /// Coordinator authorised from `activation_height` onward.
+    pub next_coordinator: [u8; 32],
+    /// Random id making independently issued transitions unambiguous.
+    pub authorization_id: [u8; 16],
+    /// Unix epoch seconds when both parties approved the transition.
+    pub issued_at: u64,
+}
+
+impl RecordCoordinatorHandoverHeaderV1 {
+    /// Computes the domain-separated digest signed by both coordinators.
+    ///
+    /// Field order and little-endian integer encoding are a stable protocol
+    /// contract. New semantics require a new version, never field reordering.
+    #[must_use]
+    pub fn signing_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx-RecordCoordinatorHandover-v1");
+        hasher.update(self.protocol_version.to_le_bytes());
+        hasher.update(self.chain_id);
+        hasher.update(self.authority_epoch.to_le_bytes());
+        hasher.update(self.activation_height.to_le_bytes());
+        hasher.update(self.previous_tip_hash);
+        hasher.update(self.previous_coordinator);
+        hasher.update(self.next_coordinator);
+        hasher.update(self.authorization_id);
+        hasher.update(self.issued_at.to_le_bytes());
+        hasher.finalize().into()
+    }
+}
+
+/// Dual-signed, replayable coordinator authority transition proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordCoordinatorHandoverV1 {
+    /// Canonical transition metadata.
+    pub header: RecordCoordinatorHandoverHeaderV1,
+    /// Signature by `header.previous_coordinator`.
+    #[serde(with = "serde_signature_64")]
+    pub previous_signature: [u8; 64],
+    /// Signature by `header.next_coordinator`, proving key possession and
+    /// explicit acceptance of the chain prefix and activation height.
+    #[serde(with = "serde_signature_64")]
+    pub next_signature: [u8; 64],
+}
+
+/// Validation failures for a coordinator handover proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCoordinatorHandoverValidationError {
+    /// The handover contract version is unsupported.
+    UnsupportedVersion,
+    /// The handover belongs to another chain.
+    WrongChain,
+    /// Authority epochs start at one.
+    InvalidAuthorityEpoch,
+    /// The transition must follow at least one commitment block.
+    InvalidActivationHeight,
+    /// The transition is not anchored to a concrete previous tip.
+    InvalidPreviousTip,
+    /// A coordinator cannot hand authority to itself.
+    SameCoordinator,
+    /// The replay-resistant authorization id is unset.
+    InvalidAuthorizationId,
+    /// The issue time is unset.
+    InvalidIssuedAt,
+    /// The previous coordinator public key is malformed.
+    InvalidPreviousCoordinator,
+    /// The next coordinator public key is malformed.
+    InvalidNextCoordinator,
+    /// The previous coordinator did not authorize the transition.
+    InvalidPreviousSignature,
+    /// The next coordinator did not accept the transition.
+    InvalidNextSignature,
+    /// The authority generation does not immediately follow durable history.
+    AuthorityEpochDiscontinuity,
+    /// Activation is not the block immediately after the audited tip.
+    ActivationHeightDiscontinuity,
+    /// The transition is anchored to a different audited prefix.
+    PreviousTipMismatch,
+    /// The outgoing key is not the currently authorised coordinator.
+    PreviousCoordinatorMismatch,
+}
+
+impl std::fmt::Display for RecordCoordinatorHandoverValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::UnsupportedVersion => "unsupported coordinator handover version",
+            Self::WrongChain => "coordinator handover belongs to another chain",
+            Self::InvalidAuthorityEpoch => "coordinator handover epoch is invalid",
+            Self::InvalidActivationHeight => "coordinator handover activation height is invalid",
+            Self::InvalidPreviousTip => "coordinator handover previous tip is invalid",
+            Self::SameCoordinator => "coordinator handover does not change authority",
+            Self::InvalidAuthorizationId => "coordinator handover authorization id is invalid",
+            Self::InvalidIssuedAt => "coordinator handover issue time is invalid",
+            Self::InvalidPreviousCoordinator => "previous coordinator public key is invalid",
+            Self::InvalidNextCoordinator => "next coordinator public key is invalid",
+            Self::InvalidPreviousSignature => "previous coordinator signature is invalid",
+            Self::InvalidNextSignature => "next coordinator signature is invalid",
+            Self::AuthorityEpochDiscontinuity => {
+                "coordinator handover authority epoch is not contiguous"
+            }
+            Self::ActivationHeightDiscontinuity => {
+                "coordinator handover activation height is not contiguous"
+            }
+            Self::PreviousTipMismatch => "coordinator handover previous tip does not match",
+            Self::PreviousCoordinatorMismatch => {
+                "coordinator handover previous authority does not match"
+            }
+        };
+        f.write_str(value)
+    }
+}
+
+impl std::error::Error for RecordCoordinatorHandoverValidationError {}
+
+impl RecordCoordinatorHandoverV1 {
+    /// Builds a transition accepted by both the outgoing and incoming keys.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new_dual_signed(
+        authority_epoch: u64,
+        activation_height: u64,
+        previous_tip_hash: [u8; 32],
+        authorization_id: [u8; 16],
+        issued_at: u64,
+        previous_coordinator: &IdentityKeyPair,
+        next_coordinator: &IdentityKeyPair,
+    ) -> Self {
+        let header = RecordCoordinatorHandoverHeaderV1 {
+            protocol_version: RECORD_COORDINATOR_HANDOVER_VERSION_V1,
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            authority_epoch,
+            activation_height,
+            previous_tip_hash,
+            previous_coordinator: previous_coordinator.public_key_bytes(),
+            next_coordinator: next_coordinator.public_key_bytes(),
+            authorization_id,
+            issued_at,
+        };
+        let digest = header.signing_digest();
+        Self {
+            previous_signature: previous_coordinator.sign(&digest),
+            next_signature: next_coordinator.sign(&digest),
+            header,
+        }
+    }
+
+    /// Verifies structure, chain scope, key validity, and both signatures.
+    ///
+    /// Epoch continuity, activation against the locally audited tip, and
+    /// uniqueness are storage-layer invariants because they depend on prior
+    /// durable authority history.
+    pub fn verify(
+        &self,
+        expected_chain_id: &[u8; 32],
+    ) -> Result<(), RecordCoordinatorHandoverValidationError> {
+        if self.header.protocol_version != RECORD_COORDINATOR_HANDOVER_VERSION_V1 {
+            return Err(RecordCoordinatorHandoverValidationError::UnsupportedVersion);
+        }
+        if &self.header.chain_id != expected_chain_id {
+            return Err(RecordCoordinatorHandoverValidationError::WrongChain);
+        }
+        if self.header.authority_epoch == 0 {
+            return Err(RecordCoordinatorHandoverValidationError::InvalidAuthorityEpoch);
+        }
+        if self.header.activation_height < 2 {
+            return Err(RecordCoordinatorHandoverValidationError::InvalidActivationHeight);
+        }
+        if self.header.previous_tip_hash == GENESIS_PREV_HASH {
+            return Err(RecordCoordinatorHandoverValidationError::InvalidPreviousTip);
+        }
+        if self.header.previous_coordinator == self.header.next_coordinator {
+            return Err(RecordCoordinatorHandoverValidationError::SameCoordinator);
+        }
+        if self.header.authorization_id == [0u8; 16] {
+            return Err(RecordCoordinatorHandoverValidationError::InvalidAuthorizationId);
+        }
+        if self.header.issued_at == 0 {
+            return Err(RecordCoordinatorHandoverValidationError::InvalidIssuedAt);
+        }
+
+        let previous = IdentityPublicKey::from_bytes(&self.header.previous_coordinator)
+            .map_err(|_| RecordCoordinatorHandoverValidationError::InvalidPreviousCoordinator)?;
+        let next = IdentityPublicKey::from_bytes(&self.header.next_coordinator)
+            .map_err(|_| RecordCoordinatorHandoverValidationError::InvalidNextCoordinator)?;
+        let digest = self.header.signing_digest();
+        previous
+            .verify(&digest, &self.previous_signature)
+            .map_err(|_| RecordCoordinatorHandoverValidationError::InvalidPreviousSignature)?;
+        next.verify(&digest, &self.next_signature)
+            .map_err(|_| RecordCoordinatorHandoverValidationError::InvalidNextSignature)
+    }
+
+    /// Verifies this proof as the exact successor of durable authority state.
+    ///
+    /// [COORDINATOR-HANDOVER 2026-08-12 by Codex] Callers must use this method,
+    /// rather than signature-only [`Self::verify`], before persisting or
+    /// activating a transition. Exact next-height activation eliminates gaps
+    /// and overlapping proposer authority; exact tip binding rejects replay
+    /// onto a different valid chain prefix.
+    pub fn verify_successor(
+        &self,
+        expected_chain_id: &[u8; 32],
+        current_authority_epoch: u64,
+        current_coordinator: &[u8; 32],
+        audited_tip_height: u64,
+        audited_tip_hash: &[u8; 32],
+    ) -> Result<(), RecordCoordinatorHandoverValidationError> {
+        self.verify(expected_chain_id)?;
+        if self.header.authority_epoch != current_authority_epoch.saturating_add(1)
+            || current_authority_epoch == u64::MAX
+        {
+            return Err(RecordCoordinatorHandoverValidationError::AuthorityEpochDiscontinuity);
+        }
+        if self.header.activation_height != audited_tip_height.saturating_add(1)
+            || audited_tip_height == u64::MAX
+        {
+            return Err(RecordCoordinatorHandoverValidationError::ActivationHeightDiscontinuity);
+        }
+        if &self.header.previous_tip_hash != audited_tip_hash {
+            return Err(RecordCoordinatorHandoverValidationError::PreviousTipMismatch);
+        }
+        if &self.header.previous_coordinator != current_coordinator {
+            return Err(RecordCoordinatorHandoverValidationError::PreviousCoordinatorMismatch);
+        }
+        Ok(())
+    }
+}
 
 // ============================================
 // BlockHeader
@@ -799,6 +1061,168 @@ mod tests {
         assert_eq!(
             block.verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, 1, &GENESIS_PREV_HASH,),
             Err(RecordCommitmentValidationError::DuplicateCommitment)
+        );
+    }
+
+    #[test]
+    fn coordinator_handover_v1_roundtrip_and_dual_signature_verify() {
+        let previous = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let handover = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            42,
+            [0xA5; 32],
+            [0x7C; 16],
+            1_780_000_000,
+            &previous,
+            &next,
+        );
+
+        handover
+            .verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID)
+            .expect("fresh dual-signed handover must verify");
+        let encoded = bincode::serialize(&handover).expect("serialize coordinator handover");
+        let restored: RecordCoordinatorHandoverV1 =
+            bincode::deserialize(&encoded).expect("deserialize coordinator handover");
+        assert_eq!(restored, handover);
+        restored
+            .verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID)
+            .expect("restored coordinator handover must verify");
+    }
+
+    #[test]
+    fn coordinator_handover_v1_rejects_single_party_or_field_tampering() {
+        let previous = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let proof = RecordCoordinatorHandoverV1::new_dual_signed(
+            2,
+            99,
+            [0xB6; 32],
+            [0x8D; 16],
+            1_780_000_001,
+            &previous,
+            &next,
+        );
+
+        let mut previous_signature_tampered = proof.clone();
+        previous_signature_tampered.previous_signature[0] ^= 0x01;
+        assert_eq!(
+            previous_signature_tampered.verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID),
+            Err(RecordCoordinatorHandoverValidationError::InvalidPreviousSignature)
+        );
+
+        let mut next_signature_tampered = proof.clone();
+        next_signature_tampered.next_signature[0] ^= 0x01;
+        assert_eq!(
+            next_signature_tampered.verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID),
+            Err(RecordCoordinatorHandoverValidationError::InvalidNextSignature)
+        );
+
+        let mut height_tampered = proof;
+        height_tampered.header.activation_height += 1;
+        assert_eq!(
+            height_tampered.verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID),
+            Err(RecordCoordinatorHandoverValidationError::InvalidPreviousSignature)
+        );
+    }
+
+    #[test]
+    fn coordinator_handover_v1_rejects_unsafe_structure() {
+        let coordinator = IdentityKeyPair::generate();
+        let same_key = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            [0xC7; 32],
+            [0x9E; 16],
+            1_780_000_002,
+            &coordinator,
+            &coordinator,
+        );
+        assert_eq!(
+            same_key.verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID),
+            Err(RecordCoordinatorHandoverValidationError::SameCoordinator)
+        );
+
+        let previous = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let invalid_height = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            1,
+            [0xC8; 32],
+            [0x9F; 16],
+            1_780_000_003,
+            &previous,
+            &next,
+        );
+        assert_eq!(
+            invalid_height.verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID),
+            Err(RecordCoordinatorHandoverValidationError::InvalidActivationHeight)
+        );
+    }
+
+    #[test]
+    fn coordinator_handover_v1_requires_exact_durable_successor() {
+        let previous = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let tip_hash = [0xD9; 32];
+        let proof = RecordCoordinatorHandoverV1::new_dual_signed(
+            4,
+            101,
+            tip_hash,
+            [0xA1; 16],
+            1_780_000_004,
+            &previous,
+            &next,
+        );
+
+        proof
+            .verify_successor(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                3,
+                &previous.public_key_bytes(),
+                100,
+                &tip_hash,
+            )
+            .expect("exact next epoch and height must verify");
+        assert_eq!(
+            proof.verify_successor(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                2,
+                &previous.public_key_bytes(),
+                100,
+                &tip_hash,
+            ),
+            Err(RecordCoordinatorHandoverValidationError::AuthorityEpochDiscontinuity)
+        );
+        assert_eq!(
+            proof.verify_successor(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                3,
+                &previous.public_key_bytes(),
+                99,
+                &tip_hash,
+            ),
+            Err(RecordCoordinatorHandoverValidationError::ActivationHeightDiscontinuity)
+        );
+        assert_eq!(
+            proof.verify_successor(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                3,
+                &previous.public_key_bytes(),
+                100,
+                &[0xDA; 32],
+            ),
+            Err(RecordCoordinatorHandoverValidationError::PreviousTipMismatch)
+        );
+        assert_eq!(
+            proof.verify_successor(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                3,
+                &next.public_key_bytes(),
+                100,
+                &tip_hash,
+            ),
+            Err(RecordCoordinatorHandoverValidationError::PreviousCoordinatorMismatch)
         );
     }
 }

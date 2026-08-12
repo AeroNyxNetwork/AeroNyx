@@ -268,12 +268,13 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v11 → v12: immutable pinned-witness checkpoint certificates
 /// v12 → v13: durable exclusive coordinator lease grants on follower witnesses
 /// v13 → v14: durable verified-delivery anchor high-water decisions
+/// v14 → v15: append-only dual-signed coordinator authority history
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 14;
+const SCHEMA_VERSION: u32 = 15;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -1692,6 +1693,33 @@ impl MemoryStorage {
             CREATE INDEX IF NOT EXISTS idx_verified_delivery_anchor_witnesses_observed
                 ON verified_delivery_anchor_witnesses(observed_at);
 
+            -- v15: replayable coordinator authority history. Each transition
+            -- is dual-signed, anchored to one existing commitment prefix, and
+            -- retained permanently so cold followers can verify the proposer
+            -- authorised at every historical block height. This table stores
+            -- no memory owner, payload, route, endpoint, or user metadata.
+            CREATE TABLE IF NOT EXISTS record_coordinator_handovers (
+                authority_epoch      INTEGER PRIMARY KEY CHECK(authority_epoch > 0),
+                activation_height    INTEGER NOT NULL UNIQUE CHECK(activation_height > 1),
+                previous_height      INTEGER NOT NULL UNIQUE CHECK(previous_height > 0),
+                chain_id             BLOB NOT NULL CHECK(length(chain_id) = 32),
+                protocol_version     INTEGER NOT NULL,
+                previous_tip_hash    BLOB NOT NULL CHECK(length(previous_tip_hash) = 32),
+                previous_coordinator BLOB NOT NULL CHECK(length(previous_coordinator) = 32),
+                next_coordinator     BLOB NOT NULL CHECK(length(next_coordinator) = 32),
+                authorization_id     BLOB NOT NULL UNIQUE CHECK(length(authorization_id) = 16),
+                issued_at            INTEGER NOT NULL CHECK(issued_at > 0),
+                previous_signature   BLOB NOT NULL CHECK(length(previous_signature) = 64),
+                next_signature       BLOB NOT NULL CHECK(length(next_signature) = 64),
+                payload              BLOB NOT NULL CHECK(length(payload) > 0 AND length(payload) <= 1024),
+                accepted_at          INTEGER NOT NULL CHECK(accepted_at > 0),
+                CHECK(activation_height = previous_height + 1),
+                FOREIGN KEY(previous_height) REFERENCES record_commitment_blocks(height)
+                    ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_record_coordinator_handovers_activation
+                ON record_coordinator_handovers(activation_height);
+
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id      TEXT NOT NULL,
@@ -2800,6 +2828,66 @@ impl MemoryStorage {
             conn.execute("UPDATE schema_version SET version = 14", [])
                 .map_err(|error| format!("Update schema version to v14: {error}"))?;
             info!("[STORAGE] Migration to v14 (delivery anchor witnesses) complete");
+        }
+
+        // v14 -> v15: append-only dual-signed coordinator authority history.
+        // [COORDINATOR-HANDOVER 2026-08-12 by Codex] The complete transition
+        // sequence is retained so cold sync can validate historical proposers;
+        // a mutable "current coordinator" row would lose that evidence.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(14);
+
+        if current < 15 {
+            info!(
+                "[STORAGE] Migrating schema v{} -> v15 (coordinator authority history)",
+                current
+            );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS record_coordinator_handovers (
+                    authority_epoch      INTEGER PRIMARY KEY CHECK(authority_epoch > 0),
+                    activation_height    INTEGER NOT NULL UNIQUE CHECK(activation_height > 1),
+                    previous_height      INTEGER NOT NULL UNIQUE CHECK(previous_height > 0),
+                    chain_id             BLOB NOT NULL CHECK(length(chain_id) = 32),
+                    protocol_version     INTEGER NOT NULL,
+                    previous_tip_hash    BLOB NOT NULL CHECK(length(previous_tip_hash) = 32),
+                    previous_coordinator BLOB NOT NULL CHECK(length(previous_coordinator) = 32),
+                    next_coordinator     BLOB NOT NULL CHECK(length(next_coordinator) = 32),
+                    authorization_id     BLOB NOT NULL UNIQUE CHECK(length(authorization_id) = 16),
+                    issued_at            INTEGER NOT NULL CHECK(issued_at > 0),
+                    previous_signature   BLOB NOT NULL CHECK(length(previous_signature) = 64),
+                    next_signature       BLOB NOT NULL CHECK(length(next_signature) = 64),
+                    payload              BLOB NOT NULL CHECK(length(payload) > 0 AND length(payload) <= 1024),
+                    accepted_at          INTEGER NOT NULL CHECK(accepted_at > 0),
+                    CHECK(activation_height = previous_height + 1),
+                    FOREIGN KEY(previous_height) REFERENCES record_commitment_blocks(height)
+                        ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS idx_record_coordinator_handovers_activation
+                    ON record_coordinator_handovers(activation_height);",
+            )
+            .map_err(|error| format!("v15 migration: create coordinator handovers: {error}"))?;
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='record_coordinator_handovers'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !exists {
+                return Err(
+                    "v15 migration: required table 'record_coordinator_handovers' was not created"
+                        .to_string(),
+                );
+            }
+            // Hardcoded 15 preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 15", [])
+                .map_err(|error| format!("Update schema version to v15: {error}"))?;
+            info!("[STORAGE] Migration to v15 (coordinator authority history) complete");
         }
 
         Ok(())
@@ -4747,9 +4835,10 @@ mod tests {
         // bounded proof vault, v10 adds durable equivocation incidents, and
         // v11 adds sticky trusted-divergence incidents, v12 adds immutable
         // checkpoint certificates, v13 adds durable coordinator leases, and
-        // v14 adds aggregate-only delivery-anchor witness high-water state
+        // v14 adds aggregate-only delivery-anchor witness high-water state,
+        // and v15 adds replayable coordinator authority history
         // even when create_schema() was not called.
-        assert_eq!(v, 14);
+        assert_eq!(v, 15);
         for table in [
             "record_commitment_blocks",
             "record_block_commitments",
@@ -4760,6 +4849,7 @@ mod tests {
             "record_checkpoint_certificate_members",
             "record_coordinator_leases",
             "verified_delivery_anchor_witnesses",
+            "record_coordinator_handovers",
         ] {
             let exists: bool = conn
                 .query_row(

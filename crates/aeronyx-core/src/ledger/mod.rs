@@ -20,6 +20,8 @@
 //!   with existing P2P messages.
 //! - v2.7.0-BlockSync: Exported the signed node-blind record commitment
 //!   chain contract used by Rust peers for integrity synchronisation.
+//! - v2.8.13-AuthorityHandover: Exported replayable dual-signed coordinator
+//!   authority transition contracts for witness and cold-sync verification.
 //!
 //! ## Main Functionality
 //!
@@ -66,6 +68,8 @@
 //! v2.7.0-BlockSync - Re-exported commitment block contracts and limits.
 //! v2.8.0-InclusionProof - [DIRECTORY-INCLUSION-PROOF 2026-07-27 by Codex]
 //! Re-exported canonical count-bound Merkle proof construction and verification.
+//! v2.8.13-AuthorityHandover - [COORDINATOR-HANDOVER 2026-08-12 by Codex]
+//! Re-exported the chain-scoped dual-signature authority transition proof.
 
 pub mod block;
 pub mod fact;
@@ -81,9 +85,11 @@ pub use block::Block;
 
 pub use block::{
     BlockHeader, RecordBlock, RecordCommitmentBlockV1, RecordCommitmentHeaderV1,
-    RecordCommitmentValidationError, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, BLOCK_TYPE_CHECKPOINT,
-    BLOCK_TYPE_MEMORY, BLOCK_TYPE_NORMAL, GENESIS_PREV_HASH, MAX_RECORD_COMMITMENTS_PER_BLOCK,
-    RECORD_COMMITMENT_BLOCK_VERSION_V1,
+    RecordCommitmentValidationError, RecordCoordinatorHandoverHeaderV1,
+    RecordCoordinatorHandoverV1, RecordCoordinatorHandoverValidationError,
+    AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, BLOCK_TYPE_CHECKPOINT, BLOCK_TYPE_MEMORY, BLOCK_TYPE_NORMAL,
+    GENESIS_PREV_HASH, MAX_RECORD_COMMITMENTS_PER_BLOCK, RECORD_COMMITMENT_BLOCK_VERSION_V1,
+    RECORD_COORDINATOR_HANDOVER_VERSION_V1,
 };
 pub use merkle::{build_merkle_inclusion_proof, merkle_root, verify_merkle_inclusion_proof};
 

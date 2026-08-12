@@ -78,6 +78,9 @@
 //! - [MEMCHAIN-CHAIN-LEASE 2026-08-12 by Codex] Scopes witness-side
 //!   coordinator exclusivity and monotonic epochs to the chain across key
 //!   rotation while safely normalizing legacy per-identity rows
+//! - [COORDINATOR-HANDOVER 2026-08-12 by Codex] Persists and re-audits the
+//!   complete dual-signed coordinator authority history against exact block
+//!   prefixes, contiguous epochs, and non-overlapping witness leases
 //! - [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Runs signed local-anchor
 //!   writes through one privacy-safe blocking worker boundary.
 //!
@@ -224,8 +227,8 @@ use tracing::{debug, error, info, warn};
 
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::ledger::{
-    MemoryLayer, MemoryRecord, RecordCommitmentBlockV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
-    GENESIS_PREV_HASH,
+    MemoryLayer, MemoryRecord, RecordCommitmentBlockV1, RecordCoordinatorHandoverV1,
+    AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, GENESIS_PREV_HASH,
 };
 use aeronyx_core::protocol::memchain::{
     decode_memchain, encode_memchain, record_chain_checkpoint_response_signing_bytes,
@@ -374,6 +377,15 @@ pub enum RecordCoordinatorLeaseReleaseOutcome {
     },
     /// No matching instance currently owns the coordinator row.
     NotHolder,
+}
+
+/// Result of one append-only coordinator authority transition decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCoordinatorHandoverPersistOutcome {
+    /// A new contiguous dual-signed transition was committed.
+    Inserted,
+    /// The exact same transition was already durable at this epoch.
+    AlreadyPresent,
 }
 
 /// Result of one serialized verified-delivery anchor witness decision.
@@ -634,6 +646,14 @@ struct StoredRecordCommitmentBlockRow {
 // below 9 KiB. Keep startup decoding bounded even if the SQLite file was
 // replaced or modified outside the process.
 const MAX_STORED_COMMITMENT_BLOCK_BYTES: usize = 16 * 1024;
+/// A V1 handover proof is fixed-size and currently below 400 bytes. The
+/// storage bound rejects corrupted or future incompatible payloads before
+/// deserialization while leaving room for bincode representation details.
+const MAX_STORED_COORDINATOR_HANDOVER_BYTES: usize = 1024;
+/// Authority history is never pruned because cold followers need every epoch.
+/// Bound one in-memory audit to prevent a replaced SQLite file from forcing an
+/// unbounded allocation; a protocol-version migration is required beyond it.
+const MAX_COORDINATOR_HANDOVER_HISTORY: usize = 4096;
 /// Bound lock time, rollback journal growth, and caller-controlled allocation.
 /// Peer protocol pages currently use 16 blocks; 32 leaves room for internal
 /// maintenance without turning this storage primitive into an unbounded API.
@@ -887,6 +907,214 @@ fn persist_record_commitment_block_transaction(
             })?;
     }
     Ok(RecordCommitmentAppendOutcome::Inserted)
+}
+
+/// Reads and cryptographically re-audits the complete authority history from
+/// one SQLite snapshot.
+///
+/// [COORDINATOR-HANDOVER 2026-08-12 by Codex] Denormalized columns are checked
+/// against the canonical bincode payload, and every transition is checked
+/// against the exact retained predecessor block. This makes disk tampering,
+/// skipped epochs, height gaps, key substitution, and alternate-prefix replay
+/// fail closed before the latest coordinator can become runtime authority.
+fn read_record_coordinator_handover_history_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    root_coordinator: &[u8; 32],
+) -> Result<Vec<RecordCoordinatorHandoverV1>, String> {
+    let rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT authority_epoch,activation_height,previous_height,
+                        chain_id,protocol_version,previous_tip_hash,
+                        previous_coordinator,next_coordinator,authorization_id,
+                        issued_at,previous_signature,next_signature,payload
+                 FROM record_coordinator_handovers
+                 ORDER BY authority_epoch ASC LIMIT ?1",
+            )
+            .map_err(|error| format!("prepare coordinator handover history: {error}"))?;
+        let limit = i64::try_from(MAX_COORDINATOR_HANDOVER_HISTORY.saturating_add(1))
+            .map_err(|_| "coordinator handover history bound overflow".to_string())?;
+        let rows = statement
+            .query_map(params![limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, Vec<u8>>(12)?,
+                ))
+            })
+            .map_err(|error| format!("read coordinator handover history: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("decode coordinator handover history row: {error}"))?;
+        rows
+    };
+    if rows.len() > MAX_COORDINATOR_HANDOVER_HISTORY {
+        return Err("coordinator handover history exceeds supported bound".to_string());
+    }
+
+    let mut current_epoch = 0u64;
+    let mut current_coordinator = *root_coordinator;
+    let mut history = Vec::with_capacity(rows.len());
+    for (
+        stored_epoch,
+        stored_activation_height,
+        stored_previous_height,
+        stored_chain_id,
+        stored_protocol_version,
+        stored_previous_tip_hash,
+        stored_previous_coordinator,
+        stored_next_coordinator,
+        stored_authorization_id,
+        stored_issued_at,
+        stored_previous_signature,
+        stored_next_signature,
+        payload,
+    ) in rows
+    {
+        if payload.len() > MAX_STORED_COORDINATOR_HANDOVER_BYTES {
+            return Err("stored coordinator handover payload exceeds bound".to_string());
+        }
+        let proof = bincode::deserialize::<RecordCoordinatorHandoverV1>(&payload)
+            .map_err(|_| "stored coordinator handover payload decode failed".to_string())?;
+        let canonical_payload = bincode::serialize(&proof)
+            .map_err(|_| "stored coordinator handover payload encode failed".to_string())?;
+        if canonical_payload != payload {
+            return Err("stored coordinator handover payload is non-canonical".to_string());
+        }
+
+        let authority_epoch = u64::try_from(stored_epoch)
+            .map_err(|_| "stored coordinator handover epoch is invalid".to_string())?;
+        let activation_height = u64::try_from(stored_activation_height)
+            .map_err(|_| "stored coordinator handover activation is invalid".to_string())?;
+        let previous_height = u64::try_from(stored_previous_height)
+            .map_err(|_| "stored coordinator handover predecessor is invalid".to_string())?;
+        let issued_at = u64::try_from(stored_issued_at)
+            .map_err(|_| "stored coordinator handover issue time is invalid".to_string())?;
+        if authority_epoch != proof.header.authority_epoch
+            || activation_height != proof.header.activation_height
+            || activation_height.checked_sub(1) != Some(previous_height)
+            || stored_chain_id.as_slice() != proof.header.chain_id.as_slice()
+            || stored_protocol_version != i64::from(proof.header.protocol_version)
+            || stored_previous_tip_hash.as_slice() != proof.header.previous_tip_hash.as_slice()
+            || stored_previous_coordinator.as_slice()
+                != proof.header.previous_coordinator.as_slice()
+            || stored_next_coordinator.as_slice() != proof.header.next_coordinator.as_slice()
+            || stored_authorization_id.as_slice() != proof.header.authorization_id.as_slice()
+            || issued_at != proof.header.issued_at
+            || stored_previous_signature.as_slice() != proof.previous_signature.as_slice()
+            || stored_next_signature.as_slice() != proof.next_signature.as_slice()
+        {
+            return Err(format!(
+                "stored coordinator handover row mismatch at epoch {authority_epoch}"
+            ));
+        }
+
+        let previous_tip_hash: Vec<u8> = transaction
+            .query_row(
+                "SELECT block_hash FROM record_commitment_blocks WHERE height=?1",
+                params![stored_previous_height],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                format!(
+                    "read coordinator handover predecessor at height {previous_height}: {error}"
+                )
+            })?;
+        let previous_tip_hash: [u8; 32] =
+            previous_tip_hash
+                .try_into()
+                .map_err(|value: Vec<u8>| {
+                    format!(
+                        "coordinator handover predecessor hash length {}",
+                        value.len()
+                    )
+                })?;
+        proof
+            .verify_successor(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                current_epoch,
+                &current_coordinator,
+                previous_height,
+                &previous_tip_hash,
+            )
+            .map_err(|error| {
+                format!("coordinator handover audit failed at epoch {authority_epoch}: {error}")
+            })?;
+        current_epoch = authority_epoch;
+        current_coordinator = proof.header.next_coordinator;
+        history.push(proof);
+    }
+    verify_record_commitment_proposer_history_transaction(
+        transaction,
+        root_coordinator,
+        &history,
+    )?;
+    Ok(history)
+}
+
+/// Verifies that every retained block was signed by the coordinator authorised
+/// for that exact height.
+///
+/// Block cryptography and denormalized row integrity are covered by the normal
+/// commitment audit. This authority audit supplies the missing historical key
+/// schedule: root key before epoch one, then each dual-signed transition from
+/// its exact activation height onward.
+fn verify_record_commitment_proposer_history_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    root_coordinator: &[u8; 32],
+    history: &[RecordCoordinatorHandoverV1],
+) -> Result<(), String> {
+    let mut statement = transaction
+        .prepare("SELECT height,proposer FROM record_commitment_blocks ORDER BY height ASC")
+        .map_err(|error| format!("prepare commitment proposer authority audit: {error}"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| format!("query commitment proposer authority audit: {error}"))?;
+    let mut current_coordinator = *root_coordinator;
+    let mut transitions = history.iter().peekable();
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("read commitment proposer authority row: {error}"))?
+    {
+        let height = row
+            .get::<_, i64>(0)
+            .map_err(|error| format!("decode commitment proposer height: {error}"))?;
+        let height = u64::try_from(height)
+            .map_err(|_| "commitment proposer height is invalid".to_string())?;
+        let proposer = row
+            .get::<_, Vec<u8>>(1)
+            .map_err(|error| format!("decode commitment proposer: {error}"))?;
+        let proposer: [u8; 32] = proposer.try_into().map_err(|value: Vec<u8>| {
+            format!("commitment proposer length {} at height {height}", value.len())
+        })?;
+
+        if let Some(transition) = transitions.peek() {
+            if transition.header.activation_height < height {
+                return Err(format!(
+                    "coordinator handover activation was skipped before height {height}"
+                ));
+            }
+            if transition.header.activation_height == height {
+                current_coordinator = transition.header.next_coordinator;
+                transitions.next();
+            }
+        }
+        if proposer != current_coordinator {
+            return Err(format!(
+                "commitment block has an unauthorized proposer at height {height}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn persist_record_commitment_tip_transaction(
@@ -3835,6 +4063,203 @@ impl MemoryStorage {
         tx.commit()
             .map_err(|error| format!("commit verified-delivery witness decision: {error}"))?;
         Ok(outcome)
+    }
+
+    /// Returns the complete cryptographically audited coordinator history.
+    ///
+    /// The root key is an operator-configured trust anchor. Returned proofs
+    /// contain only node control-plane keys and chain positions; no memory,
+    /// owner, message, route, endpoint, or client metadata is involved.
+    pub async fn record_coordinator_handover_history(
+        &self,
+        root_coordinator: &[u8; 32],
+    ) -> Result<Vec<RecordCoordinatorHandoverV1>, String> {
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("begin coordinator handover audit: {error}"))?;
+        let integrity = (*self.commitment_integrity.read())
+            .ok_or_else(|| "commitment chain is not fully audited".to_string())?;
+        let (tip_height, tip_hash) =
+            read_record_commitment_tip_transaction(&transaction, "coordinator handover audit")?;
+        if integrity.verified_tip_height != tip_height
+            || integrity.verified_tip_hash != tip_hash
+            || integrity.verified_block_count != tip_height
+        {
+            return Err("commitment chain audit baseline is stale".to_string());
+        }
+        let history =
+            read_record_coordinator_handover_history_transaction(&transaction, root_coordinator)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit coordinator handover audit snapshot: {error}"))?;
+        Ok(history)
+    }
+
+    /// Atomically verifies and appends one coordinator authority transition.
+    ///
+    /// [COORDINATOR-HANDOVER 2026-08-12 by Codex] The entire prior authority
+    /// history is re-audited in the same `IMMEDIATE` transaction. The new
+    /// proof must be the exact next epoch, activate at audited tip + 1, bind
+    /// that tip hash, be signed by both keys, and observe an expired or
+    /// explicitly released witness lease. Exact retries are idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed or non-contiguous proofs, conflicting
+    /// durable history, an active coordinator lease, a future issue time,
+    /// storage corruption, integer overflow, or SQLite failure.
+    pub async fn persist_record_coordinator_handover(
+        &self,
+        root_coordinator: &[u8; 32],
+        proof: &RecordCoordinatorHandoverV1,
+        accepted_at: u64,
+    ) -> Result<RecordCoordinatorHandoverPersistOutcome, String> {
+        proof
+            .verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID)
+            .map_err(|error| format!("coordinator handover proof is invalid: {error}"))?;
+        if accepted_at == 0 {
+            return Err("coordinator handover acceptance time is invalid".to_string());
+        }
+        if proof.header.issued_at > accepted_at {
+            return Err("coordinator handover issue time is in the future".to_string());
+        }
+        let payload = bincode::serialize(proof)
+            .map_err(|error| format!("serialize coordinator handover: {error}"))?;
+        if payload.len() > MAX_STORED_COORDINATOR_HANDOVER_BYTES {
+            return Err("coordinator handover payload exceeds storage limit".to_string());
+        }
+
+        let accepted_at_i64 = i64::try_from(accepted_at)
+            .map_err(|_| "coordinator handover acceptance exceeds SQLite range".to_string())?;
+        let authority_epoch_i64 = i64::try_from(proof.header.authority_epoch)
+            .map_err(|_| "coordinator handover epoch exceeds SQLite range".to_string())?;
+        let activation_height_i64 = i64::try_from(proof.header.activation_height)
+            .map_err(|_| "coordinator handover activation exceeds SQLite range".to_string())?;
+        let previous_height = proof
+            .header
+            .activation_height
+            .checked_sub(1)
+            .ok_or_else(|| "coordinator handover predecessor underflow".to_string())?;
+        let previous_height_i64 = i64::try_from(previous_height)
+            .map_err(|_| "coordinator handover predecessor exceeds SQLite range".to_string())?;
+        let issued_at_i64 = i64::try_from(proof.header.issued_at)
+            .map_err(|_| "coordinator handover issue time exceeds SQLite range".to_string())?;
+
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin coordinator handover transaction: {error}"))?;
+        let integrity = (*self.commitment_integrity.read())
+            .ok_or_else(|| "commitment chain is not fully audited".to_string())?;
+        let (tip_height, tip_hash) =
+            read_record_commitment_tip_transaction(&transaction, "coordinator handover")?;
+        if integrity.verified_tip_height != tip_height
+            || integrity.verified_tip_hash != tip_hash
+            || integrity.verified_block_count != tip_height
+        {
+            return Err("commitment chain audit baseline is stale".to_string());
+        }
+        let history =
+            read_record_coordinator_handover_history_transaction(&transaction, root_coordinator)?;
+        if let Some(existing) = history
+            .iter()
+            .find(|entry| entry.header.authority_epoch == proof.header.authority_epoch)
+        {
+            if existing == proof {
+                transaction.commit().map_err(|error| {
+                    format!("commit idempotent coordinator handover: {error}")
+                })?;
+                return Ok(RecordCoordinatorHandoverPersistOutcome::AlreadyPresent);
+            }
+            return Err(format!(
+                "conflicting coordinator handover at epoch {}",
+                proof.header.authority_epoch
+            ));
+        }
+
+        let (current_epoch, current_coordinator) = history.last().map_or(
+            (0, *root_coordinator),
+            |entry| {
+                (
+                    entry.header.authority_epoch,
+                    entry.header.next_coordinator,
+                )
+            },
+        );
+        proof
+            .verify_successor(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                current_epoch,
+                &current_coordinator,
+                tip_height,
+                &tip_hash,
+            )
+            .map_err(|error| format!("coordinator handover is not the next authority: {error}"))?;
+
+        let leases = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT lease_expires_at,updated_at
+                     FROM record_coordinator_leases WHERE chain_id=?1",
+                )
+                .map_err(|error| format!("prepare coordinator handover lease check: {error}"))?;
+            let rows = statement
+                .query_map(params![proof.header.chain_id.as_slice()], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|error| format!("read coordinator handover leases: {error}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("decode coordinator handover lease: {error}"))?;
+            rows
+        };
+        for (lease_expires_at, updated_at) in leases {
+            let lease_expires_at = u64::try_from(lease_expires_at)
+                .map_err(|_| "coordinator handover lease expiry is invalid".to_string())?;
+            let updated_at = u64::try_from(updated_at)
+                .map_err(|_| "coordinator handover lease update time is invalid".to_string())?;
+            let explicitly_released = lease_expires_at <= updated_at;
+            if !explicitly_released
+                && accepted_at
+                    < lease_expires_at.saturating_add(COORDINATOR_LEASE_HANDOVER_GRACE_SECS)
+            {
+                return Err(
+                    "coordinator handover rejected while a witness lease remains active"
+                        .to_string(),
+                );
+            }
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO record_coordinator_handovers
+                    (authority_epoch,activation_height,previous_height,chain_id,
+                     protocol_version,previous_tip_hash,previous_coordinator,
+                     next_coordinator,authorization_id,issued_at,
+                     previous_signature,next_signature,payload,accepted_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    authority_epoch_i64,
+                    activation_height_i64,
+                    previous_height_i64,
+                    proof.header.chain_id.as_slice(),
+                    i64::from(proof.header.protocol_version),
+                    proof.header.previous_tip_hash.as_slice(),
+                    proof.header.previous_coordinator.as_slice(),
+                    proof.header.next_coordinator.as_slice(),
+                    proof.header.authorization_id.as_slice(),
+                    issued_at_i64,
+                    proof.previous_signature.as_slice(),
+                    proof.next_signature.as_slice(),
+                    payload,
+                    accepted_at_i64,
+                ],
+            )
+            .map_err(|error| format!("persist coordinator handover: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit coordinator handover: {error}"))?;
+        Ok(RecordCoordinatorHandoverPersistOutcome::Inserted)
     }
 
     /// Atomically grants or renews one durable witness-side chain lease.
@@ -7573,6 +7998,246 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_coordinator_handover_history_is_contiguous_and_idempotent() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let root = IdentityKeyPair::generate();
+        let second = IdentityKeyPair::generate();
+        let third = IdentityKeyPair::generate();
+
+        let first_block = signed_commitment_block(1, GENESIS_PREV_HASH, 0x41, &root);
+        storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        let first_handover = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x51; 16],
+            2_000,
+            &root,
+            &second,
+        );
+        assert_eq!(
+            storage
+                .persist_record_coordinator_handover(
+                    &root.public_key_bytes(),
+                    &first_handover,
+                    2_001,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorHandoverPersistOutcome::Inserted
+        );
+        assert_eq!(
+            storage
+                .persist_record_coordinator_handover(
+                    &root.public_key_bytes(),
+                    &first_handover,
+                    2_002,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorHandoverPersistOutcome::AlreadyPresent
+        );
+
+        let second_block = signed_commitment_block(2, first_block.hash(), 0x42, &second);
+        storage
+            .append_record_commitment_block(&second_block, None)
+            .await
+            .unwrap();
+        let second_handover = RecordCoordinatorHandoverV1::new_dual_signed(
+            2,
+            3,
+            second_block.hash(),
+            [0x52; 16],
+            2_003,
+            &second,
+            &third,
+        );
+        assert_eq!(
+            storage
+                .persist_record_coordinator_handover(
+                    &root.public_key_bytes(),
+                    &second_handover,
+                    2_004,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorHandoverPersistOutcome::Inserted
+        );
+
+        let history = storage
+            .record_coordinator_handover_history(&root.public_key_bytes())
+            .await
+            .unwrap();
+        assert_eq!(history, vec![first_handover, second_handover]);
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_handover_rejects_epoch_gap_and_active_lease() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let root = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let first_block = signed_commitment_block(1, GENESIS_PREV_HASH, 0x43, &root);
+        storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+
+        let skipped_epoch = RecordCoordinatorHandoverV1::new_dual_signed(
+            2,
+            2,
+            first_block.hash(),
+            [0x53; 16],
+            3_000,
+            &root,
+            &next,
+        );
+        assert!(storage
+            .persist_record_coordinator_handover(
+                &root.public_key_bytes(),
+                &skipped_epoch,
+                3_001,
+            )
+            .await
+            .unwrap_err()
+            .contains("authority epoch is not contiguous"));
+
+        let instance = [0x54; 32];
+        assert!(matches!(
+            storage
+                .grant_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &root.public_key_bytes(),
+                    &instance,
+                    1,
+                    &first_block.hash(),
+                    3_002,
+                    MIN_COORDINATOR_LEASE_TTL_SECS_V1,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseGrantOutcome::Granted { .. }
+        ));
+        let valid = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x55; 16],
+            3_003,
+            &root,
+            &next,
+        );
+        assert_eq!(
+            storage
+                .persist_record_coordinator_handover(
+                    &root.public_key_bytes(),
+                    &valid,
+                    3_004,
+                )
+                .await
+                .unwrap_err(),
+            "coordinator handover rejected while a witness lease remains active"
+        );
+        assert!(matches!(
+            storage
+                .release_record_commitment_coordinator_lease(
+                    &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    &root.public_key_bytes(),
+                    &instance,
+                    3_005,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorLeaseReleaseOutcome::Released { .. }
+        ));
+        assert_eq!(
+            storage
+                .persist_record_coordinator_handover(
+                    &root.public_key_bytes(),
+                    &valid,
+                    3_006,
+                )
+                .await
+                .unwrap(),
+            RecordCoordinatorHandoverPersistOutcome::Inserted
+        );
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_handover_history_rejects_denormalized_tampering() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let root = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let first_block = signed_commitment_block(1, GENESIS_PREV_HASH, 0x44, &root);
+        storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        let proof = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x56; 16],
+            4_000,
+            &root,
+            &next,
+        );
+        storage
+            .persist_record_coordinator_handover(&root.public_key_bytes(), &proof, 4_001)
+            .await
+            .unwrap();
+        {
+            let conn = storage.conn.lock().await;
+            conn.execute(
+                "UPDATE record_coordinator_handovers SET next_signature=?1
+                 WHERE authority_epoch=1",
+                params![[0xFF_u8; 64].as_slice()],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .record_coordinator_handover_history(&root.public_key_bytes())
+            .await
+            .unwrap_err()
+            .contains("stored coordinator handover row mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_handover_rejects_unauthorized_historical_proposer() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let root = IdentityKeyPair::generate();
+        let unauthorized = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let first_block =
+            signed_commitment_block(1, GENESIS_PREV_HASH, 0x45, &unauthorized);
+        storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        let proof = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x57; 16],
+            5_000,
+            &root,
+            &next,
+        );
+
+        assert!(storage
+            .persist_record_coordinator_handover(&root.public_key_bytes(), &proof, 5_001)
+            .await
+            .unwrap_err()
+            .contains("unauthorized proposer at height 1"));
+    }
+
+    #[tokio::test]
     async fn test_witness_coordinator_lease_is_exclusive_renewable_and_restart_durable() {
         let directory = TempDir::new().unwrap();
         let db_path = directory.path().join("witness-lease.db");
@@ -10819,12 +11484,22 @@ mod tests {
         drop(legacy);
 
         let migrated = MemoryStorage::open(&path, None).unwrap();
-        let version: u32 = {
+        let (version, handover_table_exists): (u32, i64) = {
             let conn = migrated.conn_lock().await;
-            conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-                .unwrap()
+            (
+                conn.query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                    .unwrap(),
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='record_coordinator_handovers'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            )
         };
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
+        assert_eq!(handover_table_exists, 1);
         let chain = migrated.audit_record_commitment_chain().await.unwrap();
         assert_eq!(chain.block_count, 1);
         assert_eq!(migrated.record_commitment_chain_tip().await.1, block.hash());
@@ -10870,7 +11545,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -10914,7 +11589,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -10965,7 +11640,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         assert_eq!(certificates, 1);
         assert_eq!(members, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
