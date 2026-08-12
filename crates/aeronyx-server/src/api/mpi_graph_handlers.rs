@@ -46,29 +46,33 @@
 //! - mpi_artifact_detail and mpi_artifact_versions are still stubs (Phase D).
 //! - conn_lock() in mpi_entity_graph is Local-mode only; SaaS returns empty.
 //! - make_state() in tests must stay in sync with MpiState struct fields.
+//! - [GRAPH-EXTENSION-EXTRACTORS 2026-08-12 by Codex] Request context uses
+//!   Axum's typed `Extension<T>` extractors. Missing middleware state must be
+//!   rejected as HTTP 500 by Axum and must never panic a request task.
 //!
 //! ## Last Modified
+//! v1.0.2-ExtensionExtractors - Replaced manual extension expectations across
+//!                             all graph endpoints with typed Axum extractors.
 //! v1.0.1-SaaSFix - Extension-based storage; mpi_artifacts_search added;
 //!                  make_state updated; conn_lock Local-mode guard added.
 // ============================================
 
 use std::sync::Arc;
 
-use axum::http::Request;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::services::memchain::graph;
 use crate::services::memchain::storage_crypto::decrypt_rawlog_content_pub;
-use crate::services::memchain::{MemoryStorage, VectorIndex};
+use crate::services::memchain::MemoryStorage;
 
-use super::mpi::{default_list_limit, extract_owner, Mode, MpiState};
+use super::mpi::{default_list_limit, AuthenticatedOwner, Mode, MpiState};
 
 // ============================================
 // Shared Query Params
@@ -103,14 +107,10 @@ pub struct ConversationTurn {
 pub async fn mpi_projects(
     State(_state): State<Arc<MpiState>>,
     Query(params): Query<ListParams>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let projects = storage
         .get_projects(&owner, params.status.as_deref(), params.limit.min(100))
@@ -126,14 +126,10 @@ pub async fn mpi_projects(
 pub async fn mpi_project_detail(
     State(_state): State<Arc<MpiState>>,
     Path(project_id): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     match storage.get_project(&project_id, &owner).await {
         Some(p) => (StatusCode::OK, Json(serde_json::json!(p))).into_response(),
@@ -149,14 +145,10 @@ pub async fn mpi_project_timeline(
     State(_state): State<Arc<MpiState>>,
     Path(project_id): Path<String>,
     Query(params): Query<ListParams>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let limit = params.limit.min(100);
     let offset = params.offset;
@@ -183,14 +175,10 @@ pub async fn mpi_project_timeline(
 pub async fn mpi_session_detail(
     State(_state): State<Arc<MpiState>>,
     Path(session_id): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     match storage.get_session(&session_id, &owner).await {
         Some(s) => (StatusCode::OK, Json(serde_json::json!(s))).into_response(),
@@ -205,17 +193,11 @@ pub async fn mpi_session_detail(
 pub async fn mpi_session_conversation(
     State(state): State<Arc<MpiState>>,
     Path(session_id): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req);
     let owner = auth.owner_bytes();
     let is_remote = auth.is_remote();
-
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
 
     // Verify ownership — return 404 (not 403) to avoid leaking session existence.
     let session_meta = storage.get_session(&session_id, &owner).await;
@@ -314,14 +296,10 @@ pub async fn mpi_session_conversation(
 pub async fn mpi_session_artifacts(
     State(_state): State<Arc<MpiState>>,
     Path(session_id): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let artifacts = storage.get_artifacts_for_session(&session_id, &owner).await;
     debug!(session = %session_id, artifacts = artifacts.len(), "[MPI] GET /sessions/:id/artifacts");
@@ -355,14 +333,10 @@ pub struct ArtifactSearchParams {
 pub async fn mpi_artifacts_search(
     State(_state): State<Arc<MpiState>>,
     Query(params): Query<ArtifactSearchParams>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let limit = params.limit.min(100).max(1);
     let offset = params.offset;
@@ -416,9 +390,9 @@ pub async fn mpi_artifacts_search(
 pub async fn mpi_artifact_detail(
     State(_state): State<Arc<MpiState>>,
     Path(artifact_id): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
 ) -> impl IntoResponse {
-    let _owner = extract_owner(&req).owner_bytes();
+    let _owner = auth.owner_bytes();
     debug!(artifact = %artifact_id, "[MPI] GET /artifacts/:id (stub)");
     (
         StatusCode::OK,
@@ -433,9 +407,9 @@ pub async fn mpi_artifact_detail(
 pub async fn mpi_artifact_versions(
     State(_state): State<Arc<MpiState>>,
     Path(artifact_id): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
 ) -> impl IntoResponse {
-    let _owner = extract_owner(&req).owner_bytes();
+    let _owner = auth.owner_bytes();
     debug!(artifact = %artifact_id, "[MPI] GET /artifacts/:id/versions (stub)");
     let versions: Vec<crate::services::memchain::ArtifactRow> = Vec::new();
     (
@@ -453,14 +427,10 @@ pub async fn mpi_artifact_versions(
 pub async fn mpi_entity_detail(
     State(_state): State<Arc<MpiState>>,
     Path(entity_id): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     match storage.get_entity(&entity_id).await {
         Some(entity) => {
@@ -493,14 +463,10 @@ pub async fn mpi_entity_detail(
 pub async fn mpi_entity_graph(
     State(state): State<Arc<MpiState>>,
     Path(entity_id): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let node_json: Vec<serde_json::Value> = if state.mode == Mode::Local {
         let conn = storage.conn_lock().await;
@@ -534,14 +500,10 @@ pub async fn mpi_entity_graph(
 pub async fn mpi_entities_list(
     State(_state): State<Arc<MpiState>>,
     Query(params): Query<ListParams>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let limit = params.limit.min(200).max(1);
     let offset = params.offset;
@@ -576,14 +538,10 @@ pub struct SearchParams {
 pub async fn mpi_search(
     State(_state): State<Arc<MpiState>>,
     Query(params): Query<SearchParams>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let limit = params.limit.min(100).max(1);
 
@@ -621,14 +579,10 @@ pub async fn mpi_entity_timeline(
     State(_state): State<Arc<MpiState>>,
     Path(entity_id): Path<String>,
     Query(params): Query<ListParams>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let limit = params.limit.min(200).max(1);
     let offset = params.offset;
@@ -689,14 +643,10 @@ fn default_context_sessions() -> usize {
 pub async fn mpi_context_inject(
     State(_state): State<Arc<MpiState>>,
     Query(params): Query<ContextInjectParams>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let max_tokens = params.max_tokens.min(2000).max(100);
     let recent_count = params.recent_sessions.min(10).max(1);
@@ -827,14 +777,10 @@ pub async fn mpi_context_inject(
 
 pub async fn mpi_communities(
     State(_state): State<Arc<MpiState>>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let owner = extract_owner(&req).owner_bytes();
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
+    let owner = auth.owner_bytes();
 
     let communities = storage.get_communities(&owner).await;
     debug!(count = communities.len(), "[MPI] GET /communities");
@@ -909,6 +855,40 @@ mod tests {
             pool_max_connections: 0,
             pool_idle_timeout_secs: 0,
         })
+    }
+
+    #[tokio::test]
+    async fn missing_graph_extensions_return_internal_server_error_without_panicking() {
+        // [GRAPH-EXTENSION-EXTRACTORS 2026-08-12 by Codex] A router wiring
+        // regression must be contained as an Axum rejection, never a panic in
+        // a request task or an abort of the node process.
+        let state = make_state().await;
+        let owner = state.owner_key;
+
+        let missing_auth = axum::Router::new()
+            .route("/projects", axum::routing::get(mpi_projects))
+            .with_state(Arc::clone(&state));
+        let request = Request::builder()
+            .uri("/projects")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            missing_auth.oneshot(request).await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let missing_storage = axum::Router::new()
+            .route("/projects", axum::routing::get(mpi_projects))
+            .layer(Extension(AuthenticatedOwner::Local { owner }))
+            .with_state(state);
+        let request = Request::builder()
+            .uri("/projects")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            missing_storage.oneshot(request).await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
