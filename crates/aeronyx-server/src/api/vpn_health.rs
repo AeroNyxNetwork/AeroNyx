@@ -63,11 +63,14 @@
 //! [SYSTEMD-CHILD-ISOLATION 2026-08-11 by Codex] Local health commands use the
 //! crate-owned isolated process factory so they cannot inherit readiness,
 //! watchdog, or socket-activation authority from the Rust service process.
+//! [HEALTH-SNAPSHOT-LATENCY 2026-08-12 by Codex] Independent host checks run
+//! concurrently, while bounded journal telemetry refreshes in the background.
+//! Slow local journals therefore cannot stall VPN health or CMS heartbeats.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
@@ -96,6 +99,9 @@ const VPN_SERVICE_NAME_ENV: &str = "AERONYX_SYSTEMD_SERVICE";
 const PROC_SELF_CGROUP_PATH: &str = "/proc/self/cgroup";
 const UPGRADE_STATUS_FILE: &str = "/var/lib/aeronyx/upgrade-status.json";
 const AERONYX_STATE_DIR: &str = "/var/lib/aeronyx";
+const RECENT_ERROR_CACHE_TTL_SECS: u64 = 60;
+const RECENT_ERROR_CACHE_MAX_STALE_SECS: u64 = 600;
+const RECENT_ERROR_COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
 static RUNTIME_STARTED_AT: OnceLock<u64> = OnceLock::new();
 
 #[derive(Clone)]
@@ -247,6 +253,16 @@ struct RecentErrorEvent {
     message: String,
     privacy_boundary: &'static str,
 }
+
+#[derive(Debug, Default)]
+struct RecentErrorCache {
+    entries: RwLock<Vec<RecentErrorEvent>>,
+    last_attempt_at: AtomicU64,
+    last_success_at: AtomicU64,
+    refresh_in_flight: AtomicBool,
+}
+
+static RECENT_ERROR_CACHE: OnceLock<RecentErrorCache> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 struct NodeUpgradeStatus {
@@ -571,22 +587,44 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let listen_addr = config.listen_addr();
     let tun_device = config.device_name().to_string();
     let configured_mtu = config.mtu();
-    let running_mtu = read_tun_mtu(&tun_device).await.ok();
     let ip_range = config.ip_range().to_string();
     let service_name = resolve_vpn_service_name();
-    let service_manager = collect_service_manager_status(&service_name).await;
-
-    let mut checks = Vec::new();
-    let udp_listener_check = check_udp_listener(listen_addr).await;
+    // [HEALTH-SNAPSHOT-LATENCY 2026-08-12 by Codex] These probes do not
+    // depend on one another. Running them serially made one slow local command
+    // multiply the latency of every health request and management heartbeat.
+    let (
+        running_mtu_result,
+        service_manager,
+        udp_listener_check,
+        tun_device_check,
+        ip_forward_check,
+        nat_masquerade_check,
+        dns_socket_check,
+        dns_query_check,
+        internet_egress_check,
+    ) = tokio::join!(
+        read_tun_mtu(&tun_device),
+        collect_service_manager_status(&service_name),
+        check_udp_listener(listen_addr),
+        check_tun_device(&tun_device),
+        check_ip_forwarding(),
+        check_nat_masquerade(&ip_range),
+        check_dns_socket(gateway_ip),
+        check_dns_query(gateway_ip),
+        check_internet_egress(),
+    );
+    let running_mtu = running_mtu_result.ok();
     let transport_health = collect_transport_health(&config, listen_addr, udp_listener_check.ok);
-    checks.push(udp_listener_check);
-    checks.push(check_tun_device(&tun_device).await);
-    checks.push(check_mtu_config(&tun_device, configured_mtu, running_mtu).await);
-    checks.push(check_ip_forwarding().await);
-    checks.push(check_nat_masquerade(&ip_range).await);
-    checks.push(check_dns_socket(gateway_ip).await);
-    checks.push(check_dns_query(gateway_ip).await);
-    checks.push(check_internet_egress().await);
+    let checks = vec![
+        udp_listener_check,
+        tun_device_check,
+        check_mtu_config(&tun_device, configured_mtu, running_mtu).await,
+        ip_forward_check,
+        nat_masquerade_check,
+        dns_socket_check,
+        dns_query_check,
+        internet_egress_check,
+    ];
 
     let failed = checks.iter().filter(|c| !c.ok).count();
     let status = if failed == 0 {
@@ -602,20 +640,21 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     let node_policy = state.node_policy.snapshot();
     let policy_enforcement = state.node_policy.enforcement_snapshot();
     let placement_readiness = state.node_policy.placement_snapshot(active_sessions);
-    let capacity = collect_capacity_status(
-        &config,
-        &state.ip_pool,
-        &node_policy,
-        &policy_enforcement,
-        &placement_readiness,
-        active_sessions,
-    )
-    .await;
+    let (capacity, runtime, recent_errors, upgrade_status) = tokio::join!(
+        collect_capacity_status(
+            &config,
+            &state.ip_pool,
+            &node_policy,
+            &policy_enforcement,
+            &placement_readiness,
+            active_sessions,
+        ),
+        collect_runtime_version_status(),
+        collect_recent_error_events(&service_name),
+        collect_upgrade_status(),
+    );
     let packet_runtime = state.packet_handler.runtime_status();
     let discovery_status = collect_discovery_status_value(&state.peer_store);
-    let runtime = collect_runtime_version_status().await;
-    let recent_errors = collect_recent_error_events(&service_name).await;
-    let upgrade_status = collect_upgrade_status().await;
     let startup_self_check = collect_startup_self_check(
         &config,
         &checks,
@@ -2548,9 +2587,13 @@ fn collect_fd_capacity() -> FileDescriptorCapacityStatus {
 }
 
 async fn collect_disk_capacity() -> DiskCapacityStatus {
+    let (root, state) = tokio::join!(
+        collect_disk_path_capacity("/"),
+        collect_disk_path_capacity(AERONYX_STATE_DIR),
+    );
     DiskCapacityStatus {
-        root: collect_disk_path_capacity("/").await,
-        state: collect_disk_path_capacity(AERONYX_STATE_DIR).await,
+        root,
+        state,
         source: "df_posix_block_usage",
         privacy_boundary: concat!(
             "aggregate filesystem usage for AeroNyx operations only; no file ",
@@ -2658,6 +2701,51 @@ fn round_two(value: f64) -> f64 {
 }
 
 async fn collect_recent_error_events(service_name: &str) -> Vec<RecentErrorEvent> {
+    let cache = RECENT_ERROR_CACHE.get_or_init(RecentErrorCache::default);
+    let now = unix_now_secs();
+    let snapshot = recent_error_cache_snapshot(cache, now);
+    if recent_error_cache_needs_refresh(cache.last_attempt_at.load(Ordering::Acquire), now)
+        && cache
+            .refresh_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        cache.last_attempt_at.store(now, Ordering::Release);
+        let service_name = service_name.to_string();
+        tokio::spawn(async move {
+            if let Some(entries) = query_recent_error_events(&service_name).await {
+                if let Ok(mut current) = cache.entries.write() {
+                    *current = entries;
+                    cache
+                        .last_success_at
+                        .store(unix_now_secs(), Ordering::Release);
+                }
+            }
+            cache.refresh_in_flight.store(false, Ordering::Release);
+        });
+    }
+    snapshot
+}
+
+fn recent_error_cache_needs_refresh(last_attempt_at: u64, now: u64) -> bool {
+    last_attempt_at == 0 || now.saturating_sub(last_attempt_at) >= RECENT_ERROR_CACHE_TTL_SECS
+}
+
+fn recent_error_cache_snapshot(cache: &RecentErrorCache, now: u64) -> Vec<RecentErrorEvent> {
+    let last_success_at = cache.last_success_at.load(Ordering::Acquire);
+    if last_success_at == 0
+        || now.saturating_sub(last_success_at) > RECENT_ERROR_CACHE_MAX_STALE_SECS
+    {
+        return Vec::new();
+    }
+    cache
+        .entries
+        .read()
+        .map(|entries| entries.clone())
+        .unwrap_or_default()
+}
+
+async fn query_recent_error_events(service_name: &str) -> Option<Vec<RecentErrorEvent>> {
     let output = match run_command(
         "journalctl",
         &[
@@ -2671,20 +2759,22 @@ async fn collect_recent_error_events(service_name: &str) -> Vec<RecentErrorEvent
             "--output=short-iso",
             "--lines=20",
         ],
-        Duration::from_secs(3),
+        RECENT_ERROR_COMMAND_TIMEOUT,
     )
     .await
     {
         Ok(output) => output,
-        Err(_) => return Vec::new(),
+        Err(_) => return None,
     };
 
-    output
-        .lines()
-        .rev()
-        .filter_map(parse_recent_error_line)
-        .take(5)
-        .collect()
+    Some(
+        output
+            .lines()
+            .rev()
+            .filter_map(parse_recent_error_line)
+            .take(5)
+            .collect(),
+    )
 }
 
 fn parse_recent_error_line(line: &str) -> Option<RecentErrorEvent> {
@@ -3276,6 +3366,35 @@ mod tests {
         )
         .expect("info event");
         assert_eq!(info.severity, "info");
+    }
+
+    #[test]
+    fn recent_error_cache_bounds_refresh_and_stale_windows() {
+        assert!(recent_error_cache_needs_refresh(0, 100));
+        assert!(!recent_error_cache_needs_refresh(
+            100,
+            100 + RECENT_ERROR_CACHE_TTL_SECS - 1
+        ));
+        assert!(recent_error_cache_needs_refresh(
+            100,
+            100 + RECENT_ERROR_CACHE_TTL_SECS
+        ));
+
+        let cache = RecentErrorCache::default();
+        cache.last_success_at.store(100, Ordering::Release);
+        cache.entries.write().expect("cache write").push(
+            parse_recent_error_line(
+                "2026-08-12T00:00:00Z host aeronyx-server[42]: warning bounded cache test",
+            )
+            .expect("test event"),
+        );
+        assert_eq!(
+            recent_error_cache_snapshot(&cache, 100 + RECENT_ERROR_CACHE_MAX_STALE_SECS).len(),
+            1
+        );
+        assert!(
+            recent_error_cache_snapshot(&cache, 101 + RECENT_ERROR_CACHE_MAX_STALE_SECS).is_empty()
+        );
     }
 }
 
