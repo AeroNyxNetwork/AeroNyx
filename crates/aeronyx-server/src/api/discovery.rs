@@ -1320,53 +1320,34 @@ pub fn onion_relay_admission_status_value(
         "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
         "privacy_boundary": "aggregate onion relay admission gates only; no node endpoints, route ids, selected hops, receiver keys, encrypted payloads, client IPs, DNS contents, destinations, Memory Chain plaintext, private keys, wallet-level traffic, or social graph metadata",
     });
-    let admission_fields = admission
-        .as_object_mut()
-        .expect("onion relay admission JSON must be an object");
-    admission_fields.insert(
-        "peer_restart_recovery_ready".to_string(),
-        serde_json::json!(peer_restart_recovery_ready),
-    );
-    admission_fields.insert(
-        "proof_restart_continuity_ready".to_string(),
-        serde_json::json!(proof_restart_continuity_ready),
-    );
-    admission_fields.insert(
-        "proof_restart_continuity_source".to_string(),
-        serde_json::json!(proof_restart_continuity.source),
-    );
-    admission_fields.insert(
-        "proof_cache_authentication".to_string(),
-        serde_json::json!(proof_restart_continuity.authentication),
-    );
-    admission_fields.insert(
-        "proof_cache_rollback_protection".to_string(),
-        serde_json::json!(proof_restart_continuity.rollback_protection),
-    );
-    admission_fields.insert(
-        "proof_cache_external_witness".to_string(),
-        serde_json::json!(proof_restart_continuity.external_witness),
-    );
-    admission_fields.insert(
-        "proof_cache_external_witness_required".to_string(),
-        serde_json::json!(proof_restart_continuity.external_witness_required),
-    );
-    admission_fields.insert(
-        "proof_cache_authenticated_restore_ready".to_string(),
-        serde_json::json!(proof_restart_continuity.authenticated_restore_ready),
-    );
-    admission_fields.insert(
-        "proof_cache_signed_persistence_ready".to_string(),
-        serde_json::json!(proof_restart_continuity.signed_persistence_ready),
-    );
-    admission_fields.insert(
-        "proof_cache_restored_events".to_string(),
-        serde_json::json!(proof_restart_continuity.restored),
-    );
-    admission_fields.insert(
-        "proof_cache_persisted_events".to_string(),
-        serde_json::json!(proof_restart_continuity.persisted),
-    );
+    let continuity_fields = serde_json::json!({
+        "peer_restart_recovery_ready": peer_restart_recovery_ready,
+        "proof_restart_continuity_ready": proof_restart_continuity_ready,
+        "proof_restart_continuity_source": proof_restart_continuity.source,
+        "proof_cache_authentication": proof_restart_continuity.authentication,
+        "proof_cache_rollback_protection": proof_restart_continuity.rollback_protection,
+        "proof_cache_external_witness": proof_restart_continuity.external_witness,
+        "proof_cache_external_witness_required": proof_restart_continuity.external_witness_required,
+        "proof_cache_authenticated_restore_ready": proof_restart_continuity.authenticated_restore_ready,
+        "proof_cache_signed_persistence_ready": proof_restart_continuity.signed_persistence_ready,
+        "proof_cache_restored_events": proof_restart_continuity.restored,
+        "proof_cache_persisted_events": proof_restart_continuity.persisted,
+    });
+
+    // [DISCOVERY-PANIC-CONTAINMENT 2026-08-12 by Codex] Keep the established
+    // flat response contract without assuming either untyped JSON value has an
+    // object shape. A future schema refactor now emits a diagnostic and returns
+    // the intact base contract instead of panicking in the request path.
+    match (&mut admission, continuity_fields) {
+        (serde_json::Value::Object(admission_fields), serde_json::Value::Object(fields)) => {
+            admission_fields.extend(fields);
+        }
+        _ => {
+            tracing::error!(
+                "onion relay admission continuity fields could not be merged into JSON object"
+            );
+        }
+    }
     admission
 }
 
