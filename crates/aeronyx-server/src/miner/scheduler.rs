@@ -49,16 +49,22 @@
 //!   reclaims it on drop. It is never written to in SaaS mode.
 //! - `stub_aof` writes to a temp file. The file persists until server restart
 //!   or OS cleanup. It is never read from (SaaS Miner does not use legacy AOF).
+//! - [MINER-STARTUP-ERROR 2026-08-12 by Codex] Stub resource creation is a
+//!   fallible startup boundary. Propagate its typed error to `Server::run`;
+//!   never restore `expect` or allow a partial scheduler to start.
 //! - VectorIndex is rebuilt from DB on each tick. This is acceptable for idle
 //!   users. TODO: pass VectorIndexPool to reuse indexes across ticks.
 //! - `run_one_tick()` must be kept in sync with the timer body in
 //!   `ReflectionMiner::run()`. If new steps are added there, add them here too.
 //!
 //! ## Last Modified
+//! v1.0.1-MinerStartupError - Made stub AOF/socket initialization fallible and
+//!                            covered inaccessible state paths.
 //! v1.0.0-MultiTenant - Initial implementation (Task 4)
 // ============================================
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,6 +74,7 @@ use tracing::{error, info, warn};
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_transport::UdpTransport;
 
+use crate::error::{Result as ServerResult, ServerError};
 use crate::miner::ReflectionMiner;
 use crate::services::memchain::{
     AofWriter, EmbedEngine, LlmRouter, MemPool, NerEngine, StoragePool, SystemDb, VectorIndex,
@@ -171,31 +178,20 @@ impl MinerScheduler {
         llm_router: Option<Arc<LlmRouter>>,
         embed_engine: Option<Arc<EmbedEngine>>,
         ner_engine: Option<Arc<NerEngine>>,
-    ) -> Arc<Self> {
+    ) -> ServerResult<Arc<Self>> {
         // ── Stub AofWriter ─────────────────────────────────────────────
         // Write to a process-unique temp file. The SaaS Miner never calls
         // legacy_mine() (stub_mempool is always empty), so this file stays
         // empty. It is cleaned up when the process exits.
         let stub_aof_path =
             std::env::temp_dir().join(format!("memchain_saas_miner_{}.aof", std::process::id()));
-        let stub_aof = AofWriter::open(&stub_aof_path)
-            .await
-            .expect("[MINER_SCHED] Failed to open stub AofWriter — check /tmp permissions");
-        let stub_aof = Arc::new(TokioMutex::new(stub_aof));
-
-        // ── Stub UdpTransport ──────────────────────────────────────────
-        // Bind to an ephemeral loopback port. The OS reclaims it on drop.
-        // broadcast_header() is never called because stub_sessions is empty.
-        let stub_udp = UdpTransport::bind_addr("127.0.0.1:0".parse().unwrap())
-            .await
-            .expect("[MINER_SCHED] Failed to bind stub UDP transport");
-        let stub_udp = Arc::new(stub_udp);
+        let (stub_aof, stub_udp) = Self::initialize_stub_runtime(&stub_aof_path).await?;
 
         // ── Stub SessionManager ────────────────────────────────────────
         // 0 capacity — all_sessions() returns Vec::new().
         let stub_sessions = Arc::new(SessionManager::new(0, Duration::from_secs(60)));
 
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             storage_pool,
             system_db,
             max_owners_per_tick: max_owners_per_tick.max(1),
@@ -209,7 +205,31 @@ impl MinerScheduler {
             stub_aof,
             stub_sessions,
             stub_udp,
-        })
+        }))
+    }
+
+    async fn initialize_stub_runtime(
+        stub_aof_path: &Path,
+    ) -> ServerResult<(Arc<TokioMutex<AofWriter>>, Arc<UdpTransport>)> {
+        // [MINER-STARTUP-ERROR 2026-08-12 by Codex] These resources are
+        // process infrastructure even though they carry no user data. Return
+        // a contextual startup error so the top-level runtime can unwind all
+        // previously acquired resources and report a truthful failed start.
+        let stub_aof = AofWriter::open(stub_aof_path).await.map_err(|error| {
+            ServerError::startup_failed(format!(
+                "SaaS miner stub AOF initialization failed: {error}"
+            ))
+        })?;
+        let stub_udp_address = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+        let stub_udp = UdpTransport::bind_addr(stub_udp_address)
+            .await
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "SaaS miner loopback transport initialization failed: {error}"
+                ))
+            })?;
+
+        Ok((Arc::new(TokioMutex::new(stub_aof)), Arc::new(stub_udp)))
     }
 
     // ============================================
@@ -433,7 +453,9 @@ mod tests {
             Duration::from_secs(3600),
         );
         let identity = aeronyx_core::crypto::IdentityKeyPair::generate();
-        MinerScheduler::new(pool, db, 3, 6, identity, None, None, None).await
+        MinerScheduler::new(pool, db, 3, 6, identity, None, None, None)
+            .await
+            .unwrap()
     }
 
     // ── Quota mechanics ───────────────────────────────────────────────
@@ -503,8 +525,9 @@ mod tests {
         let identity = aeronyx_core::crypto::IdentityKeyPair::generate();
 
         // max_rounds_per_hour = 1 → each owner can only be processed once per hour.
-        let sched =
-            MinerScheduler::new(pool, Arc::clone(&db), 10, 1, identity, None, None, None).await;
+        let sched = MinerScheduler::new(pool, Arc::clone(&db), 10, 1, identity, None, None, None)
+            .await
+            .unwrap();
 
         // Assign 2 owners so they appear in active_owners.
         db.assign_volume(&make_owner(0xAA), "vol-001")
@@ -551,7 +574,9 @@ mod tests {
             Duration::from_secs(3600),
         );
         let identity = aeronyx_core::crypto::IdentityKeyPair::generate();
-        let sched = MinerScheduler::new(pool, db, 1, 100, identity, None, None, None).await;
+        let sched = MinerScheduler::new(pool, db, 1, 100, identity, None, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(sched.max_owners_per_tick, 1);
     }
@@ -574,7 +599,30 @@ mod tests {
         );
         let identity = aeronyx_core::crypto::IdentityKeyPair::generate();
         // Pass 0 — should be clamped to 1.
-        let sched = MinerScheduler::new(pool, db, 0, 6, identity, None, None, None).await;
+        let sched = MinerScheduler::new(pool, db, 0, 6, identity, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(sched.max_owners_per_tick, 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_stub_aof_failure_returns_typed_startup_error() {
+        // [MINER-STARTUP-ERROR 2026-08-12 by Codex] A non-directory parent
+        // deterministically reproduces an unavailable state path without
+        // mutating process-global TMPDIR or requiring privileged filesystem
+        // permissions. The constructor boundary must return, never panic.
+        let dir = TempDir::new().unwrap();
+        let non_directory = dir.path().join("not-a-directory");
+        std::fs::write(&non_directory, b"occupied").unwrap();
+        let invalid_path = non_directory.join("stub.aof");
+
+        let error = match MinerScheduler::initialize_stub_runtime(&invalid_path).await {
+            Ok(_) => panic!("invalid stub AOF parent unexpectedly initialized"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("SaaS miner stub AOF initialization failed"));
     }
 }

@@ -337,6 +337,9 @@
 // 128. [FAIL-CLOSED-SHUTDOWN-SIGNALS 2026-08-12 by Codex] Derives the VPN API
 //      listener from the configured gateway and converts signal-registration
 //      failures into supervised shutdown instead of panicking past cleanup.
+// 129. [MINER-STARTUP-ERROR 2026-08-12 by Codex] Propagates SaaS miner stub
+//      resource failures through the normal typed startup transaction instead
+//      of panicking after required node resources have already been acquired.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -471,6 +474,8 @@
 //     operations; adding another await requires adding the same checkpoint.
 //
 // Last Modified:
+//   v2.8.82-MinerStartupError - Made SaaS miner scheduler construction
+//     fail-closed through ServerError instead of process panic.
 //   v2.8.81-FailClosedShutdownSignals - Removed production panic paths from
 //     API address construction and shutdown-signal supervision.
 //   v2.8.80-PeerCacheRetryState - Added typed persistence outcomes and bounded
@@ -3652,7 +3657,7 @@ impl Server {
                             embed_engine.clone(),
                             ner_engine.clone(),
                         )
-                        .await;
+                        .await?;
                         let mut sched_rx = self.shutdown_tx.subscribe();
                         tasks.push((
                             "miner-scheduler",
