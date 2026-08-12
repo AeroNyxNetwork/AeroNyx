@@ -21,6 +21,8 @@
 //!                      unified_auth_middleware injects these extensions in both modes.
 //! v2.7.14-RustdocQuality - Marked the handler-context extraction pattern as a
 //!                      non-standalone Rustdoc example so standard doc tests pass.
+//! v2.7.16-TypedContext - Replaced request-extension expectations with typed
+//!                      Axum extraction while preserving the remote 403 gate.
 //!
 //! ## Main Functionality
 //! - Local-only access gate (remote -> 403)
@@ -40,9 +42,8 @@
 //!
 //! Extraction pattern used throughout:
 //! ```rust,ignore
-//! let storage = req.extensions().get::<Arc<MemoryStorage>>()
-//!     .expect("[BUG] MemoryStorage extension not set by middleware")
-//!     .clone();
+//! Extension(auth): Extension<AuthenticatedOwner>,
+//! storage: Option<Extension<Arc<MemoryStorage>>>,
 //! ```
 //!
 //! ⚠️ Important Notes for Next Developer:
@@ -56,8 +57,12 @@
 //! - MAX_EXTRACTION_BYTES (4KB): prevents storage amplification
 //! - set_record_session_id returns () — do NOT wrap in if-let-Err
 //! - Privacy stripping runs on turn.content; entropy filter uses original content
+//! - [LOG-TYPED-CONTEXT 2026-08-12 by Codex] Keep `Request<Body>` last and
+//!   preserve remote 403 responses before validating local storage context.
 //!
 //! ## Last Modified
+//! v2.7.16-TypedContext - Removed panic-on-missing request extensions and kept
+//!                       local-only authorization behavior fail-closed.
 //! v2.7.14-RustdocQuality - Corrected executable-example classification.
 //! v1.0.1-SaaSFix - Replaced all state.storage accesses with Extension extraction
 // ============================================
@@ -75,7 +80,7 @@ const MAX_EXTRACTION_BYTES: usize = 4 * 1024;
 const MAX_RULE_ENGINE_INPUT: usize = 2_000;
 
 use axum::http::Request;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -84,7 +89,7 @@ use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
 
 use crate::api::mpi::{AuthenticatedOwner, MpiState};
 use crate::services::memchain::derive_rawlog_key;
-use crate::services::memchain::{MemoryStorage, VectorIndex};
+use crate::services::memchain::MemoryStorage;
 
 // ============================================
 // Request / Response Types
@@ -636,15 +641,11 @@ fn parse_recall_context(ctx: &str) -> Vec<RecallContextEntry> {
 
 pub async fn mpi_log(
     State(state): State<Arc<MpiState>>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    storage: Option<Extension<Arc<MemoryStorage>>>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     // Step 0: extract auth and enforce local-only access.
-    let auth = req
-        .extensions()
-        .get::<AuthenticatedOwner>()
-        .expect("[BUG] AuthenticatedOwner not set by middleware")
-        .clone();
-
     if auth.is_remote() {
         warn!(
             "[MPI_LOG] Rejected remote /log request from {}",
@@ -660,14 +661,17 @@ pub async fn mpi_log(
 
     let owner = auth.owner_bytes();
 
-    // SaaS fix (v1.0.1): extract storage from Extension injected by
-    // unified_auth_middleware. In SaaS mode state.storage is None —
-    // accessing it directly would panic.
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set by middleware")
-        .clone();
+    // [LOG-TYPED-CONTEXT 2026-08-12 by Codex] Storage remains optional at the
+    // extractor boundary so remote callers receive the established 403 before
+    // any internal middleware configuration is evaluated or disclosed.
+    let Some(Extension(storage)) = storage else {
+        warn!("[MPI_LOG] Missing per-request memory storage context");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal server configuration error"})),
+        )
+            .into_response();
+    };
 
     // Parse body.
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
@@ -973,6 +977,105 @@ pub async fn mpi_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::mpi::SessionEmbeddingCache;
+    use crate::services::memchain::VectorIndex;
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use axum::body::Body;
+    use axum::http::Request;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use tower::ServiceExt;
+
+    fn make_test_state() -> (Arc<MpiState>, AuthenticatedOwner) {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let vector_index = Arc::new(VectorIndex::new());
+        let identity = IdentityKeyPair::generate();
+        let owner = identity.public_key_bytes();
+        let state = MpiState::local(
+            storage,
+            vector_index,
+            identity,
+            RwLock::new(HashMap::new()),
+            AtomicBool::new(true),
+            Arc::new(RwLock::new(HashMap::new())),
+            0.0,
+            false,
+            RwLock::new(SessionEmbeddingCache::default()),
+            RwLock::new(None),
+            owner,
+            None,
+            None,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        (Arc::new(state), AuthenticatedOwner::Local { owner })
+    }
+
+    #[tokio::test]
+    async fn missing_log_context_is_contained_without_weakening_remote_gate() {
+        // [LOG-TYPED-CONTEXT 2026-08-12 by Codex] Missing auth/storage must
+        // never panic under the release `panic=abort` profile. Remote callers
+        // retain the same local-only 403 without learning storage wiring state.
+        let (state, local_auth) = make_test_state();
+
+        let missing_auth = axum::Router::new()
+            .route("/log", axum::routing::post(mpi_log))
+            .with_state(Arc::clone(&state));
+        let request = Request::builder()
+            .uri("/log")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            missing_auth.oneshot(request).await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let missing_storage = axum::Router::new()
+            .route("/log", axum::routing::post(mpi_log))
+            .layer(Extension(local_auth))
+            .with_state(Arc::clone(&state));
+        let request = Request::builder()
+            .uri("/log")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            missing_storage.oneshot(request).await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let owner = state.owner_key;
+        let remote_auth = AuthenticatedOwner::Remote {
+            owner,
+            owner_hex: hex::encode(owner),
+        };
+        let remote_without_storage = axum::Router::new()
+            .route("/log", axum::routing::post(mpi_log))
+            .layer(Extension(remote_auth))
+            .with_state(state);
+        let request = Request::builder()
+            .uri("/log")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            remote_without_storage
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 
     #[test]
     fn test_skip_pure_task() {
