@@ -23,6 +23,8 @@
 //!                          non-standalone Rustdoc example.
 //! v2.7.15-InferenceReadiness - Centralized local inference readiness and
 //!                              exposed the previously omitted reranker state.
+//! v2.7.16-TypedExtensions - Replaced request-extension expectations with
+//!                           Axum typed extractors across core MPI endpoints.
 //!
 //! ## Main Functionality
 //! - POST /api/mpi/remember    - store a new memory record
@@ -37,10 +39,8 @@
 //! ## SaaS Compatibility (v1.0.1-SaaSFix)
 //! All handlers now extract storage and vector_index from Extensions:
 //! ```rust,ignore
-//! let storage = req.extensions().get::<Arc<MemoryStorage>>()
-//!     .expect("[BUG] MemoryStorage extension not set").clone();
-//! let vi = req.extensions().get::<Arc<VectorIndex>>()
-//!     .expect("[BUG] VectorIndex extension not set").clone();
+//! Extension(storage): Extension<Arc<MemoryStorage>>,
+//! Extension(vi): Extension<Arc<VectorIndex>>,
 //! ```
 //! unified_auth_middleware injects these in both Local and SaaS modes.
 //!
@@ -62,8 +62,13 @@
 //!   allow-listed and events never contain endpoints or node identities.
 //! - Local inference readiness is serialized through `LocalInferenceStatus`.
 //!   Preserve its flattened field names for nodeboard and operator tooling.
+//! - [MPI-TYPED-EXTENSIONS 2026-08-12 by Codex] Keep body-consuming
+//!   `Request<Body>` extractors last. Missing request context must be rejected
+//!   by Axum and must never panic a request task.
 //!
 //! ## Last Modified
+//! v2.7.16-TypedExtensions - Core MPI request context now uses typed Axum
+//!                           extractors instead of manual `expect` calls.
 //! v2.7.15-InferenceReadiness -
 //!   [MEMCHAIN-INFERENCE-READINESS 2026-07-30 by Codex] Added the missing
 //!   reranker readiness field without changing existing status JSON keys.
@@ -84,7 +89,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::Path;
 use axum::http::Request;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -97,7 +102,7 @@ use crate::services::memchain::{MemoryStorage, VectorIndex};
 
 use super::mpi::{
     default_include_graph, default_layer, default_model, default_source, default_token_budget,
-    default_top_k, extract_owner, now_secs, parse_layer, AuthenticatedOwner, Mode, MpiState,
+    default_top_k, now_secs, parse_layer, AuthenticatedOwner, Mode, MpiState,
 };
 
 /// Max identity/allergy records kept in the hot cache per owner (fix #11).
@@ -131,23 +136,13 @@ pub struct RememberResponse {
 
 pub async fn mpi_remember(
     State(state): State<Arc<MpiState>>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
+    Extension(vi): Extension<Arc<VectorIndex>>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
     let owner_hex = auth.owner_hex();
-
-    // SaaS fix: extract storage and vector_index from Extensions.
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
-    let vi = req
-        .extensions()
-        .get::<Arc<VectorIndex>>()
-        .expect("[BUG] VectorIndex extension not set")
-        .clone();
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
@@ -339,6 +334,9 @@ fn default_edge_weight() -> f64 {
 /// the ciphertext verbatim — it never decrypts, re-encrypts, or re-signs it.
 pub async fn mpi_remember_sealed(
     State(state): State<Arc<MpiState>>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
+    Extension(vi): Extension<Arc<VectorIndex>>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -354,20 +352,8 @@ pub async fn mpi_remember_sealed(
             .into_response();
     }
 
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
     let owner_hex = auth.owner_hex();
-
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
-    let vi = req
-        .extensions()
-        .get::<Arc<VectorIndex>>()
-        .expect("[BUG] VectorIndex extension not set")
-        .clone();
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await {
         Ok(b) => b,
@@ -590,7 +576,8 @@ fn attest_signing_message(owner: &[u8; 32], root: &[u8; 32], count: u64, epoch: 
 /// Owner auth is required so no one can probe another owner's set size.
 pub async fn mpi_attest(
     State(state): State<Arc<MpiState>>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
     if !(state.blind_storage_enabled || state.allow_remote_storage) {
         return (
@@ -600,14 +587,7 @@ pub async fn mpi_attest(
             .into_response();
     }
 
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
-
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
 
     let ids = storage.owner_record_ids(&owner).await;
     let count = ids.len() as u64;
@@ -744,22 +724,12 @@ pub struct ForgetResponse {
 
 pub async fn mpi_forget(
     State(state): State<Arc<MpiState>>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
+    Extension(vi): Extension<Arc<VectorIndex>>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
-
-    // SaaS fix: extract storage and vi from Extensions.
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
-    let vi = req
-        .extensions()
-        .get::<Arc<VectorIndex>>()
-        .expect("[BUG] VectorIndex extension not set")
-        .clone();
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
@@ -952,23 +922,12 @@ pub struct MvfMetrics {
 
 pub async fn mpi_status(
     State(state): State<Arc<MpiState>>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
+    Extension(vi): Extension<Arc<VectorIndex>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
     let owner_hex = auth.owner_hex();
-
-    // SaaS fix: use Extension storage for all per-user queries.
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
-    let vi = req
-        .extensions()
-        .get::<Arc<VectorIndex>>()
-        .expect("[BUG] VectorIndex extension not set")
-        .clone();
 
     let stats = storage.stats().await;
     let height = storage.last_block_height().await;
@@ -1163,16 +1122,10 @@ pub struct RecordDetailResponse {
 pub async fn mpi_get_record(
     State(_state): State<Arc<MpiState>>,
     Path(record_id_hex): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
-
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
 
     let rid = match hex::decode(&record_id_hex) {
         Ok(b) if b.len() == 32 => {
@@ -1259,16 +1212,10 @@ pub async fn mpi_get_record(
 
 pub async fn mpi_records_overview(
     State(state): State<Arc<MpiState>>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
-
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
 
     let ov = storage.get_overview(&owner, 20).await;
     let total: u64 = ov.by_layer.values().sum();
@@ -1299,9 +1246,9 @@ pub struct EmbedRequest {
 
 pub async fn mpi_embed(
     State(state): State<Arc<MpiState>>,
+    Extension(_auth): Extension<AuthenticatedOwner>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let _auth = extract_owner(&req);
     let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
@@ -1403,21 +1350,12 @@ pub struct PatchRecordRequest {
 pub async fn mpi_patch_record(
     State(state): State<Arc<MpiState>>,
     Path(record_id_hex): Path<String>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
+    Extension(vi): Extension<Arc<VectorIndex>>,
     req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
-
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
-    let vi = req
-        .extensions()
-        .get::<Arc<VectorIndex>>()
-        .expect("[BUG] VectorIndex extension not set")
-        .clone();
 
     let rid: [u8; 32] = match hex::decode(&record_id_hex) {
         Ok(b) if b.len() == 32 => {
@@ -1561,16 +1499,10 @@ pub async fn mpi_patch_record(
 pub async fn mpi_record_provenance(
     State(_state): State<Arc<MpiState>>,
     Path(record_id_hex): Path<String>,
-    req: Request<axum::body::Body>,
+    Extension(auth): Extension<AuthenticatedOwner>,
+    Extension(storage): Extension<Arc<MemoryStorage>>,
 ) -> impl IntoResponse {
-    let auth = extract_owner(&req).clone();
     let owner = auth.owner_bytes();
-
-    let storage = req
-        .extensions()
-        .get::<Arc<MemoryStorage>>()
-        .expect("[BUG] MemoryStorage extension not set")
-        .clone();
 
     let rid: [u8; 32] = match hex::decode(&record_id_hex) {
         Ok(b) if b.len() == 32 => {
@@ -1604,6 +1536,103 @@ pub async fn mpi_record_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeronyx_core::crypto::IdentityKeyPair;
+    use axum::body::Body;
+    use axum::http::Request;
+    use parking_lot::RwLock;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use tower::ServiceExt;
+
+    fn make_test_state() -> (Arc<MpiState>, AuthenticatedOwner, Arc<MemoryStorage>) {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let vector_index = Arc::new(VectorIndex::new());
+        let identity = IdentityKeyPair::generate();
+        let owner = identity.public_key_bytes();
+        let state = MpiState::local(
+            Arc::clone(&storage),
+            vector_index,
+            identity,
+            RwLock::new(HashMap::new()),
+            AtomicBool::new(true),
+            Arc::new(RwLock::new(HashMap::new())),
+            0.0,
+            false,
+            RwLock::new(super::super::mpi::SessionEmbeddingCache::default()),
+            RwLock::new(None),
+            owner,
+            None,
+            None,
+            false,
+            false,
+            0,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        (
+            Arc::new(state),
+            AuthenticatedOwner::Local { owner },
+            storage,
+        )
+    }
+
+    #[tokio::test]
+    async fn missing_core_extensions_return_internal_server_error_without_panicking() {
+        // [MPI-TYPED-EXTENSIONS 2026-08-12 by Codex] Each middleware wiring
+        // fault is an Axum rejection. Core memory requests must never panic a
+        // request task or abort the node process because context is missing.
+        let (state, auth, storage) = make_test_state();
+
+        let missing_auth = axum::Router::new()
+            .route("/remember", axum::routing::post(mpi_remember))
+            .with_state(Arc::clone(&state));
+        let request = Request::builder()
+            .uri("/remember")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            missing_auth.oneshot(request).await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let missing_storage = axum::Router::new()
+            .route("/remember", axum::routing::post(mpi_remember))
+            .layer(Extension(auth.clone()))
+            .with_state(Arc::clone(&state));
+        let request = Request::builder()
+            .uri("/remember")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            missing_storage.oneshot(request).await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let missing_vector_index = axum::Router::new()
+            .route("/remember", axum::routing::post(mpi_remember))
+            .layer(Extension(auth))
+            .layer(Extension(storage))
+            .with_state(state);
+        let request = Request::builder()
+            .uri("/remember")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            missing_vector_index
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn local_inference_status_serializes_stable_operator_contract() {
