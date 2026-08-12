@@ -24,17 +24,19 @@
 //!   `all_sessions().find()`.
 //!
 //! ## Rate Limiting
-//! Global token-bucket: 30 requests / 60 seconds across all callers.
+//! Global fixed window: 30 requests / 60 seconds across all callers.
 //! Blocks enumeration attacks that sweep pubkeys to map online users.
 //!
-//! Implementation uses a `DashMap`-backed counter (no external middleware)
-//! because `tower::limit::RateLimitLayer` produces a `RateLimit<Route>` that
-//! does not implement `Clone`, which axum's `Router::layer` requires.
-//! The DashMap approach is lock-free and Clone-safe.
+//! Implementation uses one monotonic `parking_lot::Mutex` window because
+//! `tower::limit::RateLimitLayer` produces a `RateLimit<Route>` that does not
+//! implement `Clone`, which axum's `Router::layer` requires. The window is
+//! shared by cloned routers and is independent of wall-clock corrections.
 //!
 //! ## Auth
-//! No authentication required. Virtual IPs are network-layer routing
-//! information, not user PII.
+//! This legacy lookup has no application-layer authentication and is exposed
+//! only on the node API listeners. Virtual IP and activity time are routing
+//! metadata, so future contact-gated rendezvous must replace this endpoint
+//! before it is exposed outside the VPN trust boundary.
 //!
 //! ## Client-Side Staleness Check
 //! A `get_by_wallet()` hit does not guarantee the session is truly active.
@@ -49,18 +51,20 @@
 //! - `session.idle_time()` returns a Duration — subtract from unix time for timestamp.
 //! - This router uses `VoiceState` (sessions + rate_limiter) as its axum State,
 //!   independent of MpiState. The two routers are fully isolated.
-//! - Do NOT replace the DashMap rate limiter with `tower::limit::RateLimitLayer`
+//! - Do NOT replace the shared rate limiter with `tower::limit::RateLimitLayer`
 //!   — it breaks axum's Clone requirement on Router::layer.
 //!
 //! ## Last Modified
+//! v2.8.13-VoiceMonotonicRateLimit - Replaced the single-key DashMap wall-clock
+//!   limiter with one clone-safe monotonic window and deterministic tests.
 //! v2.7.14-RustdocQuality - Marked router composition pseudocode as a
 //!   non-standalone Rustdoc example.
 //! v1.0.0 - Initial implementation for AeroNyx Voice UDP direct-connect routing.
 //!   Two-pass lookup: wallet_index O(1) + all_sessions O(n) fallback.
-//!   DashMap-based global rate limiter (30 req / 60 s).
+//!   Global fixed-window rate limiter (30 req / 60 s).
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Query, State},
@@ -68,7 +72,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use dashmap::DashMap;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::services::SessionManager;
@@ -83,50 +87,65 @@ use crate::services::SessionManager;
 const RATE_LIMIT_REQUESTS: u64 = 30;
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
-/// Global token-bucket rate limiter backed by DashMap.
+/// Mutable state for the global fixed-window rate limiter.
 ///
-/// Tracks (window_start_unix_secs, request_count) under a single
-/// "global" key. Resets automatically when the window expires.
+/// `Instant` is deliberately process-local and monotonic. System clock
+/// corrections therefore cannot extend or prematurely reset the window.
+#[derive(Debug)]
+struct RateLimitWindow {
+    started_at: Instant,
+    request_count: u64,
+}
+
+/// Global fixed-window rate limiter shared by every cloned Voice router.
 ///
 /// ## Why not tower::limit::RateLimitLayer?
 /// `RateLimit<Route>` does not implement `Clone`, which axum's
-/// `Router::layer` requires. This DashMap approach is lock-free
-/// and satisfies axum's Clone constraint.
+/// `Router::layer` requires. One mutex is sufficient because there is exactly
+/// one global window and the critical section performs no allocation or I/O.
 #[derive(Debug, Clone)]
 struct RateLimiter {
-    state: Arc<DashMap<&'static str, (u64, u64)>>,
+    state: Arc<Mutex<RateLimitWindow>>,
 }
 
 impl RateLimiter {
     fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(started_at: Instant) -> Self {
         Self {
-            state: Arc::new(DashMap::new()),
+            state: Arc::new(Mutex::new(RateLimitWindow {
+                started_at,
+                request_count: 0,
+            })),
         }
     }
 
     /// Returns `true` if the request is allowed, `false` if limit exceeded.
     ///
-    /// Thread-safe: DashMap entry lock is held only during the counter update.
+    /// Thread-safe: the window lock is held only during the counter update.
     fn check(&self) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        self.check_at(Instant::now())
+    }
 
-        let mut entry = self.state.entry("global").or_insert((now, 0));
-        let (window_start, count) = entry.value_mut();
-
-        // Reset window if the current window has expired.
-        if now.saturating_sub(*window_start) >= RATE_LIMIT_WINDOW_SECS {
-            *window_start = now;
-            *count = 0;
+    // [VOICE-RATE-MONOTONIC 2026-08-12 by Codex] Keep time injectable for
+    // deterministic boundary tests while production always supplies Instant.
+    fn check_at(&self, now: Instant) -> bool {
+        let mut state = self.state.lock();
+        let window_elapsed = now
+            .checked_duration_since(state.started_at)
+            .is_some_and(|elapsed| elapsed >= Duration::from_secs(RATE_LIMIT_WINDOW_SECS));
+        if window_elapsed {
+            state.started_at = now;
+            state.request_count = 0;
         }
 
-        if *count >= RATE_LIMIT_REQUESTS {
+        if state.request_count >= RATE_LIMIT_REQUESTS {
             return false;
         }
 
-        *count += 1;
+        state.request_count += 1;
         true
     }
 }
@@ -139,7 +158,7 @@ impl RateLimiter {
 ///
 /// Bundles `SessionManager` and `RateLimiter` into a single `Clone`-able
 /// state, because axum `Router` supports only one State type per router.
-/// Both fields are cheaply cloneable (`Arc` / `Arc<DashMap>`).
+/// Both fields are cheaply cloneable (`Arc` / `Arc<Mutex<_>>`).
 #[derive(Clone)]
 pub struct VoiceState {
     sessions: Arc<SessionManager>,
@@ -225,7 +244,7 @@ struct ErrorResponse {
 /// - Offline     → `{ online: false, virtual_ip: null,          last_seen: null }`
 /// - Bad pubkey  → `{ online: false, virtual_ip: null,          last_seen: null }`
 /// - Rate limit  → HTTP 429 `{ error: "rate limit exceeded" }`
-pub async fn peer_virtual_ip_handler(
+async fn peer_virtual_ip_handler(
     State(state): State<VoiceState>,
     Query(params): Query<PeerVirtualIpQuery>,
 ) -> Result<Json<PeerVirtualIpResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -313,4 +332,38 @@ pub fn build_voice_router(sessions: Arc<SessionManager>) -> Router {
     Router::new()
         .route("/api/peer-virtual-ip", get(peer_virtual_ip_handler))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_enforces_exact_window_and_resets_at_boundary() {
+        let started_at = Instant::now();
+        let limiter = RateLimiter::new_at(started_at);
+
+        for _ in 0..RATE_LIMIT_REQUESTS {
+            assert!(limiter.check_at(started_at));
+        }
+        assert!(!limiter.check_at(started_at));
+        assert!(!limiter.check_at(started_at + Duration::from_secs(RATE_LIMIT_WINDOW_SECS - 1)));
+        assert!(limiter.check_at(started_at + Duration::from_secs(RATE_LIMIT_WINDOW_SECS)));
+    }
+
+    #[test]
+    fn rate_limiter_clones_share_capacity_and_ignore_earlier_instants() {
+        let started_at = Instant::now();
+        let limiter = RateLimiter::new_at(started_at);
+        let clone = limiter.clone();
+
+        for _ in 0..RATE_LIMIT_REQUESTS {
+            assert!(limiter.check_at(started_at));
+        }
+        let earlier = started_at
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(started_at);
+        assert!(!clone.check_at(earlier));
+        assert!(clone.check_at(started_at + Duration::from_secs(RATE_LIMIT_WINDOW_SECS)));
+    }
 }
