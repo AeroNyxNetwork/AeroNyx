@@ -325,6 +325,9 @@
 // 124. [BACKGROUND-SHUTDOWN-COOPERATION 2026-08-12 by Codex] Makes initial
 //      traffic waits interruptible and adds shutdown checkpoints around each
 //      bounded discovery gossip stage instead of relying on forced aborts.
+// 125. [KEEPALIVE-SHUTDOWN-COOPERATION 2026-08-12 by Codex] Reuses the
+//      interruptible startup delay for VPN keepalive probes so an idle node
+//      never waits out the fixed thirty-second warm-up during service stop.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -459,6 +462,8 @@
 //     operations; adding another await requires adding the same checkpoint.
 //
 // Last Modified:
+//   v2.8.78-KeepaliveShutdownCooperation - Made the VPN keepalive warm-up
+//     observe shutdown instead of requiring supervisor cancellation.
 //   v2.8.77-BackgroundShutdownCooperation - Made traffic startup delay
 //     interruptible and bounded discovery shutdown at stage boundaries.
 //   v2.8.76-DirectoryShutdownDurability - Added a bounded, service-manager-safe
@@ -12694,7 +12699,12 @@ impl Server {
         let shutdown = Arc::clone(&self.shutdown);
         let mut rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            // [KEEPALIVE-SHUTDOWN-COOPERATION 2026-08-12 by Codex] Keepalive
+            // probes need a warm-up, but service shutdown must not wait for a
+            // fixed sleep that has no session or network work to preserve.
+            if Self::runtime_delay_interrupted_by_shutdown(&mut rx, Duration::from_secs(30)).await {
+                return;
+            }
             let mut timer =
                 tokio::time::interval(Duration::from_secs(KEEPALIVE_PROBE_INTERVAL_SECS));
             loop {
