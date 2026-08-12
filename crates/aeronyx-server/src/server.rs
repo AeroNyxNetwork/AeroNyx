@@ -334,6 +334,9 @@
 // 127. [PEER-CACHE-RETRY-STATE 2026-08-12 by Codex] Gives cache persistence a
 //      typed persisted/deferred result and caps retry pressure with exponential
 //      backoff instead of turning a coalesced notification into a hot loop.
+// 128. [FAIL-CLOSED-SHUTDOWN-SIGNALS 2026-08-12 by Codex] Derives the VPN API
+//      listener from the configured gateway and converts signal-registration
+//      failures into supervised shutdown instead of panicking past cleanup.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -468,6 +471,8 @@
 //     operations; adding another await requires adding the same checkpoint.
 //
 // Last Modified:
+//   v2.8.81-FailClosedShutdownSignals - Removed production panic paths from
+//     API address construction and shutdown-signal supervision.
 //   v2.8.80-PeerCacheRetryState - Added typed persistence outcomes and bounded
 //     retry scheduling for failed or witness-deferred cache generations.
 //   v2.8.79-PeerCacheDirtyRecovery - Kept verified delivery evidence pending
@@ -4461,9 +4466,8 @@ impl Server {
         let shutdown_rx_public = self.shutdown_tx.subscribe();
         let shutdown_rx_supervisor = self.shutdown_tx.subscribe();
         let runtime_shutdown = Arc::clone(&self.shutdown);
-        let vpn_listen_addr: std::net::SocketAddr = format!("100.64.0.1:{}", listen_addr.port())
-            .parse()
-            .unwrap_or_else(|_| "100.64.0.1:8421".parse().unwrap());
+        let vpn_listen_addr =
+            Self::vpn_client_api_listen_addr(self.config.gateway_ip(), listen_addr);
         let node_listener = Self::bind_required_api_listener("node_api", listen_addr).await?;
         let vpn_listener =
             Self::bind_required_api_listener("vpn_client_api", vpn_listen_addr).await?;
@@ -4922,6 +4926,17 @@ impl Server {
                     "required {role} listener {listen_addr} failed to bind: {error}"
                 ))
             })
+    }
+
+    fn vpn_client_api_listen_addr(
+        gateway_ip: Ipv4Addr,
+        node_api_listen_addr: std::net::SocketAddr,
+    ) -> std::net::SocketAddr {
+        // [FAIL-CLOSED-SHUTDOWN-SIGNALS 2026-08-12 by Codex] The validated
+        // gateway configuration is already a typed address. Re-parsing a
+        // hard-coded default both introduced a panic path and silently ignored
+        // legitimate non-default privacy-network ranges.
+        std::net::SocketAddr::from((gateway_ip, node_api_listen_addr.port()))
     }
 
     /// Runs one pre-bound API listener until graceful shutdown or failure.
@@ -13169,17 +13184,33 @@ impl Server {
         {
             use tokio::signal::unix::{signal, SignalKind};
 
-            let mut terminate =
-                signal(SignalKind::terminate()).expect("SIGTERM listener initialization failed");
+            let mut terminate = match signal(SignalKind::terminate()) {
+                Ok(terminate) => terminate,
+                Err(error) => {
+                    return Some(Self::shutdown_signal_failure("SIGTERM", error));
+                }
+            };
             tokio::select! {
                 result = tokio::signal::ctrl_c() => {
-                    result.expect("Ctrl+C listener failed");
-                    info!(signal = "SIGINT", "Shutdown signal received");
-                    None
+                    match result {
+                        Ok(()) => {
+                            info!(signal = "SIGINT", "Shutdown signal received");
+                            None
+                        }
+                        Err(error) => Some(Self::shutdown_signal_failure("SIGINT", error)),
+                    }
                 }
-                _ = terminate.recv() => {
-                    info!(signal = "SIGTERM", "Shutdown signal received");
-                    None
+                received = terminate.recv() => {
+                    match received {
+                        Some(()) => {
+                            info!(signal = "SIGTERM", "Shutdown signal received");
+                            None
+                        }
+                        None => Some(Self::shutdown_signal_failure(
+                            "SIGTERM",
+                            "signal stream closed unexpectedly",
+                        )),
+                    }
                 }
                 _ = programmatic_shutdown_rx.recv() => {
                     info!(signal = "PROGRAMMATIC", "Shutdown signal received");
@@ -13206,9 +13237,13 @@ impl Server {
         {
             tokio::select! {
                 result = tokio::signal::ctrl_c() => {
-                    result.expect("Ctrl+C listener failed");
-                    info!(signal = "CTRL_C", "Shutdown signal received");
-                    None
+                    match result {
+                        Ok(()) => {
+                            info!(signal = "CTRL_C", "Shutdown signal received");
+                            None
+                        }
+                        Err(error) => Some(Self::shutdown_signal_failure("CTRL_C", error)),
+                    }
                 }
                 _ = programmatic_shutdown_rx.recv() => {
                     info!(signal = "PROGRAMMATIC", "Shutdown signal received");
@@ -13225,6 +13260,20 @@ impl Server {
                     }
                 }
             }
+        }
+    }
+
+    fn shutdown_signal_failure(
+        signal: &'static str,
+        reason: impl std::fmt::Display,
+    ) -> CriticalRuntimeFailure {
+        // [FAIL-CLOSED-SHUTDOWN-SIGNALS 2026-08-12 by Codex] Signal setup is
+        // part of the required runtime surface. Report a typed local failure so
+        // `run()` executes the same persistence and task-join path used for any
+        // other required worker loss instead of unwinding the process.
+        CriticalRuntimeFailure {
+            task: "shutdown_signal_listener",
+            reason: format!("{signal} shutdown signal listener failed: {reason}"),
         }
     }
 
@@ -13417,6 +13466,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rebound.local_addr().unwrap(), address);
+    }
+
+    #[test]
+    fn vpn_client_api_listener_uses_configured_gateway_and_node_api_port() {
+        // [FAIL-CLOSED-SHUTDOWN-SIGNALS 2026-08-12 by Codex] A node using a
+        // non-default privacy subnet must expose the client API on that
+        // configured gateway while retaining the validated node API port.
+        let gateway = Ipv4Addr::new(10, 77, 0, 1);
+        let node_api = std::net::SocketAddr::from(([127, 0, 0, 1], 9443));
+
+        assert_eq!(
+            Server::vpn_client_api_listen_addr(gateway, node_api),
+            std::net::SocketAddr::from(([10, 77, 0, 1], 9443)),
+        );
     }
 
     #[tokio::test]
@@ -13885,6 +13948,20 @@ mod tests {
         .await
         .unwrap();
         assert!(inner_abort_handle.is_finished());
+    }
+
+    #[test]
+    fn shutdown_signal_setup_failure_enters_required_runtime_failure_path() {
+        // [FAIL-CLOSED-SHUTDOWN-SIGNALS 2026-08-12 by Codex] Signal setup
+        // failures must be handled by the normal supervised shutdown path;
+        // they must never panic past cache persistence and task ownership.
+        assert_eq!(
+            Server::shutdown_signal_failure("SIGTERM", "registration denied"),
+            CriticalRuntimeFailure {
+                task: "shutdown_signal_listener",
+                reason: "SIGTERM shutdown signal listener failed: registration denied".to_string(),
+            }
+        );
     }
 
     #[tokio::test]
