@@ -331,6 +331,9 @@
 // 126. [PEER-CACHE-DIRTY-RECOVERY 2026-08-12 by Codex] Restores the pending
 //      delivery-evidence dirty state when atomic peer-cache persistence fails,
 //      preventing one failed write from acknowledging data it never stored.
+// 127. [PEER-CACHE-RETRY-STATE 2026-08-12 by Codex] Gives cache persistence a
+//      typed persisted/deferred result and caps retry pressure with exponential
+//      backoff instead of turning a coalesced notification into a hot loop.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -465,6 +468,8 @@
 //     operations; adding another await requires adding the same checkpoint.
 //
 // Last Modified:
+//   v2.8.80-PeerCacheRetryState - Added typed persistence outcomes and bounded
+//     retry scheduling for failed or witness-deferred cache generations.
 //   v2.8.79-PeerCacheDirtyRecovery - Kept verified delivery evidence pending
 //     after peer-cache write failures and added a regression test.
 //   v2.8.78-KeepaliveShutdownCooperation - Made the VPN keepalive warm-up
@@ -856,6 +861,10 @@ const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
 const BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
 /// Coalesce verified-delivery bursts before atomically refreshing peer cache.
 const CLIENT_DELIVERY_CACHE_FLUSH_DEBOUNCE_MILLIS: u64 = 250;
+/// First retry delay after a failed or witness-deferred peer-cache write.
+const PEER_CACHE_PERSIST_RETRY_BASE_MILLIS: u64 = 1_000;
+/// Prevent persistent disk or witness failure from creating a background loop.
+const PEER_CACHE_PERSIST_RETRY_MAX_MILLIS: u64 = 60_000;
 /// Previous signed aggregate delivery schema accepted during rolling upgrades.
 const VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION: u16 = 1;
 /// Signed rollback anchors are intentionally tiny aggregate-only documents.
@@ -1400,6 +1409,18 @@ struct PeerStoreCachePersistReport {
     route_domain_certificates: usize,
     client_deliveries: u64,
     client_delivery_generation: u64,
+}
+
+/// Durable state reached by one peer-cache persistence attempt.
+///
+/// [PEER-CACHE-RETRY-STATE 2026-08-12 by Codex] `Deferred` is not an error: it
+/// means the generation intentionally remained pending because its configured
+/// external delivery witness was not yet protected. Callers must not log it as
+/// persisted or clear retry state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerStoreCachePersistOutcome {
+    Persisted,
+    Deferred,
 }
 
 impl PeerStoreCacheDocument {
@@ -5945,7 +5966,7 @@ impl Server {
 
         if let Some(path) = &self.config.discovery.peer_cache_path {
             let cache_save_at = unix_now_secs();
-            if let Err(e) = Self::persist_peer_store_cache_with_delivery_witnesses(
+            match Self::persist_peer_store_cache_with_delivery_witnesses(
                 &self.identity,
                 &peer_store,
                 &self.config.discovery,
@@ -5956,16 +5977,23 @@ impl Server {
             )
             .await
             {
-                warn!(
+                Ok(PeerStoreCachePersistOutcome::Persisted) => {
+                    debug!(
+                        source = %path,
+                        "[DISCOVERY] Initial peer cache snapshot persisted"
+                    );
+                }
+                Ok(PeerStoreCachePersistOutcome::Deferred) => {
+                    warn!(
+                        source = %path,
+                        "[DISCOVERY] Initial peer cache snapshot deferred pending delivery-witness protection"
+                    );
+                }
+                Err(e) => warn!(
                     source = %path,
                     error = %e,
                     "[DISCOVERY] Failed to persist initial peer cache snapshot"
-                );
-            } else {
-                debug!(
-                    source = %path,
-                    "[DISCOVERY] Initial peer cache snapshot persisted"
-                );
+                ),
             }
         }
         Ok(peer_store)
@@ -6308,7 +6336,7 @@ impl Server {
         path: &str,
         now: u64,
         startup_gate: bool,
-    ) -> Result<()> {
+    ) -> Result<PeerStoreCachePersistOutcome> {
         let witnesses_configured = !discovery.verified_delivery_witness_node_ids.is_empty();
         if witnesses_configured {
             let primary_exists = tokio::fs::metadata(path).await.is_ok();
@@ -6347,7 +6375,7 @@ impl Server {
                     format!("external_delivery_witness={status}"),
                 );
                 peer_store.mark_client_delivery_cache_dirty();
-                return Ok(());
+                return Ok(PeerStoreCachePersistOutcome::Deferred);
             }
         } else {
             peer_store.record_client_delivery_witness_round(
@@ -6381,9 +6409,10 @@ impl Server {
             .await;
             if decision != PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Protected {
                 peer_store.mark_client_delivery_cache_dirty();
+                return Ok(PeerStoreCachePersistOutcome::Deferred);
             }
         }
-        Ok(())
+        Ok(PeerStoreCachePersistOutcome::Persisted)
     }
 
     async fn init_directory_chain(
@@ -6742,6 +6771,8 @@ impl Server {
 
         Some(tokio::spawn(async move {
             let mut timer = tokio::time::interval(Duration::from_secs(interval_secs));
+            let mut consecutive_retry_rounds = 0u32;
+            let mut retry_not_before = None;
             let persist_snapshot = |identity: Arc<IdentityKeyPair>,
                                     peer_store: Arc<PeerStore>,
                                     discovery: Arc<DiscoveryConfig>,
@@ -6760,12 +6791,21 @@ impl Server {
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(PeerStoreCachePersistOutcome::Persisted) => {
                         debug!(
                             source = %path,
                             reason = reason,
                             "[DISCOVERY] Peer cache snapshot persisted"
                         );
+                        true
+                    }
+                    Ok(PeerStoreCachePersistOutcome::Deferred) => {
+                        debug!(
+                            source = %path,
+                            reason = reason,
+                            "[DISCOVERY] Peer cache snapshot retained for a bounded retry"
+                        );
+                        false
                     }
                     Err(e) => {
                         warn!(
@@ -6774,15 +6814,35 @@ impl Server {
                             error = %e,
                             "[DISCOVERY] Failed to persist peer cache snapshot"
                         );
+                        false
                     }
                 }
             };
 
+            let update_retry =
+                |stable: bool,
+                 consecutive_retry_rounds: &mut u32,
+                 retry_not_before: &mut Option<tokio::time::Instant>| {
+                    if stable {
+                        *consecutive_retry_rounds = 0;
+                        *retry_not_before = None;
+                        return;
+                    }
+                    *consecutive_retry_rounds = consecutive_retry_rounds.saturating_add(1);
+                    *retry_not_before = Some(
+                        tokio::time::Instant::now()
+                            + Self::peer_cache_persist_retry_delay(*consecutive_retry_rounds),
+                    );
+                };
+
             loop {
                 tokio::select! {
+                    // [PEER-CACHE-RETRY-STATE 2026-08-12 by Codex] Shutdown
+                    // outranks a simultaneously-ready retry or periodic tick.
+                    biased;
                     _ = rx.recv() => {
                         peer_store.take_client_delivery_cache_dirty();
-                        persist_snapshot(
+                        let _ = persist_snapshot(
                             Arc::clone(&identity),
                             Arc::clone(&peer_store),
                             Arc::clone(&discovery),
@@ -6807,8 +6867,13 @@ impl Server {
                             .await;
                             break;
                         }
+                        if retry_not_before
+                            .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+                        {
+                            continue;
+                        }
                         peer_store.take_client_delivery_cache_dirty();
-                        persist_snapshot(
+                        let stable = persist_snapshot(
                             Arc::clone(&identity),
                             Arc::clone(&peer_store),
                             Arc::clone(&discovery),
@@ -6817,13 +6882,18 @@ impl Server {
                             "interval",
                         )
                         .await;
+                        update_retry(
+                            stable,
+                            &mut consecutive_retry_rounds,
+                            &mut retry_not_before,
+                        );
                     }
-                    _ = peer_store.wait_for_client_delivery_cache_dirty() => {
+                    _ = peer_store.wait_for_client_delivery_cache_dirty(), if retry_not_before.is_none() => {
                         tokio::time::sleep(Duration::from_millis(
                             CLIENT_DELIVERY_CACHE_FLUSH_DEBOUNCE_MILLIS,
                         )).await;
                         if peer_store.take_client_delivery_cache_dirty() {
-                            persist_snapshot(
+                            let stable = persist_snapshot(
                                 Arc::clone(&identity),
                                 Arc::clone(&peer_store),
                                 Arc::clone(&discovery),
@@ -6831,11 +6901,51 @@ impl Server {
                                 path.clone(),
                                 "client_delivery",
                             ).await;
+                            update_retry(
+                                stable,
+                                &mut consecutive_retry_rounds,
+                                &mut retry_not_before,
+                            );
+                        }
+                    }
+                    _ = tokio::time::sleep_until(
+                        retry_not_before.unwrap_or_else(tokio::time::Instant::now)
+                    ), if retry_not_before.is_some() => {
+                        retry_not_before = None;
+                        if peer_store.take_client_delivery_cache_dirty() {
+                            let stable = persist_snapshot(
+                                Arc::clone(&identity),
+                                Arc::clone(&peer_store),
+                                Arc::clone(&discovery),
+                                Arc::clone(&control_http_client),
+                                path.clone(),
+                                "bounded_retry",
+                            ).await;
+                            update_retry(
+                                stable,
+                                &mut consecutive_retry_rounds,
+                                &mut retry_not_before,
+                            );
+                        } else {
+                            consecutive_retry_rounds = 0;
                         }
                     }
                 }
             }
         }))
+    }
+
+    fn peer_cache_persist_retry_delay(consecutive_retry_rounds: u32) -> Duration {
+        // [PEER-CACHE-RETRY-STATE 2026-08-12 by Codex] Keep retry state
+        // process-local. It limits I/O and witness pressure only; it never
+        // enters the signed cache document or changes route selection.
+        let shift = consecutive_retry_rounds.saturating_sub(1).min(6);
+        let multiplier = 1u64 << shift;
+        Duration::from_millis(
+            PEER_CACHE_PERSIST_RETRY_BASE_MILLIS
+                .saturating_mul(multiplier)
+                .min(PEER_CACHE_PERSIST_RETRY_MAX_MILLIS),
+        )
     }
 
     /// Publishes the current coordinator descriptor before strict witness gates.
@@ -13159,9 +13269,10 @@ mod tests {
         DirectoryProofGossipResult, DiscoveryGossipExecution, DiscoveryGossipFailure,
         DiscoveryGossipFailureKind, DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator,
         DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints, PeerHttpClients,
-        PeerStoreCacheDocument, PeerStoreVerifiedClientDeliveryAnchor,
-        PeerStoreVerifiedClientDeliveryCacheEvidence, RequiredApiListenerExit, RuntimeTaskRegistry,
-        RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server, SystemdNotifier,
+        PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
+        PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
+        RequiredApiListenerExit, RuntimeTaskRegistry, RuntimeTaskShutdownOutcome,
+        RuntimeTaskShutdownReport, Server, SystemdNotifier,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
         BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
         DATA_PLANE_RECV_FAILURE_LIMIT, DIRECTORY_OPERATOR_HTTP_PROFILE,
@@ -19583,6 +19694,69 @@ mod tests {
         assert!(result.is_err());
         assert!(peer_store.take_client_delivery_cache_dirty());
         tokio::fs::remove_file(non_directory_parent).await.unwrap();
+    }
+
+    #[test]
+    fn peer_store_cache_retry_backoff_is_bounded() {
+        assert_eq!(
+            Server::peer_cache_persist_retry_delay(1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            Server::peer_cache_persist_retry_delay(2),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            Server::peer_cache_persist_retry_delay(3),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            Server::peer_cache_persist_retry_delay(7),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            Server::peer_cache_persist_retry_delay(u32::MAX),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_reports_unprotected_witness_as_deferred() {
+        // [PEER-CACHE-RETRY-STATE 2026-08-12 by Codex] A successful local
+        // write is still pending when its configured external witness cannot
+        // protect the new generation. It must not be reported as stable.
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let witness = IdentityKeyPair::generate();
+        let mut discovery = server.config.discovery.clone();
+        discovery.verified_delivery_witness_node_ids =
+            vec![hex::encode(witness.public_key_bytes())];
+        let peer_store = PeerStore::new();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-deferred-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+
+        let outcome = Server::persist_peer_store_cache_with_delivery_witnesses(
+            &server.identity,
+            &peer_store,
+            &discovery,
+            &reqwest::Client::new(),
+            &path_str,
+            1_800_040_100,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, PeerStoreCachePersistOutcome::Deferred);
+        assert!(peer_store.take_client_delivery_cache_dirty());
+        tokio::fs::remove_file(&path).await.unwrap();
+        let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path_str)).await;
+        tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
