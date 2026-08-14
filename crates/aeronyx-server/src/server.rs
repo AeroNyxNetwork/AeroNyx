@@ -756,7 +756,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use aeronyx_core::protocol::auth::{
     verify_signed_message, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
-    DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
+    DOMAIN_DEVICE_REGISTER, DOMAIN_SESSION_CLOSE_V1, DOMAIN_WALLET_PRESENCE,
 };
 use aeronyx_core::protocol::chat::{
     encode_envelope, BlindRelayDeliveryReceipt, BlindRelayEnvelope, ChatContentType, ChatEnvelope,
@@ -883,6 +883,7 @@ use crate::services::{
     start_dns_proxy, BlindVaultService, DirectoryChainAppendReport, DirectoryChainStore,
     DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,
     HandshakeService, IpPoolService, NodePolicyRuntime, PeerStore, RoutingService, SessionManager,
+    SessionTermination,
 };
 // v1.0.0-Membership
 use crate::services::deny_list::DenyList;
@@ -3301,6 +3302,7 @@ impl Server {
             Arc::clone(&routing),
             Arc::clone(&peer_store),
             Arc::clone(&peer_http_clients.control),
+            Arc::clone(&traffic_tracker),
         );
         tasks.push((
             "udp",
@@ -12003,6 +12005,7 @@ impl Server {
         routing: Arc<RoutingService>,
         peer_store: Arc<PeerStore>,
         control_http_client: Arc<reqwest::Client>,
+        traffic_tracker: Arc<TrafficTracker>,
     ) -> JoinHandle<()> {
         let shutdown = Arc::clone(&self.shutdown);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -12145,6 +12148,41 @@ impl Server {
                                                 }
                                             }
                                             Ok((session, DecryptedPayload::MemChain(msg))) => {
+                                                // [SESSION-TERMINATION 2026-08-15 by Codex]
+                                                // Graceful close is transport lifecycle, not
+                                                // MemChain storage. Dispatch it even when the
+                                                // optional memory subsystem is disabled.
+                                                if let MemChainMessage::SessionCloseV1 {
+                                                    session_id,
+                                                    close_timestamp,
+                                                    signature,
+                                                } = &msg
+                                                {
+                                                    if Self::session_close_v1_is_authenticated(
+                                                        &session,
+                                                        session_id,
+                                                        *close_timestamp,
+                                                        signature,
+                                                    ) {
+                                                        if let Some(termination) = sessions
+                                                            .terminate_with_cooldown(&session.id)
+                                                        {
+                                                            Self::finalize_session_termination(
+                                                                termination,
+                                                                &routing,
+                                                                &session_events,
+                                                                chat_relay.as_deref(),
+                                                                &traffic_tracker,
+                                                            );
+                                                        }
+                                                    } else {
+                                                        warn!(
+                                                            reason = "authentication_failed",
+                                                            "[SESSION] Graceful close rejected"
+                                                        );
+                                                    }
+                                                    continue;
+                                                }
                                                 if let (Some(ref mp), Some(ref aw)) = (&mempool, &aof_writer) {
                                                     Self::handle_memchain_message(
                                                         msg, mp, aw, &storage, &vector_index,
@@ -12179,6 +12217,56 @@ impl Server {
                 }
             }
         })
+    }
+
+    /// Verifies one graceful-close frame against its encrypted outer session.
+    fn session_close_v1_is_authenticated(
+        session: &crate::services::Session,
+        claimed_session_id: &[u8; 16],
+        close_timestamp: u64,
+        signature: &[u8; 64],
+    ) -> bool {
+        // [SESSION-TERMINATION 2026-08-15 by Codex] Binding both the wire field
+        // and signer to the already-decrypted session prevents a valid close
+        // request from being replayed into another tunnel during its 60-second
+        // timestamp window.
+        if claimed_session_id != session.id.as_bytes() {
+            return false;
+        }
+        let timestamp_bytes = close_timestamp.to_le_bytes();
+        verify_signed_message(
+            DOMAIN_SESSION_CLOSE_V1,
+            &[claimed_session_id.as_ref(), timestamp_bytes.as_ref()],
+            &session.client_public_key.to_bytes(),
+            signature,
+            close_timestamp,
+        )
+        .is_ok()
+    }
+
+    /// Finalizes resources owned outside [`SessionManager`] exactly once.
+    fn finalize_session_termination(
+        termination: SessionTermination,
+        routing: &RoutingService,
+        events: &SessionEventSender,
+        chat_relay: Option<&ChatRelayService>,
+        traffic_tracker: &TrafficTracker,
+    ) {
+        // [SESSION-TERMINATION 2026-08-15 by Codex] Conditional route removal
+        // protects a replacement session if stale cleanup races with IP reuse.
+        routing.remove_route_for_session(termination.virtual_ip, &termination.session_id);
+        events.session_ended(
+            &termination.session_id.to_string(),
+            Some(termination.wallet_hex.clone()),
+            Some(termination.virtual_ip.to_string()),
+            termination.stats.bytes_rx,
+            termination.stats.bytes_tx,
+            quality_from_stats(termination.stats),
+        );
+        if let Some(relay) = chat_relay {
+            relay.wallet_routes.remove_session(&termination.session_id);
+        }
+        traffic_tracker.remove_wallet(&termination.wallet_hex);
     }
 
     /// Returns whether one client-tunnel chat sender is bound to the
@@ -13237,20 +13325,17 @@ impl Server {
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) { break; }
 
-                        for (sid, vip, wallet, bytes_rx, bytes_tx, snap) in sessions.cleanup_expired() {
-                            routing.remove_route(vip);
-                            events.session_ended(
-                                &sid.to_string(),
-                                Some(wallet.clone()),
-                                Some(vip.to_string()),
-                                bytes_rx,
-                                bytes_tx,
-                                quality_from_stats(snap),
+                        for termination in sessions.cleanup_expired() {
+                            // [SESSION-TERMINATION 2026-08-15 by Codex] Timeout
+                            // expiry and signed graceful close must finalize the
+                            // exact same external resources.
+                            Self::finalize_session_termination(
+                                termination,
+                                &routing,
+                                &events,
+                                chat_relay.as_deref(),
+                                &traffic_tracker,
                             );
-                            if let Some(ref relay) = chat_relay {
-                                relay.wallet_routes.remove_session(&sid);
-                            }
-                            traffic_tracker.remove_wallet(&wallet);
                         }
 
                         for ip in sessions.drain_cooldown_pool() {
@@ -13589,6 +13674,7 @@ mod tests {
         routing::{get, post},
         Json, Router,
     };
+    use sha2::{Digest, Sha256};
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
@@ -13603,6 +13689,56 @@ mod tests {
     };
     use crate::api::discovery::GossipResponse;
     use crate::config::{DiscoveryConfig, ServerConfig};
+
+    #[test]
+    fn session_close_authentication_binds_transport_identity_and_id() {
+        let identity = IdentityKeyPair::generate();
+        let session_id = aeronyx_common::types::SessionId::generate();
+        let session = crate::services::Session::new(
+            session_id.clone(),
+            identity.public_key(),
+            aeronyx_core::crypto::SessionKey::from_bytes([0x41; 32]),
+            Ipv4Addr::new(100, 64, 0, 41),
+            "127.0.0.1:1041".parse().unwrap(),
+        );
+        let close_timestamp = unix_now_secs();
+        let timestamp_bytes = close_timestamp.to_le_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(aeronyx_core::protocol::DOMAIN_SESSION_CLOSE_V1.as_bytes());
+        hasher.update(session_id.as_bytes());
+        hasher.update(timestamp_bytes);
+        let digest: [u8; 32] = hasher.finalize().into();
+        let signature = identity.sign(&digest);
+
+        assert!(Server::session_close_v1_is_authenticated(
+            &session,
+            session_id.as_bytes(),
+            close_timestamp,
+            &signature,
+        ));
+        // [SESSION-TERMINATION 2026-08-15 by Codex] Neither a different outer
+        // session nor a different ClientHello identity may reuse this frame.
+        assert!(!Server::session_close_v1_is_authenticated(
+            &session,
+            &[0x42; 16],
+            close_timestamp,
+            &signature,
+        ));
+        let wrong_identity = IdentityKeyPair::generate();
+        let wrong_session = crate::services::Session::new(
+            session_id,
+            wrong_identity.public_key(),
+            aeronyx_core::crypto::SessionKey::from_bytes([0x42; 32]),
+            Ipv4Addr::new(100, 64, 0, 42),
+            "127.0.0.1:1042".parse().unwrap(),
+        );
+        assert!(!Server::session_close_v1_is_authenticated(
+            &wrong_session,
+            wrong_session.id.as_bytes(),
+            close_timestamp,
+            &signature,
+        ));
+    }
     use crate::services::memchain::MemoryStorage;
     use crate::services::{
         DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,

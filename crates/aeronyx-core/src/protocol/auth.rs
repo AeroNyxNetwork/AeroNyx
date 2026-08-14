@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/auth.rs
 // ============================================================================
-// Version: 1.3.0-Sovereign
+// Version: 1.5.0-SessionClose
 //
 // Modification Reason:
 //   New file. Centralises per-message wallet signature verification so that
@@ -13,6 +13,8 @@
 //   stable across Ed25519 dependency versions.
 //   v1.4.0-ChatPullV2 — Added a separate domain for monotonic opaque-cursor
 //   mailbox pagination without changing the deployed v1 signature contract.
+//   v1.5.0-SessionClose — Added a unique domain for an authenticated graceful
+//   UDP tunnel close request; existing domains and signatures are unchanged.
 //
 // Main Functionality:
 //   - verify_signed_message(): canonical Ed25519 verification with:
@@ -48,6 +50,7 @@
 //     accidental leakage of internal crypto error detail to callers.
 //
 // Last Modified:
+//   v1.5.0-SessionClose — Added DOMAIN_SESSION_CLOSE_V1
 //   v1.4.0-ChatPullV2 — Added DOMAIN_CHAT_PULL_V2
 //   v1.3.0-Sovereign — Initial implementation
 //   v1.3.1-PrivacyHardening — Removed sensitive verification logs and fixed
@@ -78,6 +81,12 @@ pub const DOMAIN_CHAT_ACK: &str = "AeroNyx-ChatAck-v1";
 
 /// Domain separator for WalletPresence heartbeats.
 pub const DOMAIN_WALLET_PRESENCE: &str = "AeroNyx-WalletPresence-v1";
+
+/// Domain separator for authenticated graceful tunnel termination.
+///
+/// [SESSION-TERMINATION 2026-08-15 by Codex] This must never be reused by a
+/// message that does not close the exact encrypted transport session.
+pub const DOMAIN_SESSION_CLOSE_V1: &str = "AeroNyx-SessionClose-v1";
 
 // ============================================
 // Timestamp window

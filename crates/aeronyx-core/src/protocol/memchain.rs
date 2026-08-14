@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.14-AuthorityHandoverExchange
+// Version: 2.8.15-AuthenticatedSessionClose
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -27,6 +27,9 @@
 //   without changing message discriminants, fields, or valid wire bytes.
 //   v2.8.14-AuthorityHandoverExchange — Appended fixed-size authenticated
 //   request/response frames carrying at most one dual-signed authority proof.
+//   v2.8.15-AuthenticatedSessionClose — Appended a signed, fixed-size graceful
+//   UDP session close request. Existing discriminants and wire bytes remain
+//   unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -54,6 +57,8 @@
 //   - Record block/checkpoint/certificate/lease, delivery-anchor witness, and
 //     authority-handover frames (19-22, 25-34) are node-peer control messages and MUST NOT be
 //     accepted from ordinary client tunnels
+//   - SessionCloseV1 (35) is a client-tunnel control frame. It must match both
+//     the outer encrypted session ID and its handshake Ed25519 identity.
 //   - Commitment blocks contain opaque record IDs only; sealed memory payload
 //     replication requires a separate owner-authorised protocol
 //   - serde_bytes64 is defined in chat.rs; the [u8;64] signature fields here
@@ -63,6 +68,8 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.15-AuthenticatedSessionClose — Appended variant 35 for bounded,
+//                        signed graceful UDP tunnel cleanup
 //   v2.8.14-AuthorityHandoverExchange — Appended variants 33-34 and canonical
 //                        fixed-size authority-history signing contracts
 //   v2.8.13-BoundedWireCodec — Symmetric frame limits, wire compatibility
@@ -251,6 +258,7 @@ pub struct RecordCheckpointCertificateMemberV1 {
 /// | 32    | VerifiedDeliveryAnchorWitnessResponseV1| v2.8.12-DeliveryWitness |
 /// | 33    | RecordCoordinatorHandoverRequestV1 | v2.8.14-HandoverExchange |
 /// | 34    | RecordCoordinatorHandoverResponseV1| v2.8.14-HandoverExchange |
+/// | 35    | SessionCloseV1       | v2.8.15-AuthenticatedSessionClose |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -809,6 +817,28 @@ pub enum MemChainMessage {
         /// Latest contiguous authority epoch in the responder's audited store.
         latest_authority_epoch: u64,
         /// Responder signature over the request binding and proof digest.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+
+    // ── v2.8.15: authenticated graceful tunnel close (index 35) ─────────
+    /// [index 35] Requests immediate cleanup of the current encrypted session.
+    ///
+    /// [SESSION-TERMINATION 2026-08-15 by Codex] UDP has no connection-close
+    /// handshake. This fixed-size request lets short-lived tools and clients
+    /// release server capacity without waiting for the liveness timeout. The
+    /// server accepts it only inside the exact encrypted session named here and
+    /// only when the handshake identity verifies the signature.
+    ///
+    /// ## Signature Coverage
+    /// domain="AeroNyx-SessionClose-v1" ||
+    /// session_id(16) || close_timestamp(8,LE)
+    SessionCloseV1 {
+        /// Exact outer encrypted transport session being closed.
+        session_id: [u8; 16],
+        /// Unix epoch seconds; must be inside the standard authentication window.
+        close_timestamp: u64,
+        /// Signature by the Ed25519 identity authenticated in ClientHello.
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
@@ -1758,6 +1788,39 @@ mod tests {
             26,
             "RecordCheckpointCertificateResponseV1 must be discriminant 26"
         );
+
+        // [SESSION-TERMINATION 2026-08-15 by Codex] New client control frames
+        // append after every deployed node-peer frame; moving this value would
+        // silently reinterpret existing bincode traffic.
+        let b = bincode::serialize(&MemChainMessage::SessionCloseV1 {
+            session_id: [0xA5; 16],
+            close_timestamp: 1_700_000_009,
+            signature: [0x5A; 64],
+        })
+        .unwrap();
+        assert_eq!(disc(&b), 35, "SessionCloseV1 must be discriminant 35");
+    }
+
+    #[test]
+    fn test_session_close_v1_roundtrip() {
+        let request = MemChainMessage::SessionCloseV1 {
+            session_id: [0xC1; 16],
+            close_timestamp: 1_700_100_100,
+            signature: [0x3C; 64],
+        };
+        let encoded = encode_memchain(&request).expect("encode SessionCloseV1");
+        match decode_memchain(&encoded[1..]).expect("decode SessionCloseV1") {
+            MemChainMessage::SessionCloseV1 {
+                session_id,
+                close_timestamp,
+                signature,
+            } => {
+                assert_eq!(session_id, [0xC1; 16]);
+                assert_eq!(close_timestamp, 1_700_100_100);
+                assert_eq!(signature, [0x3C; 64]);
+            }
+            other => panic!("Expected SessionCloseV1, got {other:?}"),
+        }
     }
 
     #[test]

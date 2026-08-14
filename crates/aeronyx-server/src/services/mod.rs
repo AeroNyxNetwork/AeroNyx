@@ -107,5 +107,7 @@ pub use peer_store::{
     RouteDomainCertificateImportError,
 };
 pub use routing::RoutingService;
-pub use session::{Session, SessionManager, SessionState};
+// [SESSION-TERMINATION 2026-08-15 by Codex] Export the owned lifecycle result
+// so UDP and timeout termination share one external-resource finalizer.
+pub use session::{Session, SessionManager, SessionState, SessionTermination};
 pub use wallet_routes::WalletRouteCache;

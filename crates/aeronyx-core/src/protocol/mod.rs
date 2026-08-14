@@ -86,9 +86,11 @@ pub mod onion;
 pub mod version;
 
 // Re-export primary types
+// [SESSION-TERMINATION 2026-08-15 by Codex] Keep the close domain on the same
+// audited public protocol surface as every other wallet-authenticated frame.
 pub use auth::{
     verify_signed_message, AuthError, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL, DOMAIN_CHAT_PULL_V2,
-    DOMAIN_DEVICE_REGISTER, DOMAIN_WALLET_PRESENCE,
+    DOMAIN_DEVICE_REGISTER, DOMAIN_SESSION_CLOSE_V1, DOMAIN_WALLET_PRESENCE,
 };
 pub use blind_vault::{
     decode_blind_vault_frame, encode_blind_vault_frame, is_blind_vault_frame,

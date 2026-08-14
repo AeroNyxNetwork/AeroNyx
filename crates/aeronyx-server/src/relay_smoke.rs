@@ -50,7 +50,7 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
-use tokio::time::{sleep, timeout, timeout_at, Instant as TokioInstant};
+use tokio::time::{sleep, timeout_at, Instant as TokioInstant};
 
 use aeronyx_core::crypto::handshake::{create_client_hello, verify_server_hello};
 use aeronyx_core::crypto::kdf::derive_session_key;
@@ -61,7 +61,8 @@ use aeronyx_core::protocol::codec::{
 };
 use aeronyx_core::protocol::{
     decode_memchain, encode_memchain, ChatContentType, ChatEnvelope, DataPacket, MemChainMessage,
-    CURRENT_PROTOCOL_VERSION, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL_V2, MEMCHAIN_MAGIC,
+    CURRENT_PROTOCOL_VERSION, DOMAIN_CHAT_ACK, DOMAIN_CHAT_PULL_V2, DOMAIN_SESSION_CLOSE_V1,
+    MEMCHAIN_MAGIC,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,6 +71,10 @@ const HEALTH_BODY_LIMIT: usize = 1024 * 1024;
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const ACK_SETTLE_INTERVAL: Duration = Duration::from_millis(100);
 const SMOKE_PLAINTEXT_BYTES: usize = 48;
+// [SESSION-TERMINATION 2026-08-15 by Codex] Cleanup has its own short budget
+// after the proof deadline and duplicates the tiny UDP close frame once.
+const SESSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_CLOSE_REDUNDANCY: usize = 2;
 
 /// Host-local options for one authenticated live relay smoke run.
 #[derive(Debug, Clone)]
@@ -259,7 +264,7 @@ impl HealthClient {
         Ok(Self { client, url })
     }
 
-    async fn fetch(&self) -> Result<HealthSnapshot> {
+    async fn fetch_unbounded(&self) -> Result<HealthSnapshot> {
         let response = self
             .client
             .get(self.url.clone())
@@ -294,13 +299,22 @@ impl HealthClient {
         serde_json::from_slice(&body).context("health response contract is invalid")
     }
 
+    async fn fetch_until(&self, deadline: TokioInstant) -> Result<HealthSnapshot> {
+        // [SESSION-TERMINATION 2026-08-15 by Codex] The HTTP client's own
+        // timeout is only defense in depth. Every proof and cleanup read must
+        // obey its phase deadline so cancellation is never needed for control.
+        timeout_at(deadline, self.fetch_unbounded())
+            .await
+            .map_err(|_| anyhow::anyhow!("health request exceeded phase deadline"))?
+    }
+
     async fn wait_for_client_delivery(
         &self,
         baseline: u64,
         deadline: TokioInstant,
     ) -> Result<HealthSnapshot> {
         loop {
-            let snapshot = self.fetch().await?;
+            let snapshot = self.fetch_until(deadline).await?;
             anyhow::ensure!(
                 snapshot.active_sessions == 1,
                 "concurrent session activity prevents receipt attribution"
@@ -313,11 +327,27 @@ impl HealthClient {
             if current > baseline {
                 return Ok(snapshot);
             }
-            anyhow::ensure!(
-                TokioInstant::now() < deadline,
-                "verified terminal receipt was not observed before timeout"
-            );
-            sleep(HEALTH_POLL_INTERVAL).await;
+            timeout_at(deadline, sleep(HEALTH_POLL_INTERVAL))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("verified terminal receipt was not observed before timeout")
+                })?;
+        }
+    }
+
+    async fn wait_for_active_sessions(&self, expected: u64, deadline: TokioInstant) -> Result<()> {
+        loop {
+            let snapshot = self.fetch_until(deadline).await?;
+            if snapshot.active_sessions == expected {
+                return Ok(());
+            }
+            timeout_at(deadline, sleep(HEALTH_POLL_INTERVAL))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "explicit smoke session cleanup was not observed before timeout"
+                    )
+                })?;
         }
     }
 }
@@ -336,7 +366,7 @@ impl RelaySmokeClient {
         server_addr: SocketAddr,
         expected_server_key: &[u8; 32],
         identity: IdentityKeyPair,
-        operation_timeout: Duration,
+        deadline: TokioInstant,
     ) -> Result<Self> {
         let bind_addr = match server_addr {
             SocketAddr::V4(_) => "0.0.0.0:0",
@@ -357,14 +387,14 @@ impl RelaySmokeClient {
             CURRENT_PROTOCOL_VERSION,
         );
         let hello_bytes = encode_client_hello(&hello);
-        let sent = socket
-            .send(&hello_bytes)
+        let sent = timeout_at(deadline, socket.send(&hello_bytes))
             .await
+            .map_err(|_| anyhow::anyhow!("ClientHello send timed out"))?
             .map_err(|_| anyhow::anyhow!("ClientHello send failed"))?;
         anyhow::ensure!(sent == hello_bytes.len(), "ClientHello send was incomplete");
 
         let mut response = [0u8; 151];
-        let received = timeout(operation_timeout, socket.recv(&mut response))
+        let received = timeout_at(deadline, socket.recv(&mut response))
             .await
             .map_err(|_| anyhow::anyhow!("ServerHello timed out"))?
             .map_err(|_| anyhow::anyhow!("ServerHello receive failed"))?;
@@ -400,7 +430,11 @@ impl RelaySmokeClient {
         })
     }
 
-    async fn send_memchain(&mut self, message: &MemChainMessage) -> Result<()> {
+    async fn send_memchain(
+        &mut self,
+        message: &MemChainMessage,
+        deadline: TokioInstant,
+    ) -> Result<()> {
         let plaintext = encode_memchain(message).context("MemChain encode failed")?;
         let counter = self.next_tx_counter;
         self.next_tx_counter = self
@@ -411,12 +445,23 @@ impl RelaySmokeClient {
             .context("client transport encryption failed")?;
         let packet = DataPacket::new(self.session_id, counter, encrypted);
         let bytes = encode_data_packet(&packet);
-        let sent = self
-            .socket
-            .send(&bytes)
+        let sent = timeout_at(deadline, self.socket.send(&bytes))
             .await
+            .map_err(|_| anyhow::anyhow!("encrypted frame send timed out"))?
             .map_err(|_| anyhow::anyhow!("encrypted frame send failed"))?;
         anyhow::ensure!(sent == bytes.len(), "encrypted frame send was incomplete");
+        Ok(())
+    }
+
+    async fn send_graceful_close(&mut self, deadline: TokioInstant) -> Result<()> {
+        let request = build_session_close(&self.identity, self.session_id)?;
+        // [SESSION-TERMINATION 2026-08-15 by Codex] Duplicate the small UDP
+        // control frame with fresh transport counters. Server removal is
+        // idempotent; this only reduces the chance that a lost datagram leaves
+        // the smoke session waiting for the normal liveness timeout.
+        for _ in 0..SESSION_CLOSE_REDUNDANCY {
+            self.send_memchain(&request, deadline).await?;
+        }
         Ok(())
     }
 
@@ -532,6 +577,27 @@ fn build_ack(identity: &IdentityKeyPair, message_id: [u8; 16]) -> Result<MemChai
     })
 }
 
+fn build_session_close(
+    identity: &IdentityKeyPair,
+    session_id: [u8; 16],
+) -> Result<MemChainMessage> {
+    let close_timestamp = unix_now()?;
+    let timestamp_bytes = close_timestamp.to_le_bytes();
+    // [SESSION-TERMINATION 2026-08-15 by Codex] The close request is signed by
+    // the same identity used in ClientHello and bound to the exact negotiated
+    // session. The server additionally verifies the encrypted outer session.
+    let signature = sign_domain(
+        identity,
+        DOMAIN_SESSION_CLOSE_V1,
+        &[session_id.as_ref(), timestamp_bytes.as_ref()],
+    );
+    Ok(MemChainMessage::SessionCloseV1 {
+        session_id,
+        close_timestamp,
+        signature,
+    })
+}
+
 fn build_smoke_envelope(
     sender: &IdentityKeyPair,
     receiver: &IdentityKeyPair,
@@ -579,7 +645,7 @@ async fn pull_page(
     deadline: TokioInstant,
 ) -> Result<Vec<ChatEnvelope>> {
     let request = build_pull(&client.identity)?;
-    client.send_memchain(&request).await?;
+    client.send_memchain(&request, deadline).await?;
     loop {
         if let MemChainMessage::ChatPullResponseV2 { envelopes, .. } =
             client.receive_memchain(deadline).await?
@@ -595,13 +661,15 @@ async fn confirm_entry_ack(
     deadline: TokioInstant,
 ) -> Result<()> {
     let ack = build_ack(&receiver.identity, message_id)?;
-    receiver.send_memchain(&ack).await?;
+    receiver.send_memchain(&ack, deadline).await?;
     loop {
         anyhow::ensure!(
             TokioInstant::now() < deadline,
             "entry mailbox ACK was not observed before timeout"
         );
-        sleep(ACK_SETTLE_INTERVAL).await;
+        timeout_at(deadline, sleep(ACK_SETTLE_INTERVAL))
+            .await
+            .map_err(|_| anyhow::anyhow!("entry mailbox ACK was not observed before timeout"))?;
         let envelopes = pull_page(receiver, deadline).await?;
         if envelopes
             .iter()
@@ -612,94 +680,149 @@ async fn confirm_entry_ack(
     }
 }
 
-/// Executes one real authenticated relay smoke run within one hard deadline.
-pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
-    let total_timeout = options.timeout;
-    // [LIVE-RELAY-SMOKE 2026-08-15 by Codex] A single outer timeout bounds the
-    // whole transaction. Per-I/O timeouts remain defense in depth, but cannot
-    // accumulate beyond the operator's declared proof window.
-    timeout(total_timeout, run_bounded(options))
+async fn cleanup_ephemeral_sessions(
+    sender: &mut Option<RelaySmokeClient>,
+    receiver: &mut Option<RelaySmokeClient>,
+    health: &HealthClient,
+    baseline_active_sessions: u64,
+) -> Result<()> {
+    let cleanup_deadline = TokioInstant::now() + SESSION_CLEANUP_TIMEOUT;
+    // [SESSION-TERMINATION 2026-08-15 by Codex] Always attempt every known
+    // session even if one socket write fails. Aggregate health is the final
+    // authority because a prior redundant frame may already have succeeded.
+    if let Some(client) = receiver.as_mut() {
+        let _ = client.send_graceful_close(cleanup_deadline).await;
+    }
+    if let Some(client) = sender.as_mut() {
+        let _ = client.send_graceful_close(cleanup_deadline).await;
+    }
+    health
+        .wait_for_active_sessions(baseline_active_sessions, cleanup_deadline)
         .await
-        .map_err(|_| anyhow::anyhow!("relay smoke exceeded its total timeout"))?
 }
 
-async fn run_bounded(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
+/// Executes one real authenticated relay smoke run within one proof deadline.
+///
+/// A separate bounded cleanup phase always runs after the transaction. This is
+/// intentionally not implemented with an outer cancellation timeout: dropping
+/// the future would also drop the session keys required for graceful cleanup.
+pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
     let started = Instant::now();
     let health_url = options.validate()?;
     let health = HealthClient::new(health_url, options.timeout)?;
-    let baseline = health.fetch().await?;
-    baseline.ensure_idle_two_hop_ready()?;
-    let deliveries_before = baseline.verified_client_deliveries();
     let deadline = TokioInstant::now() + options.timeout;
+    let baseline = health.fetch_until(deadline).await?;
+    baseline.ensure_idle_two_hop_ready()?;
+    let baseline_active_sessions = baseline.active_sessions;
+    let deliveries_before = baseline.verified_client_deliveries();
 
     let sender_identity = IdentityKeyPair::generate();
     let receiver_identity = IdentityKeyPair::generate();
     let (expected_envelope, expected_plaintext, receiver_e2e) =
         build_smoke_envelope(&sender_identity, &receiver_identity)?;
+    let mut sender = None;
+    let mut receiver = None;
 
-    let mut sender = RelaySmokeClient::connect(
-        options.server_addr,
-        &options.expected_server_key,
-        sender_identity,
-        options.timeout,
+    let transaction: Result<u64> = async {
+        sender = Some(
+            RelaySmokeClient::connect(
+                options.server_addr,
+                &options.expected_server_key,
+                sender_identity,
+                deadline,
+            )
+            .await?,
+        );
+        sender
+            .as_mut()
+            .context("sender session was not retained")?
+            .send_memchain(
+                &MemChainMessage::ChatRelay(expected_envelope.clone()),
+                deadline,
+            )
+            .await?;
+        let delivery_health = health
+            .wait_for_client_delivery(deliveries_before, deadline)
+            .await?;
+
+        receiver = Some(
+            RelaySmokeClient::connect(
+                options.server_addr,
+                &options.expected_server_key,
+                receiver_identity,
+                deadline,
+            )
+            .await?,
+        );
+        let receiver_client = receiver
+            .as_mut()
+            .context("receiver session was not retained")?;
+        let envelopes = pull_page(receiver_client, deadline).await?;
+        let delivered = envelopes
+            .iter()
+            .find(|envelope| envelope.message_id == expected_envelope.message_id)
+            .context("entry mailbox did not return the smoke envelope")?;
+        anyhow::ensure!(
+            exact_envelope_match(delivered, &expected_envelope),
+            "entry mailbox envelope differs from the signed input"
+        );
+        delivered
+            .verify_signature()
+            .context("entry mailbox envelope signature is invalid")?;
+        let decrypted = receiver_e2e
+            .decrypt_raw(&delivered.ciphertext, &delivered.nonce)
+            .context("smoke E2E decryption failed")?;
+        anyhow::ensure!(
+            decrypted == expected_plaintext,
+            "smoke E2E plaintext verification failed"
+        );
+        confirm_entry_ack(receiver_client, expected_envelope.message_id, deadline).await?;
+
+        let final_health = health.fetch_until(deadline).await?;
+        anyhow::ensure!(
+            final_health.active_sessions == 2,
+            "concurrent session activity prevents final smoke attribution"
+        );
+        anyhow::ensure!(
+            final_health.verified_client_deliveries()
+                >= delivery_health.verified_client_deliveries(),
+            "verified client delivery counter regressed after mailbox ACK"
+        );
+        Ok(final_health.verified_client_deliveries())
+    }
+    .await;
+
+    let cleanup = cleanup_ephemeral_sessions(
+        &mut sender,
+        &mut receiver,
+        &health,
+        baseline_active_sessions,
     )
-    .await?;
-    sender
-        .send_memchain(&MemChainMessage::ChatRelay(expected_envelope.clone()))
-        .await?;
-    let delivery_health = health
-        .wait_for_client_delivery(deliveries_before, deadline)
-        .await?;
-
-    let mut receiver = RelaySmokeClient::connect(
-        options.server_addr,
-        &options.expected_server_key,
-        receiver_identity,
-        options.timeout,
-    )
-    .await?;
-    let envelopes = pull_page(&mut receiver, deadline).await?;
-    let delivered = envelopes
-        .iter()
-        .find(|envelope| envelope.message_id == expected_envelope.message_id)
-        .context("entry mailbox did not return the smoke envelope")?;
-    anyhow::ensure!(
-        exact_envelope_match(delivered, &expected_envelope),
-        "entry mailbox envelope differs from the signed input"
-    );
-    delivered
-        .verify_signature()
-        .context("entry mailbox envelope signature is invalid")?;
-    let decrypted = receiver_e2e
-        .decrypt_raw(&delivered.ciphertext, &delivered.nonce)
-        .context("smoke E2E decryption failed")?;
-    anyhow::ensure!(
-        decrypted == expected_plaintext,
-        "smoke E2E plaintext verification failed"
-    );
-    confirm_entry_ack(&mut receiver, expected_envelope.message_id, deadline).await?;
-
-    let final_health = health.fetch().await?;
-    anyhow::ensure!(
-        final_health.active_sessions == 2,
-        "concurrent session activity prevents final smoke attribution"
-    );
-    anyhow::ensure!(
-        final_health.verified_client_deliveries() >= delivery_health.verified_client_deliveries(),
-        "verified client delivery counter regressed after mailbox ACK"
-    );
+    .await;
+    let deliveries_after = match (transaction, cleanup) {
+        (Ok(deliveries_after), Ok(())) => deliveries_after,
+        (Err(primary), Ok(())) => return Err(primary),
+        (Ok(_), Err(cleanup_error)) => {
+            return Err(cleanup_error.context("relay proof passed but session cleanup failed"));
+        }
+        (Err(primary), Err(cleanup_error)) => {
+            return Err(primary.context(format!(
+                "smoke session cleanup also failed: {cleanup_error}"
+            )));
+        }
+    };
 
     Ok(RelaySmokeReport {
         status: "passed",
         transport: "authenticated_udp",
         terminal_receipt_observed: true,
         verified_client_deliveries_before: deliveries_before,
-        verified_client_deliveries_after: final_health.verified_client_deliveries(),
+        verified_client_deliveries_after: deliveries_after,
         entry_mailbox_round_trip_verified: true,
         entry_mailbox_ack_verified: true,
         e2e_ciphertext_verified: true,
         ephemeral_sessions_created: 2,
-        session_cleanup: "normal_node_liveness_timeout",
+        session_cleanup: "explicit_authenticated_close",
         terminal_replica_cleanup: "node_ttl_managed",
         evidence_scope: "idle_node_aggregate_terminal_receipt_plus_exact_entry_mailbox_round_trip",
         elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -749,6 +872,41 @@ mod tests {
             .decrypt_raw(&envelope.ciphertext, &envelope.nonce)
             .expect("decrypt envelope");
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn graceful_close_signature_binds_exact_session() {
+        let identity = IdentityKeyPair::generate();
+        let session_id = [0x91; 16];
+        let request = build_session_close(&identity, session_id).expect("build close request");
+        let MemChainMessage::SessionCloseV1 {
+            session_id: signed_session_id,
+            close_timestamp,
+            signature,
+        } = request
+        else {
+            panic!("expected SessionCloseV1");
+        };
+        let timestamp_bytes = close_timestamp.to_le_bytes();
+        assert!(aeronyx_core::protocol::verify_signed_message(
+            DOMAIN_SESSION_CLOSE_V1,
+            &[signed_session_id.as_ref(), timestamp_bytes.as_ref()],
+            &identity.public_key_bytes(),
+            &signature,
+            close_timestamp,
+        )
+        .is_ok());
+        // [SESSION-TERMINATION 2026-08-15 by Codex] A valid signature cannot
+        // be moved to a different encrypted session during the time window.
+        let other_session_id = [0x92; 16];
+        assert!(aeronyx_core::protocol::verify_signed_message(
+            DOMAIN_SESSION_CLOSE_V1,
+            &[other_session_id.as_ref(), timestamp_bytes.as_ref()],
+            &identity.public_key_bytes(),
+            &signature,
+            close_timestamp,
+        )
+        .is_err());
     }
 
     #[test]
@@ -875,7 +1033,7 @@ mod tests {
             server_addr,
             &expected_server_key,
             IdentityKeyPair::generate(),
-            Duration::from_secs(2),
+            TokioInstant::now() + Duration::from_secs(2),
         )
         .await
         .expect("connect smoke client");

@@ -93,6 +93,12 @@
 //!   comparison because any real counter value can be a valid "first packet".
 //!
 //! ## Last Modified
+//! v2.10.0-ExplicitTermination
+//!   - [SESSION-TERMINATION 2026-08-15 by Codex] Added one atomic termination
+//!     result used by expiry and authenticated graceful close. Removal from the
+//!     primary map, wallet-index cleanup, closed state, statistics capture, and
+//!     virtual-IP cooldown now share one lifecycle-locked operation.
+//!
 //! v2.9.0-BoundedWalletRegistration
 //!   - Bounds distinct wallet identities registered by one live session.
 //!   - Removes stale device registrations when a device changes wallet.
@@ -573,6 +579,25 @@ pub struct StatsSnapshot {
     pub keepalive_missed: u64,
     /// Keepalive probes currently waiting for an ACK.
     pub keepalive_pending: u64,
+}
+
+/// Complete privacy-safe resource snapshot returned by session termination.
+///
+/// [SESSION-TERMINATION 2026-08-15 by Codex] External resources such as the
+/// route table, management event queue, chat wallet routes, and traffic tracker
+/// live outside [`SessionManager`]. Returning one owned snapshot lets every
+/// termination source finalize those resources identically without retaining a
+/// live session or re-reading maps after removal.
+#[derive(Debug, Clone)]
+pub struct SessionTermination {
+    /// Removed session identifier used only for internal route/event cleanup.
+    pub session_id: SessionId,
+    /// Virtual IP that must remain in cooldown before reuse.
+    pub virtual_ip: Ipv4Addr,
+    /// Cached client identity used by existing aggregate accounting cleanup.
+    pub wallet_hex: String,
+    /// Final aggregate transport statistics.
+    pub stats: StatsSnapshot,
 }
 
 fn unix_now_secs() -> u64 {
@@ -1098,7 +1123,12 @@ impl SessionManager {
     /// `wallet_index` consistent.
     pub fn remove(&self, id: &SessionId) -> Option<Arc<Session>> {
         let _lifecycle_guard = self.lifecycle_lock.lock();
-        let removed = self.sessions.remove(id).map(|(_, s)| s);
+        self.remove_locked(id)
+    }
+
+    /// Removes one session while the caller holds `lifecycle_lock`.
+    fn remove_locked(&self, id: &SessionId) -> Option<Arc<Session>> {
+        let removed = self.sessions.remove(id).map(|(_, session)| session);
 
         if let Some(ref session) = removed {
             session.set_state(SessionState::Closed);
@@ -1114,6 +1144,37 @@ impl SessionManager {
         }
 
         removed
+    }
+
+    /// Atomically terminates a session and stages its virtual IP for cooldown.
+    ///
+    /// The returned snapshot must be passed through the server's external
+    /// lifecycle finalizer so routing, events, chat routes, and traffic state
+    /// are cleaned exactly once. `None` means another lifecycle owner already
+    /// removed the session.
+    pub fn terminate_with_cooldown(&self, id: &SessionId) -> Option<SessionTermination> {
+        // [SESSION-TERMINATION 2026-08-15 by Codex] Keep state transition,
+        // removal, secondary-index cleanup, final counters, and cooldown
+        // insertion under one lock. This closes the race where expiry and an
+        // explicit close could both emit termination side effects for one ID.
+        let _lifecycle_guard = self.lifecycle_lock.lock();
+        let session = self
+            .sessions
+            .get(id)
+            .map(|entry| Arc::clone(entry.value()))?;
+        session.set_state(SessionState::Closing);
+        let stats = session.stats_snapshot();
+        let virtual_ip = session.virtual_ip;
+        let wallet_hex = session.wallet_hex.clone();
+        let removed = self.remove_locked(id)?;
+        debug_assert!(Arc::ptr_eq(&session, &removed));
+        self.cooldown_pool.insert(virtual_ip, Instant::now());
+        Some(SessionTermination {
+            session_id: id.clone(),
+            virtual_ip,
+            wallet_hex,
+            stats,
+        })
     }
 
     /// 🌟 v1.2.0-MultiDevice: Remove all wallet_index entries for a session.
@@ -1157,48 +1218,25 @@ impl SessionManager {
         self.sessions.is_empty()
     }
 
-    /// Clean up expired sessions and their wallet_index entries.
+    /// Atomically terminates expired sessions and returns finalization records.
     ///
-    /// ## v1.0.0-Voice+SessionFix
-    /// Return type extended from `Vec<(SessionId, Ipv4Addr)>` to
-    /// `Vec<(SessionId, Ipv4Addr, String, u64, u64, StatsSnapshot)>`.
-    ///
-    /// The three new fields:
-    /// - `wallet_hex`: hex-encoded Ed25519 public key (client identity)
-    /// - `bytes_rx`:   bytes received from client during this session
-    /// - `bytes_tx`:   bytes sent to client during this session
-    ///
-    /// ## v1.0.0-Membership
-    /// Uses `session.wallet_hex` (cached field) instead of re-encoding
-    /// `client_public_key` on every expiry sweep.
-    pub fn cleanup_expired(&self) -> Vec<(SessionId, Ipv4Addr, String, u64, u64, StatsSnapshot)> {
-        let mut expired = Vec::new();
-
-        for entry in self.sessions.iter() {
-            let session = entry.value();
-            if session.is_expired(self.session_timeout) {
-                let snap = session.stats_snapshot();
-                // v1.0.0-Membership: use cached wallet_hex — no allocation.
-                let wallet = session.wallet_hex.clone();
-                expired.push((
-                    session.id.clone(),
-                    session.virtual_ip,
-                    wallet,
-                    snap.bytes_rx,
-                    snap.bytes_tx,
-                    snap,
-                ));
-            }
-        }
-
-        for (id, ip, _, _, _, _) in &expired {
-            debug!("Session expired");
-            self.remove(id);
-            // Stage the released IP into the cooldown pool.
-            // spawn_cleanup_task calls drain_cooldown_pool() each tick
-            // to collect IPs whose cooldown has elapsed.
-            self.cooldown_pool.insert(*ip, Instant::now());
-        }
+    /// [SESSION-TERMINATION 2026-08-15 by Codex] Expiry and explicit close now
+    /// return the same owned shape, preventing their route/event/accounting
+    /// cleanup paths from drifting apart.
+    pub fn cleanup_expired(&self) -> Vec<SessionTermination> {
+        let expired_ids: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.value().is_expired(self.session_timeout))
+            .map(|entry| entry.key().clone())
+            .collect();
+        let expired: Vec<_> = expired_ids
+            .iter()
+            .filter_map(|id| {
+                debug!("Session expired");
+                self.terminate_with_cooldown(id)
+            })
+            .collect();
 
         if !expired.is_empty() {
             info!(
@@ -2010,14 +2048,16 @@ mod tests {
         let expired = manager.cleanup_expired();
 
         assert_eq!(expired.len(), 1);
-        let (_, vip, wallet_hex, bytes_rx, bytes_tx, _snap) = &expired[0];
-        assert_eq!(*vip, virtual_ip);
-        assert_eq!(*wallet_hex, hex::encode(wallet));
-        assert_eq!(*bytes_rx, 0);
-        assert_eq!(*bytes_tx, 0);
+        // [SESSION-TERMINATION 2026-08-15 by Codex] The shared owned result is
+        // the contract consumed by timeout and explicit-close finalizers.
+        let termination = &expired[0];
+        assert_eq!(termination.virtual_ip, virtual_ip);
+        assert_eq!(termination.wallet_hex, hex::encode(wallet));
+        assert_eq!(termination.stats.bytes_rx, 0);
+        assert_eq!(termination.stats.bytes_tx, 0);
 
         assert!(
-            manager.cooldown_pool.contains_key(vip),
+            manager.cooldown_pool.contains_key(&termination.virtual_ip),
             "Released IP must be in cooldown pool"
         );
 
@@ -2029,6 +2069,40 @@ mod tests {
 
         assert!(manager.get_all_by_wallet(&wallet).is_empty());
         assert_eq!(manager.wallet_index_count(), 0);
+    }
+
+    #[test]
+    fn test_terminate_with_cooldown_is_atomic_and_idempotent() {
+        let manager = make_manager();
+        let identity = IdentityKeyPair::generate();
+        let wallet = identity.public_key_bytes();
+        let sid = SessionId::generate();
+        let virtual_ip = Ipv4Addr::new(100, 64, 0, 33);
+        manager
+            .create(
+                sid.clone(),
+                identity.public_key(),
+                SessionKey::from_bytes([0x33; 32]),
+                virtual_ip,
+                "127.0.0.1:12347".parse().unwrap(),
+            )
+            .unwrap();
+        manager.register_device(&wallet, make_device_id(0x33), sid.clone());
+
+        // [SESSION-TERMINATION 2026-08-15 by Codex] Only the lifecycle owner
+        // that removes the session receives an external-finalization record.
+        let termination = manager
+            .terminate_with_cooldown(&sid)
+            .expect("first termination must own cleanup");
+        assert_eq!(termination.session_id, sid);
+        assert_eq!(termination.virtual_ip, virtual_ip);
+        assert_eq!(termination.wallet_hex, hex::encode(wallet));
+        assert!(manager.get(&termination.session_id).is_none());
+        assert_eq!(manager.wallet_index_count(), 0);
+        assert!(manager.cooldown_pool.contains_key(&virtual_ip));
+        assert!(manager
+            .terminate_with_cooldown(&termination.session_id)
+            .is_none());
     }
 
     #[test]
