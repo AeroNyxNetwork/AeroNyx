@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.90.0 - Separated authority-proof transport pins from
-checkpoint witness policy without breaking existing follower configurations.
+Modification Reason: v0.91.0 - Made configured commitment followers fail
+startup when their authority-carrier policy or required runtime cannot be built.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.90.0 - [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Gives dual-signed authority-proof transport a dedicated follower-only pin set with an explicit legacy witness fallback.
+Last Modified: v0.91.0 - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Resolves authority-carrier policy once and prevents a configured follower from disappearing behind healthy process startup.
+Previous: v0.90.0 - [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Gives dual-signed authority-proof transport a dedicated follower-only pin set with an explicit legacy witness fallback.
 Previous: v0.89.0 - [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Recovers exact dual-signed coordinator proofs through bounded operator-pinned carriers without expanding transport into authority.
 Previous: v0.88.0 - [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Synchronizes one exact-next dual-signed coordinator proof at a time, stops block pages at activation boundaries, and applies the audited authority schedule to follower control traffic.
 Previous: v0.87.0 - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Pins a process-local commitment authority root, audits every historical proposer at startup, and enforces the active coordinator at each appended height.
@@ -123,6 +124,50 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.91 Configured followers cannot silently lose required runtime
+
+[FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex]
+
+- Authority-proof carrier source and identities are now resolved into one
+  validated typed policy before the follower task is spawned. Runtime cannot
+  independently derive a telemetry label and a `filter_map`-decoded identity
+  list, so malformed pins cannot be silently discarded or reported under a
+  different policy source.
+- The follower task constructor returns `Result<Option<JoinHandle<()>>>`:
+  `None` means only that commitment synchronization is disabled. A configured
+  follower with a missing coordinator, self-referential coordinator, or invalid
+  carrier policy returns a startup error instead of leaving a healthy process
+  without its required synchronization worker.
+- The existing startup task registry owns rollback. If this gate fails after an
+  earlier listener or worker was created, those owned tasks are aborted before
+  startup returns. Readiness therefore describes the complete configured node,
+  not a partially initialized process.
+- Operational state records only fixed privacy-safe error codes such as
+  `invalid_authority_carrier_policy`. Logs and status do not expose identities,
+  endpoints, proof contents, epochs, hashes, routes, messages, owners, or memory
+  data.
+- Public compatibility helpers and all old configuration defaults remain
+  available. This changes neither block format nor handover proof verification,
+  and it does not introduce voting, fork choice, consensus, or finality.
+
+Implementation paths:
+
+- `crates/aeronyx-server/src/config_memchain.rs`: typed, single-parse effective
+  carrier policy plus panic-free compatibility helpers.
+- `crates/aeronyx-server/src/server.rs`: fallible follower task construction and
+  startup transaction propagation.
+- `crates/aeronyx-server/src/services/memchain/storage_ops.rs`: stable
+  privacy-safe status classification for the new startup rejection.
+
+Verification:
+
+- Unit tests cover disabled, legacy witness-fallback, and dedicated policy
+  sources; malformed policies fail the typed runtime boundary.
+- Startup tests cover missing coordinator, coordinator self-reference, and
+  malformed carrier pins, including the fixed follower status error code.
+- Existing handover, authority, block-carrier, certificate, and configuration
+  suites remain the cryptographic and backward-compatibility regression gate.
 
 ### v0.90 Authority-proof transport is not witness authority
 

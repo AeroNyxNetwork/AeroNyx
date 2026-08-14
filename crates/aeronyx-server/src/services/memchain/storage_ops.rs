@@ -84,6 +84,9 @@
 //! - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Enforces the immutable
 //!   root and exact-height active coordinator during startup audit, explicit
 //!   handover audit, and atomic live block append
+//! - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Retains one bounded,
+//!   identity-blind diagnostic when typed follower carrier policy construction
+//!   fails before its required runtime task is spawned
 //! - [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Runs signed local-anchor
 //!   writes through one privacy-safe blocking worker boundary.
 //!
@@ -181,6 +184,7 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Added a fixed startup carrier-policy failure code.
 //! [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Added source-blind,
 //! follower-only authority-proof recovery and circuit runtime evidence.
 //! [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Connected persisted
@@ -2857,6 +2861,7 @@ impl MemoryStorage {
 fn privacy_safe_sync_error_code(reason: &str) -> String {
     match reason {
         "invalid_pinned_coordinator"
+        | "invalid_authority_carrier_policy"
         | "coordinator_self_reference"
         | "http_client_init_failed"
         | "pinned_coordinator_unavailable"

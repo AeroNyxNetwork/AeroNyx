@@ -39,6 +39,9 @@
 //! v2.8.61-AuthorityCarrierPolicy — Separated read-only authority-proof
 //!                     carriers from checkpoint witness trust pins while
 //!                     preserving the historical witness fallback.
+//! v2.8.62-TypedAuthorityCarrierPolicy — Resolves carrier source and pins in
+//!                     one validated object so runtime cannot observe policy
+//!                     label/pin drift or silently discard malformed entries.
 //!
 //! ## Main Functionality
 //! - `MemChainMode`   — Off / Local / P2p / Saas
@@ -110,6 +113,7 @@
 //!   before production; deploy the protocol to all pins before activation.
 //!
 //! ## Last Modified
+//! v2.8.62-TypedAuthorityCarrierPolicy - Made effective proof transport a single validated value.
 //! v2.8.61-AuthorityCarrierPolicy - Separated proof transport from checkpoint witness policy.
 //! v2.8.48-CommitmentAuthority - Pinned the proposer authority root independently of mutable SQLite.
 //! v2.8.47-RuntimeIdentityPolicy - Rejected self-referential coordinator and witness pins.
@@ -632,6 +636,50 @@ enum CommitmentNodeIdValidationError {
     InvalidLength,
     ZeroIdentity,
     Duplicate,
+}
+
+/// Effective source of follower authority-proof transport pins.
+///
+/// [TYPED-AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] This source is
+/// operational metadata only. It never grants witness or coordinator power.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitmentAuthorityCarrierPolicySource {
+    /// No transport fallback is configured.
+    Disabled,
+    /// Backward-compatible transport through checkpoint witness pins.
+    WitnessFallback,
+    /// Explicit follower-only authority carrier pins.
+    Dedicated,
+}
+
+impl CommitmentAuthorityCarrierPolicySource {
+    /// Returns the fixed source-blind label used by startup telemetry.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::WitnessFallback => "witness_fallback",
+            Self::Dedicated => "dedicated",
+        }
+    }
+}
+
+/// One validated authority-proof carrier policy consumed by the follower.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitmentAuthorityCarrierPolicy {
+    source: CommitmentAuthorityCarrierPolicySource,
+    node_ids: Vec<[u8; 32]>,
+}
+
+impl CommitmentAuthorityCarrierPolicy {
+    /// Returns the fixed source-blind policy label.
+    pub(crate) const fn source_label(&self) -> &'static str {
+        self.source.as_str()
+    }
+
+    /// Returns validated pins in deterministic operator order.
+    pub(crate) fn node_ids(&self) -> &[[u8; 32]] {
+        &self.node_ids
+    }
 }
 fn default_ner_model_path() -> String {
     "models/gliner".into()
@@ -1382,6 +1430,31 @@ impl MemChainConfig {
             .collect()
     }
 
+    /// Resolves the complete authority-proof transport policy exactly once.
+    ///
+    /// [TYPED-AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Security-sensitive
+    /// runtime code must use this fallible object instead of independently
+    /// deriving a label and `filter_map`-decoded pins. The explicit list
+    /// replaces the witness fallback; neither path widens the other.
+    pub(crate) fn effective_commitment_authority_carrier_policy(
+        &self,
+    ) -> Result<CommitmentAuthorityCarrierPolicy> {
+        if !self.commitment_authority_carrier_node_ids.is_empty() {
+            return Ok(CommitmentAuthorityCarrierPolicy {
+                source: CommitmentAuthorityCarrierPolicySource::Dedicated,
+                node_ids: self.validated_commitment_authority_carrier_node_ids()?,
+            });
+        }
+
+        let node_ids = self.validated_commitment_witness_node_ids()?;
+        let source = if node_ids.is_empty() {
+            CommitmentAuthorityCarrierPolicySource::Disabled
+        } else {
+            CommitmentAuthorityCarrierPolicySource::WitnessFallback
+        };
+        Ok(CommitmentAuthorityCarrierPolicy { source, node_ids })
+    }
+
     /// Returns effective authority-proof transport identities in operator order.
     ///
     /// [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] An explicit carrier
@@ -1390,28 +1463,16 @@ impl MemChainConfig {
     /// witness identities silently remain eligible.
     #[must_use]
     pub fn commitment_authority_carrier_node_id_bytes(&self) -> Vec<[u8; 32]> {
-        if self.commitment_authority_carrier_node_ids.is_empty() {
-            return self.commitment_witness_node_id_bytes();
-        }
-        self.commitment_authority_carrier_node_ids
-            .iter()
-            .filter_map(|value| {
-                let decoded = hex::decode(value.trim()).ok()?;
-                decoded.try_into().ok()
-            })
-            .collect()
+        self.effective_commitment_authority_carrier_policy()
+            .map(|policy| policy.node_ids)
+            .unwrap_or_default()
     }
 
     /// Returns a source-blind label suitable for startup telemetry.
     #[must_use]
     pub fn commitment_authority_carrier_policy_label(&self) -> &'static str {
-        if !self.commitment_authority_carrier_node_ids.is_empty() {
-            "dedicated"
-        } else if !self.commitment_witness_node_ids.is_empty() {
-            "witness_fallback"
-        } else {
-            "disabled"
-        }
+        self.effective_commitment_authority_carrier_policy()
+            .map_or("invalid", |policy| policy.source_label())
     }
 
     /// Resolves the coordinator-local signed tip anchor without changing old
@@ -2123,6 +2184,11 @@ mod tests {
             legacy.commitment_authority_carrier_policy_label(),
             "witness_fallback"
         );
+        let legacy_policy = legacy
+            .effective_commitment_authority_carrier_policy()
+            .unwrap();
+        assert_eq!(legacy_policy.source_label(), "witness_fallback");
+        assert_eq!(legacy_policy.node_ids(), &[[0x52; 32], [0x53; 32]]);
 
         let dedicated = MemChainConfig {
             commitment_authority_carrier_node_ids: vec![carrier.clone()],
@@ -2137,8 +2203,19 @@ mod tests {
             dedicated.commitment_authority_carrier_policy_label(),
             "dedicated"
         );
+        let dedicated_policy = dedicated
+            .effective_commitment_authority_carrier_policy()
+            .unwrap();
+        assert_eq!(dedicated_policy.source_label(), "dedicated");
+        assert_eq!(dedicated_policy.node_ids(), &[[0x54; 32]]);
         assert!(dedicated.validate_runtime_identity(&[0x55; 32]).is_ok());
         assert!(dedicated.validate_runtime_identity(&[0x54; 32]).is_err());
+
+        let disabled = MemChainConfig::default()
+            .effective_commitment_authority_carrier_policy()
+            .unwrap();
+        assert_eq!(disabled.source_label(), "disabled");
+        assert!(disabled.node_ids().is_empty());
 
         let carrier_only = MemChainConfig {
             blind_storage_enabled: true,
@@ -2220,6 +2297,24 @@ mod tests {
         ] {
             assert!(invalid.validate().is_err());
         }
+
+        // [TYPED-AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Compatibility
+        // helpers stay panic-free for non-runtime callers, while the typed
+        // runtime boundary rejects malformed policy instead of dropping it.
+        let malformed = MemChainConfig {
+            commitment_authority_carrier_node_ids: vec!["not-a-node-id".into()],
+            ..Default::default()
+        };
+        assert!(malformed
+            .effective_commitment_authority_carrier_policy()
+            .is_err());
+        assert_eq!(
+            malformed.commitment_authority_carrier_policy_label(),
+            "invalid"
+        );
+        assert!(malformed
+            .commitment_authority_carrier_node_id_bytes()
+            .is_empty());
     }
 
     #[test]

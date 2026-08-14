@@ -352,6 +352,9 @@
 // 133. [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Gives handover-proof
 //      transport a dedicated follower pin set, with an explicit compatibility
 //      fallback that does not merge transport and witness authorization.
+// 134. [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Resolves one typed
+//      authority carrier policy and propagates configured follower
+//      initialization failures through the startup transaction.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -493,8 +496,13 @@
 //   - [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Use the effective
 //     authority carrier set only for proof transport. Checkpoint block and
 //     certificate recovery must continue using the independent witness set.
+//   - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] A configured
+//     commitment follower must return a supervised task or fail startup.
+//     Never convert malformed coordinator/carrier state into `None`.
 //
 // Last Modified:
+//   [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Made follower task
+//     construction fail closed and consume one validated carrier policy.
 //   [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Separated authority-proof
 //     transport pins from checkpoint witness policy with legacy fallback.
 //   [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Added direct-first,
@@ -3578,7 +3586,7 @@ impl Server {
                 Arc::clone(&peer_store),
                 commitment_sync_tip_rx,
                 Arc::clone(&peer_http_clients.sync),
-            ) {
+            )? {
                 tasks.push((
                     "memchain-block-sync",
                     Self::supervise_required_runtime_task(
@@ -7835,9 +7843,9 @@ impl Server {
         peer_store: Arc<PeerStore>,
         mut block_announce_rx: mpsc::Receiver<u64>,
         sync_http_client: Arc<reqwest::Client>,
-    ) -> Option<JoinHandle<()>> {
+    ) -> Result<Option<JoinHandle<()>>> {
         if !self.config.memchain.commitment_sync_enabled {
-            return None;
+            return Ok(None);
         }
         let Some(coordinator_node_id) = self.config.memchain.commitment_sync_coordinator_node_id()
         else {
@@ -7851,7 +7859,9 @@ impl Server {
             error!(
                 "[MEMCHAIN_BLOCK] Follower sync disabled at runtime: invalid pinned coordinator"
             );
-            return None;
+            return Err(ServerError::startup_failed(
+                "MemChain commitment follower initialization failed: invalid pinned coordinator",
+            ));
         };
         if self.identity.public_key_bytes() == coordinator_node_id {
             let now = unix_now_secs();
@@ -7864,26 +7874,43 @@ impl Server {
             error!(
                 "[MEMCHAIN_BLOCK] Follower sync disabled at runtime: coordinator cannot follow itself"
             );
-            return None;
+            return Err(ServerError::startup_failed(
+                "MemChain commitment follower initialization failed: coordinator cannot follow itself",
+            ));
         }
+
+        // [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Build one
+        // fallible policy before spawning. Runtime must not independently
+        // derive a label and pins or silently discard malformed identities.
+        let authority_carrier_policy = self
+            .config
+            .memchain
+            .effective_commitment_authority_carrier_policy()
+            .map_err(|error| {
+                let now = unix_now_secs();
+                storage.record_commitment_sync_failure(
+                    now,
+                    "invalid_authority_carrier_policy",
+                    1,
+                    now.saturating_add(600),
+                );
+                error!(
+                    "[MEMCHAIN_BLOCK] Follower sync startup rejected invalid authority carrier policy"
+                );
+                error
+            })?;
 
         let identity = self.identity.clone();
         let base_interval_secs = self.config.memchain.commitment_sync_interval_secs;
         let max_pages_per_round = self.config.memchain.commitment_sync_max_pages_per_round;
         let certificate_witness_node_ids = self.config.memchain.commitment_witness_node_id_bytes();
-        let authority_carrier_node_ids = self
-            .config
-            .memchain
-            .commitment_authority_carrier_node_id_bytes();
-        let authority_carrier_policy = self
-            .config
-            .memchain
-            .commitment_authority_carrier_policy_label();
+        let authority_carrier_node_ids = authority_carrier_policy.node_ids().to_vec();
+        let authority_carrier_policy_label = authority_carrier_policy.source_label();
         let certificate_minimum_signers = self.config.memchain.commitment_witness_min_verified;
         let authority_handover_enabled = storage.record_commitment_authority_enforced();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        Some(tokio::spawn(async move {
+        Ok(Some(tokio::spawn(async move {
             const MAX_BACKOFF_SECS: u64 = 600;
 
             // [FOLLOWER-TASK-LIVENESS 2026-07-30 by Codex] Construct before
@@ -7914,7 +7941,7 @@ impl Server {
                 max_pages_per_round,
                 event_driven = true,
                 authority_handover_enabled,
-                authority_carrier_policy,
+                authority_carrier_policy = authority_carrier_policy_label,
                 authority_carrier_pins = authority_carrier_node_ids.len(),
                 "[MEMCHAIN_BLOCK] Authority-scheduled coordinator follower started"
             );
@@ -8294,7 +8321,7 @@ impl Server {
             }
             drop(liveness_guard);
             info!("[MEMCHAIN_BLOCK] Pinned coordinator follower stopped");
-        }))
+        })))
     }
 
     fn spawn_discovery_gossip_task(
@@ -13556,6 +13583,77 @@ mod tests {
         assert_eq!(stopped.state, "stopped");
         assert_eq!(stopped.follower_readiness_state, "stopped");
         assert!(!stopped.follower_fully_ready);
+    }
+
+    #[test]
+    fn configured_commitment_sync_task_construction_fails_closed() {
+        // [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Programmatic
+        // callers and future reload paths must receive an error rather than a
+        // healthy process with no required follower task. Each failure also
+        // leaves one fixed, identity-blind operational code.
+        let assert_startup_failure =
+            |config: ServerConfig,
+             identity: IdentityKeyPair,
+             expected_error: &str,
+             expected_status_code: &str| {
+                let server = Server::new(config, identity, None);
+                let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+                storage.configure_record_commitment_sync(false, true);
+                let (_tip_tx, tip_rx) = tokio::sync::mpsc::channel(1);
+                let error = server
+                    .spawn_memchain_commitment_sync_task(
+                        Arc::clone(&storage),
+                        Arc::new(PeerStore::new()),
+                        tip_rx,
+                        test_peer_http_client(),
+                    )
+                    .err()
+                    .expect("configured invalid follower must fail startup");
+                assert!(error.to_string().contains(expected_error));
+                let status = storage.record_commitment_sync_status();
+                assert_eq!(status.state, "backoff");
+                assert_eq!(
+                    status.last_error_code.as_deref(),
+                    Some(expected_status_code)
+                );
+            };
+
+        let mut missing_coordinator = ServerConfig::default();
+        missing_coordinator.memchain.commitment_sync_enabled = true;
+        assert_startup_failure(
+            missing_coordinator,
+            IdentityKeyPair::generate(),
+            "invalid pinned coordinator",
+            "invalid_pinned_coordinator",
+        );
+
+        let self_identity = IdentityKeyPair::generate();
+        let mut self_coordinator = ServerConfig::default();
+        self_coordinator.memchain.commitment_sync_enabled = true;
+        self_coordinator.memchain.commitment_coordinator_node_id =
+            hex::encode(self_identity.public_key_bytes());
+        assert_startup_failure(
+            self_coordinator,
+            self_identity,
+            "coordinator cannot follow itself",
+            "coordinator_self_reference",
+        );
+
+        let invalid_carrier_identity = IdentityKeyPair::generate();
+        let mut distinct_coordinator = invalid_carrier_identity.public_key_bytes();
+        distinct_coordinator[0] ^= 0x01;
+        let mut invalid_carrier = ServerConfig::default();
+        invalid_carrier.memchain.commitment_sync_enabled = true;
+        invalid_carrier.memchain.commitment_coordinator_node_id = hex::encode(distinct_coordinator);
+        invalid_carrier
+            .memchain
+            .commitment_authority_carrier_node_ids = vec!["not-a-node-id".into()];
+        assert_startup_failure(
+            invalid_carrier,
+            invalid_carrier_identity,
+            "memchain.commitment_authority_carrier_node_ids",
+            "invalid_authority_carrier_policy",
+        );
     }
 
     #[cfg(target_os = "linux")]
