@@ -33,6 +33,9 @@
 //!   through process command lines; the legacy `--code` flag remains compatible.
 //! - [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Propagate management HTTP
 //!   client initialization errors from node registration instead of panicking.
+//! - [LIVE-RELAY-SMOKE 2026-08-15 by Codex] Add a host-local operator command
+//!   that proves the production authenticated UDP, E2E relay, terminal receipt,
+//!   mailbox pull, and ACK path without exposing protocol secrets.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -55,6 +58,7 @@
 //! v1.9.0-RegistrationCodeStdin - Add bounded secret-safe registration input
 //! v1.10.0-ManagementClientStartup - Fail registration cleanly when the
 //! management HTTP client cannot initialize
+//! v1.11.0-LiveRelaySmoke - Add a bounded authenticated live relay smoke
 
 use std::fs::File;
 use std::io::{BufRead, Read};
@@ -82,6 +86,8 @@ use aeronyx_server::services::{
     AofWriter, DirectoryReplicaResolutionCommand, DirectoryReplicaStore, DirectoryReplicaTip,
 };
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
+
+mod relay_smoke;
 
 // ============================================
 // CLI Definition
@@ -174,6 +180,37 @@ enum Commands {
     /// Inspect, verify, or resolve Directory Replica state locally
     #[command(subcommand)]
     DirectoryReplica(DirectoryReplicaCommands),
+
+    /// Prove one host-local authenticated multi-hop ciphertext relay
+    RelaySmoke {
+        /// Running node UDP listener; only loopback addresses are accepted
+        #[arg(long, default_value = "127.0.0.1:51820")]
+        server: std::net::SocketAddr,
+
+        /// Running node aggregate health URL; only loopback HTTP is accepted
+        #[arg(long, default_value = "http://127.0.0.1:8421/api/vpn/health")]
+        health_url: String,
+
+        /// Path to the running node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Total bounded proof window in seconds
+        #[arg(
+            long,
+            default_value_t = 30,
+            value_parser = clap::value_parser!(u64).range(5..=120)
+        )]
+        timeout_seconds: u64,
+
+        /// Confirm creation of two ephemeral test sessions and one ciphertext
+        #[arg(long)]
+        confirm_live_relay_smoke: bool,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -378,6 +415,24 @@ async fn main() {
         Commands::Memchain(command) => cmd_memchain(command).await,
         Commands::Pubkey { config, format } => cmd_pubkey(config, format).await,
         Commands::DirectoryReplica(command) => cmd_directory_replica(command).await,
+        Commands::RelaySmoke {
+            server,
+            health_url,
+            config,
+            timeout_seconds,
+            confirm_live_relay_smoke,
+            json,
+        } => {
+            cmd_relay_smoke(
+                server,
+                health_url,
+                config,
+                timeout_seconds,
+                confirm_live_relay_smoke,
+                json,
+            )
+            .await
+        }
     };
 
     if let Err(e) = result {
@@ -392,6 +447,88 @@ async fn main() {
 
 /// Maximum accepted one-time registration-code length after trimming.
 const MAX_REGISTRATION_CODE_BYTES: usize = 128;
+
+/// Runs one explicit, aggregate-only proof against the node on this host.
+async fn cmd_relay_smoke(
+    server_addr: std::net::SocketAddr,
+    health_url: String,
+    config_path: PathBuf,
+    timeout_seconds: u64,
+    confirmed: bool,
+    emit_json: bool,
+) -> anyhow::Result<()> {
+    // [LIVE-RELAY-SMOKE 2026-08-15 by Codex] This command creates protocol
+    // traffic and two ephemeral sessions. Requiring an explicit confirmation
+    // prevents an operator from confusing a read-only health check with a live
+    // end-to-end proof.
+    anyhow::ensure!(confirmed, "relay smoke requires --confirm-live-relay-smoke");
+    let config = ServerConfig::load(&config_path)
+        .await
+        .with_context(|| format!("load node config {}", config_path.display()))?;
+    anyhow::ensure!(
+        server_addr.port() == config.listen_addr().port(),
+        "relay smoke UDP port does not match the configured node listener"
+    );
+    let key_path = PathBuf::from(&config.server_key.key_file);
+    let expected_server_key = relay_smoke::load_expected_server_public_key(&key_path).await?;
+    let report = relay_smoke::run(relay_smoke::RelaySmokeOptions {
+        server_addr,
+        health_url,
+        expected_server_key,
+        timeout: std::time::Duration::from_secs(timeout_seconds),
+    })
+    .await?;
+
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("AeroNyx authenticated live relay smoke");
+        println!("  Status:                         {}", report.status);
+        println!("  Transport:                      {}", report.transport);
+        println!(
+            "  Verified client deliveries:     {} -> {}",
+            report.verified_client_deliveries_before, report.verified_client_deliveries_after
+        );
+        println!(
+            "  Terminal receipt observed:      {}",
+            report.terminal_receipt_observed
+        );
+        println!(
+            "  Entry mailbox round trip:       {}",
+            report.entry_mailbox_round_trip_verified
+        );
+        println!(
+            "  Entry mailbox ACK:              {}",
+            report.entry_mailbox_ack_verified
+        );
+        println!(
+            "  E2E ciphertext verified:        {}",
+            report.e2e_ciphertext_verified
+        );
+        println!(
+            "  Ephemeral sessions:             {}",
+            report.ephemeral_sessions_created
+        );
+        println!(
+            "  Session cleanup:                {}",
+            report.session_cleanup
+        );
+        println!(
+            "  Terminal replica cleanup:       {}",
+            report.terminal_replica_cleanup
+        );
+        println!(
+            "  Evidence scope:                 {}",
+            report.evidence_scope
+        );
+        println!("  Elapsed:                        {} ms", report.elapsed_ms);
+        println!(
+            "  Privacy boundary:               {}",
+            report.privacy_boundary
+        );
+    }
+    Ok(())
+}
 
 /// Validates a registration code without logging or retaining surrounding input.
 fn normalize_registration_code(value: &str) -> anyhow::Result<String> {
@@ -1874,6 +2011,39 @@ mod tests {
             "NYX-123",
             "--code-stdin",
         ])
+        .is_err());
+    }
+
+    #[test]
+    fn relay_smoke_cli_is_local_bounded_and_explicit() {
+        let cli = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-smoke",
+            "--confirm-live-relay-smoke",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::RelaySmoke {
+            server,
+            health_url,
+            config,
+            timeout_seconds,
+            confirm_live_relay_smoke,
+            json,
+        } = cli.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(server, "127.0.0.1:51820".parse().unwrap());
+        assert_eq!(health_url, "http://127.0.0.1:8421/api/vpn/health");
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert_eq!(timeout_seconds, 30);
+        assert!(confirm_live_relay_smoke);
+        assert!(json);
+
+        assert!(Cli::try_parse_from(
+            ["aeronyx-server", "relay-smoke", "--timeout-seconds", "121",]
+        )
         .is_err());
     }
 
