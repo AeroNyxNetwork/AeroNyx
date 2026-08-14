@@ -13,6 +13,8 @@
 //! ceilings so many synthetic receivers cannot bypass per-mailbox limits.
 //! v1.3.0-MaintenanceBounds — Rejected TTL values that cannot be represented
 //! safely by SQLite's signed timestamp domain.
+//! v1.4.0-PeerRelayAdmission — Added a backward-compatible global admission
+//! ceiling for the legacy direct peer-relay endpoint.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -46,6 +48,12 @@
 //!   ceiling before any durable write.
 //!   Rationale: text chat envelopes should never approach 1 MB; if they do,
 //!   it indicates a misconfiguration rather than a legitimate use-case.
+//! - [PEER-RELAY-ADMISSION 2026-08-15 by Codex] The direct peer endpoint has
+//!   no authenticated previous-hop identity in its legacy wire contract.
+//!   `peer_relay_requests_per_minute` is therefore deliberately node-global;
+//!   do not derive a bucket from user/sender/receiver keys because that would
+//!   create privacy-sensitive routing state. Authenticated onion relay keeps
+//!   its separate per-node abuse guard.
 //! - `expired_notification_ttl_secs`: after this TTL, undelivered expiry
 //!   notifications are silently discarded. Flutter client local timeout is
 //!   the fallback.
@@ -54,6 +62,8 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.4.0-PeerRelayAdmission — Added configurable parser-front admission for
+//! the legacy direct peer-relay compatibility path.
 //! v1.3.0-MaintenanceBounds — Added signed timestamp boundary validation.
 //! v1.2.0-GlobalStorageQuotas — Added backward-compatible global disk ceilings.
 //! v1.1.0-ChatRelay — Initial implementation.
@@ -70,6 +80,13 @@ const MAX_MESSAGE_SIZE_HARD_LIMIT: usize = 1_048_576; // 1 MB
 
 /// SQLite INTEGER and cleanup timestamp arithmetic use signed 64-bit values.
 const MAX_SQLITE_TTL_SECS: u64 = i64::MAX as u64;
+
+/// Default node-global admission ceiling for legacy direct peer relay.
+///
+/// The onion path has authenticated per-hop limiting. Direct relay predates
+/// that contract, so this coarse ceiling bounds parser/storage pressure without
+/// creating buckets keyed by user-visible envelope metadata.
+pub const DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 1_200;
 
 // ============================================
 // ChatRelayConfig
@@ -110,6 +127,7 @@ const MAX_SQLITE_TTL_SECS: u64 = i64::MAX as u64;
 /// cleanup_interval_secs = 60
 /// dedup_lru_capacity = 10000
 /// expired_notification_ttl_secs = 604800  # 7 days
+/// peer_relay_requests_per_minute = 1200
 /// ```
 ///
 /// ## Last Modified
@@ -234,6 +252,15 @@ pub struct ChatRelayConfig {
     /// Default: 604 800 (7 days).
     #[serde(default = "default_expired_notification_ttl")]
     pub expired_notification_ttl_secs: u64,
+
+    /// Maximum direct peer-relay HTTP requests admitted per minute.
+    ///
+    /// This global compatibility guard runs before JSON deserialization. The
+    /// legacy endpoint cannot authenticate a previous-hop node without a wire
+    /// upgrade, so the limiter intentionally does not key on sender, receiver,
+    /// IP address, or other user-adjacent metadata. Default: 1 200.
+    #[serde(default = "default_peer_relay_requests_per_minute")]
+    pub peer_relay_requests_per_minute: u32,
 }
 
 // ── Default functions ──
@@ -277,6 +304,9 @@ fn default_dedup_lru_capacity() -> usize {
 fn default_expired_notification_ttl() -> u64 {
     604_800
 } // 7 days
+fn default_peer_relay_requests_per_minute() -> u32 {
+    DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE
+}
 
 impl Default for ChatRelayConfig {
     fn default() -> Self {
@@ -295,6 +325,7 @@ impl Default for ChatRelayConfig {
             cleanup_interval_secs: default_cleanup_interval(),
             dedup_lru_capacity: default_dedup_lru_capacity(),
             expired_notification_ttl_secs: default_expired_notification_ttl(),
+            peer_relay_requests_per_minute: default_peer_relay_requests_per_minute(),
         }
     }
 }
@@ -437,6 +468,13 @@ impl ChatRelayConfig {
             ));
         }
 
+        if self.peer_relay_requests_per_minute == 0 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.peer_relay_requests_per_minute",
+                "must be > 0",
+            ));
+        }
+
         Ok(())
     }
 }
@@ -471,6 +509,10 @@ mod tests {
         assert_eq!(cr.cleanup_interval_secs, 60);
         assert_eq!(cr.dedup_lru_capacity, 10_000);
         assert_eq!(cr.expired_notification_ttl_secs, 604_800);
+        assert_eq!(
+            cr.peer_relay_requests_per_minute,
+            DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE
+        );
     }
 
     #[test]
@@ -491,6 +533,7 @@ mod tests {
             cleanup_interval_secs: 0,
             dedup_lru_capacity: 0,
             expired_notification_ttl_secs: 0,
+            peer_relay_requests_per_minute: 0,
         };
         assert!(cr.validate().is_ok());
     }
@@ -669,6 +712,16 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_relay_zero_peer_relay_rate_rejected() {
+        let cr = ChatRelayConfig {
+            enabled: true,
+            peer_relay_requests_per_minute: 0,
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
+    }
+
+    #[test]
     fn test_chat_relay_toml_parsing() {
         // We can't call `toml::from_str::<ServerConfig>` here (circular dep),
         // but we can test raw TOML → ChatRelayConfig deserialization.
@@ -687,6 +740,7 @@ max_pending_blob_bytes_total = 1073741824
 cleanup_interval_secs = 30
 dedup_lru_capacity = 5000
 expired_notification_ttl_secs = 172800
+peer_relay_requests_per_minute = 2400
 "#;
         let cr: ChatRelayConfig = toml::from_str(toml_str).unwrap();
         assert!(cr.enabled);
@@ -703,6 +757,7 @@ expired_notification_ttl_secs = 172800
         assert_eq!(cr.cleanup_interval_secs, 30);
         assert_eq!(cr.dedup_lru_capacity, 5_000);
         assert_eq!(cr.expired_notification_ttl_secs, 172_800);
+        assert_eq!(cr.peer_relay_requests_per_minute, 2_400);
         assert!(cr.validate().is_ok());
     }
 

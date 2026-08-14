@@ -2928,6 +2928,7 @@ mod tests {
             cleanup_interval_secs: 60,
             dedup_lru_capacity: 10,
             expired_notification_ttl_secs: 604_800,
+            peer_relay_requests_per_minute: 1_200,
         }
     }
 

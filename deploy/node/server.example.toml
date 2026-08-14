@@ -337,3 +337,7 @@ max_pending_blob_bytes_total = 2147483648
 cleanup_interval_secs = 60
 dedup_lru_capacity = 10000
 expired_notification_ttl_secs = 604800
+# [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Global parser-front ceiling for
+# the legacy direct compatibility endpoint. Onion relay keeps its separate,
+# authenticated per-previous-hop abuse guard.
+peer_relay_requests_per_minute = 1200

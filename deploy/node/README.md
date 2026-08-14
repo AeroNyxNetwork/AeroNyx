@@ -661,7 +661,15 @@ public_api_listen_addr = "0.0.0.0:8422"
 [memchain.chat_relay]
 enabled = true
 db_path = "/var/lib/aeronyx/chat_pending.db"
+peer_relay_requests_per_minute = 1200
 ```
+
+<!-- [PEER-RELAY-ADMISSION 2026-08-15 by Codex] -->
+`peer_relay_requests_per_minute` bounds the legacy direct compatibility route
+before JSON parsing. It is intentionally node-global because that wire format
+does not authenticate a previous-hop node; AeroNyx does not create rate-limit
+buckets from user keys, receiver keys, or source IP addresses. Authenticated
+onion relay uses its separate per-node abuse guard.
 
 The recommended path is the guarded node entrypoint helper:
 

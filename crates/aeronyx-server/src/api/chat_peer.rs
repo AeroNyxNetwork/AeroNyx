@@ -50,6 +50,9 @@
 //! - [RELAY-ROUTE-RAII 2026-08-11 by Codex] Owns every newly admitted route
 //!   through an RAII lease so cancellation, shutdown, and future early-return
 //!   paths release in-flight replay state unless a durable ACK is committed
+//! - [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Applies configurable,
+//!   node-global direct-relay admission before JSON parsing without creating
+//!   privacy-sensitive sender, receiver, wallet, or source-address buckets
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -187,8 +190,16 @@
 //!   must carry a unique process-local generation. Timestamps are not unique:
 //!   fail/retry can reuse one route id within the same second. Keep the queue
 //!   bounded independently from the live route map to prevent stale-entry DoS.
+//! - [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Legacy direct relay has no
+//!   authenticated previous-hop identity. Its admission limiter must remain
+//!   node-global until a negotiated signed v2 contract exists; never emulate
+//!   peer identity with user/sender/receiver keys or source IP addresses.
 //!
 //! ## Last Modified
+//! v0.42.0-PeerRelayAdmission - Bound direct compatibility relay request rate
+//! before JSON parsing using aggregate-only, monotonic process state
+//! v0.41.0-PeerRelayReplayWindow - Apply bounded timestamp freshness to direct
+//! signed envelopes so captured requests cannot be admitted indefinitely
 //! v0.40.0-DurableReceiptBoundary - Persist exact signed peer envelopes before
 //! live dedupe so terminal receipts cannot attest to an unstored ID collision
 //! v0.39.0-FailureReceiptAntiDowngrade - Enforce signed failure receipts for
@@ -282,6 +293,7 @@ use crate::api::{
     canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
     InFlightRequestGuard, PEER_ACK_RESPONSE_MAX_BYTES,
 };
+use crate::config_chat_relay::DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE;
 use crate::services::chat_relay::ChatRelayError;
 use crate::services::peer_store::PeerStore;
 use crate::services::{
@@ -404,6 +416,66 @@ struct ChatPeerState {
     blind_relay_in_flight: Arc<AtomicUsize>,
     blind_relay_seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
     blind_relay_abuse_guard: Arc<Mutex<BlindRelayAbuseGuard>>,
+}
+
+#[derive(Clone)]
+struct PeerRelayRequestGate {
+    in_flight: Arc<AtomicUsize>,
+    rate_limit: Arc<Mutex<PeerRelayRateLimitWindow>>,
+    requests_per_minute: u32,
+    chat_relay: Option<Arc<ChatRelayService>>,
+}
+
+impl PeerRelayRequestGate {
+    fn new(requests_per_minute: u32, chat_relay: Option<Arc<ChatRelayService>>) -> Self {
+        Self {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            rate_limit: Arc::new(Mutex::new(PeerRelayRateLimitWindow::new(Instant::now()))),
+            requests_per_minute,
+            chat_relay,
+        }
+    }
+
+    fn admit(&self, now: Instant) -> bool {
+        self.rate_limit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .allow(now, self.requests_per_minute)
+    }
+
+    fn record_rejected(&self, reason: &'static str) {
+        if let Some(relay) = self.chat_relay.as_ref() {
+            relay.record_peer_relay_inbound_rejected(now_secs(), reason);
+        }
+    }
+}
+
+struct PeerRelayRateLimitWindow {
+    started_at: Instant,
+    admitted: u32,
+}
+
+impl PeerRelayRateLimitWindow {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            admitted: 0,
+        }
+    }
+
+    fn allow(&mut self, now: Instant, limit: u32) -> bool {
+        if now.saturating_duration_since(self.started_at) >= Duration::from_secs(60) {
+            self.started_at = now;
+            self.admitted = 0;
+        }
+
+        if self.admitted >= limit {
+            return false;
+        }
+
+        self.admitted = self.admitted.saturating_add(1);
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1036,6 +1108,14 @@ pub fn build_chat_peer_router(
     http_client: Arc<reqwest::Client>,
     blind_vault: Option<SharedBlindVaultService>,
 ) -> Router {
+    let peer_relay_requests_per_minute = chat_relay
+        .as_ref()
+        .map(|relay| relay.config().peer_relay_requests_per_minute)
+        .unwrap_or(DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE);
+    let peer_relay_gate = Arc::new(PeerRelayRequestGate::new(
+        peer_relay_requests_per_minute,
+        chat_relay.clone(),
+    ));
     let state = ChatPeerState {
         chat_relay,
         blind_vault,
@@ -1048,12 +1128,10 @@ pub fn build_chat_peer_router(
         blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
         blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
     };
-    let peer_relay_in_flight = Arc::new(AtomicUsize::new(0));
-
     let peer_relay_router = Router::new()
         .route("/api/chat/peer/relay", post(peer_relay_handler))
         .route_layer(middleware::from_fn_with_state(
-            peer_relay_in_flight,
+            peer_relay_gate,
             peer_relay_request_gate,
         ))
         .layer(DefaultBodyLimit::max(PEER_CHAT_REQUEST_BODY_MAX_BYTES));
@@ -1078,26 +1156,40 @@ pub fn build_chat_peer_router(
 
 /// Applies ordinary peer-relay backpressure before Axum reads a JSON body.
 async fn peer_relay_request_gate(
-    State(counter): State<Arc<AtomicUsize>>,
+    State(gate): State<Arc<PeerRelayRequestGate>>,
     request: Request,
     next: Next,
 ) -> Response {
+    // [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Count attempted direct-relay
+    // work before body parsing. This intentionally uses only aggregate process
+    // state: the legacy wire contract cannot authenticate a previous-hop node,
+    // and sender/receiver/IP buckets would create misleading identity state.
+    if !gate.admit(Instant::now()) {
+        gate.record_rejected("rate_limited");
+        return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     let Some(_in_flight) =
-        InFlightRequestGuard::try_acquire(&counter, MAX_IN_FLIGHT_PEER_CHAT_REQUESTS)
+        InFlightRequestGuard::try_acquire(&gate.in_flight, MAX_IN_FLIGHT_PEER_CHAT_REQUESTS)
     else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(PeerChatRelayResponse {
-                accepted: false,
-                duplicate: false,
-                delivered_online: 0,
-                stored_pending: false,
-            }),
-        )
-            .into_response();
+        gate.record_rejected("backpressure");
+        return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
     };
 
     next.run(request).await
+}
+
+fn rejected_peer_relay_response(status: StatusCode) -> Response {
+    (
+        status,
+        Json(PeerChatRelayResponse {
+            accepted: false,
+            duplicate: false,
+            delivered_online: 0,
+            stored_pending: false,
+        }),
+    )
+        .into_response()
 }
 
 /// Applies blind-relay backpressure before Axum reads a JSON body.
@@ -3030,18 +3122,21 @@ mod tests {
     }
 
     fn temp_chat_relay(label: &str) -> (Arc<ChatRelayService>, std::path::PathBuf) {
+        temp_chat_relay_with_peer_rate(label, DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE)
+    }
+
+    fn temp_chat_relay_with_peer_rate(
+        label: &str,
+        requests_per_minute: u32,
+    ) -> (Arc<ChatRelayService>, std::path::PathBuf) {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!("aeronyx-{label}-{unique}.db"));
-        let relay = Arc::new(
-            ChatRelayService::new(
-                test_chat_config(path.to_string_lossy().to_string()),
-                [7u8; 32],
-            )
-            .unwrap(),
-        );
+        let mut config = test_chat_config(path.to_string_lossy().to_string());
+        config.peer_relay_requests_per_minute = requests_per_minute;
+        let relay = Arc::new(ChatRelayService::new(config, [7u8; 32]).unwrap());
         (relay, path)
     }
 
@@ -3384,6 +3479,73 @@ mod tests {
             .expect("pending message should be readable");
         assert!(!has_more);
         assert_eq!(messages.len(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn peer_relay_rate_limit_uses_exact_monotonic_windows() {
+        let started_at = Instant::now();
+        let mut window = PeerRelayRateLimitWindow::new(started_at);
+
+        assert!(window.allow(started_at, 2));
+        assert!(window.allow(started_at + Duration::from_secs(59), 2));
+        assert!(!window.allow(started_at + Duration::from_secs(59), 2));
+        assert!(window.allow(started_at + Duration::from_secs(60), 2));
+        assert_eq!(window.admitted, 1);
+    }
+
+    #[tokio::test]
+    async fn peer_relay_rate_limit_rejects_before_duplicate_processing() {
+        let (relay, path) = temp_chat_relay_with_peer_rate("chat-peer-rate-limit", 1);
+        let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
+        let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let envelope = signed_envelope();
+        let body = serde_json::to_vec(&PeerChatRelayRequest { envelope }).unwrap();
+        let app = build_chat_peer_router(
+            Some(Arc::clone(&relay)),
+            sessions,
+            udp,
+            Arc::new(PeerStore::new()),
+            Arc::new(IdentityKeyPair::generate()),
+            Arc::new(reqwest::Client::new()),
+            None,
+        );
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let status = relay.peer_status();
+        assert_eq!(status.inbound_accepted_total, 1);
+        assert_eq!(status.inbound_duplicate_total, 0);
+        assert_eq!(status.inbound_rejected_total, 1);
+        assert_eq!(
+            status.last_inbound_failure_reason.as_deref(),
+            Some("rate_limited")
+        );
 
         let _ = std::fs::remove_file(path);
     }
