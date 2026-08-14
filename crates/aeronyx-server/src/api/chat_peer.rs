@@ -14,9 +14,10 @@
 //! - `POST /api/chat/peer/blind-relay`: accepts a signed `BlindRelayEnvelope`
 //!   and forwards only opaque encrypted bytes toward `next_hop`
 //! - Verifies the envelope signature before doing any delivery or storage
-//! - Delivers to locally online receiver devices when possible
-//! - Falls back to the existing SQLite pending queue when the receiver is
-//!   offline or all local routes are stale
+//! - Durably queues every accepted peer envelope before attempting local live
+//!   delivery; the authenticated receiver retires it with `ChatAck`
+//! - Delivers the already-durable envelope to locally online receiver devices
+//!   when possible, while preserving pull-after-restart recovery
 //! - Returns a terminal-signed receipt bound to the exact opaque payload after
 //!   successful onion terminal store-and-forward; middle hops only propagate it
 //! - [SIGNED-FAILURE-RECEIPT 2026-08-11 by Codex] Signs hop-local failure ACKs
@@ -65,10 +66,12 @@
 //! ## Main Logical Flow
 //! 1. Peer node posts an already end-to-end encrypted `ChatEnvelope`
 //! 2. This node checks size and sender signature
-//! 3. Duplicate message IDs are ignored idempotently
-//! 4. Online receiver sessions get the envelope through the existing encrypted
-//!    client transport
-//! 5. Offline receivers keep the existing pending-message fallback
+//! 3. The complete signed envelope enters the idempotent SQLite pending queue;
+//!    same-ID/different-envelope collisions fail before any receipt is signed
+//! 4. Duplicate live deliveries are ignored only after durable byte equality
+//!    has been established
+//! 5. Online receiver sessions get the durable envelope through the existing
+//!    encrypted client transport; `ChatAck` removes it after client persistence
 //! 6. Blind relay requests verify the previous-hop signature, decrement TTL,
 //!    re-sign with this node key, and POST to the verified `next_hop`
 //!
@@ -125,6 +128,11 @@
 //!   the existing chat relay store-and-forward path before ACKing the previous
 //!   hop. A successful peel alone is not enough to claim real encrypted message
 //!   movement.
+//! - [DURABLE-RECEIPT-BOUNDARY 2026-08-15 by Codex] Peer message acceptance
+//!   must call `store_pending` before the live-only message-id dedupe check.
+//!   Reversing this order can sign a terminal receipt for a conflicting payload
+//!   that never entered durable storage. Online delivery remains at-least-once
+//!   and is retired by the receiver's existing authenticated `ChatAck`.
 //! - Duplicate route IDs are treated as idempotent replay drops, not previous-hop
 //!   abuse. Lost ACK retries must not quarantine an otherwise healthy relay.
 //! - Relay logs are route-safe: they must not include message IDs, receiver
@@ -181,6 +189,8 @@
 //!   bounded independently from the live route map to prevent stale-entry DoS.
 //!
 //! ## Last Modified
+//! v0.40.0-DurableReceiptBoundary - Persist exact signed peer envelopes before
+//! live dedupe so terminal receipts cannot attest to an unstored ID collision
 //! v0.39.0-FailureReceiptAntiDowngrade - Enforce signed failure receipts for
 //! descriptor-negotiated peers while preserving legacy relay compatibility
 //! v0.38.0-SignedFailureReceipt - Authenticate exact hop-local failure ACKs
@@ -1176,14 +1186,27 @@ async fn process_peer_relay(
         return Err(ChatPeerRelayError::RelayUnavailable);
     };
 
+    // [DURABLE-RECEIPT-BOUNDARY 2026-08-15 by Codex] Persist the exact signed
+    // envelope before consulting the live-delivery dedupe cache. Checking only
+    // `message_id` first allowed a conflicting ciphertext to be reported as an
+    // accepted retry; an onion terminal could then sign a receipt for bytes it
+    // had never stored. `store_pending` is idempotent for byte-identical retries
+    // and rejects same-ID/different-envelope collisions atomically.
+    relay.store_pending(&envelope).map_err(|error| {
+        let reason = error.reason_bucket();
+        warn!(reason, "[CHAT_PEER] Failed to durably accept peer envelope");
+        relay.record_peer_relay_inbound_rejected(now, reason);
+        map_pending_store_error(&error)
+    })?;
+
     if relay.is_online_duplicate(&envelope.message_id) {
         debug!("[CHAT_PEER] Duplicate peer envelope ignored");
-        relay.record_peer_relay_inbound_accepted(now, true, 0, false);
+        relay.record_peer_relay_inbound_accepted(now, true, 0, true);
         return Ok(PeerChatRelayResponse {
             accepted: true,
             duplicate: true,
             delivered_online: 0,
-            stored_pending: false,
+            stored_pending: true,
         });
     }
 
@@ -1196,20 +1219,11 @@ async fn process_peer_relay(
         }
     }
 
-    let stored_pending = if delivered_online == 0 {
-        relay.store_pending(&envelope).map_err(|error| {
-            let reason = error.reason_bucket();
-            warn!(
-                reason,
-                "[CHAT_PEER] Failed to store peer envelope for offline receiver"
-            );
-            relay.record_peer_relay_inbound_rejected(now, reason);
-            map_pending_store_error(&error)
-        })?;
-        true
-    } else {
-        false
-    };
+    // The authenticated receiver retires this durable copy with ChatAck only
+    // after local persistence. This keeps online UDP delivery crash-safe and
+    // gives terminal receipts one stable meaning: accepted into durable relay
+    // custody, never merely queued to a socket.
+    let stored_pending = true;
 
     relay.record_peer_relay_inbound_accepted(now, false, delivered_online, stored_pending);
 
@@ -3632,6 +3646,95 @@ mod tests {
         assert!(!has_more);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, delivered_envelope.message_id);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn onion_terminal_rejects_same_message_id_with_different_ciphertext() {
+        use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+        let source = IdentityKeyPair::generate();
+        let chat_sender = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let (relay, path) = temp_chat_relay("onion-terminal-id-conflict");
+        let state = ChatPeerState {
+            chat_relay: Some(Arc::clone(&relay)),
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let now = now_secs();
+        let receiver = [0xA2; 32];
+        let message_id = [0xA3; 16];
+        let make_chat_envelope = |ciphertext: &[u8]| {
+            let mut envelope = ChatEnvelope {
+                message_id,
+                sender: chat_sender.public_key_bytes(),
+                receiver,
+                timestamp: now,
+                ciphertext: ciphertext.to_vec(),
+                nonce: [0xA4; 24],
+                content_type: ChatContentType::Text,
+                signature: [0u8; 64],
+            };
+            envelope.signature = chat_sender.sign(&envelope.sign_data());
+            envelope
+        };
+        let hop = OnionHop {
+            node_id: node_identity.public_key_bytes(),
+            kem_pub: crate::services::onion_keys::current_public_key(),
+        };
+        let make_request = |route_id, chat_envelope: &ChatEnvelope| {
+            let payload = encode_envelope(chat_envelope).expect("encode terminal chat envelope");
+            PeerBlindRelayRequest {
+                envelope: build_onion_envelope(
+                    std::slice::from_ref(&hop),
+                    &payload,
+                    route_id,
+                    4,
+                    now,
+                    &source,
+                )
+                .expect("build terminal onion envelope"),
+                previous_hop_node_id: source.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            }
+        };
+
+        let original = make_chat_envelope(b"first opaque ciphertext");
+        let first = process_peer_blind_relay(state.clone(), make_request([0xA5; 16], &original))
+            .await
+            .expect("first terminal envelope should be durably accepted");
+        assert!(first.delivery_receipt.is_some());
+
+        // [DURABLE-RECEIPT-BOUNDARY 2026-08-15 by Codex] A fresh route can
+        // legitimately retry the same exact envelope, but reusing its message
+        // ID for different signed bytes must never produce a terminal receipt.
+        let conflict = make_chat_envelope(b"different opaque ciphertext");
+        let rejected = process_peer_blind_relay(state, make_request([0xA6; 16], &conflict)).await;
+        assert!(matches!(rejected, Err(BlindRelayError::ForwardFailed)));
+
+        let (messages, has_more) = relay
+            .pull_pending(&receiver, 0, &[0u8; 16], 10)
+            .expect("original durable envelope should remain readable");
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            encode_envelope(&messages[0].envelope).expect("re-encode stored envelope"),
+            encode_envelope(&original).expect("re-encode original envelope")
+        );
+        let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
+        assert_eq!(blind_stats.terminal, 1);
+        assert_eq!(blind_stats.rejected, 1);
 
         let _ = std::fs::remove_file(path);
     }
