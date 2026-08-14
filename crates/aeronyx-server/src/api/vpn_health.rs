@@ -69,6 +69,10 @@
 //! [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Operator and heartbeat
 //! telemetry keeps storage/executable readiness observable without exporting
 //! host filesystem paths. Sanitized journal summaries redact path tokens too.
+//! [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] Host-local health now embeds
+//! the existing typed ChatRelay peer status. It exposes aggregate counters and
+//! stable reason buckets only, allowing relay smoke failures to be diagnosed
+//! without identifiers, endpoints, ciphertext, or payload-derived metadata.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -86,10 +90,11 @@ use crate::config::ServerConfig;
 use crate::handlers::packet::{PacketHandler, PacketRuntimeStatus};
 use crate::isolated_child_command;
 use crate::management::integrity;
+use crate::services::chat_relay::ChatRelayPeerStatus;
 use crate::services::session::CLIENT_LIVENESS_TIMEOUT_SECS;
 use crate::services::{
-    IpPoolService, NodePolicyEnforcementSnapshot, NodePolicyPlacementSnapshot, NodePolicyRuntime,
-    NodePolicySnapshot, PeerStore, SessionManager,
+    ChatRelayService, IpPoolService, NodePolicyEnforcementSnapshot, NodePolicyPlacementSnapshot,
+    NodePolicyRuntime, NodePolicySnapshot, PeerStore, SessionManager,
 };
 use crate::voucher_verifier::{VoucherMetricsSnapshot, VoucherVerifier};
 
@@ -117,6 +122,7 @@ pub struct VpnHealthState {
     encrypted_message_counter: Arc<AtomicU64>,
     packet_handler: Arc<PacketHandler>,
     peer_store: Arc<PeerStore>,
+    chat_relay: Option<Arc<ChatRelayService>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,6 +342,16 @@ struct PrivacyProtocolHealthStatus {
     privacy_boundary: &'static str,
 }
 
+/// Aggregate-only encrypted relay runtime status exposed by local health.
+#[derive(Debug, Clone, Serialize)]
+struct ChatRelayHealthStatus {
+    configured_enabled: bool,
+    runtime_ready: bool,
+    peer_relay: ChatRelayPeerStatus,
+    source: &'static str,
+    privacy_boundary: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct OperatorActionSummary {
     status: &'static str,
@@ -396,6 +412,7 @@ struct VpnHealthResponse {
     capacity: VpnCapacityStatus,
     packet_runtime: PacketRuntimeStatus,
     discovery_status: Value,
+    chat_relay_status: ChatRelayHealthStatus,
     recent_errors: Vec<RecentErrorEvent>,
     upgrade_status: NodeUpgradeStatus,
     operator_action: OperatorActionSummary,
@@ -467,6 +484,7 @@ pub fn build_vpn_health_router(
     encrypted_message_counter: Arc<AtomicU64>,
     packet_handler: Arc<PacketHandler>,
     peer_store: Arc<PeerStore>,
+    chat_relay: Option<Arc<ChatRelayService>>,
 ) -> Router {
     Router::new()
         .route("/api/vpn/health", get(vpn_health_handler))
@@ -484,6 +502,7 @@ pub fn build_vpn_health_router(
             encrypted_message_counter,
             packet_handler,
             peer_store,
+            chat_relay,
         })
 }
 
@@ -513,6 +532,7 @@ pub async fn collect_vpn_health_value(
     encrypted_message_counter: Arc<AtomicU64>,
     packet_handler: Arc<PacketHandler>,
     peer_store: Arc<PeerStore>,
+    chat_relay: Option<Arc<ChatRelayService>>,
 ) -> Value {
     let state = VpnHealthState {
         config,
@@ -523,6 +543,7 @@ pub async fn collect_vpn_health_value(
         encrypted_message_counter,
         packet_handler,
         peer_store,
+        chat_relay,
     };
     serde_json::to_value(collect_vpn_health_response(state).await).unwrap_or_else(|e| {
         serde_json::json!({
@@ -553,6 +574,7 @@ pub async fn collect_node_operator_status_value(
     encrypted_message_counter: Arc<AtomicU64>,
     packet_handler: Arc<PacketHandler>,
     peer_store: Arc<PeerStore>,
+    chat_relay: Option<Arc<ChatRelayService>>,
 ) -> Value {
     let state = VpnHealthState {
         config,
@@ -563,6 +585,7 @@ pub async fn collect_node_operator_status_value(
         encrypted_message_counter,
         packet_handler,
         peer_store,
+        chat_relay,
     };
     serde_json::to_value(collect_node_operator_status_response(state).await).unwrap_or_else(|e| {
         serde_json::json!({
@@ -658,6 +681,13 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
     );
     let packet_runtime = state.packet_handler.runtime_status();
     let discovery_status = collect_discovery_status_value(&state.peer_store);
+    let chat_relay_status = collect_chat_relay_health_status(
+        config.memchain.is_chat_relay_enabled(),
+        state
+            .chat_relay
+            .as_deref()
+            .map(ChatRelayService::peer_status),
+    );
     let startup_self_check = collect_startup_self_check(
         &config,
         &checks,
@@ -709,6 +739,7 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
         capacity,
         packet_runtime,
         discovery_status,
+        chat_relay_status,
         recent_errors,
         upgrade_status,
         operator_action,
@@ -749,6 +780,45 @@ fn collect_discovery_status_value(peer_store: &PeerStore) -> Value {
             "voucher secrets, private keys, peer private keys, or wallet-level traffic"
         )
     })
+}
+
+fn collect_chat_relay_health_status(
+    configured_enabled: bool,
+    runtime_status: Option<ChatRelayPeerStatus>,
+) -> ChatRelayHealthStatus {
+    // [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] Reuse the service-owned
+    // status snapshot. The fallback is explicit and typed, so an enabled but
+    // missing runtime cannot be mistaken for a healthy idle relay.
+    let (runtime_ready, mut peer_relay, source) = match runtime_status {
+        Some(status) => (true, status, "rust_chat_relay_service"),
+        None => (
+            false,
+            ChatRelayPeerStatus::new(configured_enabled),
+            if configured_enabled {
+                "rust_chat_relay_runtime_unavailable"
+            } else {
+                "rust_chat_relay_disabled_config"
+            },
+        ),
+    };
+    if configured_enabled && !runtime_ready {
+        peer_relay.last_outbound_status = Some("failed".to_string());
+        peer_relay.last_outbound_failure_reason =
+            Some("chat_relay_runtime_unavailable".to_string());
+    }
+    ChatRelayHealthStatus {
+        configured_enabled,
+        runtime_ready,
+        peer_relay,
+        source,
+        privacy_boundary: concat!(
+            "aggregate encrypted relay counters and stable reason buckets only; ",
+            "no message ids, wallet ids, sender or receiver keys, blob ids, ",
+            "session ids, peer endpoints, client IPs, destinations, DNS contents, ",
+            "packet payloads, plaintext, ciphertext, private keys, voucher secrets, ",
+            "or per-user traffic"
+        ),
+    }
 }
 
 fn collect_startup_self_check(
@@ -1133,6 +1203,7 @@ async fn collect_node_operator_status_response(
             "capacity": vpn_health.capacity,
             "packet_runtime": vpn_health.packet_runtime,
             "discovery_status": vpn_health.discovery_status,
+            "chat_relay_status": vpn_health.chat_relay_status,
             "recent_errors": vpn_health.recent_errors,
             "upgrade_status": vpn_health.upgrade_status.clone(),
             "operator_action": vpn_health.operator_action.clone(),
@@ -3050,6 +3121,46 @@ fn build_dns_query(name: &str) -> std::result::Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_relay_health_distinguishes_missing_enabled_runtime() {
+        let status = collect_chat_relay_health_status(true, None);
+
+        assert!(status.configured_enabled);
+        assert!(!status.runtime_ready);
+        assert_eq!(
+            status.peer_relay.last_outbound_status.as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            status.peer_relay.last_outbound_failure_reason.as_deref(),
+            Some("chat_relay_runtime_unavailable")
+        );
+        assert_eq!(status.source, "rust_chat_relay_runtime_unavailable");
+    }
+
+    #[test]
+    fn chat_relay_health_preserves_service_owned_snapshot() {
+        let mut peer_status = ChatRelayPeerStatus::new(true);
+        peer_status.outbound_attempted_total = 4;
+        peer_status.outbound_accepted_total = 3;
+        peer_status.last_outbound_status = Some("degraded".to_string());
+        peer_status.last_outbound_failure_reason = Some("peer_relay_request_timeout".to_string());
+
+        // [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] Health consumes the
+        // service snapshot verbatim instead of maintaining parallel counters.
+        let status = collect_chat_relay_health_status(true, Some(peer_status.clone()));
+        assert!(status.runtime_ready);
+        assert_eq!(status.peer_relay, peer_status);
+        assert_eq!(status.source, "rust_chat_relay_service");
+        let encoded = serde_json::to_value(&status).expect("serialize relay health");
+        assert_eq!(encoded["runtime_ready"], true);
+        assert_eq!(encoded["peer_relay"]["outbound_attempted_total"], 4);
+        assert_eq!(
+            encoded["peer_relay"]["last_outbound_failure_reason"],
+            "peer_relay_request_timeout"
+        );
+    }
 
     #[test]
     fn service_manager_name_prefers_valid_operator_override() {

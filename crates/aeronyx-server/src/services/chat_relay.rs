@@ -223,7 +223,13 @@ pub struct ChatRelayPeerStatus {
 }
 
 impl ChatRelayPeerStatus {
-    fn new(enabled: bool) -> Self {
+    /// Creates an empty aggregate snapshot for one configured runtime state.
+    ///
+    /// [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] This is crate-visible so
+    /// host-local health can publish the exact same typed contract when relay
+    /// runtime initialization is unavailable, without duplicating counters or
+    /// introducing a second telemetry model.
+    pub(crate) fn new(enabled: bool) -> Self {
         Self {
             enabled,
             outbound_attempted_total: 0,

@@ -4721,6 +4721,7 @@ impl Server {
                     encrypted_message_counter,
                     packet_handler,
                     Arc::clone(&peer_store),
+                    chat_relay.clone(),
                 ))
                 .merge(build_chat_peer_router(
                     chat_relay,
@@ -5610,6 +5611,7 @@ impl Server {
         let vpn_health_message_counter = Arc::clone(&encrypted_message_counter);
         let vpn_health_packet_handler = Arc::clone(&packet_handler);
         let vpn_health_peer_store = Arc::clone(&peer_store);
+        let vpn_health_chat_relay = chat_relay.clone();
         heartbeat = heartbeat.with_vpn_health_status(Box::new(move || {
             let config = vpn_health_config.clone();
             let ip_pool = Arc::clone(&vpn_health_ip_pool);
@@ -5619,6 +5621,7 @@ impl Server {
             let message_counter = Arc::clone(&vpn_health_message_counter);
             let packet_handler = Arc::clone(&vpn_health_packet_handler);
             let peer_store = Arc::clone(&vpn_health_peer_store);
+            let chat_relay = vpn_health_chat_relay.clone();
             Box::pin(async move {
                 Some(
                     collect_vpn_health_value(
@@ -5630,6 +5633,7 @@ impl Server {
                         message_counter,
                         packet_handler,
                         peer_store,
+                        chat_relay,
                     )
                     .await,
                 )
@@ -5644,6 +5648,7 @@ impl Server {
         let operator_status_message_counter = Arc::clone(&encrypted_message_counter);
         let operator_status_packet_handler = Arc::clone(&packet_handler);
         let operator_status_peer_store = Arc::clone(&peer_store);
+        let operator_status_chat_relay = chat_relay.clone();
         heartbeat = heartbeat.with_operator_status(Box::new(move || {
             let config = operator_status_config.clone();
             let ip_pool = Arc::clone(&operator_status_ip_pool);
@@ -5653,6 +5658,7 @@ impl Server {
             let message_counter = Arc::clone(&operator_status_message_counter);
             let packet_handler = Arc::clone(&operator_status_packet_handler);
             let peer_store = Arc::clone(&operator_status_peer_store);
+            let chat_relay = operator_status_chat_relay.clone();
             Box::pin(async move {
                 Some(
                     collect_node_operator_status_value(
@@ -5664,6 +5670,7 @@ impl Server {
                         message_counter,
                         packet_handler,
                         peer_store,
+                        chat_relay,
                     )
                     .await,
                 )

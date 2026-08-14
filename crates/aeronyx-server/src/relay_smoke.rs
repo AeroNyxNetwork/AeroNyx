@@ -149,6 +149,23 @@ struct HealthSnapshot {
     active_sessions: u64,
     privacy_protocol_health: PrivacyProtocolHealth,
     discovery_status: DiscoveryStatus,
+    #[serde(default)]
+    chat_relay_status: Option<ChatRelayHealth>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatRelayHealth {
+    peer_relay: ChatRelayOutboundStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatRelayOutboundStatus {
+    outbound_rounds: u64,
+    last_outbound_attempted: u64,
+    last_outbound_accepted: u64,
+    last_outbound_failed: u64,
+    last_outbound_status: Option<String>,
+    last_outbound_failure_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +215,42 @@ impl HealthSnapshot {
             .peer_store
             .blind_relay_quality
             .verified_client_onion_deliveries
+    }
+
+    fn relay_outbound_rounds(&self) -> Option<u64> {
+        self.chat_relay_status
+            .as_ref()
+            .map(|health| health.peer_relay.outbound_rounds)
+    }
+
+    fn relay_outbound_diagnostic(&self, baseline_rounds: Option<u64>) -> String {
+        // [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] Only serialize the
+        // service's allow-listed aggregate buckets. Never include peer IDs,
+        // endpoints, message IDs, sessions, wallets, or payload material.
+        let Some(status) = self
+            .chat_relay_status
+            .as_ref()
+            .map(|health| &health.peer_relay)
+        else {
+            return "outbound_status=unavailable".to_string();
+        };
+        if baseline_rounds.is_some_and(|baseline| status.outbound_rounds <= baseline) {
+            return "outbound_status=no_new_round".to_string();
+        }
+        format!(
+            "outbound_status={}, failure_reason={}, attempted={}, accepted={}, failed={}",
+            status
+                .last_outbound_status
+                .as_deref()
+                .unwrap_or("unobserved"),
+            status
+                .last_outbound_failure_reason
+                .as_deref()
+                .unwrap_or("none"),
+            status.last_outbound_attempted,
+            status.last_outbound_accepted,
+            status.last_outbound_failed,
+        )
     }
 
     fn ensure_idle_two_hop_ready(&self) -> Result<()> {
@@ -311,6 +364,7 @@ impl HealthClient {
     async fn wait_for_client_delivery(
         &self,
         baseline: u64,
+        baseline_outbound_rounds: Option<u64>,
         deadline: TokioInstant,
     ) -> Result<HealthSnapshot> {
         loop {
@@ -327,10 +381,13 @@ impl HealthClient {
             if current > baseline {
                 return Ok(snapshot);
             }
+            let diagnostic = snapshot.relay_outbound_diagnostic(baseline_outbound_rounds);
             timeout_at(deadline, sleep(HEALTH_POLL_INTERVAL))
                 .await
                 .map_err(|_| {
-                    anyhow::anyhow!("verified terminal receipt was not observed before timeout")
+                    anyhow::anyhow!(
+                        "verified terminal receipt was not observed before timeout ({diagnostic})"
+                    )
                 })?;
         }
     }
@@ -715,6 +772,7 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
     baseline.ensure_idle_two_hop_ready()?;
     let baseline_active_sessions = baseline.active_sessions;
     let deliveries_before = baseline.verified_client_deliveries();
+    let outbound_rounds_before = baseline.relay_outbound_rounds();
 
     let sender_identity = IdentityKeyPair::generate();
     let receiver_identity = IdentityKeyPair::generate();
@@ -742,7 +800,7 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
             )
             .await?;
         let delivery_health = health
-            .wait_for_client_delivery(deliveries_before, deadline)
+            .wait_for_client_delivery(deliveries_before, outbound_rounds_before, deadline)
             .await?;
 
         receiver = Some(
@@ -907,6 +965,50 @@ mod tests {
             close_timestamp,
         )
         .is_err());
+    }
+
+    #[test]
+    fn relay_failure_diagnostic_uses_only_aggregate_buckets() {
+        let snapshot: HealthSnapshot = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "active_sessions": 1,
+            "privacy_protocol_health": { "failed_checks": 0 },
+            "discovery_status": {
+                "peer_store": {
+                    "blind_relay_quality": {
+                        "verified_client_onion_deliveries": 4,
+                        "delivery_receipt_capable_peers": 2,
+                        "authenticated_delivery_path_ready": true,
+                        "authenticated_delivery_path_reason": "authenticated_receipt_path_ready"
+                    },
+                    "peer_quorum": { "quorum_ready": true },
+                    "route_governance": { "route_pool_ready": true },
+                    "network_story": { "chat_two_hop_onion_ready": true }
+                }
+            },
+            "chat_relay_status": {
+                "peer_relay": {
+                    "outbound_rounds": 7,
+                    "last_outbound_attempted": 2,
+                    "last_outbound_accepted": 0,
+                    "last_outbound_failed": 2,
+                    "last_outbound_status": "failed",
+                    "last_outbound_failure_reason": "onion_delivery_receipt_rejected"
+                }
+            }
+        }))
+        .expect("parse health fixture");
+
+        // [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] The rendered failure
+        // is operationally useful but cannot identify a route or user.
+        assert_eq!(
+            snapshot.relay_outbound_diagnostic(Some(6)),
+            "outbound_status=failed, failure_reason=onion_delivery_receipt_rejected, attempted=2, accepted=0, failed=2"
+        );
+        assert_eq!(
+            snapshot.relay_outbound_diagnostic(Some(7)),
+            "outbound_status=no_new_round"
+        );
     }
 
     #[test]
