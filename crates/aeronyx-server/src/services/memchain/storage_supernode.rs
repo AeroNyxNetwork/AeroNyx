@@ -61,7 +61,9 @@
 //! ⚠️ Important Notes for Next Developer:
 //! - insert_cognitive_task() is IDEMPOTENT. It skips insertion if an active
 //!   (pending/processing) task already exists for the same (target_table, target_id,
-//!   task_type) triple. Returns Ok(None) in that case. Callers must handle Option<i64>.
+//!   task_type) triple. The check and insert share an IMMEDIATE transaction so
+//!   independent SQLite connections cannot enqueue the same work concurrently.
+//!   Returns Ok(None) in that case. Callers must handle Option<i64>.
 //! - reset_stale_processing_tasks() MUST be called at server startup before TaskWorker
 //!   spawns. The worker also performs recovery in the same transaction as each
 //!   claim, so a fresh orphan skipped by the startup timeout cannot remain stuck.
@@ -77,6 +79,9 @@
 //!   task_id in llm_usage_log (e.g. manual inserts) are excluded.
 //!
 //! ## Last Modified
+//! v2.5.9-EnqueueIdempotency - [SUPERNODE-ENQUEUE-IDEMPOTENCY 2026-08-14 by Codex]
+//!   Serialized active-task detection and insertion in one IMMEDIATE transaction,
+//!   preventing duplicate model calls across independent node processes.
 //! v2.5.8-CrashLeaseRecovery - [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex]
 //!   Recovers expired processing claims in the same IMMEDIATE transaction as
 //!   the next task claim, closing the fast-crash/restart orphan window.
@@ -238,6 +243,10 @@ impl MemoryStorage {
     /// - `Ok(None)`     — active duplicate found, insertion skipped
     /// - `Err(msg)`     — database error
     ///
+    /// # Errors
+    /// Returns an error if the enqueue transaction cannot begin, query, insert,
+    /// or commit. No task identifier is returned before the commit succeeds.
+    ///
     /// ⚠️ Callers in reflection.rs must handle `Option<i64>`.
     pub async fn insert_cognitive_task(
         &self,
@@ -251,13 +260,21 @@ impl MemoryStorage {
         max_retries: i64,
     ) -> Result<Option<i64>, String> {
         let now = now_ts();
-        let conn = self.conn.lock().await;
+        let mut conn = self.conn.lock().await;
+
+        // [SUPERNODE-ENQUEUE-IDEMPOTENCY 2026-08-14 by Codex] A process-local
+        // mutex cannot serialize another MemoryStorage connection. Reserving the
+        // SQLite writer before the read closes the SELECT-then-INSERT race that
+        // could otherwise duplicate provider calls and billing.
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("insert_cognitive_task begin: {e}"))?;
 
         // ── Idempotency check ──────────────────────────────────────────────
         // Only guard when both target_table and target_id are provided.
         // Tasks without a target (e.g. one-off recall_synthesis) always insert.
         if let (Some(tbl), Some(tid)) = (target_table, target_id) {
-            let exists: bool = conn
+            let exists: bool = transaction
                 .query_row(
                     "SELECT EXISTS(
                     SELECT 1 FROM cognitive_tasks
@@ -269,9 +286,13 @@ impl MemoryStorage {
                     params![tbl, tid, task_type],
                     |row| row.get(0),
                 )
-                .unwrap_or(false);
+                .map_err(|e| format!("insert_cognitive_task duplicate check: {e}"))?;
 
             if exists {
+                transaction
+                    .commit()
+                    .map_err(|e| format!("insert_cognitive_task duplicate commit: {e}"))?;
+                drop(conn);
                 debug!(
                     task_type = task_type,
                     target = %format!("{}/{}", tbl, tid),
@@ -282,26 +303,31 @@ impl MemoryStorage {
         }
 
         // ── Insert ────────────────────────────────────────────────────────
-        conn.execute(
-            "INSERT INTO cognitive_tasks
+        transaction
+            .execute(
+                "INSERT INTO cognitive_tasks
                 (task_type, priority, status, payload, prompt_messages,
                  target_table, target_id, privacy_level, max_retries, created_at)
              VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                task_type,
-                priority,
-                payload,
-                prompt_messages,
-                target_table,
-                target_id,
-                privacy_level,
-                max_retries,
-                now,
-            ],
-        )
-        .map_err(|e| format!("Insert cognitive_task: {}", e))?;
+                params![
+                    task_type,
+                    priority,
+                    payload,
+                    prompt_messages,
+                    target_table,
+                    target_id,
+                    privacy_level,
+                    max_retries,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("insert_cognitive_task insert: {e}"))?;
 
-        let id = conn.last_insert_rowid();
+        let id = transaction.last_insert_rowid();
+        transaction
+            .commit()
+            .map_err(|e| format!("insert_cognitive_task commit: {e}"))?;
+        drop(conn);
         debug!(id = id, task_type = task_type, "[STORAGE_SN] Task enqueued");
         Ok(Some(id))
     }
@@ -1351,6 +1377,64 @@ mod tests {
         claimed.extend(second_claim.await.unwrap());
         assert_eq!(claimed.len(), 1, "a durable task may have only one owner");
         assert_eq!(claimed[0].id, task_id);
+    }
+
+    /// [SUPERNODE-ENQUEUE-IDEMPOTENCY 2026-08-14 by Codex] The active-task
+    /// invariant must hold across independent SQLite connections, not only
+    /// within one process-local connection mutex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_connections_enqueue_targeted_task_once() {
+        let directory = TempDir::new().unwrap();
+        let database_path = directory.path().join("shared-enqueue-queue.db");
+        let first = Arc::new(MemoryStorage::open(&database_path, None).unwrap());
+        let second = Arc::new(MemoryStorage::open(&database_path, None).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+
+        let enqueue = |storage: Arc<MemoryStorage>, barrier: Arc<Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                storage
+                    .insert_cognitive_task(
+                        "session_title",
+                        5,
+                        r#"{"session_id":"shared-session"}"#,
+                        None,
+                        Some("sessions"),
+                        Some("shared-session"),
+                        "structured",
+                        3,
+                    )
+                    .await
+            })
+        };
+
+        let first_enqueue = enqueue(Arc::clone(&first), Arc::clone(&barrier));
+        let second_enqueue = enqueue(Arc::clone(&second), Arc::clone(&barrier));
+        barrier.wait().await;
+
+        let outcomes = [
+            first_enqueue.await.unwrap().unwrap(),
+            second_enqueue.await.unwrap().unwrap(),
+        ];
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_some()).count(),
+            1,
+            "only one connection may enqueue an active targeted task"
+        );
+
+        let conn = first.conn.lock().await;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cognitive_tasks
+                 WHERE target_table = 'sessions'
+                   AND target_id = 'shared-session'
+                   AND task_type = 'session_title'
+                   AND status IN ('pending', 'processing')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
