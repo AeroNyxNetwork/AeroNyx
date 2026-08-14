@@ -58,6 +58,8 @@
 //!   another independently configured inference engine.
 //!
 //! ## Last Modified
+//! [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Re-exported the internal
+//! source-blind authority-proof recovery disposition.
 //! v2.8.58-RetryableOrtInitialization - Made process-global ORT startup
 //! failure-recoverable while preserving single-success semantics.
 //! v2.8.57-NerRuntimeIndependence - Wired the configured tokenizer and removed
@@ -158,8 +160,9 @@ pub use storage::{
 // [CERTIFICATE-BACKFILL-TELEMETRY 2026-07-29 by Codex] Keep the coordinator
 // outcome internal while allowing the runtime orchestrator to record it.
 pub(crate) use storage::{
-    RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificateBackfillDisposition,
-    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentAuthoritySyncDisposition, RecordCommitmentBlockPagePullDisposition,
+    RecordCommitmentCertificateBackfillDisposition, RecordCommitmentCertificatePolicyReadiness,
+    RecordCommitmentCertificateSyncDisposition,
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{

@@ -67,10 +67,9 @@
 //! - [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Local status and
 //!   heartbeat report only aggregate cooling-slot, skipped-attempt, and
 //!   half-open-probe counts; circuit slots and source details remain private.
-//! - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Block-page and certificate
-//!   recovery share one zero-cost generic circuit implementation while domain
-//!   markers prevent either path from receiving the other's mutable state.
-//!   Certificate carriers now retain an independent cross-round cooldown.
+//! - [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] Authority-proof, block-page,
+//!   and certificate recovery share one zero-cost generic circuit while domain
+//!   markers prevent any path from receiving another's mutable state.
 //! - [CERTIFICATE-CARRIER-RECOVERY 2026-07-29 by Codex] Follower and
 //!   coordinator certificate recovery share one fail-closed carrier primitive:
 //!   only availability faults advance, every verified response stops the
@@ -166,6 +165,8 @@
 //!   and audited predecessor; never trust responder identity as authority.
 //!
 //! ## Last Modified
+//! v2.8.60-AuthorityHandoverCarrier - Recovered exact dual-signed authority
+//! proofs through bounded operator-pinned transport carriers.
 //! v2.8.59-AuthorityHandoverExchange - Added bounded authenticated next-proof
 //! transport and height-aware follower authority synchronization.
 //! v2.8.58-MonotonicPeerRateLimit - Detached node-to-node abuse windows from
@@ -262,14 +263,14 @@ use super::{
 };
 use crate::api::discovery::GossipResponse;
 use crate::services::memchain::storage_ops::{
-    RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorHandoverPersistOutcome,
-    RecordCoordinatorLeaseGrantOutcome, RecordCoordinatorLeaseReleaseOutcome,
-    VerifiedDeliveryAnchorWitnessOutcome,
+    RecordCommitmentAuthorityState, RecordCommitmentCheckpointEvidencePersistOutcome,
+    RecordCoordinatorHandoverPersistOutcome, RecordCoordinatorLeaseGrantOutcome,
+    RecordCoordinatorLeaseReleaseOutcome, VerifiedDeliveryAnchorWitnessOutcome,
 };
 use crate::services::memchain::{
     MemoryStorage, RecordCommitmentAnnouncementDisposition,
-    RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificatePolicyReadiness,
-    RecordCommitmentCertificateSyncDisposition,
+    RecordCommitmentAuthoritySyncDisposition, RecordCommitmentBlockPagePullDisposition,
+    RecordCommitmentCertificatePolicyReadiness, RecordCommitmentCertificateSyncDisposition,
 };
 use crate::services::PeerStore;
 
@@ -340,6 +341,23 @@ pub struct CommitmentAuthoritySyncOutcome {
     pub pending_activation_height: Option<u64>,
     /// Whether this step durably inserted the exact-next proof.
     pub handover_inserted: bool,
+    /// Identity-blind transport class that supplied the verified snapshot.
+    pub source: CommitmentAuthoritySyncSource,
+    /// Number of pinned carriers contacted after direct unavailability.
+    pub carrier_attempts: usize,
+}
+
+/// Privacy-safe transport class for one authority-history synchronization.
+///
+/// [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] A carrier never becomes
+/// authority: it signs only the response envelope around a proof whose
+/// predecessor and successor signatures are verified independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitmentAuthoritySyncSource {
+    /// The currently audited coordinator served its own history snapshot.
+    Coordinator,
+    /// An operator-pinned peer transported the coordinator-signed proof.
+    PinnedCarrier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,19 +391,29 @@ pub struct CommitmentFollowerPagePullOutcome {
     pub carrier_attempts: usize,
 }
 
-/// Round-local preference for bounded commitment-block carriers.
+/// Round-local preference for one typed bounded carrier domain.
 ///
-/// [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] The cursor stores
-/// only an index into the caller's already validated pin order. It is neither
-/// persisted nor reported, cannot name a node, and must be discarded after one
-/// follower synchronization round. Coordinator-first and fail-closed security
-/// behavior remain mandatory for every page.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct CommitmentBlockCarrierCursor {
+/// [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] The zero-sized domain keeps
+/// authority-proof and block-page preferences separate while sharing the same
+/// scheduling algorithm. The cursor stores only an index into the caller's
+/// validated pin order; it is neither persisted nor reported and cannot name
+/// a node. Direct-first and fail-closed behavior remain mandatory.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CommitmentCarrierCursor<Domain> {
     next_index: usize,
+    domain: PhantomData<fn() -> Domain>,
 }
 
-impl CommitmentBlockCarrierCursor {
+impl<Domain> Default for CommitmentCarrierCursor<Domain> {
+    fn default() -> Self {
+        Self {
+            next_index: 0,
+            domain: PhantomData,
+        }
+    }
+}
+
+impl<Domain> CommitmentCarrierCursor<Domain> {
     fn reset(&mut self) {
         self.next_index = 0;
     }
@@ -419,19 +447,32 @@ impl CommitmentBlockCarrierCursor {
     }
 }
 
-/// Marker preventing block-page circuit state from entering certificate paths.
+/// Marker isolating commitment block-page carrier state.
 #[derive(Debug)]
 pub(crate) enum CommitmentBlockCarrierCircuitDomain {}
 
-/// Marker preventing certificate circuit state from entering block-page paths.
+/// Marker isolating coordinator-handover carrier scheduling state.
+#[derive(Debug)]
+pub(crate) enum CommitmentAuthorityCarrierCircuitDomain {}
+
+/// Marker isolating checkpoint-certificate carrier state.
 #[derive(Debug)]
 pub(crate) enum CommitmentCertificateCarrierCircuitDomain {}
+
+/// Round-local preference for coordinator-handover evidence carriers.
+pub(crate) type CommitmentAuthorityCarrierCursor =
+    CommitmentCarrierCursor<CommitmentAuthorityCarrierCircuitDomain>;
+
+/// Round-local preference for commitment block-page carriers.
+pub(crate) type CommitmentBlockCarrierCursor =
+    CommitmentCarrierCursor<CommitmentBlockCarrierCircuitDomain>;
 
 /// Process-only availability circuit for fixed operator-pin positions.
 ///
 /// [TYPED-CARRIER-CIRCUIT 2026-07-29 by Codex] The domain parameter is a
-/// zero-sized compile-time boundary: block-page and certificate recovery share
-/// scheduling mechanics without sharing mutable failure state. Slots contain
+/// zero-sized compile-time boundary: authority-proof, block-page, and
+/// certificate recovery share scheduling mechanics without sharing mutable
+/// failure state. Slots contain
 /// no node id, endpoint, error text, or wall-clock timestamp. Their position is
 /// meaningful only inside one normalized pin order, and a pin-count change
 /// clears every slot so state cannot be reassigned silently.
@@ -444,6 +485,10 @@ pub(crate) struct CommitmentCarrierCircuitBreaker<Domain> {
 /// Block-page availability circuit domain.
 pub(crate) type CommitmentBlockCarrierCircuitBreaker =
     CommitmentCarrierCircuitBreaker<CommitmentBlockCarrierCircuitDomain>;
+
+/// Coordinator-handover availability circuit domain.
+pub(crate) type CommitmentAuthorityCarrierCircuitBreaker =
+    CommitmentCarrierCircuitBreaker<CommitmentAuthorityCarrierCircuitDomain>;
 
 /// Checkpoint-certificate availability circuit domain.
 pub(crate) type CommitmentCertificateCarrierCircuitBreaker =
@@ -557,6 +602,22 @@ fn record_commitment_block_carrier_circuit_telemetry(
     // Storage receives only bounded aggregate counts and cannot reconstruct a
     // source identity or endpoint from this call.
     storage.record_commitment_block_carrier_circuit_observation(
+        circuit_breaker.cooling_slots(Instant::now()),
+        cooldown_skips,
+        half_open_attempts,
+    );
+}
+
+fn record_commitment_authority_carrier_circuit_telemetry(
+    storage: &MemoryStorage,
+    circuit_breaker: &CommitmentAuthorityCarrierCircuitBreaker,
+    cooldown_skips: usize,
+    half_open_attempts: usize,
+) {
+    // [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Authority transport
+    // has a distinct typed circuit. Collapse it to source-blind aggregates at
+    // the storage boundary so telemetry cannot reconstruct a carrier or route.
+    storage.record_commitment_authority_carrier_circuit_observation(
         circuit_breaker.cooling_slots(Instant::now()),
         cooldown_skips,
         half_open_attempts,
@@ -3348,20 +3409,57 @@ pub async fn sync_next_record_coordinator_handover(
     identity: &IdentityKeyPair,
     client: &reqwest::Client,
 ) -> Result<CommitmentAuthoritySyncOutcome, String> {
-    sync_next_record_coordinator_handover_with_endpoint_policy(
+    let mut cursor = CommitmentAuthorityCarrierCursor::default();
+    let mut circuit_breaker = CommitmentAuthorityCarrierCircuitBreaker::default();
+    sync_next_record_coordinator_handover_with_carrier_runtime_and_endpoint_policy(
         storage,
         peer_store,
         identity,
+        &[],
         client,
         &commitment_peer_endpoint_is_public,
+        &mut cursor,
+        &mut circuit_breaker,
     )
     .await
 }
 
-async fn sync_next_record_coordinator_handover_with_endpoint_policy<F>(
+/// Synchronizes one authority proof with bounded operator-pinned recovery.
+///
+/// Direct coordinator transport is always attempted first. Only explicit
+/// availability failures may advance to a carrier, and carriers transport but
+/// never authorise the independently dual-signed transition.
+pub(crate) async fn sync_next_record_coordinator_handover_with_carrier_runtime(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
     identity: &IdentityKeyPair,
+    carrier_node_ids: &[[u8; 32]],
+    client: &reqwest::Client,
+    cursor: &mut CommitmentAuthorityCarrierCursor,
+    circuit_breaker: &mut CommitmentAuthorityCarrierCircuitBreaker,
+) -> Result<CommitmentAuthoritySyncOutcome, String> {
+    sync_next_record_coordinator_handover_with_carrier_runtime_and_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        carrier_node_ids,
+        client,
+        &commitment_peer_endpoint_is_public,
+        cursor,
+        circuit_breaker,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_record_coordinator_handover_from_source_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    expected_authority: &RecordCommitmentAuthorityState,
+    response_signer: &[u8; 32],
+    source: CommitmentAuthoritySyncSource,
+    carrier_attempts: usize,
     client: &reqwest::Client,
     endpoint_allowed: &F,
 ) -> Result<CommitmentAuthoritySyncOutcome, String>
@@ -3372,21 +3470,36 @@ where
         .record_commitment_authority_state()
         .await?
         .ok_or_else(|| "commitment_authority_not_configured".to_string())?;
+    if authority != *expected_authority {
+        return Err("handover_local_authority_changed".to_string());
+    }
     if authority.coordinator == identity.public_key_bytes() {
         return Err("active_coordinator_cannot_follow_itself".to_string());
     }
 
     let request_timestamp = now_secs();
-    let coordinator = peer_store
-        .get_valid(&authority.coordinator, request_timestamp)
-        .ok_or_else(|| "active_coordinator_unavailable".to_string())?;
-    let endpoint = coordinator
+    let (unavailable_error, missing_endpoint_error, unsafe_endpoint_error) = match source {
+        CommitmentAuthoritySyncSource::Coordinator => (
+            "active_coordinator_unavailable",
+            "active_coordinator_missing_endpoint",
+            "active_coordinator_unsafe_endpoint",
+        ),
+        CommitmentAuthoritySyncSource::PinnedCarrier => (
+            "handover_carrier_unavailable",
+            "handover_carrier_missing_endpoint",
+            "handover_carrier_unsafe_endpoint",
+        ),
+    };
+    let responder = peer_store
+        .get_valid(response_signer, request_timestamp)
+        .ok_or_else(|| unavailable_error.to_string())?;
+    let endpoint = responder
         .descriptor
         .public_endpoint
         .as_deref()
-        .ok_or_else(|| "active_coordinator_missing_endpoint".to_string())?;
+        .ok_or_else(|| missing_endpoint_error.to_string())?;
     if !endpoint_allowed(endpoint) {
-        return Err("active_coordinator_unsafe_endpoint".to_string());
+        return Err(unsafe_endpoint_error.to_string());
     }
     let url = commitment_coordinator_handover_url(endpoint)?;
 
@@ -3427,11 +3540,18 @@ where
     let verified = verify_record_coordinator_handover_response(
         &body,
         &request_id,
+        response_signer,
         &authority.coordinator,
         authority.authority_epoch,
         authority.next_block_height,
         now_secs(),
     )?;
+
+    if source == CommitmentAuthoritySyncSource::PinnedCarrier && verified.handover.is_none() {
+        // A carrier's empty local head cannot prove the active coordinator
+        // made no transition; another exact operator pin may be less stale.
+        return Err("handover_carrier_behind".to_string());
+    }
 
     let mut handover_inserted = false;
     let mut pending_activation_height = None;
@@ -3458,7 +3578,236 @@ where
         next_block_height: refreshed.next_block_height,
         pending_activation_height,
         handover_inserted,
+        source,
+        carrier_attempts,
     })
+}
+
+#[cfg(test)]
+async fn sync_next_record_coordinator_handover_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+) -> Result<CommitmentAuthoritySyncOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    let authority = storage
+        .record_commitment_authority_state()
+        .await?
+        .ok_or_else(|| "commitment_authority_not_configured".to_string())?;
+    sync_record_coordinator_handover_from_source_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        &authority,
+        &authority.coordinator,
+        CommitmentAuthoritySyncSource::Coordinator,
+        0,
+        client,
+        endpoint_allowed,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_next_record_coordinator_handover_with_carrier_runtime_and_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    carrier_node_ids: &[[u8; 32]],
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+    cursor: &mut CommitmentAuthorityCarrierCursor,
+    circuit_breaker: &mut CommitmentAuthorityCarrierCircuitBreaker,
+) -> Result<CommitmentAuthoritySyncOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    let authority = storage
+        .record_commitment_authority_state()
+        .await?
+        .ok_or_else(|| "commitment_authority_not_configured".to_string())?;
+    if authority.coordinator == identity.public_key_bytes() {
+        return Err("active_coordinator_cannot_follow_itself".to_string());
+    }
+
+    // [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Recovery membership is
+    // exactly the operator pin set. Discovery resolves fresh endpoints only;
+    // it cannot nominate a transport source or alter proof authority.
+    let carriers = eligible_pinned_commitment_carriers(
+        identity.public_key_bytes(),
+        &authority.coordinator,
+        carrier_node_ids,
+    );
+    circuit_breaker.align_slots(carriers.len());
+    let mut cooldown_skips = 0usize;
+    let mut half_open_attempts = 0usize;
+    let direct = sync_record_coordinator_handover_from_source_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        &authority,
+        &authority.coordinator,
+        CommitmentAuthoritySyncSource::Coordinator,
+        0,
+        client,
+        endpoint_allowed,
+    )
+    .await;
+    let direct_error = match direct {
+        Ok(outcome) => {
+            cursor.reset();
+            record_commitment_authority_carrier_circuit_telemetry(
+                storage,
+                circuit_breaker,
+                cooldown_skips,
+                half_open_attempts,
+            );
+            storage.record_commitment_authority_sync_outcome(
+                now_secs(),
+                RecordCommitmentAuthoritySyncDisposition::Coordinator,
+                0,
+            );
+            return Ok(outcome);
+        }
+        Err(error) => error,
+    };
+    if coordinator_handover_source_failure_class(&direct_error)
+        == CommitmentAuthoritySourceFailureClass::Security
+    {
+        record_commitment_authority_carrier_circuit_telemetry(
+            storage,
+            circuit_breaker,
+            cooldown_skips,
+            half_open_attempts,
+        );
+        storage.record_commitment_authority_sync_outcome(
+            now_secs(),
+            RecordCommitmentAuthoritySyncDisposition::SecurityStopped,
+            0,
+        );
+        return Err(direct_error);
+    }
+
+    let carrier_count = carriers.len();
+    let start_index = cursor.start_index(carrier_count);
+    let mut carrier_attempts = 0usize;
+    for offset in 0..carrier_count {
+        let carrier_index = start_index.saturating_add(offset) % carrier_count;
+        match circuit_breaker.decision(carrier_index, Instant::now()) {
+            CommitmentCarrierCircuitDecision::Closed => {}
+            CommitmentCarrierCircuitDecision::Cooling => {
+                cooldown_skips = cooldown_skips.saturating_add(1);
+                continue;
+            }
+            CommitmentCarrierCircuitDecision::HalfOpen => {
+                half_open_attempts = half_open_attempts.saturating_add(1);
+            }
+        }
+        let carrier = carriers[carrier_index];
+        carrier_attempts = carrier_attempts.saturating_add(1);
+        match sync_record_coordinator_handover_from_source_with_endpoint_policy(
+            storage,
+            peer_store,
+            identity,
+            &authority,
+            &carrier,
+            CommitmentAuthoritySyncSource::PinnedCarrier,
+            carrier_attempts,
+            client,
+            endpoint_allowed,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                circuit_breaker.record_success(carrier_index);
+                cursor.prefer(carrier_index, carrier_count);
+                record_commitment_authority_carrier_circuit_telemetry(
+                    storage,
+                    circuit_breaker,
+                    cooldown_skips,
+                    half_open_attempts,
+                );
+                storage.record_commitment_authority_sync_outcome(
+                    now_secs(),
+                    RecordCommitmentAuthoritySyncDisposition::CarrierRecovered,
+                    carrier_attempts,
+                );
+                return Ok(outcome);
+            }
+            Err(error)
+                if coordinator_handover_source_failure_class(&error)
+                    == CommitmentAuthoritySourceFailureClass::Availability =>
+            {
+                circuit_breaker.record_availability_failure(carrier_index, Instant::now());
+                cursor.advance_after_availability_failure(carrier_index, carrier_count);
+            }
+            Err(error) => {
+                record_commitment_authority_carrier_circuit_telemetry(
+                    storage,
+                    circuit_breaker,
+                    cooldown_skips,
+                    half_open_attempts,
+                );
+                storage.record_commitment_authority_sync_outcome(
+                    now_secs(),
+                    RecordCommitmentAuthoritySyncDisposition::SecurityStopped,
+                    carrier_attempts,
+                );
+                return Err(error);
+            }
+        }
+    }
+
+    // Preserve the direct source's stable availability code for existing
+    // follower alerting when every bounded carrier is unavailable or behind.
+    record_commitment_authority_carrier_circuit_telemetry(
+        storage,
+        circuit_breaker,
+        cooldown_skips,
+        half_open_attempts,
+    );
+    storage.record_commitment_authority_sync_outcome(
+        now_secs(),
+        RecordCommitmentAuthoritySyncDisposition::AvailabilityExhausted,
+        carrier_attempts,
+    );
+    Err(direct_error)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitmentAuthoritySourceFailureClass {
+    Availability,
+    Security,
+}
+
+fn coordinator_handover_source_failure_class(error: &str) -> CommitmentAuthoritySourceFailureClass {
+    let retryable_status = error
+        .strip_prefix("handover_http_status_")
+        .and_then(|status| status.parse::<u16>().ok())
+        .is_some_and(|status| matches!(status, 403 | 404 | 408 | 429 | 500 | 502 | 503 | 504));
+    if retryable_status
+        || matches!(
+            error,
+            "active_coordinator_unavailable"
+                | "active_coordinator_missing_endpoint"
+                | "handover_carrier_unavailable"
+                | "handover_carrier_missing_endpoint"
+                | "handover_carrier_behind"
+                | "handover_request_timeout"
+                | "handover_request_connect"
+                | "response_body_timeout"
+                | "response_body_connect"
+                | "response_body_body"
+        )
+    {
+        CommitmentAuthoritySourceFailureClass::Availability
+    } else {
+        CommitmentAuthoritySourceFailureClass::Security
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3466,6 +3815,7 @@ fn verify_record_coordinator_handover_response(
     body: &[u8],
     expected_request_id: &[u8; 16],
     expected_responder: &[u8; 32],
+    expected_previous_coordinator: &[u8; 32],
     expected_authority_epoch: u64,
     expected_next_block_height: u64,
     now: u64,
@@ -3530,7 +3880,7 @@ fn verify_record_coordinator_handover_response(
             if proof.header.authority_epoch != expected_epoch {
                 return Err("handover_epoch_discontinuity".to_string());
             }
-            if proof.header.previous_coordinator != *expected_responder {
+            if proof.header.previous_coordinator != *expected_previous_coordinator {
                 return Err("handover_previous_coordinator_mismatch".to_string());
             }
             if proof.header.activation_height < expected_next_block_height {
@@ -3709,20 +4059,18 @@ where
     .await
 }
 
-fn eligible_commitment_block_carriers(
+fn eligible_pinned_commitment_carriers(
     local_node_id: [u8; 32],
     coordinator_node_id: &[u8; 32],
     carrier_node_ids: &[[u8; 32]],
 ) -> Vec<[u8; 32]> {
-    // [MULTIPAGE-BLOCK-CARRIER-HANDOFF 2026-07-29 by Codex] Normalize once
-    // per page from the immutable operator policy. The cursor may change only
-    // the bounded attempt start inside this exact list; it cannot import a
-    // discovery peer or alter membership.
+    // [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Block and handover
+    // recovery share one immutable pin normalizer. A typed cursor may change
+    // only the bounded attempt start inside this exact list; it cannot import
+    // a discovery peer, include self/primary, or alter membership.
     let mut carriers = Vec::with_capacity(MAX_PINNED_WITNESSES_PER_ROUND);
     for carrier in carrier_node_ids {
-        if *carrier == local_node_id
-            || carrier == coordinator_node_id
-            || carriers.contains(carrier)
+        if *carrier == local_node_id || carrier == coordinator_node_id || carriers.contains(carrier)
         {
             continue;
         }
@@ -3789,7 +4137,7 @@ where
     // [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Align before the
     // coordinator request so an operator pin-count change clears positional
     // state even when the direct path succeeds and no carrier is contacted.
-    let carriers = eligible_commitment_block_carriers(
+    let carriers = eligible_pinned_commitment_carriers(
         identity.public_key_bytes(),
         coordinator_node_id,
         carrier_node_ids,
@@ -5814,11 +6162,13 @@ mod tests {
         let request_id = [0x41; 16];
         let active = IdentityKeyPair::generate();
         let next = IdentityKeyPair::generate();
+        let carrier = IdentityKeyPair::generate();
         let omitted = signed_handover_response_frame(&active, request_id, now, None, 1);
         assert_eq!(
             verify_record_coordinator_handover_response(
                 &omitted,
                 &request_id,
+                &active.public_key_bytes(),
                 &active.public_key_bytes(),
                 0,
                 1,
@@ -5839,11 +6189,12 @@ mod tests {
             &next,
         );
         let wrapped =
-            signed_handover_response_frame(&active, request_id, now, Some(wrong_predecessor), 1);
+            signed_handover_response_frame(&carrier, request_id, now, Some(wrong_predecessor), 1);
         assert_eq!(
             verify_record_coordinator_handover_response(
                 &wrapped,
                 &request_id,
+                &carrier.public_key_bytes(),
                 &active.public_key_bytes(),
                 0,
                 1,
@@ -5852,6 +6203,69 @@ mod tests {
             .unwrap_err(),
             "handover_previous_coordinator_mismatch"
         );
+
+        let valid_transition = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            [0x44; 32],
+            [0x45; 16],
+            now.saturating_sub(1),
+            &active,
+            &next,
+        );
+        let carried = signed_handover_response_frame(
+            &carrier,
+            request_id,
+            now,
+            Some(valid_transition),
+            1,
+        );
+        assert!(verify_record_coordinator_handover_response(
+            &carried,
+            &request_id,
+            &carrier.public_key_bytes(),
+            &active.public_key_bytes(),
+            0,
+            1,
+            now,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn handover_carrier_retries_only_explicit_availability_failures() {
+        // [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Alternate pins may
+        // improve availability, never mask authenticated protocol failures.
+        for error in [
+            "active_coordinator_unavailable",
+            "active_coordinator_missing_endpoint",
+            "handover_carrier_unavailable",
+            "handover_carrier_missing_endpoint",
+            "handover_carrier_behind",
+            "handover_request_timeout",
+            "handover_http_status_503",
+        ] {
+            assert_eq!(
+                coordinator_handover_source_failure_class(error),
+                CommitmentAuthoritySourceFailureClass::Availability,
+                "{error}"
+            );
+        }
+        for error in [
+            "active_coordinator_unsafe_endpoint",
+            "handover_carrier_unsafe_endpoint",
+            "handover_http_status_401",
+            "invalid_handover_response_signature",
+            "handover_previous_coordinator_mismatch",
+            "handover_local_authority_changed",
+            "storage_append_rejected",
+        ] {
+            assert_eq!(
+                coordinator_handover_source_failure_class(error),
+                CommitmentAuthoritySourceFailureClass::Security,
+                "{error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6024,6 +6438,8 @@ mod tests {
         assert_eq!(pending.next_block_height, 1);
         assert_eq!(pending.pending_activation_height, Some(2));
         assert!(!pending.handover_inserted);
+        assert_eq!(pending.source, CommitmentAuthoritySyncSource::Coordinator);
+        assert_eq!(pending.carrier_attempts, 0);
 
         let page = pull_record_commitment_page_from_source_with_endpoint_policy(
             &destination,
@@ -6054,7 +6470,168 @@ mod tests {
         assert_eq!(activated.next_block_height, 2);
         assert_eq!(activated.pending_activation_height, None);
         assert!(activated.handover_inserted);
+        assert_eq!(
+            activated.source,
+            CommitmentAuthoritySyncSource::Coordinator
+        );
+        assert_eq!(activated.carrier_attempts, 0);
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pinned_carrier_recovers_exact_handover_when_coordinator_is_unavailable() {
+        // [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] The carrier signs
+        // only its response envelope. The accepted authority transition must
+        // still be the root coordinator's exact-next dual-signed proof bound
+        // to the follower's already-audited block-one prefix.
+        let now = now_secs();
+        let coordinator = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let stale_carrier = Arc::new(IdentityKeyPair::generate());
+        let carrier = Arc::new(IdentityKeyPair::generate());
+        let follower = IdentityKeyPair::generate();
+        let first_block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(2),
+            GENESIS_PREV_HASH,
+            vec![[0x54; 32]],
+            &coordinator,
+        );
+        let proof = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x55; 16],
+            now.saturating_sub(1),
+            &coordinator,
+            &next,
+        );
+
+        let stale_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        stale_storage
+            .configure_record_commitment_authority_root(Some(coordinator.public_key_bytes()))
+            .unwrap();
+        stale_storage.audit_record_commitment_chain().await.unwrap();
+        stale_storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        let stale_peers = Arc::new(PeerStore::new());
+        admit_peer(&stale_peers, &follower, None, now);
+        let stale_router = build_memchain_peer_router(
+            Arc::clone(&stale_storage),
+            stale_peers,
+            Arc::clone(&stale_carrier),
+        );
+        let stale_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let stale_address = stale_listener.local_addr().unwrap();
+        let stale_server = tokio::spawn(async move {
+            axum::serve(stale_listener, stale_router).await.unwrap();
+        });
+
+        let carrier_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        carrier_storage
+            .configure_record_commitment_authority_root(Some(coordinator.public_key_bytes()))
+            .unwrap();
+        carrier_storage
+            .audit_record_commitment_chain()
+            .await
+            .unwrap();
+        carrier_storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        carrier_storage
+            .persist_configured_record_coordinator_handover(&proof, now)
+            .await
+            .unwrap();
+        let carrier_peers = Arc::new(PeerStore::new());
+        admit_peer(&carrier_peers, &follower, None, now);
+        let router = build_memchain_peer_router(
+            Arc::clone(&carrier_storage),
+            carrier_peers,
+            Arc::clone(&carrier),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let destination = MemoryStorage::open(":memory:", None).unwrap();
+        destination
+            .configure_record_commitment_authority_root(Some(coordinator.public_key_bytes()))
+            .unwrap();
+        destination.audit_record_commitment_chain().await.unwrap();
+        destination
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        destination.configure_record_commitment_sync(false, true);
+        let destination_peers = PeerStore::new();
+        // The active coordinator is authenticated but has no reachable
+        // endpoint, forcing only the narrow availability fallback.
+        admit_peer(&destination_peers, &coordinator, None, now);
+        admit_peer(
+            &destination_peers,
+            stale_carrier.as_ref(),
+            Some(format!("http://{stale_address}")),
+            now,
+        );
+        admit_peer(
+            &destination_peers,
+            carrier.as_ref(),
+            Some(format!("http://{address}")),
+            now,
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let mut cursor = CommitmentAuthorityCarrierCursor::default();
+        let mut circuit_breaker = CommitmentAuthorityCarrierCircuitBreaker::default();
+        let recovered =
+            sync_next_record_coordinator_handover_with_carrier_runtime_and_endpoint_policy(
+                &destination,
+                &destination_peers,
+                &follower,
+                &[stale_carrier.public_key_bytes(), carrier.public_key_bytes()],
+                &client,
+                &allow_test_endpoint,
+                &mut cursor,
+                &mut circuit_breaker,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            recovered.source,
+            CommitmentAuthoritySyncSource::PinnedCarrier
+        );
+        assert_eq!(recovered.carrier_attempts, 2);
+        assert!(recovered.handover_inserted);
+        assert_eq!(recovered.authority_epoch, 1);
+        assert_eq!(recovered.active_coordinator, next.public_key_bytes());
+        assert_eq!(recovered.next_block_height, 2);
+        assert_eq!(recovered.pending_activation_height, None);
+        let status = destination.record_commitment_sync_status();
+        assert_eq!(status.authority_sync_rounds_total, 1);
+        assert_eq!(status.authority_coordinator_success_total, 0);
+        assert_eq!(status.authority_carrier_attempts_total, 2);
+        assert_eq!(status.authority_carrier_recoveries_total, 1);
+        assert_eq!(status.authority_availability_exhausted_total, 0);
+        assert_eq!(status.authority_security_stops_total, 0);
+        assert_eq!(
+            status.last_authority_sync_result.as_deref(),
+            Some("carrier_recovered")
+        );
+        assert!(status.last_authority_carrier_recovered_at.is_some());
+
+        stale_server.abort();
         server.abort();
     }
 

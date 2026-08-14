@@ -164,6 +164,8 @@
 //!   never be inferred from SQLite, serialized, logged, or exposed in status.
 //!
 //! ## Last Modified
+//! [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Added follower-only,
+//! source-blind authority-proof recovery and circuit telemetry.
 //! [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Added the process-local
 //! immutable proposer-authority trust anchor used by startup and live audits.
 //! v2.8.57-CertificatePersistenceTruth - Separated verified-unpersisted follower outcomes.
@@ -503,6 +505,32 @@ impl RecordCommitmentBlockPagePullDisposition {
     }
 }
 
+/// One terminal outcome for a follower coordinator-handover retrieval round.
+///
+/// [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] This process-local
+/// classification reports whether an exact dual-signed authority proof came
+/// directly from the active coordinator or through an already-pinned carrier.
+/// It cannot retain identities, endpoints, proof material, epochs, heights,
+/// hashes, signatures, raw errors, or routes, and never grants authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordCommitmentAuthoritySyncDisposition {
+    Coordinator,
+    CarrierRecovered,
+    AvailabilityExhausted,
+    SecurityStopped,
+}
+
+impl RecordCommitmentAuthoritySyncDisposition {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Coordinator => "coordinator",
+            Self::CarrierRecovered => "carrier_recovered",
+            Self::AvailabilityExhausted => "availability_exhausted",
+            Self::SecurityStopped => "security_stopped",
+        }
+    }
+}
+
 /// Current follower certificate-policy readiness after exact local validation.
 ///
 /// [FOLLOWER-CERTIFICATE-READINESS 2026-07-29 by Codex] These states are
@@ -661,6 +689,32 @@ pub struct RecordCommitmentSyncStatus {
     pub outbound_announcement_retries_succeeded_total: u64,
     /// Peers still transiently failing after the retry budget.
     pub outbound_announcement_retries_exhausted_total: u64,
+    /// Most recent terminal coordinator-handover retrieval round.
+    pub last_authority_sync_at: Option<u64>,
+    /// Latest source-blind authority-proof retrieval result.
+    pub last_authority_sync_result: Option<String>,
+    /// Most recent proof recovered through an already-pinned carrier.
+    pub last_authority_carrier_recovered_at: Option<u64>,
+    /// Terminal authority-proof retrieval rounds observed since process start.
+    pub authority_sync_rounds_total: u64,
+    /// Rounds completed directly through the active coordinator.
+    pub authority_coordinator_success_total: u64,
+    /// Pinned carrier requests attempted after coordinator availability faults.
+    pub authority_carrier_attempts_total: u64,
+    /// Rounds recovered through an already-pinned carrier.
+    pub authority_carrier_recoveries_total: u64,
+    /// Rounds where the coordinator and every bounded carrier were unavailable.
+    pub authority_availability_exhausted_total: u64,
+    /// Rounds stopped by a security or protocol-integrity failure.
+    pub authority_security_stops_total: u64,
+    /// Most recent fail-closed authority-proof security stop.
+    pub last_authority_security_stop_at: Option<u64>,
+    /// Fixed authority-carrier slots cooling at the latest observation.
+    pub authority_carrier_cooling_slots: usize,
+    /// Authority-carrier selections skipped during anonymous cooldown.
+    pub authority_carrier_cooldown_skips_total: u64,
+    /// Authority-carrier requests started after anonymous cooldown expiry.
+    pub authority_carrier_half_open_attempts_total: u64,
     /// Most recent terminal commitment-block page retrieval.
     pub last_block_page_pull_at: Option<u64>,
     /// Latest source-blind page retrieval result.
@@ -965,6 +1019,19 @@ pub(crate) struct RecordCommitmentSyncRuntime {
     pub(crate) outbound_announcement_retries_attempted_total: u64,
     pub(crate) outbound_announcement_retries_succeeded_total: u64,
     pub(crate) outbound_announcement_retries_exhausted_total: u64,
+    pub(crate) last_authority_sync_at: Option<u64>,
+    pub(crate) last_authority_sync_result: Option<&'static str>,
+    pub(crate) last_authority_carrier_recovered_at: Option<u64>,
+    pub(crate) authority_sync_rounds_total: u64,
+    pub(crate) authority_coordinator_success_total: u64,
+    pub(crate) authority_carrier_attempts_total: u64,
+    pub(crate) authority_carrier_recoveries_total: u64,
+    pub(crate) authority_availability_exhausted_total: u64,
+    pub(crate) authority_security_stops_total: u64,
+    pub(crate) last_authority_security_stop_at: Option<u64>,
+    pub(crate) authority_carrier_cooling_slots: usize,
+    pub(crate) authority_carrier_cooldown_skips_total: u64,
+    pub(crate) authority_carrier_half_open_attempts_total: u64,
     pub(crate) last_block_page_pull_at: Option<u64>,
     pub(crate) last_block_page_pull_result: Option<&'static str>,
     pub(crate) last_block_carrier_recovered_at: Option<u64>,
@@ -1060,6 +1127,19 @@ impl Default for RecordCommitmentSyncRuntime {
             outbound_announcement_retries_attempted_total: 0,
             outbound_announcement_retries_succeeded_total: 0,
             outbound_announcement_retries_exhausted_total: 0,
+            last_authority_sync_at: None,
+            last_authority_sync_result: None,
+            last_authority_carrier_recovered_at: None,
+            authority_sync_rounds_total: 0,
+            authority_coordinator_success_total: 0,
+            authority_carrier_attempts_total: 0,
+            authority_carrier_recoveries_total: 0,
+            authority_availability_exhausted_total: 0,
+            authority_security_stops_total: 0,
+            last_authority_security_stop_at: None,
+            authority_carrier_cooling_slots: 0,
+            authority_carrier_cooldown_skips_total: 0,
+            authority_carrier_half_open_attempts_total: 0,
             last_block_page_pull_at: None,
             last_block_page_pull_result: None,
             last_block_carrier_recovered_at: None,

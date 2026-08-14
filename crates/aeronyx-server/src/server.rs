@@ -346,6 +346,9 @@
 // 131. [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Installs the
 //      operator-validated immutable commitment authority root before startup
 //      audit so readiness cannot precede exact-height proposer verification.
+// 132. [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Recovers exact-next
+//      authority proofs through bounded operator pins while keeping transport
+//      identity independent from the dual-signed coordinator transition.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -481,8 +484,13 @@
 //   - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Install the immutable
 //     authority root before the first chain audit. Never derive it from mutable
 //     storage, log its identity, or bypass dual-signed coordinator handover.
+//   - [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Operator-pinned
+//     handover carriers transport exact dual-signed proofs only. They never
+//     gain coordinator, witness, voting, fork-choice, or consensus authority.
 //
 // Last Modified:
+//   [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Added direct-first,
+//     bounded proof recovery with an isolated process-lifetime carrier circuit.
 //   [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Bound startup readiness
 //     to the configured commitment authority root and proposer history audit.
 //   v2.8.83-ManagementClientStartup - Made management HTTP client creation
@@ -785,9 +793,11 @@ use crate::api::memchain_peer::{
     recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime,
     release_record_commitment_coordinator_lease, request_record_commitment_coordinator_lease,
     sync_follower_record_commitment_checkpoint_certificate_with_carrier_runtime,
-    sync_next_record_coordinator_handover, witness_verified_delivery_anchor,
-    CommitmentBlockCarrierCircuitBreaker,
-    CommitmentBlockCarrierCursor, CommitmentCertificateCarrierCircuitBreaker,
+    sync_next_record_coordinator_handover_with_carrier_runtime, witness_verified_delivery_anchor,
+    CommitmentAuthorityCarrierCircuitBreaker, CommitmentAuthorityCarrierCursor,
+    CommitmentAuthoritySyncSource,
+    CommitmentBlockCarrierCircuitBreaker, CommitmentBlockCarrierCursor,
+    CommitmentCertificateCarrierCircuitBreaker,
     CommitmentCertificateCarrierRecoveryDisposition, CommitmentCheckpointRelation,
     CommitmentFollowerCertificateSyncOutcome, CommitmentReconciliationOutcome,
     CommitmentSyncPageSource, VerifiedDeliveryAnchorWitnessRound, MAX_BLOCKS_PER_RESPONSE_WIRE,
@@ -7873,6 +7883,11 @@ impl Server {
             // discarded on restart. It contains no identity, endpoint, error,
             // payload, route, or wall-clock data.
             let mut block_carrier_circuit = CommitmentBlockCarrierCircuitBreaker::default();
+            // [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Handover
+            // evidence uses independent process-only circuit state. A stale
+            // proof carrier cannot cool block or certificate transport.
+            let mut authority_carrier_circuit =
+                CommitmentAuthorityCarrierCircuitBreaker::default();
             // [CERTIFICATE-CARRIER-CIRCUIT 2026-07-29 by Codex] Certificate
             // transport has an independent typed circuit. A block-page outage
             // cannot suppress certificate evidence recovery, or vice versa.
@@ -7935,6 +7950,8 @@ impl Server {
                     // discarded before backoff/retry and never enters status,
                     // persistence, routing policy, or trust decisions.
                     let mut block_carrier_cursor = CommitmentBlockCarrierCursor::default();
+                    let mut authority_carrier_cursor =
+                        CommitmentAuthorityCarrierCursor::default();
                     for _ in 0..max_pages_per_round {
                         // [AUTHORITY-HANDOVER-FOLLOWER 2026-08-14 by Codex]
                         // Pull exactly one proof before each block page. A
@@ -7942,13 +7959,25 @@ impl Server {
                         // after that prefix is audited, the next iteration
                         // persists the proof and resolves the new coordinator.
                         let (active_coordinator, max_blocks) = if authority_handover_enabled {
-                            let authority = sync_next_record_coordinator_handover(
-                                &storage,
-                                &peer_store,
-                                &identity,
-                                sync_http_client.as_ref(),
-                            )
-                            .await?;
+                            let authority =
+                                sync_next_record_coordinator_handover_with_carrier_runtime(
+                                    &storage,
+                                    &peer_store,
+                                    &identity,
+                                    &certificate_witness_node_ids,
+                                    sync_http_client.as_ref(),
+                                    &mut authority_carrier_cursor,
+                                    &mut authority_carrier_circuit,
+                                )
+                                .await?;
+                            if authority.source
+                                == CommitmentAuthoritySyncSource::PinnedCarrier
+                            {
+                                debug!(
+                                    carrier_attempts = authority.carrier_attempts,
+                                    "[MEMCHAIN_BLOCK] Recovered dual-signed authority proof through pinned transport"
+                                );
+                            }
                             let max_blocks = authority
                                 .pending_activation_height
                                 .map(|activation_height| {

@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.88.0 - Added authenticated exact-next coordinator
-handover exchange and height-bounded follower catch-up.
+Modification Reason: v0.89.0 - Added direct-first, bounded operator-pinned
+carrier recovery for exact coordinator handover proofs.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.88.0 - [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Synchronizes one exact-next dual-signed coordinator proof at a time, stops block pages at activation boundaries, and applies the audited authority schedule to follower control traffic.
+Last Modified: v0.89.0 - [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Recovers exact dual-signed coordinator proofs through bounded operator-pinned carriers without expanding transport into authority.
+Previous: v0.88.0 - [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Synchronizes one exact-next dual-signed coordinator proof at a time, stops block pages at activation boundaries, and applies the audited authority schedule to follower control traffic.
 Previous: v0.87.0 - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Pins a process-local commitment authority root, audits every historical proposer at startup, and enforces the active coordinator at each appended height.
 Previous: v0.86.0 - [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Preserves canonical user-storage paths, rejects orphaning reloads, serializes placement with reload, and removes owner identifiers from volume logs.
 Previous: v0.85.0 - [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] Keeps node discovery gossip available after a recovered rate-limiter lock-owner panic.
@@ -122,6 +123,63 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
 
+### v0.89 Coordinator handover proofs survive producer downtime
+
+[AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex]
+
+- A follower always requests the exact-next handover proof from its currently
+  audited coordinator first. A carrier is considered only after an explicit,
+  classified availability failure; protocol, signature, authority, epoch,
+  canonical-encoding, endpoint-policy, and storage errors stop the round.
+- Recovery is restricted to at most three distinct operator-pinned witness
+  identities. Discovery resolves the signed endpoint of those exact pins but
+  cannot nominate an arbitrary peer, widen the set, or grant authority.
+- A carrier signs only the response transport envelope. The transition remains
+  valid only when the previous and next coordinators independently signed the
+  same exact proof, the previous coordinator matches the immutable local root
+  schedule, and the activation boundary matches the audited block prefix.
+- An empty carrier history cannot prove that no handover exists. It is treated
+  as stale availability and the bounded recovery loop may try the next pin.
+  One malformed, mismatched, or invalid response fails closed immediately so a
+  later carrier cannot conceal security evidence.
+- Authority recovery owns a typed cursor and process-lifetime circuit distinct
+  from block-page and certificate circuits. Repeated availability faults cool
+  only the corresponding anonymous pin slot; half-open probes remain bounded.
+- Follower status exposes source-blind aggregate outcomes, actual bounded
+  carrier attempt counts, anonymous cooling/skip/half-open counters, monotonic
+  latest observations, and sticky security-stop times. It never stores or
+  reports a carrier identity, endpoint, proof, epoch, height, hash, signature,
+  raw failure, route, user, message, or memory payload.
+- Deployments without an authority root retain the complete legacy static-pin
+  behavior. This milestone adds availability recovery only; it is not
+  consensus, finality, fork choice, validator voting, coordinator election,
+  transactions, balances, or smart contracts.
+
+Implementation paths:
+
+- `crates/aeronyx-server/src/api/memchain_peer.rs`: direct-first classified
+  recovery, independent responder/proof authority verification, typed circuit,
+  bounded pin selection, and source-blind terminal observations.
+- `crates/aeronyx-server/src/services/memchain/storage.rs`: additive public
+  status fields plus private typed authority-sync dispositions.
+- `crates/aeronyx-server/src/services/memchain/storage_ops.rs`: follower-only
+  aggregate outcome/circuit accounting and privacy-safe status projection.
+- `crates/aeronyx-server/src/server.rs`: process-lifetime circuit ownership and
+  reuse of the validated witness pins without changing legacy mode.
+
+Verification:
+
+- A real localhost test makes the active coordinator unavailable, receives an
+  empty result from one stale pin, obtains the exact proof from a second pin,
+  persists the transition, changes active coordinator, and reports only
+  aggregate recovery evidence.
+- Adversarial coverage proves a carrier may authenticate its own envelope but
+  cannot replace the proof predecessor or manufacture coordinator authority.
+- Failure classification coverage proves only explicit availability failures
+  advance; security failures stop immediately.
+- Storage tests prove authority telemetry is monotonic, follower-only, sticky
+  for security evidence, and isolated from block/certificate carrier state.
+
 ### v0.88 MemChain followers synchronize coordinator handovers
 
 [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex]
@@ -154,10 +212,9 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
   cryptographic identity before consulting authority or peer-admission state.
   Forged traffic therefore cannot use error classes as a peer-membership or
   active-authority oracle, and cannot trigger storage-backed authority audits.
-- Current limitation: handover proofs are fetched directly from the active
-  coordinator. Pinned-carrier recovery for this control frame is not yet
-  implemented; an unavailable active coordinator therefore pauses follower
-  progress without weakening authority.
+- v0.89 adds bounded operator-pinned transport recovery when the active
+  coordinator is unavailable; proof authority and activation rules are
+  unchanged.
 - This remains an append-only privacy-protocol commitment log. It does not add
   consensus, finality, fork choice, transactions, balances, smart contracts,
   or permissionless coordinator election.

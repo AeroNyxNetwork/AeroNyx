@@ -181,6 +181,8 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Added source-blind,
+//! follower-only authority-proof recovery and circuit runtime evidence.
 //! [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Connected persisted
 //! coordinator handovers to complete-chain and live proposer authorization.
 //! v2.8.60-AnchorWorkerPrivacy - Redact Tokio panic payloads from signed
@@ -245,6 +247,7 @@ use crate::error::RuntimeTaskJoinFailureKind;
 
 use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
+    RecordCommitmentAuthoritySyncDisposition,
     RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificatePolicyReadiness,
     RecordCommitmentCertificateBackfillDisposition, RecordCommitmentCertificateSyncDisposition,
     RecordCommitmentFollowerReadiness,
@@ -5805,6 +5808,84 @@ impl MemoryStorage {
         runtime.last_error_code = None;
     }
 
+    /// Records one terminal follower authority-proof retrieval outcome.
+    ///
+    /// [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] The storage contract
+    /// accepts only one source-blind disposition and the number of actual
+    /// bounded carrier requests. It cannot retain source identities,
+    /// endpoints, authority proofs, epochs, heights, hashes, signatures,
+    /// errors, or routes, and this evidence never participates in authority.
+    pub(crate) fn record_commitment_authority_sync_outcome(
+        &self,
+        now: u64,
+        disposition: RecordCommitmentAuthoritySyncDisposition,
+        carrier_attempts: usize,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled || runtime.role != "follower" {
+            return;
+        }
+        let observed_at = record_monotonic_observation(&mut runtime.last_authority_sync_at, now);
+        let carrier_attempts = u64::try_from(carrier_attempts).unwrap_or(u64::MAX);
+
+        runtime.last_authority_sync_result = Some(disposition.as_str());
+        runtime.authority_sync_rounds_total = runtime.authority_sync_rounds_total.saturating_add(1);
+        runtime.authority_carrier_attempts_total = runtime
+            .authority_carrier_attempts_total
+            .saturating_add(carrier_attempts);
+
+        match disposition {
+            RecordCommitmentAuthoritySyncDisposition::Coordinator => {
+                runtime.authority_coordinator_success_total = runtime
+                    .authority_coordinator_success_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentAuthoritySyncDisposition::CarrierRecovered => {
+                runtime.last_authority_carrier_recovered_at = Some(observed_at);
+                runtime.authority_carrier_recoveries_total =
+                    runtime.authority_carrier_recoveries_total.saturating_add(1);
+            }
+            RecordCommitmentAuthoritySyncDisposition::AvailabilityExhausted => {
+                runtime.authority_availability_exhausted_total = runtime
+                    .authority_availability_exhausted_total
+                    .saturating_add(1);
+            }
+            RecordCommitmentAuthoritySyncDisposition::SecurityStopped => {
+                runtime.last_authority_security_stop_at = Some(observed_at);
+                runtime.authority_security_stops_total =
+                    runtime.authority_security_stops_total.saturating_add(1);
+            }
+        }
+    }
+
+    /// Records one identity-blind authority-carrier circuit observation.
+    ///
+    /// [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Authority handover,
+    /// block-page, and certificate recovery have independent typed circuits.
+    /// This follower-only projection retains only a current anonymous cooling
+    /// gauge and saturating scheduler counters; it cannot affect selection.
+    pub(crate) fn record_commitment_authority_carrier_circuit_observation(
+        &self,
+        cooling_slots: usize,
+        cooldown_skips: usize,
+        half_open_attempts: usize,
+    ) {
+        let mut runtime = self.commitment_sync.write();
+        if !runtime.enabled || runtime.role != "follower" {
+            return;
+        }
+        let cooldown_skips = u64::try_from(cooldown_skips).unwrap_or(u64::MAX);
+        let half_open_attempts = u64::try_from(half_open_attempts).unwrap_or(u64::MAX);
+
+        runtime.authority_carrier_cooling_slots = cooling_slots;
+        runtime.authority_carrier_cooldown_skips_total = runtime
+            .authority_carrier_cooldown_skips_total
+            .saturating_add(cooldown_skips);
+        runtime.authority_carrier_half_open_attempts_total = runtime
+            .authority_carrier_half_open_attempts_total
+            .saturating_add(half_open_attempts);
+    }
+
     /// Records one terminal commitment-block page retrieval outcome.
     ///
     /// [FOLLOWER-BLOCK-CARRIER-TELEMETRY 2026-07-29 by Codex] The counters are
@@ -6209,6 +6290,25 @@ impl MemoryStorage {
                 .outbound_announcement_retries_succeeded_total,
             outbound_announcement_retries_exhausted_total: runtime
                 .outbound_announcement_retries_exhausted_total,
+            last_authority_sync_at: runtime.last_authority_sync_at,
+            last_authority_sync_result: runtime
+                .last_authority_sync_result
+                .map(str::to_string),
+            last_authority_carrier_recovered_at: runtime
+                .last_authority_carrier_recovered_at,
+            authority_sync_rounds_total: runtime.authority_sync_rounds_total,
+            authority_coordinator_success_total: runtime.authority_coordinator_success_total,
+            authority_carrier_attempts_total: runtime.authority_carrier_attempts_total,
+            authority_carrier_recoveries_total: runtime.authority_carrier_recoveries_total,
+            authority_availability_exhausted_total: runtime
+                .authority_availability_exhausted_total,
+            authority_security_stops_total: runtime.authority_security_stops_total,
+            last_authority_security_stop_at: runtime.last_authority_security_stop_at,
+            authority_carrier_cooling_slots: runtime.authority_carrier_cooling_slots,
+            authority_carrier_cooldown_skips_total: runtime
+                .authority_carrier_cooldown_skips_total,
+            authority_carrier_half_open_attempts_total: runtime
+                .authority_carrier_half_open_attempts_total,
             last_block_page_pull_at: runtime.last_block_page_pull_at,
             last_block_page_pull_result: runtime
                 .last_block_page_pull_result
@@ -6295,7 +6395,7 @@ impl MemoryStorage {
             recovery_events_total: runtime.recovery_events_total,
             recent_events: runtime.recent_events.iter().cloned().collect(),
             privacy_policy:
-                "aggregate runtime only; effective follower readiness combines task liveness, bounded signed convergence freshness, and exact-tip local certificate-policy readiness while follower block-page/certificate recovery plus coordinator certificate backfill expose role-isolated, source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, monotonic latest-observation timestamps, and sticky security-stop timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, block, certificate frame, hash, signature, security reason, raw error, record commitment, owner, payload, route, or client metadata; readiness and counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
+                "aggregate runtime only; effective follower readiness combines task liveness, bounded signed convergence freshness, and exact-tip local certificate-policy readiness while follower authority-proof/block-page/certificate recovery plus coordinator certificate backfill expose role-isolated, source-blind terminal results, bounded attempt counts, independently scoped anonymous circuit cooling/skip/half-open aggregates, monotonic latest-observation timestamps, and sticky security-stop timestamps but no coordinator or carrier identity, circuit slot order, witness set, endpoint, authority proof, epoch, block, certificate frame, hash, signature, security reason, raw error, record commitment, owner, payload, route, or client metadata; readiness and counters are operations evidence, not authority, reputation, consensus, finality, or fork choice",
         }
     }
 
@@ -10731,6 +10831,97 @@ mod tests {
                 .last_block_page_security_stop_at,
             None
         );
+    }
+
+    #[test]
+    fn test_authority_carrier_runtime_is_aggregate_isolated_and_follower_only() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+
+        storage.record_commitment_authority_sync_outcome(
+            90,
+            RecordCommitmentAuthoritySyncDisposition::Coordinator,
+            0,
+        );
+        storage.record_commitment_authority_carrier_circuit_observation(2, 3, 1);
+        let disabled = storage.record_commitment_sync_status();
+        assert_eq!(disabled.authority_sync_rounds_total, 0);
+        assert_eq!(disabled.authority_carrier_cooling_slots, 0);
+
+        // [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Exercise every
+        // source-blind terminal result, monotonic timestamps, sticky security
+        // evidence, and an independent typed circuit without source details.
+        storage.configure_record_commitment_sync(false, true);
+        storage.record_commitment_block_carrier_circuit_observation(1, 2, 1);
+        storage.record_commitment_authority_carrier_circuit_observation(2, 3, 1);
+        storage.record_commitment_authority_carrier_circuit_observation(1, 4, 2);
+        storage.record_commitment_authority_sync_outcome(
+            100,
+            RecordCommitmentAuthoritySyncDisposition::Coordinator,
+            0,
+        );
+        storage.record_commitment_authority_sync_outcome(
+            110,
+            RecordCommitmentAuthoritySyncDisposition::CarrierRecovered,
+            2,
+        );
+        storage.record_commitment_authority_sync_outcome(
+            105,
+            RecordCommitmentAuthoritySyncDisposition::AvailabilityExhausted,
+            1,
+        );
+        storage.record_commitment_authority_sync_outcome(
+            120,
+            RecordCommitmentAuthoritySyncDisposition::SecurityStopped,
+            1,
+        );
+        storage.record_commitment_authority_sync_outcome(
+            130,
+            RecordCommitmentAuthoritySyncDisposition::Coordinator,
+            0,
+        );
+
+        let follower = storage.record_commitment_sync_status();
+        assert_eq!(follower.last_authority_sync_at, Some(130));
+        assert_eq!(
+            follower.last_authority_sync_result.as_deref(),
+            Some("coordinator")
+        );
+        assert_eq!(follower.last_authority_carrier_recovered_at, Some(110));
+        assert_eq!(follower.last_authority_security_stop_at, Some(120));
+        assert_eq!(follower.authority_sync_rounds_total, 5);
+        assert_eq!(follower.authority_coordinator_success_total, 2);
+        assert_eq!(follower.authority_carrier_attempts_total, 4);
+        assert_eq!(follower.authority_carrier_recoveries_total, 1);
+        assert_eq!(follower.authority_availability_exhausted_total, 1);
+        assert_eq!(follower.authority_security_stops_total, 1);
+        assert_eq!(follower.authority_carrier_cooling_slots, 1);
+        assert_eq!(follower.authority_carrier_cooldown_skips_total, 7);
+        assert_eq!(follower.authority_carrier_half_open_attempts_total, 3);
+        assert_eq!(
+            follower.authority_sync_rounds_total,
+            follower
+                .authority_coordinator_success_total
+                .saturating_add(follower.authority_carrier_recoveries_total)
+                .saturating_add(follower.authority_availability_exhausted_total)
+                .saturating_add(follower.authority_security_stops_total)
+        );
+        assert_eq!(follower.block_carrier_cooling_slots, 1);
+        assert_eq!(follower.block_carrier_cooldown_skips_total, 2);
+        assert_eq!(follower.block_carrier_half_open_attempts_total, 1);
+
+        storage.configure_record_commitment_sync(true, false);
+        storage.record_commitment_authority_sync_outcome(
+            140,
+            RecordCommitmentAuthoritySyncDisposition::CarrierRecovered,
+            1,
+        );
+        storage.record_commitment_authority_carrier_circuit_observation(3, 8, 5);
+        let coordinator = storage.record_commitment_sync_status();
+        assert_eq!(coordinator.authority_sync_rounds_total, 0);
+        assert_eq!(coordinator.authority_carrier_attempts_total, 0);
+        assert_eq!(coordinator.authority_carrier_cooling_slots, 0);
+        assert_eq!(coordinator.authority_carrier_cooldown_skips_total, 0);
+        assert_eq!(coordinator.authority_carrier_half_open_attempts_total, 0);
     }
 
     #[test]
