@@ -33,6 +33,8 @@
 //! - Prompt builders belong in `prompts.rs`. Do NOT add them here.
 //!
 //! ## Last Modified
+//! v2.5.5-FailureBoundary - [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex]
+//!   Runtime fallback logs now emit privacy-safe reason codes only.
 //! v2.5.0+SuperNode - 🌟 Created.
 //! v2.5.0+Audit Fix - 🔧 Various fixes (see previous doc).
 //! v2.5.0+Unify     - 🔧 [BUG FIX] Unified CognitiveTaskType from config_supernode.rs.
@@ -245,7 +247,15 @@ impl LlmRouter {
                         warn!(provider = %primary_name, "[LLM_ROUTER] Primary rate limited, trying fallback");
                     }
                     Err(e) => {
-                        warn!(provider = %primary_name, error = %e, "[LLM_ROUTER] Primary failed, trying fallback");
+                        // [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex]
+                        // Provider diagnostics can contain response text or a
+                        // transport endpoint; routine operator logs only need
+                        // the stable category for fallback observability.
+                        warn!(
+                            provider = %primary_name,
+                            reason = e.reason_code(),
+                            "[LLM_ROUTER] Primary failed, trying fallback"
+                        );
                     }
                 }
             } else {
@@ -273,7 +283,11 @@ impl LlmRouter {
                         return Ok(resp);
                     }
                     Err(e) => {
-                        warn!(provider = %name, error = %e, "[LLM_ROUTER] Fallback failed");
+                        warn!(
+                            provider = %name,
+                            reason = e.reason_code(),
+                            "[LLM_ROUTER] Fallback failed"
+                        );
                         last_error = e;
                     }
                 }

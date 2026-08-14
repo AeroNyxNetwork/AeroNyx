@@ -15,6 +15,9 @@
 //! Re-exported via prompts.rs. Use PrivacyLevel::from_str() for DB string parsing.
 //!
 //! ## Last Modified
+//! v2.5.5-FailureBoundary - [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex]
+//!   Reclaims panicked tasks, persists only stable failure reasons, and removes
+//!   provider output previews from JSON-parse logs.
 //! v2.5.0+SuperNode Phase A - 🌟 Created (skeleton).
 //! v2.5.0+SuperNode Phase B - 🌟 Full result parsing + writeback per task type.
 //! v2.5.0+Fix              - 🔧 Various alignment fixes.
@@ -33,7 +36,7 @@ use tracing::{debug, error, info, warn};
 
 use super::storage::MemoryStorage;
 // CognitiveTaskType is re-exported from config_supernode via llm_provider
-use super::llm_provider::{ChatMessage, ChatRequest, CognitiveTaskType};
+use super::llm_provider::{ChatRequest, CognitiveTaskType};
 use super::llm_router::LlmRouter;
 use super::storage_supernode::CognitiveTaskRow;
 // PrivacyLevel is re-exported from config_supernode via prompts
@@ -112,16 +115,37 @@ impl TaskWorker {
 
         let mut handles = Vec::with_capacity(tasks.len());
         for task in tasks {
+            let task_id = task.id;
             let storage = Arc::clone(&self.storage);
             let router = Arc::clone(&self.router);
-            handles.push(tokio::spawn(async move {
-                Self::process_task(storage, router, task).await;
-            }));
+            handles.push((
+                task_id,
+                tokio::spawn(async move {
+                    Self::process_task(storage, router, task).await;
+                }),
+            ));
         }
 
-        for handle in handles {
+        for (task_id, handle) in handles {
             if let Err(e) = handle.await {
-                error!(error = %e, "[TASK_WORKER] Task panicked");
+                // [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex] A panic used
+                // to leave the claimed row in `processing` until startup stale
+                // recovery. Associate every JoinHandle with its durable task ID
+                // so the normal bounded retry policy owns the failure.
+                let reason = if e.is_panic() {
+                    "task_worker_panicked"
+                } else {
+                    "task_worker_cancelled"
+                };
+                error!(id = task_id, reason, "[TASK_WORKER] Task execution aborted");
+                if let Err(fail_error) = self.storage.fail_task(task_id, reason).await {
+                    warn!(
+                        id = task_id,
+                        reason = "task_failure_transition_rejected",
+                        "[TASK_WORKER] Could not record aborted task"
+                    );
+                    debug!(id = task_id, error = %fail_error, "[TASK_WORKER] Failure transition detail");
+                }
             }
         }
     }
@@ -150,20 +174,20 @@ impl TaskWorker {
                     task_type = task_type_str,
                     "[TASK_WORKER] Unknown task type"
                 );
-                let _ = storage
-                    .fail_task(task_id, &format!("unknown task_type: {}", task_type_str))
-                    .await;
+                let _ = storage.fail_task(task_id, "unknown_task_type").await;
                 return;
             }
         };
 
         let payload: serde_json::Value = match serde_json::from_str(&task.payload) {
             Ok(v) => v,
-            Err(e) => {
-                warn!(id = task_id, "[TASK_WORKER] Invalid payload: {}", e);
-                let _ = storage
-                    .fail_task(task_id, &format!("invalid payload: {}", e))
-                    .await;
+            Err(_) => {
+                warn!(
+                    id = task_id,
+                    reason = "invalid_task_payload",
+                    "[TASK_WORKER] Invalid payload"
+                );
+                let _ = storage.fail_task(task_id, "invalid_task_payload").await;
                 return;
             }
         };
@@ -173,11 +197,13 @@ impl TaskWorker {
 
         let chat_req = match Self::build_prompt_for_task(&task_type, &payload, privacy).await {
             Ok(req) => req,
-            Err(e) => {
-                warn!(id = task_id, "[TASK_WORKER] Prompt build failed: {}", e);
-                let _ = storage
-                    .fail_task(task_id, &format!("prompt build: {}", e))
-                    .await;
+            Err(_) => {
+                warn!(
+                    id = task_id,
+                    reason = "prompt_build_failed",
+                    "[TASK_WORKER] Prompt build failed"
+                );
+                let _ = storage.fail_task(task_id, "prompt_build_failed").await;
                 return;
             }
         };
@@ -185,8 +211,9 @@ impl TaskWorker {
         let resp = match router.route(&task_type, &chat_req).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(id = task_id, error = %e, "[TASK_WORKER] LLM call failed");
-                let _ = storage.fail_task(task_id, &e.to_string()).await;
+                let reason = e.reason_code();
+                warn!(id = task_id, reason, "[TASK_WORKER] LLM call failed");
+                let _ = storage.fail_task(task_id, reason).await;
                 return;
             }
         };
@@ -439,7 +466,7 @@ impl TaskWorker {
     async fn write_back(
         storage: &Arc<MemoryStorage>,
         task_type: &CognitiveTaskType,
-        target_table: &str,
+        _target_table: &str,
         target_id: &str,
         result: &str,
         payload: &serde_json::Value,
@@ -672,11 +699,13 @@ fn parse_json_result(result: &str) -> serde_json::Value {
     } else {
         trimmed
     };
-    serde_json::from_str(json_str).unwrap_or_else(|e| {
+    serde_json::from_str(json_str).unwrap_or_else(|_| {
+        // [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex] The old preview
+        // both copied model output into operator logs and sliced arbitrary UTF-8
+        // at byte 200, which could panic while handling malformed JSON.
         warn!(
-            "[TASK_WORKER] JSON parse failed: {} | preview: {}",
-            e,
-            &json_str[..json_str.len().min(200)]
+            reason = "llm_result_json_invalid",
+            "[TASK_WORKER] JSON parse failed"
         );
         serde_json::Value::Null
     })
@@ -688,5 +717,78 @@ impl std::fmt::Debug for TaskWorker {
             .field("batch_size", &self.batch_size)
             .field("poll_interval_secs", &self.poll_interval.as_secs())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::llm_provider::{ChatResponse, LlmError, LlmProvider};
+    use super::*;
+    use crate::config_supernode::TaskRoutingConfig;
+
+    struct PanickingProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for PanickingProvider {
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            panic!("intentional task-worker recovery test panic");
+        }
+
+        fn name(&self) -> &str {
+            "panic-provider"
+        }
+
+        fn default_model(&self) -> &str {
+            "panic-model"
+        }
+    }
+
+    #[test]
+    fn malformed_unicode_json_is_rejected_without_byte_boundary_panic() {
+        let malformed = "界".repeat(100);
+        assert!(parse_json_result(&malformed).is_null());
+    }
+
+    #[tokio::test]
+    async fn panicked_task_is_requeued_with_stable_reason() {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let task_id = storage
+            .insert_cognitive_task(
+                "session_title",
+                1,
+                r#"{"entity_names":[]}"#,
+                None,
+                None,
+                None,
+                "structured",
+                2,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let router = Arc::new(LlmRouter::new(
+            vec![(
+                "panic-provider".into(),
+                "http://localhost".into(),
+                "panic-model".into(),
+                Arc::new(PanickingProvider),
+            )],
+            TaskRoutingConfig::default(),
+        ));
+        let worker = TaskWorker::new(
+            Arc::clone(&storage),
+            router,
+            WorkerConfig {
+                max_concurrent: 1,
+                ..WorkerConfig::default()
+            },
+        );
+
+        worker.process_batch().await;
+
+        let task = storage.get_task(task_id).await.unwrap();
+        assert_eq!(task.status, "pending");
+        assert_eq!(task.retry_count, 1);
+        assert_eq!(task.error_message.as_deref(), Some("task_worker_panicked"));
     }
 }

@@ -71,6 +71,8 @@
 //!   task_id in llm_usage_log (e.g. manual inserts) are excluded.
 //!
 //! ## Last Modified
+//! v2.5.5-FailureBoundary - [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex]
+//!   Made worker failure transitions atomic and conditional on `processing`.
 //! v2.5.0+SuperNode Phase A - Created. Core CRUD.
 //! v2.5.0+SuperNode Phase C - Fixed by_provider borrow issue in get_usage_stats.
 //! v2.5.0+SuperNode Phase D - Added retry_task, count_tasks_by_status,
@@ -391,34 +393,44 @@ impl MemoryStorage {
     /// Record a task failure. Resets to 'pending' if retries remain, else 'failed'.
     pub async fn fail_task(&self, task_id: i64, error_message: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
-        let (retry_count, max_retries): (i64, i64) = conn
+        // [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex] Compute the retry
+        // transition inside one guarded UPDATE. This prevents a stale worker or
+        // panic observer from overwriting a terminal/cancelled task and remains
+        // atomic even if another process opens the same SQLite database.
+        let affected = conn
+            .execute(
+                "UPDATE cognitive_tasks SET
+                status = CASE
+                    WHEN retry_count + 1 >= max_retries THEN 'failed'
+                    ELSE 'pending'
+                END,
+                retry_count = retry_count + 1,
+                error_message = ?1,
+                started_at = NULL
+             WHERE id = ?2 AND status = 'processing'",
+                params![error_message, task_id],
+            )
+            .map_err(|e| format!("fail_task update {}: {}", task_id, e))?;
+
+        if affected == 0 {
+            return Err(format!(
+                "fail_task {}: task not found or not in 'processing' state",
+                task_id
+            ));
+        }
+
+        let (new_count, new_status): (i64, String) = conn
             .query_row(
-                "SELECT retry_count, max_retries FROM cognitive_tasks WHERE id = ?1",
+                "SELECT retry_count, status FROM cognitive_tasks WHERE id = ?1",
                 params![task_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(|e| format!("fail_task fetch {}: {}", task_id, e))?;
-
-        let new_count = retry_count + 1;
-        let new_status = if new_count >= max_retries {
-            "failed"
-        } else {
-            "pending"
-        };
-
-        conn.execute(
-            "UPDATE cognitive_tasks SET
-                status = ?1, retry_count = ?2,
-                error_message = ?3, started_at = NULL
-             WHERE id = ?4",
-            params![new_status, new_count, error_message, task_id],
-        )
-        .map_err(|e| format!("fail_task update {}: {}", task_id, e))?;
+            .map_err(|e| format!("fail_task result {}: {}", task_id, e))?;
 
         debug!(
             id = task_id,
             retries = new_count,
-            status = new_status,
+            status = %new_status,
             "[STORAGE_SN] Task failed"
         );
         Ok(())
@@ -1219,6 +1231,44 @@ mod tests {
         s.fail_task(id, "timeout again").await.unwrap();
         let t2 = s.get_task(id).await.unwrap();
         assert_eq!(t2.status, "failed");
+    }
+
+    #[tokio::test]
+    async fn test_fail_task_rejects_non_processing_state() {
+        let s = MemoryStorage::open(":memory:", None).unwrap();
+        let id = s
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{}"#,
+                None,
+                None,
+                None,
+                "structured",
+                2,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(s.fail_task(id, "must_not_apply").await.is_err());
+        let pending = s.get_task(id).await.unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.retry_count, 0);
+        assert!(pending.error_message.is_none());
+
+        s.claim_pending_tasks(1).await;
+        s.complete_task(id, "done", "provider", "model", "{}")
+            .await
+            .unwrap();
+        assert!(s
+            .fail_task(id, "must_not_replace_completion")
+            .await
+            .is_err());
+        let completed = s.get_task(id).await.unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.retry_count, 0);
+        assert!(completed.error_message.is_none());
     }
 
     #[tokio::test]

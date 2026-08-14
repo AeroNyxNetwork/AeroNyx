@@ -41,6 +41,8 @@
 //!   environment-variable names, or secrets into process-health diagnostics.
 //!
 //! ## Last Modified
+//! v2.5.5-FailureBoundary - [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex]
+//!   Added stable, privacy-safe runtime reason codes for persistence and logs.
 //! v2.5.4-StartupIntegrity - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex]
 //!   Added typed, privacy-safe provider initialization errors plus shared API
 //!   endpoint and environment-backed key validation.
@@ -216,6 +218,27 @@ pub enum LlmError {
     ContextTooLong,
     /// Provider is not configured
     NotConfigured(String),
+}
+
+impl LlmError {
+    /// Stable failure category safe for operator logs and task persistence.
+    ///
+    /// [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex] `Display` retains
+    /// bounded provider diagnostics for direct callers, but those diagnostics
+    /// may include a provider-controlled response or transport endpoint. Queue
+    /// state and routine logs must use this method instead.
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Transport(_) => "llm_transport_error",
+            Self::ApiError { .. } => "llm_api_error",
+            Self::ParseError(_) => "llm_response_parse_error",
+            Self::EmptyResponse => "llm_empty_response",
+            Self::RateLimit { .. } => "llm_rate_limited",
+            Self::ContextTooLong => "llm_context_too_long",
+            Self::NotConfigured(_) => "llm_provider_not_configured",
+        }
+    }
 }
 
 impl fmt::Display for LlmError {
@@ -651,5 +674,44 @@ mod tests {
             ),
             Err(LlmProviderInitError::ProviderSecretUnavailable)
         );
+    }
+
+    #[test]
+    fn runtime_reason_codes_do_not_expose_provider_diagnostics() {
+        let cases = [
+            (
+                LlmError::Transport("https://secret.invalid".into()),
+                "llm_transport_error",
+            ),
+            (
+                LlmError::ApiError {
+                    status: 500,
+                    body: "private provider response".into(),
+                },
+                "llm_api_error",
+            ),
+            (
+                LlmError::ParseError("private response fragment".into()),
+                "llm_response_parse_error",
+            ),
+            (LlmError::EmptyResponse, "llm_empty_response"),
+            (
+                LlmError::RateLimit {
+                    retry_after_secs: Some(10),
+                },
+                "llm_rate_limited",
+            ),
+            (LlmError::ContextTooLong, "llm_context_too_long"),
+            (
+                LlmError::NotConfigured("private-provider-name".into()),
+                "llm_provider_not_configured",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.reason_code(), expected);
+            assert!(!error.reason_code().contains("private"));
+            assert!(!error.reason_code().contains("secret"));
+        }
     }
 }
