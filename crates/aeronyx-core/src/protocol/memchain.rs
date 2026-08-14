@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.13-BoundedWireCodec
+// Version: 2.8.14-AuthorityHandoverExchange
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -25,6 +25,8 @@
 //   never relay routes, message identifiers, payloads, or delivery counts.
 //   v2.8.13-BoundedWireCodec — Unified outbound and inbound byte ceilings
 //   without changing message discriminants, fields, or valid wire bytes.
+//   v2.8.14-AuthorityHandoverExchange — Appended fixed-size authenticated
+//   request/response frames carrying at most one dual-signed authority proof.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -49,8 +51,8 @@
 //   - v1.3.0 is a BREAKING CHANGE: DeviceRegister, ChatPull, ChatAck wire
 //     format changed — old clients cannot talk to new servers and vice versa
 //   - WalletPresence (17) is a lightweight heartbeat — node never replies
-//   - Record block/checkpoint/certificate/lease and delivery-anchor witness
-//     frames (19-22, 25-32) are node-peer control messages and MUST NOT be
+//   - Record block/checkpoint/certificate/lease, delivery-anchor witness, and
+//     authority-handover frames (19-22, 25-34) are node-peer control messages and MUST NOT be
 //     accepted from ordinary client tunnels
 //   - Commitment blocks contain opaque record IDs only; sealed memory payload
 //     replication requires a separate owner-authorised protocol
@@ -61,6 +63,8 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.14-AuthorityHandoverExchange — Appended variants 33-34 and canonical
+//                        fixed-size authority-history signing contracts
 //   v2.8.13-BoundedWireCodec — Symmetric frame limits, wire compatibility
 //                        tests, and padded-input rejection
 //   v2.8.12-VerifiedDeliveryAnchorWitness — Appended variants 31-32 and
@@ -85,7 +89,10 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 
 #[allow(deprecated)]
 use crate::ledger::Fact;
-use crate::ledger::{BlockHeader, MemoryRecord, RecordCommitmentBlockV1, RecordCommitmentHeaderV1};
+use crate::ledger::{
+    BlockHeader, MemoryRecord, RecordCommitmentBlockV1, RecordCommitmentHeaderV1,
+    RecordCoordinatorHandoverV1,
+};
 use crate::protocol::chat::ChatEnvelope;
 use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
 
@@ -240,6 +247,10 @@ pub struct RecordCheckpointCertificateMemberV1 {
 /// | 28    | RecordCoordinatorLeaseResponseV1| v2.8.10-CoordinatorLease |
 /// | 29    | RecordCoordinatorLeaseReleaseRequestV1 | v2.8.11-LeaseRelease |
 /// | 30    | RecordCoordinatorLeaseReleaseResponseV1| v2.8.11-LeaseRelease |
+/// | 31    | VerifiedDeliveryAnchorWitnessRequestV1 | v2.8.12-DeliveryWitness |
+/// | 32    | VerifiedDeliveryAnchorWitnessResponseV1| v2.8.12-DeliveryWitness |
+/// | 33    | RecordCoordinatorHandoverRequestV1 | v2.8.14-HandoverExchange |
+/// | 34    | RecordCoordinatorHandoverResponseV1| v2.8.14-HandoverExchange |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -759,6 +770,48 @@ pub enum MemChainMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+
+    // ── v2.8.14: bounded coordinator authority history (indices 33-34) ──
+    /// [index 33] Requests the exact next durable coordinator handover proof.
+    ///
+    /// [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] One-proof paging is
+    /// deliberate: a cold follower must interleave block-prefix verification
+    /// with each exact-next authority transition instead of accepting a future
+    /// unanchored history batch.
+    RecordCoordinatorHandoverRequestV1 {
+        /// Expected production/private chain identifier.
+        chain_id: [u8; 32],
+        /// Highest contiguous authority epoch already durable locally.
+        after_authority_epoch: u64,
+        /// Per-request random identifier used for replay protection.
+        request_id: [u8; 16],
+        /// Requesting node's Ed25519 identity.
+        requester: [u8; 32],
+        /// Unix epoch seconds; peers reject stale requests.
+        request_timestamp: u64,
+        /// Requester signature over every canonical request field.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+
+    /// [index 34] Returns at most the exact next dual-signed handover proof.
+    RecordCoordinatorHandoverResponseV1 {
+        /// Chain identifier copied into the signed response.
+        chain_id: [u8; 32],
+        /// Request identifier copied from the request.
+        request_id: [u8; 16],
+        /// Responding node's Ed25519 identity.
+        responder: [u8; 32],
+        /// Unix epoch seconds when this snapshot was signed.
+        response_timestamp: u64,
+        /// Exact `after_authority_epoch + 1` proof, or `None` at current head.
+        handover: Option<RecordCoordinatorHandoverV1>,
+        /// Latest contiguous authority epoch in the responder's audited store.
+        latest_authority_epoch: u64,
+        /// Responder signature over the request binding and proof digest.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn deserialize_chat_pull_cursor_v2<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -1138,6 +1191,64 @@ pub fn verified_delivery_anchor_witness_response_signing_bytes(
     bytes.extend_from_slice(&witness_generation.to_le_bytes());
     bytes.extend_from_slice(witness_anchor_digest);
     bytes.push(outcome);
+    bytes
+}
+
+/// Canonical bytes signed by `RecordCoordinatorHandoverRequestV1.requester`.
+#[must_use]
+pub fn record_coordinator_handover_request_signing_bytes(
+    chain_id: &[u8; 32],
+    after_authority_epoch: u64,
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(144);
+    bytes.extend_from_slice(b"AeroNyx-RecordCoordinatorHandoverRequest-v1");
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(&after_authority_epoch.to_le_bytes());
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(requester);
+    bytes.extend_from_slice(&request_timestamp.to_le_bytes());
+    bytes
+}
+
+/// Computes the fixed digest used to bind one optional handover proof.
+fn record_coordinator_handover_envelope_digest_v1(
+    handover: Option<&RecordCoordinatorHandoverV1>,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let Some(handover) = handover else {
+        return [0u8; 32];
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"AeroNyx-RecordCoordinatorHandoverEnvelope-v1");
+    hasher.update(handover.header.signing_digest());
+    hasher.update(handover.previous_signature);
+    hasher.update(handover.next_signature);
+    hasher.finalize().into()
+}
+
+/// Canonical bytes signed by `RecordCoordinatorHandoverResponseV1.responder`.
+#[must_use]
+pub fn record_coordinator_handover_response_signing_bytes(
+    chain_id: &[u8; 32],
+    request_id: &[u8; 16],
+    responder: &[u8; 32],
+    response_timestamp: u64,
+    handover: Option<&RecordCoordinatorHandoverV1>,
+    latest_authority_epoch: u64,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(184);
+    bytes.extend_from_slice(b"AeroNyx-RecordCoordinatorHandoverResponse-v1");
+    bytes.extend_from_slice(chain_id);
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(responder);
+    bytes.extend_from_slice(&response_timestamp.to_le_bytes());
+    bytes.push(u8::from(handover.is_some()));
+    bytes.extend_from_slice(&record_coordinator_handover_envelope_digest_v1(handover));
+    bytes.extend_from_slice(&latest_authority_epoch.to_le_bytes());
     bytes
 }
 
@@ -2323,6 +2434,126 @@ mod tests {
             ),
             request_signing_bytes,
             "generation must be covered by the request signature"
+        );
+    }
+
+    #[test]
+    fn test_coordinator_handover_exchange_roundtrip_and_signatures() {
+        // [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Appending these
+        // variants must preserve every earlier bincode discriminant while the
+        // response signature binds the complete dual-signed proof envelope.
+        let requester = IdentityKeyPair::generate();
+        let responder = IdentityKeyPair::generate();
+        let previous = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let proof = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            [0x91; 32],
+            [0x92; 16],
+            1_701_000_000,
+            &previous,
+            &next,
+        );
+        let request_id = [0x93; 16];
+        let request_timestamp = 1_701_000_001;
+        let request_signing_bytes = record_coordinator_handover_request_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            0,
+            &request_id,
+            &requester.public_key_bytes(),
+            request_timestamp,
+        );
+        let request = MemChainMessage::RecordCoordinatorHandoverRequestV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            after_authority_epoch: 0,
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp,
+            signature: requester.sign(&request_signing_bytes),
+        };
+        let encoded = encode_memchain(&request).expect("encode handover request");
+        assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()), 33);
+        let decoded = decode_memchain(&encoded[1..]).expect("decode handover request");
+        let MemChainMessage::RecordCoordinatorHandoverRequestV1 {
+            chain_id,
+            after_authority_epoch,
+            request_id: decoded_request_id,
+            requester: decoded_requester,
+            request_timestamp: decoded_timestamp,
+            signature,
+        } = decoded
+        else {
+            panic!("expected coordinator handover request");
+        };
+        let decoded_request_signing_bytes = record_coordinator_handover_request_signing_bytes(
+            &chain_id,
+            after_authority_epoch,
+            &decoded_request_id,
+            &decoded_requester,
+            decoded_timestamp,
+        );
+        requester
+            .verify(&decoded_request_signing_bytes, &signature)
+            .expect("handover request signature");
+
+        let response_timestamp = request_timestamp + 1;
+        let response_signing_bytes = record_coordinator_handover_response_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            &request_id,
+            &responder.public_key_bytes(),
+            response_timestamp,
+            Some(&proof),
+            1,
+        );
+        let response = MemChainMessage::RecordCoordinatorHandoverResponseV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            request_id,
+            responder: responder.public_key_bytes(),
+            response_timestamp,
+            handover: Some(proof.clone()),
+            latest_authority_epoch: 1,
+            signature: responder.sign(&response_signing_bytes),
+        };
+        let encoded = encode_memchain(&response).expect("encode handover response");
+        assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()), 34);
+        let decoded = decode_memchain(&encoded[1..]).expect("decode handover response");
+        let MemChainMessage::RecordCoordinatorHandoverResponseV1 {
+            chain_id,
+            request_id: decoded_request_id,
+            responder: decoded_responder,
+            response_timestamp: decoded_timestamp,
+            handover,
+            latest_authority_epoch,
+            signature,
+        } = decoded
+        else {
+            panic!("expected coordinator handover response");
+        };
+        assert_eq!(handover, Some(proof.clone()));
+        let decoded_response_signing_bytes = record_coordinator_handover_response_signing_bytes(
+            &chain_id,
+            &decoded_request_id,
+            &decoded_responder,
+            decoded_timestamp,
+            handover.as_ref(),
+            latest_authority_epoch,
+        );
+        responder
+            .verify(&decoded_response_signing_bytes, &signature)
+            .expect("handover response signature");
+
+        assert_ne!(
+            record_coordinator_handover_response_signing_bytes(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                &request_id,
+                &responder.public_key_bytes(),
+                response_timestamp,
+                None,
+                1,
+            ),
+            response_signing_bytes,
+            "proof presence must be covered by the response signature"
         );
     }
 

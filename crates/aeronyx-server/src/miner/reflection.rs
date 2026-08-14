@@ -55,8 +55,8 @@
 //! - Never put full MemoryRecord values, owner identifiers, tags, embeddings,
 //!   or plaintext into `RecordCommitmentBlockV1` or its announcement.
 //! - Block Sync v1 has no fork-choice protocol. Keep commitment production
-//!   disabled on follower nodes; only the explicitly configured coordinator
-//!   may call the packing path.
+//!   disabled on follower nodes. When an immutable authority root is enabled,
+//!   only the coordinator selected for the next audited height may pack.
 //! - A trusted-witness security incident sets a one-way storage latch. Always
 //!   check it before reading candidate records; the storage append path checks
 //!   it again under the SQLite lock and remains authoritative.
@@ -82,8 +82,11 @@
 //! v2.7.22-EventDrivenCheckpoint - Notify the coordinator witness task after
 //!   a successful local tip advance. Notification is bounded and non-blocking;
 //!   periodic reconciliation remains the authoritative recovery path.
+//! v2.8.59-AuthorityScheduledPacking - Stop obsolete coordinators before record
+//!   selection while retaining atomic storage enforcement as final authority.
 //!
 //! ## Last Modified
+//! v2.8.59-AuthorityScheduledPacking - Enforced next-height authority before packing.
 //! v2.7.22-EventDrivenCheckpoint - Added local commitment-tip notification.
 //! v2.7.21-TrustedDivergenceHalt - Honor the storage production safety latch.
 //! v2.7.14-RustdocQuality - Corrected filename example fence semantics.
@@ -693,6 +696,35 @@ impl ReflectionMiner {
         if !self.storage.record_commitment_production_permitted() {
             debug!("[MEMCHAIN_BLOCK] Commitment packing skipped: production authority unavailable");
             return 0;
+        }
+        if self.storage.record_commitment_authority_enforced() {
+            // [AUTHORITY-SCHEDULED-PACKING 2026-08-14 by Codex] Avoid building
+            // doomed blocks after a coordinator handover. The append
+            // transaction repeats authority verification and remains the
+            // canonical decision if state changes after this preflight.
+            match self.storage.record_commitment_authority_state().await {
+                Ok(Some(authority))
+                    if authority.coordinator == self.identity.public_key_bytes() => {}
+                Ok(Some(_)) => {
+                    debug!(
+                        "[MEMCHAIN_BLOCK] Commitment packing skipped: local node is not active authority"
+                    );
+                    return 0;
+                }
+                Ok(None) => {
+                    warn!(
+                        "[MEMCHAIN_BLOCK] Commitment packing skipped: authority root unavailable"
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "[MEMCHAIN_BLOCK] Commitment packing skipped: authority audit failed"
+                    );
+                    return 0;
+                }
+            }
         }
         let max_blocks = max_blocks.clamp(1, 64);
         let mut appended = 0usize;

@@ -393,6 +393,30 @@ pub enum RecordCoordinatorHandoverPersistOutcome {
     AlreadyPresent,
 }
 
+/// Audited proposer authority effective for the next local commitment height.
+///
+/// [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] This process-internal
+/// value may guide authenticated node transport, but must not be exported in
+/// public telemetry because coordinator identities are operational metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordCommitmentAuthorityState {
+    /// Highest contiguous handover epoch already durable locally.
+    pub authority_epoch: u64,
+    /// Coordinator authorised to propose `next_block_height`.
+    pub coordinator: [u8; 32],
+    /// Exact next height after the fully audited local tip.
+    pub next_block_height: u64,
+}
+
+/// One fixed-size authenticated authority-history page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordCoordinatorHandoverPage {
+    /// Exact next proof after the requested epoch, or `None` at history head.
+    pub handover: Option<RecordCoordinatorHandoverV1>,
+    /// Highest contiguous authority epoch in the audited local store.
+    pub latest_authority_epoch: u64,
+}
+
 /// Result of one serialized verified-delivery anchor witness decision.
 ///
 /// Every variant returns the witness's durable high-water state. Callers must
@@ -1142,16 +1166,19 @@ fn verify_record_commitment_proposer_history_transaction(
 /// history already verified from the immutable root. This resolver is used by
 /// live append only; the startup verifier above deliberately retains its
 /// stronger transition-consumption checks as an independent fail-closed audit.
-fn record_commitment_coordinator_at_height(
+fn record_commitment_authority_at_height(
     root_coordinator: &[u8; 32],
     history: &[RecordCoordinatorHandoverV1],
     height: u64,
-) -> [u8; 32] {
+) -> (u64, [u8; 32]) {
     history
         .iter()
         .take_while(|transition| transition.header.activation_height <= height)
-        .fold(*root_coordinator, |_, transition| {
-            transition.header.next_coordinator
+        .fold((0, *root_coordinator), |_, transition| {
+            (
+                transition.header.authority_epoch,
+                transition.header.next_coordinator,
+            )
         })
 }
 
@@ -4148,6 +4175,140 @@ impl MemoryStorage {
         Ok(history)
     }
 
+    /// Returns whether exact-height proposer authority is enforced.
+    #[must_use]
+    pub fn record_commitment_authority_enforced(&self) -> bool {
+        self.commitment_authority_root.read().is_some()
+    }
+
+    /// Reads one audit-baseline-bound authority snapshot.
+    ///
+    /// [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Runtime sync reads
+    /// only the bounded handover schedule after startup established the full
+    /// block audit baseline. This keeps each follower page `O(handovers)` while
+    /// refusing stale or unaudited storage. No identity is logged or retained
+    /// outside the process-local return value.
+    async fn audited_record_commitment_authority_snapshot(
+        &self,
+    ) -> Result<Option<([u8; 32], u64, Vec<RecordCoordinatorHandoverV1>)>, String> {
+        let Some(root_coordinator) = *self.commitment_authority_root.read() else {
+            return Ok(None);
+        };
+        let integrity = (*self.commitment_integrity.read())
+            .ok_or_else(|| "commitment chain is not fully audited".to_string())?;
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("begin commitment authority snapshot: {error}"))?;
+        let (tip_height, tip_hash) =
+            read_record_commitment_tip_transaction(&transaction, "commitment authority")?;
+        if integrity.verified_tip_height != tip_height
+            || integrity.verified_tip_hash != tip_hash
+            || integrity.verified_block_count != tip_height
+        {
+            return Err("commitment chain audit baseline is stale".to_string());
+        }
+        let history =
+            read_record_coordinator_handover_history_transaction(&transaction, &root_coordinator)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("commit commitment authority snapshot: {error}"))?;
+        Ok(Some((root_coordinator, tip_height, history)))
+    }
+
+    /// Returns the audited coordinator authorised for the next local block.
+    pub async fn record_commitment_authority_state(
+        &self,
+    ) -> Result<Option<RecordCommitmentAuthorityState>, String> {
+        let Some((root, tip_height, history)) =
+            self.audited_record_commitment_authority_snapshot().await?
+        else {
+            return Ok(None);
+        };
+        let next_block_height = tip_height
+            .checked_add(1)
+            .ok_or_else(|| "commitment chain height exhausted".to_string())?;
+        let (authority_epoch, coordinator) =
+            record_commitment_authority_at_height(&root, &history, next_block_height);
+        Ok(Some(RecordCommitmentAuthorityState {
+            authority_epoch,
+            coordinator,
+            next_block_height,
+        }))
+    }
+
+    /// Resolves the audited proposer authorised at one exact positive height.
+    pub async fn record_commitment_authority_for_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<[u8; 32]>, String> {
+        if height == 0 {
+            return Err("commitment authority height must be positive".to_string());
+        }
+        let Some((root, _, history)) = self.audited_record_commitment_authority_snapshot().await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            record_commitment_authority_at_height(&root, &history, height).1,
+        ))
+    }
+
+    /// Returns at most the exact next proof after `after_authority_epoch`.
+    ///
+    /// The fixed one-proof page lets cold followers verify the corresponding
+    /// block prefix before accepting each transition. It also keeps the peer
+    /// response size independent of total authority-history length.
+    pub async fn next_record_coordinator_handover_page(
+        &self,
+        after_authority_epoch: u64,
+    ) -> Result<RecordCoordinatorHandoverPage, String> {
+        let Some((_, _, history)) = self.audited_record_commitment_authority_snapshot().await?
+        else {
+            return Err("commitment authority root is not configured".to_string());
+        };
+        let latest_authority_epoch = history
+            .last()
+            .map_or(0, |handover| handover.header.authority_epoch);
+        if after_authority_epoch > latest_authority_epoch {
+            return Err("requested authority epoch is ahead of local history".to_string());
+        }
+        let handover = if after_authority_epoch == latest_authority_epoch {
+            None
+        } else {
+            let next_epoch = after_authority_epoch
+                .checked_add(1)
+                .ok_or_else(|| "authority epoch exhausted".to_string())?;
+            Some(
+                history
+                    .iter()
+                    .find(|handover| handover.header.authority_epoch == next_epoch)
+                    .cloned()
+                    .ok_or_else(|| "coordinator handover history is not contiguous".to_string())?,
+            )
+        };
+        Ok(RecordCoordinatorHandoverPage {
+            handover,
+            latest_authority_epoch,
+        })
+    }
+
+    /// Persists a handover against the immutable configured authority root.
+    ///
+    /// This wrapper prevents node-peer transport from supplying or replacing
+    /// a trust anchor. The root remains process-local and is copied before the
+    /// async persistence boundary so no lock guard crosses an await.
+    pub async fn persist_configured_record_coordinator_handover(
+        &self,
+        proof: &RecordCoordinatorHandoverV1,
+        accepted_at: u64,
+    ) -> Result<RecordCoordinatorHandoverPersistOutcome, String> {
+        let root = (*self.commitment_authority_root.read())
+            .ok_or_else(|| "commitment authority root is not configured".to_string())?;
+        self.persist_record_coordinator_handover(&root, proof, accepted_at)
+            .await
+    }
+
     /// Atomically verifies and appends one coordinator authority transition.
     ///
     /// [COORDINATOR-HANDOVER 2026-08-12 by Codex] The entire prior authority
@@ -6624,11 +6785,8 @@ impl MemoryStorage {
                 // the exact height-scoped key schedule before any row in the
                 // batch is inserted. A wrong old/new key fails the entire
                 // IMMEDIATE transaction without advancing runtime integrity.
-                let expected = record_commitment_coordinator_at_height(
-                    root,
-                    history,
-                    block.header.height,
-                );
+                let (_, expected) =
+                    record_commitment_authority_at_height(root, history, block.header.height);
                 if block.header.proposer != expected {
                     return Err(format!(
                         "commitment block has an unauthorized proposer at height {}",
@@ -8290,6 +8448,108 @@ mod tests {
                 .record_commitment_chain_integrity_status()
                 .verified_tip_height,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authority_snapshot_pages_exact_next_handover() {
+        // [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Runtime consumers
+        // receive only the exact next epoch while height resolution follows
+        // the same immutable schedule enforced by atomic block append.
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let root = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        storage
+            .configure_record_commitment_authority_root(Some(root.public_key_bytes()))
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+
+        assert_eq!(
+            storage.record_commitment_authority_state().await.unwrap(),
+            Some(RecordCommitmentAuthorityState {
+                authority_epoch: 0,
+                coordinator: root.public_key_bytes(),
+                next_block_height: 1,
+            })
+        );
+        assert_eq!(
+            storage
+                .next_record_coordinator_handover_page(0)
+                .await
+                .unwrap(),
+            RecordCoordinatorHandoverPage {
+                handover: None,
+                latest_authority_epoch: 0,
+            }
+        );
+
+        let first_block = signed_commitment_block(1, GENESIS_PREV_HASH, 0x69, &root);
+        storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        let handover = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x6A; 16],
+            9_000,
+            &root,
+            &next,
+        );
+        storage
+            .persist_record_coordinator_handover(&root.public_key_bytes(), &handover, 9_001)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.record_commitment_authority_state().await.unwrap(),
+            Some(RecordCommitmentAuthorityState {
+                authority_epoch: 1,
+                coordinator: next.public_key_bytes(),
+                next_block_height: 2,
+            })
+        );
+        assert_eq!(
+            storage
+                .record_commitment_authority_for_height(1)
+                .await
+                .unwrap(),
+            Some(root.public_key_bytes())
+        );
+        assert_eq!(
+            storage
+                .record_commitment_authority_for_height(2)
+                .await
+                .unwrap(),
+            Some(next.public_key_bytes())
+        );
+        assert_eq!(
+            storage
+                .next_record_coordinator_handover_page(0)
+                .await
+                .unwrap(),
+            RecordCoordinatorHandoverPage {
+                handover: Some(handover),
+                latest_authority_epoch: 1,
+            }
+        );
+        assert_eq!(
+            storage
+                .next_record_coordinator_handover_page(1)
+                .await
+                .unwrap(),
+            RecordCoordinatorHandoverPage {
+                handover: None,
+                latest_authority_epoch: 1,
+            }
+        );
+        assert_eq!(
+            storage
+                .next_record_coordinator_handover_page(2)
+                .await
+                .unwrap_err(),
+            "requested authority epoch is ahead of local history"
         );
     }
 

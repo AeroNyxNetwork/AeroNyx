@@ -779,17 +779,18 @@ use crate::api::discovery::{
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
     publish_current_descriptor_to_commitment_witnesses, pull_record_commitment_checkpoint,
-    pull_record_commitment_page_with_carrier_runtime,
+    pull_record_commitment_page_with_carrier_runtime_bounded,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses,
     recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime,
     release_record_commitment_coordinator_lease, request_record_commitment_coordinator_lease,
     sync_follower_record_commitment_checkpoint_certificate_with_carrier_runtime,
-    witness_verified_delivery_anchor, CommitmentBlockCarrierCircuitBreaker,
+    sync_next_record_coordinator_handover, witness_verified_delivery_anchor,
+    CommitmentBlockCarrierCircuitBreaker,
     CommitmentBlockCarrierCursor, CommitmentCertificateCarrierCircuitBreaker,
     CommitmentCertificateCarrierRecoveryDisposition, CommitmentCheckpointRelation,
     CommitmentFollowerCertificateSyncOutcome, CommitmentReconciliationOutcome,
-    CommitmentSyncPageSource, VerifiedDeliveryAnchorWitnessRound,
+    CommitmentSyncPageSource, VerifiedDeliveryAnchorWitnessRound, MAX_BLOCKS_PER_RESPONSE_WIRE,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState, SessionEmbeddingCache};
 use crate::api::voice::build_voice_router;
@@ -7800,9 +7801,11 @@ impl Server {
 
     /// Starts the default-off Block Sync v1 follower.
     ///
-    /// The configured coordinator identity is the sole trust root. Discovery
-    /// resolves only that identity's signed endpoint, while the pull helper
-    /// verifies the response signer, every block proposer, and full chain
+    /// The configured coordinator identity is the initial trust root. When an
+    /// immutable authority root is enabled, exact-next dual-signed handovers
+    /// select subsequent coordinators at audited block boundaries. Discovery
+    /// resolves only the active identity's signed endpoint, while pull helpers
+    /// verify the response signer, every block proposer, and full chain
     /// continuity before SQLite is changed. [CERTIFIED-BLOCK-CARRIER
     /// 2026-07-29 by Codex] Availability-only failure may use a bounded
     /// operator-pinned witness as a read-only carrier, but terminal recovery
@@ -7851,6 +7854,7 @@ impl Server {
         let max_pages_per_round = self.config.memchain.commitment_sync_max_pages_per_round;
         let certificate_witness_node_ids = self.config.memchain.commitment_witness_node_id_bytes();
         let certificate_minimum_signers = self.config.memchain.commitment_witness_min_verified;
+        let authority_handover_enabled = storage.record_commitment_authority_enforced();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         Some(tokio::spawn(async move {
@@ -7878,7 +7882,8 @@ impl Server {
                 interval_secs = base_interval_secs,
                 max_pages_per_round,
                 event_driven = true,
-                "[MEMCHAIN_BLOCK] Pinned coordinator follower started"
+                authority_handover_enabled,
+                "[MEMCHAIN_BLOCK] Authority-scheduled coordinator follower started"
             );
 
             'sync_loop: loop {
@@ -7931,16 +7936,46 @@ impl Server {
                     // persistence, routing policy, or trust decisions.
                     let mut block_carrier_cursor = CommitmentBlockCarrierCursor::default();
                     for _ in 0..max_pages_per_round {
-                        let page_pull = pull_record_commitment_page_with_carrier_runtime(
+                        // [AUTHORITY-HANDOVER-FOLLOWER 2026-08-14 by Codex]
+                        // Pull exactly one proof before each block page. A
+                        // future proof only caps this page at activation - 1;
+                        // after that prefix is audited, the next iteration
+                        // persists the proof and resolves the new coordinator.
+                        let (active_coordinator, max_blocks) = if authority_handover_enabled {
+                            let authority = sync_next_record_coordinator_handover(
+                                &storage,
+                                &peer_store,
+                                &identity,
+                                sync_http_client.as_ref(),
+                            )
+                            .await?;
+                            let max_blocks = authority
+                                .pending_activation_height
+                                .map(|activation_height| {
+                                    activation_height
+                                        .saturating_sub(authority.next_block_height)
+                                        .min(u64::from(MAX_BLOCKS_PER_RESPONSE_WIRE))
+                                        as u16
+                                })
+                                .unwrap_or(MAX_BLOCKS_PER_RESPONSE_WIRE);
+                            if max_blocks == 0 {
+                                return Err("handover_activation_boundary_invalid".to_string());
+                            }
+                            (authority.active_coordinator, max_blocks)
+                        } else {
+                            (coordinator_node_id, MAX_BLOCKS_PER_RESPONSE_WIRE)
+                        };
+                        let page_pull = pull_record_commitment_page_with_carrier_runtime_bounded(
                             &storage,
                             &peer_store,
                             &identity,
-                            &coordinator_node_id,
+                            &active_coordinator,
                             &certificate_witness_node_ids,
                             certificate_minimum_signers,
                             sync_http_client.as_ref(),
                             &mut block_carrier_cursor,
                             &mut block_carrier_circuit,
+                            max_blocks,
                         )
                         .await?;
                         let page_source = page_pull.source;
@@ -7970,7 +8005,7 @@ impl Server {
                                     &storage,
                                     &peer_store,
                                     &identity,
-                                    &coordinator_node_id,
+                                    &active_coordinator,
                                     &certificate_witness_node_ids,
                                     certificate_minimum_signers,
                                     outcome.remote_tip_height,
@@ -8028,7 +8063,7 @@ impl Server {
                                 &storage,
                                 &peer_store,
                                 &identity,
-                                &coordinator_node_id,
+                                &active_coordinator,
                                 sync_http_client.as_ref(),
                             )
                             .await
@@ -8064,7 +8099,7 @@ impl Server {
                                         &storage,
                                         &peer_store,
                                         &identity,
-                                        &coordinator_node_id,
+                                        &active_coordinator,
                                         &certificate_witness_node_ids,
                                         certificate_minimum_signers,
                                         checkpoint.remote_tip_height,

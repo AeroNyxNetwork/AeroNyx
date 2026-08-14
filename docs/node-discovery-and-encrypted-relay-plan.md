@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.87.0 - Connected the persisted MemChain coordinator
-handover schedule to startup and live block-authority enforcement.
+Modification Reason: v0.88.0 - Added authenticated exact-next coordinator
+handover exchange and height-bounded follower catch-up.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.87.0 - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Pins a process-local commitment authority root, audits every historical proposer at startup, and enforces the active coordinator at each appended height.
+Last Modified: v0.88.0 - [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Synchronizes one exact-next dual-signed coordinator proof at a time, stops block pages at activation boundaries, and applies the audited authority schedule to follower control traffic.
+Previous: v0.87.0 - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Pins a process-local commitment authority root, audits every historical proposer at startup, and enforces the active coordinator at each appended height.
 Previous: v0.86.0 - [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Preserves canonical user-storage paths, rejects orphaning reloads, serializes placement with reload, and removes owner identifiers from volume logs.
 Previous: v0.85.0 - [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] Keeps node discovery gossip available after a recovered rate-limiter lock-owner panic.
 Previous: v0.84.0 - [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] Gives all authenticated Directory peer blocking workers one privacy-safe failure and observability contract.
@@ -121,6 +122,70 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
 
+### v0.88 MemChain followers synchronize coordinator handovers
+
+[AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex]
+
+- The peer protocol appends request and response variants for one exact-next
+  coordinator handover proof. Existing bincode discriminants are unchanged,
+  so older frames remain wire compatible.
+- Requests bind chain id, current local authority epoch, random request id,
+  requester identity, and timestamp. Responses bind the same request, the
+  responder, response time, proof digest, and advertised history head.
+- The response contains at most one dual-signed proof. A responder that claims
+  a newer history head but omits the exact-next proof is rejected. A proof for
+  another predecessor, chain, epoch, or already-passed activation height is
+  also rejected before persistence.
+- A cold follower asks its currently audited coordinator for the next proof
+  before every block page. When the proof activates in the future, the page is
+  capped at `activation_height - 1`; after that exact block prefix is audited,
+  the follower persists the proof and switches to the next coordinator.
+- Block announcements and witness lease grant/release now resolve authority
+  from the same exact-height audited schedule. The old static coordinator pin
+  remains the complete behavior when no authority root is configured.
+- An obsolete producer checks next-height authority before reading uncommitted
+  records and stops quietly after rotation. Atomic block append repeats the
+  authority check and remains the final decision against races.
+- The endpoint is admitted-peer-only, timestamp checked, signed, replay
+  protected, rate limited, POST-only, allocation bounded, and SSRF guarded on
+  outbound use. It carries no user identity, message, payload, route, memory
+  ciphertext, blind index, or social graph data.
+- Handover, block-announcement, and coordinator-lease control handlers verify
+  cryptographic identity before consulting authority or peer-admission state.
+  Forged traffic therefore cannot use error classes as a peer-membership or
+  active-authority oracle, and cannot trigger storage-backed authority audits.
+- Current limitation: handover proofs are fetched directly from the active
+  coordinator. Pinned-carrier recovery for this control frame is not yet
+  implemented; an unavailable active coordinator therefore pauses follower
+  progress without weakening authority.
+- This remains an append-only privacy-protocol commitment log. It does not add
+  consensus, finality, fork choice, transactions, balances, smart contracts,
+  or permissionless coordinator election.
+
+Implementation paths:
+
+- `crates/aeronyx-core/src/protocol/memchain.rs`: append-only wire variants and
+  canonical request/response signing bytes.
+- `crates/aeronyx-server/src/services/memchain/storage_ops.rs`: audit-bound
+  authority snapshots, exact-next proof paging, and configured-root persistence.
+- `crates/aeronyx-server/src/api/memchain_peer.rs`: authenticated endpoint,
+  client verification, dynamic announcement/lease authority, and bounded pages.
+- `crates/aeronyx-server/src/server.rs`: interleaves proof synchronization and
+  block-prefix catch-up without crossing an activation boundary.
+- `crates/aeronyx-server/src/miner/reflection.rs`: preflights next-height
+  production authority before selecting sealed record commitments.
+
+Verification:
+
+- Canonical wire round-trip and signature-tamper coverage passes.
+- Storage tests prove exact-next paging and height-based authority resolution.
+- Adversarial tests reject omitted proofs and wrong predecessor identities.
+- Admission-order regression coverage proves forged known and unknown
+  requester identities receive the same unauthenticated result.
+- A real localhost two-node test catches up block one, persists the exact
+  transition, and switches authority for block two.
+- Legacy static-pin announcement and witness-lease tests remain green.
+
 ### v0.87 MemChain commitment authority is enforced at runtime
 
 [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex]
@@ -153,8 +218,9 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 - This is a signed privacy-protocol commitment log, not a general-purpose
   blockchain, payment ledger, smart-contract platform, permissionless
   consensus protocol, or finality claim. Coordinator-handover submission and
-  network gossip are still separate future runtime work; this milestone only
-  makes persisted authority transitions enforceable and auditable.
+  network gossip. The later v0.88 milestone adds direct authenticated handover
+  exchange; carrier recovery and permissionless coordinator election remain
+  intentionally outside this milestone.
 
 Implementation paths:
 

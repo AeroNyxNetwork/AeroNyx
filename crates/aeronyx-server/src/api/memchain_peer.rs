@@ -16,6 +16,7 @@
 //! - `POST /api/memchain/peer/checkpoint-certificate`
 //! - `POST /api/memchain/peer/coordinator-lease`
 //! - `POST /api/memchain/peer/coordinator-lease/release`
+//! - `POST /api/memchain/peer/coordinator-handover`
 //! - `POST /api/discovery/peer/verified-delivery-anchor-witness`
 //! - Bincode `MemChainMessage` request/response with the existing magic byte.
 //! - Signed discovery-peer admission, timestamp freshness, stateful-request
@@ -82,6 +83,8 @@
 //!   for cross-host duplicate-writer fencing.
 //! - Default-off external witness transport for signed aggregate-only verified-
 //!   delivery cache anchors, with contiguous generation enforcement.
+//! - [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Fixed one-proof
+//!   authority-history exchange interleaved with exact-prefix block catch-up.
 //!
 //! ## Calling Relationships
 //! - Mounted by `server.rs` on the public node peer listener and local operator
@@ -158,8 +161,13 @@
 //!   by overwriting the witness high-water mark.
 //! - The localhost endpoint override below is compiled only for crate tests.
 //!   Never expose it in production or bypass final-hop SSRF validation.
+//! - A handover response is transport only. Accept authority exclusively by
+//!   persisting the exact-next dual-signed proof against the configured root
+//!   and audited predecessor; never trust responder identity as authority.
 //!
 //! ## Last Modified
+//! v2.8.59-AuthorityHandoverExchange - Added bounded authenticated next-proof
+//! transport and height-aware follower authority synchronization.
 //! v2.8.58-MonotonicPeerRateLimit - Detached node-to-node abuse windows from
 //!   wall-clock minutes and added deterministic rollback/boundary coverage.
 //! v2.8.57-CertificatePersistenceTruth - Report verified-but-unpersisted follower evidence honestly.
@@ -221,7 +229,8 @@ use tracing::{debug, warn};
 
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::ledger::{
-    RecordCommitmentBlockV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, GENESIS_PREV_HASH,
+    RecordCommitmentBlockV1, RecordCoordinatorHandoverV1,
+    AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, GENESIS_PREV_HASH,
     MAX_RECORD_COMMITMENTS_PER_BLOCK, RECORD_COMMITMENT_BLOCK_VERSION_V1,
 };
 use aeronyx_core::protocol::memchain::{
@@ -230,6 +239,8 @@ use aeronyx_core::protocol::memchain::{
     record_chain_checkpoint_response_signing_bytes, record_checkpoint_certificate_digest_v1,
     record_checkpoint_certificate_request_signing_bytes,
     record_checkpoint_certificate_response_signing_bytes,
+    record_coordinator_handover_request_signing_bytes,
+    record_coordinator_handover_response_signing_bytes,
     record_coordinator_lease_release_request_signing_bytes,
     record_coordinator_lease_release_response_signing_bytes,
     record_coordinator_lease_request_signing_bytes,
@@ -251,8 +262,9 @@ use super::{
 };
 use crate::api::discovery::GossipResponse;
 use crate::services::memchain::storage_ops::{
-    RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorLeaseGrantOutcome,
-    RecordCoordinatorLeaseReleaseOutcome, VerifiedDeliveryAnchorWitnessOutcome,
+    RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorHandoverPersistOutcome,
+    RecordCoordinatorLeaseGrantOutcome, RecordCoordinatorLeaseReleaseOutcome,
+    VerifiedDeliveryAnchorWitnessOutcome,
 };
 use crate::services::memchain::{
     MemoryStorage, RecordCommitmentAnnouncementDisposition,
@@ -264,7 +276,7 @@ use crate::services::PeerStore;
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 512 * 1024;
 const MAX_BLOCKS_PER_RESPONSE: usize = 16;
-const MAX_BLOCKS_PER_RESPONSE_WIRE: u16 = 16;
+pub(crate) const MAX_BLOCKS_PER_RESPONSE_WIRE: u16 = 16;
 const MAX_REQUESTS_PER_PEER_PER_MINUTE: u32 = 30;
 const PEER_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const PEER_RATE_LIMIT_RETENTION: Duration = Duration::from_secs(120);
@@ -309,6 +321,31 @@ pub struct CommitmentSyncPageOutcome {
     pub has_more: bool,
     /// Privacy-safe height of the coordinator's signed chain tip.
     pub remote_tip_height: u64,
+}
+
+/// Result of one authenticated exact-next authority synchronization step.
+///
+/// Coordinator identities stay process-local and must never enter public
+/// status, logs, heartbeat fields, or peer reputation. The follower uses this
+/// value only to select the next authenticated control-plane request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitmentAuthoritySyncOutcome {
+    /// Highest authority epoch now durable locally.
+    pub authority_epoch: u64,
+    /// Coordinator authorised for `next_block_height`.
+    pub active_coordinator: [u8; 32],
+    /// Exact height the next block page must start from.
+    pub next_block_height: u64,
+    /// Future transition boundary not yet anchored by the local block prefix.
+    pub pending_activation_height: Option<u64>,
+    /// Whether this step durably inserted the exact-next proof.
+    pub handover_inserted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedCoordinatorHandoverResponse {
+    handover: Option<RecordCoordinatorHandoverV1>,
+    latest_authority_epoch: u64,
 }
 
 /// Privacy-safe transport class for one verified commitment page.
@@ -1035,6 +1072,10 @@ pub fn build_memchain_peer_router_with_runtime(
             post(coordinator_lease_release_handler),
         )
         .route(
+            "/api/memchain/peer/coordinator-handover",
+            post(coordinator_handover_handler),
+        )
+        .route(
             "/api/discovery/peer/verified-delivery-anchor-witness",
             post(verified_delivery_anchor_witness_handler),
         )
@@ -1303,12 +1344,6 @@ async fn block_announce_handler(State(state): State<MemChainPeerState>, body: By
         return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
     };
 
-    let Some(authorized_coordinator) = state.lease_authorized_coordinator else {
-        return protocol_error(StatusCode::FORBIDDEN, "follower_sync_disabled");
-    };
-    if header.proposer != authorized_coordinator {
-        return protocol_error(StatusCode::FORBIDDEN, "coordinator_not_pinned");
-    }
     let now = now_secs();
     if header.protocol_version != RECORD_COMMITMENT_BLOCK_VERSION_V1
         || header.chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID
@@ -1321,15 +1356,39 @@ async fn block_announce_handler(State(state): State<MemChainPeerState>, body: By
     {
         return protocol_error(StatusCode::BAD_REQUEST, "invalid_block_announcement");
     }
-    if state.peer_store.get_valid(&header.proposer, now).is_none() {
-        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
-    }
+    // [COORDINATOR-CONTROL-ADMISSION 2026-08-14 by Codex] Authenticate before
+    // consulting authority or PeerStore state. This avoids membership and
+    // authority probes while keeping unauthenticated traffic away from the
+    // storage-backed authority audit.
     let header_hash = header.hash();
     let signature_valid = IdentityPublicKey::from_bytes(&header.proposer)
         .and_then(|key| key.verify(&header_hash, &proposer_signature))
         .is_ok();
     if !signature_valid {
         return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    let authorized_coordinator = match runtime_authorized_coordinator_for_height(
+        &state.storage,
+        state.lease_authorized_coordinator,
+        header.height,
+    )
+    .await
+    {
+        Ok(Some(coordinator)) => coordinator,
+        Ok(None) => return protocol_error(StatusCode::FORBIDDEN, "follower_sync_disabled"),
+        Err(error) => {
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Refused unaudited announcement authority");
+            return protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "coordinator_authority_unavailable",
+            );
+        }
+    };
+    if header.proposer != authorized_coordinator {
+        return protocol_error(StatusCode::FORBIDDEN, "coordinator_not_authorized");
+    }
+    if state.peer_store.get_valid(&header.proposer, now).is_none() {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
     }
     if !state
         .guard
@@ -1394,6 +1453,35 @@ async fn block_announce_handler(State(state): State<MemChainPeerState>, body: By
             );
             protocol_error(StatusCode::SERVICE_UNAVAILABLE, "sync_notifier_unavailable")
         }
+    }
+}
+
+async fn runtime_authorized_coordinator_for_height(
+    storage: &MemoryStorage,
+    legacy_coordinator: Option<[u8; 32]>,
+    height: u64,
+) -> Result<Option<[u8; 32]>, String> {
+    // [AUTHORITY-SCHEDULE-RUNTIME 2026-08-14 by Codex] Preserve the legacy
+    // static pin when no authority root is configured. Once enabled, only the
+    // fully audited append-only schedule may authorise a proposer.
+    if storage.record_commitment_authority_enforced() {
+        storage.record_commitment_authority_for_height(height).await
+    } else {
+        Ok(legacy_coordinator)
+    }
+}
+
+async fn runtime_authorized_coordinator_for_next_height(
+    storage: &MemoryStorage,
+    legacy_coordinator: Option<[u8; 32]>,
+) -> Result<Option<[u8; 32]>, String> {
+    if storage.record_commitment_authority_enforced() {
+        Ok(storage
+            .record_commitment_authority_state()
+            .await?
+            .map(|authority| authority.coordinator))
+    } else {
+        Ok(legacy_coordinator)
     }
 }
 
@@ -3246,6 +3334,224 @@ pub async fn pull_record_commitment_page(
     .await
 }
 
+/// Pulls at most one exact-next coordinator handover proof from the currently
+/// authorised coordinator and persists it only at its activation boundary.
+///
+/// [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] The responder is merely a
+/// transport source. Authority comes exclusively from the dual-signed proof,
+/// the immutable local authority root, and the audited local block prefix.
+/// A future proof is returned only as a page boundary so the caller can catch
+/// up without accepting coordinator authority early.
+pub async fn sync_next_record_coordinator_handover(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+) -> Result<CommitmentAuthoritySyncOutcome, String> {
+    sync_next_record_coordinator_handover_with_endpoint_policy(
+        storage,
+        peer_store,
+        identity,
+        client,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+async fn sync_next_record_coordinator_handover_with_endpoint_policy<F>(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    endpoint_allowed: &F,
+) -> Result<CommitmentAuthoritySyncOutcome, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    let authority = storage
+        .record_commitment_authority_state()
+        .await?
+        .ok_or_else(|| "commitment_authority_not_configured".to_string())?;
+    if authority.coordinator == identity.public_key_bytes() {
+        return Err("active_coordinator_cannot_follow_itself".to_string());
+    }
+
+    let request_timestamp = now_secs();
+    let coordinator = peer_store
+        .get_valid(&authority.coordinator, request_timestamp)
+        .ok_or_else(|| "active_coordinator_unavailable".to_string())?;
+    let endpoint = coordinator
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "active_coordinator_missing_endpoint".to_string())?;
+    if !endpoint_allowed(endpoint) {
+        return Err("active_coordinator_unsafe_endpoint".to_string());
+    }
+    let url = commitment_coordinator_handover_url(endpoint)?;
+
+    let mut request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    let requester = identity.public_key_bytes();
+    let signing_bytes = record_coordinator_handover_request_signing_bytes(
+        &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+        authority.authority_epoch,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    let request = MemChainMessage::RecordCoordinatorHandoverRequestV1 {
+        chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+        after_authority_epoch: authority.authority_epoch,
+        request_id,
+        requester,
+        request_timestamp,
+        signature: identity.sign(&signing_bytes),
+    };
+    let frame =
+        encode_memchain(&request).map_err(|_| "handover_request_encode_failed".to_string())?;
+    let response = client
+        .post(url)
+        .header("content-type", "application/octet-stream")
+        .body(frame)
+        .send()
+        .await
+        .map_err(|error| classify_http_error("handover_request", &error))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "handover_http_status_{}",
+            response.status().as_u16()
+        ));
+    }
+    let body = read_bounded_response(response).await?;
+    let verified = verify_record_coordinator_handover_response(
+        &body,
+        &request_id,
+        &authority.coordinator,
+        authority.authority_epoch,
+        authority.next_block_height,
+        now_secs(),
+    )?;
+
+    let mut handover_inserted = false;
+    let mut pending_activation_height = None;
+    if let Some(handover) = verified.handover {
+        if handover.header.activation_height == authority.next_block_height {
+            handover_inserted = matches!(
+                storage
+                    .persist_configured_record_coordinator_handover(&handover, now_secs())
+                    .await?,
+                RecordCoordinatorHandoverPersistOutcome::Inserted
+            );
+        } else {
+            pending_activation_height = Some(handover.header.activation_height);
+        }
+    }
+
+    let refreshed = storage
+        .record_commitment_authority_state()
+        .await?
+        .ok_or_else(|| "commitment_authority_not_configured".to_string())?;
+    Ok(CommitmentAuthoritySyncOutcome {
+        authority_epoch: refreshed.authority_epoch,
+        active_coordinator: refreshed.coordinator,
+        next_block_height: refreshed.next_block_height,
+        pending_activation_height,
+        handover_inserted,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_record_coordinator_handover_response(
+    body: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_responder: &[u8; 32],
+    expected_authority_epoch: u64,
+    expected_next_block_height: u64,
+    now: u64,
+) -> Result<VerifiedCoordinatorHandoverResponse, String> {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return Err("invalid_handover_response_frame".to_string());
+    }
+    let response =
+        decode_memchain(&body[1..]).map_err(|_| "invalid_handover_response_frame".to_string())?;
+    let canonical =
+        encode_memchain(&response).map_err(|_| "invalid_handover_response_frame".to_string())?;
+    if canonical != body {
+        return Err("noncanonical_handover_response".to_string());
+    }
+    let MemChainMessage::RecordCoordinatorHandoverResponseV1 {
+        chain_id,
+        request_id,
+        responder,
+        response_timestamp,
+        handover,
+        latest_authority_epoch,
+        signature,
+    } = response
+    else {
+        return Err("unexpected_handover_response".to_string());
+    };
+    if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID {
+        return Err("handover_response_chain_mismatch".to_string());
+    }
+    if request_id != *expected_request_id {
+        return Err("handover_response_request_mismatch".to_string());
+    }
+    if responder != *expected_responder {
+        return Err("handover_response_responder_mismatch".to_string());
+    }
+    if now.abs_diff(response_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return Err("stale_handover_response".to_string());
+    }
+    if latest_authority_epoch < expected_authority_epoch {
+        return Err("handover_history_rollback".to_string());
+    }
+    let signing_bytes = record_coordinator_handover_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &responder,
+        response_timestamp,
+        handover.as_ref(),
+        latest_authority_epoch,
+    );
+    IdentityPublicKey::from_bytes(&responder)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .map_err(|_| "invalid_handover_response_signature".to_string())?;
+
+    match handover.as_ref() {
+        Some(proof) => {
+            proof
+                .verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID)
+                .map_err(|_| "invalid_handover_proof".to_string())?;
+            let expected_epoch = expected_authority_epoch
+                .checked_add(1)
+                .ok_or_else(|| "authority_epoch_exhausted".to_string())?;
+            if proof.header.authority_epoch != expected_epoch {
+                return Err("handover_epoch_discontinuity".to_string());
+            }
+            if proof.header.previous_coordinator != *expected_responder {
+                return Err("handover_previous_coordinator_mismatch".to_string());
+            }
+            if proof.header.activation_height < expected_next_block_height {
+                return Err("handover_activation_rollback".to_string());
+            }
+            if latest_authority_epoch < proof.header.authority_epoch {
+                return Err("handover_history_head_mismatch".to_string());
+            }
+        }
+        None if latest_authority_epoch != expected_authority_epoch => {
+            return Err("handover_proof_omitted".to_string());
+        }
+        None => {}
+    }
+
+    Ok(VerifiedCoordinatorHandoverResponse {
+        handover,
+        latest_authority_epoch,
+    })
+}
+
 /// Pulls one coordinator-authored page with bounded pinned-carrier recovery.
 ///
 /// The coordinator is always attempted first. Carrier recovery is enabled only
@@ -3313,14 +3619,12 @@ pub(crate) async fn pull_record_commitment_page_with_carrier_cursor(
     .await
 }
 
-/// Pulls one page with both round-local ordering and process-local availability
-/// cooldown state.
+/// Pulls one verified page with an exact caller-selected hard limit.
 ///
-/// The circuit breaker can skip only operator-pinned slots that previously
-/// failed with a classified availability error. Coordinator transport remains
-/// first on every call, and any observed security error remains terminal.
+/// The follower uses this only to stop immediately before a signed authority
+/// transition. Existing callers retain the full protocol page size.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn pull_record_commitment_page_with_carrier_runtime(
+pub(crate) async fn pull_record_commitment_page_with_carrier_runtime_bounded(
     storage: &MemoryStorage,
     peer_store: &PeerStore,
     identity: &IdentityKeyPair,
@@ -3330,7 +3634,11 @@ pub(crate) async fn pull_record_commitment_page_with_carrier_runtime(
     client: &reqwest::Client,
     cursor: &mut CommitmentBlockCarrierCursor,
     circuit_breaker: &mut CommitmentBlockCarrierCircuitBreaker,
+    max_blocks: u16,
 ) -> Result<CommitmentFollowerPagePullOutcome, String> {
+    if !(1..=MAX_BLOCKS_PER_RESPONSE_WIRE).contains(&max_blocks) {
+        return Err("invalid_block_page_limit".to_string());
+    }
     pull_record_commitment_page_with_carrier_runtime_and_endpoint_policy(
         storage,
         peer_store,
@@ -3342,6 +3650,7 @@ pub(crate) async fn pull_record_commitment_page_with_carrier_runtime(
         &commitment_peer_endpoint_is_public,
         cursor,
         circuit_breaker,
+        max_blocks,
     )
     .await
 }
@@ -3365,6 +3674,7 @@ where
         coordinator_node_id,
         client,
         endpoint_allowed,
+        MAX_BLOCKS_PER_RESPONSE_WIRE,
     )
     .await
 }
@@ -3451,6 +3761,7 @@ where
         endpoint_allowed,
         cursor,
         &mut circuit_breaker,
+        MAX_BLOCKS_PER_RESPONSE_WIRE,
     )
     .await
 }
@@ -3467,10 +3778,14 @@ async fn pull_record_commitment_page_with_carrier_runtime_and_endpoint_policy<F>
     endpoint_allowed: &F,
     cursor: &mut CommitmentBlockCarrierCursor,
     circuit_breaker: &mut CommitmentBlockCarrierCircuitBreaker,
+    max_blocks: u16,
 ) -> Result<CommitmentFollowerPagePullOutcome, String>
 where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
 {
+    if !(1..=MAX_BLOCKS_PER_RESPONSE_WIRE).contains(&max_blocks) {
+        return Err("invalid_block_page_limit".to_string());
+    }
     // [BLOCK-CARRIER-CIRCUIT-TELEMETRY 2026-07-29 by Codex] Align before the
     // coordinator request so an operator pin-count change clears positional
     // state even when the direct path succeeds and no carrier is contacted.
@@ -3495,6 +3810,7 @@ where
         coordinator_node_id,
         client,
         endpoint_allowed,
+        max_blocks,
     )
     .await;
     let direct_error = match direct {
@@ -3608,6 +3924,7 @@ where
             coordinator_node_id,
             client,
             endpoint_allowed,
+            max_blocks,
         )
         .await
         {
@@ -3717,6 +4034,7 @@ async fn pull_record_commitment_page_from_source_with_endpoint_policy<F>(
     expected_proposer_node_id: &[u8; 32],
     client: &reqwest::Client,
     endpoint_allowed: &F,
+    max_blocks: u16,
 ) -> Result<CommitmentSyncPageOutcome, String>
 where
     F: Fn(&str) -> bool + Send + Sync + ?Sized,
@@ -3740,7 +4058,10 @@ where
     let mut request_id = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut request_id);
     let requester = identity.public_key_bytes();
-    let limit = MAX_BLOCKS_PER_RESPONSE_WIRE;
+    if !(1..=MAX_BLOCKS_PER_RESPONSE_WIRE).contains(&max_blocks) {
+        return Err("invalid_block_page_limit".to_string());
+    }
+    let limit = max_blocks;
     let signing_bytes = record_block_range_request_signing_bytes(
         &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
         from_height,
@@ -3778,6 +4099,9 @@ where
         local_tip,
         now_secs(),
     )?;
+    if page.blocks.len() > usize::from(max_blocks) {
+        return Err("response_page_exceeds_request".to_string());
+    }
 
     let append = storage
         .append_record_commitment_blocks_atomic(&page.blocks, Some(expected_proposer_node_id))
@@ -3806,6 +4130,10 @@ fn commitment_checkpoint_url(endpoint: &str) -> Result<Url, String> {
 
 fn commitment_checkpoint_certificate_url(endpoint: &str) -> Result<Url, String> {
     commitment_peer_url(endpoint, "/api/memchain/peer/checkpoint-certificate")
+}
+
+fn commitment_coordinator_handover_url(endpoint: &str) -> Result<Url, String> {
+    commitment_peer_url(endpoint, "/api/memchain/peer/coordinator-handover")
 }
 
 fn commitment_coordinator_lease_url(endpoint: &str) -> Result<Url, String> {
@@ -4627,6 +4955,110 @@ async fn checkpoint_certificate_handler(
         .into_response()
 }
 
+async fn coordinator_handover_handler(
+    State(state): State<MemChainPeerState>,
+    body: Bytes,
+) -> Response {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
+    }
+    let message = match decode_memchain(&body[1..]) {
+        Ok(message) => message,
+        Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
+    };
+    let MemChainMessage::RecordCoordinatorHandoverRequestV1 {
+        chain_id,
+        after_authority_epoch,
+        request_id,
+        requester,
+        request_timestamp,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+
+    let now = now_secs();
+    if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID || after_authority_epoch == u64::MAX {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_handover_request");
+    }
+    if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
+    }
+    let signing_bytes = record_coordinator_handover_request_signing_bytes(
+        &chain_id,
+        after_authority_epoch,
+        &request_id,
+        &requester,
+        request_timestamp,
+    );
+    if IdentityPublicKey::from_bytes(&requester)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .is_err()
+    {
+        return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    // [AUTHORITY-HANDOVER-ADMISSION 2026-08-14 by Codex] Authenticate before
+    // consulting PeerStore. Otherwise a forged request can distinguish a
+    // known public key from an unknown one by comparing HTTP error classes.
+    if state.peer_store.get_valid(&requester, now).is_none() {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
+    }
+    if !state.guard.lock().await.admit(requester, request_id, now) {
+        return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
+    }
+
+    let page = match state
+        .storage
+        .next_record_coordinator_handover_page(after_authority_epoch)
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Refused authority handover snapshot");
+            return protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "handover_history_unavailable",
+            );
+        }
+    };
+    let responder = state.identity.public_key_bytes();
+    let response_timestamp = now_secs();
+    let has_handover = page.handover.is_some();
+    let response_signing_bytes = record_coordinator_handover_response_signing_bytes(
+        &chain_id,
+        &request_id,
+        &responder,
+        response_timestamp,
+        page.handover.as_ref(),
+        page.latest_authority_epoch,
+    );
+    let response = MemChainMessage::RecordCoordinatorHandoverResponseV1 {
+        chain_id,
+        request_id,
+        responder,
+        response_timestamp,
+        handover: page.handover,
+        latest_authority_epoch: page.latest_authority_epoch,
+        signature: state.identity.sign(&response_signing_bytes),
+    };
+    let encoded = match encode_memchain(&response) {
+        Ok(encoded) => encoded,
+        Err(_) => return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_error"),
+    };
+    debug!(
+        has_handover,
+        latest_authority_epoch = page.latest_authority_epoch,
+        "[MEMCHAIN_BLOCK] Served authenticated authority handover snapshot"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        encoded,
+    )
+        .into_response()
+}
+
 async fn coordinator_lease_handler(
     State(state): State<MemChainPeerState>,
     body: Bytes,
@@ -4661,14 +5093,8 @@ async fn coordinator_lease_handler(
     {
         return protocol_error(StatusCode::BAD_REQUEST, "invalid_lease_request");
     }
-    if state.lease_authorized_coordinator != Some(coordinator) {
-        return protocol_error(StatusCode::FORBIDDEN, "unauthorized_coordinator");
-    }
     if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
         return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
-    }
-    if !coordinator_control_requester_is_admitted(&state, &coordinator, now) {
-        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
     }
     let signing_bytes = record_coordinator_lease_request_signing_bytes(
         &chain_id,
@@ -4685,6 +5111,35 @@ async fn coordinator_lease_handler(
         .is_err()
     {
         return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    // [COORDINATOR-CONTROL-ADMISSION 2026-08-14 by Codex] Only an
+    // authenticated coordinator may trigger the storage-backed authority
+    // lookup or learn its peer-admission result.
+    let Some(next_height) = known_tip_height.checked_add(1) else {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_lease_request");
+    };
+    let authorized_coordinator = match runtime_authorized_coordinator_for_height(
+        &state.storage,
+        state.lease_authorized_coordinator,
+        next_height,
+    )
+    .await
+    {
+        Ok(Some(authorized)) => authorized,
+        Ok(None) => return protocol_error(StatusCode::FORBIDDEN, "follower_sync_disabled"),
+        Err(error) => {
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Refused unaudited lease authority");
+            return protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "coordinator_authority_unavailable",
+            );
+        }
+    };
+    if authorized_coordinator != coordinator {
+        return protocol_error(StatusCode::FORBIDDEN, "unauthorized_coordinator");
+    }
+    if !coordinator_control_requester_is_admitted(&state, &coordinator, now) {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
     }
     if !state.guard.lock().await.admit(coordinator, request_id, now) {
         return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
@@ -4797,14 +5252,8 @@ async fn coordinator_lease_release_handler(
     if chain_id != AERONYX_MEMCHAIN_MAINNET_CHAIN_ID || instance_id.iter().all(|byte| *byte == 0) {
         return protocol_error(StatusCode::BAD_REQUEST, "invalid_lease_release_request");
     }
-    if state.lease_authorized_coordinator != Some(coordinator) {
-        return protocol_error(StatusCode::FORBIDDEN, "unauthorized_coordinator");
-    }
     if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
         return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
-    }
-    if !coordinator_control_requester_is_admitted(&state, &coordinator, now) {
-        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
     }
     let signing_bytes = record_coordinator_lease_release_request_signing_bytes(
         &chain_id,
@@ -4818,6 +5267,30 @@ async fn coordinator_lease_release_handler(
         .is_err()
     {
         return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    // [COORDINATOR-CONTROL-ADMISSION 2026-08-14 by Codex] Release requests
+    // use the same authenticate-before-authorize ordering as acquisition.
+    let authorized_coordinator = match runtime_authorized_coordinator_for_next_height(
+        &state.storage,
+        state.lease_authorized_coordinator,
+    )
+    .await
+    {
+        Ok(Some(authorized)) => authorized,
+        Ok(None) => return protocol_error(StatusCode::FORBIDDEN, "follower_sync_disabled"),
+        Err(error) => {
+            warn!(error = %error, "[MEMCHAIN_BLOCK] Refused unaudited lease release authority");
+            return protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "coordinator_authority_unavailable",
+            );
+        }
+    };
+    if authorized_coordinator != coordinator {
+        return protocol_error(StatusCode::FORBIDDEN, "unauthorized_coordinator");
+    }
+    if !coordinator_control_requester_is_admitted(&state, &coordinator, now) {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
     }
     if !state.guard.lock().await.admit(coordinator, request_id, now) {
         return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
@@ -5301,6 +5774,349 @@ mod tests {
 
     fn allow_test_endpoint(_endpoint: &str) -> bool {
         true
+    }
+
+    fn signed_handover_response_frame(
+        responder: &IdentityKeyPair,
+        request_id: [u8; 16],
+        response_timestamp: u64,
+        handover: Option<RecordCoordinatorHandoverV1>,
+        latest_authority_epoch: u64,
+    ) -> Vec<u8> {
+        let responder_id = responder.public_key_bytes();
+        let signing_bytes = record_coordinator_handover_response_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            &request_id,
+            &responder_id,
+            response_timestamp,
+            handover.as_ref(),
+            latest_authority_epoch,
+        );
+        encode_memchain(&MemChainMessage::RecordCoordinatorHandoverResponseV1 {
+            chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            request_id,
+            responder: responder_id,
+            response_timestamp,
+            handover,
+            latest_authority_epoch,
+            signature: responder.sign(&signing_bytes),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn handover_response_rejects_omission_and_wrong_predecessor() {
+        // [AUTHORITY-HANDOVER-ADVERSARIAL 2026-08-14 by Codex] A responder
+        // cannot advertise a newer history head while withholding the exact
+        // next proof, nor wrap somebody else's valid transition in its own
+        // authenticated transport response.
+        let now = 50_000;
+        let request_id = [0x41; 16];
+        let active = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let omitted = signed_handover_response_frame(&active, request_id, now, None, 1);
+        assert_eq!(
+            verify_record_coordinator_handover_response(
+                &omitted,
+                &request_id,
+                &active.public_key_bytes(),
+                0,
+                1,
+                now,
+            )
+            .unwrap_err(),
+            "handover_proof_omitted"
+        );
+
+        let unrelated_previous = IdentityKeyPair::generate();
+        let wrong_predecessor = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            [0x42; 32],
+            [0x43; 16],
+            now.saturating_sub(1),
+            &unrelated_previous,
+            &next,
+        );
+        let wrapped =
+            signed_handover_response_frame(&active, request_id, now, Some(wrong_predecessor), 1);
+        assert_eq!(
+            verify_record_coordinator_handover_response(
+                &wrapped,
+                &request_id,
+                &active.public_key_bytes(),
+                0,
+                1,
+                now,
+            )
+            .unwrap_err(),
+            "handover_previous_coordinator_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn handover_endpoint_authenticates_before_peer_membership_admission() {
+        // [AUTHORITY-HANDOVER-ADMISSION 2026-08-14 by Codex] A forged request
+        // must not reveal whether its claimed requester is in PeerStore. A
+        // genuinely signed but unadmitted requester remains forbidden.
+        let now = now_secs();
+        let responder = Arc::new(IdentityKeyPair::generate());
+        let known = IdentityKeyPair::generate();
+        let unknown = IdentityKeyPair::generate();
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let peer_store = Arc::new(PeerStore::new());
+        admit_peer(&peer_store, &known, None, now);
+        let router = build_memchain_peer_router(storage, peer_store, responder);
+
+        for (requester, request_id) in [
+            (known.public_key_bytes(), [0x44; 16]),
+            (unknown.public_key_bytes(), [0x45; 16]),
+        ] {
+            let forged = encode_memchain(
+                &MemChainMessage::RecordCoordinatorHandoverRequestV1 {
+                    chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                    after_authority_epoch: 0,
+                    request_id,
+                    requester,
+                    request_timestamp: now,
+                    signature: [0u8; 64],
+                },
+            )
+            .unwrap();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/memchain/peer/coordinator-handover")
+                        .body(Body::from(forged))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let request_id = [0x46; 16];
+        let requester = unknown.public_key_bytes();
+        let signing_bytes = record_coordinator_handover_request_signing_bytes(
+            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+            0,
+            &request_id,
+            &requester,
+            now,
+        );
+        let signed_unknown = encode_memchain(
+            &MemChainMessage::RecordCoordinatorHandoverRequestV1 {
+                chain_id: AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                after_authority_epoch: 0,
+                request_id,
+                requester,
+                request_timestamp: now,
+                signature: unknown.sign(&signing_bytes),
+            },
+        )
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/coordinator-handover")
+                    .body(Body::from(signed_unknown))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cold_follower_interleaves_prefix_and_exact_handover() {
+        // [AUTHORITY-HANDOVER-FOLLOWER 2026-08-14 by Codex] The follower first
+        // learns the transition as a future boundary, pulls only block one,
+        // then accepts the same dual-signed proof and switches authority for
+        // height two. No responder assertion alone can rotate authority.
+        let now = now_secs();
+        let coordinator = Arc::new(IdentityKeyPair::generate());
+        let next = IdentityKeyPair::generate();
+        let follower = IdentityKeyPair::generate();
+        let source = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        source
+            .configure_record_commitment_authority_root(Some(coordinator.public_key_bytes()))
+            .unwrap();
+        source.audit_record_commitment_chain().await.unwrap();
+        let first_block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(2),
+            GENESIS_PREV_HASH,
+            vec![[0x51; 32]],
+            coordinator.as_ref(),
+        );
+        source
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        let proof = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x52; 16],
+            now.saturating_sub(1),
+            coordinator.as_ref(),
+            &next,
+        );
+        source
+            .persist_configured_record_coordinator_handover(&proof, now)
+            .await
+            .unwrap();
+        let second_block = RecordCommitmentBlockV1::new_signed(
+            2,
+            now.saturating_sub(1),
+            first_block.hash(),
+            vec![[0x53; 32]],
+            &next,
+        );
+        source
+            .append_record_commitment_block(&second_block, None)
+            .await
+            .unwrap();
+
+        let source_peers = Arc::new(PeerStore::new());
+        admit_peer(&source_peers, &follower, None, now);
+        let router =
+            build_memchain_peer_router(Arc::clone(&source), source_peers, Arc::clone(&coordinator));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let destination = MemoryStorage::open(":memory:", None).unwrap();
+        destination
+            .configure_record_commitment_authority_root(Some(coordinator.public_key_bytes()))
+            .unwrap();
+        destination.audit_record_commitment_chain().await.unwrap();
+        destination.configure_record_commitment_sync(false, true);
+        let destination_peers = PeerStore::new();
+        admit_peer(
+            &destination_peers,
+            coordinator.as_ref(),
+            Some(format!("http://{address}")),
+            now,
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let pending = sync_next_record_coordinator_handover_with_endpoint_policy(
+            &destination,
+            &destination_peers,
+            &follower,
+            &client,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.authority_epoch, 0);
+        assert_eq!(pending.active_coordinator, coordinator.public_key_bytes());
+        assert_eq!(pending.next_block_height, 1);
+        assert_eq!(pending.pending_activation_height, Some(2));
+        assert!(!pending.handover_inserted);
+
+        let page = pull_record_commitment_page_from_source_with_endpoint_policy(
+            &destination,
+            &destination_peers,
+            &follower,
+            &coordinator.public_key_bytes(),
+            &coordinator.public_key_bytes(),
+            &client,
+            &allow_test_endpoint,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.inserted, 1);
+        assert!(page.has_more);
+
+        let activated = sync_next_record_coordinator_handover_with_endpoint_policy(
+            &destination,
+            &destination_peers,
+            &follower,
+            &client,
+            &allow_test_endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(activated.authority_epoch, 1);
+        assert_eq!(activated.active_coordinator, next.public_key_bytes());
+        assert_eq!(activated.next_block_height, 2);
+        assert_eq!(activated.pending_activation_height, None);
+        assert!(activated.handover_inserted);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn audited_authority_schedule_supersedes_legacy_runtime_pin() {
+        // [AUTHORITY-SCHEDULE-RUNTIME 2026-08-14 by Codex] Announcement and
+        // lease handlers share this resolver. Once a handover is durable, the
+        // legacy bootstrap pin cannot continue authorising later heights.
+        let now = now_secs();
+        let root = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage
+            .configure_record_commitment_authority_root(Some(root.public_key_bytes()))
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let first_block = RecordCommitmentBlockV1::new_signed(
+            1,
+            now.saturating_sub(2),
+            GENESIS_PREV_HASH,
+            vec![[0x61; 32]],
+            &root,
+        );
+        storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        let handover = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x62; 16],
+            now.saturating_sub(1),
+            &root,
+            &next,
+        );
+        storage
+            .persist_configured_record_coordinator_handover(&handover, now)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime_authorized_coordinator_for_height(&storage, Some(root.public_key_bytes()), 1)
+                .await
+                .unwrap(),
+            Some(root.public_key_bytes())
+        );
+        assert_eq!(
+            runtime_authorized_coordinator_for_height(&storage, Some(root.public_key_bytes()), 2)
+                .await
+                .unwrap(),
+            Some(next.public_key_bytes())
+        );
+        assert_eq!(
+            runtime_authorized_coordinator_for_next_height(
+                &storage,
+                Some(root.public_key_bytes()),
+            )
+            .await
+            .unwrap(),
+            Some(next.public_key_bytes())
+        );
     }
 
     #[test]
@@ -6198,6 +7014,7 @@ mod tests {
                 &allow_test_endpoint,
                 &mut cursor,
                 &mut circuit_breaker,
+                MAX_BLOCKS_PER_RESPONSE_WIRE,
             )
             .await
             .unwrap();
@@ -6229,6 +7046,7 @@ mod tests {
                 &allow_test_endpoint,
                 &mut cursor,
                 &mut circuit_breaker,
+                MAX_BLOCKS_PER_RESPONSE_WIRE,
             )
             .await
             .unwrap();
