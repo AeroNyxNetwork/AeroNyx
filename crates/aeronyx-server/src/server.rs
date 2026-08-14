@@ -343,6 +343,9 @@
 // 130. [MANAGEMENT-CLIENT-STARTUP 2026-08-12 by Codex] Treats management HTTP
 //      client construction as a typed startup boundary before spawning any
 //      management worker, preventing a panic or partial control plane.
+// 131. [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Installs the
+//      operator-validated immutable commitment authority root before startup
+//      audit so readiness cannot precede exact-height proposer verification.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -475,8 +478,13 @@
 //   - [BACKGROUND-SHUTDOWN-COOPERATION 2026-08-12 by Codex] Every long initial
 //     delay and multi-stage gossip round must observe shutdown between bounded
 //     operations; adding another await requires adding the same checkpoint.
+//   - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Install the immutable
+//     authority root before the first chain audit. Never derive it from mutable
+//     storage, log its identity, or bypass dual-signed coordinator handover.
 //
 // Last Modified:
+//   [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Bound startup readiness
+//     to the configured commitment authority root and proposer history audit.
 //   v2.8.83-ManagementClientStartup - Made management HTTP client creation
 //     fail-closed through ServerError before worker startup.
 //   v2.8.82-MinerStartupError - Made SaaS miner scheduler construction
@@ -4189,6 +4197,31 @@ impl Server {
         let storage = Arc::new(
             MemoryStorage::open(db_path, Some(record_key))
                 .map_err(|e| ServerError::startup_failed(format!("SQLite: {}", e)))?,
+        );
+        // [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Install the
+        // operator-validated root before any chain audit. The root stays
+        // process-local; logs expose only whether height-scoped authority
+        // enforcement is active, never the identity itself.
+        let commitment_authority_root = self
+            .config
+            .memchain
+            .effective_commitment_authority_root_node_id(&self.identity.public_key_bytes());
+        storage
+            .configure_record_commitment_authority_root(commitment_authority_root)
+            .map_err(|error| {
+                ServerError::startup_failed(format!(
+                    "MemChain commitment authority root: {error}"
+                ))
+            })?;
+        info!(
+            enabled = commitment_authority_root.is_some(),
+            explicit = !self
+                .config
+                .memchain
+                .commitment_authority_root_node_id
+                .trim()
+                .is_empty(),
+            "[MEMCHAIN_BLOCK] Commitment proposer authority configured"
         );
         let commitment_durability = storage
             .configure_record_commitment_durability(

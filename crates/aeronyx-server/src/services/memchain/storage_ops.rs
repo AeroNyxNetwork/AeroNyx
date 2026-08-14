@@ -81,6 +81,9 @@
 //! - [COORDINATOR-HANDOVER 2026-08-12 by Codex] Persists and re-audits the
 //!   complete dual-signed coordinator authority history against exact block
 //!   prefixes, contiguous epochs, and non-overlapping witness leases
+//! - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Enforces the immutable
+//!   root and exact-height active coordinator during startup audit, explicit
+//!   handover audit, and atomic live block append
 //! - [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Runs signed local-anchor
 //!   writes through one privacy-safe blocking worker boundary.
 //!
@@ -178,6 +181,8 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Connected persisted
+//! coordinator handovers to complete-chain and live proposer authorization.
 //! v2.8.60-AnchorWorkerPrivacy - Redact Tokio panic payloads from signed
 //! local-anchor persistence failures.
 //! v2.8.57-CertificatePersistenceTruth - Distinguish verified-unpersisted follower outcomes.
@@ -1068,11 +1073,10 @@ fn read_record_coordinator_handover_history_transaction(
         current_coordinator = proof.header.next_coordinator;
         history.push(proof);
     }
-    verify_record_commitment_proposer_history_transaction(
-        transaction,
-        root_coordinator,
-        &history,
-    )?;
+    // [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] This helper audits
+    // the bounded handover schedule only. Callers that establish or expose a
+    // full-chain authority baseline separately invoke the O(blocks) proposer
+    // scan; live append stays O(handovers) instead of degrading with height.
     Ok(history)
 }
 
@@ -1130,6 +1134,25 @@ fn verify_record_commitment_proposer_history_transaction(
         }
     }
     Ok(())
+}
+
+/// Resolves the coordinator authorised for one exact commitment height.
+///
+/// [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] The caller supplies a
+/// history already verified from the immutable root. This resolver is used by
+/// live append only; the startup verifier above deliberately retains its
+/// stronger transition-consumption checks as an independent fail-closed audit.
+fn record_commitment_coordinator_at_height(
+    root_coordinator: &[u8; 32],
+    history: &[RecordCoordinatorHandoverV1],
+    height: u64,
+) -> [u8; 32] {
+    history
+        .iter()
+        .take_while(|transition| transition.header.activation_height <= height)
+        .fold(*root_coordinator, |_, transition| {
+            transition.header.next_coordinator
+        })
 }
 
 fn persist_record_commitment_tip_transaction(
@@ -4089,6 +4112,15 @@ impl MemoryStorage {
         &self,
         root_coordinator: &[u8; 32],
     ) -> Result<Vec<RecordCoordinatorHandoverV1>, String> {
+        if self
+            .commitment_authority_root
+            .read()
+            .is_some_and(|configured| configured != *root_coordinator)
+        {
+            return Err(
+                "coordinator handover root does not match configured authority".to_string(),
+            );
+        }
         let mut conn = self.conn.lock().await;
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
@@ -4105,6 +4137,11 @@ impl MemoryStorage {
         }
         let history =
             read_record_coordinator_handover_history_transaction(&transaction, root_coordinator)?;
+        verify_record_commitment_proposer_history_transaction(
+            &transaction,
+            root_coordinator,
+            &history,
+        )?;
         transaction
             .commit()
             .map_err(|error| format!("commit coordinator handover audit snapshot: {error}"))?;
@@ -4130,6 +4167,18 @@ impl MemoryStorage {
         proof: &RecordCoordinatorHandoverV1,
         accepted_at: u64,
     ) -> Result<RecordCoordinatorHandoverPersistOutcome, String> {
+        // [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] A caller cannot
+        // substitute an alternate root after startup configuration. This is a
+        // trust-anchor check, independent of the proof's two valid signatures.
+        if self
+            .commitment_authority_root
+            .read()
+            .is_some_and(|configured| configured != *root_coordinator)
+        {
+            return Err(
+                "coordinator handover root does not match configured authority".to_string(),
+            );
+        }
         proof
             .verify(&AERONYX_MEMCHAIN_MAINNET_CHAIN_ID)
             .map_err(|error| format!("coordinator handover proof is invalid: {error}"))?;
@@ -4177,6 +4226,11 @@ impl MemoryStorage {
         }
         let history =
             read_record_coordinator_handover_history_transaction(&transaction, root_coordinator)?;
+        verify_record_commitment_proposer_history_transaction(
+            &transaction,
+            root_coordinator,
+            &history,
+        )?;
         if let Some(existing) = history
             .iter()
             .find(|entry| entry.header.authority_epoch == proof.header.authority_epoch)
@@ -4626,6 +4680,47 @@ impl MemoryStorage {
     #[must_use]
     pub fn record_commitment_production_halted(&self) -> bool {
         self.commitment_production_halted.load(Ordering::Acquire)
+    }
+
+    /// Configures the immutable process-local proposer-authority trust root.
+    ///
+    /// [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Call this before the
+    /// startup chain audit. Once installed, only an identical value may be
+    /// configured again; authority rotation must use the dual-signed handover
+    /// schedule instead of replacing this trust anchor. `None` preserves
+    /// legacy tooling and protocol-disabled deployments before installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured root is the all-zero sentinel, or
+    /// when a caller attempts to replace or disable an installed root.
+    pub fn configure_record_commitment_authority_root(
+        &self,
+        root: Option<[u8; 32]>,
+    ) -> Result<(), String> {
+        if root.is_some_and(|value| value.iter().all(|byte| *byte == 0)) {
+            return Err("commitment authority root must be non-zero".to_string());
+        }
+        let mut configured = self.commitment_authority_root.write();
+        match (*configured, root) {
+            (Some(existing), Some(candidate)) if existing != candidate => {
+                return Err(
+                    "commitment authority root is immutable after installation".to_string(),
+                );
+            }
+            (Some(_), None) => {
+                return Err(
+                    "commitment authority root cannot be disabled after installation".to_string(),
+                );
+            }
+            (None, Some(candidate)) => {
+                *configured = Some(candidate);
+                drop(configured);
+                *self.commitment_integrity.write() = None;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Configures the process-local Block Sync role once startup validation has
@@ -6219,6 +6314,7 @@ impl MemoryStorage {
         // evidence visible to operators or the central health plane.
         *self.commitment_integrity.write() = None;
         let started = Instant::now();
+        let authority_root = *self.commitment_authority_root.read();
         let mut conn = self.conn.lock().await;
         let transaction = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
@@ -6309,6 +6405,20 @@ impl MemoryStorage {
             .map_err(|_| "commitment audit found an invalid membership count".to_string())?;
         if indexed_total != commitment_count {
             return Err("commitment audit contains orphaned membership rows".to_string());
+        }
+        if let Some(root_coordinator) = authority_root {
+            // [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Re-audit the
+            // complete dual-signed key schedule and every stored proposer in
+            // this same SQLite snapshot before publishing a verified baseline.
+            let authority_history = read_record_coordinator_handover_history_transaction(
+                &transaction,
+                &root_coordinator,
+            )?;
+            verify_record_commitment_proposer_history_transaction(
+                &transaction,
+                &root_coordinator,
+                &authority_history,
+            )?;
         }
         transaction
             .commit()
@@ -6454,6 +6564,7 @@ impl MemoryStorage {
         blocks: &[RecordCommitmentBlockV1],
         received_from: Option<&[u8; 32]>,
     ) -> Result<CommittedRecordCommitmentBatch, String> {
+        let authority_root = *self.commitment_authority_root.read();
         let mut conn = self.conn.lock().await;
         if received_from.is_none() {
             if let Some(error) = self.local_record_commitment_production_error() {
@@ -6483,6 +6594,12 @@ impl MemoryStorage {
             }
             None => (0, GENESIS_PREV_HASH),
         };
+        let authority_history = authority_root
+            .as_ref()
+            .map(|root| {
+                read_record_coordinator_handover_history_transaction(&transaction, root)
+            })
+            .transpose()?;
         let appended_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -6500,6 +6617,25 @@ impl MemoryStorage {
                 return Err("commitment block batch is not height-contiguous".to_string());
             }
             previous_input_height = Some(block.header.height);
+            if let (Some(root), Some(history)) =
+                (authority_root.as_ref(), authority_history.as_ref())
+            {
+                // [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Enforce
+                // the exact height-scoped key schedule before any row in the
+                // batch is inserted. A wrong old/new key fails the entire
+                // IMMEDIATE transaction without advancing runtime integrity.
+                let expected = record_commitment_coordinator_at_height(
+                    root,
+                    history,
+                    block.header.height,
+                );
+                if block.header.proposer != expected {
+                    return Err(format!(
+                        "commitment block has an unauthorized proposer at height {}",
+                        block.header.height
+                    ));
+                }
+            }
             let expected_height = current_height
                 .checked_add(1)
                 .ok_or_else(|| "commitment chain height exhausted".to_string())?;
@@ -8088,6 +8224,187 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(history, vec![first_handover, second_handover]);
+    }
+
+    #[tokio::test]
+    async fn test_configured_authority_rejects_old_coordinator_after_handover() {
+        // [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Once epoch one
+        // activates at height two, the old coordinator remains a valid
+        // cryptographic signer but is no longer an authorised proposer.
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let root = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        storage
+            .configure_record_commitment_authority_root(Some(root.public_key_bytes()))
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+
+        let first_block = signed_commitment_block(1, GENESIS_PREV_HASH, 0x61, &root);
+        storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        let handover = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x62; 16],
+            7_000,
+            &root,
+            &next,
+        );
+        storage
+            .persist_record_coordinator_handover(
+                &root.public_key_bytes(),
+                &handover,
+                7_001,
+            )
+            .await
+            .unwrap();
+
+        let stale_authority = signed_commitment_block(2, first_block.hash(), 0x63, &root);
+        assert_eq!(
+            storage
+                .append_record_commitment_block(&stale_authority, None)
+                .await
+                .unwrap_err(),
+            "commitment block has an unauthorized proposer at height 2"
+        );
+        assert_eq!(
+            storage
+                .record_commitment_chain_integrity_status()
+                .verified_tip_height,
+            1
+        );
+
+        let authorised = signed_commitment_block(2, first_block.hash(), 0x64, &next);
+        assert_eq!(
+            storage
+                .append_record_commitment_block(&authorised, None)
+                .await
+                .unwrap(),
+            RecordCommitmentAppendOutcome::Inserted
+        );
+        assert_eq!(
+            storage
+                .record_commitment_chain_integrity_status()
+                .verified_tip_height,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authority_root_is_immutable_and_rejects_sentinel() {
+        // [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Reusing the same
+        // root is idempotent, while replacement or disabling must not provide
+        // an alternate path around the dual-signed handover schedule.
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let root = IdentityKeyPair::generate().public_key_bytes();
+        let replacement = IdentityKeyPair::generate().public_key_bytes();
+
+        assert_eq!(
+            storage
+                .configure_record_commitment_authority_root(Some([0; 32]))
+                .unwrap_err(),
+            "commitment authority root must be non-zero"
+        );
+        storage
+            .configure_record_commitment_authority_root(Some(root))
+            .unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        assert_eq!(
+            storage.record_commitment_chain_integrity_status().state,
+            "verified"
+        );
+
+        storage
+            .configure_record_commitment_authority_root(Some(root))
+            .unwrap();
+        assert_eq!(
+            storage.record_commitment_chain_integrity_status().state,
+            "verified"
+        );
+
+        assert_eq!(
+            storage
+                .configure_record_commitment_authority_root(Some(replacement))
+                .unwrap_err(),
+            "commitment authority root is immutable after installation"
+        );
+        assert_eq!(
+            storage
+                .configure_record_commitment_authority_root(None)
+                .unwrap_err(),
+            "commitment authority root cannot be disabled after installation"
+        );
+        assert_eq!(
+            storage.record_commitment_chain_integrity_status().state,
+            "verified"
+        );
+        assert_eq!(
+            storage
+                .record_coordinator_handover_history(&replacement)
+                .await
+                .unwrap_err(),
+            "coordinator handover root does not match configured authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_startup_authority_audit_rejects_legacy_unauthorised_proposer() {
+        // [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Model an older
+        // binary that verified signatures but did not enforce the handover key
+        // schedule. The upgraded node must fail closed during startup audit.
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("authority-upgrade.db");
+        let root = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        {
+            let legacy = MemoryStorage::open(&db_path, None).unwrap();
+            legacy.audit_record_commitment_chain().await.unwrap();
+            let first_block = signed_commitment_block(1, GENESIS_PREV_HASH, 0x65, &root);
+            legacy
+                .append_record_commitment_block(&first_block, None)
+                .await
+                .unwrap();
+            let handover = RecordCoordinatorHandoverV1::new_dual_signed(
+                1,
+                2,
+                first_block.hash(),
+                [0x66; 16],
+                8_000,
+                &root,
+                &next,
+            );
+            legacy
+                .persist_record_coordinator_handover(
+                    &root.public_key_bytes(),
+                    &handover,
+                    8_001,
+                )
+                .await
+                .unwrap();
+            let stale_authority = signed_commitment_block(2, first_block.hash(), 0x67, &root);
+            legacy
+                .append_record_commitment_block(&stale_authority, Some(&[0x68; 32]))
+                .await
+                .unwrap();
+        }
+
+        let upgraded = MemoryStorage::open(&db_path, None).unwrap();
+        upgraded
+            .configure_record_commitment_authority_root(Some(root.public_key_bytes()))
+            .unwrap();
+        assert_eq!(
+            upgraded.audit_record_commitment_chain().await.unwrap_err(),
+            "commitment block has an unauthorized proposer at height 2"
+        );
+        assert_eq!(
+            upgraded
+                .record_commitment_chain_integrity_status()
+                .state,
+            "not_verified"
+        );
     }
 
     #[tokio::test]

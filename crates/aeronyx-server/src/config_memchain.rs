@@ -34,6 +34,8 @@
 //!                     recover current-tip checkpoint certificates.
 //! v2.8.47-RuntimeIdentityPolicy — Rejects coordinator and witness trust pins
 //!                     that resolve to the node's own runtime identity.
+//! v2.8.48-CommitmentAuthority — Added a stable, operator-pinned commitment
+//!                     authority root for dual-signed coordinator rotation.
 //!
 //! ## Main Functionality
 //! - `MemChainMode`   — Off / Local / P2p / Saas
@@ -81,6 +83,10 @@
 //! - commitment_sync_enabled must remain default-off. A follower accepts
 //!   blocks only from the explicitly pinned coordinator node identity and
 //!   fails closed on rollback, fork, signature, or continuity errors.
+//! - commitment_authority_root_node_id is the immutable genesis authority
+//!   anchor for proposer rotation. Empty preserves old deployments by using
+//!   the follower source pin or the coordinator's runtime identity. Once a
+//!   handover exists, operators must retain the original root across restarts.
 //! - commitment_tip_anchor_path is a coordinator-local rollback guard outside
 //!   SQLite. An empty value derives a sibling file beside db_path. Never point
 //!   it at the SQLite database itself.
@@ -97,6 +103,7 @@
 //!   before production; deploy the protocol to all pins before activation.
 //!
 //! ## Last Modified
+//! v2.8.48-CommitmentAuthority - Pinned the proposer authority root independently of mutable SQLite.
 //! v2.8.47-RuntimeIdentityPolicy - Rejected self-referential coordinator and witness pins.
 //! v2.8.46-FollowerCertificateConfig - Made follower certificate witness policy configurable.
 //! v2.8.10-CoordinatorLease - Added strict all-witness lease policy and TTL.
@@ -282,6 +289,16 @@ pub struct MemChainConfig {
     /// while sync is disabled so existing configurations remain compatible.
     #[serde(default)]
     pub commitment_coordinator_node_id: String,
+
+    /// Stable hex-encoded Ed25519 root for commitment proposer authority.
+    ///
+    /// Empty preserves existing deployments: a follower reuses
+    /// `commitment_coordinator_node_id`, while a coordinator uses its runtime
+    /// identity. Set this explicitly before the first dual-signed handover and
+    /// keep it unchanged after coordinator rotation. The current sync source
+    /// may then change without changing the chain's root trust anchor.
+    #[serde(default)]
+    pub commitment_authority_root_node_id: String,
 
     /// Base interval between successful follower catch-up rounds.
     ///
@@ -762,6 +779,34 @@ impl MemChainConfig {
             debug!("[MEMCHAIN_BLOCK] Canonical commitment coordinator enabled");
         }
 
+        // [COMMITMENT-AUTHORITY-CONFIG 2026-08-14 by Codex] The authority
+        // root is chain-spec-like trust state. Never infer an explicit value
+        // from SQLite or silently accept malformed/dormant configuration.
+        let authority_root = self.commitment_authority_root_node_id.trim();
+        if !authority_root.is_empty() {
+            if !self.commitment_coordinator_enabled && !self.commitment_sync_enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_authority_root_node_id",
+                    "requires a commitment coordinator or follower sync role",
+                ));
+            }
+            let decoded = hex::decode(authority_root).map_err(|_| {
+                ServerError::config_invalid(
+                    "memchain.commitment_authority_root_node_id",
+                    "must be a 64-character Ed25519 public key in hexadecimal",
+                )
+            })?;
+            if authority_root.len() != 64
+                || decoded.len() != 32
+                || decoded.iter().all(|byte| *byte == 0)
+            {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_authority_root_node_id",
+                    "must be a non-zero 64-character Ed25519 public key in hexadecimal",
+                ));
+            }
+        }
+
         if self.commitment_witness_min_verified == 0 {
             return Err(ServerError::config_invalid(
                 "memchain.commitment_witness_min_verified",
@@ -1187,6 +1232,29 @@ impl MemChainConfig {
         bytes.try_into().ok()
     }
 
+    /// Resolves the immutable proposer-authority root for the active role.
+    ///
+    /// [COMMITMENT-AUTHORITY-CONFIG 2026-08-14 by Codex] An explicit root is
+    /// preferred and must survive coordinator rotation. Empty values retain
+    /// backward compatibility by anchoring a follower to its pinned source or
+    /// a coordinator to its current runtime identity. No role means no
+    /// authority enforcement, preserving protocol-disabled storage tooling.
+    #[must_use]
+    pub fn effective_commitment_authority_root_node_id(
+        &self,
+        local_node_id: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        let configured = self.commitment_authority_root_node_id.trim();
+        if !configured.is_empty() {
+            let decoded = hex::decode(configured).ok()?;
+            return decoded.try_into().ok();
+        }
+        if self.commitment_sync_enabled {
+            return self.commitment_sync_coordinator_node_id();
+        }
+        self.commitment_coordinator_enabled.then_some(*local_node_id)
+    }
+
     /// Returns validated pinned witness identities in operator order.
     ///
     /// Config validation rejects malformed values. `filter_map` keeps this
@@ -1314,6 +1382,7 @@ impl Default for MemChainConfig {
             commitment_coordinator_enabled: false,
             commitment_sync_enabled: false,
             commitment_coordinator_node_id: String::new(),
+            commitment_authority_root_node_id: String::new(),
             commitment_sync_interval_secs: default_commitment_sync_interval_secs(),
             commitment_sync_max_pages_per_round: default_commitment_sync_max_pages_per_round(),
             commitment_tip_anchor_path: String::new(),
@@ -1389,6 +1458,7 @@ mod tests {
         assert!(!mc.commitment_coordinator_enabled);
         assert!(!mc.commitment_sync_enabled);
         assert!(mc.commitment_coordinator_node_id.is_empty());
+        assert!(mc.commitment_authority_root_node_id.is_empty());
         assert_eq!(mc.commitment_sync_interval_secs, 30);
         assert_eq!(mc.commitment_sync_max_pages_per_round, 8);
         assert!(mc.commitment_tip_anchor_path.is_empty());
@@ -1809,6 +1879,68 @@ mod tests {
                 commitment_sync_enabled: true,
                 commitment_coordinator_node_id: "11".repeat(32),
                 commitment_sync_max_pages_per_round: 65,
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn test_commitment_authority_root_is_stable_and_role_scoped() {
+        // [COMMITMENT-AUTHORITY-CONFIG 2026-08-14 by Codex] Existing
+        // deployments receive deterministic role-derived roots, while a
+        // rotated coordinator can retain the original explicit trust anchor.
+        let local = [0x21; 32];
+        let follower_source = "22".repeat(32);
+        let follower = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_sync_enabled: true,
+            commitment_coordinator_node_id: follower_source,
+            ..Default::default()
+        };
+        assert_eq!(
+            follower.effective_commitment_authority_root_node_id(&local),
+            Some([0x22; 32])
+        );
+
+        let coordinator = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_coordinator_enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            coordinator.effective_commitment_authority_root_node_id(&local),
+            Some(local)
+        );
+
+        let rotated = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_coordinator_enabled: true,
+            commitment_authority_root_node_id: "23".repeat(32),
+            ..Default::default()
+        };
+        assert!(rotated.validate().is_ok());
+        assert_eq!(
+            rotated.effective_commitment_authority_root_node_id(&local),
+            Some([0x23; 32])
+        );
+
+        for invalid in [
+            MemChainConfig {
+                commitment_authority_root_node_id: "24".repeat(32),
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_authority_root_node_id: "00".repeat(32),
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_authority_root_node_id: "not-a-node-id".to_string(),
                 ..Default::default()
             },
         ] {

@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.86.0 - Made MemChain volume placement and hot reload
-fail closed without retaining owner identities in operational logs.
+Modification Reason: v0.87.0 - Connected the persisted MemChain coordinator
+handover schedule to startup and live block-authority enforcement.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.86.0 - [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Preserves canonical user-storage paths, rejects orphaning reloads, serializes placement with reload, and removes owner identifiers from volume logs.
+Last Modified: v0.87.0 - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Pins a process-local commitment authority root, audits every historical proposer at startup, and enforces the active coordinator at each appended height.
+Previous: v0.86.0 - [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Preserves canonical user-storage paths, rejects orphaning reloads, serializes placement with reload, and removes owner identifiers from volume logs.
 Previous: v0.85.0 - [DISCOVERY-RATE-LIMIT-RECOVERY 2026-07-30 by Codex] Keeps node discovery gossip available after a recovered rate-limiter lock-owner panic.
 Previous: v0.84.0 - [DIRECTORY-BLOCKING-BOUNDARY 2026-07-30 by Codex] Gives all authenticated Directory peer blocking workers one privacy-safe failure and observability contract.
 Previous: v0.83.0 - [BLOCKING-WORKER-RECOVERY 2026-07-30 by Codex] Keeps SystemDb usable after a failed worker and prevents raw JoinError payloads from entering anchor/status diagnostics.
@@ -119,6 +120,61 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.87 MemChain commitment authority is enforced at runtime
+
+[COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex]
+
+- A coordinator or follower now installs one immutable, process-local authority
+  root before the commitment-chain startup audit. The root is supplied by the
+  operator and is never inferred from mutable SQLite history.
+- `commitment_authority_root_node_id` is the explicit genesis trust anchor for
+  coordinator rotation. Existing deployments remain compatible while the
+  field is empty: followers reuse their configured coordinator pin and a
+  coordinator uses its runtime identity. Operators must set the field
+  explicitly before the first dual-signed handover and keep it unchanged
+  across later rotations.
+- Startup verifies the complete dual-signed handover schedule and every stored
+  block proposer in one SQLite snapshot before publishing an integrity
+  baseline. A legacy block signed by a cryptographically valid but
+  height-unauthorised coordinator prevents readiness.
+- Live block append resolves the coordinator authorised at each exact height
+  and rejects a stale or premature proposer before inserting any row. A batch
+  failure rolls back atomically and cannot advance the in-memory integrity tip.
+- Full startup and operator audits remain `O(blocks + handovers)`. Normal live
+  append audits only the bounded handover schedule, avoiding chain-height cost
+  on every block while preserving the stronger independent startup scan.
+- The process rejects attempts to replace or disable an installed root.
+  Coordinator rotation must use the dual-signed handover schedule; callers
+  cannot bypass it by mutating the in-memory trust anchor.
+- The root and coordinator identities are not logged or exposed through public
+  telemetry. This change does not reveal memory ciphertext, owners, message
+  parties, routes, payloads, blind indexes, or any user-level activity.
+- This is a signed privacy-protocol commitment log, not a general-purpose
+  blockchain, payment ledger, smart-contract platform, permissionless
+  consensus protocol, or finality claim. Coordinator-handover submission and
+  network gossip are still separate future runtime work; this milestone only
+  makes persisted authority transitions enforceable and auditable.
+
+Implementation paths:
+
+- `crates/aeronyx-server/src/config_memchain.rs`: validates and resolves the
+  immutable authority root with backward-compatible role fallbacks.
+- `crates/aeronyx-server/src/server.rs`: installs the root before startup audit.
+- `crates/aeronyx-server/src/services/memchain/storage.rs`: owns the
+  non-persistent process-local trust anchor.
+- `crates/aeronyx-server/src/services/memchain/storage_ops.rs`: audits handover
+  history and enforces exact-height proposer authority atomically.
+- `deploy/node/server.example.toml`: documents the operator configuration.
+
+Verification:
+
+- Authority tests reject an old coordinator after handover activation and
+  accept the new coordinator at the same height.
+- Upgrade recovery tests reject a historically stored unauthorised proposer
+  during startup and leave integrity state `not_verified`.
+- Existing handover tamper, epoch, lease, activation, and acceptance-time
+  regression tests remain green.
 
 ### v0.86 MemChain volume routing fails closed
 

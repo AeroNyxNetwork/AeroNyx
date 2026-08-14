@@ -281,6 +281,10 @@ embed_enabled = true
 # coordinator-only production gates.
 # commitment_sync_enabled = true
 # commitment_coordinator_node_id = "64_HEX_ED25519_COORDINATOR_NODE_ID"
+# Keep this immutable root unchanged across dual-signed coordinator rotation.
+# Empty preserves legacy behavior by reusing the source pin on followers or
+# the runtime identity on a coordinator. Set it explicitly before handover.
+# commitment_authority_root_node_id = "64_HEX_ED25519_GENESIS_AUTHORITY_NODE_ID"
 # commitment_witness_node_ids = [
 #   "64_HEX_ED25519_WITNESS_A_NODE_ID",
 #   "64_HEX_ED25519_WITNESS_B_NODE_ID",

@@ -159,8 +159,13 @@
 //! - commitment_production_halted is one-way for the process lifetime. Only a
 //!   trusted-witness security incident may set it; no network input or later
 //!   converged frame may clear it. Recovery requires operator review/restart.
+//! - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] The commitment
+//!   authority root is process-local and immutable after installation. It must
+//!   never be inferred from SQLite, serialized, logged, or exposed in status.
 //!
 //! ## Last Modified
+//! [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Added the process-local
+//! immutable proposer-authority trust anchor used by startup and live audits.
 //! v2.8.57-CertificatePersistenceTruth - Separated verified-unpersisted follower outcomes.
 //! v2.8.56-StickySecurityEvidence - Retained role-isolated security-stop times across later success.
 //! v2.8.55-CertificateBackfillTelemetry - Added coordinator-only, source-blind recovery evidence.
@@ -1423,6 +1428,13 @@ pub struct MemoryStorage {
     /// Runtime-only complete-chain audit baseline. Cleared before every audit
     /// and advanced only after an atomic, fully validated block append.
     pub(crate) commitment_integrity: RwLock<Option<RecordCommitmentIntegrityRuntime>>,
+    /// Immutable process-local trust anchor for commitment proposer authority.
+    ///
+    /// [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] The root comes from
+    /// validated operator configuration or the role's backward-compatible
+    /// identity fallback. It is never inferred from mutable SQLite state and
+    /// is never serialized, logged, or exposed through management telemetry.
+    pub(crate) commitment_authority_root: RwLock<Option<[u8; 32]>>,
     /// Effective SQLite `PRAGMA synchronous` level for this process. This is
     /// aggregate configuration evidence only and never contains chain data.
     pub(crate) commitment_durability: AtomicU64,
@@ -1501,6 +1513,7 @@ impl MemoryStorage {
             record_key: record_key.map(Zeroizing::new),
             commitment_sync: RwLock::new(RecordCommitmentSyncRuntime::default()),
             commitment_integrity: RwLock::new(None),
+            commitment_authority_root: RwLock::new(None),
             // `open` explicitly configures NORMAL. A coordinator upgrades this
             // to FULL and verifies the effective value before startup audit.
             commitment_durability: AtomicU64::new(1),
