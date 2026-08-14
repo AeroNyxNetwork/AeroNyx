@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.0.0-SnapshotPull
+// Version: 2.0.1-StartupIntegrity
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -27,6 +27,8 @@
 //   atomic concurrent online deduplication.
 //   v2.0.0-SnapshotPull — Added a durable monotonic queue sequence and an
 //   authenticated opaque cursor for stable ChatPullV2 snapshot pagination.
+//   v2.0.1-StartupIntegrity — Removed the configured database path from
+//   successful startup logs; server.rs now owns fail-closed activation.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -76,10 +78,14 @@
 //     it on the wire or in logs; only issue the AEAD-protected opaque cursor.
 //   - Retention cleanup is batch-bounded. Do not replace it with an unbounded
 //     SELECT/DELETE or hold the SQLite connection across multiple batches.
+//   - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Do not log the relay
+//     database path or raw initialization errors. server.rs exposes only the
+//     stable `reason_bucket()` when explicit activation fails.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.0.1-StartupIntegrity — Privacy-safe, fail-closed service activation
 //   v2.0.0-SnapshotPull — Monotonic queue sequence, atomic legacy backfill,
 //     and wallet-bound XChaCha20-Poly1305 snapshot cursors
 //   v1.9.0-DurableQuarantine — Poison-row isolation, private tombstones,
@@ -759,10 +765,10 @@ impl ChatRelayService {
         };
 
         svc.init_schema()?;
-        info!(
-            "[CHAT_RELAY] Service initialised (db: {})",
-            svc.config.db_path
-        );
+        // [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] The filesystem
+        // path is operator-local state and may contain deployment identities.
+        // Keep successful activation observable without publishing that path.
+        info!("[CHAT_RELAY] Durable service initialized");
         Ok(svc)
     }
 

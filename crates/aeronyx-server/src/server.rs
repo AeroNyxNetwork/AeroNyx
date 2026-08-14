@@ -355,6 +355,9 @@
 // 134. [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Resolves one typed
 //      authority carrier policy and propagates configured follower
 //      initialization failures through the startup transaction.
+// 135. [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Makes explicit
+//      Chat Relay enablement fail startup when its durable service cannot be
+//      initialized, using only a privacy-safe reason bucket.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -499,8 +502,13 @@
 //   - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] A configured
 //     commitment follower must return a supervised task or fail startup.
 //     Never convert malformed coordinator/carrier state into `None`.
+//   - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Never turn an
+//     explicitly enabled Chat Relay initialization failure into `None`.
+//     Capability readiness and the configured service contract must agree.
 //
 // Last Modified:
+//   [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Made configured Chat
+//     Relay storage initialization a privacy-safe startup gate.
 //   [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Made follower task
 //     construction fail closed and consume one validated carrier policy.
 //   [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Separated authority-proof
@@ -3065,26 +3073,7 @@ impl Server {
         }
 
         let chat_relay_enabled = self.config.memchain.is_chat_relay_enabled();
-        let chat_relay: Option<Arc<ChatRelayService>> = if chat_relay_enabled {
-            let node_secret = derive_node_secret(&self.identity.to_bytes());
-            match ChatRelayService::new(self.config.memchain.chat_relay.clone(), node_secret) {
-                Ok(svc) => {
-                    info!("[CHAT_RELAY] Service initialized");
-                    Some(Arc::new(svc))
-                }
-                Err(e) => {
-                    warn!(error = %e, "[CHAT_RELAY] Init failed — chat relay disabled");
-                    None
-                }
-            }
-        } else {
-            if self.config.memchain.is_enabled() {
-                info!(
-                    "[CHAT_RELAY] Disabled by memchain.chat_relay.enabled=false; chat routes remain unavailable"
-                );
-            }
-            None
-        };
+        let chat_relay = self.init_chat_relay_service()?;
 
         // [BLIND-VAULT-SERVICE 2026-07-23 by Codex] This store is independent
         // from identity-indexed MemChain and receiver-indexed ChatRelay state.
@@ -4200,6 +4189,35 @@ impl Server {
     // ============================================
     // MemChain initialization
     // ============================================
+
+    /// Initializes the explicitly configured durable Chat Relay service.
+    ///
+    /// [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] `enabled=true` is a
+    /// required service contract, not a best-effort hint. Return one stable,
+    /// aggregate reason bucket so SQLite paths or raw storage diagnostics do
+    /// not enter process-health output while the startup transaction fails.
+    fn init_chat_relay_service(&self) -> Result<Option<Arc<ChatRelayService>>> {
+        if !self.config.memchain.is_chat_relay_enabled() {
+            if self.config.memchain.is_enabled() {
+                info!(
+                    "[CHAT_RELAY] Disabled by memchain.chat_relay.enabled=false; chat routes remain unavailable"
+                );
+            }
+            return Ok(None);
+        }
+
+        let node_secret = derive_node_secret(&self.identity.to_bytes());
+        ChatRelayService::new(self.config.memchain.chat_relay.clone(), node_secret)
+            .map(|service| Some(Arc::new(service)))
+            .map_err(|error| {
+                let reason = error.reason_bucket();
+                error!(
+                    reason,
+                    "[CHAT_RELAY] Required durable service initialization failed"
+                );
+                ServerError::startup_failed(format!("Chat Relay initialization failed ({reason})"))
+            })
+    }
 
     async fn init_memchain(
         &self,
@@ -13654,6 +13672,33 @@ mod tests {
             "memchain.commitment_authority_carrier_node_ids",
             "invalid_authority_carrier_policy",
         );
+    }
+
+    #[test]
+    fn configured_chat_relay_initialization_fails_closed_without_leaking_path() {
+        // [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] A configured
+        // durable relay must not disappear behind a healthy node. The returned
+        // error is intentionally diagnostic-bucket-only.
+        let disabled = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        assert!(disabled.init_chat_relay_service().unwrap().is_none());
+
+        let directory = tempfile::tempdir().unwrap();
+        let non_directory = directory.path().join("relay-parent-is-a-file");
+        std::fs::write(&non_directory, b"not a directory").unwrap();
+        let private_path = non_directory.join("private-relay.sqlite");
+        let mut config = ServerConfig::default();
+        config.memchain.chat_relay.enabled = true;
+        config.memchain.chat_relay.db_path = private_path.display().to_string();
+        let server = Server::new(config, IdentityKeyPair::generate(), None);
+
+        let error = server
+            .init_chat_relay_service()
+            .err()
+            .expect("configured Chat Relay storage failure must reject startup");
+        let rendered = error.to_string();
+        assert!(rendered.contains("Chat Relay initialization failed (sqlite_error)"));
+        assert!(!rendered.contains(&private_path.display().to_string()));
+        assert!(!rendered.contains("relay-parent-is-a-file"));
     }
 
     #[cfg(target_os = "linux")]

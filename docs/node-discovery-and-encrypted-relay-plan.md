@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.91.0 - Made configured commitment followers fail
-startup when their authority-carrier policy or required runtime cannot be built.
+Modification Reason: v0.92.0 - Made explicitly enabled durable Chat Relay
+storage a fail-closed, privacy-safe startup requirement.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.91.0 - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Resolves authority-carrier policy once and prevents a configured follower from disappearing behind healthy process startup.
+Last Modified: v0.92.0 - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents an explicitly enabled Chat Relay from silently disappearing after durable initialization failure.
+Previous: v0.91.0 - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Resolves authority-carrier policy once and prevents a configured follower from disappearing behind healthy process startup.
 Previous: v0.90.0 - [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Gives dual-signed authority-proof transport a dedicated follower-only pin set with an explicit legacy witness fallback.
 Previous: v0.89.0 - [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Recovers exact dual-signed coordinator proofs through bounded operator-pinned carriers without expanding transport into authority.
 Previous: v0.88.0 - [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Synchronizes one exact-next dual-signed coordinator proof at a time, stops block pages at activation boundaries, and applies the audited authority schedule to follower control traffic.
@@ -124,6 +125,41 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.92 Explicit Chat Relay activation is fail closed
+
+[CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex]
+
+- `memchain.chat_relay.enabled = false` remains the backward-compatible
+  default and continues to start without a Chat Relay service.
+- Once an operator explicitly sets `enabled = true`, opening the durable queue,
+  applying its schema, rebuilding usage counters, and deriving opaque-cursor
+  protection are required startup work. Any failure now rejects node startup;
+  the process cannot remain healthy with chat routes silently absent.
+- This aligns configured service state, signed capability readiness, health
+  reporting, and actual route availability. A node advertises Chat Relay only
+  after the same service instance has initialized successfully.
+- Startup diagnostics expose only a stable aggregate bucket such as
+  `sqlite_error`. Database paths and raw SQLite errors are not copied into
+  process-health errors, and successful startup no longer logs the path.
+- The relay remains blind: this change does not expose or parse sender,
+  receiver, message ID, ciphertext, blob ID, endpoint, session, or plaintext.
+  No wire frame, schema, retention policy, or client behavior changes.
+
+Implementation paths:
+
+- `crates/aeronyx-server/src/server.rs`: one fallible service initializer wired
+  directly into the startup transaction.
+- `crates/aeronyx-server/src/services/chat_relay.rs`: path-free success logging
+  and stable error classification retained at the service boundary.
+
+Verification:
+
+- A disabled configuration still returns no service without error.
+- An explicitly enabled relay with an unusable database path rejects startup,
+  returns `sqlite_error`, and does not include that private path in the error.
+- Existing Chat Relay storage, migration, pull, ACK, quota, quarantine, and
+  capability tests remain the functional regression gate.
 
 ### v0.91 Configured followers cannot silently lose required runtime
 
