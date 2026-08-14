@@ -16,6 +16,8 @@
 //! ### cognitive_tasks CRUD
 //! - insert_cognitive_task()        — enqueue a new pending task (idempotent: skips if active duplicate exists)
 //! - claim_pending_tasks()          — atomic SELECT + UPDATE to 'processing'
+//! - stage_task_result_and_usage()  — atomically persist inference + usage before writeback
+//! - complete_staged_task()         — finalize a staged task after durable writeback
 //! - complete_task()                — mark completed + write result + token_usage
 //! - fail_task()                    — increment retry_count or mark 'failed'
 //! - retry_task()                   — human-initiated reset of failed/cancelled → pending
@@ -71,6 +73,11 @@
 //!   task_id in llm_usage_log (e.g. manual inserts) are excluded.
 //!
 //! ## Last Modified
+//! v2.5.6-DurableWriteback - [SUPERNODE-DURABLE-WRITEBACK 2026-08-14 by Codex]
+//!   Added a two-phase completion boundary so target writeback retries reuse the
+//!   staged inference result and cannot duplicate provider calls or usage rows.
+//!   [SUPERNODE-MANUAL-RETRY 2026-08-14 by Codex] Restored a claimable retry
+//!   budget when an operator explicitly retries a terminal task.
 //! v2.5.5-FailureBoundary - [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex]
 //!   Made worker failure transitions atomic and conditional on `processing`.
 //! v2.5.0+SuperNode Phase A - Created. Core CRUD.
@@ -124,6 +131,31 @@ pub struct CognitiveTaskRow {
     pub retry_count: i64,
     pub max_retries: i64,
     pub error_message: Option<String>,
+}
+
+/// Outcome of staging an inference result for durable writeback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageTaskResult {
+    /// This call stored both the inference result and its usage row.
+    Stored,
+    /// A previous attempt already stored the result; no usage row was added.
+    AlreadyStored,
+}
+
+/// Immutable accounting data written with a staged inference result.
+pub(crate) struct TaskUsageRecord<'a> {
+    /// Provider that executed the inference.
+    pub provider: &'a str,
+    /// Concrete provider model used for the inference.
+    pub model: &'a str,
+    /// Prompt tokens reported by the provider.
+    pub input_tokens: i64,
+    /// Completion tokens reported by the provider.
+    pub output_tokens: i64,
+    /// Prompt tokens served from provider cache.
+    pub cached_tokens: i64,
+    /// End-to-end provider latency in milliseconds.
+    pub latency_ms: i64,
 }
 
 /// LLM usage statistics for a time window (by provider).
@@ -390,8 +422,142 @@ impl MemoryStorage {
         Ok(())
     }
 
+    /// Persist provider output and usage before attempting target writeback.
+    ///
+    /// [SUPERNODE-DURABLE-WRITEBACK 2026-08-14 by Codex] The result row is the
+    /// durable idempotency marker. Result metadata and `llm_usage_log` commit in
+    /// one SQLite transaction, so a crash cannot retain one without the other.
+    /// Repeated calls for an already-staged processing task are successful no-ops.
+    pub(crate) async fn stage_task_result_and_usage(
+        &self,
+        task_id: i64,
+        result: &str,
+        token_usage_json: &str,
+        usage: &TaskUsageRecord<'_>,
+    ) -> Result<StageTaskResult, String> {
+        let now = now_ts();
+        let mut conn = self.conn.lock().await;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("stage_task_result transaction {}: {}", task_id, e))?;
+
+        let state: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT status, result FROM cognitive_tasks WHERE id = ?1",
+                params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("stage_task_result read {}: {}", task_id, e))?;
+
+        let Some((status, existing_result)) = state else {
+            return Err(format!("stage_task_result {}: task not found", task_id));
+        };
+        if status != "processing" {
+            return Err(format!(
+                "stage_task_result {}: task is not in 'processing' state",
+                task_id
+            ));
+        }
+        if existing_result.is_some() {
+            return Ok(StageTaskResult::AlreadyStored);
+        }
+
+        let affected = tx
+            .execute(
+                "UPDATE cognitive_tasks SET
+                    result = ?1, provider_used = ?2, model_used = ?3,
+                    token_usage = ?4, error_message = NULL
+                 WHERE id = ?5 AND status = 'processing' AND result IS NULL",
+                params![
+                    result,
+                    usage.provider,
+                    usage.model,
+                    token_usage_json,
+                    task_id
+                ],
+            )
+            .map_err(|e| format!("stage_task_result update {}: {}", task_id, e))?;
+        if affected != 1 {
+            return Err(format!(
+                "stage_task_result {}: guarded update affected {} rows",
+                task_id, affected
+            ));
+        }
+
+        tx.execute(
+            "INSERT INTO llm_usage_log
+                (task_id, provider, model, input_tokens, output_tokens,
+                 cached_tokens, latency_ms, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                task_id,
+                usage.provider,
+                usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_tokens,
+                usage.latency_ms,
+                now
+            ],
+        )
+        .map_err(|e| format!("stage_task_result usage {}: {}", task_id, e))?;
+
+        tx.commit()
+            .map_err(|e| format!("stage_task_result commit {}: {}", task_id, e))?;
+        debug!(id = task_id, "[STORAGE_SN] Task result staged");
+        Ok(StageTaskResult::Stored)
+    }
+
+    /// Finalize a task only after its target writeback succeeds.
+    pub(crate) async fn complete_staged_task(&self, task_id: i64) -> Result<(), String> {
+        let now = now_ts();
+        let conn = self.conn.lock().await;
+        let affected = conn
+            .execute(
+                "UPDATE cognitive_tasks SET
+                    status = 'completed', completed_at = ?1, error_message = NULL
+                 WHERE id = ?2 AND status = 'processing' AND result IS NOT NULL",
+                params![now, task_id],
+            )
+            .map_err(|e| format!("complete_staged_task {}: {}", task_id, e))?;
+
+        if affected != 1 {
+            return Err(format!(
+                "complete_staged_task {}: staged processing task not found",
+                task_id
+            ));
+        }
+        debug!(id = task_id, "[STORAGE_SN] Staged task completed");
+        Ok(())
+    }
+
     /// Record a task failure. Resets to 'pending' if retries remain, else 'failed'.
     pub async fn fail_task(&self, task_id: i64, error_message: &str) -> Result<(), String> {
+        self.transition_task_failure(task_id, error_message, true)
+            .await
+    }
+
+    /// Record a failure caused by invalid provider output and allow re-inference.
+    ///
+    /// The usage row remains as an accurate record of the provider call, while
+    /// staged result metadata is cleared so the next claim does not replay the
+    /// same invalid output.
+    pub(crate) async fn fail_task_and_discard_result(
+        &self,
+        task_id: i64,
+        error_message: &str,
+    ) -> Result<(), String> {
+        self.transition_task_failure(task_id, error_message, false)
+            .await
+    }
+
+    async fn transition_task_failure(
+        &self,
+        task_id: i64,
+        error_message: &str,
+        preserve_staged_result: bool,
+    ) -> Result<(), String> {
         let conn = self.conn.lock().await;
         // [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex] Compute the retry
         // transition inside one guarded UPDATE. This prevents a stale worker or
@@ -406,9 +572,13 @@ impl MemoryStorage {
                 END,
                 retry_count = retry_count + 1,
                 error_message = ?1,
-                started_at = NULL
+                started_at = NULL,
+                result = CASE WHEN ?3 THEN result ELSE NULL END,
+                provider_used = CASE WHEN ?3 THEN provider_used ELSE NULL END,
+                model_used = CASE WHEN ?3 THEN model_used ELSE NULL END,
+                token_usage = CASE WHEN ?3 THEN token_usage ELSE NULL END
              WHERE id = ?2 AND status = 'processing'",
-                params![error_message, task_id],
+                params![error_message, task_id, preserve_staged_result],
             )
             .map_err(|e| format!("fail_task update {}: {}", task_id, e))?;
 
@@ -440,7 +610,8 @@ impl MemoryStorage {
     ///
     /// Unlike fail_task() (worker-called), this is the management API override.
     /// Increments retry_count by 1 (audit trail), but always allows the reset
-    /// regardless of retry_count vs max_retries.
+    /// regardless of retry_count vs max_retries. `max_retries` is extended when
+    /// necessary so `claim_pending_tasks()` can actually claim the reset row.
     /// Clears error_message and started_at for a clean attempt.
     pub async fn retry_task(&self, task_id: i64) -> Result<(), String> {
         let conn = self.conn.lock().await;
@@ -460,9 +631,13 @@ impl MemoryStorage {
             ));
         }
 
+        // [SUPERNODE-MANUAL-RETRY 2026-08-14 by Codex] The previous update
+        // incremented `retry_count` without extending the ceiling. A terminal
+        // task therefore looked pending but could never satisfy the claim query.
         conn.execute(
             "UPDATE cognitive_tasks SET
                 status = 'pending', retry_count = ?1,
+                max_retries = MAX(max_retries, ?1 + 1),
                 error_message = NULL, started_at = NULL
              WHERE id = ?2",
             params![retry_count + 1, task_id],
@@ -1202,6 +1377,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_result_is_idempotent_and_survives_writeback_retry() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let task_id = storage
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                r#"{"session_id":"s1"}"#,
+                None,
+                Some("sessions"),
+                Some("s1"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        storage.claim_pending_tasks(1).await;
+
+        let usage = TaskUsageRecord {
+            provider: "test-provider",
+            model: "test-model",
+            input_tokens: 21,
+            output_tokens: 8,
+            cached_tokens: 3,
+            latency_ms: 17,
+        };
+        let first = storage
+            .stage_task_result_and_usage(
+                task_id,
+                "Durable title",
+                r#"{"input":21,"output":8,"cached":3}"#,
+                &usage,
+            )
+            .await
+            .unwrap();
+        let second = storage
+            .stage_task_result_and_usage(
+                task_id,
+                "Must not replace the first result",
+                r#"{"input":999,"output":999,"cached":0}"#,
+                &usage,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, StageTaskResult::Stored);
+        assert_eq!(second, StageTaskResult::AlreadyStored);
+
+        let staged = storage.get_task(task_id).await.unwrap();
+        assert_eq!(staged.status, "processing");
+        assert_eq!(staged.result.as_deref(), Some("Durable title"));
+        assert_eq!(staged.provider_used.as_deref(), Some("test-provider"));
+
+        let usage_rows: i64 = {
+            let conn = storage.conn.lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM llm_usage_log WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(usage_rows, 1, "staging retries must not duplicate usage");
+
+        storage
+            .fail_task(task_id, "session_title_target_not_found")
+            .await
+            .unwrap();
+        let retry = storage.claim_pending_tasks(1).await;
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].result.as_deref(), Some("Durable title"));
+
+        storage.complete_staged_task(task_id).await.unwrap();
+        let completed = storage.get_task(task_id).await.unwrap();
+        assert_eq!(completed.status, "completed");
+        assert!(completed.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn complete_staged_task_requires_a_result() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let task_id = storage
+            .insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap()
+            .unwrap();
+        storage.claim_pending_tasks(1).await;
+
+        assert!(storage.complete_staged_task(task_id).await.is_err());
+        assert_eq!(
+            storage.get_task(task_id).await.unwrap().status,
+            "processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_output_failure_discards_only_the_staged_result() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let task_id = storage
+            .insert_cognitive_task(
+                "session_title",
+                5,
+                "{}",
+                None,
+                Some("sessions"),
+                Some("s1"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        storage.claim_pending_tasks(1).await;
+        storage
+            .stage_task_result_and_usage(
+                task_id,
+                "",
+                r#"{"input":2,"output":0,"cached":0}"#,
+                &TaskUsageRecord {
+                    provider: "test-provider",
+                    model: "test-model",
+                    input_tokens: 2,
+                    output_tokens: 0,
+                    cached_tokens: 0,
+                    latency_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        storage
+            .fail_task_and_discard_result(task_id, "session_title_empty")
+            .await
+            .unwrap();
+        let pending = storage.get_task(task_id).await.unwrap();
+        assert_eq!(pending.status, "pending");
+        assert!(pending.result.is_none());
+        assert!(pending.provider_used.is_none());
+        assert!(pending.model_used.is_none());
+        assert!(pending.token_usage.is_none());
+
+        let usage_rows: i64 = {
+            let conn = storage.conn.lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM llm_usage_log WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(usage_rows, 1, "actual provider usage must remain auditable");
+    }
+
+    #[tokio::test]
     async fn test_fail_task_retries() {
         let s = MemoryStorage::open(":memory:", None).unwrap();
         let id = s
@@ -1298,6 +1626,13 @@ mod tests {
         let t2 = s.get_task(id).await.unwrap();
         assert_eq!(t2.status, "pending");
         assert_eq!(t2.retry_count, 2); // incremented, not reset
+        assert!(
+            t2.retry_count < t2.max_retries,
+            "manual retry must restore a claimable retry budget"
+        );
+        let claimed = s.claim_pending_tasks(1).await;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, id);
     }
 
     #[tokio::test]

@@ -15,6 +15,9 @@
 //! Re-exported via prompts.rs. Use PrivacyLevel::from_str() for DB string parsing.
 //!
 //! ## Last Modified
+//! v2.5.6-DurableWriteback - [SUPERNODE-DURABLE-WRITEBACK 2026-08-14 by Codex]
+//!   Persists inference output and usage atomically before target writeback;
+//!   retries now reuse the staged result instead of calling the provider again.
 //! v2.5.5-FailureBoundary - [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex]
 //!   Reclaims panicked tasks, persists only stable failure reasons, and removes
 //!   provider output previews from JSON-parse logs.
@@ -38,7 +41,7 @@ use super::storage::MemoryStorage;
 // CognitiveTaskType is re-exported from config_supernode via llm_provider
 use super::llm_provider::{ChatRequest, CognitiveTaskType};
 use super::llm_router::LlmRouter;
-use super::storage_supernode::CognitiveTaskRow;
+use super::storage_supernode::{CognitiveTaskRow, StageTaskResult, TaskUsageRecord};
 // PrivacyLevel is re-exported from config_supernode via prompts
 use super::prompts::{
     build_code_analysis, build_community_narrative, build_conflict_resolution,
@@ -53,6 +56,34 @@ use crate::config_supernode::{PrivacyLevel, WorkerConfig};
 // ============================================
 
 const MAX_RESULT_LEN: usize = 8192;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritebackRetry {
+    ReuseStagedResult,
+    RecomputeInference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskWritebackError {
+    reason: &'static str,
+    retry: WritebackRetry,
+}
+
+impl TaskWritebackError {
+    const fn reuse(reason: &'static str) -> Self {
+        Self {
+            reason,
+            retry: WritebackRetry::ReuseStagedResult,
+        }
+    }
+
+    const fn recompute(reason: &'static str) -> Self {
+        Self {
+            reason,
+            retry: WritebackRetry::RecomputeInference,
+        }
+    }
+}
 
 // ============================================
 // TaskWorker
@@ -192,91 +223,164 @@ impl TaskWorker {
             }
         };
 
-        // v2.5.0+Unify: Use PrivacyLevel::from_str() (defined in config_supernode.rs)
-        let privacy = PrivacyLevel::from_str(task.privacy_level.as_str());
+        // [SUPERNODE-DURABLE-WRITEBACK 2026-08-14 by Codex] A staged result is
+        // the durable provider-call boundary. Retries after writeback failure or
+        // process restart reuse it, preventing duplicate inference and billing.
+        let mut reused_staged_result = task.result.is_some();
+        let mut result_stored = task.result.clone().unwrap_or_default();
+        let mut provider_used = task.provider_used.clone().unwrap_or_default();
+        let mut model_used = task.model_used.clone().unwrap_or_default();
+        let mut input_tokens = 0_u32;
+        let mut output_tokens = 0_u32;
+        let mut latency_ms = 0_u64;
 
-        let chat_req = match Self::build_prompt_for_task(&task_type, &payload, privacy).await {
-            Ok(req) => req,
-            Err(_) => {
+        if !reused_staged_result {
+            // v2.5.0+Unify: Use PrivacyLevel::from_str() (defined in config_supernode.rs)
+            let privacy = PrivacyLevel::from_str(task.privacy_level.as_str());
+            let chat_req = match Self::build_prompt_for_task(&task_type, &payload, privacy).await {
+                Ok(req) => req,
+                Err(_) => {
+                    warn!(
+                        id = task_id,
+                        reason = "prompt_build_failed",
+                        "[TASK_WORKER] Prompt build failed"
+                    );
+                    let _ = storage.fail_task(task_id, "prompt_build_failed").await;
+                    return;
+                }
+            };
+
+            let resp = match router.route(&task_type, &chat_req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let reason = e.reason_code();
+                    warn!(id = task_id, reason, "[TASK_WORKER] LLM call failed");
+                    let _ = storage.fail_task(task_id, reason).await;
+                    return;
+                }
+            };
+
+            latency_ms = start.elapsed().as_millis() as u64;
+            input_tokens = resp.usage.input_tokens;
+            output_tokens = resp.usage.output_tokens;
+            provider_used = resp.provider_name.clone();
+            model_used = resp.model_used.clone();
+
+            let cleaned = clean_llm_response(&resp.content, &task_type);
+            result_stored = truncate_utf8(&cleaned, MAX_RESULT_LEN).to_string();
+            let token_usage_json = serde_json::json!({
+                "input": input_tokens,
+                "output": output_tokens,
+                "cached": resp.usage.cached_tokens,
+            })
+            .to_string();
+            let usage = TaskUsageRecord {
+                provider: &provider_used,
+                model: &model_used,
+                input_tokens: input_tokens as i64,
+                output_tokens: output_tokens as i64,
+                cached_tokens: resp.usage.cached_tokens as i64,
+                latency_ms: latency_ms as i64,
+            };
+
+            match storage
+                .stage_task_result_and_usage(task_id, &result_stored, &token_usage_json, &usage)
+                .await
+            {
+                Ok(StageTaskResult::Stored) => {}
+                Ok(StageTaskResult::AlreadyStored) => {
+                    let Some(staged) = storage.get_task(task_id).await else {
+                        let _ = storage.fail_task(task_id, "task_result_stage_lost").await;
+                        return;
+                    };
+                    let Some(staged_result) = staged.result else {
+                        let _ = storage.fail_task(task_id, "task_result_stage_lost").await;
+                        return;
+                    };
+                    result_stored = staged_result;
+                    reused_staged_result = true;
+                }
+                Err(error) => {
+                    warn!(
+                        id = task_id,
+                        reason = "task_result_stage_failed",
+                        "[TASK_WORKER] Could not stage inference result"
+                    );
+                    debug!(id = task_id, error = %error, "[TASK_WORKER] Result stage detail");
+                    let _ = storage.fail_task(task_id, "task_result_stage_failed").await;
+                    return;
+                }
+            }
+        } else {
+            debug!(
+                id = task_id,
+                "[TASK_WORKER] Reusing staged inference result for writeback"
+            );
+        }
+
+        match (task.target_table.as_deref(), task.target_id.as_deref()) {
+            (Some(table), Some(target_id)) => {
+                if let Err(error) = Self::write_back(
+                    &storage,
+                    &task_type,
+                    table,
+                    target_id,
+                    &result_stored,
+                    &payload,
+                )
+                .await
+                {
+                    warn!(
+                        id = task_id,
+                        reason = error.reason,
+                        retry = ?error.retry,
+                        "[TASK_WORKER] Durable writeback failed"
+                    );
+                    let _ = match error.retry {
+                        WritebackRetry::ReuseStagedResult => {
+                            storage.fail_task(task_id, error.reason).await
+                        }
+                        WritebackRetry::RecomputeInference => {
+                            storage
+                                .fail_task_and_discard_result(task_id, error.reason)
+                                .await
+                        }
+                    };
+                    return;
+                }
+            }
+            (None, None) => {}
+            _ => {
+                let reason = "task_target_metadata_incomplete";
                 warn!(
                     id = task_id,
-                    reason = "prompt_build_failed",
-                    "[TASK_WORKER] Prompt build failed"
+                    reason, "[TASK_WORKER] Invalid target metadata"
                 );
-                let _ = storage.fail_task(task_id, "prompt_build_failed").await;
-                return;
-            }
-        };
-
-        let resp = match router.route(&task_type, &chat_req).await {
-            Ok(r) => r,
-            Err(e) => {
-                let reason = e.reason_code();
-                warn!(id = task_id, reason, "[TASK_WORKER] LLM call failed");
                 let _ = storage.fail_task(task_id, reason).await;
                 return;
             }
-        };
-
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-
-        let cleaned = clean_llm_response(&resp.content, &task_type);
-        let result_stored = &cleaned[..cleaned.len().min(MAX_RESULT_LEN)];
-
-        let token_usage_json = serde_json::json!({
-            "input": resp.usage.input_tokens,
-            "output": resp.usage.output_tokens,
-            "cached": resp.usage.cached_tokens,
-        })
-        .to_string();
-
-        // target_table and target_id are Option<String> — use as_deref()
-        if let (Some(table), Some(tid)) = (task.target_table.as_deref(), task.target_id.as_deref())
-        {
-            if let Err(e) =
-                Self::write_back(&storage, &task_type, table, tid, result_stored, &payload).await
-            {
-                warn!(
-                    id = task_id, table = table, target_id = tid,
-                    error = %e, "[TASK_WORKER] Writeback failed (result preserved in DB)"
-                );
-            }
         }
 
-        if let Err(e) = storage
-            .complete_task(
-                task_id,
-                result_stored,
-                &resp.provider_name,
-                &resp.model_used,
-                &token_usage_json,
-            )
-            .await
-        {
-            warn!(id = task_id, error = %e, "[TASK_WORKER] complete_task failed");
-        }
-
-        if let Err(e) = storage
-            .insert_usage_log(
-                Some(task_id),
-                &resp.provider_name,
-                &resp.model_used,
-                resp.usage.input_tokens as i64,
-                resp.usage.output_tokens as i64,
-                resp.usage.cached_tokens as i64,
-                elapsed_ms as i64,
-            )
-            .await
-        {
-            warn!(id = task_id, error = %e, "[TASK_WORKER] insert_usage_log failed");
+        if let Err(error) = storage.complete_staged_task(task_id).await {
+            let reason = "task_completion_failed";
+            warn!(
+                id = task_id,
+                reason, "[TASK_WORKER] Completion transition failed"
+            );
+            debug!(id = task_id, error = %error, "[TASK_WORKER] Completion detail");
+            let _ = storage.fail_task(task_id, reason).await;
+            return;
         }
 
         info!(
-            id = task_id, task_type = task_type_str,
-            provider = %resp.provider_name, model = %resp.model_used,
-            input_tokens = resp.usage.input_tokens,
-            output_tokens = resp.usage.output_tokens,
-            latency_ms = elapsed_ms,
+            id = task_id,
+            task_type = task_type_str,
+            provider = %provider_used,
+            model = %model_used,
+            input_tokens,
+            output_tokens,
+            latency_ms,
+            reused_staged_result,
             "[TASK_WORKER] ✅ Complete"
         );
     }
@@ -466,36 +570,50 @@ impl TaskWorker {
     async fn write_back(
         storage: &Arc<MemoryStorage>,
         task_type: &CognitiveTaskType,
-        _target_table: &str,
+        target_table: &str,
         target_id: &str,
         result: &str,
         payload: &serde_json::Value,
-    ) -> Result<(), String> {
+    ) -> Result<(), TaskWritebackError> {
+        let expected_table = match task_type {
+            CognitiveTaskType::SessionTitle | CognitiveTaskType::RecallSynthesis => "sessions",
+            CognitiveTaskType::CommunityNarrative => "communities",
+            CognitiveTaskType::ConflictResolution => "knowledge_edges",
+            CognitiveTaskType::CodeAnalysis => "artifacts",
+            CognitiveTaskType::EntityDescription => "entities",
+        };
+        if target_table != expected_table {
+            return Err(TaskWritebackError::reuse("task_target_table_mismatch"));
+        }
+
         match task_type {
             CognitiveTaskType::SessionTitle => {
                 let title = result
                     .trim_matches(|c| c == '"' || c == '\'' || c == '`')
                     .trim();
                 if title.is_empty() {
-                    return Err("LLM returned empty title".to_string());
+                    return Err(TaskWritebackError::recompute("session_title_empty"));
                 }
                 let conn = storage.conn_lock().await;
-                conn.execute(
-                    "UPDATE sessions SET title = ?1 WHERE session_id = ?2",
-                    rusqlite::params![title, target_id],
-                )
-                .map_err(|e| format!("sessions.title writeback: {}", e))?;
-                debug!(
-                    session = target_id,
-                    title = title,
-                    "[TASK_WORKER] session_title written"
-                );
+                let affected = conn
+                    .execute(
+                        "UPDATE sessions SET title = ?1 WHERE session_id = ?2",
+                        rusqlite::params![title, target_id],
+                    )
+                    .map_err(|error| {
+                        debug!(error = %error, "[TASK_WORKER] Session title writeback detail");
+                        TaskWritebackError::reuse("session_title_writeback_failed")
+                    })?;
+                if affected != 1 {
+                    return Err(TaskWritebackError::reuse("session_title_target_not_found"));
+                }
+                debug!(writeback = "session_title", "[TASK_WORKER] Target updated");
             }
 
             CognitiveTaskType::CommunityNarrative => {
                 let summary = result.trim();
                 if summary.is_empty() {
-                    return Err("LLM returned empty community summary".to_string());
+                    return Err(TaskWritebackError::recompute("community_narrative_empty"));
                 }
                 // Write summary directly via SQL — avoids needing get_community()
                 // which doesn't exist on MemoryStorage. upsert_community requires
@@ -507,13 +625,18 @@ impl TaskWorker {
                         "UPDATE communities SET summary = ?1 WHERE community_id = ?2",
                         rusqlite::params![summary, target_id],
                     )
-                    .map_err(|e| format!("communities.summary writeback: {}", e))?;
-                if affected == 0 {
-                    return Err(format!("Community {} not found for writeback", target_id));
+                    .map_err(|error| {
+                        debug!(error = %error, "[TASK_WORKER] Community writeback detail");
+                        TaskWritebackError::reuse("community_narrative_writeback_failed")
+                    })?;
+                if affected != 1 {
+                    return Err(TaskWritebackError::reuse(
+                        "community_narrative_target_not_found",
+                    ));
                 }
                 debug!(
-                    community = target_id,
-                    "[TASK_WORKER] community_narrative written"
+                    writeback = "community_narrative",
+                    "[TASK_WORKER] Target updated"
                 );
             }
 
@@ -522,35 +645,101 @@ impl TaskWorker {
                 let summary = parsed["summary"].as_str().unwrap_or(result).trim();
                 let key_decisions = parsed["key_decisions"].as_str();
                 if summary.is_empty() {
-                    return Err("LLM returned empty summary".to_string());
+                    return Err(TaskWritebackError::recompute("recall_synthesis_empty"));
                 }
-                storage
-                    .update_session_summary(target_id, summary, key_decisions, None)
-                    .await;
+                let conn = storage.conn_lock().await;
+                let affected = conn
+                    .execute(
+                        "UPDATE sessions SET
+                            summary = ?1, key_decisions = ?2, summary_generated = 1
+                         WHERE session_id = ?3",
+                        rusqlite::params![summary, key_decisions, target_id],
+                    )
+                    .map_err(|error| {
+                        debug!(error = %error, "[TASK_WORKER] Recall writeback detail");
+                        TaskWritebackError::reuse("recall_synthesis_writeback_failed")
+                    })?;
+                if affected != 1 {
+                    return Err(TaskWritebackError::reuse(
+                        "recall_synthesis_target_not_found",
+                    ));
+                }
                 debug!(
-                    session = target_id,
-                    "[TASK_WORKER] recall_synthesis written"
+                    writeback = "recall_synthesis",
+                    "[TASK_WORKER] Target updated"
                 );
             }
 
             CognitiveTaskType::ConflictResolution => {
                 let parsed = parse_json_result(result);
                 let keep_id = parsed["keep_edge_id"].as_i64().ok_or_else(|| {
-                    format!("conflict_resolution missing keep_edge_id: {}", result)
+                    TaskWritebackError::recompute("conflict_resolution_invalid_result")
                 })?;
-                if let Some(edge_ids) = payload["conflict_edge_ids"].as_array() {
-                    for val in edge_ids {
-                        if let Some(eid) = val.as_i64() {
-                            if eid != keep_id {
-                                storage.invalidate_edge(eid).await;
-                            }
-                        }
+                let edge_ids: Vec<i64> = payload["conflict_edge_ids"]
+                    .as_array()
+                    .ok_or_else(|| {
+                        TaskWritebackError::reuse("conflict_resolution_invalid_payload")
+                    })?
+                    .iter()
+                    .filter_map(serde_json::Value::as_i64)
+                    .collect();
+                if edge_ids.is_empty() || !edge_ids.contains(&keep_id) {
+                    return Err(TaskWritebackError::reuse(
+                        "conflict_resolution_invalid_payload",
+                    ));
+                }
+
+                // [SUPERNODE-DURABLE-WRITEBACK 2026-08-14 by Codex] Validate
+                // and invalidate the complete conflict set in one transaction;
+                // partial graph mutation must never escape a failed attempt.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let mut conn = storage.conn_lock().await;
+                let tx = conn.transaction().map_err(|error| {
+                    debug!(error = %error, "[TASK_WORKER] Conflict transaction detail");
+                    TaskWritebackError::reuse("conflict_resolution_writeback_failed")
+                })?;
+                let keep_exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM knowledge_edges WHERE edge_id = ?1)",
+                        rusqlite::params![keep_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        debug!(error = %error, "[TASK_WORKER] Conflict validation detail");
+                        TaskWritebackError::reuse("conflict_resolution_writeback_failed")
+                    })?;
+                if !keep_exists {
+                    return Err(TaskWritebackError::reuse(
+                        "conflict_resolution_target_not_found",
+                    ));
+                }
+                for edge_id in edge_ids.into_iter().filter(|edge_id| *edge_id != keep_id) {
+                    let affected = tx
+                        .execute(
+                            "UPDATE knowledge_edges SET valid_until = ?1, updated_at = ?1
+                             WHERE edge_id = ?2",
+                            rusqlite::params![now, edge_id],
+                        )
+                        .map_err(|error| {
+                            debug!(error = %error, "[TASK_WORKER] Conflict update detail");
+                            TaskWritebackError::reuse("conflict_resolution_writeback_failed")
+                        })?;
+                    if affected != 1 {
+                        return Err(TaskWritebackError::reuse(
+                            "conflict_resolution_target_not_found",
+                        ));
                     }
                 }
+                tx.commit().map_err(|error| {
+                    debug!(error = %error, "[TASK_WORKER] Conflict commit detail");
+                    TaskWritebackError::reuse("conflict_resolution_writeback_failed")
+                })?;
                 debug!(
-                    target_id = target_id,
-                    keep_id = keep_id,
-                    "[TASK_WORKER] conflict_resolution written"
+                    writeback = "conflict_resolution",
+                    "[TASK_WORKER] Target updated"
                 );
             }
 
@@ -558,30 +747,48 @@ impl TaskWorker {
                 let parsed = parse_json_result(result);
                 let description = parsed["description"].as_str().unwrap_or(result).trim();
                 if description.is_empty() {
-                    return Err("LLM returned empty code description".to_string());
+                    return Err(TaskWritebackError::recompute("code_analysis_empty"));
                 }
                 let conn = storage.conn_lock().await;
-                conn.execute(
-                    "UPDATE artifacts SET description = ?1 WHERE artifact_id = ?2",
-                    rusqlite::params![description, target_id],
-                )
-                .map_err(|e| format!("artifacts.description writeback: {}", e))?;
-                debug!(artifact = target_id, "[TASK_WORKER] code_analysis written");
+                let affected = conn
+                    .execute(
+                        "UPDATE artifacts SET description = ?1 WHERE artifact_id = ?2",
+                        rusqlite::params![description, target_id],
+                    )
+                    .map_err(|error| {
+                        debug!(error = %error, "[TASK_WORKER] Code writeback detail");
+                        TaskWritebackError::reuse("code_analysis_writeback_failed")
+                    })?;
+                if affected != 1 {
+                    return Err(TaskWritebackError::reuse("code_analysis_target_not_found"));
+                }
+                debug!(writeback = "code_analysis", "[TASK_WORKER] Target updated");
             }
 
             CognitiveTaskType::EntityDescription => {
                 let desc = result.trim_matches(|c| c == '"' || c == '\'').trim();
                 if desc.is_empty() {
-                    return Err("LLM returned empty entity description".to_string());
+                    return Err(TaskWritebackError::recompute("entity_description_empty"));
                 }
                 let conn = storage.conn_lock().await;
-                conn.execute(
-                    "UPDATE entities SET description = ?1, updated_at = strftime('%s', 'now') WHERE entity_id = ?2",
-                    rusqlite::params![desc, target_id],
-                ).map_err(|e| format!("entities.description writeback: {}", e))?;
+                let affected = conn
+                    .execute(
+                        "UPDATE entities SET description = ?1,
+                            updated_at = strftime('%s', 'now') WHERE entity_id = ?2",
+                        rusqlite::params![desc, target_id],
+                    )
+                    .map_err(|error| {
+                        debug!(error = %error, "[TASK_WORKER] Entity writeback detail");
+                        TaskWritebackError::reuse("entity_description_writeback_failed")
+                    })?;
+                if affected != 1 {
+                    return Err(TaskWritebackError::reuse(
+                        "entity_description_target_not_found",
+                    ));
+                }
                 debug!(
-                    entity = target_id,
-                    "[TASK_WORKER] entity_description written"
+                    writeback = "entity_description",
+                    "[TASK_WORKER] Target updated"
                 );
             }
         }
@@ -593,6 +800,19 @@ impl TaskWorker {
 // ============================================
 // LLM Response Cleaner
 // ============================================
+
+/// Return at most `max_bytes` without splitting a UTF-8 scalar value.
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
 
 fn clean_llm_response(raw: &str, task_type: &CognitiveTaskType) -> String {
     let after_think = strip_think_tags(raw);
@@ -722,11 +942,21 @@ impl std::fmt::Debug for TaskWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::super::llm_provider::{ChatResponse, LlmError, LlmProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::super::llm_provider::{ChatResponse, LlmError, LlmProvider, TokenUsage};
     use super::*;
     use crate::config_supernode::TaskRoutingConfig;
 
     struct PanickingProvider;
+
+    struct CountingProvider {
+        calls: AtomicUsize,
+    }
+
+    struct RecoveringProvider {
+        calls: AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl LlmProvider for PanickingProvider {
@@ -743,10 +973,72 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl LlmProvider for CountingProvider {
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: "Durable session title".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 13,
+                    output_tokens: 4,
+                    cached_tokens: 2,
+                },
+                model_used: "counting-model".to_string(),
+                provider_name: "counting-provider".to_string(),
+                latency_ms: 1,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "counting-provider"
+        }
+
+        fn default_model(&self) -> &str {
+            "counting-model"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RecoveringProvider {
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: if attempt == 0 {
+                    String::new()
+                } else {
+                    "Recovered title".to_string()
+                },
+                usage: TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: u32::from(attempt > 0),
+                    cached_tokens: 0,
+                },
+                model_used: "recovering-model".to_string(),
+                provider_name: "recovering-provider".to_string(),
+                latency_ms: 1,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "recovering-provider"
+        }
+
+        fn default_model(&self) -> &str {
+            "recovering-model"
+        }
+    }
+
     #[test]
     fn malformed_unicode_json_is_rejected_without_byte_boundary_panic() {
         let malformed = "界".repeat(100);
         assert!(parse_json_result(&malformed).is_null());
+    }
+
+    #[test]
+    fn result_truncation_preserves_utf8_boundaries() {
+        assert_eq!(truncate_utf8("界界", 5), "界");
+        assert_eq!(truncate_utf8("short", MAX_RESULT_LEN), "short");
     }
 
     #[tokio::test]
@@ -790,5 +1082,149 @@ mod tests {
         assert_eq!(task.status, "pending");
         assert_eq!(task.retry_count, 1);
         assert_eq!(task.error_message.as_deref(), Some("task_worker_panicked"));
+    }
+
+    #[tokio::test]
+    async fn writeback_retry_reuses_staged_result_without_rebilling() {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let task_id = storage
+            .insert_cognitive_task(
+                "session_title",
+                1,
+                r#"{"entity_names":[]}"#,
+                None,
+                Some("sessions"),
+                Some("session-retry"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let provider = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let router = Arc::new(LlmRouter::new(
+            vec![(
+                "counting-provider".into(),
+                "http://localhost".into(),
+                "counting-model".into(),
+                provider.clone() as Arc<dyn LlmProvider>,
+            )],
+            TaskRoutingConfig::default(),
+        ));
+        let worker = TaskWorker::new(
+            Arc::clone(&storage),
+            router,
+            WorkerConfig {
+                max_concurrent: 1,
+                ..WorkerConfig::default()
+            },
+        );
+
+        worker.process_batch().await;
+        let pending = storage.get_task(task_id).await.unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.retry_count, 1);
+        assert_eq!(
+            pending.error_message.as_deref(),
+            Some("session_title_target_not_found")
+        );
+        assert_eq!(
+            pending.result.as_deref(),
+            Some("Durable session title"),
+            "provider output must survive the failed writeback"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.get_usage_stats(0, 0).await.total_calls, 1);
+
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "INSERT INTO sessions (session_id, owner, started_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["session-retry", vec![0_u8; 32], 1_i64],
+            )
+            .unwrap();
+        }
+
+        worker.process_batch().await;
+        let completed = storage.get_task(task_id).await.unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.get_usage_stats(0, 0).await.total_calls, 1);
+
+        let title: String = {
+            let conn = storage.conn_lock().await;
+            conn.query_row(
+                "SELECT title FROM sessions WHERE session_id = ?1",
+                rusqlite::params!["session-retry"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(title, "Durable session title");
+    }
+
+    #[tokio::test]
+    async fn invalid_provider_output_is_recomputed_on_retry() {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "INSERT INTO sessions (session_id, owner, started_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["session-invalid", vec![0_u8; 32], 1_i64],
+            )
+            .unwrap();
+        }
+        let task_id = storage
+            .insert_cognitive_task(
+                "session_title",
+                1,
+                r#"{"entity_names":[]}"#,
+                None,
+                Some("sessions"),
+                Some("session-invalid"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let provider = Arc::new(RecoveringProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let router = Arc::new(LlmRouter::new(
+            vec![(
+                "recovering-provider".into(),
+                "http://localhost".into(),
+                "recovering-model".into(),
+                provider.clone() as Arc<dyn LlmProvider>,
+            )],
+            TaskRoutingConfig::default(),
+        ));
+        let worker = TaskWorker::new(
+            Arc::clone(&storage),
+            router,
+            WorkerConfig {
+                max_concurrent: 1,
+                ..WorkerConfig::default()
+            },
+        );
+
+        worker.process_batch().await;
+        let pending = storage.get_task(task_id).await.unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(
+            pending.error_message.as_deref(),
+            Some("session_title_empty")
+        );
+        assert!(pending.result.is_none());
+
+        worker.process_batch().await;
+        assert_eq!(storage.get_task(task_id).await.unwrap().status, "completed");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.get_usage_stats(0, 0).await.total_calls, 2);
     }
 }
