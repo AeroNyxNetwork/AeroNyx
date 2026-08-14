@@ -3433,7 +3433,16 @@ impl Server {
             let reranker_engine = self.init_reranker_engine();
 
             if llm_router.is_some() {
-                let timeout_secs = self.config.memchain.supernode.worker.task_timeout_secs as i64;
+                // [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex] Startup and the
+                // live worker must agree on when a processing claim is expired.
+                // The grace interval prevents a second process from stealing a
+                // task while its original owner persists the timeout outcome.
+                let timeout_secs = self
+                    .config
+                    .memchain
+                    .supernode
+                    .worker
+                    .stale_claim_recovery_secs();
                 let recovered = st.reset_stale_processing_tasks(timeout_secs).await;
                 if recovered > 0 {
                     info!(recovered, timeout_secs, "[SUPERNODE] Recovered stale tasks");

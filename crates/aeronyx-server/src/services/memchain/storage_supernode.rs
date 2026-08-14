@@ -28,7 +28,8 @@
 //! - get_tasks_filtered()           — list tasks with optional status + task_type filters (paginated)
 //! - get_tasks_for_target()         — find tasks for a specific (table, id) pair
 //! - count_tasks_by_status()        — HashMap<status, count> for queue summary
-//! - reset_stale_processing_tasks() — on startup: recover tasks stuck in 'processing'
+//! - reset_stale_processing_tasks() — recover tasks stuck in 'processing'
+//! - recover_and_claim_pending_tasks() — atomically recover expired claims and claim work
 //!
 //! ### llm_usage_log CRUD
 //! - insert_usage_log()              — write a single LLM call record
@@ -62,7 +63,8 @@
 //!   (pending/processing) task already exists for the same (target_table, target_id,
 //!   task_type) triple. Returns Ok(None) in that case. Callers must handle Option<i64>.
 //! - reset_stale_processing_tasks() MUST be called at server startup before TaskWorker
-//!   spawns. Recovers tasks stuck in 'processing' after a crash/restart.
+//!   spawns. The worker also performs recovery in the same transaction as each
+//!   claim, so a fresh orphan skipped by the startup timeout cannot remain stuck.
 //! - claim_pending_tasks() uses an IMMEDIATE SQLite transaction. A process-local
 //!   mutex alone does not prevent another connection or process from claiming
 //!   the same row. Do not weaken this to separate autocommit statements.
@@ -75,6 +77,9 @@
 //!   task_id in llm_usage_log (e.g. manual inserts) are excluded.
 //!
 //! ## Last Modified
+//! v2.5.8-CrashLeaseRecovery - [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex]
+//!   Recovers expired processing claims in the same IMMEDIATE transaction as
+//!   the next task claim, closing the fast-crash/restart orphan window.
 //! v2.5.7-TaskOwnership - [SUPERNODE-TASK-OWNERSHIP 2026-08-14 by Codex]
 //!   Claims now use an IMMEDIATE SQLite transaction across SELECT + UPDATE,
 //!   preventing duplicate execution across independent database connections.
@@ -112,6 +117,12 @@ use tracing::{debug, info, warn};
 
 use super::storage::MemoryStorage;
 
+const EXPIRED_CLAIM_REASON: &str = "task_worker_claim_expired";
+const RECOVER_STALE_TASKS_SQL: &str = "UPDATE cognitive_tasks
+     SET status = 'pending', started_at = NULL, error_message = ?1
+     WHERE status = 'processing'
+       AND (started_at IS NULL OR started_at <= ?2)";
+
 // ============================================
 // Row Types
 // ============================================
@@ -137,6 +148,14 @@ pub struct CognitiveTaskRow {
     pub retry_count: i64,
     pub max_retries: i64,
     pub error_message: Option<String>,
+}
+
+/// Result of an atomic stale-claim recovery and pending-task claim.
+pub(crate) struct TaskClaimBatch {
+    /// Tasks now durably owned by the caller.
+    pub tasks: Vec<CognitiveTaskRow>,
+    /// Expired processing rows returned to the pending queue in this transaction.
+    pub recovered: usize,
 }
 
 /// Outcome of staging an inference result for durable writeback.
@@ -287,19 +306,20 @@ impl MemoryStorage {
         Ok(Some(id))
     }
 
-    /// Recover tasks stuck in 'processing' after a server crash or restart.
+    /// Recover tasks stuck in 'processing' after a worker crash or restart.
     ///
     /// ## When to Call
-    /// Call ONCE at server startup, before TaskWorker spawns. Typical location:
-    /// `server.rs::init_llm_router()` or immediately before `TaskWorker::spawn()`.
+    /// Call at server startup before TaskWorker spawns. The live worker also uses
+    /// [`Self::recover_and_claim_pending_tasks`] so tasks that are still fresh at
+    /// a quick restart are recovered once their ownership deadline expires.
     ///
     /// ## Logic
     /// Any task that has been in 'processing' for longer than `timeout_secs`
     /// is assumed to have been orphaned by a crash. It is reset to 'pending'
     /// so the TaskWorker can re-claim it.
     ///
-    /// The `retry_count` is NOT incremented here — the crash was not the task's
-    /// fault. The error_message is set to indicate the recovery event for audit.
+    /// The `retry_count` is NOT incremented here because infrastructure failure
+    /// is not a task failure. A stable reason code is retained for audit.
     ///
     /// ## Parameters
     /// - `timeout_secs` — should match `supernode.worker.task_timeout_secs` from config.
@@ -308,24 +328,19 @@ impl MemoryStorage {
     /// Returns the number of tasks recovered.
     pub async fn reset_stale_processing_tasks(&self, timeout_secs: i64) -> usize {
         let now = now_ts();
-        let stale_before = now - timeout_secs;
+        let stale_before = now.saturating_sub(timeout_secs.max(1));
 
         let conn = self.conn.lock().await;
         match conn.execute(
-            "UPDATE cognitive_tasks
-             SET status        = 'pending',
-                 started_at    = NULL,
-                 error_message = 'Recovered: task was in processing at server startup'
-             WHERE status     = 'processing'
-               AND started_at < ?1",
-            params![stale_before],
+            RECOVER_STALE_TASKS_SQL,
+            params![EXPIRED_CLAIM_REASON, stale_before],
         ) {
             Ok(n) => {
                 if n > 0 {
                     info!(
                         recovered = n,
                         timeout_secs = timeout_secs,
-                        "[STORAGE_SN] Recovered stale processing tasks on startup"
+                        "[STORAGE_SN] Recovered stale processing task claims"
                     );
                 }
                 n
@@ -345,8 +360,35 @@ impl MemoryStorage {
     /// SQLite writer reservation before the SELECT, so no competing claimant
     /// can observe and transition the same pending rows between these steps.
     pub async fn claim_pending_tasks(&self, batch_size: usize) -> Vec<CognitiveTaskRow> {
+        self.claim_pending_tasks_inner(batch_size, None).await.tasks
+    }
+
+    /// Atomically recover expired processing claims and claim pending work.
+    ///
+    /// [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex] Startup-only recovery leaves
+    /// a liveness hole when a process crashes immediately after claiming a row:
+    /// the quick restart sees a fresh claim, skips it, and never revisits it.
+    /// Recovery and claiming share one IMMEDIATE transaction here so an expired
+    /// orphan becomes claimable without an intermediate externally visible state.
+    pub(crate) async fn recover_and_claim_pending_tasks(
+        &self,
+        batch_size: usize,
+        stale_after_secs: i64,
+    ) -> TaskClaimBatch {
+        self.claim_pending_tasks_inner(batch_size, Some(stale_after_secs))
+            .await
+    }
+
+    async fn claim_pending_tasks_inner(
+        &self,
+        batch_size: usize,
+        stale_after_secs: Option<i64>,
+    ) -> TaskClaimBatch {
         if batch_size == 0 {
-            return Vec::new();
+            return TaskClaimBatch {
+                tasks: Vec::new(),
+                recovered: 0,
+            };
         }
 
         let now = now_ts();
@@ -360,8 +402,34 @@ impl MemoryStorage {
                     error = %e,
                     "[STORAGE_SN] Could not begin task claim transaction"
                 );
-                return Vec::new();
+                return TaskClaimBatch {
+                    tasks: Vec::new(),
+                    recovered: 0,
+                };
             }
+        };
+
+        let recovered = if let Some(stale_after_secs) = stale_after_secs {
+            let stale_before = now.saturating_sub(stale_after_secs.max(1));
+            match transaction.execute(
+                RECOVER_STALE_TASKS_SQL,
+                params![EXPIRED_CLAIM_REASON, stale_before],
+            ) {
+                Ok(recovered) => recovered,
+                Err(e) => {
+                    warn!(
+                        reason = "task_claim_recovery_failed",
+                        error = %e,
+                        "[STORAGE_SN] Task claim transaction rolled back"
+                    );
+                    return TaskClaimBatch {
+                        tasks: Vec::new(),
+                        recovered: 0,
+                    };
+                }
+            }
+        } else {
+            0
         };
 
         let candidates: Vec<CognitiveTaskRow> = {
@@ -382,27 +450,42 @@ impl MemoryStorage {
                         error = %e,
                         "[STORAGE_SN] Could not prepare task claim query"
                     );
-                    return Vec::new();
+                    return TaskClaimBatch {
+                        tasks: Vec::new(),
+                        recovered: 0,
+                    };
                 }
             };
 
             let query_result = match statement.query_map(params![limit], task_row) {
-                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Ok(rows) => match rows.collect::<rusqlite::Result<Vec<_>>>() {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!(
+                            reason = "task_claim_row_decode_failed",
+                            error = %e,
+                            "[STORAGE_SN] Could not decode task claim candidate"
+                        );
+                        return TaskClaimBatch {
+                            tasks: Vec::new(),
+                            recovered: 0,
+                        };
+                    }
+                },
                 Err(e) => {
                     warn!(
                         reason = "task_claim_query_failed",
                         error = %e,
                         "[STORAGE_SN] Could not read task claim candidates"
                     );
-                    return Vec::new();
+                    return TaskClaimBatch {
+                        tasks: Vec::new(),
+                        recovered: 0,
+                    };
                 }
             };
             query_result
         };
-
-        if candidates.is_empty() {
-            return Vec::new();
-        }
 
         let mut claimed = Vec::with_capacity(candidates.len());
         for task in candidates {
@@ -419,7 +502,10 @@ impl MemoryStorage {
                         error = %e,
                         "[STORAGE_SN] Task claim transaction rolled back"
                     );
-                    return Vec::new();
+                    return TaskClaimBatch {
+                        tasks: Vec::new(),
+                        recovered: 0,
+                    };
                 }
             };
             if affected == 1 {
@@ -433,11 +519,20 @@ impl MemoryStorage {
                 error = %e,
                 "[STORAGE_SN] Task claim transaction did not commit"
             );
-            return Vec::new();
+            return TaskClaimBatch {
+                tasks: Vec::new(),
+                recovered: 0,
+            };
         }
 
-        debug!(claimed = claimed.len(), "[STORAGE_SN] Tasks claimed");
-        claimed
+        debug!(
+            claimed = claimed.len(),
+            recovered, "[STORAGE_SN] Tasks claimed"
+        );
+        TaskClaimBatch {
+            tasks: claimed,
+            recovered,
+        }
     }
 
     /// Release a worker-owned set of processing tasks back to the pending queue.
@@ -1258,6 +1353,80 @@ mod tests {
         assert_eq!(claimed[0].id, task_id);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_recovery_assigns_expired_claim_to_one_owner() {
+        let directory = TempDir::new().unwrap();
+        let database_path = directory.path().join("shared-recovery-queue.db");
+        let first = Arc::new(MemoryStorage::open(&database_path, None).unwrap());
+        let second = Arc::new(MemoryStorage::open(&database_path, None).unwrap());
+        let task_id = first
+            .insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap()
+            .unwrap();
+        first.claim_pending_tasks(1).await;
+        first
+            .stage_task_result_and_usage(
+                task_id,
+                "staged-title",
+                r#"{"input":1,"output":1,"cached":0}"#,
+                &TaskUsageRecord {
+                    provider: "test-provider",
+                    model: "test-model",
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    latency_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let conn = first.conn.lock().await;
+            conn.execute(
+                "UPDATE cognitive_tasks SET started_at = started_at - 1000 WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(3));
+        let first_claim = {
+            let storage = Arc::clone(&first);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                storage.recover_and_claim_pending_tasks(1, 60).await
+            })
+        };
+        let second_claim = {
+            let storage = Arc::clone(&second);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                storage.recover_and_claim_pending_tasks(1, 60).await
+            })
+        };
+        barrier.wait().await;
+
+        let first_claim = first_claim.await.unwrap();
+        let second_claim = second_claim.await.unwrap();
+        assert_eq!(
+            first_claim.recovered + second_claim.recovered,
+            1,
+            "an expired claim must be recovered once"
+        );
+        let mut claimed = first_claim.tasks;
+        claimed.extend(second_claim.tasks);
+        assert_eq!(claimed.len(), 1, "a recovered task may have only one owner");
+        assert_eq!(claimed[0].id, task_id);
+
+        let recovered = first.get_task(task_id).await.unwrap();
+        assert_eq!(recovered.status, "processing");
+        assert_eq!(recovered.result.as_deref(), Some("staged-title"));
+        assert_eq!(recovered.retry_count, 0);
+    }
+
     /// (v2.5.0+Fix) Verify idempotency: inserting the same (target_table, target_id,
     /// task_type) while an active task exists must return Ok(None).
     #[tokio::test]
@@ -1425,7 +1594,7 @@ mod tests {
             task.retry_count, 0,
             "retry_count must NOT be incremented by recovery"
         );
-        assert!(task.error_message.unwrap_or_default().contains("Recovered"));
+        assert_eq!(task.error_message.as_deref(), Some(EXPIRED_CLAIM_REASON));
     }
 
     /// Within-timeout tasks must NOT be reset.

@@ -45,6 +45,9 @@
 //! - PrivacyConfig.level_for() returns PrivacyLevel (owned, cloned).
 //!
 //! ## Last Modified
+//! v2.5.8-CrashLeaseRecovery - [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex]
+//!   Defines one overflow-safe stale-claim deadline shared by startup recovery
+//!   and the live task worker.
 //! v2.5.7-TaskOwnership - [SUPERNODE-TASK-OWNERSHIP 2026-08-14 by Codex]
 //!   Rejects task timeout values that cannot share one safe meaning between
 //!   Tokio execution deadlines and signed SQLite startup recovery timestamps.
@@ -413,6 +416,24 @@ pub struct WorkerConfig {
     pub max_retries: u32,
     #[serde(default = "default_task_timeout")]
     pub task_timeout_secs: u64,
+}
+
+impl WorkerConfig {
+    /// Deadline after which a processing row cannot still have a live owner.
+    ///
+    /// [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex] Recovery waits one complete
+    /// poll interval plus one second after the Tokio execution timeout. This
+    /// gives the owning worker time to persist its timeout transition before a
+    /// different process reclaims the row. Saturation keeps config parsing
+    /// backward compatible for extreme legacy values while preserving SQLite's
+    /// signed timestamp boundary.
+    pub(crate) fn stale_claim_recovery_secs(&self) -> i64 {
+        let seconds = self
+            .task_timeout_secs
+            .saturating_add(self.poll_interval_secs)
+            .saturating_add(1);
+        i64::try_from(seconds).unwrap_or(i64::MAX)
+    }
 }
 
 fn default_poll_interval() -> u64 {
@@ -914,6 +935,19 @@ mod tests {
         assert_eq!(worker.max_concurrent, 3);
         assert_eq!(worker.max_retries, 3);
         assert_eq!(worker.task_timeout_secs, 120);
+        assert_eq!(worker.stale_claim_recovery_secs(), 126);
+    }
+
+    #[test]
+    fn stale_claim_recovery_deadline_saturates_to_sqlite_timestamp_range() {
+        // [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex] Legacy/extreme values
+        // must not wrap when timeout, poll interval, and settlement grace add.
+        let worker = WorkerConfig {
+            poll_interval_secs: u64::MAX,
+            task_timeout_secs: u64::MAX,
+            ..WorkerConfig::default()
+        };
+        assert_eq!(worker.stale_claim_recovery_secs(), i64::MAX);
     }
 
     #[test]

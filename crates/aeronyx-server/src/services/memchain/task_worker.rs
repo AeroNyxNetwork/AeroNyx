@@ -15,6 +15,9 @@
 //! Re-exported via prompts.rs. Use PrivacyLevel::from_str() for DB string parsing.
 //!
 //! ## Last Modified
+//! v2.5.8-CrashLeaseRecovery - [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex]
+//!   Atomically reclaims expired processing rows before each batch, ensuring a
+//!   fast crash/restart cannot strand a task after the startup recovery scan.
 //! v2.5.7-TaskOwnership - [SUPERNODE-TASK-OWNERSHIP 2026-08-14 by Codex]
 //!   Enforces configured per-task timeouts, owns concurrent work in a JoinSet,
 //!   and releases unfinished claims during graceful shutdown.
@@ -100,6 +103,7 @@ pub struct TaskWorker {
     batch_size: usize,
     poll_interval: Duration,
     task_timeout: Duration,
+    stale_claim_recovery_secs: i64,
 }
 
 impl TaskWorker {
@@ -108,12 +112,14 @@ impl TaskWorker {
         router: Arc<LlmRouter>,
         worker_config: WorkerConfig,
     ) -> Self {
+        let stale_claim_recovery_secs = worker_config.stale_claim_recovery_secs();
         Self {
             storage,
             router,
             batch_size: worker_config.max_concurrent.max(1).min(50),
             poll_interval: Duration::from_secs(worker_config.poll_interval_secs.max(1)),
             task_timeout: Duration::from_secs(worker_config.task_timeout_secs.max(1)),
+            stale_claim_recovery_secs,
         }
     }
 
@@ -122,6 +128,7 @@ impl TaskWorker {
             batch_size = self.batch_size,
             poll_interval_secs = self.poll_interval.as_secs(),
             task_timeout_secs = self.task_timeout.as_secs(),
+            stale_claim_recovery_secs = self.stale_claim_recovery_secs,
             "[TASK_WORKER] Started"
         );
 
@@ -152,7 +159,22 @@ impl TaskWorker {
         &self,
         shutdown_rx: &mut broadcast::Receiver<()>,
     ) -> bool {
-        let tasks = self.storage.claim_pending_tasks(self.batch_size).await;
+        // [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex] Recovery is part of the
+        // same SQLite writer transaction as claiming. A task that was fresh
+        // during a quick process restart is therefore eventually reclaimed,
+        // without exposing a pending interval to another competing worker.
+        let claim = self
+            .storage
+            .recover_and_claim_pending_tasks(self.batch_size, self.stale_claim_recovery_secs)
+            .await;
+        if claim.recovered > 0 {
+            info!(
+                recovered = claim.recovered,
+                stale_after_secs = self.stale_claim_recovery_secs,
+                "[TASK_WORKER] Recovered expired task claims"
+            );
+        }
+        let tasks = claim.tasks;
         if tasks.is_empty() {
             debug!("[TASK_WORKER] No pending tasks");
             return false;
@@ -1025,6 +1047,7 @@ impl std::fmt::Debug for TaskWorker {
             .field("batch_size", &self.batch_size)
             .field("poll_interval_secs", &self.poll_interval.as_secs())
             .field("task_timeout_secs", &self.task_timeout.as_secs())
+            .field("stale_claim_recovery_secs", &self.stale_claim_recovery_secs)
             .finish()
     }
 }
@@ -1235,6 +1258,124 @@ mod tests {
         assert_eq!(task.status, "pending");
         assert_eq!(task.retry_count, 1);
         assert_eq!(task.error_message.as_deref(), Some("task_worker_timed_out"));
+    }
+
+    #[tokio::test]
+    async fn expired_orphan_is_recovered_by_live_worker() {
+        // [SUPERNODE-CRASH-LEASE 2026-08-14 by Codex] Simulate a process that
+        // died after claiming work, followed by a replacement worker that stays
+        // alive past the startup scan and must recover the orphan itself.
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "INSERT INTO sessions (session_id, owner, started_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params!["session-crash", vec![0_u8; 32], 1_i64],
+            )
+            .unwrap();
+        }
+        let task_id = storage
+            .insert_cognitive_task(
+                "session_title",
+                1,
+                r#"{"entity_names":[]}"#,
+                None,
+                Some("sessions"),
+                Some("session-crash"),
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        storage.claim_pending_tasks(1).await;
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "UPDATE cognitive_tasks SET started_at = started_at - 1000 WHERE id = ?1",
+                rusqlite::params![task_id],
+            )
+            .unwrap();
+        }
+
+        let provider = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let router = Arc::new(LlmRouter::new(
+            vec![(
+                "counting-provider".into(),
+                "http://localhost".into(),
+                "counting-model".into(),
+                provider.clone() as Arc<dyn LlmProvider>,
+            )],
+            TaskRoutingConfig::default(),
+        ));
+        let worker = TaskWorker::new(
+            Arc::clone(&storage),
+            router,
+            WorkerConfig {
+                poll_interval_secs: 1,
+                max_concurrent: 1,
+                task_timeout_secs: 10,
+                ..WorkerConfig::default()
+            },
+        );
+
+        worker.process_batch().await;
+
+        let completed = storage.get_task(task_id).await.unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.retry_count, 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_processing_claim_is_not_stolen() {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let task_id = storage
+            .insert_cognitive_task(
+                "session_title",
+                1,
+                r#"{"entity_names":[]}"#,
+                None,
+                None,
+                None,
+                "structured",
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        storage.claim_pending_tasks(1).await;
+        let provider = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let router = Arc::new(LlmRouter::new(
+            vec![(
+                "counting-provider".into(),
+                "http://localhost".into(),
+                "counting-model".into(),
+                provider.clone() as Arc<dyn LlmProvider>,
+            )],
+            TaskRoutingConfig::default(),
+        ));
+        let worker = TaskWorker::new(
+            Arc::clone(&storage),
+            router,
+            WorkerConfig {
+                poll_interval_secs: 1,
+                max_concurrent: 1,
+                task_timeout_secs: 10,
+                ..WorkerConfig::default()
+            },
+        );
+
+        worker.process_batch().await;
+
+        let still_owned = storage.get_task(task_id).await.unwrap();
+        assert_eq!(still_owned.status, "processing");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
