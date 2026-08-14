@@ -53,6 +53,9 @@
 //! - [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Applies configurable,
 //!   node-global direct-relay admission before JSON parsing without creating
 //!   privacy-sensitive sender, receiver, wallet, or source-address buckets
+//! - [PEER-ACK-PRIVACY 2026-08-15 by Codex] Normalizes successful direct
+//!   relay ACKs so peers cannot probe receiver presence, device count, or
+//!   mailbox/dedup state through legacy compatibility fields
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -194,8 +197,13 @@
 //!   authenticated previous-hop identity. Its admission limiter must remain
 //!   node-global until a negotiated signed v2 contract exists; never emulate
 //!   peer identity with user/sender/receiver keys or source IP addresses.
+//! - [PEER-ACK-PRIVACY 2026-08-15 by Codex] Direct relay success proves only
+//!   durable custody of the opaque envelope. Keep actual duplicate and online
+//!   delivery counts in aggregate local health; never return them on peer wire.
 //!
 //! ## Last Modified
+//! v0.43.0-PeerAckPrivacy - Normalize direct relay success ACKs to durable
+//! custody without receiver presence, device-count, or mailbox-state signals
 //! v0.42.0-PeerRelayAdmission - Bound direct compatibility relay request rate
 //! before JSON parsing using aggregate-only, monotonic process state
 //! v0.41.0-PeerRelayReplayWindow - Apply bounded timestamp freshness to direct
@@ -851,11 +859,11 @@ pub struct PeerChatRelayRequest {
 pub struct PeerChatRelayResponse {
     /// Whether this node accepted the envelope as valid relay work.
     pub accepted: bool,
-    /// Whether the message id was already seen on this node.
+    /// Legacy compatibility field; privacy-safe public responses keep it false.
     pub duplicate: bool,
-    /// Number of local online receiver sessions reached.
+    /// Legacy compatibility field; privacy-safe public responses keep it zero.
     pub delivered_online: usize,
-    /// Whether the envelope was stored in the local pending queue.
+    /// Whether the node accepted durable custody of the opaque envelope.
     pub stored_pending: bool,
 }
 
@@ -1192,6 +1200,19 @@ fn rejected_peer_relay_response(status: StatusCode) -> Response {
         .into_response()
 }
 
+fn durable_peer_acceptance_response() -> PeerChatRelayResponse {
+    // [PEER-ACK-PRIVACY 2026-08-15 by Codex] Preserve the legacy JSON schema
+    // while returning only the one fact another node needs: the ciphertext is
+    // now in durable custody. Revealing duplicate or online-session state lets
+    // arbitrary signed senders probe a receiver's presence and device count.
+    PeerChatRelayResponse {
+        accepted: true,
+        duplicate: false,
+        delivered_online: 0,
+        stored_pending: true,
+    }
+}
+
 /// Applies blind-relay backpressure before Axum reads a JSON body.
 async fn peer_blind_relay_request_gate(
     State(state): State<ChatPeerState>,
@@ -1310,12 +1331,7 @@ async fn process_peer_relay(
     if relay.is_online_duplicate(&envelope.message_id) {
         debug!("[CHAT_PEER] Duplicate peer envelope ignored");
         relay.record_peer_relay_inbound_accepted(now, true, 0, true);
-        return Ok(PeerChatRelayResponse {
-            accepted: true,
-            duplicate: true,
-            delivered_online: 0,
-            stored_pending: true,
-        });
+        return Ok(durable_peer_acceptance_response());
     }
 
     let target_sessions = state.sessions.get_all_by_wallet(&envelope.receiver);
@@ -1331,16 +1347,9 @@ async fn process_peer_relay(
     // after local persistence. This keeps online UDP delivery crash-safe and
     // gives terminal receipts one stable meaning: accepted into durable relay
     // custody, never merely queued to a socket.
-    let stored_pending = true;
+    relay.record_peer_relay_inbound_accepted(now, false, delivered_online, true);
 
-    relay.record_peer_relay_inbound_accepted(now, false, delivered_online, stored_pending);
-
-    Ok(PeerChatRelayResponse {
-        accepted: true,
-        duplicate: false,
-        delivered_online,
-        stored_pending,
-    })
+    Ok(durable_peer_acceptance_response())
 }
 
 fn map_pending_store_error(error: &ChatRelayError) -> ChatPeerRelayError {
@@ -2731,7 +2740,7 @@ mod tests {
         BlindVaultPutRequest, NodeCapability, NodeCapacity, NodeDescriptor, SignedNodeDescriptor,
     };
     use aeronyx_transport::UdpTransport;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use axum::response::IntoResponse;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -3462,6 +3471,18 @@ mod tests {
         );
         let body = serde_json::to_vec(&PeerChatRelayRequest { envelope }).unwrap();
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let retry = app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3474,11 +3495,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(retry.status(), StatusCode::OK);
+        let response: PeerChatRelayResponse = serde_json::from_slice(
+            &to_bytes(response.into_body(), PEER_ACK_RESPONSE_MAX_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let retry: PeerChatRelayResponse = serde_json::from_slice(
+            &to_bytes(retry.into_body(), PEER_ACK_RESPONSE_MAX_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let privacy_safe_acceptance = durable_peer_acceptance_response();
+        assert_eq!(response, privacy_safe_acceptance);
+        assert_eq!(retry, privacy_safe_acceptance);
         let (messages, has_more) = relay
             .pull_pending(&receiver, 0, &[0u8; 16], 10)
             .expect("pending message should be readable");
         assert!(!has_more);
         assert_eq!(messages.len(), 1);
+        let status = relay.peer_status();
+        assert_eq!(status.inbound_accepted_total, 2);
+        assert_eq!(status.inbound_duplicate_total, 1);
 
         let _ = std::fs::remove_file(path);
     }
