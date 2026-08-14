@@ -79,6 +79,9 @@
 //!   task_id in llm_usage_log (e.g. manual inserts) are excluded.
 //!
 //! ## Last Modified
+//! v2.5.10-AtomicManualRetry - [SUPERNODE-MANUAL-RETRY 2026-08-14 by Codex]
+//!   Serialized operator retries in an IMMEDIATE transaction so concurrent
+//!   management requests cannot overwrite a worker's processing claim.
 //! v2.5.9-EnqueueIdempotency - [SUPERNODE-ENQUEUE-IDEMPOTENCY 2026-08-14 by Codex]
 //!   Serialized active-task detection and insertion in one IMMEDIATE transaction,
 //!   preventing duplicate model calls across independent node processes.
@@ -837,36 +840,62 @@ impl MemoryStorage {
     /// regardless of retry_count vs max_retries. `max_retries` is extended when
     /// necessary so `claim_pending_tasks()` can actually claim the reset row.
     /// Clears error_message and started_at for a clean attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the task is missing, is not terminal, or the
+    /// serialized SQLite transition cannot be committed.
     pub async fn retry_task(&self, task_id: i64) -> Result<(), String> {
-        let conn = self.conn.lock().await;
+        let mut conn = self.conn.lock().await;
+        // [SUPERNODE-MANUAL-RETRY 2026-08-14 by Codex] Keep validation and
+        // transition under one cross-process SQLite writer lease. The previous
+        // autocommit SELECT followed by an unconditional UPDATE could race a
+        // worker claim and move `processing` back to `pending`, allowing the
+        // same provider work to execute and be billed again.
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("retry_task begin {task_id}: {e}"))?;
 
-        let (status, retry_count): (String, i64) = conn
+        let state: Option<(String, i64)> = transaction
             .query_row(
                 "SELECT status, retry_count FROM cognitive_tasks WHERE id = ?1",
                 params![task_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(|_| format!("retry_task: task {} not found", task_id))?;
+            .optional()
+            .map_err(|e| format!("retry_task read {task_id}: {e}"))?;
+        let Some((status, retry_count)) = state else {
+            return Err(format!("retry_task: task {task_id} not found"));
+        };
 
         if status != "failed" && status != "cancelled" {
             return Err(format!(
-                "Task {} is '{}', can only retry 'failed' or 'cancelled'",
-                task_id, status
+                "Task {task_id} is '{status}', can only retry 'failed' or 'cancelled'"
             ));
         }
 
         // [SUPERNODE-MANUAL-RETRY 2026-08-14 by Codex] The previous update
         // incremented `retry_count` without extending the ceiling. A terminal
         // task therefore looked pending but could never satisfy the claim query.
-        conn.execute(
-            "UPDATE cognitive_tasks SET
+        let affected = transaction
+            .execute(
+                "UPDATE cognitive_tasks SET
                 status = 'pending', retry_count = ?1,
                 max_retries = MAX(max_retries, ?1 + 1),
                 error_message = NULL, started_at = NULL
-             WHERE id = ?2",
-            params![retry_count + 1, task_id],
-        )
-        .map_err(|e| format!("retry_task update {}: {}", task_id, e))?;
+             WHERE id = ?2 AND status IN ('failed', 'cancelled')",
+                params![retry_count + 1, task_id],
+            )
+            .map_err(|e| format!("retry_task update {task_id}: {e}"))?;
+        if affected != 1 {
+            return Err(format!(
+                "retry_task {task_id}: guarded transition affected {affected} rows"
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|e| format!("retry_task commit {task_id}: {e}"))?;
+        drop(conn);
 
         debug!(
             id = task_id,
@@ -2082,6 +2111,47 @@ mod tests {
         let claimed = s.claim_pending_tasks(1).await;
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].id, id);
+    }
+
+    /// [SUPERNODE-MANUAL-RETRY 2026-08-14 by Codex] An operator action is a
+    /// single state transition even when separate node processes receive it at
+    /// the same time. Exactly one request may restore the retry budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_connections_retry_terminal_task_once() {
+        let directory = TempDir::new().unwrap();
+        let database_path = directory.path().join("shared-manual-retry-queue.db");
+        let first = Arc::new(MemoryStorage::open(&database_path, None).unwrap());
+        let second = Arc::new(MemoryStorage::open(&database_path, None).unwrap());
+        let task_id = first
+            .insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 1)
+            .await
+            .unwrap()
+            .unwrap();
+        first.claim_pending_tasks(1).await;
+        first.fail_task(task_id, "terminal failure").await.unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let retry = |storage: Arc<MemoryStorage>, barrier: Arc<Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                storage.retry_task(task_id).await
+            })
+        };
+        let first_retry = retry(Arc::clone(&first), Arc::clone(&barrier));
+        let second_retry = retry(Arc::clone(&second), Arc::clone(&barrier));
+        barrier.wait().await;
+
+        let outcomes = [first_retry.await.unwrap(), second_retry.await.unwrap()];
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "a terminal task may be manually retried only once"
+        );
+
+        let pending = first.get_task(task_id).await.unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.retry_count, 2);
+        assert!(pending.retry_count < pending.max_retries);
     }
 
     #[tokio::test]
