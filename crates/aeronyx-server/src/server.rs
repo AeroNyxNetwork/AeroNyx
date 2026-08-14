@@ -358,6 +358,9 @@
 // 135. [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Makes explicit
 //      Chat Relay enablement fail startup when its durable service cannot be
 //      initialized, using only a privacy-safe reason bucket.
+// 136. [CHAT-SESSION-SENDER-BINDING 2026-08-15 by Codex] Requires every
+//      client-tunnel ChatEnvelope sender to match the authenticated VPN
+//      session identity before dedupe, route announcement, or peer relay.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -507,6 +510,8 @@
 //     Capability readiness and the configured service contract must agree.
 //
 // Last Modified:
+//   [CHAT-SESSION-SENDER-BINDING 2026-08-15 by Codex] Bound every accepted
+//     client ChatRelay sender to its authenticated VPN session identity.
 //   [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Made configured Chat
 //     Relay storage initialization a privacy-safe startup gate.
 //   [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Made follower task
@@ -517,6 +522,8 @@
 //     bounded proof recovery with an isolated process-lifetime carrier circuit.
 //   [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Bound startup readiness
 //     to the configured commitment authority root and proposer history audit.
+//   v2.8.84-ChatSessionSenderBinding - Bound client ChatRelay senders to the
+//     authenticated VPN session before route mutation or relay fan-out.
 //   v2.8.83-ManagementClientStartup - Made management HTTP client creation
 //     fail-closed through ServerError before worker startup.
 //   v2.8.82-MinerStartupError - Made SaaS miner scheduler construction
@@ -12160,8 +12167,25 @@ impl Server {
         })
     }
 
+    /// Returns whether one client-tunnel chat sender is bound to the
+    /// authenticated VPN session identity.
+    ///
+    /// [CHAT-SESSION-SENDER-BINDING 2026-08-15 by Codex] A valid envelope
+    /// signature proves that `sender` authorized the envelope; it does not
+    /// prove that the current transport session belongs to that sender. Keep
+    /// this check ahead of dedupe and every route mutation so replaying another
+    /// user's signed ciphertext cannot claim their wallet route or trigger
+    /// peer fan-out from an unrelated authenticated session.
+    #[must_use]
+    fn chat_sender_matches_authenticated_session(
+        envelope: &ChatEnvelope,
+        authenticated_session_key: &[u8; 32],
+    ) -> bool {
+        &envelope.sender == authenticated_session_key
+    }
+
     // ============================================
-    // MemChain Message Handler (unchanged)
+    // MemChain Message Handler
     // ============================================
 
     #[allow(clippy::too_many_arguments)]
@@ -12348,6 +12372,17 @@ impl Server {
                     );
                     return;
                 }
+                let authenticated_sender = session.client_public_key.to_bytes();
+                if !Self::chat_sender_matches_authenticated_session(
+                    &envelope,
+                    &authenticated_sender,
+                ) {
+                    warn!(
+                        reason = "session_sender_mismatch",
+                        "[CHAT_RELAY] Envelope dropped"
+                    );
+                    return;
+                }
                 let Some(ref relay) = chat_relay else {
                     warn!(
                         reason = "relay_unavailable",
@@ -12360,13 +12395,11 @@ impl Server {
                     return;
                 }
                 relay.wallet_routes.announce(
-                    &envelope.sender,
+                    &authenticated_sender,
                     session.id.clone(),
                     session.client_endpoint,
                 );
                 let receiver = envelope.receiver;
-                let authenticated_client_origin =
-                    envelope.sender == session.client_public_key.to_bytes();
                 let target_routes = relay.wallet_routes.lookup(&receiver);
 
                 if !target_routes.is_empty() {
@@ -12395,19 +12428,15 @@ impl Server {
                         }
                     }
                     if all_failed {
-                        let onion_outcome = if authenticated_client_origin {
-                            Self::relay_authenticated_chat_over_onion_paths(
-                                chat_peer_client,
-                                Some(relay.as_ref()),
-                                peer_store,
-                                node_identity,
-                                self_node_id,
-                                &envelope,
-                            )
-                            .await
-                        } else {
-                            AuthenticatedChatOnionRelayOutcome::default()
-                        };
+                        let onion_outcome = Self::relay_authenticated_chat_over_onion_paths(
+                            chat_peer_client,
+                            Some(relay.as_ref()),
+                            peer_store,
+                            node_identity,
+                            self_node_id,
+                            &envelope,
+                        )
+                        .await;
                         if !onion_outcome.delivered() {
                             Self::relay_chat_envelope_to_discovered_peers(
                                 chat_peer_client,
@@ -12433,19 +12462,15 @@ impl Server {
                         );
                     }
                 } else {
-                    let onion_outcome = if authenticated_client_origin {
-                        Self::relay_authenticated_chat_over_onion_paths(
-                            chat_peer_client,
-                            Some(relay.as_ref()),
-                            peer_store,
-                            node_identity,
-                            self_node_id,
-                            &envelope,
-                        )
-                        .await
-                    } else {
-                        AuthenticatedChatOnionRelayOutcome::default()
-                    };
+                    let onion_outcome = Self::relay_authenticated_chat_over_onion_paths(
+                        chat_peer_client,
+                        Some(relay.as_ref()),
+                        peer_store,
+                        node_identity,
+                        self_node_id,
+                        &envelope,
+                    )
+                    .await;
                     if !onion_outcome.delivered() {
                         Self::relay_chat_envelope_to_discovered_peers(
                             chat_peer_client,
@@ -15145,6 +15170,37 @@ mod tests {
         };
         envelope.signature = sender.sign(&envelope.sign_data());
         envelope
+    }
+
+    #[test]
+    fn chat_sender_must_match_authenticated_session_identity() {
+        // [CHAT-SESSION-SENDER-BINDING 2026-08-15 by Codex] Signature
+        // validity and transport-session ownership are independent proofs. A
+        // captured valid envelope must not authorize another VPN session to
+        // claim the sender's return route or start peer relay fan-out.
+        let sender = IdentityKeyPair::generate();
+        let unrelated_session = IdentityKeyPair::generate();
+        let mut envelope = ChatEnvelope {
+            message_id: [0x31; 16],
+            sender: sender.public_key_bytes(),
+            receiver: [0x32; 32],
+            timestamp: 1_700_000_000,
+            ciphertext: b"opaque signed ciphertext".to_vec(),
+            nonce: [0x33; 24],
+            content_type: ChatContentType::Text,
+            signature: [0; 64],
+        };
+        envelope.signature = sender.sign(&envelope.sign_data());
+
+        assert!(envelope.verify_signature().is_ok());
+        assert!(Server::chat_sender_matches_authenticated_session(
+            &envelope,
+            &sender.public_key_bytes(),
+        ));
+        assert!(!Server::chat_sender_matches_authenticated_session(
+            &envelope,
+            &unrelated_session.public_key_bytes(),
+        ));
     }
 
     #[test]
