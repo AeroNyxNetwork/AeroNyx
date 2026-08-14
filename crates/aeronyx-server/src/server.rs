@@ -10647,7 +10647,18 @@ impl Server {
         envelope: &ChatEnvelope,
     ) -> AuthenticatedChatOnionRelayOutcome {
         let now = unix_now_secs();
+        // [RELAY-SELECTION-DIAGNOSTICS 2026-08-15 by Codex] Every pre-attempt
+        // return must advance the aggregate status with a stable reason bucket;
+        // otherwise a real routing failure is indistinguishable from idle.
         let Some(client) = client else {
+            if let Some(relay) = relay {
+                relay.record_peer_relay_outbound(
+                    now,
+                    0,
+                    0,
+                    Some("peer_http_client_unavailable".to_string()),
+                );
+            }
             return AuthenticatedChatOnionRelayOutcome::default();
         };
         // [AUTHENTICATED-RELAY-PATH-READINESS 2026-08-15 by Codex] Fail over
@@ -10661,6 +10672,14 @@ impl Server {
                 reason = path_readiness.reason,
                 "[CHAT_RELAY] Authenticated onion path is not currently ready"
             );
+            if let Some(relay) = relay {
+                relay.record_peer_relay_outbound(
+                    now,
+                    0,
+                    0,
+                    Some(path_readiness.reason.to_string()),
+                );
+            }
             return AuthenticatedChatOnionRelayOutcome::default();
         }
         let terminal_candidates = peer_store
@@ -10671,6 +10690,17 @@ impl Server {
                 &[*self_node_id],
             );
         if terminal_candidates.is_empty() {
+            // [RELAY-SELECTION-DIAGNOSTICS 2026-08-15 by Codex] Peer state can
+            // change between readiness and selection. Record only a stable
+            // aggregate bucket, never the missing descriptor or endpoint.
+            if let Some(relay) = relay {
+                relay.record_peer_relay_outbound(
+                    now,
+                    0,
+                    0,
+                    Some("onion_terminal_selection_changed".to_string()),
+                );
+            }
             return AuthenticatedChatOnionRelayOutcome::default();
         }
 
@@ -10684,6 +10714,7 @@ impl Server {
             if used_hop_node_ids.contains(&terminal_node_id)
                 || !PeerStore::route_endpoint_is_network_diverse_from_all(&terminal, &used_hops)
             {
+                last_failure_reason = Some("onion_terminal_diversity_exhausted".to_string());
                 continue;
             }
             let mut excluded_node_ids = Vec::with_capacity(used_hop_node_ids.len() + 2);
@@ -10703,13 +10734,16 @@ impl Server {
                         && PeerStore::route_endpoint_is_network_diverse_from_all(middle, &used_hops)
                 })
             else {
+                last_failure_reason = Some("onion_middle_candidate_unavailable".to_string());
                 continue;
             };
             let middle_node_id = middle.node_id();
             let Some(endpoint) = middle.descriptor.public_endpoint.as_deref() else {
+                last_failure_reason = Some("onion_middle_endpoint_missing".to_string());
                 continue;
             };
             let Some(url) = Self::blind_relay_probe_url(endpoint) else {
+                last_failure_reason = Some("onion_middle_endpoint_invalid".to_string());
                 continue;
             };
 
@@ -10724,6 +10758,7 @@ impl Server {
                 route_id,
                 now,
             ) else {
+                last_failure_reason = Some("onion_request_build_failed".to_string());
                 continue;
             };
 
@@ -13659,6 +13694,7 @@ mod tests {
     use crate::api::{
         decode_bounded_json_response, read_bounded_http_response, BoundedHttpResponseError,
     };
+    use crate::config_chat_relay::ChatRelayConfig;
     use crate::error::RuntimeTaskJoinFailureKind;
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
@@ -16050,6 +16086,48 @@ mod tests {
             &terminal.public_key_bytes(),
             now + 1,
         ));
+    }
+
+    #[tokio::test]
+    async fn authenticated_chat_records_privacy_safe_preflight_failure() {
+        let directory = tempfile::tempdir().expect("relay status temp directory");
+        let mut relay_config = ChatRelayConfig::default();
+        relay_config.enabled = true;
+        relay_config.db_path = directory
+            .path()
+            .join("relay-status.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let relay = crate::services::ChatRelayService::new(relay_config, [0x61; 32])
+            .expect("initialize relay status service");
+        let source = IdentityKeyPair::generate();
+        let store = PeerStore::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build isolated relay test client");
+
+        let outcome = Server::relay_authenticated_chat_over_onion_paths(
+            Some(&client),
+            Some(&relay),
+            &store,
+            &source,
+            &source.public_key_bytes(),
+            &signed_test_chat_envelope(unix_now_secs()),
+        )
+        .await;
+
+        assert!(!outcome.delivered());
+        // [RELAY-SELECTION-DIAGNOSTICS 2026-08-15 by Codex] A preflight miss
+        // advances the aggregate round and carries only a stable reason bucket.
+        let status = relay.peer_status();
+        assert_eq!(status.outbound_rounds, 1);
+        assert_eq!(status.last_outbound_attempted, 0);
+        assert_eq!(status.last_outbound_status.as_deref(), Some("failed"));
+        assert_eq!(
+            status.last_outbound_failure_reason.as_deref(),
+            Some("no_receipt_capable_terminal")
+        );
     }
 
     #[tokio::test]
