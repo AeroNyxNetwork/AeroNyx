@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.92.0 - Made explicitly enabled durable Chat Relay
-storage a fail-closed, privacy-safe startup requirement.
+Modification Reason: v0.93.0 - Removed host filesystem paths from operator
+status, CMS heartbeat, rollout telemetry, and sanitized journal summaries.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.92.0 - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents an explicitly enabled Chat Relay from silently disappearing after durable initialization failure.
+Last Modified: v0.93.0 - [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Keeps storage and rollout readiness observable without exporting operator filesystem identity.
+Previous: v0.92.0 - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents an explicitly enabled Chat Relay from silently disappearing after durable initialization failure.
 Previous: v0.91.0 - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Resolves authority-carrier policy once and prevents a configured follower from disappearing behind healthy process startup.
 Previous: v0.90.0 - [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Gives dual-signed authority-proof transport a dedicated follower-only pin set with an explicit legacy witness fallback.
 Previous: v0.89.0 - [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Recovers exact dual-signed coordinator proofs through bounded operator-pinned carriers without expanding transport into authority.
@@ -125,6 +126,35 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.93 Operator telemetry does not export host filesystem identity
+
+[OPERATOR-PATH-PRIVACY 2026-08-14 by Codex]
+
+- Nodeboard and the CMS heartbeat retain aggregate MemChain and Chat Relay
+  storage readiness, backend kind, quotas, and service state, but no longer
+  receive configured SQLite or append-only-log paths. Historical path keys are
+  retained with `null` values so older consumers do not lose their shape.
+- Runtime rollout detection still inspects the local executable target for the
+  Linux ` (deleted)` replacement marker. The serialized legacy
+  `executable_path` field is retained as `null`; only `executable_replaced` and
+  `restart_required` leave the node.
+- Bounded journal summaries now redact Unix, home-relative, file-URI, and
+  Windows drive path tokens before they enter node health or heartbeat JSON.
+- These paths are operator infrastructure metadata rather than user content,
+  but exporting them can reveal usernames, mount layout, deployment tooling,
+  and node placement. The blind-node boundary therefore excludes them.
+- No wire frame, storage schema, key derivation, routing decision, client API,
+  service enablement, or capacity metric changes.
+
+Verification:
+
+- Canary database, AOF, executable, Unix, and Windows paths do not appear in
+  serialized operator telemetry or sanitized journal summaries.
+- Executable replacement still sets both aggregate rollout booleans, so
+  maintenance and restart guidance remains available to Nodeboard.
+- Existing status field shape is preserved: historical `db_path`, `aof_path`,
+  and `executable_path` keys remain present with privacy-safe null values.
 
 ### v0.92 Explicit Chat Relay activation is fail closed
 

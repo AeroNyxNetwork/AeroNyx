@@ -66,6 +66,9 @@
 //! [HEALTH-SNAPSHOT-LATENCY 2026-08-12 by Codex] Independent host checks run
 //! concurrently, while bounded journal telemetry refreshes in the background.
 //! Slow local journals therefore cannot stall VPN health or CMS heartbeats.
+//! [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Operator and heartbeat
+//! telemetry keeps storage/executable readiness observable without exporting
+//! host filesystem paths. Sanitized journal summaries redact path tokens too.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -1043,6 +1046,43 @@ fn discovery_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     discovery_value(value, path).and_then(Value::as_str)
 }
 
+/// Builds the aggregate MemChain operator contract without reading or
+/// serializing operator-local storage paths.
+fn memchain_operator_metrics(config: &ServerConfig) -> Value {
+    let enabled = config.memchain.is_enabled();
+    serde_json::json!({
+        "mode": format!("{:?}", config.memchain.mode),
+        "api_listen_addr": config.memchain.api_listen_addr.to_string(),
+        "db_path": Value::Null,
+        "aof_path": Value::Null,
+        "storage_backend": if enabled { "sqlite_aof" } else { "disabled" },
+        "storage_paths_exposed": false,
+        "api_secret_configured": config.memchain.effective_api_secret().is_some(),
+        "ner_enabled": config.memchain.ner_enabled,
+        "graph_enabled": config.memchain.graph_enabled,
+        "reranker_enabled": config.memchain.reranker_enabled,
+        "remote_storage_enabled": config.memchain.is_remote_storage_enabled(),
+        "max_remote_owners": config.memchain.max_remote_owners,
+    })
+}
+
+/// Builds the aggregate Chat Relay operator contract without exporting the
+/// durable queue location.
+fn chat_relay_operator_metrics(config: &ServerConfig) -> Value {
+    let enabled = config.memchain.is_chat_relay_enabled();
+    serde_json::json!({
+        "offline_ttl_secs": config.memchain.chat_relay.offline_ttl_secs,
+        "max_pending_per_wallet": config.memchain.chat_relay.max_pending_per_wallet,
+        "db_path": Value::Null,
+        "storage_backend": if enabled { "sqlite" } else { "disabled" },
+        "storage_paths_exposed": false,
+        "max_message_size": config.memchain.chat_relay.max_message_size,
+        "max_blob_size": config.memchain.chat_relay.max_blob_size,
+        "max_blobs_per_receiver": config.memchain.chat_relay.max_blobs_per_receiver,
+        "cleanup_interval_secs": config.memchain.chat_relay.cleanup_interval_secs,
+    })
+}
+
 async fn collect_node_operator_status_response(
     state: VpnHealthState,
 ) -> NodeOperatorStatusResponse {
@@ -1131,18 +1171,10 @@ async fn collect_node_operator_status_response(
         } else {
             "MemChain is disabled in this node config".to_string()
         },
-        metrics: serde_json::json!({
-            "mode": format!("{:?}", config.memchain.mode),
-            "api_listen_addr": config.memchain.api_listen_addr.to_string(),
-            "db_path": config.memchain.db_path,
-            "aof_path": config.memchain.aof_path,
-            "api_secret_configured": api_secret_configured,
-            "ner_enabled": config.memchain.ner_enabled,
-            "graph_enabled": config.memchain.graph_enabled,
-            "reranker_enabled": config.memchain.reranker_enabled,
-            "remote_storage_enabled": remote_storage_enabled,
-            "max_remote_owners": config.memchain.max_remote_owners,
-        }),
+        // [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] The backend and
+        // nodeboard need storage readiness, not the operator's username,
+        // home directory, mount layout, or deployment convention.
+        metrics: memchain_operator_metrics(&config),
     });
 
     services.push(OperatorServiceStatus {
@@ -1161,15 +1193,7 @@ async fn collect_node_operator_status_response(
             "Chat relay is disabled; encrypted messages are not stored for offline delivery"
                 .to_string()
         },
-        metrics: serde_json::json!({
-            "offline_ttl_secs": config.memchain.chat_relay.offline_ttl_secs,
-            "max_pending_per_wallet": config.memchain.chat_relay.max_pending_per_wallet,
-            "db_path": config.memchain.chat_relay.db_path,
-            "max_message_size": config.memchain.chat_relay.max_message_size,
-            "max_blob_size": config.memchain.chat_relay.max_blob_size,
-            "max_blobs_per_receiver": config.memchain.chat_relay.max_blobs_per_receiver,
-            "cleanup_interval_secs": config.memchain.chat_relay.cleanup_interval_secs,
-        }),
+        metrics: chat_relay_operator_metrics(&config),
     });
 
     services.push(OperatorServiceStatus {
@@ -1322,9 +1346,9 @@ async fn collect_node_operator_status_response(
         risks,
         privacy_boundary: concat!(
             "operator status contains aggregate service health and configuration ",
-            "only; no user plaintext, social graph plaintext, destinations, DNS ",
-            "contents, packet payloads, domains, URLs, browsing history, voucher ",
-            "secrets, or wallet-level traffic"
+            "only; host filesystem paths, user plaintext, social graph plaintext, ",
+            "destinations, DNS contents, packet payloads, domains, URLs, browsing ",
+            "history, voucher secrets, and wallet-level traffic are excluded"
         ),
     }
 }
@@ -1607,25 +1631,36 @@ async fn collect_runtime_rollout_status() -> RuntimeRolloutStatus {
     // `(deleted)`. That is a strong operator signal that a new binary may be
     // staged but the node still needs a controlled maintenance drain/restart.
     //
-    // This reports process metadata only: executable path state and whether a
-    // restart is required. It never includes user destinations, DNS contents,
-    // packet payloads, browsing history, voucher secrets, or wallet traffic.
+    // This reports process metadata only: executable replacement state and
+    // whether a restart is required. The exact path remains process-local.
     let proc_exe = tokio::fs::read_link("/proc/self/exe").await.ok();
     let fallback_exe = if proc_exe.is_none() {
         std::env::current_exe().ok()
     } else {
         None
     };
-    let executable_path = proc_exe
-        .or(fallback_exe)
-        .map(|path| path.to_string_lossy().chars().take(512).collect::<String>());
+    runtime_rollout_status_from_executable_path(proc_exe.or(fallback_exe))
+}
+
+/// Converts a local executable observation into aggregate rollout telemetry.
+///
+/// [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Detection still uses the exact
+/// path because Linux appends ` (deleted)` after replacement. Serialization
+/// deliberately retains the legacy `executable_path` key as `null`, preserving
+/// the response shape without exporting host filesystem identity.
+fn runtime_rollout_status_from_executable_path(
+    executable_path: Option<std::path::PathBuf>,
+) -> RuntimeRolloutStatus {
     let executable_replaced = executable_path
         .as_deref()
-        .map(|path| path.contains(" (deleted)") || path.ends_with("(deleted)"))
+        .map(|path| {
+            let path = path.to_string_lossy();
+            path.contains(" (deleted)") || path.ends_with("(deleted)")
+        })
         .unwrap_or(false);
 
     RuntimeRolloutStatus {
-        executable_path,
+        executable_path: None,
         executable_replaced,
         restart_required: executable_replaced,
         detail: if executable_replaced {
@@ -1633,11 +1668,12 @@ async fn collect_runtime_rollout_status() -> RuntimeRolloutStatus {
         } else {
             "Running process executable is active; no rollout restart signal detected".to_string()
         },
-        source: "/proc/self/exe",
+        source: "rust_process_executable_state",
         privacy_boundary: concat!(
-            "runtime process executable metadata only; no destinations, DNS ",
-            "contents, packet payloads, domains, URLs, browsing history, ",
-            "voucher secrets, client public IPs, or wallet-level traffic"
+            "aggregate runtime replacement state only; exact executable path, ",
+            "destinations, DNS contents, packet payloads, domains, URLs, browsing ",
+            "history, voucher secrets, client public IPs, and wallet-level traffic ",
+            "are excluded"
         ),
     }
 }
@@ -2849,6 +2885,8 @@ fn sanitize_operational_log_message(input: &str) -> String {
         let lower = value.to_ascii_lowercase();
         let replacement = if lower.starts_with("http://") || lower.starts_with("https://") {
             Some("[url]")
+        } else if looks_like_filesystem_path(value) {
+            Some("[path]")
         } else if looks_like_network_destination(value) {
             Some("[ip]")
         } else if looks_like_key_material(value) {
@@ -2875,6 +2913,25 @@ fn sanitize_operational_log_message(input: &str) -> String {
         message.push_str("...");
     }
     message
+}
+
+/// Recognizes host-local path tokens without treating ordinary protocol
+/// labels containing a slash as private filesystem state.
+fn looks_like_filesystem_path(value: &str) -> bool {
+    let value = value
+        .trim_matches(|c: char| matches!(c, ',' | ';' | ')' | '(' | '[' | ']' | '"' | '\'' | ':'));
+    if value.starts_with('/') || value.starts_with("~/") || value.starts_with("./") {
+        return value.len() > 1;
+    }
+    if value.starts_with("../") || value.starts_with("file://") {
+        return true;
+    }
+
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 fn looks_like_network_destination(value: &str) -> bool {
@@ -3188,7 +3245,7 @@ mod tests {
     #[test]
     fn recent_error_sanitizer_redacts_sensitive_tokens() {
         let sanitized = sanitize_operational_log_message(
-            "failed peer 203.0.113.10 endpoint=198.51.100.8:443 ipv6=2001:db8::1 host=api.example.com url=https://example.com/path key=0123456789abcdef0123456789abcdef",
+            "failed peer 203.0.113.10 endpoint=198.51.100.8:443 ipv6=2001:db8::1 host=api.example.com url=https://example.com/path db=/root/private/operator.sqlite win=C:\\AeroNyx\\private.db key=0123456789abcdef0123456789abcdef",
         );
 
         assert!(sanitized.contains("[ip]"));
@@ -3196,12 +3253,48 @@ mod tests {
         assert!(sanitized.contains("ipv6=[ip]"));
         assert!(sanitized.contains("host=[ip]"));
         assert!(sanitized.contains("url=[url]") || sanitized.contains("[url]"));
+        assert!(sanitized.contains("db=[path]"));
+        assert!(sanitized.contains("win=[path]"));
         assert!(sanitized.contains("key=[redacted]") || sanitized.contains("[redacted]"));
         assert!(!sanitized.contains("203.0.113.10"));
         assert!(!sanitized.contains("198.51.100.8"));
         assert!(!sanitized.contains("2001:db8::1"));
         assert!(!sanitized.contains("api.example.com"));
+        assert!(!sanitized.contains("/root/private/operator.sqlite"));
+        assert!(!sanitized.contains("C:\\AeroNyx\\private.db"));
         assert!(!sanitized.contains("0123456789abcdef0123456789abcdef"));
+    }
+
+    #[test]
+    fn operator_telemetry_excludes_storage_and_executable_paths() {
+        // [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Canary values prove
+        // configured and runtime paths remain local while operational state
+        // stays machine-readable and backward-compatible.
+        let mut config = ServerConfig::default();
+        config.memchain.db_path = "/home/private-node/memchain.sqlite".to_string();
+        config.memchain.aof_path = "/home/private-node/memchain.aof".to_string();
+        config.memchain.chat_relay.db_path = "/home/private-node/chat-relay.sqlite".to_string();
+
+        let memchain_metrics = memchain_operator_metrics(&config);
+        let relay_metrics = chat_relay_operator_metrics(&config);
+        let rollout = runtime_rollout_status_from_executable_path(Some(std::path::PathBuf::from(
+            "/home/private-node/aeronyx-server (deleted)",
+        )));
+        let rendered =
+            serde_json::to_string(&(&memchain_metrics, &relay_metrics, &rollout)).unwrap();
+
+        assert!(rollout.executable_replaced);
+        assert!(rollout.restart_required);
+        assert!(rollout.executable_path.is_none());
+        assert!(memchain_metrics["db_path"].is_null());
+        assert!(memchain_metrics["aof_path"].is_null());
+        assert!(relay_metrics["db_path"].is_null());
+        assert_eq!(memchain_metrics["storage_paths_exposed"], false);
+        assert_eq!(relay_metrics["storage_paths_exposed"], false);
+        assert!(!rendered.contains("private-node"));
+        assert!(!rendered.contains("memchain.sqlite"));
+        assert!(!rendered.contains("chat-relay.sqlite"));
+        assert!(!rendered.contains("aeronyx-server (deleted)"));
     }
 
     fn healthy_runtime_checks() -> Vec<HealthCheck> {
