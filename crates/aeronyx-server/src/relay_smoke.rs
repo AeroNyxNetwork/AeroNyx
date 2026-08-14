@@ -223,19 +223,20 @@ impl HealthSnapshot {
                 .chat_two_hop_onion_ready,
             "two-hop onion route is not ready"
         );
-        anyhow::ensure!(
-            self.discovery_status
-                .peer_store
-                .blind_relay_quality
-                .delivery_receipt_capable_peers
-                >= 2,
-            "fewer than two delivery-receipt-capable peers are available"
-        );
         let path = &self.discovery_status.peer_store.blind_relay_quality;
+        // [AUTHENTICATED-RELAY-PATH-DIAGNOSTICS 2026-08-15 by Codex] Report
+        // the production selector's stable failure bucket before the
+        // defensive aggregate-count invariant. The path gate already proves
+        // that distinct middle and terminal peers exist, while its reason is
+        // actionable for operators and never exposes peer identities.
         anyhow::ensure!(
             path.authenticated_delivery_path_ready,
             "authenticated delivery path is not ready: {}",
             path.authenticated_delivery_path_reason
+        );
+        anyhow::ensure!(
+            path.delivery_receipt_capable_peers >= 2,
+            "authenticated delivery path reported ready with fewer than two delivery-receipt-capable peers"
         );
         Ok(())
     }
@@ -806,6 +807,38 @@ mod tests {
         assert!(error
             .to_string()
             .contains("no_network_diverse_receipt_path"));
+    }
+
+    #[test]
+    fn idle_two_hop_preflight_preserves_zero_peer_path_reason() {
+        // [AUTHENTICATED-RELAY-PATH-DIAGNOSTICS 2026-08-15 by Codex] A cold
+        // restart intentionally clears process-local receipt evidence. Keep
+        // the privacy-safe selector reason visible so rollout work is not
+        // mistaken for a generic peer-count failure.
+        let snapshot: HealthSnapshot = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "active_sessions": 0,
+            "privacy_protocol_health": { "failed_checks": 0 },
+            "discovery_status": {
+                "peer_store": {
+                    "blind_relay_quality": {
+                        "verified_client_onion_deliveries": 0,
+                        "delivery_receipt_capable_peers": 0,
+                        "authenticated_delivery_path_ready": false,
+                        "authenticated_delivery_path_reason": "no_receipt_capable_terminal"
+                    },
+                    "peer_quorum": { "quorum_ready": true },
+                    "route_governance": { "route_pool_ready": true },
+                    "network_story": { "chat_two_hop_onion_ready": true }
+                }
+            }
+        }))
+        .expect("health fixture");
+
+        let error = snapshot
+            .ensure_idle_two_hop_ready()
+            .expect_err("zero receipt peers must fail closed");
+        assert!(error.to_string().contains("no_receipt_capable_terminal"));
     }
 
     #[tokio::test]
