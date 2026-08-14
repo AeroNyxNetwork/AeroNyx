@@ -155,6 +155,10 @@ struct HealthSnapshot {
 
 #[derive(Debug, Deserialize)]
 struct ChatRelayHealth {
+    #[serde(default)]
+    configured_enabled: bool,
+    #[serde(default)]
+    runtime_ready: bool,
     peer_relay: ChatRelayOutboundStatus,
 }
 
@@ -302,6 +306,23 @@ impl HealthSnapshot {
         anyhow::ensure!(
             path.delivery_receipt_capable_peers >= 2,
             "authenticated delivery path reported ready with fewer than two delivery-receipt-capable peers"
+        );
+        // [RELAY-SMOKE-RUNTIME-GATE 2026-08-15 by Codex] Discovery readiness
+        // does not prove the local encrypted mailbox/relay runtime exists.
+        // Fail before creating ephemeral VPN sessions when the service failed
+        // initialization or an older running binary lacks route-class proof.
+        let relay = self
+            .chat_relay_status
+            .as_ref()
+            .context("chat relay health is unavailable")?;
+        anyhow::ensure!(
+            relay.configured_enabled,
+            "chat relay is disabled in node configuration"
+        );
+        anyhow::ensure!(relay.runtime_ready, "chat relay runtime is not ready");
+        anyhow::ensure!(
+            relay.peer_relay.authenticated_onion_outbound.is_some(),
+            "authenticated onion relay health is unavailable; restart the node with the current binary"
         );
         Ok(())
     }
@@ -1109,6 +1130,83 @@ mod tests {
             .ensure_idle_two_hop_ready()
             .expect_err("zero receipt peers must fail closed");
         assert!(error.to_string().contains("no_receipt_capable_terminal"));
+    }
+
+    #[test]
+    fn idle_two_hop_preflight_rejects_missing_relay_runtime() {
+        let snapshot: HealthSnapshot = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "active_sessions": 0,
+            "privacy_protocol_health": { "failed_checks": 0 },
+            "discovery_status": {
+                "peer_store": {
+                    "blind_relay_quality": {
+                        "verified_client_onion_deliveries": 0,
+                        "delivery_receipt_capable_peers": 2,
+                        "authenticated_delivery_path_ready": true,
+                        "authenticated_delivery_path_reason": "authenticated_receipt_path_ready"
+                    },
+                    "peer_quorum": { "quorum_ready": true },
+                    "route_governance": { "route_pool_ready": true },
+                    "network_story": { "chat_two_hop_onion_ready": true }
+                }
+            },
+            "chat_relay_status": {
+                "configured_enabled": true,
+                "runtime_ready": false,
+                "peer_relay": {
+                    "authenticated_onion_outbound": {
+                        "rounds": 0,
+                        "last_attempted": 0,
+                        "last_accepted": 0,
+                        "last_failed": 0,
+                        "last_status": null,
+                        "last_failure_reason": null
+                    }
+                }
+            }
+        }))
+        .expect("health fixture");
+
+        let error = snapshot
+            .ensure_idle_two_hop_ready()
+            .expect_err("missing relay runtime must fail before creating sessions");
+        assert!(error.to_string().contains("runtime is not ready"));
+    }
+
+    #[test]
+    fn idle_two_hop_preflight_requires_route_class_health_contract() {
+        let snapshot: HealthSnapshot = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "active_sessions": 0,
+            "privacy_protocol_health": { "failed_checks": 0 },
+            "discovery_status": {
+                "peer_store": {
+                    "blind_relay_quality": {
+                        "verified_client_onion_deliveries": 0,
+                        "delivery_receipt_capable_peers": 2,
+                        "authenticated_delivery_path_ready": true,
+                        "authenticated_delivery_path_reason": "authenticated_receipt_path_ready"
+                    },
+                    "peer_quorum": { "quorum_ready": true },
+                    "route_governance": { "route_pool_ready": true },
+                    "network_story": { "chat_two_hop_onion_ready": true }
+                }
+            },
+            "chat_relay_status": {
+                "configured_enabled": true,
+                "runtime_ready": true,
+                "peer_relay": {}
+            }
+        }))
+        .expect("health fixture");
+
+        let error = snapshot
+            .ensure_idle_two_hop_ready()
+            .expect_err("ambiguous relay status must fail before creating sessions");
+        assert!(error
+            .to_string()
+            .contains("authenticated onion relay health is unavailable"));
     }
 
     #[tokio::test]
