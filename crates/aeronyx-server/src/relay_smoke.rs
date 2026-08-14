@@ -160,12 +160,21 @@ struct ChatRelayHealth {
 
 #[derive(Debug, Deserialize)]
 struct ChatRelayOutboundStatus {
-    outbound_rounds: u64,
-    last_outbound_attempted: u64,
-    last_outbound_accepted: u64,
-    last_outbound_failed: u64,
-    last_outbound_status: Option<String>,
-    last_outbound_failure_reason: Option<String>,
+    /// [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] Optional preserves
+    /// readable failure output against an older local binary, but never falls
+    /// back to the ambiguous aggregate/direct relay status.
+    #[serde(default)]
+    authenticated_onion_outbound: Option<ChatRelayRouteStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatRelayRouteStatus {
+    rounds: u64,
+    last_attempted: u64,
+    last_accepted: u64,
+    last_failed: u64,
+    last_status: Option<String>,
+    last_failure_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,39 +226,37 @@ impl HealthSnapshot {
             .verified_client_onion_deliveries
     }
 
-    fn relay_outbound_rounds(&self) -> Option<u64> {
+    fn authenticated_onion_outbound_rounds(&self) -> Option<u64> {
         self.chat_relay_status
             .as_ref()
-            .map(|health| health.peer_relay.outbound_rounds)
+            .and_then(|health| health.peer_relay.authenticated_onion_outbound.as_ref())
+            .map(|status| status.rounds)
     }
 
-    fn relay_outbound_diagnostic(&self, baseline_rounds: Option<u64>) -> String {
+    fn authenticated_onion_outbound_diagnostic(&self, baseline_rounds: Option<u64>) -> String {
         // [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] Only serialize the
         // service's allow-listed aggregate buckets. Never include peer IDs,
         // endpoints, message IDs, sessions, wallets, or payload material.
         let Some(status) = self
             .chat_relay_status
             .as_ref()
-            .map(|health| &health.peer_relay)
+            .and_then(|health| health.peer_relay.authenticated_onion_outbound.as_ref())
         else {
-            return "outbound_status=unavailable".to_string();
+            return "authenticated_onion_status=unavailable".to_string();
         };
-        if baseline_rounds.is_some_and(|baseline| status.outbound_rounds <= baseline) {
-            return "outbound_status=no_new_round".to_string();
+        if baseline_rounds.is_some_and(|baseline| status.rounds <= baseline) {
+            return "authenticated_onion_status=no_new_round".to_string();
         }
         format!(
-            "outbound_status={}, failure_reason={}, attempted={}, accepted={}, failed={}",
+            "authenticated_onion_status={}, failure_reason={}, attempted={}, accepted={}, failed={}",
+            status.last_status.as_deref().unwrap_or("unobserved"),
             status
-                .last_outbound_status
-                .as_deref()
-                .unwrap_or("unobserved"),
-            status
-                .last_outbound_failure_reason
+                .last_failure_reason
                 .as_deref()
                 .unwrap_or("none"),
-            status.last_outbound_attempted,
-            status.last_outbound_accepted,
-            status.last_outbound_failed,
+            status.last_attempted,
+            status.last_accepted,
+            status.last_failed,
         )
     }
 
@@ -381,7 +388,8 @@ impl HealthClient {
             if current > baseline {
                 return Ok(snapshot);
             }
-            let diagnostic = snapshot.relay_outbound_diagnostic(baseline_outbound_rounds);
+            let diagnostic =
+                snapshot.authenticated_onion_outbound_diagnostic(baseline_outbound_rounds);
             timeout_at(deadline, sleep(HEALTH_POLL_INTERVAL))
                 .await
                 .map_err(|_| {
@@ -772,7 +780,7 @@ pub async fn run(options: RelaySmokeOptions) -> Result<RelaySmokeReport> {
     baseline.ensure_idle_two_hop_ready()?;
     let baseline_active_sessions = baseline.active_sessions;
     let deliveries_before = baseline.verified_client_deliveries();
-    let outbound_rounds_before = baseline.relay_outbound_rounds();
+    let outbound_rounds_before = baseline.authenticated_onion_outbound_rounds();
 
     let sender_identity = IdentityKeyPair::generate();
     let receiver_identity = IdentityKeyPair::generate();
@@ -988,12 +996,14 @@ mod tests {
             },
             "chat_relay_status": {
                 "peer_relay": {
-                    "outbound_rounds": 7,
-                    "last_outbound_attempted": 2,
-                    "last_outbound_accepted": 0,
-                    "last_outbound_failed": 2,
-                    "last_outbound_status": "failed",
-                    "last_outbound_failure_reason": "onion_delivery_receipt_rejected"
+                    "authenticated_onion_outbound": {
+                        "rounds": 7,
+                        "last_attempted": 2,
+                        "last_accepted": 0,
+                        "last_failed": 2,
+                        "last_status": "failed",
+                        "last_failure_reason": "onion_delivery_receipt_rejected"
+                    }
                 }
             }
         }))
@@ -1002,12 +1012,12 @@ mod tests {
         // [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] The rendered failure
         // is operationally useful but cannot identify a route or user.
         assert_eq!(
-            snapshot.relay_outbound_diagnostic(Some(6)),
-            "outbound_status=failed, failure_reason=onion_delivery_receipt_rejected, attempted=2, accepted=0, failed=2"
+            snapshot.authenticated_onion_outbound_diagnostic(Some(6)),
+            "authenticated_onion_status=failed, failure_reason=onion_delivery_receipt_rejected, attempted=2, accepted=0, failed=2"
         );
         assert_eq!(
-            snapshot.relay_outbound_diagnostic(Some(7)),
-            "outbound_status=no_new_round"
+            snapshot.authenticated_onion_outbound_diagnostic(Some(7)),
+            "authenticated_onion_status=no_new_round"
         );
     }
 

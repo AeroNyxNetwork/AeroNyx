@@ -170,6 +170,47 @@ const CHAT_PULL_CURSOR_V2_HKDF_INFO: &[u8] = b"XChaCha20-Poly1305";
 // Peer relay health status
 // ============================================
 
+/// Aggregate-only health for one outbound encrypted relay route class.
+///
+/// [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] Authenticated onion relay
+/// and compatibility direct relay can run sequentially for the same opaque
+/// envelope. Keeping independent snapshots prevents the fallback result from
+/// overwriting the route class an operator or live proof is actually testing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatRelayOutboundRouteStatus {
+    /// Total requests attempted through this route class.
+    pub attempted_total: u64,
+    /// Total requests accepted through this route class.
+    pub accepted_total: u64,
+    /// Total requests that failed or were rejected through this route class.
+    pub failed_total: u64,
+    /// Total route-class rounds observed, including failed preflight rounds.
+    pub rounds: u64,
+    /// Requests attempted in the latest route-class round.
+    pub last_attempted: u64,
+    /// Requests accepted in the latest route-class round.
+    pub last_accepted: u64,
+    /// Requests failed in the latest route-class round.
+    pub last_failed: u64,
+    /// Latest health bucket: healthy, degraded, failed, idle.
+    pub last_status: Option<String>,
+    /// Privacy-safe reason bucket for the latest failure.
+    pub last_failure_reason: Option<String>,
+    /// Consecutive route-class rounds with no accepted request.
+    pub consecutive_failures: u64,
+    /// Timestamp of the latest route-class round with an accepted request.
+    pub last_success_at: Option<u64>,
+    /// Timestamp of the latest route-class round.
+    pub last_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundRouteClass {
+    AuthenticatedOnion,
+    DirectPeer,
+}
+
 /// Privacy-safe node-to-node encrypted chat relay health snapshot.
 ///
 /// This structure intentionally contains only aggregate counters and stable
@@ -204,6 +245,12 @@ pub struct ChatRelayPeerStatus {
     pub last_outbound_success_at: Option<u64>,
     /// Timestamp of the last outbound fanout round.
     pub last_outbound_at: Option<u64>,
+    /// Authenticated receipt-verified onion relay health, isolated from fallback.
+    #[serde(default)]
+    pub authenticated_onion_outbound: ChatRelayOutboundRouteStatus,
+    /// Compatibility direct peer relay health, isolated from onion delivery.
+    #[serde(default)]
+    pub direct_peer_outbound: ChatRelayOutboundRouteStatus,
     /// Total inbound peer relay envelopes accepted for local processing.
     pub inbound_accepted_total: u64,
     /// Total inbound duplicate envelopes ignored idempotently.
@@ -244,6 +291,8 @@ impl ChatRelayPeerStatus {
             consecutive_outbound_failures: 0,
             last_outbound_success_at: None,
             last_outbound_at: None,
+            authenticated_onion_outbound: ChatRelayOutboundRouteStatus::default(),
+            direct_peer_outbound: ChatRelayOutboundRouteStatus::default(),
             inbound_accepted_total: 0,
             inbound_duplicate_total: 0,
             inbound_delivered_online_total: 0,
@@ -2618,8 +2667,9 @@ impl ChatRelayService {
     // Peer relay health
     // ============================================
 
-    /// Records an outbound node-to-node encrypted chat relay fanout round.
+    /// Records a compatibility direct node-to-node encrypted relay round.
     ///
+    /// The backward-compatible aggregate fields are also advanced.
     /// The failure reason must be a stable bucket such as
     /// `peer_relay_request_timeout` or `peer_relay_http_503`; do not pass peer
     /// URLs, message IDs, wallet IDs, client IPs, or payload-derived data.
@@ -2629,6 +2679,45 @@ impl ChatRelayService {
         attempted: usize,
         accepted: usize,
         failure_reason: Option<String>,
+    ) {
+        self.record_outbound_round(
+            now,
+            attempted,
+            accepted,
+            failure_reason,
+            OutboundRouteClass::DirectPeer,
+        );
+    }
+
+    /// Records one authenticated receipt-verified onion relay round.
+    ///
+    /// [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] This advances both the
+    /// backward-compatible aggregate and the authenticated-onion snapshot.
+    /// A later compatibility fallback may update the aggregate but cannot
+    /// erase the authenticated path's latest evidence.
+    pub fn record_authenticated_onion_outbound(
+        &self,
+        now: u64,
+        attempted: usize,
+        accepted: usize,
+        failure_reason: Option<String>,
+    ) {
+        self.record_outbound_round(
+            now,
+            attempted,
+            accepted,
+            failure_reason,
+            OutboundRouteClass::AuthenticatedOnion,
+        );
+    }
+
+    fn record_outbound_round(
+        &self,
+        now: u64,
+        attempted: usize,
+        accepted: usize,
+        failure_reason: Option<String>,
+        route_class: OutboundRouteClass,
     ) {
         let failed = attempted.saturating_sub(accepted);
         let status_bucket = if attempted == 0 && failure_reason.is_some() {
@@ -2649,6 +2738,31 @@ impl ChatRelayService {
         };
 
         let mut status = self.peer_status.write();
+        let route_status = match route_class {
+            OutboundRouteClass::AuthenticatedOnion => &mut status.authenticated_onion_outbound,
+            OutboundRouteClass::DirectPeer => &mut status.direct_peer_outbound,
+        };
+        route_status.attempted_total = route_status
+            .attempted_total
+            .saturating_add(attempted as u64);
+        route_status.accepted_total = route_status.accepted_total.saturating_add(accepted as u64);
+        route_status.failed_total = route_status.failed_total.saturating_add(failed as u64);
+        route_status.rounds = route_status.rounds.saturating_add(1);
+        route_status.last_attempted = attempted as u64;
+        route_status.last_accepted = accepted as u64;
+        route_status.last_failed = failed as u64;
+        route_status.last_status = Some(status_bucket.to_string());
+        route_status.last_failure_reason = failure_reason.clone();
+        route_status.last_at = Some(now);
+        if accepted > 0 {
+            route_status.consecutive_failures = 0;
+            route_status.last_success_at = Some(now);
+        } else if attempted > 0 || route_status.last_failure_reason.is_some() {
+            route_status.consecutive_failures = route_status.consecutive_failures.saturating_add(1);
+        }
+
+        // Preserve the original aggregate contract for existing health and
+        // heartbeat consumers while route-specific readers use the fields above.
         status.outbound_attempted_total = status
             .outbound_attempted_total
             .saturating_add(attempted as u64);
@@ -2926,6 +3040,70 @@ mod tests {
         assert_eq!(status.last_outbound_failure_reason, None);
         assert_eq!(status.consecutive_outbound_failures, 0);
         assert_eq!(status.last_outbound_success_at, Some(1_800_000_030));
+        assert_eq!(status.direct_peer_outbound.rounds, 3);
+        assert_eq!(
+            status.direct_peer_outbound.last_status.as_deref(),
+            Some("healthy")
+        );
+        assert_eq!(status.authenticated_onion_outbound.rounds, 0);
+    }
+
+    #[test]
+    fn authenticated_onion_health_survives_direct_fallback_result() {
+        let svc = make_service();
+
+        // [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] This reproduces the
+        // production order: receipt-verified onion fails, then compatibility
+        // direct relay succeeds for availability. Aggregate remains backward
+        // compatible while the authenticated proof keeps its true result.
+        svc.record_authenticated_onion_outbound(
+            1_800_000_040,
+            1,
+            0,
+            Some("onion_delivery_receipt_rejected".to_string()),
+        );
+        svc.record_peer_relay_outbound(1_800_000_041, 1, 1, None);
+
+        let status = svc.peer_status();
+        assert_eq!(status.outbound_rounds, 2);
+        assert_eq!(status.last_outbound_status.as_deref(), Some("healthy"));
+        assert_eq!(status.authenticated_onion_outbound.rounds, 1);
+        assert_eq!(
+            status.authenticated_onion_outbound.last_status.as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            status
+                .authenticated_onion_outbound
+                .last_failure_reason
+                .as_deref(),
+            Some("onion_delivery_receipt_rejected")
+        );
+        assert_eq!(status.direct_peer_outbound.rounds, 1);
+        assert_eq!(
+            status.direct_peer_outbound.last_status.as_deref(),
+            Some("healthy")
+        );
+    }
+
+    #[test]
+    fn peer_health_deserializes_pre_route_class_snapshot() {
+        let svc = make_service();
+        svc.record_peer_relay_outbound(1_800_000_050, 1, 1, None);
+        let mut encoded = serde_json::to_value(svc.peer_status()).expect("serialize peer status");
+        let object = encoded.as_object_mut().expect("peer status JSON object");
+        object.remove("authenticated_onion_outbound");
+        object.remove("direct_peer_outbound");
+
+        // [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] Additive health
+        // fields must not invalidate status cached or forwarded by an older
+        // node during a rolling upgrade.
+        let decoded: ChatRelayPeerStatus =
+            serde_json::from_value(encoded).expect("deserialize legacy peer status");
+        assert_eq!(decoded.outbound_rounds, 1);
+        assert_eq!(decoded.last_outbound_status.as_deref(), Some("healthy"));
+        assert_eq!(decoded.authenticated_onion_outbound.rounds, 0);
+        assert_eq!(decoded.direct_peer_outbound.rounds, 0);
     }
 
     #[test]

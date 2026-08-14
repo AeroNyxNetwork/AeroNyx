@@ -10652,7 +10652,7 @@ impl Server {
         // otherwise a real routing failure is indistinguishable from idle.
         let Some(client) = client else {
             if let Some(relay) = relay {
-                relay.record_peer_relay_outbound(
+                relay.record_authenticated_onion_outbound(
                     now,
                     0,
                     0,
@@ -10673,7 +10673,7 @@ impl Server {
                 "[CHAT_RELAY] Authenticated onion path is not currently ready"
             );
             if let Some(relay) = relay {
-                relay.record_peer_relay_outbound(
+                relay.record_authenticated_onion_outbound(
                     now,
                     0,
                     0,
@@ -10694,7 +10694,7 @@ impl Server {
             // change between readiness and selection. Record only a stable
             // aggregate bucket, never the missing descriptor or endpoint.
             if let Some(relay) = relay {
-                relay.record_peer_relay_outbound(
+                relay.record_authenticated_onion_outbound(
                     now,
                     0,
                     0,
@@ -10868,7 +10868,15 @@ impl Server {
         }
 
         if let Some(relay) = relay {
-            relay.record_peer_relay_outbound(now, attempted, accepted, last_failure_reason);
+            // [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] Keep verified
+            // onion evidence independent from the compatibility direct-relay
+            // fallback that may run immediately after this function returns.
+            relay.record_authenticated_onion_outbound(
+                now,
+                attempted,
+                accepted,
+                last_failure_reason,
+            );
         }
         let outcome = AuthenticatedChatOnionRelayOutcome {
             attempted_paths: attempted,
@@ -16119,7 +16127,8 @@ mod tests {
 
         assert!(!outcome.delivered());
         // [RELAY-SELECTION-DIAGNOSTICS 2026-08-15 by Codex] A preflight miss
-        // advances the aggregate round and carries only a stable reason bucket.
+        // advances both backward-compatible aggregate and authenticated-onion
+        // evidence with only a stable reason bucket.
         let status = relay.peer_status();
         assert_eq!(status.outbound_rounds, 1);
         assert_eq!(status.last_outbound_attempted, 0);
@@ -16128,6 +16137,19 @@ mod tests {
             status.last_outbound_failure_reason.as_deref(),
             Some("no_receipt_capable_terminal")
         );
+        assert_eq!(status.authenticated_onion_outbound.rounds, 1);
+        assert_eq!(
+            status.authenticated_onion_outbound.last_status.as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            status
+                .authenticated_onion_outbound
+                .last_failure_reason
+                .as_deref(),
+            Some("no_receipt_capable_terminal")
+        );
+        assert_eq!(status.direct_peer_outbound.rounds, 0);
     }
 
     #[tokio::test]
