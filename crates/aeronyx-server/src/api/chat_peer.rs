@@ -872,6 +872,12 @@ enum ChatPeerRelayError {
     #[error("envelope serialization failed")]
     Serialization,
 
+    #[error("chat envelope timestamp expired")]
+    TimestampExpired,
+
+    #[error("chat envelope timestamp is too far in the future")]
+    TimestampInFuture,
+
     #[error("pending store failed")]
     StoreFailed,
 
@@ -936,6 +942,12 @@ enum BlindRelayError {
     DownstreamRejected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayTimestampError {
+    Expired,
+    InFuture,
+}
+
 impl BlindRelayError {
     fn status_code(&self) -> StatusCode {
         match self {
@@ -986,9 +998,11 @@ impl ChatPeerRelayError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::RelayUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::InvalidSignature | Self::EnvelopeTooLarge { .. } | Self::Serialization => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::InvalidSignature
+            | Self::EnvelopeTooLarge { .. }
+            | Self::Serialization
+            | Self::TimestampExpired
+            | Self::TimestampInFuture => StatusCode::BAD_REQUEST,
             Self::PendingCapacity => StatusCode::SERVICE_UNAVAILABLE,
             Self::StoreFailed => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -1000,6 +1014,8 @@ impl ChatPeerRelayError {
             Self::InvalidSignature => "invalid_signature",
             Self::EnvelopeTooLarge { .. } => "envelope_too_large",
             Self::Serialization => "envelope_serialization_failed",
+            Self::TimestampExpired => "timestamp_expired",
+            Self::TimestampInFuture => "timestamp_in_future",
             Self::PendingCapacity => "pending_capacity_exhausted",
             Self::StoreFailed => "store_pending_failed",
         }
@@ -1175,7 +1191,7 @@ async fn process_peer_relay(
     envelope: ChatEnvelope,
 ) -> Result<PeerChatRelayResponse, ChatPeerRelayError> {
     let now = now_secs();
-    if let Err(error) = validate_peer_envelope(&envelope) {
+    if let Err(error) = validate_peer_envelope(&envelope, now) {
         if let Some(relay) = state.chat_relay.as_ref() {
             relay.record_peer_relay_inbound_rejected(now, error.reason_bucket());
         }
@@ -2463,13 +2479,16 @@ fn validate_blind_relay_envelope(
 }
 
 fn validate_blind_relay_timestamp(timestamp: u64, now: u64) -> Result<(), BlindRelayError> {
-    if timestamp > now.saturating_add(BLIND_RELAY_MAX_FUTURE_SKEW_SECS) {
-        return Err(BlindRelayError::TimestampInFuture);
-    }
-    if now.saturating_sub(timestamp) > BLIND_RELAY_MAX_ENVELOPE_AGE_SECS {
-        return Err(BlindRelayError::TimestampExpired);
-    }
-    Ok(())
+    validate_relay_timestamp(
+        timestamp,
+        now,
+        BLIND_RELAY_MAX_ENVELOPE_AGE_SECS,
+        BLIND_RELAY_MAX_FUTURE_SKEW_SECS,
+    )
+    .map_err(|error| match error {
+        RelayTimestampError::Expired => BlindRelayError::TimestampExpired,
+        RelayTimestampError::InFuture => BlindRelayError::TimestampInFuture,
+    })
 }
 
 fn blind_peer_relay_url(endpoint: &str) -> Option<String> {
@@ -2514,10 +2533,25 @@ fn classify_reqwest_error(phase: &str, error: &reqwest::Error) -> String {
     format!("{phase}_unknown")
 }
 
-fn validate_peer_envelope(envelope: &ChatEnvelope) -> Result<(), ChatPeerRelayError> {
+fn validate_peer_envelope(envelope: &ChatEnvelope, now: u64) -> Result<(), ChatPeerRelayError> {
     envelope
         .verify_signature()
         .map_err(|_| ChatPeerRelayError::InvalidSignature)?;
+
+    // [PEER-RELAY-REPLAY-WINDOW 2026-08-15 by Codex] Direct compatibility
+    // relay is immediate node-to-node work, not a durable replay token. Use
+    // the same bounded freshness policy as blind routing so an observed signed
+    // ciphertext cannot be admitted to fresh node mailboxes indefinitely.
+    validate_relay_timestamp(
+        envelope.timestamp,
+        now,
+        BLIND_RELAY_MAX_ENVELOPE_AGE_SECS,
+        BLIND_RELAY_MAX_FUTURE_SKEW_SECS,
+    )
+    .map_err(|error| match error {
+        RelayTimestampError::Expired => ChatPeerRelayError::TimestampExpired,
+        RelayTimestampError::InFuture => ChatPeerRelayError::TimestampInFuture,
+    })?;
 
     let encoded = encode_envelope(envelope).map_err(|_| ChatPeerRelayError::Serialization)?;
     if encoded.len() > MAX_PEER_CHAT_ENVELOPE_BYTES {
@@ -2526,6 +2560,21 @@ fn validate_peer_envelope(envelope: &ChatEnvelope) -> Result<(), ChatPeerRelayEr
         });
     }
 
+    Ok(())
+}
+
+fn validate_relay_timestamp(
+    timestamp: u64,
+    now: u64,
+    max_age_secs: u64,
+    max_future_skew_secs: u64,
+) -> Result<(), RelayTimestampError> {
+    if timestamp > now.saturating_add(max_future_skew_secs) {
+        return Err(RelayTimestampError::InFuture);
+    }
+    if now.saturating_sub(timestamp) > max_age_secs {
+        return Err(RelayTimestampError::Expired);
+    }
     Ok(())
 }
 
@@ -2603,12 +2652,16 @@ mod tests {
     use crate::services::{BlindVaultLeaseProvisionOutcome, BlindVaultService};
 
     fn signed_envelope() -> ChatEnvelope {
+        signed_envelope_at(now_secs())
+    }
+
+    fn signed_envelope_at(timestamp: u64) -> ChatEnvelope {
         let kp = IdentityKeyPair::generate();
         let mut envelope = ChatEnvelope {
             message_id: [0x11u8; 16],
             sender: kp.public_key_bytes(),
             receiver: [0x22u8; 32],
-            timestamp: 1_800_000_000,
+            timestamp,
             ciphertext: b"opaque encrypted payload".to_vec(),
             nonce: [0x33u8; 24],
             content_type: ChatContentType::Text,
@@ -3106,8 +3159,43 @@ mod tests {
         envelope.ciphertext.push(0x44);
 
         assert!(matches!(
-            validate_peer_envelope(&envelope),
+            validate_peer_envelope(&envelope, now_secs()),
             Err(ChatPeerRelayError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn validate_peer_envelope_enforces_bounded_replay_window() {
+        let now = 1_800_000_000u64;
+        assert!(validate_peer_envelope(
+            &signed_envelope_at(now.saturating_sub(BLIND_RELAY_MAX_ENVELOPE_AGE_SECS)),
+            now,
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_peer_envelope(
+                &signed_envelope_at(
+                    now.saturating_sub(BLIND_RELAY_MAX_ENVELOPE_AGE_SECS)
+                        .saturating_sub(1)
+                ),
+                now,
+            ),
+            Err(ChatPeerRelayError::TimestampExpired)
+        ));
+        assert!(validate_peer_envelope(
+            &signed_envelope_at(now.saturating_add(BLIND_RELAY_MAX_FUTURE_SKEW_SECS)),
+            now,
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_peer_envelope(
+                &signed_envelope_at(
+                    now.saturating_add(BLIND_RELAY_MAX_FUTURE_SKEW_SECS)
+                        .saturating_add(1)
+                ),
+                now,
+            ),
+            Err(ChatPeerRelayError::TimestampInFuture)
         ));
     }
 
@@ -4177,7 +4265,7 @@ mod tests {
                         Ok(envelope) => envelope,
                         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
                     };
-                    if validate_peer_envelope(&inner).is_err() {
+                    if validate_peer_envelope(&inner, now_secs()).is_err() {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
                     if terminal_relay_for_request.store_pending(&inner).is_err() {
