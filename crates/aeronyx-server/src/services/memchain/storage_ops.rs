@@ -917,6 +917,11 @@ fn persist_record_commitment_block_transaction(
 /// against the exact retained predecessor block. This makes disk tampering,
 /// skipped epochs, height gaps, key substitution, and alternate-prefix replay
 /// fail closed before the latest coordinator can become runtime authority.
+///
+/// [HANDOVER-ACCEPTANCE-AUDIT 2026-08-14 by Codex] The local acceptance time is
+/// also revalidated on every history read. Although it is not consensus data,
+/// allowing it to precede the dual-signed issue time would make durable audit
+/// metadata rollbackable after restart and weaken incident reconstruction.
 fn read_record_coordinator_handover_history_transaction(
     transaction: &rusqlite::Transaction<'_>,
     root_coordinator: &[u8; 32],
@@ -927,7 +932,8 @@ fn read_record_coordinator_handover_history_transaction(
                 "SELECT authority_epoch,activation_height,previous_height,
                         chain_id,protocol_version,previous_tip_hash,
                         previous_coordinator,next_coordinator,authorization_id,
-                        issued_at,previous_signature,next_signature,payload
+                        issued_at,previous_signature,next_signature,payload,
+                        accepted_at
                  FROM record_coordinator_handovers
                  ORDER BY authority_epoch ASC LIMIT ?1",
             )
@@ -950,6 +956,7 @@ fn read_record_coordinator_handover_history_transaction(
                     row.get::<_, Vec<u8>>(10)?,
                     row.get::<_, Vec<u8>>(11)?,
                     row.get::<_, Vec<u8>>(12)?,
+                    row.get::<_, i64>(13)?,
                 ))
             })
             .map_err(|error| format!("read coordinator handover history: {error}"))?
@@ -978,6 +985,7 @@ fn read_record_coordinator_handover_history_transaction(
         stored_previous_signature,
         stored_next_signature,
         payload,
+        stored_accepted_at,
     ) in rows
     {
         if payload.len() > MAX_STORED_COORDINATOR_HANDOVER_BYTES {
@@ -999,6 +1007,8 @@ fn read_record_coordinator_handover_history_transaction(
             .map_err(|_| "stored coordinator handover predecessor is invalid".to_string())?;
         let issued_at = u64::try_from(stored_issued_at)
             .map_err(|_| "stored coordinator handover issue time is invalid".to_string())?;
+        let accepted_at = u64::try_from(stored_accepted_at)
+            .map_err(|_| "stored coordinator handover acceptance time is invalid".to_string())?;
         if authority_epoch != proof.header.authority_epoch
             || activation_height != proof.header.activation_height
             || activation_height.checked_sub(1) != Some(previous_height)
@@ -1015,6 +1025,11 @@ fn read_record_coordinator_handover_history_transaction(
         {
             return Err(format!(
                 "stored coordinator handover row mismatch at epoch {authority_epoch}"
+            ));
+        }
+        if accepted_at == 0 || accepted_at < issued_at {
+            return Err(format!(
+                "stored coordinator handover acceptance time is invalid at epoch {authority_epoch}"
             ));
         }
 
@@ -8205,6 +8220,53 @@ mod tests {
             .await
             .unwrap_err()
             .contains("stored coordinator handover row mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_handover_history_rejects_acceptance_time_rollback() {
+        // [HANDOVER-ACCEPTANCE-AUDIT 2026-08-14 by Codex] Model an operator or
+        // disk attacker rewriting non-consensus audit metadata after a valid
+        // insert. Restart/history replay must fail closed instead of trusting
+        // the insert-time check forever.
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        storage.audit_record_commitment_chain().await.unwrap();
+        let root = IdentityKeyPair::generate();
+        let next = IdentityKeyPair::generate();
+        let first_block = signed_commitment_block(1, GENESIS_PREV_HASH, 0x46, &root);
+        storage
+            .append_record_commitment_block(&first_block, None)
+            .await
+            .unwrap();
+        let proof = RecordCoordinatorHandoverV1::new_dual_signed(
+            1,
+            2,
+            first_block.hash(),
+            [0x58; 16],
+            6_000,
+            &root,
+            &next,
+        );
+        storage
+            .persist_record_coordinator_handover(&root.public_key_bytes(), &proof, 6_001)
+            .await
+            .unwrap();
+        {
+            let conn = storage.conn.lock().await;
+            conn.execute(
+                "UPDATE record_coordinator_handovers SET accepted_at=?1
+                 WHERE authority_epoch=1",
+                params![5_999_i64],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            storage
+                .record_coordinator_handover_history(&root.public_key_bytes())
+                .await
+                .unwrap_err(),
+            "stored coordinator handover acceptance time is invalid at epoch 1"
+        );
     }
 
     #[tokio::test]
