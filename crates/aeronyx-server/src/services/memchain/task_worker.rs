@@ -15,6 +15,9 @@
 //! Re-exported via prompts.rs. Use PrivacyLevel::from_str() for DB string parsing.
 //!
 //! ## Last Modified
+//! v2.5.7-TaskOwnership - [SUPERNODE-TASK-OWNERSHIP 2026-08-14 by Codex]
+//!   Enforces configured per-task timeouts, owns concurrent work in a JoinSet,
+//!   and releases unfinished claims during graceful shutdown.
 //! v2.5.6-DurableWriteback - [SUPERNODE-DURABLE-WRITEBACK 2026-08-14 by Codex]
 //!   Persists inference output and usage atomically before target writeback;
 //!   retries now reuse the staged result instead of calling the provider again.
@@ -31,10 +34,12 @@
 //!   Fixed CognitiveTaskType::from_str → CognitiveTaskType::parse().
 //!   Fixed clean_llm_response match arms to use correct variant names.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
+use tokio::task::{Id, JoinSet};
 use tracing::{debug, error, info, warn};
 
 use super::storage::MemoryStorage;
@@ -94,6 +99,7 @@ pub struct TaskWorker {
     router: Arc<LlmRouter>,
     batch_size: usize,
     poll_interval: Duration,
+    task_timeout: Duration,
 }
 
 impl TaskWorker {
@@ -107,6 +113,7 @@ impl TaskWorker {
             router,
             batch_size: worker_config.max_concurrent.max(1).min(50),
             poll_interval: Duration::from_secs(worker_config.poll_interval_secs.max(1)),
+            task_timeout: Duration::from_secs(worker_config.task_timeout_secs.max(1)),
         }
     }
 
@@ -114,6 +121,7 @@ impl TaskWorker {
         info!(
             batch_size = self.batch_size,
             poll_interval_secs = self.poll_interval.as_secs(),
+            task_timeout_secs = self.task_timeout.as_secs(),
             "[TASK_WORKER] Started"
         );
 
@@ -127,7 +135,9 @@ impl TaskWorker {
                     break;
                 }
                 _ = timer.tick() => {
-                    self.process_batch().await;
+                    if self.process_batch_until_shutdown(&mut shutdown_rx).await {
+                        break;
+                    }
                 }
             }
         }
@@ -135,50 +145,128 @@ impl TaskWorker {
         info!("[TASK_WORKER] Stopped");
     }
 
-    async fn process_batch(&self) {
+    /// Process one claimed batch while retaining ownership of every child task.
+    ///
+    /// Returns `true` when shutdown was observed while the batch was active.
+    async fn process_batch_until_shutdown(
+        &self,
+        shutdown_rx: &mut broadcast::Receiver<()>,
+    ) -> bool {
         let tasks = self.storage.claim_pending_tasks(self.batch_size).await;
         if tasks.is_empty() {
             debug!("[TASK_WORKER] No pending tasks");
-            return;
+            return false;
         }
 
         info!(count = tasks.len(), "[TASK_WORKER] Processing batch");
 
-        let mut handles = Vec::with_capacity(tasks.len());
+        // [SUPERNODE-TASK-OWNERSHIP 2026-08-14 by Codex] JoinSet provides
+        // structured ownership: cancelling the worker can no longer detach
+        // provider/writeback tasks into the runtime. The Tokio task ID maps a
+        // panic or cancellation back to its durable cognitive task row.
+        let mut running = JoinSet::new();
+        let mut task_ids: HashMap<Id, i64> = HashMap::with_capacity(tasks.len());
         for task in tasks {
             let task_id = task.id;
             let storage = Arc::clone(&self.storage);
             let router = Arc::clone(&self.router);
-            handles.push((
-                task_id,
-                tokio::spawn(async move {
-                    Self::process_task(storage, router, task).await;
-                }),
-            ));
+            let task_timeout = self.task_timeout;
+            let abort_handle = running.spawn(async move {
+                let timed_out =
+                    tokio::time::timeout(task_timeout, Self::process_task(storage, router, task))
+                        .await
+                        .is_err();
+                (task_id, timed_out)
+            });
+            task_ids.insert(abort_handle.id(), task_id);
         }
 
-        for (task_id, handle) in handles {
-            if let Err(e) = handle.await {
-                // [SUPERNODE-FAILURE-BOUNDARY 2026-08-14 by Codex] A panic used
-                // to leave the claimed row in `processing` until startup stale
-                // recovery. Associate every JoinHandle with its durable task ID
-                // so the normal bounded retry policy owns the failure.
-                let reason = if e.is_panic() {
-                    "task_worker_panicked"
-                } else {
-                    "task_worker_cancelled"
-                };
-                error!(id = task_id, reason, "[TASK_WORKER] Task execution aborted");
-                if let Err(fail_error) = self.storage.fail_task(task_id, reason).await {
-                    warn!(
-                        id = task_id,
-                        reason = "task_failure_transition_rejected",
-                        "[TASK_WORKER] Could not record aborted task"
-                    );
-                    debug!(id = task_id, error = %fail_error, "[TASK_WORKER] Failure transition detail");
+        while !running.is_empty() {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    let claimed_ids: Vec<i64> = task_ids.values().copied().collect();
+                    running.abort_all();
+                    while running.join_next().await.is_some() {}
+
+                    match self
+                        .storage
+                        .release_processing_tasks(&claimed_ids, "task_worker_shutdown")
+                        .await
+                    {
+                        Ok(released) => info!(
+                            released,
+                            "[TASK_WORKER] Released unfinished tasks during shutdown"
+                        ),
+                        Err(release_error) => {
+                            warn!(
+                                reason = "task_shutdown_release_failed",
+                                "[TASK_WORKER] Could not release unfinished tasks"
+                            );
+                            debug!(error = %release_error, "[TASK_WORKER] Shutdown release detail");
+                        }
+                    }
+                    return true;
+                }
+                joined = running.join_next_with_id() => {
+                    let Some(joined) = joined else {
+                        break;
+                    };
+                    match joined {
+                        Ok((runtime_id, (task_id, timed_out))) => {
+                            task_ids.remove(&runtime_id);
+                            if timed_out {
+                                warn!(
+                                    id = task_id,
+                                    timeout_secs = self.task_timeout.as_secs(),
+                                    reason = "task_worker_timed_out",
+                                    "[TASK_WORKER] Task exceeded execution deadline"
+                                );
+                                self.record_aborted_task(task_id, "task_worker_timed_out").await;
+                            }
+                        }
+                        Err(join_error) => {
+                            let runtime_id = join_error.id();
+                            let Some(task_id) = task_ids.remove(&runtime_id) else {
+                                error!(
+                                    reason = "task_runtime_id_unmapped",
+                                    "[TASK_WORKER] Child task failed without durable ownership mapping"
+                                );
+                                continue;
+                            };
+                            let reason = if join_error.is_panic() {
+                                "task_worker_panicked"
+                            } else {
+                                "task_worker_cancelled"
+                            };
+                            error!(id = task_id, reason, "[TASK_WORKER] Task execution aborted");
+                            self.record_aborted_task(task_id, reason).await;
+                        }
+                    }
                 }
             }
         }
+
+        false
+    }
+
+    async fn record_aborted_task(&self, task_id: i64, reason: &'static str) {
+        if let Err(fail_error) = self.storage.fail_task(task_id, reason).await {
+            warn!(
+                id = task_id,
+                reason = "task_failure_transition_rejected",
+                "[TASK_WORKER] Could not record aborted task"
+            );
+            debug!(id = task_id, error = %fail_error, "[TASK_WORKER] Failure transition detail");
+        }
+    }
+
+    #[cfg(test)]
+    async fn process_batch(&self) {
+        let (_shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        assert!(
+            !self.process_batch_until_shutdown(&mut shutdown_rx).await,
+            "test batch unexpectedly observed shutdown"
+        );
     }
 
     async fn process_task(
@@ -936,6 +1024,7 @@ impl std::fmt::Debug for TaskWorker {
         f.debug_struct("TaskWorker")
             .field("batch_size", &self.batch_size)
             .field("poll_interval_secs", &self.poll_interval.as_secs())
+            .field("task_timeout_secs", &self.task_timeout.as_secs())
             .finish()
     }
 }
@@ -957,6 +1046,8 @@ mod tests {
     struct RecoveringProvider {
         calls: AtomicUsize,
     }
+
+    struct PendingProvider;
 
     #[async_trait::async_trait]
     impl LlmProvider for PanickingProvider {
@@ -1029,6 +1120,33 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl LlmProvider for PendingProvider {
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            std::future::pending().await
+        }
+
+        fn name(&self) -> &str {
+            "pending-provider"
+        }
+
+        fn default_model(&self) -> &str {
+            "pending-model"
+        }
+    }
+
+    fn pending_router() -> Arc<LlmRouter> {
+        Arc::new(LlmRouter::new(
+            vec![(
+                "pending-provider".into(),
+                "http://localhost".into(),
+                "pending-model".into(),
+                Arc::new(PendingProvider),
+            )],
+            TaskRoutingConfig::default(),
+        ))
+    }
+
     #[test]
     fn malformed_unicode_json_is_rejected_without_byte_boundary_panic() {
         let malformed = "界".repeat(100);
@@ -1082,6 +1200,106 @@ mod tests {
         assert_eq!(task.status, "pending");
         assert_eq!(task.retry_count, 1);
         assert_eq!(task.error_message.as_deref(), Some("task_worker_panicked"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_task_is_requeued_with_stable_reason() {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let task_id = storage
+            .insert_cognitive_task(
+                "session_title",
+                1,
+                r#"{"entity_names":[]}"#,
+                None,
+                None,
+                None,
+                "structured",
+                2,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let worker = TaskWorker::new(
+            Arc::clone(&storage),
+            pending_router(),
+            WorkerConfig {
+                max_concurrent: 1,
+                task_timeout_secs: 1,
+                ..WorkerConfig::default()
+            },
+        );
+
+        worker.process_batch().await;
+
+        let task = storage.get_task(task_id).await.unwrap();
+        assert_eq!(task.status, "pending");
+        assert_eq!(task.retry_count, 1);
+        assert_eq!(task.error_message.as_deref(), Some("task_worker_timed_out"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_children_and_releases_claims_without_retry_penalty() {
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let task_id = storage
+            .insert_cognitive_task(
+                "session_title",
+                1,
+                r#"{"entity_names":[]}"#,
+                None,
+                None,
+                None,
+                "structured",
+                2,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let worker = Arc::new(TaskWorker::new(
+            Arc::clone(&storage),
+            pending_router(),
+            WorkerConfig {
+                max_concurrent: 1,
+                task_timeout_secs: 60,
+                ..WorkerConfig::default()
+            },
+        ));
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+        let batch = {
+            let worker = Arc::clone(&worker);
+            tokio::spawn(async move { worker.process_batch_until_shutdown(&mut shutdown_rx).await })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if storage
+                    .get_task(task_id)
+                    .await
+                    .is_some_and(|task| task.status == "processing")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker must claim the test task");
+        shutdown_tx.send(()).unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), batch)
+                .await
+                .expect("worker must stop promptly")
+                .unwrap(),
+            "batch must report that it observed shutdown"
+        );
+        let released = storage.get_task(task_id).await.unwrap();
+        assert_eq!(released.status, "pending");
+        assert_eq!(released.retry_count, 0);
+        assert_eq!(released.started_at, None);
+        assert_eq!(
+            released.error_message.as_deref(),
+            Some("task_worker_shutdown")
+        );
     }
 
     #[tokio::test]

@@ -45,6 +45,9 @@
 //! - PrivacyConfig.level_for() returns PrivacyLevel (owned, cloned).
 //!
 //! ## Last Modified
+//! v2.5.7-TaskOwnership - [SUPERNODE-TASK-OWNERSHIP 2026-08-14 by Codex]
+//!   Rejects task timeout values that cannot share one safe meaning between
+//!   Tokio execution deadlines and signed SQLite startup recovery timestamps.
 //! v2.5.0-SuperNode - 🌟 Created. Full SuperNode configuration with providers,
 //!   routing, privacy, and worker settings.
 //! v2.5.0+Audit Fix 9  - 🔧 CognitiveTaskType::from_str renamed to parse() to avoid
@@ -562,6 +565,22 @@ impl SuperNodeConfig {
                 "must be >= 1",
             ));
         }
+        // [SUPERNODE-TASK-OWNERSHIP 2026-08-14 by Codex] The same timeout is
+        // used by Tokio for live task execution and converted to i64 seconds by
+        // SQLite startup recovery. Reject values whose meanings would diverge
+        // across those two ownership boundaries.
+        if self.worker.task_timeout_secs == 0 {
+            return Err(ServerError::config_invalid(
+                "memchain.supernode.worker.task_timeout_secs",
+                "must be >= 1",
+            ));
+        }
+        if self.worker.task_timeout_secs > i64::MAX as u64 {
+            return Err(ServerError::config_invalid(
+                "memchain.supernode.worker.task_timeout_secs",
+                format!("must be <= {}", i64::MAX),
+            ));
+        }
 
         info!(
             providers = self.providers.len(),
@@ -862,6 +881,30 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_worker_task_timeout_out_of_range_rejected() {
+        for task_timeout_secs in [0, i64::MAX as u64 + 1] {
+            let cfg = SuperNodeConfig {
+                enabled: true,
+                providers: vec![ProviderConfig {
+                    name: "test".into(),
+                    provider_type: ProviderType::Anthropic,
+                    api_base: String::new(),
+                    api_key: None,
+                    model: "test".into(),
+                    max_tokens: None,
+                    temperature: None,
+                }],
+                worker: WorkerConfig {
+                    task_timeout_secs,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err());
+        }
     }
 
     #[test]

@@ -15,7 +15,8 @@
 //! ## Main Functionality
 //! ### cognitive_tasks CRUD
 //! - insert_cognitive_task()        — enqueue a new pending task (idempotent: skips if active duplicate exists)
-//! - claim_pending_tasks()          — atomic SELECT + UPDATE to 'processing'
+//! - claim_pending_tasks()          — transactional claim to 'processing'
+//! - release_processing_tasks()     — release worker-owned tasks during shutdown
 //! - stage_task_result_and_usage()  — atomically persist inference + usage before writeback
 //! - complete_staged_task()         — finalize a staged task after durable writeback
 //! - complete_task()                — mark completed + write result + token_usage
@@ -62,8 +63,9 @@
 //!   task_type) triple. Returns Ok(None) in that case. Callers must handle Option<i64>.
 //! - reset_stale_processing_tasks() MUST be called at server startup before TaskWorker
 //!   spawns. Recovers tasks stuck in 'processing' after a crash/restart.
-//! - claim_pending_tasks() uses a single conn lock (SELECT + UPDATE atomic).
-//!   Do NOT split into two separate conn.lock() calls.
+//! - claim_pending_tasks() uses an IMMEDIATE SQLite transaction. A process-local
+//!   mutex alone does not prevent another connection or process from claiming
+//!   the same row. Do not weaken this to separate autocommit statements.
 //! - fail_task() checks retry_count < max_retries before marking 'failed'.
 //!   retry_task() is the human override — always resets to pending regardless.
 //! - get_tasks_filtered() uses four SQL variants (no dynamic string building).
@@ -73,6 +75,10 @@
 //!   task_id in llm_usage_log (e.g. manual inserts) are excluded.
 //!
 //! ## Last Modified
+//! v2.5.7-TaskOwnership - [SUPERNODE-TASK-OWNERSHIP 2026-08-14 by Codex]
+//!   Claims now use an IMMEDIATE SQLite transaction across SELECT + UPDATE,
+//!   preventing duplicate execution across independent database connections.
+//!   Added guarded batch release for structured worker shutdown.
 //! v2.5.6-DurableWriteback - [SUPERNODE-DURABLE-WRITEBACK 2026-08-14 by Codex]
 //!   Added a two-phase completion boundary so target writeback retries reuse the
 //!   staged inference result and cannot duplicate provider calls or usage rows.
@@ -101,7 +107,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use tracing::{debug, info, warn};
 
 use super::storage::MemoryStorage;
@@ -333,48 +339,145 @@ impl MemoryStorage {
 
     /// Atomically claim up to `batch_size` pending tasks for processing.
     ///
-    /// Uses a single connection lock (SELECT + UPDATE atomic).
-    /// ⚠️ Do NOT split into two conn.lock() calls — would allow double-claiming.
+    /// [SUPERNODE-TASK-OWNERSHIP 2026-08-14 by Codex] The process-local
+    /// connection mutex cannot serialize a second `MemoryStorage` instance or
+    /// another process opening the same WAL database. `IMMEDIATE` takes the
+    /// SQLite writer reservation before the SELECT, so no competing claimant
+    /// can observe and transition the same pending rows between these steps.
     pub async fn claim_pending_tasks(&self, batch_size: usize) -> Vec<CognitiveTaskRow> {
-        let now = now_ts();
-        let conn = self.conn.lock().await;
+        if batch_size == 0 {
+            return Vec::new();
+        }
 
-        let mut stmt = match conn.prepare(
-            "SELECT id, task_type, priority, status, payload, result,
-                    target_table, target_id, privacy_level, provider_used, model_used,
-                    token_usage, created_at, started_at, completed_at,
-                    retry_count, max_retries, error_message
-             FROM cognitive_tasks
-             WHERE status = 'pending' AND retry_count < max_retries
-             ORDER BY priority DESC, created_at ASC
-             LIMIT ?1",
-        ) {
-            Ok(s) => s,
+        let now = now_ts();
+        let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
+        let mut conn = self.conn.lock().await;
+        let transaction = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(transaction) => transaction,
             Err(e) => {
-                warn!("[STORAGE_SN] claim_pending_tasks prepare failed: {}", e);
+                warn!(
+                    reason = "task_claim_transaction_unavailable",
+                    error = %e,
+                    "[STORAGE_SN] Could not begin task claim transaction"
+                );
                 return Vec::new();
             }
         };
 
-        let tasks: Vec<CognitiveTaskRow> = stmt
-            .query_map(params![batch_size as i64], |row| task_row(row))
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
+        let candidates: Vec<CognitiveTaskRow> = {
+            let mut statement = match transaction.prepare(
+                "SELECT id, task_type, priority, status, payload, result,
+                        target_table, target_id, privacy_level, provider_used, model_used,
+                        token_usage, created_at, started_at, completed_at,
+                        retry_count, max_retries, error_message
+                 FROM cognitive_tasks
+                 WHERE status = 'pending' AND retry_count < max_retries
+                 ORDER BY priority DESC, created_at ASC
+                 LIMIT ?1",
+            ) {
+                Ok(statement) => statement,
+                Err(e) => {
+                    warn!(
+                        reason = "task_claim_query_unavailable",
+                        error = %e,
+                        "[STORAGE_SN] Could not prepare task claim query"
+                    );
+                    return Vec::new();
+                }
+            };
 
-        if tasks.is_empty() {
-            return tasks;
+            let query_result = match statement.query_map(params![limit], task_row) {
+                Ok(rows) => rows.filter_map(Result::ok).collect(),
+                Err(e) => {
+                    warn!(
+                        reason = "task_claim_query_failed",
+                        error = %e,
+                        "[STORAGE_SN] Could not read task claim candidates"
+                    );
+                    return Vec::new();
+                }
+            };
+            query_result
+        };
+
+        if candidates.is_empty() {
+            return Vec::new();
         }
 
-        for task in &tasks {
-            let _ = conn.execute(
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for task in candidates {
+            let affected = match transaction.execute(
                 "UPDATE cognitive_tasks SET status = 'processing', started_at = ?1
                  WHERE id = ?2 AND status = 'pending'",
                 params![now, task.id],
-            );
+            ) {
+                Ok(affected) => affected,
+                Err(e) => {
+                    warn!(
+                        id = task.id,
+                        reason = "task_claim_transition_failed",
+                        error = %e,
+                        "[STORAGE_SN] Task claim transaction rolled back"
+                    );
+                    return Vec::new();
+                }
+            };
+            if affected == 1 {
+                claimed.push(task);
+            }
         }
 
-        debug!(claimed = tasks.len(), "[STORAGE_SN] Tasks claimed");
-        tasks
+        if let Err(e) = transaction.commit() {
+            warn!(
+                reason = "task_claim_commit_failed",
+                error = %e,
+                "[STORAGE_SN] Task claim transaction did not commit"
+            );
+            return Vec::new();
+        }
+
+        debug!(claimed = claimed.len(), "[STORAGE_SN] Tasks claimed");
+        claimed
+    }
+
+    /// Release a worker-owned set of processing tasks back to the pending queue.
+    ///
+    /// This is used only during structured worker shutdown. It deliberately does
+    /// not increment `retry_count`: an operator-requested shutdown is not an
+    /// inference failure. The status guard makes the operation safe when a task
+    /// completed between shutdown notification and task cancellation. Any staged
+    /// result remains intact and will be reused after restart.
+    pub(crate) async fn release_processing_tasks(
+        &self,
+        task_ids: &[i64],
+        reason: &str,
+    ) -> Result<usize, String> {
+        if task_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock().await;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("release_processing_tasks begin: {e}"))?;
+        let mut released = 0;
+
+        for task_id in task_ids {
+            released += transaction
+                .execute(
+                    "UPDATE cognitive_tasks SET
+                        status = 'pending', started_at = NULL, error_message = ?1
+                     WHERE id = ?2 AND status = 'processing'",
+                    params![reason, task_id],
+                )
+                .map_err(|e| format!("release_processing_tasks update {task_id}: {e}"))?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|e| format!("release_processing_tasks commit: {e}"))?;
+        debug!(released, "[STORAGE_SN] Worker-owned tasks released");
+        Ok(released)
     }
 
     /// Mark a task as completed.
@@ -1084,7 +1187,11 @@ fn task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CognitiveTaskRow> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use tempfile::TempDir;
+    use tokio::sync::Barrier;
 
     #[tokio::test]
     async fn test_insert_and_claim_task() {
@@ -1112,6 +1219,43 @@ mod tests {
         // Double-claim prevention
         let claimed2 = s.claim_pending_tasks(10).await;
         assert!(claimed2.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_connections_claim_each_task_once() {
+        let directory = TempDir::new().unwrap();
+        let database_path = directory.path().join("shared-task-queue.db");
+        let first = Arc::new(MemoryStorage::open(&database_path, None).unwrap());
+        let second = Arc::new(MemoryStorage::open(&database_path, None).unwrap());
+        let task_id = first
+            .insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap()
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first_claim = {
+            let storage = Arc::clone(&first);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                storage.claim_pending_tasks(1).await
+            })
+        };
+        let second_claim = {
+            let storage = Arc::clone(&second);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                storage.claim_pending_tasks(1).await
+            })
+        };
+        barrier.wait().await;
+
+        let mut claimed = first_claim.await.unwrap();
+        claimed.extend(second_claim.await.unwrap());
+        assert_eq!(claimed.len(), 1, "a durable task may have only one owner");
+        assert_eq!(claimed[0].id, task_id);
     }
 
     /// (v2.5.0+Fix) Verify idempotency: inserting the same (target_table, target_id,
@@ -1304,6 +1448,58 @@ mod tests {
 
         let recovered = s.reset_stale_processing_tasks(120).await;
         assert_eq!(recovered, 0);
+    }
+
+    #[tokio::test]
+    async fn release_processing_tasks_preserves_staged_result_and_retry_budget() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        let task_id = storage
+            .insert_cognitive_task("session_title", 5, "{}", None, None, None, "structured", 3)
+            .await
+            .unwrap()
+            .unwrap();
+        storage.claim_pending_tasks(1).await;
+        storage
+            .stage_task_result_and_usage(
+                task_id,
+                "staged-title",
+                r#"{"input":1,"output":1,"cached":0}"#,
+                &TaskUsageRecord {
+                    provider: "test-provider",
+                    model: "test-model",
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    latency_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .release_processing_tasks(&[task_id], "task_worker_shutdown")
+                .await
+                .unwrap(),
+            1
+        );
+        let released = storage.get_task(task_id).await.unwrap();
+        assert_eq!(released.status, "pending");
+        assert_eq!(released.retry_count, 0);
+        assert_eq!(released.started_at, None);
+        assert_eq!(released.result.as_deref(), Some("staged-title"));
+        assert_eq!(
+            released.error_message.as_deref(),
+            Some("task_worker_shutdown")
+        );
+        assert_eq!(
+            storage
+                .release_processing_tasks(&[task_id], "task_worker_shutdown")
+                .await
+                .unwrap(),
+            0,
+            "release must remain status guarded and idempotent"
+        );
     }
 
     #[tokio::test]
