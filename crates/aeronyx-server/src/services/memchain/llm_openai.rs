@@ -53,8 +53,14 @@
 //! - The provider does NOT retry on failure — LlmRouter handles retry policy.
 //! - All response bodies use the shared bounded reader; provider-controlled
 //!   `Content-Length` is never trusted as the only memory guard.
+//! - API base and `$ENV_VAR` resolution use the shared typed startup boundary;
+//!   a configured missing environment variable is no longer treated as an
+//!   implicit keyless provider.
+//! - Provider traffic never inherits undeclared host proxy state.
 //!
 //! ## Last Modified
+//! v2.5.4-StartupIntegrity - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex]
+//!   Fails closed on invalid API bases and unavailable configured secrets.
 //! v2.5.3-ResponseBoundary - [LLM-RESPONSE-BOUNDARY 2026-07-30 by Codex]
 //!   Bounded success/error bodies, added recoverable provider cooldowns, and
 //!   normalized `/v1` API bases so configured endpoints are not duplicated.
@@ -65,7 +71,8 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::llm_provider::{
-    read_bounded_llm_response, ChatRequest, ChatResponse, LlmError, LlmProvider, ProviderHealth,
+    build_llm_http_client, normalize_llm_api_base, read_bounded_llm_response, resolve_llm_api_key,
+    ChatRequest, ChatResponse, LlmError, LlmProvider, LlmProviderInitError, ProviderHealth,
     TokenUsage, MAX_LLM_ERROR_BODY_BYTES, MAX_LLM_SUCCESS_BODY_BYTES,
 };
 
@@ -176,27 +183,14 @@ impl OpenAiCompatProvider {
         model: impl Into<String>,
         max_tokens: Option<u32>,
         temperature: Option<f32>,
-    ) -> Result<Self, String> {
-        let api_key_raw = api_key.into();
-        // Resolve $ENV_VAR syntax
-        let api_key = if let Some(var_name) = api_key_raw.strip_prefix('$') {
-            std::env::var(var_name).unwrap_or_else(|_| {
-                warn!(
-                    "[LLM_OPENAI] Env var '{}' not set, using empty api_key",
-                    var_name
-                );
-                String::new()
-            })
-        } else {
-            api_key_raw
-        };
+    ) -> Result<Self, LlmProviderInitError> {
+        // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] An explicit
+        // environment reference is a required configuration dependency. An
+        // absent api_key remains valid for intentionally keyless local APIs.
+        let api_key = resolve_llm_api_key(&api_key.into(), false)?;
+        let api_base = normalize_llm_api_base(&api_base.into())?;
 
-        let api_base = normalize_api_base(&api_base.into());
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|error| format!("Build HTTP client: {error}"))?;
+        let client = build_llm_http_client()?;
 
         Ok(Self {
             name: name.into(),
@@ -217,18 +211,14 @@ impl OpenAiCompatProvider {
 /// use both `https://host` and `https://host/v1`. Appending `/v1` blindly made
 /// the latter call `/v1/v1/chat/completions`.
 fn chat_completions_url(api_base: &str) -> String {
-    let api_base = normalize_api_base(api_base);
+    let api_base = api_base.trim_end_matches('/');
     if api_base.ends_with("/chat/completions") {
-        api_base
+        api_base.to_owned()
     } else if api_base.ends_with("/v1") {
         format!("{api_base}/chat/completions")
     } else {
         format!("{api_base}/v1/chat/completions")
     }
-}
-
-fn normalize_api_base(api_base: &str) -> String {
-    api_base.trim_end_matches('/').to_owned()
 }
 
 #[async_trait::async_trait]
@@ -409,12 +399,36 @@ mod tests {
     #[test]
     fn endpoint_resolution_removes_all_trailing_slashes_without_network_state() {
         assert_eq!(
-            normalize_api_base("http://localhost:11434/v1///"),
-            "http://localhost:11434/v1"
-        );
-        assert_eq!(
             chat_completions_url("http://localhost:11434/v1///"),
             "http://localhost:11434/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn constructor_rejects_invalid_base_and_missing_explicit_secret() {
+        assert!(matches!(
+            OpenAiCompatProvider::new("local", "not-a-url", "", "model", None, None),
+            Err(LlmProviderInitError::InvalidApiBase)
+        ));
+        assert!(matches!(
+            OpenAiCompatProvider::new(
+                "local",
+                "http://localhost:11434/v1",
+                "$AERONYX_TEST_SUPERNODE_SECRET_MUST_NOT_EXIST_20260814",
+                "model",
+                None,
+                None,
+            ),
+            Err(LlmProviderInitError::ProviderSecretUnavailable)
+        ));
+        assert!(OpenAiCompatProvider::new(
+            "local",
+            "http://localhost:11434/v1",
+            "",
+            "model",
+            None,
+            None,
+        )
+        .is_ok());
     }
 }

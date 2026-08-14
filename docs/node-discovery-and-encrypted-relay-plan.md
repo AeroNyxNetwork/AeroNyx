@@ -4,8 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.93.0 - Removed host filesystem paths from operator
-status, CMS heartbeat, rollout telemetry, and sanitized journal summaries.
+Modification Reason: v0.94.0 - Made explicitly enabled SuperNode providers
+and their worker a fail-closed runtime contract, while honoring configured
+Anthropic Messages endpoints.
 
 Main Functionality:
 
@@ -30,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.93.0 - [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Keeps storage and rollout readiness observable without exporting operator filesystem identity.
+Last Modified: v0.94.0 - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents configured cognitive providers or workers from silently disappearing behind healthy node readiness.
+Previous: v0.93.0 - [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Keeps storage and rollout readiness observable without exporting operator filesystem identity.
 Previous: v0.92.0 - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents an explicitly enabled Chat Relay from silently disappearing after durable initialization failure.
 Previous: v0.91.0 - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Resolves authority-carrier policy once and prevents a configured follower from disappearing behind healthy process startup.
 Previous: v0.90.0 - [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Gives dual-signed authority-proof transport a dedicated follower-only pin set with an explicit legacy witness fallback.
@@ -126,6 +128,51 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.94 Explicit SuperNode activation is a runtime contract
+
+[SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex]
+
+- `memchain.supernode.enabled = false` remains the backward-compatible
+  default and creates neither provider clients nor a cognitive task worker.
+- SuperNode requires `memchain.mode` to be `local`, `p2p`, or `saas`; combining
+  `mode=off` with `supernode.enabled=true` is rejected by both configuration
+  validation and the defensive runtime boundary.
+- Once enabled, every configured provider must pass endpoint, environment-key,
+  required-secret, and HTTP-client initialization before the node can report
+  ready. Partial provider sets are rejected because routing and fallback policy
+  may refer to any configured member.
+- OpenAI-compatible providers still support intentionally keyless local
+  endpoints. However, an explicit `$ENV_VAR` reference that is unavailable is
+  configuration drift and now rejects startup rather than becoming keyless.
+- Anthropic keeps its default official endpoint while now honoring a configured
+  root, `/v1`, or complete `/v1/messages` API base. Embedded URL credentials,
+  non-HTTP(S) schemes, query strings, and fragments are rejected.
+- Provider clients use a fixed request deadline and do not inherit OS or
+  environment proxy state. This keeps cognitive traffic bound to the explicit
+  validated endpoint and avoids platform proxy-adapter startup failures.
+- Provider startup failures expose only fixed reason codes. API endpoints,
+  provider names, environment-variable names, and secrets are excluded from
+  process-health diagnostics.
+- The spawned SuperNode worker is supervised as required runtime. Unexpected
+  return, panic, or cancellation triggers the same process-recovery path as
+  other required node services.
+- Provider initialization completes before self descriptors, peer cache,
+  discovery gossip, or Agent Relay capability publication can start. A node
+  cannot briefly advertise cognitive relay participation while initialization
+  is still unresolved.
+- This changes only node-local cognitive task execution. It does not alter
+  relay frames, identities, key derivation, encrypted payloads, client APIs,
+  LiveKit meeting grants, or the blind-node privacy boundary.
+
+Verification:
+
+- Disabled configuration still returns no router without error.
+- Missing configured secrets and invalid API bases reject initialization with
+  stable, non-sensitive reason codes.
+- Keyless local OpenAI-compatible endpoints remain valid.
+- Custom Anthropic endpoint normalization is covered without network access.
+- Worker disappearance is attached to process-level required-task supervision.
 
 ### v0.93 Operator telemetry does not export host filesystem identity
 

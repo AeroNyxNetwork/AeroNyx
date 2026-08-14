@@ -42,6 +42,8 @@
 //! v2.8.62-TypedAuthorityCarrierPolicy — Resolves carrier source and pins in
 //!                     one validated object so runtime cannot observe policy
 //!                     label/pin drift or silently discard malformed entries.
+//! v2.8.63-SuperNodeStartupIntegrity — Rejects SuperNode activation while the
+//!                     required MemChain storage/runtime is disabled.
 //!
 //! ## Main Functionality
 //! - `MemChainMode`   — Off / Local / P2p / Saas
@@ -64,7 +66,8 @@
 //!
 //! ## Main Logical Flow
 //! 1. TOML `[memchain]` → deserialize into `MemChainConfig`
-//! 2. `validate()` — skips everything when mode = Off
+//! 2. `validate()` — rejects dependent SuperNode activation, then skips
+//!    independent MemChain validation when mode = Off
 //! 3. Validates fields in dependency order:
 //!    addr/path → api_secret → mvf/embed → remote storage →
 //!    NER → graph → entropy → miner steps → vector →
@@ -113,6 +116,8 @@
 //!   before production; deploy the protocol to all pins before activation.
 //!
 //! ## Last Modified
+//! v2.8.63-SuperNodeStartupIntegrity - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex]
+//!   Prevented `mode=off` from silently suppressing an enabled SuperNode.
 //! v2.8.62-TypedAuthorityCarrierPolicy - Made effective proof transport a single validated value.
 //! v2.8.61-AuthorityCarrierPolicy - Separated proof transport from checkpoint witness policy.
 //! v2.8.48-CommitmentAuthority - Pinned the proposer authority root independently of mutable SQLite.
@@ -723,6 +728,15 @@ fn default_jwt_ttl() -> u64 {
 impl MemChainConfig {
     pub fn validate(&self) -> Result<()> {
         if self.mode == MemChainMode::Off {
+            // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] SuperNode
+            // workers require MemoryStorage for their durable task queue.
+            // The historical early return must not hide an impossible runtime.
+            if self.supernode.enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.supernode.enabled",
+                    "requires memchain.mode to be local, p2p, or saas",
+                ));
+            }
             return Ok(());
         }
 
@@ -2579,6 +2593,32 @@ mod tests {
             ..Default::default()
         };
         assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_supernode_rejects_disabled_memchain_runtime() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::Off,
+            supernode: SuperNodeConfig {
+                enabled: true,
+                providers: vec![config_supernode::ProviderConfig {
+                    name: "ollama".into(),
+                    provider_type: config_supernode::ProviderType::OpenaiCompatible,
+                    api_base: "http://localhost:11434/v1".into(),
+                    api_key: None,
+                    model: "llama3".into(),
+                    max_tokens: None,
+                    temperature: None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = mc
+            .validate()
+            .err()
+            .expect("SuperNode cannot run without MemChain storage");
+        assert!(error.to_string().contains("memchain.supernode.enabled"));
     }
 
     // ── SaaS ──────────────────────────────────────────────────────────────

@@ -48,8 +48,15 @@
 //! - Provider failures enter a bounded monotonic cooldown. The router can retry
 //!   automatically after expiry instead of permanently skipping the provider.
 //! - Response bodies must use the shared bounded reader before JSON parsing.
+//! - `new()` remains the default Anthropic endpoint constructor. Custom or
+//!   proxy-compatible Messages endpoints must use `new_with_api_base()`; both
+//!   paths share the same strict URL and secret startup validation.
+//! - Provider traffic never inherits undeclared host proxy state.
 //!
 //! ## Last Modified
+//! v2.5.4-StartupIntegrity - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex]
+//!   Honors configured Anthropic API bases and fails closed on unavailable
+//!   provider secrets while retaining the original constructor.
 //! v2.5.3-ResponseBoundary - [LLM-RESPONSE-BOUNDARY 2026-07-30 by Codex]
 //!   Bounded response accumulation and recoverable provider cooldowns through
 //!   the shared provider layer.
@@ -63,7 +70,8 @@ use std::time::Instant;
 use tracing::{debug, warn};
 
 use super::llm_provider::{
-    read_bounded_llm_response, ChatRequest, ChatResponse, LlmError, LlmProvider, ProviderHealth,
+    build_llm_http_client, normalize_llm_api_base, read_bounded_llm_response, resolve_llm_api_key,
+    ChatRequest, ChatResponse, LlmError, LlmProvider, LlmProviderInitError, ProviderHealth,
     TokenUsage, MAX_LLM_ERROR_BODY_BYTES, MAX_LLM_SUCCESS_BODY_BYTES,
 };
 
@@ -148,6 +156,8 @@ pub struct AnthropicProvider {
     /// Resolved API key (after $ENV_VAR expansion).
     /// ⚠️ Never log or expose this value — redacted in Debug impl.
     api_key: String,
+    /// Canonical Messages API base. Never contains credentials or query data.
+    api_base: String,
     /// Default model identifier (e.g. "claude-haiku-4-5-20251001").
     model: String,
     /// Optional max_tokens override. Defaults to DEFAULT_MAX_TOKENS if not set.
@@ -170,35 +180,55 @@ impl AnthropicProvider {
         model: impl Into<String>,
         max_tokens: Option<u32>,
         temperature: Option<f32>,
-    ) -> Result<Self, String> {
-        let api_key_raw = api_key.into();
-        let api_key = if let Some(var_name) = api_key_raw.strip_prefix('$') {
-            std::env::var(var_name).unwrap_or_else(|_| {
-                warn!("[LLM_ANTHROPIC] Env var '{}' not set", var_name);
-                String::new()
-            })
-        } else {
-            api_key_raw
-        };
+    ) -> Result<Self, LlmProviderInitError> {
+        Self::new_with_api_base(
+            name,
+            ANTHROPIC_API_BASE,
+            api_key,
+            model,
+            max_tokens,
+            temperature,
+        )
+    }
 
-        if api_key.is_empty() {
-            warn!("[LLM_ANTHROPIC] api_key is empty — calls will fail with 401");
-        }
+    /// Construct an Anthropic Messages provider with an explicit API base.
+    pub fn new_with_api_base(
+        name: impl Into<String>,
+        api_base: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+    ) -> Result<Self, LlmProviderInitError> {
+        // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Anthropic never
+        // has a keyless mode. Resolve and validate before creating any worker.
+        let api_key = resolve_llm_api_key(&api_key.into(), true)?;
+        let api_base = normalize_llm_api_base(&api_base.into())?;
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|error| format!("Build HTTP client: {error}"))?;
+        let client = build_llm_http_client()?;
 
         Ok(Self {
             name: name.into(),
             api_key,
+            api_base,
             model: model.into(),
             max_tokens,
             temperature,
             client,
             health: ProviderHealth::default(),
         })
+    }
+}
+
+/// Resolves root, `/v1`, and complete Anthropic Messages endpoints uniformly.
+fn messages_url(api_base: &str) -> String {
+    let api_base = api_base.trim_end_matches('/');
+    if api_base.ends_with("/v1/messages") {
+        api_base.to_owned()
+    } else if api_base.ends_with("/v1") {
+        format!("{api_base}/messages")
+    } else {
+        format!("{api_base}/v1/messages")
     }
 }
 
@@ -267,7 +297,7 @@ impl LlmProvider for AnthropicProvider {
             stop_sequences: req.stop.as_deref(),
         };
 
-        let url = format!("{ANTHROPIC_API_BASE}/v1/messages");
+        let url = messages_url(&self.api_base);
 
         let resp = self
             .client
@@ -419,5 +449,55 @@ impl std::fmt::Debug for AnthropicProvider {
             .field("model", &self.model)
             .field("api_key", &"[REDACTED]")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_endpoint_accepts_root_versioned_and_complete_bases() {
+        assert_eq!(
+            messages_url("https://api.example.com"),
+            "https://api.example.com/v1/messages"
+        );
+        assert_eq!(
+            messages_url("https://api.example.com/v1"),
+            "https://api.example.com/v1/messages"
+        );
+        assert_eq!(
+            messages_url("https://api.example.com/v1/messages"),
+            "https://api.example.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn custom_api_base_is_retained_and_required_secret_fails_closed() {
+        let provider = AnthropicProvider::new_with_api_base(
+            "claude",
+            "https://proxy.example.com/v1/",
+            "test-key",
+            "test-model",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(provider.api_base, "https://proxy.example.com/v1");
+
+        assert!(matches!(
+            AnthropicProvider::new(
+                "claude",
+                "$AERONYX_TEST_SUPERNODE_SECRET_MUST_NOT_EXIST_20260814",
+                "test-model",
+                None,
+                None,
+            ),
+            Err(LlmProviderInitError::ProviderSecretUnavailable)
+        ));
+        assert!(matches!(
+            AnthropicProvider::new("claude", "", "test-model", None, None),
+            Err(LlmProviderInitError::ProviderSecretRequired)
+        ));
     }
 }

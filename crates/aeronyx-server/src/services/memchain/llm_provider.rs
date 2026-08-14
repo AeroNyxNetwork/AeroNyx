@@ -35,8 +35,15 @@
 //!   if the task is cancelled.
 //! - Provider response bodies must be consumed through
 //!   [`read_bounded_llm_response`]. Never call unbounded `Response::text/json`.
+//! - Provider construction must use [`normalize_llm_api_base`] and
+//!   [`resolve_llm_api_key`], then [`build_llm_http_client`], so explicitly
+//!   configured runtimes fail closed without copying endpoints,
+//!   environment-variable names, or secrets into process-health diagnostics.
 //!
 //! ## Last Modified
+//! v2.5.4-StartupIntegrity - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex]
+//!   Added typed, privacy-safe provider initialization errors plus shared API
+//!   endpoint and environment-backed key validation.
 //! v2.5.3-ResponseBoundary - [LLM-RESPONSE-BOUNDARY 2026-07-30 by Codex]
 //!   Added a shared bounded response reader, UTF-8-safe error formatting, and
 //!   a monotonic provider cooldown that recovers without a background timer.
@@ -71,6 +78,9 @@ const DEFAULT_LLM_PROVIDER_COOLDOWN: Duration = Duration::from_secs(30);
 /// Maximum provider-requested cooldown accepted from `Retry-After`.
 const MAX_LLM_PROVIDER_COOLDOWN_SECS: u64 = 5 * 60;
 
+/// Fixed provider request deadline until per-provider limits are introduced.
+const LLM_PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 // ============================================
 // Re-export CognitiveTaskType from canonical location
 // ============================================
@@ -83,6 +93,111 @@ pub use crate::config_supernode::CognitiveTaskType;
 // ============================================
 // Error Type
 // ============================================
+
+/// Privacy-safe reason for rejecting one configured LLM provider at startup.
+///
+/// [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] These variants are the
+/// complete diagnostics boundary used by process health. They intentionally
+/// retain no endpoint, provider name, environment-variable name, or secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmProviderInitError {
+    InvalidApiBase,
+    ProviderSecretUnavailable,
+    ProviderSecretRequired,
+    HttpClientInitializationFailed,
+}
+
+impl LlmProviderInitError {
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::InvalidApiBase => "invalid_api_base",
+            Self::ProviderSecretUnavailable => "provider_secret_unavailable",
+            Self::ProviderSecretRequired => "provider_secret_required",
+            Self::HttpClientInitializationFailed => "http_client_initialization_failed",
+        }
+    }
+}
+
+impl fmt::Display for LlmProviderInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "LLM provider initialization failed ({})",
+            self.reason_code()
+        )
+    }
+}
+
+impl std::error::Error for LlmProviderInitError {}
+
+/// Canonicalizes and validates a configured provider endpoint.
+///
+/// Only HTTP(S) hierarchical URLs without embedded credentials, query, or
+/// fragment state are accepted. Provider adapters append their fixed API path
+/// after this boundary, so accepting those components would make routing
+/// ambiguous and could leak credentials through ordinary URL diagnostics.
+pub(super) fn normalize_llm_api_base(raw_api_base: &str) -> Result<String, LlmProviderInitError> {
+    let normalized = raw_api_base.trim().trim_end_matches('/');
+    if normalized.is_empty() {
+        return Err(LlmProviderInitError::InvalidApiBase);
+    }
+
+    let parsed =
+        reqwest::Url::parse(normalized).map_err(|_| LlmProviderInitError::InvalidApiBase)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.cannot_be_a_base()
+    {
+        return Err(LlmProviderInitError::InvalidApiBase);
+    }
+
+    Ok(normalized.to_owned())
+}
+
+/// Resolves an optional `$ENV_VAR` provider key at the startup boundary.
+///
+/// A missing explicitly referenced environment variable is configuration
+/// drift and therefore an error even for keyless OpenAI-compatible endpoints.
+/// A literal empty key remains valid only when `required` is false.
+pub(super) fn resolve_llm_api_key(
+    raw_api_key: &str,
+    required: bool,
+) -> Result<String, LlmProviderInitError> {
+    let api_key = if let Some(var_name) = raw_api_key.strip_prefix('$') {
+        if var_name.is_empty() {
+            return Err(LlmProviderInitError::ProviderSecretUnavailable);
+        }
+        std::env::var(var_name).map_err(|_| LlmProviderInitError::ProviderSecretUnavailable)?
+    } else {
+        raw_api_key.to_owned()
+    };
+
+    if required && api_key.trim().is_empty() {
+        return Err(LlmProviderInitError::ProviderSecretRequired);
+    }
+
+    Ok(api_key)
+}
+
+/// Builds the shared provider HTTP transport without implicit host proxies.
+///
+/// [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Provider routing is an
+/// explicit node configuration decision. Consulting OS or environment proxy
+/// state could redirect private cognitive traffic to an undeclared endpoint;
+/// on some macOS hosts the system proxy adapter can also panic during client
+/// construction. Explicit future proxy support must be validated configuration.
+pub(super) fn build_llm_http_client() -> Result<reqwest::Client, LlmProviderInitError> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(LLM_PROVIDER_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| LlmProviderInitError::HttpClientInitializationFailed)
+}
 
 /// Structured error returned by LLM provider calls.
 #[derive(Debug, Clone)]
@@ -498,6 +613,43 @@ mod tests {
         assert_eq!(
             rate_limit_cooldown(Some(MAX_LLM_PROVIDER_COOLDOWN_SECS + 1)),
             Duration::from_secs(MAX_LLM_PROVIDER_COOLDOWN_SECS)
+        );
+    }
+
+    #[test]
+    fn provider_api_base_rejects_ambiguous_or_secret_bearing_urls() {
+        assert_eq!(
+            normalize_llm_api_base(" https://api.example.com/v1/// ").unwrap(),
+            "https://api.example.com/v1"
+        );
+        for invalid in [
+            "",
+            "api.example.com",
+            "ftp://api.example.com",
+            "https://user:secret@api.example.com",
+            "https://api.example.com/v1?token=secret",
+            "https://api.example.com/v1#fragment",
+        ] {
+            assert_eq!(
+                normalize_llm_api_base(invalid),
+                Err(LlmProviderInitError::InvalidApiBase)
+            );
+        }
+    }
+
+    #[test]
+    fn provider_key_resolution_distinguishes_keyless_and_required_modes() {
+        assert_eq!(resolve_llm_api_key("", false).unwrap(), "");
+        assert_eq!(
+            resolve_llm_api_key("", true),
+            Err(LlmProviderInitError::ProviderSecretRequired)
+        );
+        assert_eq!(
+            resolve_llm_api_key(
+                "$AERONYX_TEST_SUPERNODE_SECRET_MUST_NOT_EXIST_20260814",
+                false
+            ),
+            Err(LlmProviderInitError::ProviderSecretUnavailable)
         );
     }
 }

@@ -58,6 +58,8 @@
 //!   another independently configured inference engine.
 //!
 //! ## Last Modified
+//! [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Re-exported the typed,
+//! privacy-safe LLM provider initialization error.
 //! [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Re-exported the internal
 //! source-blind authority-proof recovery disposition.
 //! v2.8.58-RetryableOrtInitialization - Made process-global ORT startup
@@ -214,7 +216,8 @@ pub use reranker::RerankerEngine;
 pub use llm_anthropic::AnthropicProvider;
 pub use llm_openai::OpenAiCompatProvider;
 pub use llm_provider::{
-    ChatMessage, ChatRequest, ChatResponse, CognitiveTaskType, LlmError, LlmProvider, TokenUsage,
+    ChatMessage, ChatRequest, ChatResponse, CognitiveTaskType, LlmError, LlmProvider,
+    LlmProviderInitError, TokenUsage,
 };
 pub use llm_router::LlmRouter;
 pub use task_worker::TaskWorker;

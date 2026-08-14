@@ -3054,6 +3054,10 @@ impl Server {
             info!("[MEMCHAIN] Disabled (mode=off)");
             (None, None, None, None)
         };
+        // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Complete the
+        // provider transaction before self descriptors, peer cache, gossip,
+        // or AgentRelay capability can leave this process.
+        let llm_router: Option<Arc<LlmRouter>> = self.init_llm_router()?;
         if let Some(ref commitment_storage) = storage {
             commitment_storage.configure_record_commitment_sync(
                 self.config.memchain.commitment_coordinator_enabled,
@@ -3428,8 +3432,6 @@ impl Server {
             let ner_engine = self.init_ner_engine();
             let reranker_engine = self.init_reranker_engine();
 
-            let llm_router: Option<Arc<LlmRouter>> = self.init_llm_router().await;
-
             if llm_router.is_some() {
                 let timeout_secs = self.config.memchain.supernode.worker.task_timeout_secs as i64;
                 let recovered = st.reset_stale_processing_tasks(timeout_secs).await;
@@ -3610,11 +3612,20 @@ impl Server {
                     self.config.memchain.supernode.worker.clone(),
                 );
                 let worker_shutdown = self.shutdown_tx.subscribe();
+                // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Once the
+                // operator enables SuperNode, its worker is required runtime.
+                // Unexpected return or panic must revoke process readiness.
+                let worker_task = tokio::spawn(async move {
+                    worker.run(worker_shutdown).await;
+                });
                 tasks.push((
                     "supernode-worker",
-                    tokio::spawn(async move {
-                        worker.run(worker_shutdown).await;
-                    }),
+                    Self::supervise_required_runtime_task(
+                        "supernode-worker",
+                        worker_task,
+                        Arc::clone(&self.shutdown),
+                        critical_failure_tx.clone(),
+                    ),
                 ));
                 info!(
                     poll_interval = self.config.memchain.supernode.worker.poll_interval_secs,
@@ -4091,33 +4102,38 @@ impl Server {
     // LlmRouter initialization
     // ============================================
 
-    async fn init_llm_router(&self) -> Option<Arc<LlmRouter>> {
+    /// Builds the complete configured SuperNode provider set transactionally.
+    ///
+    /// [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] `enabled=true` is a
+    /// runtime contract. One invalid provider can be referenced by routing or
+    /// fallback policy, so partial initialization is rejected rather than
+    /// silently changing operator intent. Error output is a fixed reason code.
+    fn init_llm_router(&self) -> Result<Option<Arc<LlmRouter>>> {
         use crate::config_supernode::ProviderType;
-        use crate::services::memchain::{AnthropicProvider, LlmProvider, OpenAiCompatProvider};
+        use crate::services::memchain::{
+            AnthropicProvider, LlmProvider, LlmProviderInitError, OpenAiCompatProvider,
+        };
 
         if !self.config.memchain.is_supernode_enabled() {
             debug!("[SUPERNODE] Disabled");
-            return None;
+            return Ok(None);
+        }
+        if !self.config.memchain.is_enabled() {
+            return Err(ServerError::startup_failed(
+                "SuperNode initialization failed (memchain_runtime_required)",
+            ));
         }
 
         let supernode = &self.config.memchain.supernode;
         if supernode.providers.is_empty() {
-            warn!("[SUPERNODE] enabled=true but no providers — disabled");
-            return None;
+            return Err(ServerError::startup_failed(
+                "SuperNode initialization failed (provider_set_empty)",
+            ));
         }
 
         let mut providers: Vec<(String, String, String, Arc<dyn LlmProvider>)> = Vec::new();
 
         for provider_cfg in &supernode.providers {
-            let api_key: Option<String> = provider_cfg.api_key.as_ref().map(|k| {
-                if k.starts_with('$') {
-                    std::env::var(&k[1..]).unwrap_or_else(|_| {
-                        warn!(key = %k, provider = %provider_cfg.name, "[SUPERNODE] ENV var not set for api_key");
-                        String::new()
-                    })
-                } else { k.clone() }
-            });
-
             let api_base = if provider_cfg.api_base.is_empty()
                 && provider_cfg.provider_type == ProviderType::Anthropic
             {
@@ -4126,48 +4142,37 @@ impl Server {
                 provider_cfg.api_base.clone()
             };
 
-            let provider: Arc<dyn LlmProvider> = match provider_cfg.provider_type {
-                ProviderType::OpenaiCompatible => {
-                    match OpenAiCompatProvider::new(
+            let provider_result: std::result::Result<Arc<dyn LlmProvider>, LlmProviderInitError> =
+                match provider_cfg.provider_type {
+                    ProviderType::OpenaiCompatible => OpenAiCompatProvider::new(
                         provider_cfg.name.clone(),
                         api_base.clone(),
-                        api_key.unwrap_or_default(),
+                        provider_cfg.api_key.clone().unwrap_or_default(),
                         provider_cfg.model.clone(),
                         provider_cfg.max_tokens,
                         provider_cfg.temperature,
-                    ) {
-                        Ok(p) => Arc::new(p),
-                        Err(e) => {
-                            warn!(provider = %provider_cfg.name, error = %e, "[SUPERNODE] OpenAiCompatProvider failed");
-                            continue;
-                        }
-                    }
-                }
-                ProviderType::Anthropic => {
-                    let key = match api_key {
-                        Some(k) if !k.is_empty() => k,
-                        _ => {
-                            warn!(provider = %provider_cfg.name, "[SUPERNODE] Anthropic requires api_key");
-                            continue;
-                        }
-                    };
-                    match AnthropicProvider::new(
+                    )
+                    .map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>),
+                    ProviderType::Anthropic => AnthropicProvider::new_with_api_base(
                         provider_cfg.name.clone(),
-                        key,
+                        api_base.clone(),
+                        provider_cfg.api_key.clone().unwrap_or_default(),
                         provider_cfg.model.clone(),
                         provider_cfg.max_tokens,
                         provider_cfg.temperature,
-                    ) {
-                        Ok(p) => Arc::new(p),
-                        Err(e) => {
-                            warn!(provider = %provider_cfg.name, error = %e, "[SUPERNODE] AnthropicProvider failed");
-                            continue;
-                        }
-                    }
-                }
-            };
+                    )
+                    .map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>),
+                };
 
-            info!(name = %provider_cfg.name, type_ = ?provider_cfg.provider_type, model = %provider_cfg.model, api_base = %api_base, "[SUPERNODE] Provider registered");
+            let provider = provider_result.map_err(|error| {
+                let reason = error.reason_code();
+                warn!(reason, "[SUPERNODE] Required provider initialization rejected");
+                ServerError::startup_failed(format!(
+                    "SuperNode initialization failed ({reason})"
+                ))
+            })?;
+
+            info!(type_ = ?provider_cfg.provider_type, model = %provider_cfg.model, "[SUPERNODE] Provider registered");
             providers.push((
                 provider_cfg.name.clone(),
                 api_base,
@@ -4176,14 +4181,9 @@ impl Server {
             ));
         }
 
-        if providers.is_empty() {
-            warn!("[SUPERNODE] All providers failed — disabled");
-            return None;
-        }
-
         let router = LlmRouter::new(providers, supernode.routing.clone());
         info!(providers = supernode.providers.len(), fallback = ?supernode.routing.fallback, "[SUPERNODE] LlmRouter initialized");
-        Some(Arc::new(router))
+        Ok(Some(Arc::new(router)))
     }
 
     // ============================================
@@ -13699,6 +13699,115 @@ mod tests {
         assert!(rendered.contains("Chat Relay initialization failed (sqlite_error)"));
         assert!(!rendered.contains(&private_path.display().to_string()));
         assert!(!rendered.contains("relay-parent-is-a-file"));
+    }
+
+    #[test]
+    fn configured_supernode_initialization_is_atomic_and_privacy_safe() {
+        // [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Disabled remains
+        // backward compatible, while every explicitly configured provider is
+        // required. Startup errors expose only the typed aggregate reason.
+        let disabled = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        assert!(disabled.init_llm_router().unwrap().is_none());
+
+        let mut disabled_memchain_config = ServerConfig::default();
+        disabled_memchain_config.memchain.mode = crate::config_memchain::MemChainMode::Off;
+        disabled_memchain_config.memchain.supernode.enabled = true;
+        let disabled_memchain_server = Server::new(
+            disabled_memchain_config,
+            IdentityKeyPair::generate(),
+            None,
+        );
+        assert_eq!(
+            disabled_memchain_server
+                .init_llm_router()
+                .err()
+                .expect("SuperNode requires an active MemChain runtime")
+                .to_string(),
+            "Server failed to start: SuperNode initialization failed (memchain_runtime_required)"
+        );
+
+        let missing_environment =
+            "AERONYX_TEST_SUPERNODE_SECRET_MUST_NOT_EXIST_20260814";
+        let mut missing_secret_config = ServerConfig::default();
+        missing_secret_config.memchain.supernode.enabled = true;
+        missing_secret_config.memchain.supernode.providers =
+            vec![crate::config_supernode::ProviderConfig {
+                name: "private-provider-name".into(),
+                provider_type: crate::config_supernode::ProviderType::OpenaiCompatible,
+                api_base: "https://private-provider.example.com/v1".into(),
+                api_key: Some(format!("${missing_environment}")),
+                model: "test-model".into(),
+                max_tokens: None,
+                temperature: None,
+            }];
+        let missing_secret_server = Server::new(
+            missing_secret_config,
+            IdentityKeyPair::generate(),
+            None,
+        );
+        let error = missing_secret_server
+            .init_llm_router()
+            .err()
+            .expect("missing configured secret must reject startup");
+        let rendered = error.to_string();
+        assert!(rendered.contains(
+            "SuperNode initialization failed (provider_secret_unavailable)"
+        ));
+        assert!(!rendered.contains(missing_environment));
+        assert!(!rendered.contains("private-provider-name"));
+        assert!(!rendered.contains("private-provider.example.com"));
+
+        let mut malformed_base_config = ServerConfig::default();
+        malformed_base_config.memchain.supernode.enabled = true;
+        malformed_base_config.memchain.supernode.providers =
+            vec![crate::config_supernode::ProviderConfig {
+                name: "local".into(),
+                provider_type: crate::config_supernode::ProviderType::OpenaiCompatible,
+                api_base: "http://localhost:11434/v1?private=1".into(),
+                api_key: None,
+                model: "test-model".into(),
+                max_tokens: None,
+                temperature: None,
+            }];
+        let malformed_base_server = Server::new(
+            malformed_base_config,
+            IdentityKeyPair::generate(),
+            None,
+        );
+        let malformed_error = malformed_base_server
+            .init_llm_router()
+            .err()
+            .expect("ambiguous provider URL must reject startup");
+        assert_eq!(
+            malformed_error.to_string(),
+            "Server failed to start: SuperNode initialization failed (invalid_api_base)"
+        );
+
+        let mut keyless_local_config = ServerConfig::default();
+        keyless_local_config.memchain.supernode.enabled = true;
+        keyless_local_config.memchain.supernode.providers =
+            vec![crate::config_supernode::ProviderConfig {
+                name: "local".into(),
+                provider_type: crate::config_supernode::ProviderType::OpenaiCompatible,
+                api_base: "http://localhost:11434/v1".into(),
+                api_key: None,
+                model: "test-model".into(),
+                max_tokens: None,
+                temperature: None,
+            }];
+        let keyless_local_server = Server::new(
+            keyless_local_config,
+            IdentityKeyPair::generate(),
+            None,
+        );
+        assert_eq!(
+            keyless_local_server
+                .init_llm_router()
+                .unwrap()
+                .unwrap()
+                .provider_count(),
+            1
+        );
     }
 
     #[cfg(target_os = "linux")]
