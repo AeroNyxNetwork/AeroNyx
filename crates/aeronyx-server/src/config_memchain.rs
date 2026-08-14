@@ -1728,10 +1728,13 @@ mod tests {
         assert!(!mc.is_supernode_enabled());
     }
 
-    // ── mode=off skips all validation ─────────────────────────────────────
+    // ── mode=off skips inactive feature validation ────────────────────────
 
     #[test]
-    fn test_memchain_off_skips_all_validation() {
+    fn test_memchain_off_skips_inactive_feature_validation() {
+        // [SUPERNODE-STARTUP-INTEGRITY 2026-08-15 by Codex] Keep this fixture
+        // focused on inactive fields. An explicitly enabled SuperNode is not
+        // inactive and requires a MemChain runtime even when mode is `off`.
         let mc = MemChainConfig {
             mode: MemChainMode::Off,
             mvf_alpha: 999.0,
@@ -1743,11 +1746,7 @@ mod tests {
             ner_confidence_threshold: 2.0,
             graph_max_depth: 99,
             entropy_filter_threshold: -1.0,
-            supernode: SuperNodeConfig {
-                enabled: true,
-                providers: Vec::new(),
-                ..Default::default()
-            },
+            supernode: SuperNodeConfig::default(),
             jwt_secret: Some("short".into()),
             token_ttl_secs: 0,
             saas: Some(SaasConfig {
@@ -1763,6 +1762,19 @@ mod tests {
             ..Default::default()
         };
         assert!(mc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_memchain_off_rejects_enabled_supernode() {
+        let mc = MemChainConfig {
+            mode: MemChainMode::Off,
+            supernode: SuperNodeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(mc.validate().is_err());
     }
 
     // ── api_secret ────────────────────────────────────────────────────────

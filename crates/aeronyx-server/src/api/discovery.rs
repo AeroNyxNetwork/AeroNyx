@@ -1470,6 +1470,8 @@ pub fn discovery_readiness_status_value(
             "verified_client_onion_deliveries": blind_relay_quality.verified_client_onion_deliveries,
             "last_verified_client_onion_delivery_age_seconds": blind_relay_quality.last_verified_client_onion_delivery_age_seconds,
             "delivery_receipt_capable_peers": blind_relay_quality.delivery_receipt_capable_peers,
+            "authenticated_delivery_path_ready": blind_relay_quality.authenticated_delivery_path_ready,
+            "authenticated_delivery_path_reason": &blind_relay_quality.authenticated_delivery_path_reason,
             "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
@@ -1541,6 +1543,8 @@ pub fn discovery_readiness_status_value(
             "verified_client_onion_deliveries": blind_relay_quality.verified_client_onion_deliveries,
             "last_verified_client_onion_delivery_age_seconds": blind_relay_quality.last_verified_client_onion_delivery_age_seconds,
             "delivery_receipt_capable_peers": blind_relay_quality.delivery_receipt_capable_peers,
+            "authenticated_delivery_path_ready": blind_relay_quality.authenticated_delivery_path_ready,
+            "authenticated_delivery_path_reason": &blind_relay_quality.authenticated_delivery_path_reason,
             "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "evidence_mode": &blind_relay_quality.evidence_mode,
@@ -1592,7 +1596,7 @@ pub fn blind_relay_runtime_status_value(
         >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
         && peer_quorum.routeable_onion_middle_hops >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
 
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "generated_at": generated_at,
         "contract_version": "blind_relay_runtime.v1",
         "source": "rust_blind_relay_runtime",
@@ -1685,7 +1689,21 @@ pub fn blind_relay_runtime_status_value(
         "next_action": &quality.next_action,
         "privacy_invariant": "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
         "privacy_boundary": "aggregate blind relay runtime counters only; no node endpoints, route ids, selected hops, receiver keys, encrypted payloads, client IPs, DNS contents, destinations, Memory Chain plaintext, private keys, wallet-level traffic, or social graph metadata",
-    })
+    });
+    // [AUTHENTICATED-RELAY-PATH-READINESS 2026-08-15 by Codex] Insert these
+    // fields after the legacy macro expansion so this already-large stable
+    // contract does not require a crate-wide recursion-limit increase.
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "authenticated_delivery_path_ready".to_string(),
+            quality.authenticated_delivery_path_ready.into(),
+        );
+        object.insert(
+            "authenticated_delivery_path_reason".to_string(),
+            quality.authenticated_delivery_path_reason.clone().into(),
+        );
+    }
+    value
 }
 
 fn latest_blind_relay_event_value(
@@ -2036,6 +2054,8 @@ pub fn discovery_summary_response(
             "verified_client_onion_deliveries": blind_relay_quality.verified_client_onion_deliveries,
             "last_verified_client_onion_delivery_age_seconds": blind_relay_quality.last_verified_client_onion_delivery_age_seconds,
             "delivery_receipt_capable_peers": blind_relay_quality.delivery_receipt_capable_peers,
+            "authenticated_delivery_path_ready": blind_relay_quality.authenticated_delivery_path_ready,
+            "authenticated_delivery_path_reason": &blind_relay_quality.authenticated_delivery_path_reason,
             "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
             "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
             "evidence_mode": &blind_relay_quality.evidence_mode,
@@ -2193,6 +2213,8 @@ pub fn discovery_public_card_response(
                 "verified_client_onion_deliveries": blind_relay_quality.verified_client_onion_deliveries,
                 "last_verified_client_onion_delivery_age_seconds": blind_relay_quality.last_verified_client_onion_delivery_age_seconds,
                 "delivery_receipt_capable_peers": blind_relay_quality.delivery_receipt_capable_peers,
+                "authenticated_delivery_path_ready": blind_relay_quality.authenticated_delivery_path_ready,
+                "authenticated_delivery_path_reason": &blind_relay_quality.authenticated_delivery_path_reason,
                 "accepted_relay_ready": blind_relay_quality.accepted_relay_ready,
                 "synthetic_probe_ready": blind_relay_quality.synthetic_probe_ready,
                 "proof_ready": message_delivery_proof_ready,
@@ -5922,6 +5944,11 @@ mod tests {
 
         store.upsert_verified(middle, now).unwrap();
         store.upsert_verified(terminal, now).unwrap();
+        // [AUTHENTICATED-RELAY-PATH-READINESS 2026-08-15 by Codex] Public
+        // `real_relay_ready` now requires current routeability in addition to
+        // purpose-bound receipt evidence and network-diverse endpoints.
+        store.record_route_forward_success(&middle_node_id, now);
+        store.record_route_forward_success(&terminal_node_id, now);
         store.record_purpose_bound_delivery_receipt_capability(&middle_node_id, now);
         store.record_purpose_bound_delivery_receipt_capability(&terminal_node_id, now);
         store.record_blind_relay_terminal(now, 2, 128);

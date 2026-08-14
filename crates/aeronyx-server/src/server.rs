@@ -873,7 +873,8 @@ use crate::services::memchain::{
 use crate::services::peer_store::{
     PeerStoreDirectoryProofGossipRound, PeerStoreRouteabilityCacheEvidence, PeerStoreStatus,
     PeerStoreTwoHopPathProofEvent, PeerStoreVerifiedClientDeliveryCacheEvidence,
-    PeerStoreVerifiedDeliveryWitnessRound, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+    PeerStoreVerifiedDeliveryWitnessRound, AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT,
+    AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
     ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES, ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION,
     THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
@@ -10640,11 +10641,24 @@ impl Server {
         let Some(client) = client else {
             return AuthenticatedChatOnionRelayOutcome::default();
         };
+        // [AUTHENTICATED-RELAY-PATH-READINESS 2026-08-15 by Codex] Fail over
+        // before allocating route material when no current receipt-capable,
+        // network-diverse pair satisfies the same production selector. The
+        // coarse reason is safe for operator logs and contains no route data.
+        let path_readiness =
+            peer_store.authenticated_delivery_path_readiness_excluding(now, &[*self_node_id]);
+        if !path_readiness.ready {
+            debug!(
+                reason = path_readiness.reason,
+                "[CHAT_RELAY] Authenticated onion path is not currently ready"
+            );
+            return AuthenticatedChatOnionRelayOutcome::default();
+        }
         let terminal_candidates = peer_store
             .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
                 now,
-                CHAT_PEER_RELAY_FANOUT_LIMIT,
+                AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT,
                 &[*self_node_id],
             );
         if terminal_candidates.is_empty() {
@@ -10671,7 +10685,7 @@ impl Server {
                 .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
                     NodeCapability::OnionMiddle,
                     now,
-                    ONION_ROUTE_SELECTION_CANDIDATE_LIMIT,
+                    AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT,
                     &excluded_node_ids,
                 )
                 .into_iter()

@@ -349,8 +349,19 @@ const PEER_HEALTH_STATUS_LIMIT: usize = 64;
 const PEER_QUORUM_MIN_VALID_PEERS: usize = 2;
 const PEER_QUORUM_MIN_ROUTEABLE_CHAT_RELAYS: usize = 1;
 const TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS: usize = 2;
+/// Maximum terminal replicas considered by authenticated App chat delivery.
+pub(crate) const AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT: usize = 3;
+/// Maximum middle-hop candidates inspected for each authenticated terminal.
+pub(crate) const AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PATH_POLICY_NETWORK_DIVERSE: &str = "distinct_node_and_network_prefix";
 const MAX_ROUTE_DOMAIN_CERTIFICATES: usize = ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES;
+
+/// Privacy-safe result of applying authenticated client relay path policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthenticatedDeliveryPathReadiness {
+    pub ready: bool,
+    pub reason: &'static str,
+}
 
 /// Internal selector for signed path-proof cache sections.
 ///
@@ -1452,6 +1463,19 @@ pub struct PeerStoreBlindRelayQualityStatus {
     /// Number of fresh peers proven to carry purpose-bound v2 delivery receipts.
     #[serde(default)]
     pub delivery_receipt_capable_peers: usize,
+    /// Whether current receipt-capable route surfaces contain at least one
+    /// policy-compliant, network-diverse middle/terminal pair.
+    ///
+    /// [AUTHENTICATED-RELAY-PATH-READINESS 2026-08-15 by Codex] This is
+    /// intentionally stronger than `delivery_receipt_capable_peers >= 2`.
+    /// It applies the same capability, routeability, attestation, exclusion,
+    /// fanout, and network-diversity gates as authenticated client relay.
+    #[serde(default)]
+    pub authenticated_delivery_path_ready: bool,
+    /// Stable aggregate reason for authenticated delivery path readiness.
+    /// Never encode peer ids, endpoints, route ids, or message metadata here.
+    #[serde(default)]
+    pub authenticated_delivery_path_reason: String,
     /// Whether this process has fresh accepted terminal or forwarded relay work.
     ///
     /// This is intentionally origin-neutral: accepted work may be App traffic,
@@ -7286,6 +7310,69 @@ impl PeerStore {
             .collect()
     }
 
+    /// Determines whether authenticated App traffic has one usable two-hop
+    /// receipt path under the exact production candidate budgets.
+    ///
+    /// [AUTHENTICATED-RELAY-PATH-READINESS 2026-08-15 by Codex] Counting two
+    /// independently capable peers is insufficient: they may not expose the
+    /// required middle/terminal capabilities after exclusions, may fail strict
+    /// route-domain attestation, or may share one coarse endpoint network. This
+    /// helper reuses the production receipt selector and returns only a stable
+    /// aggregate reason. It never exports which peers or endpoints were tested.
+    #[must_use]
+    pub(crate) fn authenticated_delivery_path_readiness_excluding(
+        &self,
+        now: u64,
+        excluded_node_ids: &[[u8; 32]],
+    ) -> AuthenticatedDeliveryPathReadiness {
+        let terminals = self.multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
+            NodeCapability::ChatRelay,
+            now,
+            AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT,
+            excluded_node_ids,
+        );
+        if terminals.is_empty() {
+            return AuthenticatedDeliveryPathReadiness {
+                ready: false,
+                reason: "no_receipt_capable_terminal",
+            };
+        }
+
+        let mut middle_candidate_seen = false;
+        for terminal in terminals {
+            let terminal_node_id = terminal.node_id();
+            let mut middle_exclusions = Vec::with_capacity(excluded_node_ids.len() + 1);
+            middle_exclusions.extend_from_slice(excluded_node_ids);
+            middle_exclusions.push(terminal_node_id);
+            let middles = self
+                .multi_hop_delivery_receipt_route_candidates_with_capability_excluding(
+                    NodeCapability::OnionMiddle,
+                    now,
+                    AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT,
+                    &middle_exclusions,
+                );
+            middle_candidate_seen |= !middles.is_empty();
+            if middles
+                .iter()
+                .any(|middle| Self::route_endpoints_are_network_diverse(middle, &terminal))
+            {
+                return AuthenticatedDeliveryPathReadiness {
+                    ready: true,
+                    reason: "authenticated_receipt_path_ready",
+                };
+            }
+        }
+
+        AuthenticatedDeliveryPathReadiness {
+            ready: false,
+            reason: if middle_candidate_seen {
+                "no_network_diverse_receipt_path"
+            } else {
+                "no_receipt_capable_middle"
+            },
+        }
+    }
+
     /// Returns probe-only route candidates with cooled-down quarantine recovery.
     ///
     /// This method is intentionally narrower than the normal route candidate
@@ -7668,11 +7755,14 @@ impl PeerStore {
         let runtime = self.counters.snapshot();
         let delivery_receipt_capable_peers =
             self.fresh_purpose_bound_delivery_receipt_peer_count(now);
+        let authenticated_delivery_path =
+            self.authenticated_delivery_path_readiness_excluding(now, &[]);
         let blind_relay_quality = Self::blind_relay_quality_status(
             now,
             &runtime.blind_relay,
             &two_hop_path_proof_history,
             delivery_receipt_capable_peers,
+            authenticated_delivery_path,
         );
         let stability = Self::stability(&snapshot, &bootstrap, now);
         let peer_summary = self.peer_summary(now);
@@ -7714,6 +7804,7 @@ impl PeerStore {
         stats: &PeerStoreBlindRelayStats,
         two_hop_path_proof_history: &PeerStoreTwoHopPathProofHistory,
         delivery_receipt_capable_peers: usize,
+        authenticated_delivery_path: AuthenticatedDeliveryPathReadiness,
     ) -> PeerStoreBlindRelayQualityStatus {
         let accepted_total = stats.terminal.saturating_add(stats.forwarded);
         let last_event_age_seconds = stats
@@ -7748,7 +7839,8 @@ impl PeerStore {
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
                 .unwrap_or(false);
         let real_relay_ready = verified_client_onion_evidence_fresh
-            && delivery_receipt_capable_peers >= TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS;
+            && delivery_receipt_capable_peers >= TWO_HOP_DELIVERY_RECEIPT_MIN_CAPABLE_PEERS
+            && authenticated_delivery_path.ready;
         let probe_ready = probe_evidence_seen
             && last_probe_age_seconds
                 .map(|age| age <= PEER_ROUTEABILITY_STALE_AFTER_SECS)
@@ -7925,7 +8017,7 @@ impl PeerStore {
         };
 
         let detail = format!(
-            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} two_hop_probe_attempted={} two_hop_probe_succeeded={} two_hop_probe_failed={} timestamp_rejected={} real_relay_ready={} verified_client_onion_deliveries={} delivery_receipt_capable_peers={} accepted_relay_ready={} synthetic_probe_ready={} two_hop_probe_ready={} evidence_mode={} proof_scope={} readiness_reason={} protection_active={} accepted_percent={} transport_attention_recovered={} proof_stability_status={} stale_after_seconds={} last_event_age_seconds={} last_accepted_age_seconds={} last_probe_age_seconds={} last_two_hop_probe_age_seconds={} last_verified_client_onion_delivery_age_seconds={}",
+            "received={} accepted_total={} terminal={} forwarded={} rejected={} forward_failed={} retry_attempted={} retry_succeeded={} retry_exhausted={} backpressure_dropped={} probe_attempted={} probe_succeeded={} probe_failed={} two_hop_probe_attempted={} two_hop_probe_succeeded={} two_hop_probe_failed={} timestamp_rejected={} real_relay_ready={} verified_client_onion_deliveries={} delivery_receipt_capable_peers={} authenticated_delivery_path_ready={} authenticated_delivery_path_reason={} accepted_relay_ready={} synthetic_probe_ready={} two_hop_probe_ready={} evidence_mode={} proof_scope={} readiness_reason={} protection_active={} accepted_percent={} transport_attention_recovered={} proof_stability_status={} stale_after_seconds={} last_event_age_seconds={} last_accepted_age_seconds={} last_probe_age_seconds={} last_two_hop_probe_age_seconds={} last_verified_client_onion_delivery_age_seconds={}",
             stats.received,
             accepted_total,
             stats.terminal,
@@ -7946,6 +8038,8 @@ impl PeerStore {
             real_relay_ready,
             stats.verified_client_onion_deliveries,
             delivery_receipt_capable_peers,
+            authenticated_delivery_path.ready,
+            authenticated_delivery_path.reason,
             accepted_relay_ready,
             synthetic_probe_ready,
             two_hop_probe_ready,
@@ -7983,6 +8077,8 @@ impl PeerStore {
             verified_client_onion_deliveries: stats.verified_client_onion_deliveries,
             last_verified_client_onion_delivery_age_seconds,
             delivery_receipt_capable_peers,
+            authenticated_delivery_path_ready: authenticated_delivery_path.ready,
+            authenticated_delivery_path_reason: authenticated_delivery_path.reason.to_string(),
             accepted_relay_ready,
             synthetic_probe_ready,
             evidence_mode: evidence_mode.to_string(),
@@ -9899,10 +9995,55 @@ mod tests {
             accepted.blind_relay_quality.delivery_receipt_capable_peers,
             2
         );
+        assert!(
+            accepted
+                .blind_relay_quality
+                .authenticated_delivery_path_ready
+        );
+        assert_eq!(
+            accepted
+                .blind_relay_quality
+                .authenticated_delivery_path_reason,
+            "authenticated_receipt_path_ready"
+        );
         assert!(accepted.blind_relay_quality.real_relay_ready);
         assert!(store.is_routeable_now(&middle_node_id, now + 22));
         assert!(store.is_routeable_now(&terminal_node_id, now + 22));
         assert!(store.take_client_delivery_cache_dirty());
+    }
+
+    #[test]
+    fn test_verified_receipt_peers_do_not_imply_network_diverse_path() {
+        // [AUTHENTICATED-RELAY-PATH-READINESS 2026-08-15 by Codex] Preserve
+        // valid terminal receipt evidence while refusing to advertise a live
+        // App path when both eligible hops share one endpoint network identity.
+        let now = 1_700_000_100;
+        let middle_identity = IdentityKeyPair::generate();
+        let terminal_identity = IdentityKeyPair::generate();
+
+        let mut middle = signed_descriptor_for(&middle_identity, 7, now + 4_000);
+        middle.descriptor.public_endpoint = Some("https://collocated.example:8422".to_string());
+        middle.descriptor.capabilities = vec![NodeCapability::OnionMiddle];
+        middle = SignedNodeDescriptor::sign(middle.descriptor, &middle_identity).unwrap();
+
+        let mut terminal = signed_descriptor_for(&terminal_identity, 7, now + 4_000);
+        terminal.descriptor.public_endpoint = Some("https://collocated.example:9422".to_string());
+        terminal.descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        terminal = SignedNodeDescriptor::sign(terminal.descriptor, &terminal_identity).unwrap();
+
+        let store = PeerStore::new();
+        store.upsert_verified(middle.clone(), now).unwrap();
+        store.upsert_verified(terminal.clone(), now).unwrap();
+        assert!(store.record_verified_client_onion_route_delivery(&middle, &terminal, now + 1,));
+
+        let quality = store.status(now + 2).blind_relay_quality;
+        assert_eq!(quality.delivery_receipt_capable_peers, 2);
+        assert!(!quality.authenticated_delivery_path_ready);
+        assert_eq!(
+            quality.authenticated_delivery_path_reason,
+            "no_network_diverse_receipt_path"
+        );
+        assert!(!quality.real_relay_ready);
     }
 
     #[test]

@@ -168,6 +168,8 @@ struct HealthPeerStore {
 struct BlindRelayQuality {
     verified_client_onion_deliveries: u64,
     delivery_receipt_capable_peers: u64,
+    authenticated_delivery_path_ready: bool,
+    authenticated_delivery_path_reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +230,12 @@ impl HealthSnapshot {
                 .delivery_receipt_capable_peers
                 >= 2,
             "fewer than two delivery-receipt-capable peers are available"
+        );
+        let path = &self.discovery_status.peer_store.blind_relay_quality;
+        anyhow::ensure!(
+            path.authenticated_delivery_path_ready,
+            "authenticated delivery path is not ready: {}",
+            path.authenticated_delivery_path_reason
         );
         Ok(())
     }
@@ -752,7 +760,9 @@ mod tests {
                 "peer_store": {
                     "blind_relay_quality": {
                         "verified_client_onion_deliveries": 0,
-                        "delivery_receipt_capable_peers": 2
+                        "delivery_receipt_capable_peers": 2,
+                        "authenticated_delivery_path_ready": true,
+                        "authenticated_delivery_path_reason": "authenticated_receipt_path_ready"
                     },
                     "peer_quorum": { "quorum_ready": true },
                     "route_governance": { "route_pool_ready": true },
@@ -763,6 +773,39 @@ mod tests {
         .expect("health fixture");
 
         assert!(snapshot.ensure_idle_two_hop_ready().is_err());
+    }
+
+    #[test]
+    fn idle_two_hop_preflight_rejects_unpairable_receipt_peers() {
+        // [AUTHENTICATED-RELAY-PATH-READINESS 2026-08-15 by Codex] A raw peer
+        // count must not start a destructive live smoke when the production
+        // selector cannot build a network-diverse middle/terminal pair.
+        let snapshot: HealthSnapshot = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "active_sessions": 0,
+            "privacy_protocol_health": { "failed_checks": 0 },
+            "discovery_status": {
+                "peer_store": {
+                    "blind_relay_quality": {
+                        "verified_client_onion_deliveries": 0,
+                        "delivery_receipt_capable_peers": 2,
+                        "authenticated_delivery_path_ready": false,
+                        "authenticated_delivery_path_reason": "no_network_diverse_receipt_path"
+                    },
+                    "peer_quorum": { "quorum_ready": true },
+                    "route_governance": { "route_pool_ready": true },
+                    "network_story": { "chat_two_hop_onion_ready": true }
+                }
+            }
+        }))
+        .expect("health fixture");
+
+        let error = snapshot
+            .ensure_idle_two_hop_ready()
+            .expect_err("unpairable peers must fail closed");
+        assert!(error
+            .to_string()
+            .contains("no_network_diverse_receipt_path"));
     }
 
     #[tokio::test]
