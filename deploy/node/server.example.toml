@@ -285,6 +285,15 @@ embed_enabled = true
 # Empty preserves legacy behavior by reusing the source pin on followers or
 # the runtime identity on a coordinator. Set it explicitly before handover.
 # commitment_authority_root_node_id = "64_HEX_ED25519_GENESIS_AUTHORITY_NODE_ID"
+# [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Optional follower-only
+# transport pins for dual-signed coordinator handover proofs. These nodes gain
+# no witness, coordinator, voting, finality, or fork-choice authority. Empty
+# preserves existing deployments by reusing commitment_witness_node_ids;
+# a non-empty list replaces that fallback and is capped at three identities.
+# commitment_authority_carrier_node_ids = [
+#   "64_HEX_ED25519_PROOF_CARRIER_A_NODE_ID",
+#   "64_HEX_ED25519_PROOF_CARRIER_B_NODE_ID",
+# ]
 # commitment_witness_node_ids = [
 #   "64_HEX_ED25519_WITNESS_A_NODE_ID",
 #   "64_HEX_ED25519_WITNESS_B_NODE_ID",

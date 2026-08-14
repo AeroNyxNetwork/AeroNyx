@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.89.0 - Added direct-first, bounded operator-pinned
-carrier recovery for exact coordinator handover proofs.
+Modification Reason: v0.90.0 - Separated authority-proof transport pins from
+checkpoint witness policy without breaking existing follower configurations.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.89.0 - [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Recovers exact dual-signed coordinator proofs through bounded operator-pinned carriers without expanding transport into authority.
+Last Modified: v0.90.0 - [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Gives dual-signed authority-proof transport a dedicated follower-only pin set with an explicit legacy witness fallback.
+Previous: v0.89.0 - [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Recovers exact dual-signed coordinator proofs through bounded operator-pinned carriers without expanding transport into authority.
 Previous: v0.88.0 - [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Synchronizes one exact-next dual-signed coordinator proof at a time, stops block pages at activation boundaries, and applies the audited authority schedule to follower control traffic.
 Previous: v0.87.0 - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Pins a process-local commitment authority root, audits every historical proposer at startup, and enforces the active coordinator at each appended height.
 Previous: v0.86.0 - [VOLUME-ROUTER-INTEGRITY 2026-07-30 by Codex] Preserves canonical user-storage paths, rejects orphaning reloads, serializes placement with reload, and removes owner identifiers from volume logs.
@@ -123,6 +124,51 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
 
+### v0.90 Authority-proof transport is not witness authority
+
+[AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex]
+
+- `commitment_authority_carrier_node_ids` is a dedicated follower-only list of
+  at most three operator-pinned identities allowed to transport exact-next,
+  dual-signed coordinator handover proofs. A carrier cannot sign a checkpoint
+  certificate, satisfy witness policy, produce a commitment block, vote,
+  select a fork, or change the immutable authority root.
+- Empty preserves every existing deployment by using
+  `commitment_witness_node_ids` as the effective proof-transport set. A
+  non-empty dedicated list replaces that fallback rather than merging with it,
+  so narrowing transport eligibility cannot silently retain old witnesses.
+- When MemChain is enabled, static validation rejects malformed, zero,
+  duplicate, over-capacity, coordinator-self, and non-follower configurations.
+  Runtime identity validation additionally rejects a carrier pin that resolves
+  to the local node itself before any listener is opened.
+- Witnesses and carriers reuse one internal Ed25519 pin parser only for syntax,
+  bounds, and duplicate rejection. Their authorization, runtime collections,
+  circuits, and call sites remain separate. This is deliberate type-and-policy
+  separation, not a new quorum or consensus role.
+- Startup telemetry exposes only the source-blind policy label
+  (`dedicated`, `witness_fallback`, or `disabled`) and aggregate pin count. It
+  does not log identities, endpoints, proof contents, epochs, hashes, routes,
+  messages, owners, or memory data.
+
+Implementation paths:
+
+- `crates/aeronyx-server/src/config_memchain.rs`: dedicated serde-defaulted
+  field, shared syntax-only parser, role validation, legacy fallback helper,
+  runtime self-pin rejection, and regression tests.
+- `crates/aeronyx-server/src/server.rs`: separate effective carrier and witness
+  collections; only the carrier collection enters authority-proof recovery.
+- `deploy/node/server.example.toml`: operator guidance spelling out the
+  transport-only role and exact fallback behavior.
+
+Verification:
+
+- Config tests prove legacy followers retain witness-based transport, explicit
+  carriers replace rather than extend it, carrier-only followers are valid,
+  and invalid role/identity/bound combinations fail closed.
+- Existing handover, block-carrier, certificate, and authority tests remain
+  unchanged to demonstrate the configuration split does not alter wire or
+  cryptographic verification behavior.
+
 ### v0.89 Coordinator handover proofs survive producer downtime
 
 [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex]
@@ -131,9 +177,10 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
   audited coordinator first. A carrier is considered only after an explicit,
   classified availability failure; protocol, signature, authority, epoch,
   canonical-encoding, endpoint-policy, and storage errors stop the round.
-- Recovery is restricted to at most three distinct operator-pinned witness
-  identities. Discovery resolves the signed endpoint of those exact pins but
-  cannot nominate an arbitrary peer, widen the set, or grant authority.
+- Recovery is restricted to at most three distinct operator-pinned carrier
+  identities. Legacy configurations use witness pins as transport carriers;
+  discovery resolves only the exact effective pins and cannot nominate an
+  arbitrary peer, widen the set, or grant authority.
 - A carrier signs only the response transport envelope. The transition remains
   valid only when the previous and next coordinators independently signed the
   same exact proof, the previous coordinator matches the immutable local root
@@ -165,7 +212,7 @@ Implementation paths:
 - `crates/aeronyx-server/src/services/memchain/storage_ops.rs`: follower-only
   aggregate outcome/circuit accounting and privacy-safe status projection.
 - `crates/aeronyx-server/src/server.rs`: process-lifetime circuit ownership and
-  reuse of the validated witness pins without changing legacy mode.
+  the validated effective carrier pins without changing legacy mode.
 
 Verification:
 

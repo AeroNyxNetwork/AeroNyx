@@ -349,6 +349,9 @@
 // 132. [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Recovers exact-next
 //      authority proofs through bounded operator pins while keeping transport
 //      identity independent from the dual-signed coordinator transition.
+// 133. [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Gives handover-proof
+//      transport a dedicated follower pin set, with an explicit compatibility
+//      fallback that does not merge transport and witness authorization.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -487,8 +490,13 @@
 //   - [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Operator-pinned
 //     handover carriers transport exact dual-signed proofs only. They never
 //     gain coordinator, witness, voting, fork-choice, or consensus authority.
+//   - [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Use the effective
+//     authority carrier set only for proof transport. Checkpoint block and
+//     certificate recovery must continue using the independent witness set.
 //
 // Last Modified:
+//   [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Separated authority-proof
+//     transport pins from checkpoint witness policy with legacy fallback.
 //   [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Added direct-first,
 //     bounded proof recovery with an isolated process-lifetime carrier circuit.
 //   [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Bound startup readiness
@@ -7863,6 +7871,14 @@ impl Server {
         let base_interval_secs = self.config.memchain.commitment_sync_interval_secs;
         let max_pages_per_round = self.config.memchain.commitment_sync_max_pages_per_round;
         let certificate_witness_node_ids = self.config.memchain.commitment_witness_node_id_bytes();
+        let authority_carrier_node_ids = self
+            .config
+            .memchain
+            .commitment_authority_carrier_node_id_bytes();
+        let authority_carrier_policy = self
+            .config
+            .memchain
+            .commitment_authority_carrier_policy_label();
         let certificate_minimum_signers = self.config.memchain.commitment_witness_min_verified;
         let authority_handover_enabled = storage.record_commitment_authority_enforced();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -7898,6 +7914,8 @@ impl Server {
                 max_pages_per_round,
                 event_driven = true,
                 authority_handover_enabled,
+                authority_carrier_policy,
+                authority_carrier_pins = authority_carrier_node_ids.len(),
                 "[MEMCHAIN_BLOCK] Authority-scheduled coordinator follower started"
             );
 
@@ -7964,7 +7982,7 @@ impl Server {
                                     &storage,
                                     &peer_store,
                                     &identity,
-                                    &certificate_witness_node_ids,
+                                    &authority_carrier_node_ids,
                                     sync_http_client.as_ref(),
                                     &mut authority_carrier_cursor,
                                     &mut authority_carrier_circuit,

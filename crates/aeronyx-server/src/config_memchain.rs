@@ -36,6 +36,9 @@
 //!                     that resolve to the node's own runtime identity.
 //! v2.8.48-CommitmentAuthority — Added a stable, operator-pinned commitment
 //!                     authority root for dual-signed coordinator rotation.
+//! v2.8.61-AuthorityCarrierPolicy — Separated read-only authority-proof
+//!                     carriers from checkpoint witness trust pins while
+//!                     preserving the historical witness fallback.
 //!
 //! ## Main Functionality
 //! - `MemChainMode`   — Off / Local / P2p / Saas
@@ -87,6 +90,10 @@
 //!   anchor for proposer rotation. Empty preserves old deployments by using
 //!   the follower source pin or the coordinator's runtime identity. Once a
 //!   handover exists, operators must retain the original root across restarts.
+//! - commitment_authority_carrier_node_ids are follower-only transport pins.
+//!   They may return a dual-signed handover proof but never become witnesses,
+//!   coordinators, or authority. Empty preserves the historical behavior by
+//!   using commitment_witness_node_ids as the carrier transport set.
 //! - commitment_tip_anchor_path is a coordinator-local rollback guard outside
 //!   SQLite. An empty value derives a sibling file beside db_path. Never point
 //!   it at the SQLite database itself.
@@ -103,6 +110,7 @@
 //!   before production; deploy the protocol to all pins before activation.
 //!
 //! ## Last Modified
+//! v2.8.61-AuthorityCarrierPolicy - Separated proof transport from checkpoint witness policy.
 //! v2.8.48-CommitmentAuthority - Pinned the proposer authority root independently of mutable SQLite.
 //! v2.8.47-RuntimeIdentityPolicy - Rejected self-referential coordinator and witness pins.
 //! v2.8.46-FollowerCertificateConfig - Made follower certificate witness policy configurable.
@@ -299,6 +307,16 @@ pub struct MemChainConfig {
     /// may then change without changing the chain's root trust anchor.
     #[serde(default)]
     pub commitment_authority_root_node_id: String,
+
+    /// Follower-only nodes allowed to transport coordinator handover proofs.
+    ///
+    /// [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] These identities are
+    /// availability pins, not trust anchors: every returned proof still needs
+    /// valid predecessor/successor signatures under the immutable authority
+    /// schedule. An empty list preserves existing deployments by reusing
+    /// `commitment_witness_node_ids`; a non-empty list replaces that fallback.
+    #[serde(default)]
+    pub commitment_authority_carrier_node_ids: Vec<String>,
 
     /// Base interval between successful follower catch-up rounds.
     ///
@@ -603,6 +621,18 @@ fn default_commitment_coordinator_lease_ttl_secs() -> u32 {
 }
 
 const MAX_COMMITMENT_WITNESS_NODE_IDS: usize = 3;
+const MAX_COMMITMENT_AUTHORITY_CARRIER_NODE_IDS: usize = 3;
+
+// [PINNED-NODE-PARSER 2026-08-14 by Codex] Keep syntax failures typed so each
+// authorization policy can retain its stable operator-facing diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitmentNodeIdValidationError {
+    TooMany,
+    InvalidHex,
+    InvalidLength,
+    ZeroIdentity,
+    Duplicate,
+}
 fn default_ner_model_path() -> String {
     "models/gliner".into()
 }
@@ -807,6 +837,23 @@ impl MemChainConfig {
             }
         }
 
+        // [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] A dedicated
+        // transport set is meaningful only for a follower. Once MemChain is
+        // enabled, validate it before decoding the coordinator so malformed
+        // policy cannot hide behind another inactive commitment role.
+        let validated_authority_carriers = if self.commitment_authority_carrier_node_ids.is_empty()
+        {
+            Vec::new()
+        } else {
+            if !self.commitment_sync_enabled {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_authority_carrier_node_ids",
+                    "is available only on a commitment follower",
+                ));
+            }
+            self.validated_commitment_authority_carrier_node_ids()?
+        };
+
         if self.commitment_witness_min_verified == 0 {
             return Err(ServerError::config_invalid(
                 "memchain.commitment_witness_min_verified",
@@ -926,6 +973,12 @@ impl MemChainConfig {
                     "must decode to exactly 32 bytes",
                 )
             })?;
+            if validated_authority_carriers.contains(&coordinator_node_id) {
+                return Err(ServerError::config_invalid(
+                    "memchain.commitment_authority_carrier_node_ids",
+                    "authority carriers must not include the initial pinned coordinator",
+                ));
+            }
             if !validated_witnesses.is_empty() {
                 if self.commitment_witness_min_verified < 2 {
                     return Err(ServerError::config_invalid(
@@ -1102,48 +1155,99 @@ impl MemChainConfig {
 // ── Convenience methods ────────────────────────────────────────────────────
 
 impl MemChainConfig {
+    /// Validates one bounded list of operator-pinned Ed25519 node identities.
+    ///
+    /// [PINNED-NODE-PARSER 2026-08-14 by Codex] Witnesses and read-only proof
+    /// carriers share wire identity syntax, but their authorization semantics
+    /// remain separate at the callers. Centralizing only syntax and duplicate
+    /// rejection prevents the two policies from drifting during maintenance.
+    fn validated_commitment_node_ids(
+        configured_node_ids: &[String],
+        maximum: usize,
+    ) -> std::result::Result<Vec<[u8; 32]>, CommitmentNodeIdValidationError> {
+        if configured_node_ids.len() > maximum {
+            return Err(CommitmentNodeIdValidationError::TooMany);
+        }
+
+        let mut validated = Vec::<[u8; 32]>::with_capacity(configured_node_ids.len());
+        for configured in configured_node_ids {
+            let value = configured.trim();
+            let decoded =
+                hex::decode(value).map_err(|_| CommitmentNodeIdValidationError::InvalidHex)?;
+            let node_id: [u8; 32] = decoded
+                .try_into()
+                .map_err(|_| CommitmentNodeIdValidationError::InvalidLength)?;
+            if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
+                return Err(CommitmentNodeIdValidationError::ZeroIdentity);
+            }
+            if validated.contains(&node_id) {
+                return Err(CommitmentNodeIdValidationError::Duplicate);
+            }
+            validated.push(node_id);
+        }
+        Ok(validated)
+    }
+
     /// Validates and decodes the bounded checkpoint-witness trust policy.
     ///
     /// This helper is role-neutral by design. The caller separately enforces
     /// coordinator startup/lease semantics or follower certificate semantics.
     fn validated_commitment_witness_node_ids(&self) -> Result<Vec<[u8; 32]>> {
-        if self.commitment_witness_node_ids.len() > MAX_COMMITMENT_WITNESS_NODE_IDS {
-            return Err(ServerError::config_invalid(
-                "memchain.commitment_witness_node_ids",
-                format!("supports at most {MAX_COMMITMENT_WITNESS_NODE_IDS} pinned witnesses"),
-            ));
-        }
+        Self::validated_commitment_node_ids(
+            &self.commitment_witness_node_ids,
+            MAX_COMMITMENT_WITNESS_NODE_IDS,
+        )
+        .map_err(|reason| {
+            let message = match reason {
+                CommitmentNodeIdValidationError::TooMany => {
+                    format!("supports at most {MAX_COMMITMENT_WITNESS_NODE_IDS} pinned witnesses")
+                }
+                CommitmentNodeIdValidationError::InvalidHex => {
+                    "each entry must be a 64-character Ed25519 public key in hexadecimal".into()
+                }
+                CommitmentNodeIdValidationError::InvalidLength => {
+                    "each entry must decode to exactly 32 bytes".into()
+                }
+                CommitmentNodeIdValidationError::ZeroIdentity => {
+                    "each entry must be a non-zero 64-character Ed25519 public key".into()
+                }
+                CommitmentNodeIdValidationError::Duplicate => {
+                    "duplicate witness identities are not allowed".into()
+                }
+            };
+            ServerError::config_invalid("memchain.commitment_witness_node_ids", message)
+        })
+    }
 
-        let mut validated = Vec::<[u8; 32]>::with_capacity(self.commitment_witness_node_ids.len());
-        for configured in &self.commitment_witness_node_ids {
-            let value = configured.trim();
-            let decoded = hex::decode(value).map_err(|_| {
-                ServerError::config_invalid(
-                    "memchain.commitment_witness_node_ids",
-                    "each entry must be a 64-character Ed25519 public key in hexadecimal",
-                )
-            })?;
-            let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
-                ServerError::config_invalid(
-                    "memchain.commitment_witness_node_ids",
-                    "each entry must decode to exactly 32 bytes",
-                )
-            })?;
-            if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
-                return Err(ServerError::config_invalid(
-                    "memchain.commitment_witness_node_ids",
-                    "each entry must be a non-zero 64-character Ed25519 public key",
-                ));
-            }
-            if validated.contains(&node_id) {
-                return Err(ServerError::config_invalid(
-                    "memchain.commitment_witness_node_ids",
-                    "duplicate witness identities are not allowed",
-                ));
-            }
-            validated.push(node_id);
-        }
-        Ok(validated)
+    /// Validates explicitly configured read-only authority-proof carriers.
+    fn validated_commitment_authority_carrier_node_ids(&self) -> Result<Vec<[u8; 32]>> {
+        Self::validated_commitment_node_ids(
+            &self.commitment_authority_carrier_node_ids,
+            MAX_COMMITMENT_AUTHORITY_CARRIER_NODE_IDS,
+        )
+        .map_err(|reason| {
+            let message = match reason {
+                CommitmentNodeIdValidationError::TooMany => format!(
+                    "supports at most {MAX_COMMITMENT_AUTHORITY_CARRIER_NODE_IDS} pinned authority carriers"
+                ),
+                CommitmentNodeIdValidationError::InvalidHex => {
+                    "each entry must be a 64-character Ed25519 public key in hexadecimal".into()
+                }
+                CommitmentNodeIdValidationError::InvalidLength => {
+                    "each entry must decode to exactly 32 bytes".into()
+                }
+                CommitmentNodeIdValidationError::ZeroIdentity => {
+                    "each entry must be a non-zero 64-character Ed25519 public key".into()
+                }
+                CommitmentNodeIdValidationError::Duplicate => {
+                    "duplicate authority carrier identities are not allowed".into()
+                }
+            };
+            ServerError::config_invalid(
+                "memchain.commitment_authority_carrier_node_ids",
+                message,
+            )
+        })
     }
 
     /// Validates trust relationships that depend on the loaded node identity.
@@ -1164,6 +1268,14 @@ impl MemChainConfig {
             return Err(ServerError::config_invalid(
                 "memchain.commitment_witness_node_ids",
                 "external checkpoint witnesses must not include this node's runtime identity",
+            ));
+        }
+
+        let authority_carrier_node_ids = self.validated_commitment_authority_carrier_node_ids()?;
+        if authority_carrier_node_ids.contains(local_node_id) {
+            return Err(ServerError::config_invalid(
+                "memchain.commitment_authority_carrier_node_ids",
+                "external authority carriers must not include this node's runtime identity",
             ));
         }
 
@@ -1268,6 +1380,38 @@ impl MemChainConfig {
                 decoded.try_into().ok()
             })
             .collect()
+    }
+
+    /// Returns effective authority-proof transport identities in operator order.
+    ///
+    /// [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] An explicit carrier
+    /// list replaces, rather than extends, the legacy witness fallback. This
+    /// prevents an operator from narrowing the transport set only to have old
+    /// witness identities silently remain eligible.
+    #[must_use]
+    pub fn commitment_authority_carrier_node_id_bytes(&self) -> Vec<[u8; 32]> {
+        if self.commitment_authority_carrier_node_ids.is_empty() {
+            return self.commitment_witness_node_id_bytes();
+        }
+        self.commitment_authority_carrier_node_ids
+            .iter()
+            .filter_map(|value| {
+                let decoded = hex::decode(value.trim()).ok()?;
+                decoded.try_into().ok()
+            })
+            .collect()
+    }
+
+    /// Returns a source-blind label suitable for startup telemetry.
+    #[must_use]
+    pub fn commitment_authority_carrier_policy_label(&self) -> &'static str {
+        if !self.commitment_authority_carrier_node_ids.is_empty() {
+            "dedicated"
+        } else if !self.commitment_witness_node_ids.is_empty() {
+            "witness_fallback"
+        } else {
+            "disabled"
+        }
     }
 
     /// Resolves the coordinator-local signed tip anchor without changing old
@@ -1383,6 +1527,7 @@ impl Default for MemChainConfig {
             commitment_sync_enabled: false,
             commitment_coordinator_node_id: String::new(),
             commitment_authority_root_node_id: String::new(),
+            commitment_authority_carrier_node_ids: Vec::new(),
             commitment_sync_interval_secs: default_commitment_sync_interval_secs(),
             commitment_sync_max_pages_per_round: default_commitment_sync_max_pages_per_round(),
             commitment_tip_anchor_path: String::new(),
@@ -1459,6 +1604,9 @@ mod tests {
         assert!(!mc.commitment_sync_enabled);
         assert!(mc.commitment_coordinator_node_id.is_empty());
         assert!(mc.commitment_authority_root_node_id.is_empty());
+        assert!(mc.commitment_authority_carrier_node_ids.is_empty());
+        assert!(mc.commitment_authority_carrier_node_id_bytes().is_empty());
+        assert_eq!(mc.commitment_authority_carrier_policy_label(), "disabled");
         assert_eq!(mc.commitment_sync_interval_secs, 30);
         assert_eq!(mc.commitment_sync_max_pages_per_round, 8);
         assert!(mc.commitment_tip_anchor_path.is_empty());
@@ -1941,6 +2089,132 @@ mod tests {
                 blind_storage_enabled: true,
                 commitment_coordinator_enabled: true,
                 commitment_authority_root_node_id: "not-a-node-id".to_string(),
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn test_commitment_authority_carrier_policy_is_scoped_and_backward_compatible() {
+        // [AUTHORITY-CARRIER-POLICY 2026-08-14 by Codex] Existing followers
+        // keep their witness-based transport set, while an explicit list
+        // narrows handover transport without changing certificate witnesses.
+        let coordinator = "51".repeat(32);
+        let first_witness = "52".repeat(32);
+        let second_witness = "53".repeat(32);
+        let carrier = "54".repeat(32);
+
+        let legacy = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_sync_enabled: true,
+            commitment_coordinator_node_id: coordinator.clone(),
+            commitment_witness_node_ids: vec![first_witness.clone(), second_witness.clone()],
+            commitment_witness_min_verified: 2,
+            ..Default::default()
+        };
+        assert!(legacy.validate().is_ok());
+        assert_eq!(
+            legacy.commitment_authority_carrier_node_id_bytes(),
+            vec![[0x52; 32], [0x53; 32]]
+        );
+        assert_eq!(
+            legacy.commitment_authority_carrier_policy_label(),
+            "witness_fallback"
+        );
+
+        let dedicated = MemChainConfig {
+            commitment_authority_carrier_node_ids: vec![carrier.clone()],
+            ..legacy.clone()
+        };
+        assert!(dedicated.validate().is_ok());
+        assert_eq!(
+            dedicated.commitment_authority_carrier_node_id_bytes(),
+            vec![[0x54; 32]]
+        );
+        assert_eq!(
+            dedicated.commitment_authority_carrier_policy_label(),
+            "dedicated"
+        );
+        assert!(dedicated.validate_runtime_identity(&[0x55; 32]).is_ok());
+        assert!(dedicated.validate_runtime_identity(&[0x54; 32]).is_err());
+
+        let carrier_only = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_sync_enabled: true,
+            commitment_coordinator_node_id: coordinator.clone(),
+            commitment_authority_carrier_node_ids: vec![carrier.clone()],
+            ..Default::default()
+        };
+        assert!(carrier_only.validate().is_ok());
+
+        let legacy_diagnostic = MemChainConfig {
+            blind_storage_enabled: true,
+            commitment_coordinator_enabled: true,
+            commitment_witness_node_ids: vec![first_witness.clone(), first_witness.clone()],
+            commitment_witness_min_verified: 2,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        match legacy_diagnostic {
+            crate::error::ServerError::ConfigInvalid { field, reason } => {
+                assert_eq!(field, "memchain.commitment_witness_node_ids");
+                assert_eq!(reason, "duplicate witness identities are not allowed");
+            }
+            other => panic!("unexpected witness validation error: {other}"),
+        }
+
+        for invalid in [
+            MemChainConfig {
+                commitment_authority_carrier_node_ids: vec![carrier.clone()],
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_coordinator_enabled: true,
+                commitment_authority_carrier_node_ids: vec![carrier.clone()],
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator.clone(),
+                commitment_authority_carrier_node_ids: vec![coordinator.clone()],
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator.clone(),
+                commitment_authority_carrier_node_ids: vec!["00".repeat(32)],
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator.clone(),
+                commitment_authority_carrier_node_ids: vec![carrier.clone(), carrier.clone()],
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator.clone(),
+                commitment_authority_carrier_node_ids: vec![
+                    "54".repeat(32),
+                    "55".repeat(32),
+                    "56".repeat(32),
+                    "57".repeat(32),
+                ],
+                ..Default::default()
+            },
+            MemChainConfig {
+                blind_storage_enabled: true,
+                commitment_sync_enabled: true,
+                commitment_coordinator_node_id: coordinator,
+                commitment_authority_carrier_node_ids: vec!["not-a-node-id".into()],
                 ..Default::default()
             },
         ] {
