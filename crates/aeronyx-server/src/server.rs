@@ -1000,6 +1000,19 @@ impl AuthenticatedChatOnionRelayOutcome {
     fn fully_replicated(self) -> bool {
         self.attempted_paths > 0 && self.attempted_paths == self.verified_receipts
     }
+
+    /// Whether compatibility direct relay can run without widening a route
+    /// surface that already observed this exact opaque envelope.
+    ///
+    /// [ONION-FALLBACK-PRIVACY 2026-08-15 by Codex] A lost or invalid receipt
+    /// does not prove the attempted middle/terminal failed to observe or store
+    /// the payload. Only a preflight outcome with zero network attempts may
+    /// safely enter the compatibility path; otherwise local pending storage
+    /// preserves retry availability without immediate correlation expansion.
+    #[must_use]
+    fn compatibility_direct_fallback_allowed(self) -> bool {
+        self.attempted_paths == 0
+    }
 }
 
 /// Public IP services should return one textual IP address and whitespace.
@@ -10633,11 +10646,13 @@ impl Server {
     /// Attempts authenticated client traffic over receipt-capable two-hop
     /// onion paths and returns aggregate delivery/replication evidence.
     ///
-    /// At least one verified receipt proves terminal delivery and suppresses
-    /// legacy direct relay fallback. `fully_replicated()` additionally means
-    /// every attempted independent terminal replica returned a fresh signature
-    /// bound to the exact opaque payload. Mixed-version meshes return an empty
-    /// outcome before sending, preserving the legacy availability fallback.
+    /// At least one verified receipt proves terminal delivery. Any onion
+    /// network attempt suppresses legacy direct relay because a lost receipt
+    /// cannot prove the selected hops never observed the opaque payload.
+    /// `fully_replicated()` additionally means every attempted independent
+    /// terminal replica returned a fresh signature bound to that payload.
+    /// Mixed-version meshes return an empty outcome before sending, preserving
+    /// the compatibility availability fallback without widening route exposure.
     async fn relay_authenticated_chat_over_onion_paths(
         client: Option<&reqwest::Client>,
         relay: Option<&ChatRelayService>,
@@ -12589,7 +12604,9 @@ impl Server {
                             &envelope,
                         )
                         .await;
-                        if !onion_outcome.delivered() {
+                        if !onion_outcome.delivered()
+                            && onion_outcome.compatibility_direct_fallback_allowed()
+                        {
                             Self::relay_chat_envelope_to_discovered_peers(
                                 chat_peer_client,
                                 Some(relay.as_ref()),
@@ -12623,7 +12640,9 @@ impl Server {
                         &envelope,
                     )
                     .await;
-                    if !onion_outcome.delivered() {
+                    if !onion_outcome.delivered()
+                        && onion_outcome.compatibility_direct_fallback_allowed()
+                    {
                         Self::relay_chat_envelope_to_discovered_peers(
                             chat_peer_client,
                             Some(relay.as_ref()),
@@ -15424,6 +15443,13 @@ mod tests {
         };
         assert!(!failed.delivered());
         assert!(!failed.fully_replicated());
+        assert!(!failed.compatibility_direct_fallback_allowed());
+
+        // [ONION-FALLBACK-PRIVACY 2026-08-15 by Codex] Mixed-version or cold
+        // meshes may use compatibility relay only when onion preflight sent
+        // the envelope to no peer at all.
+        let preflight_only = super::AuthenticatedChatOnionRelayOutcome::default();
+        assert!(preflight_only.compatibility_direct_fallback_allowed());
     }
 
     #[test]
