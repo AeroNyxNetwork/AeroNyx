@@ -364,6 +364,9 @@
 // 137. [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Retries one exact
 //      target-bound v3 request after transport ambiguity or HTTP 425, relying
 //      on the target's bounded commitment-keyed custody ACK cache.
+// 138. [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Treats bounded ACK-body
+//      truncation as transport ambiguity and retries the exact v3 request,
+//      while deterministic protocol, size, and receipt failures remain final.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -523,8 +526,14 @@
 //   - [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Retry only the exact
 //     signed v3 request and only once. v1/v2 do not advertise target-bound
 //     replay semantics, so they must retain their historical single attempt.
+//   - [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] A v3 attempt owns request
+//     send, bounded ACK read, and negotiated ACK verification as one operation.
+//     Only ambiguous transport/body failures and HTTP 425 may cross the retry
+//     edge; explicit rejection, oversized ACKs, or invalid receipts must not.
 //
 // Last Modified:
+//   [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Extended exact v3 retries
+//     through bounded ACK-body reads and negotiated target ACK verification.
 //   [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Added one safe exact
 //     v3 retry for transport ambiguity and in-flight custody publication.
 //   [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Added signed target
@@ -938,6 +947,60 @@ const DIRECT_PEER_RELAY_V3_MAX_ATTEMPTS: usize = 2;
 const DIRECT_PEER_RELAY_V3_RETRY_DELAY_MILLIS: u64 = 50;
 /// Numeric form keeps compatibility with the workspace's pinned http crate.
 const HTTP_TOO_EARLY_STATUS_CODE: u16 = 425;
+
+/// Typed validation failures for one bounded direct-relay acknowledgement.
+///
+/// [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Keep this typed until the route
+/// health boundary so retry policy cannot depend on strings or peer-controlled
+/// response content. Only body-read and JSON truncation are ambiguous: size,
+/// rejection, and cryptographic failures are deterministic protocol failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPeerRelayAckFailure {
+    Bounded(BoundedHttpResponseError),
+    Rejected,
+    ReceiptRequestMissing,
+    ReceiptMissing,
+    ReceiptInvalid(&'static str),
+}
+
+impl DirectPeerRelayAckFailure {
+    const fn retryable_after_ambiguous_delivery(self) -> bool {
+        matches!(
+            self,
+            Self::Bounded(
+                BoundedHttpResponseError::BodyRead | BoundedHttpResponseError::JsonDecode
+            )
+        )
+    }
+
+    fn privacy_safe_reason(self) -> String {
+        match self {
+            Self::Bounded(error) => format!("peer_relay_ack_{}", error.as_str()),
+            Self::Rejected => "peer_relay_ack_rejected".to_string(),
+            Self::ReceiptRequestMissing => "peer_relay_receipt_request_missing".to_string(),
+            Self::ReceiptMissing => "peer_relay_receipt_missing".to_string(),
+            Self::ReceiptInvalid(reason) => format!("peer_relay_{reason}"),
+        }
+    }
+}
+
+/// Failure of one complete target-bound v3 delivery attempt.
+#[derive(Debug)]
+enum TargetBoundPeerRelayFailure {
+    Transport(reqwest::Error),
+    Http(reqwest::StatusCode),
+    Ack(DirectPeerRelayAckFailure),
+}
+
+impl TargetBoundPeerRelayFailure {
+    fn retryable_after_ambiguous_delivery(&self) -> bool {
+        match self {
+            Self::Transport(_) => true,
+            Self::Http(status) => status.as_u16() == HTTP_TOO_EARLY_STATUS_CODE,
+            Self::Ack(error) => error.retryable_after_ambiguous_delivery(),
+        }
+    }
+}
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PROBE_REQUEST_LIMIT: usize = 8;
 const THREE_HOP_PROBE_REQUEST_LIMIT: usize = 4;
@@ -10948,62 +11011,113 @@ impl Server {
         require_signed_receipt: bool,
         observed_at: u64,
     ) -> std::result::Result<(), String> {
+        Self::validate_direct_peer_relay_ack_typed(
+            response,
+            expected_request_commitment,
+            expected_node_id,
+            require_signed_receipt,
+            observed_at,
+        )
+        .await
+        .map_err(DirectPeerRelayAckFailure::privacy_safe_reason)
+    }
+
+    /// Typed form shared by compatibility and retry-aware v3 dispatch.
+    async fn validate_direct_peer_relay_ack_typed(
+        response: reqwest::Response,
+        expected_request_commitment: Option<&[u8; 32]>,
+        expected_node_id: &[u8; 32],
+        require_signed_receipt: bool,
+        observed_at: u64,
+    ) -> std::result::Result<(), DirectPeerRelayAckFailure> {
         if require_signed_receipt {
             let request_commitment = expected_request_commitment
-                .ok_or_else(|| "peer_relay_receipt_request_missing".to_string())?;
-            let response = decode_bounded_json_response::<PeerChatRelayResponseV2>(
+                .ok_or(DirectPeerRelayAckFailure::ReceiptRequestMissing)?;
+            return Self::validate_signed_direct_peer_relay_ack(
                 response,
-                PEER_ACK_RESPONSE_MAX_BYTES,
+                request_commitment,
+                expected_node_id,
+                observed_at,
             )
-            .await
-            .map_err(|error| format!("peer_relay_ack_{}", error.as_str()))?;
-            if !response.relay.accepted || !response.relay.stored_pending {
-                return Err("peer_relay_ack_rejected".to_string());
-            }
-            let receipt = response
-                .receipt
-                .as_ref()
-                .ok_or_else(|| "peer_relay_receipt_missing".to_string())?;
-            receipt
-                .verify_expected_commitment(request_commitment, expected_node_id, observed_at)
-                .map_err(|reason| format!("peer_relay_{reason}"))?;
-            return Ok(());
+            .await;
         }
-
         let response = decode_bounded_json_response::<PeerChatRelayResponse>(
             response,
             PEER_ACK_RESPONSE_MAX_BYTES,
         )
         .await
-        .map_err(|error| format!("peer_relay_ack_{}", error.as_str()))?;
+        .map_err(DirectPeerRelayAckFailure::Bounded)?;
         if response.accepted && response.stored_pending {
             Ok(())
         } else {
-            Err("peer_relay_ack_rejected".to_string())
+            Err(DirectPeerRelayAckFailure::Rejected)
         }
     }
 
-    /// Sends one target-bound request with one byte-identical ambiguity retry.
+    /// Validates one bounded signed durable-custody acknowledgement.
+    async fn validate_signed_direct_peer_relay_ack(
+        response: reqwest::Response,
+        expected_request_commitment: &[u8; 32],
+        expected_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> std::result::Result<(), DirectPeerRelayAckFailure> {
+        let response = decode_bounded_json_response::<PeerChatRelayResponseV2>(
+            response,
+            PEER_ACK_RESPONSE_MAX_BYTES,
+        )
+        .await
+        .map_err(DirectPeerRelayAckFailure::Bounded)?;
+        if !response.relay.accepted || !response.relay.stored_pending {
+            return Err(DirectPeerRelayAckFailure::Rejected);
+        }
+        let receipt = response
+            .receipt
+            .as_ref()
+            .ok_or(DirectPeerRelayAckFailure::ReceiptMissing)?;
+        receipt
+            .verify_expected_commitment(expected_request_commitment, expected_node_id, observed_at)
+            .map_err(DirectPeerRelayAckFailure::ReceiptInvalid)
+    }
+
+    /// Sends and validates one target-bound request with one exact ambiguity retry.
     ///
-    /// [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] v3 binds the exact
-    /// request to one target and that target retains the signed custody ACK by
-    /// opaque request commitment. Retrying is therefore safe only for this
-    /// negotiated surface, and only after a transport error or HTTP 425 while
-    /// the first owner is still publishing its durable result.
-    async fn send_target_bound_peer_relay(
+    /// [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] v3 binds the exact request
+    /// to one target and retains its signed ACK by opaque commitment. One
+    /// attempt therefore spans send, status, bounded body read, and receipt
+    /// verification. Retry remains limited to transport ambiguity, HTTP 425,
+    /// or an incomplete/undecodable bounded ACK body; deterministic protocol
+    /// and cryptographic failures terminate immediately.
+    async fn send_and_validate_target_bound_peer_relay(
         client: &reqwest::Client,
         url: &str,
         request: &PeerChatRelayRequestV3,
-    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        expected_request_commitment: &[u8; 32],
+        expected_node_id: &[u8; 32],
+        require_signed_receipt: bool,
+    ) -> std::result::Result<(), TargetBoundPeerRelayFailure> {
         let mut attempt = 1usize;
         loop {
-            let response = client.post(url).json(request).send().await;
-            let retryable = match &response {
-                Ok(response) => response.status().as_u16() == HTTP_TOO_EARLY_STATUS_CODE,
-                Err(_) => true,
+            let outcome = match client.post(url).json(request).send().await {
+                Err(error) => Err(TargetBoundPeerRelayFailure::Transport(error)),
+                Ok(response) if !response.status().is_success() => {
+                    Err(TargetBoundPeerRelayFailure::Http(response.status()))
+                }
+                Ok(response) => Self::validate_direct_peer_relay_ack_typed(
+                    response,
+                    Some(expected_request_commitment),
+                    expected_node_id,
+                    require_signed_receipt,
+                    unix_now_secs(),
+                )
+                .await
+                .map_err(TargetBoundPeerRelayFailure::Ack),
             };
-            if !retryable || attempt >= DIRECT_PEER_RELAY_V3_MAX_ATTEMPTS {
-                return response;
+            let should_retry = outcome
+                .as_ref()
+                .err()
+                .is_some_and(TargetBoundPeerRelayFailure::retryable_after_ambiguous_delivery);
+            if !should_retry || attempt >= DIRECT_PEER_RELAY_V3_MAX_ATTEMPTS {
+                return outcome;
             }
 
             attempt = attempt.saturating_add(1);
@@ -11091,7 +11205,7 @@ impl Server {
             };
 
             attempted += 1;
-            let (response, expected_request_commitment) = if use_target_bound_relay {
+            let delivery_result = if use_target_bound_relay {
                 // [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Build
                 // inside the peer loop because the signed target differs for
                 // every candidate. Reusing one request would recreate the v2
@@ -11113,92 +11227,96 @@ impl Server {
                         continue;
                     }
                 };
-                let request_commitment = request.request_commitment().ok();
-                (
-                    Self::send_target_bound_peer_relay(client, &url, &request).await,
-                    request_commitment,
-                )
-            } else if use_authenticated_relay {
-                let Some(request) = authenticated_request.as_ref() else {
-                    let reason = "peer_relay_auth_encode_failed".to_string();
-                    let _ = peer_store.record_route_forward_failure_for_descriptor(
-                        &peer,
-                        now,
-                        reason.clone(),
-                    );
-                    last_failure_reason = Some(reason);
-                    continue;
+                let request_commitment = match request.request_commitment() {
+                    Ok(commitment) => commitment,
+                    Err(_) => {
+                        let reason = "peer_relay_target_auth_encode_failed".to_string();
+                        let _ = peer_store.record_route_forward_failure_for_descriptor(
+                            &peer,
+                            now,
+                            reason.clone(),
+                        );
+                        last_failure_reason = Some(reason);
+                        continue;
+                    }
                 };
-                (
-                    client.post(&url).json(request).send().await,
-                    request.request_commitment().ok(),
+                Self::send_and_validate_target_bound_peer_relay(
+                    client,
+                    &url,
+                    &request,
+                    &request_commitment,
+                    &peer.node_id(),
+                    require_signed_receipt,
                 )
+                .await
+                .map_err(|error| match error {
+                    TargetBoundPeerRelayFailure::Transport(error) => {
+                        Self::classify_reqwest_error("peer_relay_request", &error)
+                    }
+                    TargetBoundPeerRelayFailure::Http(status) => {
+                        format!("peer_relay_http_{}", status.as_u16())
+                    }
+                    TargetBoundPeerRelayFailure::Ack(error) => error.privacy_safe_reason(),
+                })
             } else {
-                (
-                    client
-                        .post(&url)
-                        .json(&PeerChatRelayRequest {
-                            envelope: envelope.clone(),
-                        })
-                        .send()
-                        .await,
-                    None,
-                )
+                let (response, expected_request_commitment) = if use_authenticated_relay {
+                    let Some(request) = authenticated_request.as_ref() else {
+                        let reason = "peer_relay_auth_encode_failed".to_string();
+                        let _ = peer_store.record_route_forward_failure_for_descriptor(
+                            &peer,
+                            now,
+                            reason.clone(),
+                        );
+                        last_failure_reason = Some(reason);
+                        continue;
+                    };
+                    (
+                        client.post(&url).json(request).send().await,
+                        request.request_commitment().ok(),
+                    )
+                } else {
+                    (
+                        client
+                            .post(&url)
+                            .json(&PeerChatRelayRequest {
+                                envelope: envelope.clone(),
+                            })
+                            .send()
+                            .await,
+                        None,
+                    )
+                };
+                match response {
+                    Ok(response) if response.status().is_success() => {
+                        Self::validate_direct_peer_relay_ack(
+                            response,
+                            expected_request_commitment.as_ref(),
+                            &peer.node_id(),
+                            require_signed_receipt,
+                            unix_now_secs(),
+                        )
+                        .await
+                    }
+                    Ok(response) => Err(format!("peer_relay_http_{}", response.status().as_u16())),
+                    Err(error) => Err(Self::classify_reqwest_error("peer_relay_request", &error)),
+                }
             };
 
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    let observed_at = unix_now_secs();
-                    match Self::validate_direct_peer_relay_ack(
-                        response,
-                        expected_request_commitment.as_ref(),
-                        &peer.node_id(),
-                        require_signed_receipt,
+            let observed_at = unix_now_secs();
+            match delivery_result {
+                Ok(()) => {
+                    accepted += 1;
+                    let _ =
+                        peer_store.record_route_forward_success_for_descriptor(&peer, observed_at);
+                }
+                Err(reason) => {
+                    let _ = peer_store.record_route_forward_failure_for_descriptor(
+                        &peer,
                         observed_at,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            accepted += 1;
-                            let _ = peer_store
-                                .record_route_forward_success_for_descriptor(&peer, observed_at);
-                        }
-                        Err(reason) => {
-                            let _ = peer_store.record_route_forward_failure_for_descriptor(
-                                &peer,
-                                observed_at,
-                                reason.clone(),
-                            );
-                            last_failure_reason = Some(reason.clone());
-                            debug!(reason, "[CHAT_RELAY] Peer relay ACK rejected");
-                        }
-                    }
-                }
-                Ok(response) => {
-                    let reason = format!("peer_relay_http_{}", response.status().as_u16());
-                    let _ = peer_store.record_route_forward_failure_for_descriptor(
-                        &peer,
-                        now,
                         reason.clone(),
                     );
-                    last_failure_reason = Some(reason);
-                    debug!(
-                        status = %response.status(),
-                        "[CHAT_RELAY] Peer relay rejected encrypted envelope"
-                    );
-                }
-                Err(error) => {
-                    let reason = Self::classify_reqwest_error("peer_relay_request", &error);
-                    let _ = peer_store.record_route_forward_failure_for_descriptor(
-                        &peer,
-                        now,
-                        reason.clone(),
-                    );
-                    last_failure_reason = Some(reason);
-                    debug!(
-                        reason = Self::classify_reqwest_error("peer_relay_request", &error),
-                        "[CHAT_RELAY] Peer relay request failed"
-                    );
+                    last_failure_reason = Some(reason.clone());
+                    debug!(reason, "[CHAT_RELAY] Peer relay delivery failed");
                 }
             }
         }
@@ -13872,25 +13990,29 @@ mod tests {
         CommitmentFollowerRoundOutcome, CommitmentSyncTaskLivenessGuard,
         CommitmentTipAnnouncementWaitOutcome, CommitmentWitnessStartupBlockReason,
         CommitmentWitnessStartupDecision, CriticalRuntimeFailure, DataPlaneReceiveFailureAction,
-        DirectoryChainStore, DirectoryProofGossipOutcome, DirectoryProofGossipPeerState,
-        DirectoryProofGossipResult, DiscoveryGossipExecution, DiscoveryGossipFailure,
-        DiscoveryGossipFailureKind, DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator,
-        DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints, PeerHttpClients,
-        PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
+        DirectPeerRelayAckFailure, DirectoryChainStore, DirectoryProofGossipOutcome,
+        DirectoryProofGossipPeerState, DirectoryProofGossipResult, DiscoveryGossipExecution,
+        DiscoveryGossipFailure, DiscoveryGossipFailureKind, DiscoveryGossipPhase,
+        DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints,
+        PeerHttpClients, PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
         RequiredApiListenerExit, RuntimeTaskRegistry, RuntimeTaskShutdownOutcome,
-        RuntimeTaskShutdownReport, Server, SystemdNotifier,
+        RuntimeTaskShutdownReport, Server, SystemdNotifier, TargetBoundPeerRelayFailure,
         BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
         BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
         DATA_PLANE_RECV_FAILURE_LIMIT, DIRECTORY_OPERATOR_HTTP_PROFILE,
         DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
         DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, HTTP_TOO_EARLY_STATUS_CODE,
-        MEMCHAIN_SYNC_HTTP_PROFILE,
-        ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION,
-        THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
-        VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT,
+        MEMCHAIN_SYNC_HTTP_PROFILE, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
+        ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION, THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT,
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
+    };
+    use crate::api::chat_peer::{
+        build_chat_peer_router, PeerBlindRelayRequest, PeerBlindRelayResponse,
+        PeerChatRelayReceiptV2, PeerChatRelayRequest, PeerChatRelayRequestV2,
+        PeerChatRelayRequestV3, PeerChatRelayResponse, PeerChatRelayResponseV2,
     };
     use crate::api::memchain_peer::{
         announce_current_record_commitment_tip_for_test, build_memchain_peer_router,
@@ -13898,6 +14020,7 @@ mod tests {
     };
     use crate::api::{
         decode_bounded_json_response, read_bounded_http_response, BoundedHttpResponseError,
+        PEER_ACK_RESPONSE_MAX_BYTES,
     };
     use crate::config_chat_relay::ChatRelayConfig;
     use crate::error::RuntimeTaskJoinFailureKind;
@@ -13917,8 +14040,13 @@ mod tests {
         NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
         NodeProtocolFeature, OnionRoutePurpose, SignedNodeDescriptor,
     };
+    use aeronyx_transport::UdpTransport;
     use axum::{
-        http::StatusCode,
+        body::{to_bytes, Body},
+        extract::{Request, State},
+        http::{header::CONTENT_LENGTH, HeaderValue, StatusCode},
+        middleware::{self, Next},
+        response::Response,
         routing::{get, post},
         Json, Router,
     };
@@ -13932,11 +14060,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixDatagram;
 
-    use crate::api::chat_peer::{
-        PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayReceiptV2,
-        PeerChatRelayRequest, PeerChatRelayRequestV2, PeerChatRelayRequestV3,
-        PeerChatRelayResponse, PeerChatRelayResponseV2,
-    };
     use crate::api::discovery::GossipResponse;
     use crate::config::{DiscoveryConfig, ServerConfig};
 
@@ -13991,8 +14114,8 @@ mod tests {
     }
     use crate::services::memchain::MemoryStorage;
     use crate::services::{
-        DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore, DirectoryReplicaSyncRuntime,
-        PeerStore, PeerStoreImportReport,
+        ChatRelayService, DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore,
+        DirectoryReplicaSyncRuntime, PeerStore, PeerStoreImportReport, SessionManager,
     };
 
     fn test_peer_http_client() -> Arc<reqwest::Client> {
@@ -14004,6 +14127,94 @@ mod tests {
                 .build()
                 .unwrap(),
         )
+    }
+
+    /// Captures exact v3 ACK bodies and truncates the first one after custody.
+    ///
+    /// [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] This test-only middleware
+    /// runs outside the real target router. `next.run` therefore completes
+    /// SQLite custody and replay-cache publication before the injected stream
+    /// error reaches the source node.
+    #[derive(Default)]
+    struct DirectRelayAckLossInjection {
+        successful_ack_bodies: Mutex<Vec<Vec<u8>>>,
+        successful_acks_seen: AtomicUsize,
+    }
+
+    async fn truncate_first_direct_relay_ack(
+        State(injection): State<Arc<DirectRelayAckLossInjection>>,
+        request: Request,
+        next: Next,
+    ) -> Response {
+        let targets_v3 = request.uri().path() == "/api/chat/peer/relay-v3";
+        let response = next.run(request).await;
+        if !targets_v3 || !response.status().is_success() {
+            return response;
+        }
+
+        let (mut parts, body) = response.into_parts();
+        let body = to_bytes(body, PEER_ACK_RESPONSE_MAX_BYTES)
+            .await
+            .expect("real target ACK must remain bounded");
+        injection
+            .successful_ack_bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(body.to_vec());
+        let ack_index = injection
+            .successful_acks_seen
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        parts.headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string()).expect("bounded ACK length header"),
+        );
+        if ack_index > 0 {
+            return Response::from_parts(parts, Body::from(body));
+        }
+
+        let prefix_len = body.len().saturating_div(2).max(1).min(body.len());
+        let prefix = body.slice(..prefix_len);
+        let truncated = futures::stream::iter(vec![
+            Ok::<_, std::io::Error>(prefix),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "injected custody ACK loss",
+            )),
+        ]);
+        Response::from_parts(parts, Body::from_stream(truncated))
+    }
+
+    #[test]
+    fn target_bound_retry_policy_excludes_deterministic_protocol_failures() {
+        // [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] A bounded exact retry
+        // may recover ambiguous delivery, but it must not amplify explicit
+        // rejection, oversized bodies, or cryptographic contract failures.
+        for error in [
+            BoundedHttpResponseError::BodyRead,
+            BoundedHttpResponseError::JsonDecode,
+        ] {
+            assert!(
+                TargetBoundPeerRelayFailure::Ack(DirectPeerRelayAckFailure::Bounded(error))
+                    .retryable_after_ambiguous_delivery()
+            );
+        }
+        for error in [
+            DirectPeerRelayAckFailure::Bounded(BoundedHttpResponseError::TooLarge),
+            DirectPeerRelayAckFailure::Rejected,
+            DirectPeerRelayAckFailure::ReceiptRequestMissing,
+            DirectPeerRelayAckFailure::ReceiptMissing,
+            DirectPeerRelayAckFailure::ReceiptInvalid("receipt_signature_invalid"),
+        ] {
+            assert!(!TargetBoundPeerRelayFailure::Ack(error).retryable_after_ambiguous_delivery());
+        }
+        assert!(TargetBoundPeerRelayFailure::Http(
+            reqwest::StatusCode::from_u16(HTTP_TOO_EARLY_STATUS_CODE).unwrap()
+        )
+        .retryable_after_ambiguous_delivery());
+        assert!(
+            !TargetBoundPeerRelayFailure::Http(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .retryable_after_ambiguous_delivery()
+        );
     }
 
     #[test]
@@ -18009,8 +18220,9 @@ mod tests {
     #[tokio::test]
     async fn discovered_chat_relay_prefers_target_bound_v3_when_advertised() {
         // [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] The signed
-        // descriptor selects v3, and the request and custody receipt must both
-        // bind the same target identity. A v2 endpoint must not be probed.
+        // rolling descriptor selects v3 without independently requiring the
+        // receipt feature. The request remains target-bound, retries stay
+        // exact, and the v2 endpoint must not be probed.
         let target_identity = Arc::new(IdentityKeyPair::generate());
         let target_node_id = target_identity.public_key_bytes();
         let identity_for_handler = Arc::clone(&target_identity);
@@ -18041,10 +18253,8 @@ mod tests {
                         if attempt == 0 {
                             // [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex]
                             // Model a target that still owns the first attempt.
-                            return Err(
-                                StatusCode::from_u16(HTTP_TOO_EARLY_STATUS_CODE)
-                                    .unwrap_or(StatusCode::CONFLICT),
-                            );
+                            return Err(StatusCode::from_u16(HTTP_TOO_EARLY_STATUS_CODE)
+                                .unwrap_or(StatusCode::CONFLICT));
                         }
                         Ok(Json(PeerChatRelayResponseV2 {
                             relay: PeerChatRelayResponse {
@@ -18086,7 +18296,6 @@ mod tests {
             now + 300,
             &[
                 NodeProtocolFeature::DirectPeerRelayAuthV2,
-                NodeProtocolFeature::DirectPeerRelayReceiptV2,
                 NodeProtocolFeature::DirectPeerRelayTargetBindingV3,
             ],
             target_identity.as_ref(),
@@ -18114,6 +18323,128 @@ mod tests {
         assert_eq!(commitments.len(), 2);
         assert_eq!(commitments[0], commitments[1]);
         mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn target_bound_v3_recovers_when_ack_body_is_lost_after_durable_custody() {
+        // [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Exercise the complete
+        // source -> TCP -> real target router -> SQLite pending-store path.
+        // The target publishes its replay-cache entry before test middleware
+        // truncates ACK #1, so ACK #2 must be the exact cached custody proof.
+        let directory = tempfile::tempdir().expect("ACK-loss relay directory");
+        let mut relay_config = ChatRelayConfig::default();
+        relay_config.enabled = true;
+        relay_config.db_path = directory
+            .path()
+            .join("ack-loss-relay.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let target_relay = Arc::new(
+            ChatRelayService::new(relay_config, [0x71; 32])
+                .expect("initialize real target relay storage"),
+        );
+        let target_identity = Arc::new(IdentityKeyPair::generate());
+        let target_node_id = target_identity.public_key_bytes();
+        let target_sessions = Arc::new(SessionManager::new(16, Duration::from_secs(60)));
+        let target_udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let injection = Arc::new(DirectRelayAckLossInjection::default());
+        let target_app = build_chat_peer_router(
+            Some(Arc::clone(&target_relay)),
+            target_sessions,
+            target_udp,
+            Arc::new(PeerStore::new()),
+            Arc::clone(&target_identity),
+            test_peer_http_client(),
+            None,
+        )
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&injection),
+            truncate_first_direct_relay_ack,
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let target_node = tokio::spawn(async move {
+            axum::serve(listener, target_app).await.unwrap();
+        });
+
+        let now = unix_now_secs();
+        let source_identity = IdentityKeyPair::generate();
+        let envelope = signed_test_chat_envelope(now);
+        let receiver = envelope.receiver;
+        let source_peer_store = PeerStore::new();
+        let descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            endpoint,
+            now.saturating_sub(1),
+            now + 300,
+            &[
+                NodeProtocolFeature::DirectPeerRelayAuthV2,
+                NodeProtocolFeature::DirectPeerRelayReceiptV2,
+                NodeProtocolFeature::DirectPeerRelayTargetBindingV3,
+            ],
+            target_identity.as_ref(),
+        );
+        source_peer_store
+            .upsert_verified(descriptor, now)
+            .expect("real target descriptor should verify");
+        source_peer_store.record_route_forward_success(&target_node_id, now.saturating_sub(1));
+
+        let source_client = test_peer_http_client();
+        let accepted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(source_client.as_ref()),
+            None,
+            &source_peer_store,
+            &source_identity,
+            &envelope,
+        )
+        .await;
+
+        assert_eq!(accepted, 1);
+        assert_eq!(
+            target_relay
+                .pull_pending(&receiver, 0, &[0u8; 16], 10)
+                .expect("durable target message should remain readable")
+                .0
+                .len(),
+            1
+        );
+        let target_status = target_relay.peer_status();
+        assert_eq!(target_status.inbound_accepted_total, 2);
+        assert_eq!(target_status.inbound_duplicate_total, 1);
+
+        let ack_bodies = injection
+            .successful_ack_bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(ack_bodies.len(), 2);
+        assert_eq!(ack_bodies[0], ack_bodies[1]);
+        let ack: PeerChatRelayResponseV2 =
+            serde_json::from_slice(&ack_bodies[1]).expect("cached ACK should retain its schema");
+        let exact_request =
+            PeerChatRelayRequestV3::sign(envelope, target_node_id, &source_identity)
+                .expect("source request should be reproducible");
+        ack.receipt
+            .as_ref()
+            .expect("recovered ACK should contain custody evidence")
+            .verify_expected_commitment(
+                &exact_request
+                    .request_commitment()
+                    .expect("reproduced request commitment"),
+                &target_node_id,
+                unix_now_secs(),
+            )
+            .expect("recovered receipt must bind the exact target request");
+        drop(ack_bodies);
+
+        let route_status = source_peer_store.route_candidate_status(unix_now_secs());
+        let target_prefix = hex::encode(&target_node_id[..4]);
+        let target_route = route_status
+            .chat_relay
+            .iter()
+            .find(|candidate| candidate.node_id_prefix == target_prefix)
+            .expect("target route status should remain observable");
+        assert_eq!(target_route.route_health, "healthy");
+        assert_eq!(target_route.route_consecutive_failures, 0);
+        target_node.abort();
     }
 
     #[tokio::test]
