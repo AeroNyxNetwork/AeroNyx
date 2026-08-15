@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.0.1-StartupIntegrity
+// Version: 2.0.2-DirectRetryTelemetry
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -29,6 +29,8 @@
 //   authenticated opaque cursor for stable ChatPullV2 snapshot pagination.
 //   v2.0.1-StartupIntegrity — Removed the configured database path from
 //   successful startup logs; server.rs now owns fail-closed activation.
+//   v2.0.2-DirectRetryTelemetry — Added aggregate-only direct peer retry
+//   recovery, exhaustion, and deterministic-failure telemetry.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -43,6 +45,7 @@
 //   - Maintenance telemetry: aggregate TTL cleanup, batch, and backlog evidence
 //   - Durable quarantine: bounded de-identified evidence for corrupt relay rows
 //   - Snapshot pull: restart-stable pagination that excludes concurrent inserts
+//   - Direct retry telemetry: aggregate ACK-loss recovery evidence without IDs
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -81,10 +84,14 @@
 //   - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Do not log the relay
 //     database path or raw initialization errors. server.rs exposes only the
 //     stable `reason_bucket()` when explicit activation fails.
+//   - [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] Retry telemetry must
+//     remain aggregate-only. Never add peer IDs, message IDs, request
+//     commitments, endpoints, wallet keys, or payload-derived dimensions.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.0.2-DirectRetryTelemetry — Privacy-safe ACK retry outcome counters
 //   v2.0.1-StartupIntegrity — Privacy-safe, fail-closed service activation
 //   v2.0.0-SnapshotPull — Monotonic queue sequence, atomic legacy backfill,
 //     and wallet-bound XChaCha20-Poly1305 snapshot cursors
@@ -205,6 +212,32 @@ pub struct ChatRelayOutboundRouteStatus {
     pub last_at: Option<u64>,
 }
 
+/// Aggregate-only target-bound direct relay retry outcomes.
+///
+/// [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] These counters describe
+/// transport reliability without recording which peer, envelope, request
+/// commitment, endpoint, or wallet caused an event. Every recorded retry
+/// trigger is classified as recovered or exhausted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatRelayDirectPeerRetryStatus {
+    /// Deliveries that entered the one-shot exact retry path.
+    pub retry_triggered_total: u64,
+    /// Retried deliveries whose exact retry produced a valid ACK.
+    pub retry_recovered_total: u64,
+    /// Retried deliveries that still failed after the retry budget was spent.
+    pub retry_exhausted_total: u64,
+    /// Deliveries whose final failure was deterministic and not retryable.
+    ///
+    /// This may overlap `retry_exhausted_total` when an ambiguity retry receives
+    /// a deterministic rejection on its second attempt.
+    pub deterministic_failure_total: u64,
+    /// Latest observed retry outcome: recovered, exhausted, or deterministic_failure.
+    pub last_outcome: Option<String>,
+    /// Unix timestamp of the latest retry or deterministic-failure observation.
+    pub last_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutboundRouteClass {
     AuthenticatedOnion,
@@ -251,6 +284,9 @@ pub struct ChatRelayPeerStatus {
     /// Compatibility direct peer relay health, isolated from onion delivery.
     #[serde(default)]
     pub direct_peer_outbound: ChatRelayOutboundRouteStatus,
+    /// Aggregate target-bound direct relay retry reliability.
+    #[serde(default)]
+    pub direct_peer_retry: ChatRelayDirectPeerRetryStatus,
     /// Total inbound peer relay envelopes accepted for local processing.
     pub inbound_accepted_total: u64,
     /// Total inbound duplicate envelopes ignored idempotently.
@@ -293,6 +329,7 @@ impl ChatRelayPeerStatus {
             last_outbound_at: None,
             authenticated_onion_outbound: ChatRelayOutboundRouteStatus::default(),
             direct_peer_outbound: ChatRelayOutboundRouteStatus::default(),
+            direct_peer_retry: ChatRelayDirectPeerRetryStatus::default(),
             inbound_accepted_total: 0,
             inbound_duplicate_total: 0,
             inbound_delivered_online_total: 0,
@@ -2689,6 +2726,49 @@ impl ChatRelayService {
         );
     }
 
+    /// Records one aggregate target-bound direct relay retry observation.
+    ///
+    /// `retry_triggered` means a second exact request was sent. A triggered
+    /// retry is classified as either recovered or exhausted. Independently,
+    /// `final_failure_deterministic` records that the final typed failure was
+    /// not eligible for another ambiguity retry. Successful first attempts do
+    /// not change this snapshot.
+    ///
+    /// [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] Parameters are
+    /// deliberately aggregate booleans. Do not extend this API with peer,
+    /// message, commitment, endpoint, wallet, or payload identifiers.
+    pub(crate) fn record_direct_peer_retry_observation(
+        &self,
+        now: u64,
+        retry_triggered: bool,
+        delivery_succeeded: bool,
+        final_failure_deterministic: bool,
+    ) {
+        debug_assert!(!(delivery_succeeded && final_failure_deterministic));
+        if !retry_triggered && !final_failure_deterministic {
+            return;
+        }
+
+        let mut status = self.peer_status.write();
+        let retry = &mut status.direct_peer_retry;
+        if retry_triggered {
+            retry.retry_triggered_total = retry.retry_triggered_total.saturating_add(1);
+            if delivery_succeeded {
+                retry.retry_recovered_total = retry.retry_recovered_total.saturating_add(1);
+                retry.last_outcome = Some("recovered".to_string());
+            } else {
+                retry.retry_exhausted_total = retry.retry_exhausted_total.saturating_add(1);
+                retry.last_outcome = Some("exhausted".to_string());
+            }
+        } else {
+            retry.last_outcome = Some("deterministic_failure".to_string());
+        }
+        if final_failure_deterministic {
+            retry.deterministic_failure_total = retry.deterministic_failure_total.saturating_add(1);
+        }
+        retry.last_at = Some(now);
+    }
+
     /// Records one authenticated receipt-verified onion relay round.
     ///
     /// [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] This advances both the
@@ -3096,6 +3176,7 @@ mod tests {
         let object = encoded.as_object_mut().expect("peer status JSON object");
         object.remove("authenticated_onion_outbound");
         object.remove("direct_peer_outbound");
+        object.remove("direct_peer_retry");
 
         // [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] Additive health
         // fields must not invalidate status cached or forwarded by an older
@@ -3106,6 +3187,39 @@ mod tests {
         assert_eq!(decoded.last_outbound_status.as_deref(), Some("healthy"));
         assert_eq!(decoded.authenticated_onion_outbound.rounds, 0);
         assert_eq!(decoded.direct_peer_outbound.rounds, 0);
+        assert_eq!(
+            decoded.direct_peer_retry,
+            ChatRelayDirectPeerRetryStatus::default()
+        );
+    }
+
+    #[test]
+    fn direct_peer_retry_health_tracks_recovery_exhaustion_and_determinism() {
+        let svc = make_service();
+
+        // [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] A normal first
+        // attempt is intentionally invisible to retry telemetry.
+        svc.record_direct_peer_retry_observation(1_800_000_001, false, true, false);
+        assert_eq!(
+            svc.peer_status().direct_peer_retry,
+            ChatRelayDirectPeerRetryStatus::default()
+        );
+
+        svc.record_direct_peer_retry_observation(1_800_000_010, true, true, false);
+        svc.record_direct_peer_retry_observation(1_800_000_020, true, false, true);
+        svc.record_direct_peer_retry_observation(1_800_000_030, false, false, true);
+
+        let retry = svc.peer_status().direct_peer_retry;
+        assert_eq!(retry.retry_triggered_total, 2);
+        assert_eq!(retry.retry_recovered_total, 1);
+        assert_eq!(retry.retry_exhausted_total, 1);
+        assert_eq!(retry.deterministic_failure_total, 2);
+        assert_eq!(
+            retry.retry_recovered_total + retry.retry_exhausted_total,
+            retry.retry_triggered_total
+        );
+        assert_eq!(retry.last_outcome.as_deref(), Some("deterministic_failure"));
+        assert_eq!(retry.last_at, Some(1_800_000_030));
     }
 
     #[test]

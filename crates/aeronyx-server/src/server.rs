@@ -367,6 +367,9 @@
 // 138. [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Treats bounded ACK-body
 //      truncation as transport ambiguity and retries the exact v3 request,
 //      while deterministic protocol, size, and receipt failures remain final.
+// 139. [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] Publishes only
+//      aggregate direct-relay retry recovery, exhaustion, and deterministic
+//      failure evidence through the existing relay health contract.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -885,7 +888,8 @@ use crate::management::{
 };
 use crate::miner::ReflectionMiner;
 use crate::services::chat_relay::{
-    derive_node_secret, ChatRelayService, ExpiredNotification, MAX_CHAT_ACK_MESSAGE_IDS,
+    derive_node_secret, ChatRelayPeerStatus, ChatRelayService, ExpiredNotification,
+    MAX_CHAT_ACK_MESSAGE_IDS,
 };
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
@@ -999,6 +1003,34 @@ impl TargetBoundPeerRelayFailure {
             Self::Http(status) => status.as_u16() == HTTP_TOO_EARLY_STATUS_CODE,
             Self::Ack(error) => error.retryable_after_ambiguous_delivery(),
         }
+    }
+}
+
+/// Result of one bounded target-bound delivery, including aggregate retry state.
+///
+/// [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] Attempt count stays
+/// process-local and is reduced to aggregate counters before health publication.
+/// Never add peer, message, commitment, endpoint, wallet, or payload fields.
+#[derive(Debug)]
+struct TargetBoundPeerRelayDeliveryOutcome {
+    result: std::result::Result<(), TargetBoundPeerRelayFailure>,
+    attempts: usize,
+}
+
+impl TargetBoundPeerRelayDeliveryOutcome {
+    fn retry_triggered(&self) -> bool {
+        self.attempts > 1
+    }
+
+    fn delivery_succeeded(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    fn final_failure_deterministic(&self) -> bool {
+        self.result
+            .as_ref()
+            .err()
+            .is_some_and(|error| !error.retryable_after_ambiguous_delivery())
     }
 }
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
@@ -5852,29 +5884,10 @@ impl Server {
                     let now = unix_now_secs();
                     Some(serde_json::json!({
                         "generated_at": now,
-                        "peer_relay": {
-                            "enabled": false,
-                            "outbound_attempted_total": 0,
-                            "outbound_accepted_total": 0,
-                            "outbound_failed_total": 0,
-                            "outbound_rounds": 0,
-                            "last_outbound_attempted": 0,
-                            "last_outbound_accepted": 0,
-                            "last_outbound_failed": 0,
-                            "last_outbound_status": null,
-                            "last_outbound_failure_reason": null,
-                            "consecutive_outbound_failures": 0,
-                            "last_outbound_success_at": null,
-                            "last_outbound_at": null,
-                            "inbound_accepted_total": 0,
-                            "inbound_duplicate_total": 0,
-                            "inbound_delivered_online_total": 0,
-                            "inbound_stored_pending_total": 0,
-                            "inbound_rejected_total": 0,
-                            "last_inbound_status": null,
-                            "last_inbound_failure_reason": null,
-                            "last_inbound_at": null
-                        },
+                        // [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex]
+                        // Reuse the typed schema so disabled heartbeats cannot
+                        // silently omit newly added aggregate health fields.
+                        "peer_relay": ChatRelayPeerStatus::new(false),
                         "maintenance": null,
                         "storage_usage": null,
                         "storage_capacity": null,
@@ -11094,7 +11107,7 @@ impl Server {
         expected_request_commitment: &[u8; 32],
         expected_node_id: &[u8; 32],
         require_signed_receipt: bool,
-    ) -> std::result::Result<(), TargetBoundPeerRelayFailure> {
+    ) -> TargetBoundPeerRelayDeliveryOutcome {
         let mut attempt = 1usize;
         loop {
             let outcome = match client.post(url).json(request).send().await {
@@ -11117,7 +11130,10 @@ impl Server {
                 .err()
                 .is_some_and(TargetBoundPeerRelayFailure::retryable_after_ambiguous_delivery);
             if !should_retry || attempt >= DIRECT_PEER_RELAY_V3_MAX_ATTEMPTS {
-                return outcome;
+                return TargetBoundPeerRelayDeliveryOutcome {
+                    result: outcome,
+                    attempts: attempt,
+                };
             }
 
             attempt = attempt.saturating_add(1);
@@ -11240,7 +11256,7 @@ impl Server {
                         continue;
                     }
                 };
-                Self::send_and_validate_target_bound_peer_relay(
+                let outcome = Self::send_and_validate_target_bound_peer_relay(
                     client,
                     &url,
                     &request,
@@ -11248,8 +11264,16 @@ impl Server {
                     &peer.node_id(),
                     require_signed_receipt,
                 )
-                .await
-                .map_err(|error| match error {
+                .await;
+                if let Some(relay) = relay {
+                    relay.record_direct_peer_retry_observation(
+                        unix_now_secs(),
+                        outcome.retry_triggered(),
+                        outcome.delivery_succeeded(),
+                        outcome.final_failure_deterministic(),
+                    );
+                }
+                outcome.result.map_err(|error| match error {
                     TargetBoundPeerRelayFailure::Transport(error) => {
                         Self::classify_reqwest_error("peer_relay_request", &error)
                     }
@@ -14126,6 +14150,18 @@ mod tests {
             super::privacy_safe_peer_http_client_builder()
                 .build()
                 .unwrap(),
+        )
+    }
+
+    fn test_chat_relay_service(
+        db_path: &std::path::Path,
+        node_secret: [u8; 32],
+    ) -> Arc<ChatRelayService> {
+        let mut config = ChatRelayConfig::default();
+        config.enabled = true;
+        config.db_path = db_path.to_string_lossy().into_owned();
+        Arc::new(
+            ChatRelayService::new(config, node_secret).expect("initialize test chat relay service"),
         )
     }
 
@@ -18223,6 +18259,11 @@ mod tests {
         // rolling descriptor selects v3 without independently requiring the
         // receipt feature. The request remains target-bound, retries stay
         // exact, and the v2 endpoint must not be probed.
+        let source_directory = tempfile::tempdir().expect("v3 source relay directory");
+        let source_relay = test_chat_relay_service(
+            &source_directory.path().join("source-relay.sqlite3"),
+            [0x70; 32],
+        );
         let target_identity = Arc::new(IdentityKeyPair::generate());
         let target_node_id = target_identity.public_key_bytes();
         let identity_for_handler = Arc::clone(&target_identity);
@@ -18307,7 +18348,7 @@ mod tests {
 
         let accepted = Server::relay_chat_envelope_to_discovered_peers(
             Some(&reqwest::Client::new()),
-            None,
+            Some(source_relay.as_ref()),
             &peer_store,
             &IdentityKeyPair::generate(),
             &signed_test_chat_envelope(now),
@@ -18322,6 +18363,12 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(commitments.len(), 2);
         assert_eq!(commitments[0], commitments[1]);
+        let retry = source_relay.peer_status().direct_peer_retry;
+        assert_eq!(retry.retry_triggered_total, 1);
+        assert_eq!(retry.retry_recovered_total, 1);
+        assert_eq!(retry.retry_exhausted_total, 0);
+        assert_eq!(retry.deterministic_failure_total, 0);
+        assert_eq!(retry.last_outcome.as_deref(), Some("recovered"));
         mock_peer.abort();
     }
 
@@ -18342,6 +18389,10 @@ mod tests {
         let target_relay = Arc::new(
             ChatRelayService::new(relay_config, [0x71; 32])
                 .expect("initialize real target relay storage"),
+        );
+        let source_relay = test_chat_relay_service(
+            &directory.path().join("ack-loss-source.sqlite3"),
+            [0x72; 32],
         );
         let target_identity = Arc::new(IdentityKeyPair::generate());
         let target_node_id = target_identity.public_key_bytes();
@@ -18391,7 +18442,7 @@ mod tests {
         let source_client = test_peer_http_client();
         let accepted = Server::relay_chat_envelope_to_discovered_peers(
             Some(source_client.as_ref()),
-            None,
+            Some(source_relay.as_ref()),
             &source_peer_store,
             &source_identity,
             &envelope,
@@ -18410,6 +18461,12 @@ mod tests {
         let target_status = target_relay.peer_status();
         assert_eq!(target_status.inbound_accepted_total, 2);
         assert_eq!(target_status.inbound_duplicate_total, 1);
+        let retry = source_relay.peer_status().direct_peer_retry;
+        assert_eq!(retry.retry_triggered_total, 1);
+        assert_eq!(retry.retry_recovered_total, 1);
+        assert_eq!(retry.retry_exhausted_total, 0);
+        assert_eq!(retry.deterministic_failure_total, 0);
+        assert_eq!(retry.last_outcome.as_deref(), Some("recovered"));
 
         let ack_bodies = injection
             .successful_ack_bodies
@@ -18445,6 +18502,100 @@ mod tests {
         assert_eq!(target_route.route_health, "healthy");
         assert_eq!(target_route.route_consecutive_failures, 0);
         target_node.abort();
+    }
+
+    #[tokio::test]
+    async fn target_bound_v3_retry_health_distinguishes_exhaustion_and_determinism() {
+        // [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] The first
+        // delivery spends its exact-retry budget on two ambiguous 425 replies.
+        // The second receives one deterministic 429. Metrics must distinguish
+        // those outcomes without retaining target or envelope identifiers.
+        let directory = tempfile::tempdir().expect("retry telemetry directory");
+        let source_relay = test_chat_relay_service(
+            &directory.path().join("retry-telemetry.sqlite3"),
+            [0x73; 32],
+        );
+        let target_identity = Arc::new(IdentityKeyPair::generate());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_handler = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/api/chat/peer/relay-v3",
+            post(move |Json(_request): Json<PeerChatRelayRequestV3>| {
+                let calls_for_handler = Arc::clone(&calls_for_handler);
+                async move {
+                    let call = calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                    let status = if call < 2 {
+                        StatusCode::from_u16(HTTP_TOO_EARLY_STATUS_CODE)
+                            .unwrap_or(StatusCode::CONFLICT)
+                    } else {
+                        StatusCode::TOO_MANY_REQUESTS
+                    };
+                    Err::<Json<PeerChatRelayResponseV2>, _>(status)
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock_peer = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let now = unix_now_secs();
+        let descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            endpoint,
+            now.saturating_sub(1),
+            now + 300,
+            &[NodeProtocolFeature::DirectPeerRelayTargetBindingV3],
+            target_identity.as_ref(),
+        );
+        let target_node_id = descriptor.node_id();
+        let source_identity = IdentityKeyPair::generate();
+        let client = test_peer_http_client();
+
+        let exhausted_store = PeerStore::new();
+        exhausted_store
+            .upsert_verified(descriptor.clone(), now)
+            .expect("exhaustion target descriptor should verify");
+        exhausted_store.record_route_forward_success(&target_node_id, now.saturating_sub(1));
+        let exhausted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(client.as_ref()),
+            Some(source_relay.as_ref()),
+            &exhausted_store,
+            &source_identity,
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+        assert_eq!(exhausted, 0);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        let retry = source_relay.peer_status().direct_peer_retry;
+        assert_eq!(retry.retry_triggered_total, 1);
+        assert_eq!(retry.retry_recovered_total, 0);
+        assert_eq!(retry.retry_exhausted_total, 1);
+        assert_eq!(retry.deterministic_failure_total, 0);
+        assert_eq!(retry.last_outcome.as_deref(), Some("exhausted"));
+
+        let deterministic_store = PeerStore::new();
+        deterministic_store
+            .upsert_verified(descriptor, now)
+            .expect("deterministic target descriptor should verify");
+        deterministic_store.record_route_forward_success(&target_node_id, now.saturating_sub(1));
+        let deterministic = Server::relay_chat_envelope_to_discovered_peers(
+            Some(client.as_ref()),
+            Some(source_relay.as_ref()),
+            &deterministic_store,
+            &source_identity,
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+        assert_eq!(deterministic, 0);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+        let retry = source_relay.peer_status().direct_peer_retry;
+        assert_eq!(retry.retry_triggered_total, 1);
+        assert_eq!(retry.retry_recovered_total, 0);
+        assert_eq!(retry.retry_exhausted_total, 1);
+        assert_eq!(retry.deterministic_failure_total, 1);
+        assert_eq!(retry.last_outcome.as_deref(), Some("deterministic_failure"));
+        mock_peer.abort();
     }
 
     #[tokio::test]

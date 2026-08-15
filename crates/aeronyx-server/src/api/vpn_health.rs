@@ -3146,6 +3146,10 @@ mod tests {
         peer_status.outbound_accepted_total = 3;
         peer_status.last_outbound_status = Some("degraded".to_string());
         peer_status.last_outbound_failure_reason = Some("peer_relay_request_timeout".to_string());
+        peer_status.direct_peer_retry.retry_triggered_total = 2;
+        peer_status.direct_peer_retry.retry_recovered_total = 1;
+        peer_status.direct_peer_retry.retry_exhausted_total = 1;
+        peer_status.direct_peer_retry.last_outcome = Some("exhausted".to_string());
 
         // [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] Health consumes the
         // service snapshot verbatim instead of maintaining parallel counters.
@@ -3156,6 +3160,14 @@ mod tests {
         let encoded = serde_json::to_value(&status).expect("serialize relay health");
         assert_eq!(encoded["runtime_ready"], true);
         assert_eq!(encoded["peer_relay"]["outbound_attempted_total"], 4);
+        assert_eq!(
+            encoded["peer_relay"]["direct_peer_retry"]["retry_triggered_total"],
+            2
+        );
+        assert_eq!(
+            encoded["peer_relay"]["direct_peer_retry"]["last_outcome"],
+            "exhausted"
+        );
         assert_eq!(
             encoded["peer_relay"]["last_outbound_failure_reason"],
             "peer_relay_request_timeout"
