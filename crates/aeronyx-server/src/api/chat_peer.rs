@@ -56,6 +56,9 @@
 //! - [PEER-ACK-PRIVACY 2026-08-15 by Codex] Normalizes successful direct
 //!   relay ACKs so peers cannot probe receiver presence, device count, or
 //!   mailbox/dedup state through legacy compatibility fields
+//! - [PREVIOUS-HOP-ATTRIBUTION 2026-08-15 by Codex] Authenticates the claimed
+//!   blind-relay previous hop before touching per-node rate, reputation, or
+//!   quarantine state, preventing forged node-id poisoning
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -200,8 +203,14 @@
 //! - [PEER-ACK-PRIVACY 2026-08-15 by Codex] Direct relay success proves only
 //!   durable custody of the opaque envelope. Keep actual duplicate and online
 //!   delivery counts in aggregate local health; never return them on peer wire.
+//! - [PREVIOUS-HOP-ATTRIBUTION 2026-08-15 by Codex] An unverified claimed
+//!   previous-hop key has no attribution authority. Invalid keys/signatures may
+//!   increment aggregate rejection telemetry only; they must never consume a
+//!   node bucket or mutate that node's route reputation/quarantine state.
 //!
 //! ## Last Modified
+//! v0.44.0-PreviousHopAttribution - Verify blind-relay node identity before
+//! per-node admission and failure scoring to prevent forged-id quarantine
 //! v0.43.0-PeerAckPrivacy - Normalize direct relay success ACKs to durable
 //! custody without receiver presence, device-count, or mailbox-state signals
 //! v0.42.0-PeerRelayAdmission - Bound direct compatibility relay request rate
@@ -1379,9 +1388,20 @@ async fn process_peer_blind_relay(
     let onward_descriptor_hint = request.onward_descriptor_hint;
     let envelope = request.envelope;
 
+    // [PREVIOUS-HOP-ATTRIBUTION 2026-08-15 by Codex] The claimed node id is
+    // attacker-controlled until this exact envelope verifies against it. Do
+    // not let unauthenticated traffic consume or poison another node's rate,
+    // reputation, or quarantine bucket.
+    authenticate_blind_relay_envelope(&envelope, &previous_hop_node_id).map_err(|error| {
+        state
+            .peer_store
+            .record_blind_relay_rejected(now, error.reason_bucket());
+        error
+    })?;
+
     check_blind_relay_previous_hop_allowed(&state, previous_hop_node_id, now)?;
 
-    validate_blind_relay_envelope(&envelope, &previous_hop_node_id, now).map_err(|error| {
+    validate_blind_relay_metadata(&envelope, now).map_err(|error| {
         reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, error.reason_bucket());
         error
     })?;
@@ -2569,11 +2589,26 @@ fn validate_blind_relay_envelope(
     previous_hop_node_id: &[u8; 32],
     now: u64,
 ) -> Result<(), BlindRelayError> {
+    authenticate_blind_relay_envelope(envelope, previous_hop_node_id)?;
+    validate_blind_relay_metadata(envelope, now)
+}
+
+fn authenticate_blind_relay_envelope(
+    envelope: &BlindRelayEnvelope,
+    previous_hop_node_id: &[u8; 32],
+) -> Result<(), BlindRelayError> {
     let previous_hop = IdentityPublicKey::from_bytes(previous_hop_node_id)
         .map_err(|_| BlindRelayError::InvalidPreviousHop)?;
     envelope
         .verify_signature_from(&previous_hop)
         .map_err(|_| BlindRelayError::InvalidSignature)?;
+    Ok(())
+}
+
+fn validate_blind_relay_metadata(
+    envelope: &BlindRelayEnvelope,
+    now: u64,
+) -> Result<(), BlindRelayError> {
     validate_blind_relay_timestamp(envelope.timestamp, now)?;
     encode_blind_relay_envelope(envelope).map_err(|_| BlindRelayError::EnvelopeTooLarge)?;
     Ok(())
@@ -5005,6 +5040,93 @@ mod tests {
                 quarantine_until: quarantine_at + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
             }
         );
+    }
+
+    #[tokio::test]
+    async fn forged_previous_hop_signatures_cannot_poison_node_quarantine() {
+        let claimed_previous_hop = IdentityKeyPair::generate();
+        let attacker = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let now = now_secs();
+        let claimed_node_id = claimed_previous_hop.public_key_bytes();
+
+        for attempt in 0..=BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD {
+            let mut route_id = [0x91u8; 16];
+            route_id[0] = u8::try_from(attempt).unwrap_or(u8::MAX);
+            let forged = BlindRelayEnvelope {
+                route_id,
+                next_hop: node_identity.public_key_bytes(),
+                ttl: 2,
+                encrypted_blob: b"opaque forged-attribution candidate".to_vec(),
+                timestamp: now,
+                signature: [0u8; 64],
+            }
+            .sign_with(&attacker);
+
+            assert!(matches!(
+                process_peer_blind_relay(
+                    state.clone(),
+                    PeerBlindRelayRequest {
+                        envelope: forged,
+                        previous_hop_node_id: claimed_node_id,
+                        onward_envelope: None,
+                        onward_descriptor_hint: None,
+                    },
+                )
+                .await,
+                Err(BlindRelayError::InvalidSignature)
+            ));
+        }
+
+        let decision = state
+            .blind_relay_abuse_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_request(claimed_node_id, now);
+        assert_eq!(decision, BlindRelayAbuseDecision::Allowed);
+
+        let valid = BlindRelayEnvelope {
+            route_id: [0xa2u8; 16],
+            next_hop: node_identity.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: b"opaque authenticated previous-hop payload".to_vec(),
+            timestamp: now,
+            signature: [0u8; 64],
+        }
+        .sign_with(&claimed_previous_hop);
+        let response = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope: valid,
+                previous_hop_node_id: claimed_node_id,
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await
+        .expect("valid claimed previous hop must remain admissible");
+
+        assert!(response.accepted);
+        assert!(response.terminal);
+        let blind_status = peer_store.status(now).runtime.blind_relay;
+        assert_eq!(
+            blind_status.rejected,
+            u64::from(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD) + 1
+        );
+        assert_eq!(blind_status.quarantine_started, 0);
     }
 
     #[tokio::test]
