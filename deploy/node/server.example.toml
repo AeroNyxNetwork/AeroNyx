@@ -337,7 +337,10 @@ max_pending_blob_bytes_total = 2147483648
 cleanup_interval_secs = 60
 dedup_lru_capacity = 10000
 expired_notification_ttl_secs = 604800
-# [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Global parser-front ceiling for
-# the legacy direct compatibility endpoint. Onion relay keeps its separate,
-# authenticated per-previous-hop abuse guard.
+# [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Global parser-front ceiling shared
+# by direct relay v1/v2. It intentionally uses no node, user, receiver, or IP
+# bucket and remains mandatory against permissionless identity rotation.
 peer_relay_requests_per_minute = 1200
+# [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] Post-signature fairness
+# ceiling for one verified direct-relay v2 previous-hop node identity.
+peer_relay_authenticated_requests_per_minute = 240

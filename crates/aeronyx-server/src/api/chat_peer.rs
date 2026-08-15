@@ -64,6 +64,9 @@
 //! - [DIRECT-RELAY-AUTH-V2 2026-08-15 by Codex] Adds a separately negotiated
 //!   direct-relay endpoint whose node signature binds the complete canonical
 //!   encrypted envelope; the legacy endpoint remains available during rollout
+//! - [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] Applies a bounded
+//!   per-node fairness ceiling only after direct-relay v2 authentication while
+//!   retaining the global parser-front ceiling against identity rotation
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -161,6 +164,10 @@
 //!   canonical `ChatEnvelope`. Never weaken it to a bearer header or sign only
 //!   a message id; either would permit ciphertext substitution or replay across
 //!   protocol surfaces.
+//! - Per-node direct-relay admission must run after outer node authentication.
+//!   Invalid signatures must not create or mutate node buckets. Keep the
+//!   process-global parser-front ceiling because permissionless node keys are
+//!   not Sybil resistance.
 //! - Next-hop acknowledgement bodies are untrusted and must use the shared
 //!   bounded decoder. Never call `Response::json()` directly on peer traffic.
 //! - Durable queue count/byte exhaustion is a retryable capacity condition,
@@ -220,6 +227,8 @@
 //!   node bucket or mutate that node's route reputation/quarantine state.
 //!
 //! ## Last Modified
+//! v0.46.0-AuthenticatedPeerFairness - Add bounded post-signature per-node
+//! admission while retaining global parser-front protection
 //! v0.45.0-DirectRelayAuthV2 - Authenticate direct relay previous-hop node
 //! identity through a signed, descriptor-negotiated rolling-upgrade endpoint
 //! v0.44.0-PreviousHopAttribution - Verify blind-relay node identity before
@@ -308,7 +317,7 @@ use aeronyx_core::protocol::{
 use aeronyx_transport::traits::Transport;
 use aeronyx_transport::UdpTransport;
 use axum::{
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Extension, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -323,7 +332,9 @@ use crate::api::{
     canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
     InFlightRequestGuard, PEER_ACK_RESPONSE_MAX_BYTES,
 };
-use crate::config_chat_relay::DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE;
+use crate::config_chat_relay::{
+    DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE, DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE,
+};
 use crate::services::chat_relay::ChatRelayError;
 use crate::services::peer_store::PeerStore;
 use crate::services::{
@@ -361,6 +372,9 @@ const PEER_CHAT_RELAY_AUTH_V2_DOMAIN: &[u8] = b"AeroNyx/peer-chat-relay-auth/v2"
 
 /// Maximum ordinary peer-relay requests allowed in parser/handler execution.
 const MAX_IN_FLIGHT_PEER_CHAT_REQUESTS: usize = 64;
+
+/// Maximum authenticated direct-relay node buckets retained in memory.
+const MAX_AUTHENTICATED_PEER_RELAY_BUCKETS: usize = 4096;
 
 /// Maximum concurrent blind relay requests handled by this process.
 ///
@@ -456,15 +470,25 @@ struct PeerRelayRequestGate {
     in_flight: Arc<AtomicUsize>,
     rate_limit: Arc<Mutex<PeerRelayRateLimitWindow>>,
     requests_per_minute: u32,
+    authenticated_rate_limit: Arc<Mutex<AuthenticatedPeerRelayRateLimiter>>,
+    authenticated_requests_per_minute: u32,
     chat_relay: Option<Arc<ChatRelayService>>,
 }
 
 impl PeerRelayRequestGate {
-    fn new(requests_per_minute: u32, chat_relay: Option<Arc<ChatRelayService>>) -> Self {
+    fn new(
+        requests_per_minute: u32,
+        authenticated_requests_per_minute: u32,
+        chat_relay: Option<Arc<ChatRelayService>>,
+    ) -> Self {
         Self {
             in_flight: Arc::new(AtomicUsize::new(0)),
             rate_limit: Arc::new(Mutex::new(PeerRelayRateLimitWindow::new(Instant::now()))),
             requests_per_minute,
+            authenticated_rate_limit: Arc::new(Mutex::new(
+                AuthenticatedPeerRelayRateLimiter::default(),
+            )),
+            authenticated_requests_per_minute,
             chat_relay,
         }
     }
@@ -481,11 +505,59 @@ impl PeerRelayRequestGate {
             relay.record_peer_relay_inbound_rejected(now_secs(), reason);
         }
     }
+
+    fn admit_authenticated(&self, node_id: [u8; 32], now: Instant) -> bool {
+        self.authenticated_rate_limit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .allow(node_id, now, self.authenticated_requests_per_minute)
+    }
 }
 
 struct PeerRelayRateLimitWindow {
     started_at: Instant,
     admitted: u32,
+}
+
+#[derive(Default)]
+struct AuthenticatedPeerRelayRateLimiter {
+    buckets: HashMap<[u8; 32], AuthenticatedPeerRelayRateBucket>,
+}
+
+struct AuthenticatedPeerRelayRateBucket {
+    window: PeerRelayRateLimitWindow,
+    last_seen: Instant,
+}
+
+impl AuthenticatedPeerRelayRateLimiter {
+    fn allow(&mut self, node_id: [u8; 32], now: Instant, limit: u32) -> bool {
+        // [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] New identities
+        // evict only the least-recently-observed node when the fixed memory
+        // ceiling is reached. The global parser-front guard bounds identity
+        // churn, so this O(capacity) path cannot become unbounded work.
+        if !self.buckets.contains_key(&node_id)
+            && self.buckets.len() >= MAX_AUTHENTICATED_PEER_RELAY_BUCKETS
+        {
+            if let Some(oldest) = self
+                .buckets
+                .iter()
+                .min_by_key(|(_, bucket)| bucket.last_seen)
+                .map(|(node_id, _)| *node_id)
+            {
+                self.buckets.remove(&oldest);
+            }
+        }
+
+        let bucket =
+            self.buckets
+                .entry(node_id)
+                .or_insert_with(|| AuthenticatedPeerRelayRateBucket {
+                    window: PeerRelayRateLimitWindow::new(now),
+                    last_seen: now,
+                });
+        bucket.last_seen = now;
+        bucket.window.allow(now, limit)
+    }
 }
 
 impl PeerRelayRateLimitWindow {
@@ -1227,8 +1299,13 @@ pub fn build_chat_peer_router(
         .as_ref()
         .map(|relay| relay.config().peer_relay_requests_per_minute)
         .unwrap_or(DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE);
+    let authenticated_peer_relay_requests_per_minute = chat_relay
+        .as_ref()
+        .map(|relay| relay.config().peer_relay_authenticated_requests_per_minute)
+        .unwrap_or(DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE);
     let peer_relay_gate = Arc::new(PeerRelayRequestGate::new(
         peer_relay_requests_per_minute,
+        authenticated_peer_relay_requests_per_minute,
         chat_relay.clone(),
     ));
     let state = ChatPeerState {
@@ -1273,7 +1350,7 @@ pub fn build_chat_peer_router(
 /// Applies ordinary peer-relay backpressure before Axum reads a JSON body.
 async fn peer_relay_request_gate(
     State(gate): State<Arc<PeerRelayRequestGate>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Count attempted direct-relay
@@ -1292,6 +1369,10 @@ async fn peer_relay_request_gate(
         return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
     };
 
+    // [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] Pass the exact gate
+    // that admitted parser work to the v2 handler. This keeps direct-relay
+    // admission ownership out of the shared chat/blind relay runtime state.
+    request.extensions_mut().insert(Arc::clone(&gate));
     next.run(request).await
 }
 
@@ -1361,6 +1442,7 @@ async fn peer_relay_handler(
 
 async fn peer_relay_v2_handler(
     State(state): State<ChatPeerState>,
+    Extension(gate): Extension<Arc<PeerRelayRequestGate>>,
     Json(request): Json<PeerChatRelayRequestV2>,
 ) -> impl IntoResponse {
     // [DIRECT-RELAY-AUTH-V2 2026-08-15 by Codex] Authenticate the immediate
@@ -1371,6 +1453,11 @@ async fn peer_relay_v2_handler(
             relay.record_peer_relay_inbound_rejected(now_secs(), "peer_auth_invalid");
         }
         return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
+    }
+
+    if !gate.admit_authenticated(request.previous_hop_node_id, Instant::now()) {
+        gate.record_rejected("peer_auth_rate_limited");
+        return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
     }
 
     peer_relay_response(state, request.envelope).await
@@ -3293,6 +3380,18 @@ mod tests {
         label: &str,
         requests_per_minute: u32,
     ) -> (Arc<ChatRelayService>, std::path::PathBuf) {
+        temp_chat_relay_with_rates(
+            label,
+            requests_per_minute,
+            DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE,
+        )
+    }
+
+    fn temp_chat_relay_with_rates(
+        label: &str,
+        requests_per_minute: u32,
+        authenticated_requests_per_minute: u32,
+    ) -> (Arc<ChatRelayService>, std::path::PathBuf) {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3300,6 +3399,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aeronyx-{label}-{unique}.db"));
         let mut config = test_chat_config(path.to_string_lossy().to_string());
         config.peer_relay_requests_per_minute = requests_per_minute;
+        config.peer_relay_authenticated_requests_per_minute = authenticated_requests_per_minute;
         let relay = Arc::new(ChatRelayService::new(config, [7u8; 32]).unwrap());
         (relay, path)
     }
@@ -3683,7 +3783,11 @@ mod tests {
         // [DIRECT-RELAY-AUTH-V2 2026-08-15 by Codex] A forged previous-hop
         // claim must not reach the durable queue, while the exact signed
         // request remains accepted through the same relay processing path.
-        let (relay, path) = temp_chat_relay("chat-peer-auth-v2");
+        let (relay, path) = temp_chat_relay_with_rates(
+            "chat-peer-auth-v2",
+            DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE,
+            1,
+        );
         let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
         let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
         let previous_hop = IdentityKeyPair::generate();
@@ -3729,6 +3833,7 @@ mod tests {
         );
 
         let accepted_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3749,11 +3854,44 @@ mod tests {
                 .len(),
             1
         );
+        let rate_limited_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay-v2")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rate_limited_response.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
         let status = relay.peer_status();
-        assert_eq!(status.inbound_rejected_total, 1);
+        assert_eq!(status.inbound_rejected_total, 2);
         assert_eq!(status.inbound_accepted_total, 1);
+        assert_eq!(
+            status.last_inbound_failure_reason.as_deref(),
+            Some("peer_auth_rate_limited")
+        );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn authenticated_peer_rate_limit_isolated_by_verified_node_id() {
+        let started_at = Instant::now();
+        let first = [0x31; 32];
+        let second = [0x32; 32];
+        let mut limiter = AuthenticatedPeerRelayRateLimiter::default();
+
+        assert!(limiter.allow(first, started_at, 1));
+        assert!(!limiter.allow(first, started_at + Duration::from_secs(59), 1));
+        assert!(limiter.allow(second, started_at + Duration::from_secs(59), 1));
+        assert!(limiter.allow(first, started_at + Duration::from_secs(60), 1));
+        assert_eq!(limiter.buckets.len(), 2);
     }
 
     #[test]

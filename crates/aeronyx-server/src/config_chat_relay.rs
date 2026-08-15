@@ -15,6 +15,8 @@
 //! safely by SQLite's signed timestamp domain.
 //! v1.4.0-PeerRelayAdmission — Added a backward-compatible global admission
 //! ceiling for the legacy direct peer-relay endpoint.
+//! v1.5.0-AuthenticatedPeerFairness — Added a bounded per-authenticated-node
+//! ceiling behind direct peer-relay v2 signature verification.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -48,12 +50,15 @@
 //!   ceiling before any durable write.
 //!   Rationale: text chat envelopes should never approach 1 MB; if they do,
 //!   it indicates a misconfiguration rather than a legitimate use-case.
-//! - [PEER-RELAY-ADMISSION 2026-08-15 by Codex] The direct peer endpoint has
-//!   no authenticated previous-hop identity in its legacy wire contract.
-//!   `peer_relay_requests_per_minute` is therefore deliberately node-global;
-//!   do not derive a bucket from user/sender/receiver keys because that would
-//!   create privacy-sensitive routing state. Authenticated onion relay keeps
-//!   its separate per-node abuse guard.
+//! - [PEER-RELAY-ADMISSION 2026-08-15 by Codex] The direct peer legacy
+//!   endpoint has no authenticated previous-hop identity. The parser-front
+//!   `peer_relay_requests_per_minute` guard is therefore deliberately global
+//!   across v1/v2; never derive it from user/sender/receiver keys or IPs.
+//! - [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] Direct relay v2 may
+//!   additionally use `peer_relay_authenticated_requests_per_minute` only
+//!   after node-signature verification. This node-id bucket is bounded and is
+//!   not a substitute for the global guard because permissionless identities
+//!   remain Sybil-able.
 //! - `expired_notification_ttl_secs`: after this TTL, undelivered expiry
 //!   notifications are silently discarded. Flutter client local timeout is
 //!   the fallback.
@@ -62,6 +67,8 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.5.0-AuthenticatedPeerFairness — Added configurable post-signature
+//! per-node admission for direct peer-relay v2.
 //! v1.4.0-PeerRelayAdmission — Added configurable parser-front admission for
 //! the legacy direct peer-relay compatibility path.
 //! v1.3.0-MaintenanceBounds — Added signed timestamp boundary validation.
@@ -87,6 +94,13 @@ const MAX_SQLITE_TTL_SECS: u64 = i64::MAX as u64;
 /// that contract, so this coarse ceiling bounds parser/storage pressure without
 /// creating buckets keyed by user-visible envelope metadata.
 pub const DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 1_200;
+
+/// Default per-authenticated-node admission ceiling for direct relay v2.
+///
+/// This fairness limit runs only after Ed25519 node authentication. The global
+/// parser-front limit remains mandatory because permissionless node identities
+/// can be rotated and therefore cannot provide Sybil resistance by themselves.
+pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
 
 // ============================================
 // ChatRelayConfig
@@ -128,6 +142,7 @@ pub const DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 1_200;
 /// dedup_lru_capacity = 10000
 /// expired_notification_ttl_secs = 604800  # 7 days
 /// peer_relay_requests_per_minute = 1200
+/// peer_relay_authenticated_requests_per_minute = 240
 /// ```
 ///
 /// ## Last Modified
@@ -255,12 +270,21 @@ pub struct ChatRelayConfig {
 
     /// Maximum direct peer-relay HTTP requests admitted per minute.
     ///
-    /// This global compatibility guard runs before JSON deserialization. The
-    /// legacy endpoint cannot authenticate a previous-hop node without a wire
-    /// upgrade, so the limiter intentionally does not key on sender, receiver,
-    /// IP address, or other user-adjacent metadata. Default: 1 200.
+    /// This global guard covers direct relay v1/v2 before JSON deserialization.
+    /// Because legacy v1 cannot authenticate a previous-hop node, and because
+    /// permissionless node identities are rotatable, it intentionally does not
+    /// key on node, sender, receiver, IP, or other user-adjacent metadata.
+    /// Default: 1 200.
     #[serde(default = "default_peer_relay_requests_per_minute")]
     pub peer_relay_requests_per_minute: u32,
+
+    /// Maximum direct relay v2 requests admitted per authenticated node/minute.
+    ///
+    /// The bucket is created only after the outer Ed25519 node signature has
+    /// verified. It contains no user, receiver, IP, endpoint, or payload data.
+    /// Default: 240.
+    #[serde(default = "default_authenticated_peer_relay_requests_per_minute")]
+    pub peer_relay_authenticated_requests_per_minute: u32,
 }
 
 // ── Default functions ──
@@ -307,6 +331,9 @@ fn default_expired_notification_ttl() -> u64 {
 fn default_peer_relay_requests_per_minute() -> u32 {
     DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE
 }
+fn default_authenticated_peer_relay_requests_per_minute() -> u32 {
+    DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
+}
 
 impl Default for ChatRelayConfig {
     fn default() -> Self {
@@ -326,6 +353,8 @@ impl Default for ChatRelayConfig {
             dedup_lru_capacity: default_dedup_lru_capacity(),
             expired_notification_ttl_secs: default_expired_notification_ttl(),
             peer_relay_requests_per_minute: default_peer_relay_requests_per_minute(),
+            peer_relay_authenticated_requests_per_minute:
+                default_authenticated_peer_relay_requests_per_minute(),
         }
     }
 }
@@ -475,6 +504,13 @@ impl ChatRelayConfig {
             ));
         }
 
+        if self.peer_relay_authenticated_requests_per_minute == 0 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.peer_relay_authenticated_requests_per_minute",
+                "must be > 0",
+            ));
+        }
+
         Ok(())
     }
 }
@@ -513,6 +549,10 @@ mod tests {
             cr.peer_relay_requests_per_minute,
             DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE
         );
+        assert_eq!(
+            cr.peer_relay_authenticated_requests_per_minute,
+            DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
+        );
     }
 
     #[test]
@@ -534,6 +574,7 @@ mod tests {
             dedup_lru_capacity: 0,
             expired_notification_ttl_secs: 0,
             peer_relay_requests_per_minute: 0,
+            peer_relay_authenticated_requests_per_minute: 0,
         };
         assert!(cr.validate().is_ok());
     }
@@ -722,6 +763,16 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_relay_zero_authenticated_peer_relay_rate_rejected() {
+        let cr = ChatRelayConfig {
+            enabled: true,
+            peer_relay_authenticated_requests_per_minute: 0,
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
+    }
+
+    #[test]
     fn test_chat_relay_toml_parsing() {
         // We can't call `toml::from_str::<ServerConfig>` here (circular dep),
         // but we can test raw TOML → ChatRelayConfig deserialization.
@@ -741,6 +792,7 @@ cleanup_interval_secs = 30
 dedup_lru_capacity = 5000
 expired_notification_ttl_secs = 172800
 peer_relay_requests_per_minute = 2400
+peer_relay_authenticated_requests_per_minute = 480
 "#;
         let cr: ChatRelayConfig = toml::from_str(toml_str).unwrap();
         assert!(cr.enabled);
@@ -758,6 +810,7 @@ peer_relay_requests_per_minute = 2400
         assert_eq!(cr.dedup_lru_capacity, 5_000);
         assert_eq!(cr.expired_notification_ttl_secs, 172_800);
         assert_eq!(cr.peer_relay_requests_per_minute, 2_400);
+        assert_eq!(cr.peer_relay_authenticated_requests_per_minute, 480);
         assert!(cr.validate().is_ok());
     }
 
@@ -766,6 +819,24 @@ peer_relay_requests_per_minute = 2400
         // Missing fields → all defaults applied
         let cr: ChatRelayConfig = toml::from_str("").unwrap();
         assert!(!cr.enabled);
+        assert!(cr.validate().is_ok());
+    }
+
+    #[test]
+    fn test_chat_relay_toml_backward_compat_defaults_authenticated_rate() {
+        // [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] A pre-v1.5
+        // operator file remains valid and receives the conservative default.
+        let cr: ChatRelayConfig = toml::from_str(
+            r#"
+enabled = true
+peer_relay_requests_per_minute = 1200
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cr.peer_relay_authenticated_requests_per_minute,
+            DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
+        );
         assert!(cr.validate().is_ok());
     }
 }

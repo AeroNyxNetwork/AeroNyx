@@ -2929,6 +2929,7 @@ mod tests {
             dedup_lru_capacity: 10,
             expired_notification_ttl_secs: 604_800,
             peer_relay_requests_per_minute: 1_200,
+            peer_relay_authenticated_requests_per_minute: 240,
         }
     }
 

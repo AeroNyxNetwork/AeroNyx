@@ -662,14 +662,21 @@ public_api_listen_addr = "0.0.0.0:8422"
 enabled = true
 db_path = "/var/lib/aeronyx/chat_pending.db"
 peer_relay_requests_per_minute = 1200
+peer_relay_authenticated_requests_per_minute = 240
 ```
 
 <!-- [PEER-RELAY-ADMISSION 2026-08-15 by Codex] -->
-`peer_relay_requests_per_minute` bounds the legacy direct compatibility route
-before JSON parsing. It is intentionally node-global because that wire format
-does not authenticate a previous-hop node; AeroNyx does not create rate-limit
-buckets from user keys, receiver keys, or source IP addresses. Authenticated
-onion relay uses its separate per-node abuse guard.
+`peer_relay_requests_per_minute` bounds both direct relay versions before JSON
+parsing. It is intentionally node-global because v1 cannot authenticate a
+previous hop and permissionless identities can be rotated. AeroNyx does not
+create rate-limit buckets from user keys, receiver keys, source IPs, endpoints,
+or ciphertext metadata.
+
+<!-- [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] -->
+`peer_relay_authenticated_requests_per_minute` adds a bounded fairness ceiling
+for one direct-relay v2 node identity only after its Ed25519 signature verifies.
+It cannot replace the global ceiling and does not imply Sybil resistance,
+operator trust, or permissioned membership.
 
 The recommended path is the guarded node entrypoint helper:
 
