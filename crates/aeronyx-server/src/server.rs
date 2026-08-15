@@ -539,6 +539,9 @@
 //     recovery admits one generation-bound v3 delivery at a time.
 //
 // Last Modified:
+//   [DIRECT-RELAY-HALF-OPEN-CRASH 2026-08-15 by Codex] Extended the
+//     multi-process restart drill through an abruptly interrupted half-open
+//     recovery lease, which must be counted failed and reopened on restart.
 //   [DIRECT-RELAY-CRASH-DRILL 2026-08-15 by Codex] Added a test-only,
 //     multi-process crash/restart drill proving encrypted mailbox custody and
 //     no-downgrade circuit state survive abrupt source-node termination.
@@ -18881,6 +18884,27 @@ mod tests {
             .expect("start restart drill child")
     }
 
+    fn assert_restart_drill_child_crashed(output: &std::process::Output) {
+        assert_eq!(
+            output.status.code(),
+            Some(DIRECT_RELAY_RESTART_DRILL_CRASH_EXIT_CODE),
+            "seed worker missed the intentional crash boundary with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn assert_restart_drill_child_succeeded(stage: &str, output: &std::process::Output) {
+        assert!(
+            output.status.success(),
+            "{stage} worker rejected durable restart invariants with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[tokio::test]
     async fn target_bound_v3_circuit_and_custody_survive_abrupt_process_restart() {
         // [DIRECT-RELAY-CRASH-DRILL 2026-08-15 by Codex] This is deliberately
@@ -18947,11 +18971,7 @@ mod tests {
 
         let crashed =
             run_direct_relay_restart_drill_child("seed_crash", &db_path, None, None).await;
-        assert_eq!(
-            crashed.status.code(),
-            Some(DIRECT_RELAY_RESTART_DRILL_CRASH_EXIT_CODE),
-            "seed worker must terminate through the intentional crash boundary"
-        );
+        assert_restart_drill_child_crashed(&crashed);
 
         let restarted = run_direct_relay_restart_drill_child(
             "verify_restart",
@@ -18960,13 +18980,7 @@ mod tests {
             Some(&v2_endpoint),
         )
         .await;
-        assert!(
-            restarted.status.success(),
-            "fresh worker rejected durable restart invariants with status {:?}\nstdout:\n{}\nstderr:\n{}",
-            restarted.status.code(),
-            String::from_utf8_lossy(&restarted.stdout),
-            String::from_utf8_lossy(&restarted.stderr)
-        );
+        assert_restart_drill_child_succeeded("fresh restart", &restarted);
         assert_eq!(
             v3_calls.load(AtomicOrdering::SeqCst),
             0,
@@ -18984,13 +18998,40 @@ mod tests {
         let _ = v2_node.await;
     }
 
-    fn seed_direct_relay_restart_drill_crash(relay: &ChatRelayService) -> ! {
-        let now = unix_now_secs();
-        relay
-            .store_pending(&signed_test_chat_envelope(now))
-            .expect("persist encrypted custody before crash");
+    #[tokio::test]
+    async fn interrupted_half_open_probe_reopens_after_abrupt_process_restart() {
+        // [DIRECT-RELAY-HALF-OPEN-CRASH 2026-08-15 by Codex] The seed process
+        // uses the production admission API to commit an in-flight lease, then
+        // exits without cancellation or completion. A fresh process must treat
+        // the unknowable network outcome as failed and start a new cooldown.
+        let directory = tempfile::tempdir().expect("half-open crash drill directory");
+        let db_path = directory.path().join("direct-relay-half-open-crash.sqlite3");
+
+        let crashed = run_direct_relay_restart_drill_child(
+            "seed_half_open_crash",
+            &db_path,
+            None,
+            None,
+        )
+        .await;
+        assert_restart_drill_child_crashed(&crashed);
+
+        let restarted = run_direct_relay_restart_drill_child(
+            "verify_interrupted_probe_restart",
+            &db_path,
+            None,
+            None,
+        )
+        .await;
+        assert_restart_drill_child_succeeded("interrupted half-open restart", &restarted);
+    }
+
+    fn open_direct_relay_restart_drill_circuit(
+        relay: &ChatRelayService,
+        first_failure_at: u64,
+    ) {
         for offset in 0..3 {
-            let observed_at = now.saturating_add(offset);
+            let observed_at = first_failure_at.saturating_add(offset);
             let permit = relay
                 .begin_direct_peer_delivery(observed_at)
                 .expect("closed circuit should admit failure seed");
@@ -19003,15 +19044,53 @@ mod tests {
             );
             assert_eq!(allows_more, offset < 2);
         }
+    }
+
+    fn terminate_direct_relay_restart_drill_process() -> ! {
+        // `process::exit` intentionally skips Rust destructors while preserving
+        // committed SQLite transactions. This is a bounded crash injection,
+        // not a graceful service recreation.
+        std::process::exit(DIRECT_RELAY_RESTART_DRILL_CRASH_EXIT_CODE);
+    }
+
+    fn seed_direct_relay_restart_drill_crash(relay: &ChatRelayService) -> ! {
+        let now = unix_now_secs();
+        relay
+            .store_pending(&signed_test_chat_envelope(now))
+            .expect("persist encrypted custody before crash");
+        open_direct_relay_restart_drill_circuit(relay, now.saturating_sub(2));
         let status = relay.peer_status().direct_peer_retry.circuit;
         assert_eq!(status.state, "open");
         assert!(status.restart_protected);
 
         // [DIRECT-RELAY-CRASH-DRILL 2026-08-15 by Codex] `process::exit`
-        // intentionally skips Rust destructors while preserving committed
-        // SQLite transactions. This is a bounded crash injection, not a
-        // graceful service recreation.
-        std::process::exit(DIRECT_RELAY_RESTART_DRILL_CRASH_EXIT_CODE);
+        // crosses a real process boundary after both safety writes commit.
+        terminate_direct_relay_restart_drill_process();
+    }
+
+    fn seed_direct_relay_half_open_crash(relay: &ChatRelayService) -> ! {
+        let now = unix_now_secs();
+        let cooldown = relay
+            .peer_status()
+            .direct_peer_retry
+            .circuit
+            .cooldown_seconds;
+        let first_failure_at = now.saturating_sub(cooldown.saturating_add(2));
+        open_direct_relay_restart_drill_circuit(relay, first_failure_at);
+
+        let permit = relay
+            .begin_direct_peer_delivery(now)
+            .expect("expired cooldown should commit one half-open lease");
+        assert!(permit.is_half_open());
+        let circuit = relay.peer_status().direct_peer_retry.circuit;
+        assert_eq!(circuit.state, "half_open");
+        assert_eq!(circuit.half_open_attempted_total, 1);
+        assert_eq!(circuit.half_open_failed_total, 0);
+        assert!(circuit.restart_protected);
+
+        // [DIRECT-RELAY-HALF-OPEN-CRASH 2026-08-15 by Codex] Deliberately
+        // abandon the durable lease without cancellation or completion.
+        terminate_direct_relay_restart_drill_process();
     }
 
     async fn verify_direct_relay_restart_drill(relay: &ChatRelayService) {
@@ -19099,6 +19178,31 @@ mod tests {
         assert!(!has_more);
     }
 
+    fn verify_interrupted_half_open_restart(relay: &ChatRelayService) {
+        let now = unix_now_secs();
+        let circuit = relay.peer_status().direct_peer_retry.circuit;
+        assert_eq!(circuit.state, "open");
+        assert!(circuit.restart_protected);
+        assert!(circuit.checkpoint_loaded_at.is_some());
+        assert!(circuit.checkpoint_persisted_at.is_some());
+        assert_eq!(circuit.opened_total, 2);
+        assert_eq!(circuit.half_open_attempted_total, 1);
+        assert_eq!(circuit.half_open_succeeded_total, 0);
+        assert_eq!(circuit.half_open_failed_total, 1);
+        let remaining = circuit
+            .open_remaining_seconds
+            .expect("interrupted probe must restart a bounded cooldown");
+        assert!(remaining > 0);
+        assert!(remaining <= circuit.cooldown_seconds);
+
+        let blocked_before = circuit.blocked_total;
+        assert!(relay.begin_direct_peer_delivery(now).is_none());
+        let blocked = relay.peer_status().direct_peer_retry.circuit;
+        assert_eq!(blocked.state, "open");
+        assert_eq!(blocked.blocked_total, blocked_before.saturating_add(1));
+        assert_eq!(blocked.half_open_failed_total, 1);
+    }
+
     #[tokio::test]
     #[ignore = "invoked only as an isolated child of the restart drill"]
     async fn target_bound_v3_restart_drill_subprocess_worker() {
@@ -19114,7 +19218,11 @@ mod tests {
 
         match stage.as_str() {
             "seed_crash" => seed_direct_relay_restart_drill_crash(relay.as_ref()),
+            "seed_half_open_crash" => seed_direct_relay_half_open_crash(relay.as_ref()),
             "verify_restart" => verify_direct_relay_restart_drill(relay.as_ref()).await,
+            "verify_interrupted_probe_restart" => {
+                verify_interrupted_half_open_restart(relay.as_ref());
+            }
             other => panic!("unsupported restart drill stage: {other}"),
         }
     }
