@@ -11,6 +11,8 @@
 //! ## Main Functionality
 //! - `POST /api/chat/peer/relay`: accepts a signed `ChatEnvelope` from another
 //!   AeroNyx node
+//! - `POST /api/chat/peer/relay-v2`: additionally authenticates the immediate
+//!   previous-hop node over the exact encrypted envelope
 //! - `POST /api/chat/peer/blind-relay`: accepts a signed `BlindRelayEnvelope`
 //!   and forwards only opaque encrypted bytes toward `next_hop`
 //! - Verifies the envelope signature before doing any delivery or storage
@@ -59,6 +61,9 @@
 //! - [PREVIOUS-HOP-ATTRIBUTION 2026-08-15 by Codex] Authenticates the claimed
 //!   blind-relay previous hop before touching per-node rate, reputation, or
 //!   quarantine state, preventing forged node-id poisoning
+//! - [DIRECT-RELAY-AUTH-V2 2026-08-15 by Codex] Adds a separately negotiated
+//!   direct-relay endpoint whose node signature binds the complete canonical
+//!   encrypted envelope; the legacy endpoint remains available during rollout
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -83,6 +88,8 @@
 //!    encrypted client transport; `ChatAck` removes it after client persistence
 //! 6. Blind relay requests verify the previous-hop signature, decrement TTL,
 //!    re-sign with this node key, and POST to the verified `next_hop`
+//! 7. Direct-relay v2 requests verify node-key possession before durable relay
+//!    processing; the inner sender signature remains independently mandatory
 //!
 //! ## Important Note for Next Developer
 //! - Never decrypt, inspect, log, store, or report ciphertext contents.
@@ -150,6 +157,10 @@
 //! - Route-specific request ceilings and concurrency gates must wrap the Axum
 //!   handlers. Putting them inside a `Json<T>` handler is too late because an
 //!   attacker can consume memory and parser work before the guard executes.
+//! - Direct-relay v2 authentication is domain-separated and binds the complete
+//!   canonical `ChatEnvelope`. Never weaken it to a bearer header or sign only
+//!   a message id; either would permit ciphertext substitution or replay across
+//!   protocol surfaces.
 //! - Next-hop acknowledgement bodies are untrusted and must use the shared
 //!   bounded decoder. Never call `Response::json()` directly on peer traffic.
 //! - Durable queue count/byte exhaustion is a retryable capacity condition,
@@ -209,6 +220,8 @@
 //!   node bucket or mutate that node's route reputation/quarantine state.
 //!
 //! ## Last Modified
+//! v0.45.0-DirectRelayAuthV2 - Authenticate direct relay previous-hop node
+//! identity through a signed, descriptor-negotiated rolling-upgrade endpoint
 //! v0.44.0-PreviousHopAttribution - Verify blind-relay node identity before
 //! per-node admission and failure scoring to prevent forged-id quarantine
 //! v0.43.0-PeerAckPrivacy - Normalize direct relay success ACKs to durable
@@ -342,6 +355,9 @@ const PEER_CHAT_REQUEST_BODY_MAX_BYTES: usize = 768 * 1024;
 /// blobs plus a signed descriptor. JSON byte arrays can expand to roughly four
 /// characters per byte, so 2 MiB is the narrow safe ceiling for that contract.
 const PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Domain separator for the direct peer-relay v2 node-auth signature.
+const PEER_CHAT_RELAY_AUTH_V2_DOMAIN: &[u8] = b"AeroNyx/peer-chat-relay-auth/v2";
 
 /// Maximum ordinary peer-relay requests allowed in parser/handler execution.
 const MAX_IN_FLIGHT_PEER_CHAT_REQUESTS: usize = 64;
@@ -863,6 +879,88 @@ pub struct PeerChatRelayRequest {
     pub envelope: ChatEnvelope,
 }
 
+/// Authenticated node-to-node encrypted envelope relay request.
+///
+/// The inner `ChatEnvelope` remains sender-signed end-to-end content. This
+/// outer signature proves only which immediate node submitted the opaque
+/// envelope and must never be treated as user identity or content authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerChatRelayRequestV2 {
+    /// End-to-end encrypted, sender-signed chat envelope.
+    pub envelope: ChatEnvelope,
+    /// Ed25519 node id of the immediate previous hop.
+    pub previous_hop_node_id: [u8; 32],
+    /// Previous-hop signature over the domain-separated canonical request.
+    #[serde(with = "peer_relay_signature_serde")]
+    pub previous_hop_signature: [u8; 64],
+}
+
+impl PeerChatRelayRequestV2 {
+    /// Builds a request authenticated by the immediate node identity.
+    pub fn sign(
+        envelope: ChatEnvelope,
+        node_identity: &IdentityKeyPair,
+    ) -> Result<Self, bincode::Error> {
+        let previous_hop_node_id = node_identity.public_key_bytes();
+        let signing_data = peer_chat_relay_auth_v2_signing_data(&previous_hop_node_id, &envelope)?;
+        let previous_hop_signature = node_identity.sign(&signing_data);
+        Ok(Self {
+            envelope,
+            previous_hop_node_id,
+            previous_hop_signature,
+        })
+    }
+
+    /// Verifies node-key possession and exact encrypted-envelope binding.
+    #[must_use]
+    pub fn verify_previous_hop(&self) -> bool {
+        let Ok(public_key) = IdentityPublicKey::from_bytes(&self.previous_hop_node_id) else {
+            return false;
+        };
+        let Ok(signing_data) =
+            peer_chat_relay_auth_v2_signing_data(&self.previous_hop_node_id, &self.envelope)
+        else {
+            return false;
+        };
+        public_key
+            .verify(&signing_data, &self.previous_hop_signature)
+            .is_ok()
+    }
+}
+
+fn peer_chat_relay_auth_v2_signing_data(
+    previous_hop_node_id: &[u8; 32],
+    envelope: &ChatEnvelope,
+) -> Result<Vec<u8>, bincode::Error> {
+    let encoded_envelope = encode_envelope(envelope)?;
+    let mut signing_data =
+        Vec::with_capacity(PEER_CHAT_RELAY_AUTH_V2_DOMAIN.len() + 32 + 8 + encoded_envelope.len());
+    signing_data.extend_from_slice(PEER_CHAT_RELAY_AUTH_V2_DOMAIN);
+    signing_data.extend_from_slice(previous_hop_node_id);
+    signing_data.extend_from_slice(&(encoded_envelope.len() as u64).to_be_bytes());
+    signing_data.extend_from_slice(&encoded_envelope);
+    Ok(signing_data)
+}
+
+/// Serde helper preserving a fixed 64-byte Ed25519 signature representation.
+mod peer_relay_signature_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error> {
+        let lower: [u8; 32] = value[..32].try_into().expect("fixed signature half");
+        let upper: [u8; 32] = value[32..].try_into().expect("fixed signature half");
+        (lower, upper).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 64], D::Error> {
+        let (lower, upper): ([u8; 32], [u8; 32]) = Deserialize::deserialize(deserializer)?;
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(&lower);
+        signature[32..].copy_from_slice(&upper);
+        Ok(signature)
+    }
+}
+
 /// Node-to-node encrypted envelope relay response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerChatRelayResponse {
@@ -1147,6 +1245,7 @@ pub fn build_chat_peer_router(
     };
     let peer_relay_router = Router::new()
         .route("/api/chat/peer/relay", post(peer_relay_handler))
+        .route("/api/chat/peer/relay-v2", post(peer_relay_v2_handler))
         .route_layer(middleware::from_fn_with_state(
             peer_relay_gate,
             peer_relay_request_gate,
@@ -1257,7 +1356,28 @@ async fn peer_relay_handler(
     State(state): State<ChatPeerState>,
     Json(request): Json<PeerChatRelayRequest>,
 ) -> impl IntoResponse {
-    match process_peer_relay(state, request.envelope).await {
+    peer_relay_response(state, request.envelope).await
+}
+
+async fn peer_relay_v2_handler(
+    State(state): State<ChatPeerState>,
+    Json(request): Json<PeerChatRelayRequestV2>,
+) -> impl IntoResponse {
+    // [DIRECT-RELAY-AUTH-V2 2026-08-15 by Codex] Authenticate the immediate
+    // node before the inner envelope reaches durable storage. Invalid claims
+    // affect only aggregate health and cannot poison another node's identity.
+    if !request.verify_previous_hop() {
+        if let Some(relay) = state.chat_relay.as_ref() {
+            relay.record_peer_relay_inbound_rejected(now_secs(), "peer_auth_invalid");
+        }
+        return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
+    }
+
+    peer_relay_response(state, request.envelope).await
+}
+
+async fn peer_relay_response(state: ChatPeerState, envelope: ChatEnvelope) -> Response {
+    match process_peer_relay(state, envelope).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => (
             error.status_code(),
@@ -3554,6 +3674,84 @@ mod tests {
         let status = relay.peer_status();
         assert_eq!(status.inbound_accepted_total, 2);
         assert_eq!(status.inbound_duplicate_total, 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn peer_relay_v2_rejects_tampering_before_durable_storage() {
+        // [DIRECT-RELAY-AUTH-V2 2026-08-15 by Codex] A forged previous-hop
+        // claim must not reach the durable queue, while the exact signed
+        // request remains accepted through the same relay processing path.
+        let (relay, path) = temp_chat_relay("chat-peer-auth-v2");
+        let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
+        let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let previous_hop = IdentityKeyPair::generate();
+        let envelope = signed_envelope();
+        let receiver = envelope.receiver;
+        let request = PeerChatRelayRequestV2::sign(envelope, &previous_hop).unwrap();
+        let mut tampered = request.clone();
+        tampered.envelope.ciphertext[0] ^= 0x01;
+
+        let app = build_chat_peer_router(
+            Some(Arc::clone(&relay)),
+            sessions,
+            udp,
+            Arc::new(PeerStore::new()),
+            Arc::new(IdentityKeyPair::generate()),
+            Arc::new(reqwest::Client::new()),
+            None,
+        );
+        let tampered_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay-v2")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&tampered).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(tampered_response.status(), StatusCode::UNAUTHORIZED);
+        assert!(relay
+            .pull_pending(&receiver, 0, &[0u8; 16], 10)
+            .unwrap()
+            .0
+            .is_empty());
+        let rejected_status = relay.peer_status();
+        assert_eq!(rejected_status.inbound_rejected_total, 1);
+        assert_eq!(
+            rejected_status.last_inbound_failure_reason.as_deref(),
+            Some("peer_auth_invalid")
+        );
+
+        let accepted_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay-v2")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(accepted_response.status(), StatusCode::OK);
+        assert_eq!(
+            relay
+                .pull_pending(&receiver, 0, &[0u8; 16], 10)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        let status = relay.peer_status();
+        assert_eq!(status.inbound_rejected_total, 1);
+        assert_eq!(status.inbound_accepted_total, 1);
 
         let _ = std::fs::remove_file(path);
     }
