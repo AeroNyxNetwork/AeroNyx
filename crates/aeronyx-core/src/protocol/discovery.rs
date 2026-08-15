@@ -159,8 +159,14 @@
 //! - [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Target-signed direct relay
 //!   receipts use a separate feature token, preserving rolling compatibility
 //!   with nodes that authenticate requests but do not yet sign durable ACKs.
+//! - [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Target-bound direct
+//!   relay authentication uses another signed feature token. A sender must not
+//!   infer support from an endpoint response or send one v3 request to multiple
+//!   targets because the selected target identity is part of the signature.
 //!
 //! ## Last Modified
+//! v0.27.0-DirectRelayTargetBindingV3 - Added signed negotiation for direct
+//! relay requests bound to one selected target node identity
 //! v0.26.0-DirectRelayReceiptV2 - Added signed negotiation for target-authored
 //! direct encrypted relay durable-custody receipts
 //! v0.25.0-DirectRelayAuthV2 - Added signed rolling-upgrade negotiation for
@@ -407,15 +413,24 @@ pub enum NodeProtocolFeature {
     /// separate from request authentication so mixed-version v2 fleets can
     /// upgrade the response contract without treating HTTP claims as trust.
     DirectPeerRelayReceiptV2,
+    /// The node accepts direct relay requests whose previous-hop signature is
+    /// bound to the exact selected target node identity.
+    ///
+    /// [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] This prevents one
+    /// valid authenticated request from being replayed across different relay
+    /// nodes. It remains separately negotiated so v1/v2 peers keep working
+    /// during a rolling fleet upgrade.
+    DirectPeerRelayTargetBindingV3,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::BlindRelayFailureReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
         Self::DirectPeerRelayAuthV2,
         Self::DirectPeerRelayReceiptV2,
+        Self::DirectPeerRelayTargetBindingV3,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -426,6 +441,7 @@ impl NodeProtocolFeature {
             Self::PurposeBoundDeliveryReceiptV2 => "anpf1-pbdr2",
             Self::DirectPeerRelayAuthV2 => "anpf1-dpra2",
             Self::DirectPeerRelayReceiptV2 => "anpf1-dprr2",
+            Self::DirectPeerRelayTargetBindingV3 => "anpf1-dprtb3",
         }
     }
 }
@@ -3988,23 +4004,26 @@ mod tests {
         let purpose_receipt = NodeProtocolFeature::PurposeBoundDeliveryReceiptV2;
         let direct_relay_auth = NodeProtocolFeature::DirectPeerRelayAuthV2;
         let direct_relay_receipt = NodeProtocolFeature::DirectPeerRelayReceiptV2;
+        let direct_relay_target_binding = NodeProtocolFeature::DirectPeerRelayTargetBindingV3;
         let descriptor = descriptor_for(&identity).with_protocol_features([
             purpose_receipt,
             failure_receipt,
             direct_relay_auth,
             direct_relay_receipt,
+            direct_relay_target_binding,
             purpose_receipt,
         ]);
 
         assert_eq!(descriptor.schema_version, NODE_DESCRIPTOR_SCHEMA_VERSION);
         assert_eq!(
             descriptor.software_version,
-            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-pbdr2"
+            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-dprtb3.anpf1-pbdr2"
         );
         assert!(descriptor.advertises_protocol_feature(failure_receipt));
         assert!(descriptor.advertises_protocol_feature(purpose_receipt));
         assert!(descriptor.advertises_protocol_feature(direct_relay_auth));
         assert!(descriptor.advertises_protocol_feature(direct_relay_receipt));
+        assert!(descriptor.advertises_protocol_feature(direct_relay_target_binding));
 
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
         let encoded = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {
@@ -4028,6 +4047,9 @@ mod tests {
         assert!(descriptor
             .descriptor
             .advertises_protocol_feature(direct_relay_receipt));
+        assert!(descriptor
+            .descriptor
+            .advertises_protocol_feature(direct_relay_target_binding));
 
         let mut stripped = signed;
         stripped.descriptor.software_version = "test".to_string();

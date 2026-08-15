@@ -13,6 +13,8 @@
 //!   AeroNyx node
 //! - `POST /api/chat/peer/relay-v2`: additionally authenticates the immediate
 //!   previous-hop node over the exact encrypted envelope
+//! - `POST /api/chat/peer/relay-v3`: also binds that signature to the selected
+//!   target node, preventing cross-node replay of an authenticated request
 //! - `POST /api/chat/peer/blind-relay`: accepts a signed `BlindRelayEnvelope`
 //!   and forwards only opaque encrypted bytes toward `next_hop`
 //! - Verifies the envelope signature before doing any delivery or storage
@@ -70,6 +72,9 @@
 //! - [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Signs a privacy-minimal
 //!   receipt after durable direct-relay v2 acceptance so the sender can verify
 //!   the selected target node, exact request, and fresh custody evidence
+//! - [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Negotiates a v3
+//!   request whose previous-hop signature commits to the selected target node,
+//!   while retaining v1/v2 endpoints for rolling fleet compatibility
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -95,7 +100,8 @@
 //! 6. Blind relay requests verify the previous-hop signature, decrement TTL,
 //!    re-sign with this node key, and POST to the verified `next_hop`
 //! 7. Direct-relay v2 requests verify node-key possession before durable relay
-//!    processing; the inner sender signature remains independently mandatory
+//!    processing; v3 additionally rejects requests signed for another target
+//!    node; the inner sender signature remains independently mandatory
 //!
 //! ## Important Note for Next Developer
 //! - Never decrypt, inspect, log, store, or report ciphertext contents.
@@ -233,6 +239,8 @@
 //!   node bucket or mutate that node's route reputation/quarantine state.
 //!
 //! ## Last Modified
+//! v0.48.0-DirectRelayTargetBindingV3 - Bind authenticated direct relay work to
+//! the selected target node without breaking v1/v2 rolling compatibility
 //! v0.47.0-DirectRelayReceiptV2 - Sign exact target-authored durable-custody
 //! evidence for descriptor-negotiated direct relay v2 responses
 //! v0.46.0-AuthenticatedPeerFairness - Add bounded post-signature per-node
@@ -379,9 +387,16 @@ const PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// Domain separator for the direct peer-relay v2 node-auth signature.
 const PEER_CHAT_RELAY_AUTH_V2_DOMAIN: &[u8] = b"AeroNyx/peer-chat-relay-auth/v2";
 
+/// Domain separator for target-bound direct peer-relay v3 authentication.
+const PEER_CHAT_RELAY_AUTH_V3_DOMAIN: &[u8] = b"AeroNyx/peer-chat-relay-auth/v3";
+
 /// Domain separator for exact direct peer-relay request commitments.
 const PEER_CHAT_RELAY_REQUEST_COMMITMENT_V2_DOMAIN: &[u8] =
     b"AeroNyx/peer-chat-relay-request-commitment/v2";
+
+/// Domain separator for exact target-bound direct relay commitments.
+const PEER_CHAT_RELAY_REQUEST_COMMITMENT_V3_DOMAIN: &[u8] =
+    b"AeroNyx/peer-chat-relay-request-commitment/v3";
 
 /// Domain separator for target-authored direct peer-relay receipts.
 const PEER_CHAT_RELAY_RECEIPT_V2_DOMAIN: &[u8] = b"AeroNyx/peer-chat-relay-receipt/v2";
@@ -1060,6 +1075,112 @@ fn peer_chat_relay_auth_v2_signing_data(
     Ok(signing_data)
 }
 
+/// Target-bound authenticated node-to-node encrypted envelope relay request.
+///
+/// [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Unlike v2, the
+/// previous-hop signature includes `target_node_id`. A valid request captured
+/// by one relay therefore cannot be submitted to another relay as fresh work.
+/// The target id is public node-routing metadata; content remains opaque.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerChatRelayRequestV3 {
+    /// End-to-end encrypted, sender-signed chat envelope.
+    pub envelope: ChatEnvelope,
+    /// Ed25519 node id of the immediate previous hop.
+    pub previous_hop_node_id: [u8; 32],
+    /// Ed25519 node id of the one relay authorized to accept this request.
+    pub target_node_id: [u8; 32],
+    /// Previous-hop signature over source, target, and canonical envelope.
+    #[serde(with = "peer_relay_signature_serde")]
+    pub previous_hop_signature: [u8; 64],
+}
+
+impl PeerChatRelayRequestV3 {
+    /// Builds a target-bound request authenticated by the immediate node.
+    pub fn sign(
+        envelope: ChatEnvelope,
+        target_node_id: [u8; 32],
+        node_identity: &IdentityKeyPair,
+    ) -> Result<Self, bincode::Error> {
+        let previous_hop_node_id = node_identity.public_key_bytes();
+        let signing_data = peer_chat_relay_auth_v3_signing_data(
+            &previous_hop_node_id,
+            &target_node_id,
+            &envelope,
+        )?;
+        let previous_hop_signature = node_identity.sign(&signing_data);
+        Ok(Self {
+            envelope,
+            previous_hop_node_id,
+            target_node_id,
+            previous_hop_signature,
+        })
+    }
+
+    /// Verifies previous-hop possession and binding to the local target.
+    #[must_use]
+    pub fn verify_for_target(&self, expected_target_node_id: &[u8; 32]) -> bool {
+        if &self.target_node_id != expected_target_node_id {
+            return false;
+        }
+        let Ok(public_key) = IdentityPublicKey::from_bytes(&self.previous_hop_node_id) else {
+            return false;
+        };
+        let Ok(signing_data) = peer_chat_relay_auth_v3_signing_data(
+            &self.previous_hop_node_id,
+            &self.target_node_id,
+            &self.envelope,
+        ) else {
+            return false;
+        };
+        public_key
+            .verify(&signing_data, &self.previous_hop_signature)
+            .is_ok()
+    }
+
+    /// Returns a commitment to the complete target-bound request.
+    pub fn request_commitment(&self) -> Result<[u8; 32], bincode::Error> {
+        let signing_data = peer_chat_relay_auth_v3_signing_data(
+            &self.previous_hop_node_id,
+            &self.target_node_id,
+            &self.envelope,
+        )?;
+        let mut hasher = Sha256::new();
+        hasher.update(PEER_CHAT_RELAY_REQUEST_COMMITMENT_V3_DOMAIN);
+        hasher.update((signing_data.len() as u64).to_be_bytes());
+        hasher.update(signing_data);
+        hasher.update(self.previous_hop_signature);
+        Ok(hasher.finalize().into())
+    }
+
+    /// Authenticates this exact target and returns the request commitment.
+    #[must_use]
+    pub fn verified_request_commitment_for_target(
+        &self,
+        expected_target_node_id: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        if !self.verify_for_target(expected_target_node_id) {
+            return None;
+        }
+        self.request_commitment().ok()
+    }
+}
+
+fn peer_chat_relay_auth_v3_signing_data(
+    previous_hop_node_id: &[u8; 32],
+    target_node_id: &[u8; 32],
+    envelope: &ChatEnvelope,
+) -> Result<Vec<u8>, bincode::Error> {
+    let encoded_envelope = encode_envelope(envelope)?;
+    let mut signing_data =
+        Vec::with_capacity(PEER_CHAT_RELAY_AUTH_V3_DOMAIN.len() + 64 + 8 + encoded_envelope.len());
+    signing_data.extend_from_slice(PEER_CHAT_RELAY_AUTH_V3_DOMAIN);
+    signing_data.extend_from_slice(previous_hop_node_id);
+    signing_data.extend_from_slice(target_node_id);
+    signing_data.extend_from_slice(&(encoded_envelope.len() as u64).to_be_bytes());
+    signing_data.extend_from_slice(&encoded_envelope);
+    Ok(signing_data)
+}
+
 /// Serde helper preserving a fixed 64-byte Ed25519 signature representation.
 mod peer_relay_signature_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1092,12 +1213,12 @@ pub struct PeerChatRelayResponse {
     pub stored_pending: bool,
 }
 
-/// Target-signed proof of direct relay v2 durable ciphertext acceptance.
+/// Target-signed proof of authenticated direct relay ciphertext acceptance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerChatRelayReceiptV2 {
     /// Receipt contract version.
     pub version: u8,
-    /// SHA-256 commitment to the exact authenticated v2 request.
+    /// SHA-256 commitment to the exact domain-separated authenticated request.
     pub request_commitment: [u8; 32],
     /// Ed25519 identity of the node that accepted durable custody.
     pub accepting_node_id: [u8; 32],
@@ -1134,6 +1255,24 @@ impl PeerChatRelayReceiptV2 {
         expected_node_id: &[u8; 32],
         observed_at: u64,
     ) -> Result<(), &'static str> {
+        let request_commitment = request
+            .request_commitment()
+            .map_err(|_| "receipt_binding_invalid")?;
+        self.verify_expected_commitment(&request_commitment, expected_node_id, observed_at)
+    }
+
+    /// Verifies this receipt against an independently computed request digest.
+    ///
+    /// [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Receipt v2 is a
+    /// generic custody statement over a domain-separated request commitment.
+    /// Accepting the commitment directly lets v3 retain the audited receipt
+    /// format without pretending its request bytes follow the v2 contract.
+    pub fn verify_expected_commitment(
+        &self,
+        expected_request_commitment: &[u8; 32],
+        expected_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<(), &'static str> {
         if self.version != PEER_CHAT_RELAY_RECEIPT_V2_VERSION {
             return Err("receipt_version_invalid");
         }
@@ -1145,7 +1284,7 @@ impl PeerChatRelayReceiptV2 {
         public_key
             .verify(&self.signing_data(), &self.signature)
             .map_err(|_| "receipt_signature_invalid")?;
-        if request.request_commitment().ok() != Some(self.request_commitment) {
+        if &self.request_commitment != expected_request_commitment {
             return Err("receipt_binding_invalid");
         }
         if self.accepted_at
@@ -1171,8 +1310,9 @@ impl PeerChatRelayReceiptV2 {
     }
 }
 
-/// Direct relay v2 response. Flattening preserves the legacy JSON fields so a
-/// request-auth-only v2 sender can ignore the independently negotiated receipt.
+/// Authenticated direct relay response. Flattening preserves the legacy JSON
+/// fields so request-auth-only v2/v3 senders can ignore the independently
+/// negotiated receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerChatRelayResponseV2 {
     /// Privacy-normalized direct relay acceptance fields.
@@ -1460,6 +1600,7 @@ pub fn build_chat_peer_router(
     let peer_relay_router = Router::new()
         .route("/api/chat/peer/relay", post(peer_relay_handler))
         .route("/api/chat/peer/relay-v2", post(peer_relay_v2_handler))
+        .route("/api/chat/peer/relay-v3", post(peer_relay_v3_handler))
         .route_layer(middleware::from_fn_with_state(
             peer_relay_gate,
             peer_relay_request_gate,
@@ -1592,13 +1733,69 @@ async fn peer_relay_v2_handler(
         return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
     };
 
-    if !gate.admit_authenticated(request.previous_hop_node_id, Instant::now()) {
+    authenticated_peer_relay_response(
+        state,
+        gate,
+        request.envelope,
+        request.previous_hop_node_id,
+        request_commitment,
+    )
+    .await
+}
+
+async fn peer_relay_v3_handler(
+    State(state): State<ChatPeerState>,
+    Extension(gate): Extension<Arc<PeerRelayRequestGate>>,
+    Json(request): Json<PeerChatRelayRequestV3>,
+) -> impl IntoResponse {
+    // [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Reject a request
+    // signed for another node before durable storage or authenticated quota
+    // attribution. Node ids are already public discovery metadata, so this
+    // branch does not expose client identity, receiver state, or content.
+    let local_node_id = state.node_identity.public_key_bytes();
+    if request.target_node_id != local_node_id {
+        if let Some(relay) = state.chat_relay.as_ref() {
+            relay.record_peer_relay_inbound_rejected(now_secs(), "peer_target_mismatch");
+        }
+        return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
+    }
+    let Some(request_commitment) = request.verified_request_commitment_for_target(&local_node_id)
+    else {
+        if let Some(relay) = state.chat_relay.as_ref() {
+            relay.record_peer_relay_inbound_rejected(now_secs(), "peer_auth_invalid");
+        }
+        return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
+    };
+
+    authenticated_peer_relay_response(
+        state,
+        gate,
+        request.envelope,
+        request.previous_hop_node_id,
+        request_commitment,
+    )
+    .await
+}
+
+/// Applies post-authentication fairness and emits one common custody response.
+///
+/// [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] v2 and v3 share the
+/// exact durable-storage and signed-receipt boundary. Version-specific code is
+/// limited to request authentication, avoiding divergent custody semantics.
+async fn authenticated_peer_relay_response(
+    state: ChatPeerState,
+    gate: Arc<PeerRelayRequestGate>,
+    envelope: ChatEnvelope,
+    previous_hop_node_id: [u8; 32],
+    request_commitment: [u8; 32],
+) -> Response {
+    if !gate.admit_authenticated(previous_hop_node_id, Instant::now()) {
         gate.record_rejected("peer_auth_rate_limited");
         return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
     }
 
     let node_identity = Arc::clone(&state.node_identity);
-    match process_peer_relay(state, request.envelope).await {
+    match process_peer_relay(state, envelope).await {
         Ok(relay) => {
             // [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Sign only after
             // `process_peer_relay` has established durable custody. The
@@ -4143,6 +4340,101 @@ mod tests {
             status.last_inbound_failure_reason.as_deref(),
             Some("peer_auth_rate_limited")
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn peer_relay_v3_rejects_request_signed_for_another_target() {
+        // [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] A request that
+        // is fully valid for target A must not become authenticated work for
+        // target B. The rejected attempt also must not consume B's per-node
+        // authenticated quota or reach its durable pending store.
+        let (relay, path) = temp_chat_relay_with_rates(
+            "chat-peer-target-binding-v3",
+            DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE,
+            1,
+        );
+        let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
+        let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let previous_hop = IdentityKeyPair::generate();
+        let target_identity = Arc::new(IdentityKeyPair::generate());
+        let target_node_id = target_identity.public_key_bytes();
+        let other_target_node_id = IdentityKeyPair::generate().public_key_bytes();
+        let envelope = signed_envelope();
+        let receiver = envelope.receiver;
+        let wrong_target_request =
+            PeerChatRelayRequestV3::sign(envelope.clone(), other_target_node_id, &previous_hop)
+                .unwrap();
+        assert!(wrong_target_request.verify_for_target(&other_target_node_id));
+
+        let app = build_chat_peer_router(
+            Some(Arc::clone(&relay)),
+            sessions,
+            udp,
+            Arc::new(PeerStore::new()),
+            Arc::clone(&target_identity),
+            Arc::new(reqwest::Client::new()),
+            None,
+        );
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay-v3")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&wrong_target_request).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert!(relay
+            .pull_pending(&receiver, 0, &[0u8; 16], 10)
+            .unwrap()
+            .0
+            .is_empty());
+
+        let accepted_request =
+            PeerChatRelayRequestV3::sign(envelope, target_node_id, &previous_hop).unwrap();
+        let expected_commitment = accepted_request.request_commitment().unwrap();
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay-v3")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&accepted_request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted: PeerChatRelayResponseV2 = serde_json::from_slice(
+            &to_bytes(accepted.into_body(), PEER_ACK_RESPONSE_MAX_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        accepted
+            .receipt
+            .expect("target-bound durable acceptance should be signed")
+            .verify_expected_commitment(&expected_commitment, &target_node_id, now_secs())
+            .expect("receipt should bind the exact v3 request to the target");
+        assert_eq!(
+            relay
+                .pull_pending(&receiver, 0, &[0u8; 16], 10)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
+        let status = relay.peer_status();
+        assert_eq!(status.inbound_rejected_total, 1);
+        assert_eq!(status.inbound_accepted_total, 1);
 
         let _ = std::fs::remove_file(path);
     }
