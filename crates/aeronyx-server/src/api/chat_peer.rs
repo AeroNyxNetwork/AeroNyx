@@ -75,6 +75,9 @@
 //! - [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Negotiates a v3
 //!   request whose previous-hop signature commits to the selected target node,
 //!   while retaining v1/v2 endpoints for rolling fleet compatibility
+//! - [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Retains a bounded,
+//!   short-lived exact custody ACK by opaque request commitment so an ACK-loss
+//!   retry cannot consume quota or repeat durable/live delivery
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -237,8 +240,15 @@
 //!   previous-hop key has no attribution authority. Invalid keys/signatures may
 //!   increment aggregate rejection telemetry only; they must never consume a
 //!   node bucket or mutate that node's route reputation/quarantine state.
+//! - [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] The ACK replay cache
+//!   stores only request commitments and signed ACKs. Keep its entries and
+//!   generation queue independently bounded; stale owners must never mutate a
+//!   newer generation, and retries must bypass authenticated quota only after
+//!   exact request authentication succeeds.
 //!
 //! ## Last Modified
+//! v0.49.0-DirectRelayIdempotentRetry - Return exact bounded custody ACKs for
+//! authenticated same-request retries without repeating relay side effects
 //! v0.48.0-DirectRelayTargetBindingV3 - Bind authenticated direct relay work to
 //! the selected target node without breaking v1/v2 rolling compatibility
 //! v0.47.0-DirectRelayReceiptV2 - Sign exact target-authored durable-custody
@@ -416,6 +426,19 @@ const MAX_IN_FLIGHT_PEER_CHAT_REQUESTS: usize = 64;
 /// Maximum authenticated direct-relay node buckets retained in memory.
 const MAX_AUTHENTICATED_PEER_RELAY_BUCKETS: usize = 4096;
 
+/// Maximum exact authenticated requests retained for safe ACK replay.
+const MAX_AUTHENTICATED_PEER_RELAY_REPLAYS: usize = 4096;
+
+/// Maximum live and stale generations retained by the ACK replay queue.
+const MAX_AUTHENTICATED_PEER_RELAY_REPLAY_GENERATIONS: usize =
+    MAX_AUTHENTICATED_PEER_RELAY_REPLAYS * 2;
+
+/// Completed ACKs expire before their signed receipt freshness horizon.
+const AUTHENTICATED_PEER_RELAY_REPLAY_TTL: Duration = Duration::from_secs(90);
+
+/// HTTP 425 remains unavailable as a named constant in the pinned http crate.
+const HTTP_TOO_EARLY_STATUS_CODE: u16 = 425;
+
 /// Maximum concurrent blind relay requests handled by this process.
 ///
 /// Blind relay is intentionally opaque and can carry large encrypted blobs, so
@@ -512,6 +535,7 @@ struct PeerRelayRequestGate {
     requests_per_minute: u32,
     authenticated_rate_limit: Arc<Mutex<AuthenticatedPeerRelayRateLimiter>>,
     authenticated_requests_per_minute: u32,
+    authenticated_replays: Arc<Mutex<AuthenticatedPeerRelayReplayCache>>,
     chat_relay: Option<Arc<ChatRelayService>>,
 }
 
@@ -529,6 +553,9 @@ impl PeerRelayRequestGate {
                 AuthenticatedPeerRelayRateLimiter::default(),
             )),
             authenticated_requests_per_minute,
+            authenticated_replays: Arc::new(Mutex::new(
+                AuthenticatedPeerRelayReplayCache::default(),
+            )),
             chat_relay,
         }
     }
@@ -551,6 +578,247 @@ impl PeerRelayRequestGate {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .allow(node_id, now, self.authenticated_requests_per_minute)
+    }
+
+    fn begin_authenticated_replay(
+        &self,
+        request_commitment: [u8; 32],
+        now: Instant,
+    ) -> AuthenticatedPeerRelayReplayStart {
+        let mut cache = self
+            .authenticated_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match cache.begin(request_commitment, now) {
+            AuthenticatedPeerRelayReplayDecision::New(generation) => {
+                AuthenticatedPeerRelayReplayStart::Acquired(AuthenticatedPeerRelayReplayLease::new(
+                    Arc::clone(&self.authenticated_replays),
+                    request_commitment,
+                    generation,
+                ))
+            }
+            AuthenticatedPeerRelayReplayDecision::InFlight => {
+                AuthenticatedPeerRelayReplayStart::InFlight
+            }
+            AuthenticatedPeerRelayReplayDecision::Completed(response) => {
+                AuthenticatedPeerRelayReplayStart::Completed(response)
+            }
+            AuthenticatedPeerRelayReplayDecision::Saturated => {
+                AuthenticatedPeerRelayReplayStart::Saturated
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthenticatedPeerRelayReplayState {
+    InFlight,
+    Completed(PeerChatRelayResponseV2),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedPeerRelayReplayEntry {
+    observed_at: Instant,
+    generation: u64,
+    state: AuthenticatedPeerRelayReplayState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthenticatedPeerRelayReplayDecision {
+    New(u64),
+    InFlight,
+    Completed(PeerChatRelayResponseV2),
+    Saturated,
+}
+
+enum AuthenticatedPeerRelayReplayStart {
+    Acquired(AuthenticatedPeerRelayReplayLease),
+    InFlight,
+    Completed(PeerChatRelayResponseV2),
+    Saturated,
+}
+
+/// Owns one authenticated request until its exact ACK is published.
+///
+/// [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Cancellation or an
+/// error removes the in-flight marker through `Drop`; durable success consumes
+/// the lease and publishes the exact signed ACK for bounded replay. The cache
+/// key is only a SHA-256 request commitment and carries no receiver or content.
+struct AuthenticatedPeerRelayReplayLease {
+    cache: Arc<Mutex<AuthenticatedPeerRelayReplayCache>>,
+    request_commitment: [u8; 32],
+    generation: u64,
+    active: bool,
+}
+
+impl AuthenticatedPeerRelayReplayLease {
+    fn new(
+        cache: Arc<Mutex<AuthenticatedPeerRelayReplayCache>>,
+        request_commitment: [u8; 32],
+        generation: u64,
+    ) -> Self {
+        Self {
+            cache,
+            request_commitment,
+            generation,
+            active: true,
+        }
+    }
+
+    fn complete(mut self, response: PeerChatRelayResponseV2) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .complete(&self.request_commitment, self.generation, response);
+        self.active = false;
+    }
+}
+
+impl Drop for AuthenticatedPeerRelayReplayLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .forget(&self.request_commitment, self.generation);
+    }
+}
+
+#[derive(Default)]
+struct AuthenticatedPeerRelayReplayCache {
+    entries: HashMap<[u8; 32], AuthenticatedPeerRelayReplayEntry>,
+    order: VecDeque<([u8; 32], u64)>,
+    next_generation: u64,
+}
+
+impl AuthenticatedPeerRelayReplayCache {
+    fn begin(
+        &mut self,
+        request_commitment: [u8; 32],
+        now: Instant,
+    ) -> AuthenticatedPeerRelayReplayDecision {
+        self.evict_expired(now);
+        if let Some(entry) = self.entries.get(&request_commitment) {
+            return match &entry.state {
+                AuthenticatedPeerRelayReplayState::InFlight => {
+                    AuthenticatedPeerRelayReplayDecision::InFlight
+                }
+                AuthenticatedPeerRelayReplayState::Completed(response) => {
+                    AuthenticatedPeerRelayReplayDecision::Completed(response.clone())
+                }
+            };
+        }
+
+        let generation = self.allocate_generation();
+        self.entries.insert(
+            request_commitment,
+            AuthenticatedPeerRelayReplayEntry {
+                observed_at: now,
+                generation,
+                state: AuthenticatedPeerRelayReplayState::InFlight,
+            },
+        );
+        self.order.push_back((request_commitment, generation));
+        let retained = self.evict_over_capacity(request_commitment, generation);
+        self.compact_stale_generations();
+        if retained {
+            AuthenticatedPeerRelayReplayDecision::New(generation)
+        } else {
+            AuthenticatedPeerRelayReplayDecision::Saturated
+        }
+    }
+
+    fn complete(
+        &mut self,
+        request_commitment: &[u8; 32],
+        generation: u64,
+        response: PeerChatRelayResponseV2,
+    ) {
+        if let Some(entry) = self.entries.get_mut(request_commitment) {
+            if entry.generation == generation {
+                entry.state = AuthenticatedPeerRelayReplayState::Completed(response);
+            }
+        }
+    }
+
+    fn forget(&mut self, request_commitment: &[u8; 32], generation: u64) {
+        if self
+            .entries
+            .get(request_commitment)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            self.entries.remove(request_commitment);
+        }
+    }
+
+    fn evict_expired(&mut self, now: Instant) {
+        while let Some((request_commitment, generation)) = self.order.front().copied() {
+            let Some(entry) = self.entries.get(&request_commitment) else {
+                self.order.pop_front();
+                continue;
+            };
+            if entry.generation != generation {
+                self.order.pop_front();
+                continue;
+            }
+            if now.saturating_duration_since(entry.observed_at)
+                <= AUTHENTICATED_PEER_RELAY_REPLAY_TTL
+            {
+                break;
+            }
+            self.order.pop_front();
+            self.entries.remove(&request_commitment);
+        }
+    }
+
+    fn evict_over_capacity(
+        &mut self,
+        new_request_commitment: [u8; 32],
+        new_generation: u64,
+    ) -> bool {
+        while self.entries.len() > MAX_AUTHENTICATED_PEER_RELAY_REPLAYS {
+            // [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Preserve
+            // insertion order while looking past in-flight owners. Rotating
+            // those owners to the tail would break the chronological invariant
+            // used by `evict_expired` and could leave old work pinned forever.
+            let completed_position = self.order.iter().position(|(commitment, generation)| {
+                self.entries.get(commitment).is_some_and(|entry| {
+                    entry.generation == *generation
+                        && matches!(entry.state, AuthenticatedPeerRelayReplayState::Completed(_))
+                })
+            });
+            let Some(completed_position) = completed_position else {
+                self.forget(&new_request_commitment, new_generation);
+                return false;
+            };
+            let Some((commitment, generation)) = self.order.remove(completed_position) else {
+                self.forget(&new_request_commitment, new_generation);
+                return false;
+            };
+            self.forget(&commitment, generation);
+        }
+        true
+    }
+
+    fn compact_stale_generations(&mut self) {
+        if self.order.len() <= MAX_AUTHENTICATED_PEER_RELAY_REPLAY_GENERATIONS {
+            return;
+        }
+        self.order.retain(|(commitment, generation)| {
+            self.entries
+                .get(commitment)
+                .is_some_and(|entry| entry.generation == *generation)
+        });
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        if self.next_generation == 0 {
+            self.next_generation = 1;
+        }
+        self.next_generation
     }
 }
 
@@ -1789,6 +2057,29 @@ async fn authenticated_peer_relay_response(
     previous_hop_node_id: [u8; 32],
     request_commitment: [u8; 32],
 ) -> Response {
+    let replay_lease = match gate.begin_authenticated_replay(request_commitment, Instant::now()) {
+        AuthenticatedPeerRelayReplayStart::Acquired(lease) => lease,
+        AuthenticatedPeerRelayReplayStart::Completed(response) => {
+            // [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Return the
+            // exact ACK produced after durable custody. This path neither
+            // consumes per-node quota nor repeats storage/live delivery.
+            if let Some(relay) = state.chat_relay.as_ref() {
+                relay.record_peer_relay_inbound_accepted(now_secs(), true, 0, false);
+            }
+            return (StatusCode::OK, Json(response)).into_response();
+        }
+        AuthenticatedPeerRelayReplayStart::InFlight => {
+            gate.record_rejected("peer_auth_retry_in_flight");
+            let status =
+                StatusCode::from_u16(HTTP_TOO_EARLY_STATUS_CODE).unwrap_or(StatusCode::CONFLICT);
+            return rejected_peer_relay_response(status);
+        }
+        AuthenticatedPeerRelayReplayStart::Saturated => {
+            gate.record_rejected("peer_auth_retry_cache_saturated");
+            return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
+        }
+    };
+
     if !gate.admit_authenticated(previous_hop_node_id, Instant::now()) {
         gate.record_rejected("peer_auth_rate_limited");
         return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
@@ -1805,14 +2096,12 @@ async fn authenticated_peer_relay_response(
                 now_secs(),
                 node_identity.as_ref(),
             );
-            (
-                StatusCode::OK,
-                Json(PeerChatRelayResponseV2 {
-                    relay,
-                    receipt: Some(receipt),
-                }),
-            )
-                .into_response()
+            let response = PeerChatRelayResponseV2 {
+                relay,
+                receipt: Some(receipt),
+            };
+            replay_lease.complete(response.clone());
+            (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => (
             error.status_code(),
@@ -4307,6 +4596,7 @@ mod tests {
         assert_eq!(accepted_response.relay, durable_peer_acceptance_response());
         accepted_response
             .receipt
+            .as_ref()
             .expect("authenticated direct relay should return signed custody evidence")
             .verify_expected(&request, &target_node_id, now_secs())
             .expect("receipt should bind the exact request to the target node");
@@ -4318,7 +4608,7 @@ mod tests {
                 .len(),
             1
         );
-        let rate_limited_response = app
+        let replayed_response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4329,17 +4619,18 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            rate_limited_response.status(),
-            StatusCode::TOO_MANY_REQUESTS
-        );
+        assert_eq!(replayed_response.status(), StatusCode::OK);
+        let replayed_response: PeerChatRelayResponseV2 = serde_json::from_slice(
+            &to_bytes(replayed_response.into_body(), PEER_ACK_RESPONSE_MAX_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replayed_response, accepted_response);
         let status = relay.peer_status();
-        assert_eq!(status.inbound_rejected_total, 2);
-        assert_eq!(status.inbound_accepted_total, 1);
-        assert_eq!(
-            status.last_inbound_failure_reason.as_deref(),
-            Some("peer_auth_rate_limited")
-        );
+        assert_eq!(status.inbound_rejected_total, 1);
+        assert_eq!(status.inbound_accepted_total, 2);
+        assert_eq!(status.inbound_duplicate_total, 1);
 
         let _ = std::fs::remove_file(path);
     }
@@ -4402,6 +4693,7 @@ mod tests {
             PeerChatRelayRequestV3::sign(envelope, target_node_id, &previous_hop).unwrap();
         let expected_commitment = accepted_request.request_commitment().unwrap();
         let accepted = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4421,6 +4713,7 @@ mod tests {
         .unwrap();
         accepted
             .receipt
+            .as_ref()
             .expect("target-bound durable acceptance should be signed")
             .verify_expected_commitment(&expected_commitment, &target_node_id, now_secs())
             .expect("receipt should bind the exact v3 request to the target");
@@ -4432,11 +4725,182 @@ mod tests {
                 .len(),
             1
         );
+
+        // [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Simulate an
+        // ACK lost after durable custody. The byte-identical retry bypasses
+        // the already-consumed per-node quota and returns the exact signed ACK
+        // without inserting or delivering the encrypted envelope twice.
+        let replayed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/relay-v3")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&accepted_request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed.status(), StatusCode::OK);
+        let replayed: PeerChatRelayResponseV2 = serde_json::from_slice(
+            &to_bytes(replayed.into_body(), PEER_ACK_RESPONSE_MAX_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replayed, accepted);
+        assert_eq!(
+            relay
+                .pull_pending(&receiver, 0, &[0u8; 16], 10)
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
         let status = relay.peer_status();
         assert_eq!(status.inbound_rejected_total, 1);
-        assert_eq!(status.inbound_accepted_total, 1);
+        assert_eq!(status.inbound_accepted_total, 2);
+        assert_eq!(status.inbound_duplicate_total, 1);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn authenticated_peer_replay_cache_returns_exact_completed_ack() {
+        let now = Instant::now();
+        let commitment = [0x41; 32];
+        let response = PeerChatRelayResponseV2 {
+            relay: durable_peer_acceptance_response(),
+            receipt: None,
+        };
+        let mut cache = AuthenticatedPeerRelayReplayCache::default();
+
+        let generation = match cache.begin(commitment, now) {
+            AuthenticatedPeerRelayReplayDecision::New(generation) => generation,
+            decision => panic!("unexpected first replay decision: {decision:?}"),
+        };
+        assert_eq!(
+            cache.begin(commitment, now),
+            AuthenticatedPeerRelayReplayDecision::InFlight
+        );
+        cache.complete(&commitment, generation, response.clone());
+        assert_eq!(
+            cache.begin(commitment, now),
+            AuthenticatedPeerRelayReplayDecision::Completed(response)
+        );
+    }
+
+    #[test]
+    fn authenticated_peer_replay_generation_isolation_survives_stale_owner() {
+        // [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] A cancelled or
+        // expired owner must never delete or complete a newer request generation
+        // for the same opaque commitment.
+        let now = Instant::now();
+        let commitment = [0x42; 32];
+        let response = PeerChatRelayResponseV2 {
+            relay: durable_peer_acceptance_response(),
+            receipt: None,
+        };
+        let mut cache = AuthenticatedPeerRelayReplayCache::default();
+        let first_generation = match cache.begin(commitment, now) {
+            AuthenticatedPeerRelayReplayDecision::New(generation) => generation,
+            decision => panic!("unexpected first replay decision: {decision:?}"),
+        };
+        cache.forget(&commitment, first_generation);
+        let second_generation = match cache.begin(commitment, now) {
+            AuthenticatedPeerRelayReplayDecision::New(generation) => generation,
+            decision => panic!("unexpected second replay decision: {decision:?}"),
+        };
+        assert_ne!(first_generation, second_generation);
+
+        cache.complete(&commitment, first_generation, response);
+        cache.forget(&commitment, first_generation);
+        assert_eq!(
+            cache.begin(commitment, now),
+            AuthenticatedPeerRelayReplayDecision::InFlight
+        );
+    }
+
+    #[test]
+    fn authenticated_peer_replay_cache_expires_and_bounds_stale_generations() {
+        let now = Instant::now();
+        let commitment = [0x43; 32];
+        let mut cache = AuthenticatedPeerRelayReplayCache::default();
+        let first_generation = match cache.begin(commitment, now) {
+            AuthenticatedPeerRelayReplayDecision::New(generation) => generation,
+            decision => panic!("unexpected first replay decision: {decision:?}"),
+        };
+        cache.complete(
+            &commitment,
+            first_generation,
+            PeerChatRelayResponseV2 {
+                relay: durable_peer_acceptance_response(),
+                receipt: None,
+            },
+        );
+        assert!(matches!(
+            cache.begin(
+                commitment,
+                now + AUTHENTICATED_PEER_RELAY_REPLAY_TTL + Duration::from_millis(1)
+            ),
+            AuthenticatedPeerRelayReplayDecision::New(_)
+        ));
+
+        for _ in 0..=MAX_AUTHENTICATED_PEER_RELAY_REPLAY_GENERATIONS {
+            let generation = cache.allocate_generation();
+            cache.order.push_back((commitment, generation));
+        }
+        cache.compact_stale_generations();
+        assert!(cache.order.len() <= MAX_AUTHENTICATED_PEER_RELAY_REPLAY_GENERATIONS);
+    }
+
+    #[test]
+    fn authenticated_peer_replay_capacity_preserves_expiry_order() {
+        let now = Instant::now();
+        let response = PeerChatRelayResponseV2 {
+            relay: durable_peer_acceptance_response(),
+            receipt: None,
+        };
+        let mut cache = AuthenticatedPeerRelayReplayCache::default();
+        for index in 0..MAX_AUTHENTICATED_PEER_RELAY_REPLAYS {
+            let mut commitment = [0u8; 32];
+            commitment[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let generation = (index as u64).saturating_add(1);
+            let state = if index == 0 {
+                AuthenticatedPeerRelayReplayState::InFlight
+            } else {
+                AuthenticatedPeerRelayReplayState::Completed(response.clone())
+            };
+            cache.entries.insert(
+                commitment,
+                AuthenticatedPeerRelayReplayEntry {
+                    observed_at: now,
+                    generation,
+                    state,
+                },
+            );
+            cache.order.push_back((commitment, generation));
+        }
+
+        let oldest_in_flight = cache.order.front().copied().unwrap();
+        let evicted_completed = cache.order.get(1).copied().unwrap();
+        let new_commitment = [0xFF; 32];
+        let new_generation = u64::MAX;
+        cache.entries.insert(
+            new_commitment,
+            AuthenticatedPeerRelayReplayEntry {
+                observed_at: now,
+                generation: new_generation,
+                state: AuthenticatedPeerRelayReplayState::InFlight,
+            },
+        );
+        cache.order.push_back((new_commitment, new_generation));
+
+        assert!(cache.evict_over_capacity(new_commitment, new_generation));
+        assert_eq!(cache.order.front().copied(), Some(oldest_in_flight));
+        assert!(!cache.entries.contains_key(&evicted_completed.0));
+        assert!(cache.entries.contains_key(&oldest_in_flight.0));
+        assert!(cache.entries.contains_key(&new_commitment));
     }
 
     #[test]

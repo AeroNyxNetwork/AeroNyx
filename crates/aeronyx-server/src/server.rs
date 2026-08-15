@@ -361,6 +361,9 @@
 // 136. [CHAT-SESSION-SENDER-BINDING 2026-08-15 by Codex] Requires every
 //      client-tunnel ChatEnvelope sender to match the authenticated VPN
 //      session identity before dedupe, route announcement, or peer relay.
+// 137. [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Retries one exact
+//      target-bound v3 request after transport ambiguity or HTTP 425, relying
+//      on the target's bounded commitment-keyed custody ACK cache.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -517,8 +520,13 @@
 //     request separately for every selected peer because target identity is
 //     part of its authorization. Never reuse one target-bound request across
 //     fanout peers or infer v3 support from an HTTP response.
+//   - [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Retry only the exact
+//     signed v3 request and only once. v1/v2 do not advertise target-bound
+//     replay semantics, so they must retain their historical single attempt.
 //
 // Last Modified:
+//   [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Added one safe exact
+//     v3 retry for transport ambiguity and in-flight custody publication.
 //   [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Added signed target
 //     binding and descriptor-negotiated v3 direct relay transport.
 //   [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Added target-signed direct
@@ -924,6 +932,12 @@ const DATA_PLANE_RECV_RETRY_MAX_MILLIS: u64 = 1_000;
 /// Consecutive receive failures that make the data plane process-unhealthy.
 const DATA_PLANE_RECV_FAILURE_LIMIT: u32 = 8;
 const CHAT_PEER_RELAY_FANOUT_LIMIT: usize = 3;
+/// Target-bound direct relay permits one exact retry after transport ambiguity.
+const DIRECT_PEER_RELAY_V3_MAX_ATTEMPTS: usize = 2;
+/// Small delay gives an in-flight first attempt time to publish its custody ACK.
+const DIRECT_PEER_RELAY_V3_RETRY_DELAY_MILLIS: u64 = 50;
+/// Numeric form keeps compatibility with the workspace's pinned http crate.
+const HTTP_TOO_EARLY_STATUS_CODE: u16 = 425;
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
 const TWO_HOP_PROBE_REQUEST_LIMIT: usize = 8;
 const THREE_HOP_PROBE_REQUEST_LIMIT: usize = 4;
@@ -10969,6 +10983,37 @@ impl Server {
         }
     }
 
+    /// Sends one target-bound request with one byte-identical ambiguity retry.
+    ///
+    /// [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] v3 binds the exact
+    /// request to one target and that target retains the signed custody ACK by
+    /// opaque request commitment. Retrying is therefore safe only for this
+    /// negotiated surface, and only after a transport error or HTTP 425 while
+    /// the first owner is still publishing its durable result.
+    async fn send_target_bound_peer_relay(
+        client: &reqwest::Client,
+        url: &str,
+        request: &PeerChatRelayRequestV3,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        let mut attempt = 1usize;
+        loop {
+            let response = client.post(url).json(request).send().await;
+            let retryable = match &response {
+                Ok(response) => response.status().as_u16() == HTTP_TOO_EARLY_STATUS_CODE,
+                Err(_) => true,
+            };
+            if !retryable || attempt >= DIRECT_PEER_RELAY_V3_MAX_ATTEMPTS {
+                return response;
+            }
+
+            attempt = attempt.saturating_add(1);
+            tokio::time::sleep(Duration::from_millis(
+                DIRECT_PEER_RELAY_V3_RETRY_DELAY_MILLIS,
+            ))
+            .await;
+        }
+    }
+
     async fn relay_chat_envelope_to_discovered_peers(
         client: Option<&reqwest::Client>,
         relay: Option<&ChatRelayService>,
@@ -11070,7 +11115,7 @@ impl Server {
                 };
                 let request_commitment = request.request_commitment().ok();
                 (
-                    client.post(&url).json(&request).send().await,
+                    Self::send_target_bound_peer_relay(client, &url, &request).await,
                     request_commitment,
                 )
             } else if use_authenticated_relay {
@@ -13839,7 +13884,8 @@ mod tests {
         BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
         DATA_PLANE_RECV_FAILURE_LIMIT, DIRECTORY_OPERATOR_HTTP_PROFILE,
         DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
-        DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, MEMCHAIN_SYNC_HTTP_PROFILE,
+        DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, HTTP_TOO_EARLY_STATUS_CODE,
+        MEMCHAIN_SYNC_HTTP_PROFILE,
         ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION,
         THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT,
@@ -13879,7 +13925,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
 
@@ -17970,22 +18016,37 @@ mod tests {
         let identity_for_handler = Arc::clone(&target_identity);
         let v3_received = Arc::new(AtomicUsize::new(0));
         let v2_received = Arc::new(AtomicUsize::new(0));
+        let v3_commitments = Arc::new(Mutex::new(Vec::new()));
         let v3_for_handler = Arc::clone(&v3_received);
         let v2_for_handler = Arc::clone(&v2_received);
+        let commitments_for_handler = Arc::clone(&v3_commitments);
         let app = Router::new()
             .route(
                 "/api/chat/peer/relay-v3",
                 post(move |Json(request): Json<PeerChatRelayRequestV3>| {
                     let identity_for_handler = Arc::clone(&identity_for_handler);
                     let v3_for_handler = Arc::clone(&v3_for_handler);
+                    let commitments_for_handler = Arc::clone(&commitments_for_handler);
                     async move {
                         let commitment = request
                             .verified_request_commitment_for_target(
                                 &identity_for_handler.public_key_bytes(),
                             )
                             .expect("request should bind the selected target");
-                        v3_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
-                        Json(PeerChatRelayResponseV2 {
+                        commitments_for_handler
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(commitment);
+                        let attempt = v3_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                        if attempt == 0 {
+                            // [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex]
+                            // Model a target that still owns the first attempt.
+                            return Err(
+                                StatusCode::from_u16(HTTP_TOO_EARLY_STATUS_CODE)
+                                    .unwrap_or(StatusCode::CONFLICT),
+                            );
+                        }
+                        Ok(Json(PeerChatRelayResponseV2 {
                             relay: PeerChatRelayResponse {
                                 accepted: true,
                                 duplicate: false,
@@ -17997,7 +18058,7 @@ mod tests {
                                 unix_now_secs(),
                                 identity_for_handler.as_ref(),
                             )),
-                        })
+                        }))
                     }
                 }),
             )
@@ -18045,8 +18106,13 @@ mod tests {
         .await;
 
         assert_eq!(accepted, 1);
-        assert_eq!(v3_received.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(v3_received.load(AtomicOrdering::SeqCst), 2);
         assert_eq!(v2_received.load(AtomicOrdering::SeqCst), 0);
+        let commitments = v3_commitments
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(commitments.len(), 2);
+        assert_eq!(commitments[0], commitments[1]);
         mock_peer.abort();
     }
 
