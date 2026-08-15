@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.1.0-DirectRetrySlo
+// Version: 2.2.0-DirectRelayCircuit
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -33,6 +33,8 @@
 //   recovery, exhaustion, and deterministic-failure telemetry.
 //   v2.1.0-DirectRetrySlo — Added a fixed-memory five-minute delivery SLO
 //   window with deterministic degradation and outage thresholds.
+//   v2.2.0-DirectRelayCircuit — Added a source-blind, generation-safe circuit
+//   breaker for target-bound direct relay delivery.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -49,6 +51,7 @@
 //   - Snapshot pull: restart-stable pagination that excludes concurrent inserts
 //   - Direct retry telemetry: aggregate ACK-loss recovery evidence without IDs
 //   - Direct retry SLO: five fixed minute buckets, no event log or timer task
+//   - Direct relay circuit: bounded open/half-open recovery without downgrade
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -93,10 +96,14 @@
 //   - [DIRECT-RELAY-SLO 2026-08-15 by Codex] The recent window is process-local
 //     and fixed-size. Do not replace it with per-delivery events, labels, or a
 //     background timer; snapshots prune stale minute buckets on read.
+//   - [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] Circuit state is source-blind
+//     and process-local. Never add peer, route, message, endpoint, wallet, or
+//     payload identifiers to permits, state, telemetry, or health snapshots.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.2.0-DirectRelayCircuit — Generation-safe fail-closed delivery circuit
 //   v2.1.0-DirectRetrySlo — Fixed-memory five-minute delivery health window
 //   v2.0.2-DirectRetryTelemetry — Privacy-safe ACK retry outcome counters
 //   v2.0.1-StartupIntegrity — Privacy-safe, fail-closed service activation
@@ -190,6 +197,12 @@ const DIRECT_PEER_RETRY_SLO_TARGET_BPS: u16 = 9_900;
 const DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES: u64 = 3;
 /// At or below 50% delivery success with enough failures is a failed window.
 const DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS: u16 = 5_000;
+/// Cooldown before one source-blind target-bound relay recovery probe.
+const DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS: u64 = 30;
+/// Maximum time reserved for one half-open delivery before fail-closed reopen.
+const DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS: u64 = 15;
+/// Consecutive half-open delivery successes required to close the circuit.
+const DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES: u8 = 2;
 
 // ============================================
 // Peer relay health status
@@ -322,6 +335,64 @@ pub struct ChatRelayDirectPeerRetryStatus {
     /// Current fixed-memory target-bound delivery SLO window.
     #[serde(default)]
     pub recent_window: ChatRelayDirectPeerSloStatus,
+    /// Source-blind target-bound delivery admission circuit.
+    #[serde(default)]
+    pub circuit: ChatRelayDirectPeerCircuitStatus,
+}
+
+/// Aggregate target-bound direct relay circuit status.
+///
+/// This contract intentionally exposes no circuit slot, peer identity, route,
+/// endpoint, request commitment, message identifier, or payload dimension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatRelayDirectPeerCircuitStatus {
+    /// Current state: closed, open, or half_open.
+    pub state: String,
+    /// Fixed open-state cooldown in seconds.
+    pub cooldown_seconds: u64,
+    /// Maximum lease for one in-flight half-open probe.
+    pub half_open_lease_seconds: u64,
+    /// Consecutive successful probes required to close.
+    pub half_open_successes_required: u8,
+    /// Successful probes accumulated in the current recovery sequence.
+    pub half_open_consecutive_successes: u8,
+    /// Number of transitions into open state.
+    pub opened_total: u64,
+    /// Delivery rounds denied while open or while a probe is in flight.
+    pub blocked_total: u64,
+    /// Half-open probes admitted by this process.
+    pub half_open_attempted_total: u64,
+    /// Half-open probes that ended with valid acknowledgement.
+    pub half_open_succeeded_total: u64,
+    /// Half-open probes that failed or exceeded their lease.
+    pub half_open_failed_total: u64,
+    /// Half-open recovery sequences that closed the circuit.
+    pub recovered_total: u64,
+    /// Remaining open cooldown, or none outside a cooling open state.
+    pub open_remaining_seconds: Option<u64>,
+    /// Unix timestamp of the latest state transition.
+    pub last_transition_at: Option<u64>,
+}
+
+impl Default for ChatRelayDirectPeerCircuitStatus {
+    fn default() -> Self {
+        Self {
+            state: "closed".to_string(),
+            cooldown_seconds: DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS,
+            half_open_lease_seconds: DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS,
+            half_open_successes_required: DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES,
+            half_open_consecutive_successes: 0,
+            opened_total: 0,
+            blocked_total: 0,
+            half_open_attempted_total: 0,
+            half_open_succeeded_total: 0,
+            half_open_failed_total: 0,
+            recovered_total: 0,
+            open_remaining_seconds: None,
+            last_transition_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -444,6 +515,237 @@ fn ratio_basis_points(numerator: u64, denominator: u64) -> Option<u16> {
     }
     let basis_points = (u128::from(numerator).saturating_mul(10_000)) / u128::from(denominator);
     Some(basis_points.min(10_000) as u16)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPeerRelayCircuitState {
+    Closed,
+    Open {
+        retry_at: u64,
+    },
+    HalfOpenReady {
+        successful_probes: u8,
+    },
+    HalfOpenInFlight {
+        successful_probes: u8,
+        lease_expires_at: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPeerRelayPermitKind {
+    Closed,
+    HalfOpen,
+}
+
+/// Process-local admission token for one target-bound direct relay attempt.
+///
+/// [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] The generation prevents a late
+/// outcome from an older request from closing or reopening a newer circuit.
+/// The token deliberately contains no peer, route, endpoint, message, wallet,
+/// commitment, ciphertext, or payload-derived value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChatRelayDirectPeerPermit {
+    generation: u64,
+    kind: DirectPeerRelayPermitKind,
+}
+
+impl ChatRelayDirectPeerPermit {
+    /// Returns whether this permit is the circuit's single recovery probe.
+    #[must_use]
+    pub(crate) const fn is_half_open(self) -> bool {
+        matches!(self.kind, DirectPeerRelayPermitKind::HalfOpen)
+    }
+}
+
+#[derive(Debug)]
+struct DirectPeerRelayCircuit {
+    state: DirectPeerRelayCircuitState,
+    generation: u64,
+    opened_total: u64,
+    blocked_total: u64,
+    half_open_attempted_total: u64,
+    half_open_succeeded_total: u64,
+    half_open_failed_total: u64,
+    recovered_total: u64,
+    last_transition_at: Option<u64>,
+}
+
+impl Default for DirectPeerRelayCircuit {
+    fn default() -> Self {
+        Self {
+            state: DirectPeerRelayCircuitState::Closed,
+            generation: 0,
+            opened_total: 0,
+            blocked_total: 0,
+            half_open_attempted_total: 0,
+            half_open_succeeded_total: 0,
+            half_open_failed_total: 0,
+            recovered_total: 0,
+            last_transition_at: None,
+        }
+    }
+}
+
+impl DirectPeerRelayCircuit {
+    fn accepts_completion(&self, permit: ChatRelayDirectPeerPermit) -> bool {
+        if permit.generation != self.generation {
+            return false;
+        }
+        matches!(
+            (permit.kind, self.state),
+            (
+                DirectPeerRelayPermitKind::Closed,
+                DirectPeerRelayCircuitState::Closed
+            ) | (
+                DirectPeerRelayPermitKind::HalfOpen,
+                DirectPeerRelayCircuitState::HalfOpenInFlight { .. }
+            )
+        )
+    }
+
+    fn begin(&mut self, now: u64) -> Option<ChatRelayDirectPeerPermit> {
+        match self.state {
+            DirectPeerRelayCircuitState::Closed => Some(ChatRelayDirectPeerPermit {
+                generation: self.generation,
+                kind: DirectPeerRelayPermitKind::Closed,
+            }),
+            DirectPeerRelayCircuitState::Open { retry_at } if now < retry_at => {
+                self.blocked_total = self.blocked_total.saturating_add(1);
+                None
+            }
+            DirectPeerRelayCircuitState::Open { .. } => Some(self.begin_half_open(now, 0)),
+            DirectPeerRelayCircuitState::HalfOpenReady { successful_probes } => {
+                Some(self.begin_half_open(now, successful_probes))
+            }
+            DirectPeerRelayCircuitState::HalfOpenInFlight {
+                lease_expires_at, ..
+            } if now < lease_expires_at => {
+                self.blocked_total = self.blocked_total.saturating_add(1);
+                None
+            }
+            DirectPeerRelayCircuitState::HalfOpenInFlight { .. } => {
+                // [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] A dropped future
+                // cannot permanently strand half-open admission. Expiry is a
+                // failed probe and starts a fresh cooldown without a timer.
+                self.half_open_failed_total = self.half_open_failed_total.saturating_add(1);
+                self.open(now);
+                self.blocked_total = self.blocked_total.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    fn begin_half_open(&mut self, now: u64, successful_probes: u8) -> ChatRelayDirectPeerPermit {
+        self.generation = self.generation.wrapping_add(1);
+        self.state = DirectPeerRelayCircuitState::HalfOpenInFlight {
+            successful_probes,
+            lease_expires_at: now.saturating_add(DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS),
+        };
+        self.half_open_attempted_total = self.half_open_attempted_total.saturating_add(1);
+        self.last_transition_at = Some(now);
+        ChatRelayDirectPeerPermit {
+            generation: self.generation,
+            kind: DirectPeerRelayPermitKind::HalfOpen,
+        }
+    }
+
+    fn cancel(&mut self, now: u64, permit: ChatRelayDirectPeerPermit) {
+        if permit.kind != DirectPeerRelayPermitKind::HalfOpen
+            || permit.generation != self.generation
+        {
+            return;
+        }
+        let DirectPeerRelayCircuitState::HalfOpenInFlight {
+            successful_probes, ..
+        } = self.state
+        else {
+            return;
+        };
+        self.generation = self.generation.wrapping_add(1);
+        self.state = DirectPeerRelayCircuitState::HalfOpenReady { successful_probes };
+        self.last_transition_at = Some(now);
+    }
+
+    fn complete(
+        &mut self,
+        now: u64,
+        permit: ChatRelayDirectPeerPermit,
+        delivery_succeeded: bool,
+        slo_failed: bool,
+    ) -> bool {
+        if !self.accepts_completion(permit) {
+            return false;
+        }
+        match (permit.kind, self.state) {
+            (DirectPeerRelayPermitKind::Closed, DirectPeerRelayCircuitState::Closed) => {
+                if !delivery_succeeded && slo_failed {
+                    self.open(now);
+                }
+            }
+            (
+                DirectPeerRelayPermitKind::HalfOpen,
+                DirectPeerRelayCircuitState::HalfOpenInFlight {
+                    successful_probes, ..
+                },
+            ) => {
+                if !delivery_succeeded {
+                    self.half_open_failed_total = self.half_open_failed_total.saturating_add(1);
+                    self.open(now);
+                    return false;
+                }
+
+                self.half_open_succeeded_total = self.half_open_succeeded_total.saturating_add(1);
+                let successful_probes = successful_probes.saturating_add(1);
+                self.generation = self.generation.wrapping_add(1);
+                if successful_probes >= DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES {
+                    self.state = DirectPeerRelayCircuitState::Closed;
+                    self.recovered_total = self.recovered_total.saturating_add(1);
+                } else {
+                    self.state = DirectPeerRelayCircuitState::HalfOpenReady { successful_probes };
+                }
+                self.last_transition_at = Some(now);
+            }
+            _ => {}
+        }
+        !matches!(self.state, DirectPeerRelayCircuitState::Open { .. })
+    }
+
+    fn open(&mut self, now: u64) {
+        self.generation = self.generation.wrapping_add(1);
+        self.state = DirectPeerRelayCircuitState::Open {
+            retry_at: now.saturating_add(DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS),
+        };
+        self.opened_total = self.opened_total.saturating_add(1);
+        self.last_transition_at = Some(now);
+    }
+
+    fn snapshot(&self, now: u64) -> ChatRelayDirectPeerCircuitStatus {
+        let (state, successful_probes, open_remaining_seconds) = match self.state {
+            DirectPeerRelayCircuitState::Closed => ("closed", 0, None),
+            DirectPeerRelayCircuitState::Open { retry_at } if now < retry_at => {
+                ("open", 0, Some(retry_at.saturating_sub(now)))
+            }
+            DirectPeerRelayCircuitState::Open { .. } => ("half_open", 0, None),
+            DirectPeerRelayCircuitState::HalfOpenReady { successful_probes }
+            | DirectPeerRelayCircuitState::HalfOpenInFlight {
+                successful_probes, ..
+            } => ("half_open", successful_probes, None),
+        };
+        ChatRelayDirectPeerCircuitStatus {
+            state: state.to_string(),
+            half_open_consecutive_successes: successful_probes,
+            opened_total: self.opened_total,
+            blocked_total: self.blocked_total,
+            half_open_attempted_total: self.half_open_attempted_total,
+            half_open_succeeded_total: self.half_open_succeeded_total,
+            half_open_failed_total: self.half_open_failed_total,
+            recovered_total: self.recovered_total,
+            open_remaining_seconds,
+            last_transition_at: self.last_transition_at,
+            ..ChatRelayDirectPeerCircuitStatus::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1022,6 +1324,7 @@ pub struct ChatRelayService {
     dedup: MessageDedup,
     peer_status: RwLock<ChatRelayPeerStatus>,
     direct_peer_retry_slo: Mutex<DirectPeerRetrySloWindow>,
+    direct_peer_relay_circuit: Mutex<DirectPeerRelayCircuit>,
     maintenance_status: RwLock<ChatRelayMaintenanceStatus>,
     /// In-memory wallet → session routing table.
     ///
@@ -1061,6 +1364,7 @@ impl ChatRelayService {
             dedup: MessageDedup::new(dedup_capacity),
             peer_status: RwLock::new(ChatRelayPeerStatus::new(relay_enabled)),
             direct_peer_retry_slo: Mutex::new(DirectPeerRetrySloWindow::default()),
+            direct_peer_relay_circuit: Mutex::new(DirectPeerRelayCircuit::default()),
             maintenance_status: RwLock::new(ChatRelayMaintenanceStatus::default()),
             // v1.3.0-Sovereign: initialise empty route cache
             wallet_routes: Arc::new(WalletRouteCache::new()),
@@ -2936,7 +3240,24 @@ impl ChatRelayService {
         );
     }
 
-    /// Records one aggregate target-bound direct relay retry observation.
+    /// Begins one target-bound direct relay delivery when the circuit permits.
+    ///
+    /// A returned permit must be completed after a network outcome or cancelled
+    /// if local request construction fails before network I/O. `None` means the
+    /// caller must fail closed without falling back to an older relay protocol.
+    pub(crate) fn begin_direct_peer_delivery(&self, now: u64) -> Option<ChatRelayDirectPeerPermit> {
+        // [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] Admission is intentionally
+        // process-global and source-blind; per-peer quarantine remains owned by
+        // PeerStore and must not be duplicated with identity-labelled state here.
+        self.direct_peer_relay_circuit.lock().begin(now)
+    }
+
+    /// Releases an unused half-open permit after a local preflight failure.
+    pub(crate) fn cancel_direct_peer_delivery(&self, now: u64, permit: ChatRelayDirectPeerPermit) {
+        self.direct_peer_relay_circuit.lock().cancel(now, permit);
+    }
+
+    /// Completes one aggregate target-bound direct relay delivery observation.
     ///
     /// `retry_triggered` means a second exact request was sent. A triggered
     /// retry is classified as either recovered or exhausted. Independently,
@@ -2948,25 +3269,36 @@ impl ChatRelayService {
     /// [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] Parameters are
     /// deliberately aggregate booleans. Do not extend this API with peer,
     /// message, commitment, endpoint, wallet, or payload identifiers.
-    pub(crate) fn record_direct_peer_retry_observation(
+    pub(crate) fn complete_direct_peer_delivery(
         &self,
         now: u64,
+        permit: ChatRelayDirectPeerPermit,
         retry_triggered: bool,
         delivery_succeeded: bool,
         final_failure_deterministic: bool,
-    ) {
+    ) -> bool {
         debug_assert!(!(delivery_succeeded && final_failure_deterministic));
         // [DIRECT-RELAY-SLO 2026-08-15 by Codex] Every v3 delivery contributes
         // exactly one aggregate sample, including successful first attempts.
         // The fixed ring retains no event identity or peer dimension.
-        self.direct_peer_retry_slo.lock().record(
-            now,
-            retry_triggered,
-            delivery_succeeded,
-            final_failure_deterministic,
-        );
+        let mut circuit = self.direct_peer_relay_circuit.lock();
+        if !circuit.accepts_completion(permit) {
+            return false;
+        }
+        let slo_failed = {
+            let mut window = self.direct_peer_retry_slo.lock();
+            window.record(
+                now,
+                retry_triggered,
+                delivery_succeeded,
+                final_failure_deterministic,
+            );
+            window.snapshot(now).status == "failed"
+        };
+        let circuit_allows_more = circuit.complete(now, permit, delivery_succeeded, slo_failed);
+        drop(circuit);
         if !retry_triggered && !final_failure_deterministic {
-            return;
+            return circuit_allows_more;
         }
 
         let mut status = self.peer_status.write();
@@ -2987,6 +3319,7 @@ impl ChatRelayService {
             retry.deterministic_failure_total = retry.deterministic_failure_total.saturating_add(1);
         }
         retry.last_at = Some(now);
+        circuit_allows_more
     }
 
     /// Records one authenticated receipt-verified onion relay round.
@@ -3133,11 +3466,15 @@ impl ChatRelayService {
     /// Returns a privacy-safe node-to-node relay health snapshot.
     #[must_use]
     pub fn peer_status(&self) -> ChatRelayPeerStatus {
-        // Snapshot the ring before cloning status; no code path holds both
-        // locks concurrently, keeping the telemetry path deadlock-free.
-        let recent_window = self.direct_peer_retry_slo.lock().snapshot(now_secs());
+        // [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] Snapshot each process-local
+        // aggregate independently; neither guard is held while taking the next.
+        // Completion uses circuit -> SLO, so no reverse nested lock exists.
+        let now = now_secs();
+        let circuit = self.direct_peer_relay_circuit.lock().snapshot(now);
+        let recent_window = self.direct_peer_retry_slo.lock().snapshot(now);
         let mut status = self.peer_status.read().clone();
         status.direct_peer_retry.recent_window = recent_window;
+        status.direct_peer_retry.circuit = circuit;
         status
     }
 
@@ -3245,6 +3582,25 @@ mod tests {
     fn make_service_with_config(config: ChatRelayConfig) -> ChatRelayService {
         let secret = derive_node_secret(&[0x42u8; 32]);
         ChatRelayService::new(config, secret).expect("init")
+    }
+
+    fn complete_direct_peer_test_delivery(
+        svc: &ChatRelayService,
+        now: u64,
+        retry_triggered: bool,
+        delivery_succeeded: bool,
+        final_failure_deterministic: bool,
+    ) {
+        let permit = svc
+            .begin_direct_peer_delivery(now)
+            .expect("test delivery should be admitted");
+        svc.complete_direct_peer_delivery(
+            now,
+            permit,
+            retry_triggered,
+            delivery_succeeded,
+            final_failure_deterministic,
+        );
     }
 
     fn unique_test_db_path(label: &str) -> PathBuf {
@@ -3421,7 +3777,7 @@ mod tests {
     #[test]
     fn direct_peer_retry_health_preserves_nested_rolling_compatibility() {
         let svc = make_service();
-        svc.record_direct_peer_retry_observation(1_800_000_051, true, true, false);
+        complete_direct_peer_test_delivery(&svc, 1_800_000_051, true, true, false);
         let mut encoded = serde_json::to_value(svc.peer_status()).expect("serialize peer status");
         let retry = encoded
             .get_mut("direct_peer_retry")
@@ -3434,7 +3790,13 @@ mod tests {
         assert_eq!(recent.get("window_seconds"), Some(&serde_json::json!(300)));
         assert_eq!(recent.get("deliveries_total"), Some(&serde_json::json!(1)));
         assert_eq!(recent.get("status"), Some(&serde_json::json!("healthy")));
+        let circuit = retry
+            .get("circuit")
+            .and_then(serde_json::Value::as_object)
+            .expect("direct relay circuit JSON object");
+        assert_eq!(circuit.get("state"), Some(&serde_json::json!("closed")));
         retry.remove("recent_window");
+        retry.remove("circuit");
 
         // [DIRECT-RELAY-RETRY-SLO 2026-08-15 by Codex] Nodes may first learn
         // the lifetime retry counters and only later learn the rolling SLO.
@@ -3446,6 +3808,10 @@ mod tests {
             decoded.direct_peer_retry.recent_window,
             ChatRelayDirectPeerSloStatus::default()
         );
+        assert_eq!(
+            decoded.direct_peer_retry.circuit,
+            ChatRelayDirectPeerCircuitStatus::default()
+        );
     }
 
     #[test]
@@ -3455,7 +3821,7 @@ mod tests {
         // [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] A normal first
         // attempt is invisible to lifetime exception counters but remains in
         // the recent delivery SLO denominator.
-        svc.record_direct_peer_retry_observation(1_800_000_001, false, true, false);
+        complete_direct_peer_test_delivery(&svc, 1_800_000_001, false, true, false);
         let retry = svc.peer_status().direct_peer_retry;
         assert_eq!(retry.retry_triggered_total, 0);
         assert_eq!(retry.retry_recovered_total, 0);
@@ -3466,9 +3832,9 @@ mod tests {
         assert_eq!(retry.recent_window.delivery_success_bps, Some(10_000));
         assert_eq!(retry.recent_window.status, "healthy");
 
-        svc.record_direct_peer_retry_observation(1_800_000_010, true, true, false);
-        svc.record_direct_peer_retry_observation(1_800_000_020, true, false, true);
-        svc.record_direct_peer_retry_observation(1_800_000_030, false, false, true);
+        complete_direct_peer_test_delivery(&svc, 1_800_000_010, true, true, false);
+        complete_direct_peer_test_delivery(&svc, 1_800_000_020, true, false, true);
+        complete_direct_peer_test_delivery(&svc, 1_800_000_030, false, false, true);
 
         let retry = svc.peer_status().direct_peer_retry;
         assert_eq!(retry.retry_triggered_total, 2);
@@ -3527,6 +3893,118 @@ mod tests {
         assert_eq!(expired.delivery_success_bps, None);
         assert_eq!(expired.meets_slo, None);
         assert_eq!(expired.status, "idle");
+    }
+
+    #[test]
+    fn direct_peer_circuit_opens_half_opens_and_requires_two_successes() {
+        let svc = make_service();
+        let base = 1_800_000_100;
+
+        for offset in 0..3 {
+            complete_direct_peer_test_delivery(&svc, base + offset, false, false, true);
+        }
+        let opened = svc.direct_peer_relay_circuit.lock().snapshot(base + 2);
+        assert_eq!(opened.state, "open");
+        assert_eq!(opened.opened_total, 1);
+        assert_eq!(
+            opened.open_remaining_seconds,
+            Some(DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS)
+        );
+        assert!(svc.begin_direct_peer_delivery(base + 3).is_none());
+
+        let first_probe = svc
+            .begin_direct_peer_delivery(base + 2 + DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS)
+            .expect("cooldown expiry should admit one half-open probe");
+        assert!(first_probe.is_half_open());
+        assert!(svc
+            .begin_direct_peer_delivery(base + 2 + DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS)
+            .is_none());
+        svc.complete_direct_peer_delivery(base + 33, first_probe, false, true, false);
+        let recovering = svc.direct_peer_relay_circuit.lock().snapshot(base + 33);
+        assert_eq!(recovering.state, "half_open");
+        assert_eq!(recovering.half_open_consecutive_successes, 1);
+
+        // A duplicate late outcome for the consumed permit cannot overwrite
+        // the newer generation or count as a failed recovery probe.
+        svc.complete_direct_peer_delivery(base + 34, first_probe, false, false, true);
+        let after_stale = svc.direct_peer_relay_circuit.lock().snapshot(base + 34);
+        assert_eq!(after_stale.state, "half_open");
+        assert_eq!(after_stale.half_open_failed_total, 0);
+        assert_eq!(
+            svc.direct_peer_retry_slo
+                .lock()
+                .snapshot(base + 34)
+                .deliveries_total,
+            4
+        );
+
+        let second_probe = svc
+            .begin_direct_peer_delivery(base + 34)
+            .expect("second recovery proof should be admitted serially");
+        assert!(second_probe.is_half_open());
+        svc.complete_direct_peer_delivery(base + 34, second_probe, false, true, false);
+        let recovered = svc.direct_peer_relay_circuit.lock().snapshot(base + 34);
+        assert_eq!(recovered.state, "closed");
+        assert_eq!(recovered.half_open_attempted_total, 2);
+        assert_eq!(recovered.half_open_succeeded_total, 2);
+        assert_eq!(recovered.recovered_total, 1);
+        assert_eq!(recovered.blocked_total, 2);
+
+        // The previous failed SLO is not enough to reopen by itself, but one
+        // new failed delivery while that window remains failed is.
+        complete_direct_peer_test_delivery(&svc, base + 35, false, false, true);
+        let reopened = svc.direct_peer_relay_circuit.lock().snapshot(base + 35);
+        assert_eq!(reopened.state, "open");
+        assert_eq!(reopened.opened_total, 2);
+    }
+
+    #[test]
+    fn direct_peer_circuit_recovers_abandoned_half_open_permit_fail_closed() {
+        let svc = make_service();
+        let base = 1_800_000_200;
+        for offset in 0..3 {
+            complete_direct_peer_test_delivery(&svc, base + offset, false, false, true);
+        }
+
+        let first_probe_at = base + 2 + DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS;
+        let abandoned = svc
+            .begin_direct_peer_delivery(first_probe_at)
+            .expect("expired open circuit should admit a half-open probe");
+        assert!(abandoned.is_half_open());
+        assert!(svc
+            .begin_direct_peer_delivery(first_probe_at + DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS)
+            .is_none());
+        let timed_out = svc
+            .direct_peer_relay_circuit
+            .lock()
+            .snapshot(first_probe_at + DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS);
+        assert_eq!(timed_out.state, "open");
+        assert_eq!(timed_out.opened_total, 2);
+        assert_eq!(timed_out.half_open_failed_total, 1);
+
+        // A later completion from the expired lease is stale and cannot close
+        // the newly opened generation.
+        svc.complete_direct_peer_delivery(
+            first_probe_at + DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS + 1,
+            abandoned,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(
+            svc.direct_peer_relay_circuit
+                .lock()
+                .snapshot(first_probe_at + DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS + 1)
+                .state,
+            "open"
+        );
+        assert_eq!(
+            svc.direct_peer_retry_slo
+                .lock()
+                .snapshot(first_probe_at + DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS + 1)
+                .deliveries_total,
+            3
+        );
     }
 
     #[test]

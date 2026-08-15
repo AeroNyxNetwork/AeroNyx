@@ -533,8 +533,14 @@
 //     send, bounded ACK read, and negotiated ACK verification as one operation.
 //     Only ambiguous transport/body failures and HTTP 425 may cross the retry
 //     edge; explicit rejection, oversized ACKs, or invalid receipts must not.
+//   - [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] A failed aggregate v3 SLO
+//     opens a source-blind circuit. While cooling, direct fallback fails closed
+//     into local pending storage and must never downgrade to v2/v1. Half-open
+//     recovery admits one generation-bound v3 delivery at a time.
 //
 // Last Modified:
+//   [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] Wired source-blind open and
+//     half-open admission into direct relay without protocol downgrade.
 //   [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Extended exact v3 retries
 //     through bounded ACK-body reads and negotiated target ACK verification.
 //   [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Added one safe exact
@@ -11171,7 +11177,7 @@ impl Server {
         let excluded_node_ids = [node_identity.public_key_bytes()];
         let authenticated_request =
             PeerChatRelayRequestV2::sign(envelope.clone(), node_identity).ok();
-        for peer in peer_store
+        let mut candidates = peer_store
             .route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
                 now,
@@ -11180,7 +11186,56 @@ impl Server {
             )
             .into_iter()
             .filter(|peer| peer_store.is_routeable_now(&peer.node_id(), now))
-        {
+            .collect::<Vec<_>>();
+        let has_target_bound_candidate = candidates.iter().any(|peer| {
+            peer.descriptor
+                .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayTargetBindingV3)
+        });
+        let mut first_target_bound_permit = None;
+        if has_target_bound_candidate {
+            if let Some(relay) = relay {
+                let Some(permit) = relay.begin_direct_peer_delivery(now) else {
+                    relay.record_peer_relay_outbound(
+                        now,
+                        0,
+                        0,
+                        Some("peer_relay_circuit_open".to_string()),
+                    );
+                    return 0;
+                };
+                if permit.is_half_open() {
+                    // [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] A half-open
+                    // round must probe v3 first; trying compatibility peers
+                    // before the reserved probe would be a protocol downgrade.
+                    candidates.sort_by_key(|peer| {
+                        !peer.descriptor.advertises_protocol_feature(
+                            NodeProtocolFeature::DirectPeerRelayTargetBindingV3,
+                        )
+                    });
+                }
+                first_target_bound_permit = Some(permit);
+            }
+        }
+
+        for peer in candidates {
+            let use_target_bound_relay = peer
+                .descriptor
+                .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayTargetBindingV3);
+            if !use_target_bound_relay
+                && first_target_bound_permit
+                    .is_some_and(|permit| permit.is_half_open())
+            {
+                // Every v3 candidate failed local preflight before the reserved
+                // probe could run. Do not spend that recovery edge on v2/v1.
+                if let (Some(relay), Some(permit)) =
+                    (relay, first_target_bound_permit.take())
+                {
+                    relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
+                }
+                last_failure_reason =
+                    Some("peer_relay_half_open_probe_unavailable".to_string());
+                break;
+            }
             let Some(endpoint) = peer.descriptor.public_endpoint.as_deref() else {
                 let _ = peer_store.record_route_forward_failure_for_descriptor(
                     &peer,
@@ -11193,9 +11248,6 @@ impl Server {
             // endpoint only from the target's verified signed descriptor.
             // Legacy peers retain v1 during rolling upgrades; an unsigned HTTP
             // response can never upgrade or downgrade this decision.
-            let use_target_bound_relay = peer
-                .descriptor
-                .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayTargetBindingV3);
             let use_authenticated_relay = use_target_bound_relay
                 || peer
                     .descriptor
@@ -11220,7 +11272,26 @@ impl Server {
                 continue;
             };
 
+            let delivery_permit = if use_target_bound_relay {
+                if let Some(relay) = relay {
+                    let permit = first_target_bound_permit
+                        .take()
+                        .or_else(|| relay.begin_direct_peer_delivery(unix_now_secs()));
+                    let Some(permit) = permit else {
+                        last_failure_reason = Some("peer_relay_circuit_open".to_string());
+                        break;
+                    };
+                    Some(permit)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             attempted += 1;
+            let stop_after_delivery = delivery_permit
+                .is_some_and(|permit| permit.is_half_open());
+            let mut circuit_allows_more = true;
             let delivery_result = if use_target_bound_relay {
                 // [DIRECT-RELAY-TARGET-BINDING-V3 2026-08-15 by Codex] Build
                 // inside the peer loop because the signed target differs for
@@ -11233,6 +11304,9 @@ impl Server {
                 ) {
                     Ok(request) => request,
                     Err(_) => {
+                        if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
+                            relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
+                        }
                         let reason = "peer_relay_target_auth_encode_failed".to_string();
                         let _ = peer_store.record_route_forward_failure_for_descriptor(
                             &peer,
@@ -11240,12 +11314,15 @@ impl Server {
                             reason.clone(),
                         );
                         last_failure_reason = Some(reason);
-                        continue;
+                        break;
                     }
                 };
                 let request_commitment = match request.request_commitment() {
                     Ok(commitment) => commitment,
                     Err(_) => {
+                        if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
+                            relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
+                        }
                         let reason = "peer_relay_target_auth_encode_failed".to_string();
                         let _ = peer_store.record_route_forward_failure_for_descriptor(
                             &peer,
@@ -11253,7 +11330,7 @@ impl Server {
                             reason.clone(),
                         );
                         last_failure_reason = Some(reason);
-                        continue;
+                        break;
                     }
                 };
                 let outcome = Self::send_and_validate_target_bound_peer_relay(
@@ -11265,9 +11342,10 @@ impl Server {
                     require_signed_receipt,
                 )
                 .await;
-                if let Some(relay) = relay {
-                    relay.record_direct_peer_retry_observation(
+                if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
+                    circuit_allows_more = relay.complete_direct_peer_delivery(
                         unix_now_secs(),
+                        permit,
                         outcome.retry_triggered(),
                         outcome.delivery_succeeded(),
                         outcome.final_failure_deterministic(),
@@ -11343,6 +11421,17 @@ impl Server {
                     debug!(reason, "[CHAT_RELAY] Peer relay delivery failed");
                 }
             }
+            if stop_after_delivery || !circuit_allows_more {
+                break;
+            }
+        }
+
+        if let (Some(relay), Some(permit)) = (relay, first_target_bound_permit.take()) {
+            if permit.is_half_open() && last_failure_reason.is_none() {
+                last_failure_reason =
+                    Some("peer_relay_half_open_probe_unavailable".to_string());
+            }
+            relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
         }
 
         if let Some(relay) = relay {
@@ -18596,6 +18685,154 @@ mod tests {
         assert_eq!(retry.deterministic_failure_total, 1);
         assert_eq!(retry.last_outcome.as_deref(), Some("deterministic_failure"));
         mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn target_bound_v3_circuit_blocks_legacy_protocol_downgrade() {
+        // [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] Once v3 delivery health
+        // opens the source-blind circuit, a compatibility-capable peer must not
+        // turn an availability incident into a silent authentication downgrade.
+        let directory = tempfile::tempdir().expect("direct circuit directory");
+        let source_relay = test_chat_relay_service(
+            &directory.path().join("direct-circuit.sqlite3"),
+            [0x74; 32],
+        );
+        let now = unix_now_secs();
+        for offset in 0..3 {
+            let observed_at = now.saturating_add(offset);
+            let permit = source_relay
+                .begin_direct_peer_delivery(observed_at)
+                .expect("closed circuit should admit failure seed");
+            let allows_more = source_relay.complete_direct_peer_delivery(
+                observed_at,
+                permit,
+                false,
+                false,
+                true,
+            );
+            assert_eq!(allows_more, offset < 2);
+        }
+
+        let v3_calls = Arc::new(AtomicUsize::new(0));
+        let v3_calls_for_handler = Arc::clone(&v3_calls);
+        let v3_app = Router::new().route(
+            "/api/chat/peer/relay-v3",
+            post(move || {
+                let v3_calls_for_handler = Arc::clone(&v3_calls_for_handler);
+                async move {
+                    v3_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let v3_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let v3_endpoint = format!("http://{}", v3_listener.local_addr().unwrap());
+        let v3_node = tokio::spawn(async move {
+            axum::serve(v3_listener, v3_app).await.unwrap();
+        });
+
+        let v2_calls = Arc::new(AtomicUsize::new(0));
+        let v2_calls_for_handler = Arc::clone(&v2_calls);
+        let v2_app = Router::new().route(
+            "/api/chat/peer/relay-v2",
+            post(move || {
+                let v2_calls_for_handler = Arc::clone(&v2_calls_for_handler);
+                async move {
+                    v2_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let v2_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let v2_endpoint = format!("http://{}", v2_listener.local_addr().unwrap());
+        let v2_node = tokio::spawn(async move {
+            axum::serve(v2_listener, v2_app).await.unwrap();
+        });
+
+        let v3_identity = IdentityKeyPair::generate();
+        let v2_identity = IdentityKeyPair::generate();
+        let v3_descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            v3_endpoint,
+            now.saturating_sub(1),
+            now.saturating_add(300),
+            &[NodeProtocolFeature::DirectPeerRelayTargetBindingV3],
+            &v3_identity,
+        );
+        let v2_descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            v2_endpoint,
+            now.saturating_sub(1),
+            now.saturating_add(300),
+            &[NodeProtocolFeature::DirectPeerRelayAuthV2],
+            &v2_identity,
+        );
+        let v3_node_id = v3_descriptor.node_id();
+        let v2_node_id = v2_descriptor.node_id();
+        let peer_store = PeerStore::new();
+        peer_store
+            .upsert_verified(v3_descriptor, now)
+            .expect("v3 circuit target should verify");
+        peer_store
+            .upsert_verified(v2_descriptor, now)
+            .expect("v2 compatibility target should verify");
+        peer_store.record_route_forward_success(&v3_node_id, now.saturating_sub(1));
+        peer_store.record_route_forward_success(&v2_node_id, now.saturating_sub(1));
+
+        let accepted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(&reqwest::Client::new()),
+            Some(source_relay.as_ref()),
+            &peer_store,
+            &IdentityKeyPair::generate(),
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+
+        assert_eq!(accepted, 0);
+        assert_eq!(v3_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(v2_calls.load(AtomicOrdering::SeqCst), 0);
+        let status = source_relay.peer_status();
+        assert_eq!(status.direct_peer_retry.circuit.state, "open");
+        assert_eq!(status.direct_peer_retry.circuit.blocked_total, 1);
+        assert_eq!(status.last_outbound_attempted, 0);
+        assert_eq!(
+            status.last_outbound_failure_reason.as_deref(),
+            Some("peer_relay_circuit_open")
+        );
+
+        // Move the circuit to half-open-ready without sleeping. The production
+        // relay call must spend exactly one probe on v3; its failure must reopen
+        // the circuit before the compatibility candidate can receive traffic.
+        let recovery_at = now
+            .saturating_add(2)
+            .saturating_add(status.direct_peer_retry.circuit.cooldown_seconds);
+        let reserved_probe = source_relay
+            .begin_direct_peer_delivery(recovery_at)
+            .expect("cooldown expiry should reserve a half-open probe");
+        assert!(reserved_probe.is_half_open());
+        source_relay.cancel_direct_peer_delivery(recovery_at, reserved_probe);
+
+        let half_open_accepted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(&reqwest::Client::new()),
+            Some(source_relay.as_ref()),
+            &peer_store,
+            &IdentityKeyPair::generate(),
+            &signed_test_chat_envelope(now.saturating_add(1)),
+        )
+        .await;
+        assert_eq!(half_open_accepted, 0);
+        assert_eq!(v3_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(v2_calls.load(AtomicOrdering::SeqCst), 0);
+        let recovered_status = source_relay.peer_status();
+        assert_eq!(recovered_status.direct_peer_retry.circuit.state, "open");
+        assert_eq!(
+            recovered_status
+                .direct_peer_retry
+                .circuit
+                .half_open_failed_total,
+            1
+        );
+        assert_eq!(recovered_status.last_outbound_attempted, 1);
+        v3_node.abort();
+        v2_node.abort();
     }
 
     #[tokio::test]
