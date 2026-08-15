@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.0.2-DirectRetryTelemetry
+// Version: 2.1.0-DirectRetrySlo
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -31,6 +31,8 @@
 //   successful startup logs; server.rs now owns fail-closed activation.
 //   v2.0.2-DirectRetryTelemetry — Added aggregate-only direct peer retry
 //   recovery, exhaustion, and deterministic-failure telemetry.
+//   v2.1.0-DirectRetrySlo — Added a fixed-memory five-minute delivery SLO
+//   window with deterministic degradation and outage thresholds.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -46,6 +48,7 @@
 //   - Durable quarantine: bounded de-identified evidence for corrupt relay rows
 //   - Snapshot pull: restart-stable pagination that excludes concurrent inserts
 //   - Direct retry telemetry: aggregate ACK-loss recovery evidence without IDs
+//   - Direct retry SLO: five fixed minute buckets, no event log or timer task
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -87,10 +90,14 @@
 //   - [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] Retry telemetry must
 //     remain aggregate-only. Never add peer IDs, message IDs, request
 //     commitments, endpoints, wallet keys, or payload-derived dimensions.
+//   - [DIRECT-RELAY-SLO 2026-08-15 by Codex] The recent window is process-local
+//     and fixed-size. Do not replace it with per-delivery events, labels, or a
+//     background timer; snapshots prune stale minute buckets on read.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.1.0-DirectRetrySlo — Fixed-memory five-minute delivery health window
 //   v2.0.2-DirectRetryTelemetry — Privacy-safe ACK retry outcome counters
 //   v2.0.1-StartupIntegrity — Privacy-safe, fail-closed service activation
 //   v2.0.0-SnapshotPull — Monotonic queue sequence, atomic legacy backfill,
@@ -172,6 +179,17 @@ const CHAT_PULL_CURSOR_V2_BYTES: usize = 1
 const CHAT_PULL_CURSOR_V2_AAD_DOMAIN: &[u8] = b"AeroNyx-ChatPullCursor-v2";
 const CHAT_PULL_CURSOR_V2_HKDF_SALT: &[u8] = b"AeroNyx-ChatPullCursor-v2-key";
 const CHAT_PULL_CURSOR_V2_HKDF_INFO: &[u8] = b"XChaCha20-Poly1305";
+/// Recent target-bound delivery health uses five fixed one-minute buckets.
+const DIRECT_PEER_RETRY_SLO_BUCKET_SECS: u64 = 60;
+const DIRECT_PEER_RETRY_SLO_BUCKET_COUNT: usize = 5;
+const DIRECT_PEER_RETRY_SLO_WINDOW_SECS: u64 =
+    DIRECT_PEER_RETRY_SLO_BUCKET_SECS * DIRECT_PEER_RETRY_SLO_BUCKET_COUNT as u64;
+/// 99.00% target-bound delivery success target, represented in basis points.
+const DIRECT_PEER_RETRY_SLO_TARGET_BPS: u16 = 9_900;
+/// Require repeated failures before declaring a short-window outage.
+const DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES: u64 = 3;
+/// At or below 50% delivery success with enough failures is a failed window.
+const DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS: u16 = 5_000;
 
 // ============================================
 // Peer relay health status
@@ -212,6 +230,71 @@ pub struct ChatRelayOutboundRouteStatus {
     pub last_at: Option<u64>,
 }
 
+/// Fixed-window target-bound direct relay delivery SLO.
+///
+/// All ratios use basis points (`10_000 == 100%`) so heartbeat consumers get a
+/// stable integer contract. The window contains aggregate counts only and is
+/// reset when the process restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatRelayDirectPeerSloStatus {
+    /// Width of the rolling aggregate window.
+    pub window_seconds: u64,
+    /// Delivery success target in basis points.
+    pub slo_target_bps: u16,
+    /// Minimum failures required before the window can be classified failed.
+    pub failed_min_failures: u64,
+    /// Delivery success ceiling for a failed classification, in basis points.
+    pub failed_success_ceiling_bps: u16,
+    /// Target-bound v3 deliveries observed in the current window.
+    pub deliveries_total: u64,
+    /// Deliveries that ended with a valid acknowledgement.
+    pub delivered_total: u64,
+    /// Deliveries that ended without a valid acknowledgement.
+    pub failed_total: u64,
+    /// Deliveries that entered the exact retry path.
+    pub retry_triggered_total: u64,
+    /// Exact retries that recovered a valid acknowledgement.
+    pub retry_recovered_total: u64,
+    /// Exact retries that exhausted their bounded retry budget.
+    pub retry_exhausted_total: u64,
+    /// Deliveries whose final typed failure was deterministic.
+    pub deterministic_failure_total: u64,
+    /// Delivery success ratio in basis points, or none when idle.
+    pub delivery_success_bps: Option<u16>,
+    /// Retry recovery ratio in basis points, or none when no retry occurred.
+    pub retry_recovery_bps: Option<u16>,
+    /// Whether the current non-empty window meets the configured SLO.
+    pub meets_slo: Option<bool>,
+    /// Current aggregate bucket: idle, healthy, degraded, or failed.
+    pub status: String,
+    /// Unix timestamp used to evaluate the rolling window.
+    pub evaluated_at: u64,
+}
+
+impl Default for ChatRelayDirectPeerSloStatus {
+    fn default() -> Self {
+        Self {
+            window_seconds: DIRECT_PEER_RETRY_SLO_WINDOW_SECS,
+            slo_target_bps: DIRECT_PEER_RETRY_SLO_TARGET_BPS,
+            failed_min_failures: DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES,
+            failed_success_ceiling_bps: DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS,
+            deliveries_total: 0,
+            delivered_total: 0,
+            failed_total: 0,
+            retry_triggered_total: 0,
+            retry_recovered_total: 0,
+            retry_exhausted_total: 0,
+            deterministic_failure_total: 0,
+            delivery_success_bps: None,
+            retry_recovery_bps: None,
+            meets_slo: None,
+            status: "idle".to_string(),
+            evaluated_at: 0,
+        }
+    }
+}
+
 /// Aggregate-only target-bound direct relay retry outcomes.
 ///
 /// [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] These counters describe
@@ -236,6 +319,131 @@ pub struct ChatRelayDirectPeerRetryStatus {
     pub last_outcome: Option<String>,
     /// Unix timestamp of the latest retry or deterministic-failure observation.
     pub last_at: Option<u64>,
+    /// Current fixed-memory target-bound delivery SLO window.
+    #[serde(default)]
+    pub recent_window: ChatRelayDirectPeerSloStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DirectPeerRetrySloBucket {
+    initialized: bool,
+    epoch_minute: u64,
+    deliveries: u64,
+    delivered: u64,
+    retry_triggered: u64,
+    retry_recovered: u64,
+    retry_exhausted: u64,
+    deterministic_failure: u64,
+}
+
+#[derive(Debug, Default)]
+struct DirectPeerRetrySloWindow {
+    buckets: [DirectPeerRetrySloBucket; DIRECT_PEER_RETRY_SLO_BUCKET_COUNT],
+    latest_epoch_minute: u64,
+}
+
+impl DirectPeerRetrySloWindow {
+    fn record(
+        &mut self,
+        now: u64,
+        retry_triggered: bool,
+        delivery_succeeded: bool,
+        final_failure_deterministic: bool,
+    ) {
+        let observed_epoch = now / DIRECT_PEER_RETRY_SLO_BUCKET_SECS;
+        let epoch_minute = observed_epoch.max(self.latest_epoch_minute);
+        self.latest_epoch_minute = epoch_minute;
+        let index = (epoch_minute % DIRECT_PEER_RETRY_SLO_BUCKET_COUNT as u64) as usize;
+        let bucket = &mut self.buckets[index];
+        if !bucket.initialized || bucket.epoch_minute != epoch_minute {
+            *bucket = DirectPeerRetrySloBucket {
+                initialized: true,
+                epoch_minute,
+                ..DirectPeerRetrySloBucket::default()
+            };
+        }
+
+        bucket.deliveries = bucket.deliveries.saturating_add(1);
+        if delivery_succeeded {
+            bucket.delivered = bucket.delivered.saturating_add(1);
+        }
+        if retry_triggered {
+            bucket.retry_triggered = bucket.retry_triggered.saturating_add(1);
+            if delivery_succeeded {
+                bucket.retry_recovered = bucket.retry_recovered.saturating_add(1);
+            } else {
+                bucket.retry_exhausted = bucket.retry_exhausted.saturating_add(1);
+            }
+        }
+        if final_failure_deterministic {
+            bucket.deterministic_failure = bucket.deterministic_failure.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self, now: u64) -> ChatRelayDirectPeerSloStatus {
+        let current_epoch = (now / DIRECT_PEER_RETRY_SLO_BUCKET_SECS).max(self.latest_epoch_minute);
+        let mut snapshot = ChatRelayDirectPeerSloStatus {
+            evaluated_at: now,
+            ..ChatRelayDirectPeerSloStatus::default()
+        };
+        for bucket in &self.buckets {
+            if !bucket.initialized
+                || bucket.epoch_minute > current_epoch
+                || current_epoch.saturating_sub(bucket.epoch_minute)
+                    >= DIRECT_PEER_RETRY_SLO_BUCKET_COUNT as u64
+            {
+                continue;
+            }
+            snapshot.deliveries_total = snapshot.deliveries_total.saturating_add(bucket.deliveries);
+            snapshot.delivered_total = snapshot.delivered_total.saturating_add(bucket.delivered);
+            snapshot.retry_triggered_total = snapshot
+                .retry_triggered_total
+                .saturating_add(bucket.retry_triggered);
+            snapshot.retry_recovered_total = snapshot
+                .retry_recovered_total
+                .saturating_add(bucket.retry_recovered);
+            snapshot.retry_exhausted_total = snapshot
+                .retry_exhausted_total
+                .saturating_add(bucket.retry_exhausted);
+            snapshot.deterministic_failure_total = snapshot
+                .deterministic_failure_total
+                .saturating_add(bucket.deterministic_failure);
+        }
+        snapshot.failed_total = snapshot
+            .deliveries_total
+            .saturating_sub(snapshot.delivered_total);
+        snapshot.delivery_success_bps =
+            ratio_basis_points(snapshot.delivered_total, snapshot.deliveries_total);
+        snapshot.retry_recovery_bps = ratio_basis_points(
+            snapshot.retry_recovered_total,
+            snapshot.retry_triggered_total,
+        );
+        snapshot.meets_slo = snapshot
+            .delivery_success_bps
+            .map(|ratio| ratio >= DIRECT_PEER_RETRY_SLO_TARGET_BPS);
+        snapshot.status = if snapshot.deliveries_total == 0 {
+            "idle"
+        } else if snapshot.failed_total >= DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES
+            && snapshot.delivery_success_bps.unwrap_or(0)
+                <= DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS
+        {
+            "failed"
+        } else if snapshot.meets_slo == Some(true) {
+            "healthy"
+        } else {
+            "degraded"
+        }
+        .to_string();
+        snapshot
+    }
+}
+
+fn ratio_basis_points(numerator: u64, denominator: u64) -> Option<u16> {
+    if denominator == 0 {
+        return None;
+    }
+    let basis_points = (u128::from(numerator).saturating_mul(10_000)) / u128::from(denominator);
+    Some(basis_points.min(10_000) as u16)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,6 +1021,7 @@ pub struct ChatRelayService {
     pull_cursor_key: [u8; 32],
     dedup: MessageDedup,
     peer_status: RwLock<ChatRelayPeerStatus>,
+    direct_peer_retry_slo: Mutex<DirectPeerRetrySloWindow>,
     maintenance_status: RwLock<ChatRelayMaintenanceStatus>,
     /// In-memory wallet → session routing table.
     ///
@@ -851,6 +1060,7 @@ impl ChatRelayService {
             pull_cursor_key,
             dedup: MessageDedup::new(dedup_capacity),
             peer_status: RwLock::new(ChatRelayPeerStatus::new(relay_enabled)),
+            direct_peer_retry_slo: Mutex::new(DirectPeerRetrySloWindow::default()),
             maintenance_status: RwLock::new(ChatRelayMaintenanceStatus::default()),
             // v1.3.0-Sovereign: initialise empty route cache
             wallet_routes: Arc::new(WalletRouteCache::new()),
@@ -2731,8 +2941,9 @@ impl ChatRelayService {
     /// `retry_triggered` means a second exact request was sent. A triggered
     /// retry is classified as either recovered or exhausted. Independently,
     /// `final_failure_deterministic` records that the final typed failure was
-    /// not eligible for another ambiguity retry. Successful first attempts do
-    /// not change this snapshot.
+    /// not eligible for another ambiguity retry. Every delivery updates the
+    /// recent SLO window, while successful first attempts leave the lifetime
+    /// exception counters unchanged.
     ///
     /// [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] Parameters are
     /// deliberately aggregate booleans. Do not extend this API with peer,
@@ -2745,6 +2956,15 @@ impl ChatRelayService {
         final_failure_deterministic: bool,
     ) {
         debug_assert!(!(delivery_succeeded && final_failure_deterministic));
+        // [DIRECT-RELAY-SLO 2026-08-15 by Codex] Every v3 delivery contributes
+        // exactly one aggregate sample, including successful first attempts.
+        // The fixed ring retains no event identity or peer dimension.
+        self.direct_peer_retry_slo.lock().record(
+            now,
+            retry_triggered,
+            delivery_succeeded,
+            final_failure_deterministic,
+        );
         if !retry_triggered && !final_failure_deterministic {
             return;
         }
@@ -2913,7 +3133,12 @@ impl ChatRelayService {
     /// Returns a privacy-safe node-to-node relay health snapshot.
     #[must_use]
     pub fn peer_status(&self) -> ChatRelayPeerStatus {
-        self.peer_status.read().clone()
+        // Snapshot the ring before cloning status; no code path holds both
+        // locks concurrently, keeping the telemetry path deadlock-free.
+        let recent_window = self.direct_peer_retry_slo.lock().snapshot(now_secs());
+        let mut status = self.peer_status.read().clone();
+        status.direct_peer_retry.recent_window = recent_window;
+        status
     }
 
     /// Returns aggregate TTL cleanup execution evidence.
@@ -3194,16 +3419,52 @@ mod tests {
     }
 
     #[test]
+    fn direct_peer_retry_health_preserves_nested_rolling_compatibility() {
+        let svc = make_service();
+        svc.record_direct_peer_retry_observation(1_800_000_051, true, true, false);
+        let mut encoded = serde_json::to_value(svc.peer_status()).expect("serialize peer status");
+        let retry = encoded
+            .get_mut("direct_peer_retry")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("direct peer retry JSON object");
+        let recent = retry
+            .get("recent_window")
+            .and_then(serde_json::Value::as_object)
+            .expect("recent delivery SLO JSON object");
+        assert_eq!(recent.get("window_seconds"), Some(&serde_json::json!(300)));
+        assert_eq!(recent.get("deliveries_total"), Some(&serde_json::json!(1)));
+        assert_eq!(recent.get("status"), Some(&serde_json::json!("healthy")));
+        retry.remove("recent_window");
+
+        // [DIRECT-RELAY-RETRY-SLO 2026-08-15 by Codex] Nodes may first learn
+        // the lifetime retry counters and only later learn the rolling SLO.
+        // Missing additive nested health must therefore deserialize as idle.
+        let decoded: ChatRelayPeerStatus =
+            serde_json::from_value(encoded).expect("deserialize pre-SLO peer status");
+        assert_eq!(decoded.direct_peer_retry.retry_triggered_total, 1);
+        assert_eq!(
+            decoded.direct_peer_retry.recent_window,
+            ChatRelayDirectPeerSloStatus::default()
+        );
+    }
+
+    #[test]
     fn direct_peer_retry_health_tracks_recovery_exhaustion_and_determinism() {
         let svc = make_service();
 
         // [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] A normal first
-        // attempt is intentionally invisible to retry telemetry.
+        // attempt is invisible to lifetime exception counters but remains in
+        // the recent delivery SLO denominator.
         svc.record_direct_peer_retry_observation(1_800_000_001, false, true, false);
-        assert_eq!(
-            svc.peer_status().direct_peer_retry,
-            ChatRelayDirectPeerRetryStatus::default()
-        );
+        let retry = svc.peer_status().direct_peer_retry;
+        assert_eq!(retry.retry_triggered_total, 0);
+        assert_eq!(retry.retry_recovered_total, 0);
+        assert_eq!(retry.retry_exhausted_total, 0);
+        assert_eq!(retry.deterministic_failure_total, 0);
+        assert_eq!(retry.recent_window.deliveries_total, 1);
+        assert_eq!(retry.recent_window.delivered_total, 1);
+        assert_eq!(retry.recent_window.delivery_success_bps, Some(10_000));
+        assert_eq!(retry.recent_window.status, "healthy");
 
         svc.record_direct_peer_retry_observation(1_800_000_010, true, true, false);
         svc.record_direct_peer_retry_observation(1_800_000_020, true, false, true);
@@ -3220,6 +3481,52 @@ mod tests {
         );
         assert_eq!(retry.last_outcome.as_deref(), Some("deterministic_failure"));
         assert_eq!(retry.last_at, Some(1_800_000_030));
+        assert_eq!(retry.recent_window.deliveries_total, 4);
+        assert_eq!(retry.recent_window.delivered_total, 2);
+        assert_eq!(retry.recent_window.failed_total, 2);
+        assert_eq!(retry.recent_window.delivery_success_bps, Some(5_000));
+        assert_eq!(retry.recent_window.retry_recovery_bps, Some(5_000));
+        assert_eq!(retry.recent_window.meets_slo, Some(false));
+        assert_eq!(retry.recent_window.status, "degraded");
+    }
+
+    #[test]
+    fn direct_peer_retry_slo_window_expires_and_requires_repeated_failure() {
+        let mut window = DirectPeerRetrySloWindow::default();
+        let base = 1_800_000_000;
+
+        window.record(base, false, true, false);
+        window.record(base + 1, true, true, false);
+        let healthy = window.snapshot(base + 2);
+        assert_eq!(healthy.deliveries_total, 2);
+        assert_eq!(healthy.delivery_success_bps, Some(10_000));
+        assert_eq!(healthy.retry_recovery_bps, Some(10_000));
+        assert_eq!(healthy.meets_slo, Some(true));
+        assert_eq!(healthy.status, "healthy");
+
+        window.record(base + 61, false, false, true);
+        let one_failure = window.snapshot(base + 61);
+        assert_eq!(one_failure.failed_total, 1);
+        assert_eq!(one_failure.status, "degraded");
+
+        window.record(base + 62, true, false, false);
+        window.record(base + 63, true, false, true);
+        let failed = window.snapshot(base + 64);
+        assert_eq!(failed.deliveries_total, 5);
+        assert_eq!(failed.delivered_total, 2);
+        assert_eq!(failed.failed_total, 3);
+        assert_eq!(failed.delivery_success_bps, Some(4_000));
+        assert_eq!(failed.retry_triggered_total, 3);
+        assert_eq!(failed.retry_recovered_total, 1);
+        assert_eq!(failed.retry_exhausted_total, 2);
+        assert_eq!(failed.deterministic_failure_total, 2);
+        assert_eq!(failed.status, "failed");
+
+        let expired = window.snapshot(base + DIRECT_PEER_RETRY_SLO_WINDOW_SECS + 61);
+        assert_eq!(expired.deliveries_total, 0);
+        assert_eq!(expired.delivery_success_bps, None);
+        assert_eq!(expired.meets_slo, None);
+        assert_eq!(expired.status, "idle");
     }
 
     #[test]
