@@ -67,6 +67,9 @@
 //! - [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] Applies a bounded
 //!   per-node fairness ceiling only after direct-relay v2 authentication while
 //!   retaining the global parser-front ceiling against identity rotation
+//! - [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Signs a privacy-minimal
+//!   receipt after durable direct-relay v2 acceptance so the sender can verify
+//!   the selected target node, exact request, and fresh custody evidence
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -168,6 +171,9 @@
 //!   Invalid signatures must not create or mutate node buckets. Keep the
 //!   process-global parser-front ceiling because permissionless node keys are
 //!   not Sybil resistance.
+//! - A direct-relay receipt proves only that one node accepted one opaque
+//!   authenticated request into durable custody. It must never include user,
+//!   receiver, message-id, online-state, endpoint, or payload-size fields.
 //! - Next-hop acknowledgement bodies are untrusted and must use the shared
 //!   bounded decoder. Never call `Response::json()` directly on peer traffic.
 //! - Durable queue count/byte exhaustion is a retryable capacity condition,
@@ -227,6 +233,8 @@
 //!   node bucket or mutate that node's route reputation/quarantine state.
 //!
 //! ## Last Modified
+//! v0.47.0-DirectRelayReceiptV2 - Sign exact target-authored durable-custody
+//! evidence for descriptor-negotiated direct relay v2 responses
 //! v0.46.0-AuthenticatedPeerFairness - Add bounded post-signature per-node
 //! admission while retaining global parser-front protection
 //! v0.45.0-DirectRelayAuthV2 - Authenticate direct relay previous-hop node
@@ -325,6 +333,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
@@ -369,6 +378,22 @@ const PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// Domain separator for the direct peer-relay v2 node-auth signature.
 const PEER_CHAT_RELAY_AUTH_V2_DOMAIN: &[u8] = b"AeroNyx/peer-chat-relay-auth/v2";
+
+/// Domain separator for exact direct peer-relay request commitments.
+const PEER_CHAT_RELAY_REQUEST_COMMITMENT_V2_DOMAIN: &[u8] =
+    b"AeroNyx/peer-chat-relay-request-commitment/v2";
+
+/// Domain separator for target-authored direct peer-relay receipts.
+const PEER_CHAT_RELAY_RECEIPT_V2_DOMAIN: &[u8] = b"AeroNyx/peer-chat-relay-receipt/v2";
+
+/// Current direct peer-relay durable receipt version.
+const PEER_CHAT_RELAY_RECEIPT_V2_VERSION: u8 = 2;
+
+/// Direct receipts are online acknowledgements, not durable bearer tokens.
+const PEER_CHAT_RELAY_RECEIPT_MAX_AGE_SECS: u64 = 120;
+
+/// Small clock-skew allowance for a target node whose clock is ahead.
+const PEER_CHAT_RELAY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 /// Maximum ordinary peer-relay requests allowed in parser/handler execution.
 const MAX_IN_FLIGHT_PEER_CHAT_REQUESTS: usize = 64;
@@ -998,6 +1023,27 @@ impl PeerChatRelayRequestV2 {
             .verify(&signing_data, &self.previous_hop_signature)
             .is_ok()
     }
+
+    /// Returns a commitment to the complete authenticated request.
+    pub fn request_commitment(&self) -> Result<[u8; 32], bincode::Error> {
+        let signing_data =
+            peer_chat_relay_auth_v2_signing_data(&self.previous_hop_node_id, &self.envelope)?;
+        let mut hasher = Sha256::new();
+        hasher.update(PEER_CHAT_RELAY_REQUEST_COMMITMENT_V2_DOMAIN);
+        hasher.update((signing_data.len() as u64).to_be_bytes());
+        hasher.update(signing_data);
+        hasher.update(self.previous_hop_signature);
+        Ok(hasher.finalize().into())
+    }
+
+    /// Authenticates the previous hop and returns the exact request commitment.
+    #[must_use]
+    pub fn verified_request_commitment(&self) -> Option<[u8; 32]> {
+        if !self.verify_previous_hop() {
+            return None;
+        }
+        self.request_commitment().ok()
+    }
 }
 
 fn peer_chat_relay_auth_v2_signing_data(
@@ -1044,6 +1090,97 @@ pub struct PeerChatRelayResponse {
     pub delivered_online: usize,
     /// Whether the node accepted durable custody of the opaque envelope.
     pub stored_pending: bool,
+}
+
+/// Target-signed proof of direct relay v2 durable ciphertext acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerChatRelayReceiptV2 {
+    /// Receipt contract version.
+    pub version: u8,
+    /// SHA-256 commitment to the exact authenticated v2 request.
+    pub request_commitment: [u8; 32],
+    /// Ed25519 identity of the node that accepted durable custody.
+    pub accepting_node_id: [u8; 32],
+    /// Node wall-clock time when durable acceptance completed.
+    pub accepted_at: u64,
+    /// Target-node signature over every preceding receipt field.
+    #[serde(with = "peer_relay_signature_serde")]
+    pub signature: [u8; 64],
+}
+
+impl PeerChatRelayReceiptV2 {
+    /// Creates a receipt after durable acceptance has already succeeded.
+    #[must_use]
+    pub fn accepted(
+        request_commitment: [u8; 32],
+        accepted_at: u64,
+        node_identity: &IdentityKeyPair,
+    ) -> Self {
+        let mut receipt = Self {
+            version: PEER_CHAT_RELAY_RECEIPT_V2_VERSION,
+            request_commitment,
+            accepting_node_id: node_identity.public_key_bytes(),
+            accepted_at,
+            signature: [0u8; 64],
+        };
+        receipt.signature = node_identity.sign(&receipt.signing_data());
+        receipt
+    }
+
+    /// Verifies signature, target binding, request commitment, and freshness.
+    pub fn verify_expected(
+        &self,
+        request: &PeerChatRelayRequestV2,
+        expected_node_id: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<(), &'static str> {
+        if self.version != PEER_CHAT_RELAY_RECEIPT_V2_VERSION {
+            return Err("receipt_version_invalid");
+        }
+        if &self.accepting_node_id != expected_node_id {
+            return Err("receipt_binding_invalid");
+        }
+        let public_key = IdentityPublicKey::from_bytes(&self.accepting_node_id)
+            .map_err(|_| "receipt_signature_invalid")?;
+        public_key
+            .verify(&self.signing_data(), &self.signature)
+            .map_err(|_| "receipt_signature_invalid")?;
+        if request.request_commitment().ok() != Some(self.request_commitment) {
+            return Err("receipt_binding_invalid");
+        }
+        if self.accepted_at
+            > observed_at.saturating_add(PEER_CHAT_RELAY_RECEIPT_MAX_FUTURE_SKEW_SECS)
+        {
+            return Err("receipt_timestamp_in_future");
+        }
+        if observed_at.saturating_sub(self.accepted_at) > PEER_CHAT_RELAY_RECEIPT_MAX_AGE_SECS {
+            return Err("receipt_timestamp_expired");
+        }
+        Ok(())
+    }
+
+    fn signing_data(&self) -> Vec<u8> {
+        let mut data =
+            Vec::with_capacity(PEER_CHAT_RELAY_RECEIPT_V2_DOMAIN.len() + 1 + 32 + 32 + 8);
+        data.extend_from_slice(PEER_CHAT_RELAY_RECEIPT_V2_DOMAIN);
+        data.push(self.version);
+        data.extend_from_slice(&self.request_commitment);
+        data.extend_from_slice(&self.accepting_node_id);
+        data.extend_from_slice(&self.accepted_at.to_be_bytes());
+        data
+    }
+}
+
+/// Direct relay v2 response. Flattening preserves the legacy JSON fields so a
+/// request-auth-only v2 sender can ignore the independently negotiated receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerChatRelayResponseV2 {
+    /// Privacy-normalized direct relay acceptance fields.
+    #[serde(flatten)]
+    pub relay: PeerChatRelayResponse,
+    /// Target-signed durable-custody evidence on successful acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<PeerChatRelayReceiptV2>,
 }
 
 /// Node-to-node blind relay request.
@@ -1448,19 +1585,52 @@ async fn peer_relay_v2_handler(
     // [DIRECT-RELAY-AUTH-V2 2026-08-15 by Codex] Authenticate the immediate
     // node before the inner envelope reaches durable storage. Invalid claims
     // affect only aggregate health and cannot poison another node's identity.
-    if !request.verify_previous_hop() {
+    let Some(request_commitment) = request.verified_request_commitment() else {
         if let Some(relay) = state.chat_relay.as_ref() {
             relay.record_peer_relay_inbound_rejected(now_secs(), "peer_auth_invalid");
         }
         return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
-    }
+    };
 
     if !gate.admit_authenticated(request.previous_hop_node_id, Instant::now()) {
         gate.record_rejected("peer_auth_rate_limited");
         return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    peer_relay_response(state, request.envelope).await
+    let node_identity = Arc::clone(&state.node_identity);
+    match process_peer_relay(state, request.envelope).await {
+        Ok(relay) => {
+            // [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Sign only after
+            // `process_peer_relay` has established durable custody. The
+            // commitment was computed from the already authenticated request.
+            let receipt = PeerChatRelayReceiptV2::accepted(
+                request_commitment,
+                now_secs(),
+                node_identity.as_ref(),
+            );
+            (
+                StatusCode::OK,
+                Json(PeerChatRelayResponseV2 {
+                    relay,
+                    receipt: Some(receipt),
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            error.status_code(),
+            Json(PeerChatRelayResponseV2 {
+                relay: PeerChatRelayResponse {
+                    accepted: false,
+                    duplicate: false,
+                    delivered_online: 0,
+                    stored_pending: false,
+                },
+                receipt: None,
+            }),
+        )
+            .into_response(),
+    }
 }
 
 async fn peer_relay_response(state: ChatPeerState, envelope: ChatEnvelope) -> Response {
@@ -3015,6 +3185,89 @@ mod tests {
     }
 
     #[test]
+    fn direct_peer_relay_receipt_binds_request_target_signature_and_freshness() {
+        // [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Every receipt is
+        // usable only for the exact authenticated request and selected node,
+        // within the short online acknowledgement window.
+        let previous_hop = IdentityKeyPair::generate();
+        let target = IdentityKeyPair::generate();
+        let observed_at = 1_800_000_000u64;
+        let request =
+            PeerChatRelayRequestV2::sign(signed_envelope_at(observed_at), &previous_hop).unwrap();
+        let receipt = PeerChatRelayReceiptV2::accepted(
+            request.request_commitment().unwrap(),
+            observed_at,
+            &target,
+        );
+
+        assert_eq!(
+            receipt.verify_expected(&request, &target.public_key_bytes(), observed_at),
+            Ok(())
+        );
+
+        let wrong_target = IdentityKeyPair::generate();
+        assert_eq!(
+            receipt.verify_expected(&request, &wrong_target.public_key_bytes(), observed_at),
+            Err("receipt_binding_invalid")
+        );
+
+        let other_request = PeerChatRelayRequestV2::sign(
+            signed_envelope_at(observed_at.saturating_add(1)),
+            &previous_hop,
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.verify_expected(&other_request, &target.public_key_bytes(), observed_at),
+            Err("receipt_binding_invalid")
+        );
+
+        let mut forged = receipt.clone();
+        forged.signature[0] ^= 0x01;
+        assert_eq!(
+            forged.verify_expected(&request, &target.public_key_bytes(), observed_at),
+            Err("receipt_signature_invalid")
+        );
+
+        let expired = PeerChatRelayReceiptV2::accepted(
+            request.request_commitment().unwrap(),
+            observed_at.saturating_sub(PEER_CHAT_RELAY_RECEIPT_MAX_AGE_SECS + 1),
+            &target,
+        );
+        assert_eq!(
+            expired.verify_expected(&request, &target.public_key_bytes(), observed_at),
+            Err("receipt_timestamp_expired")
+        );
+
+        let future = PeerChatRelayReceiptV2::accepted(
+            request.request_commitment().unwrap(),
+            observed_at.saturating_add(PEER_CHAT_RELAY_RECEIPT_MAX_FUTURE_SKEW_SECS + 1),
+            &target,
+        );
+        assert_eq!(
+            future.verify_expected(&request, &target.public_key_bytes(), observed_at),
+            Err("receipt_timestamp_in_future")
+        );
+
+        let encoded = serde_json::to_value(PeerChatRelayResponseV2 {
+            relay: durable_peer_acceptance_response(),
+            receipt: Some(receipt),
+        })
+        .unwrap();
+        let object = encoded.as_object().unwrap();
+        assert_eq!(object.len(), 5);
+        assert!(object.contains_key("receipt"));
+        for forbidden in [
+            "receiver",
+            "message_id",
+            "online",
+            "endpoint",
+            "payload_size",
+        ] {
+            assert!(!object.contains_key(forbidden));
+        }
+    }
+
+    #[test]
     fn delayed_receipt_validation_uses_response_observation_time() {
         // [RELAY-RESPONSE-OBSERVATION-TIME 2026-08-11 by Codex] A valid ACK
         // produced after a long request must be compared with response time,
@@ -3797,12 +4050,14 @@ mod tests {
         let mut tampered = request.clone();
         tampered.envelope.ciphertext[0] ^= 0x01;
 
+        let target_identity = Arc::new(IdentityKeyPair::generate());
+        let target_node_id = target_identity.public_key_bytes();
         let app = build_chat_peer_router(
             Some(Arc::clone(&relay)),
             sessions,
             udp,
             Arc::new(PeerStore::new()),
-            Arc::new(IdentityKeyPair::generate()),
+            Arc::clone(&target_identity),
             Arc::new(reqwest::Client::new()),
             None,
         );
@@ -3846,6 +4101,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(accepted_response.status(), StatusCode::OK);
+        let accepted_response: PeerChatRelayResponseV2 = serde_json::from_slice(
+            &to_bytes(accepted_response.into_body(), PEER_ACK_RESPONSE_MAX_BYTES)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(accepted_response.relay, durable_peer_acceptance_response());
+        accepted_response
+            .receipt
+            .expect("authenticated direct relay should return signed custody evidence")
+            .verify_expected(&request, &target_node_id, now_secs())
+            .expect("receipt should bind the exact request to the target node");
         assert_eq!(
             relay
                 .pull_pending(&receiver, 0, &[0u8; 16], 10)

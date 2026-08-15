@@ -156,8 +156,13 @@
 //! - [DIRECT-RELAY-AUTH-V2 2026-08-15 by Codex] Direct relay node
 //!   authentication is advertised as one signed feature token so upgraded
 //!   senders cannot be redirected to a weaker endpoint by an HTTP response.
+//! - [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Target-signed direct relay
+//!   receipts use a separate feature token, preserving rolling compatibility
+//!   with nodes that authenticate requests but do not yet sign durable ACKs.
 //!
 //! ## Last Modified
+//! v0.26.0-DirectRelayReceiptV2 - Added signed negotiation for target-authored
+//! direct encrypted relay durable-custody receipts
 //! v0.25.0-DirectRelayAuthV2 - Added signed rolling-upgrade negotiation for
 //! immediate-node-authenticated direct encrypted relay requests
 //! v0.24.0-SignedReceiptNegotiation - Added a descriptor-bound purpose-receipt
@@ -395,14 +400,22 @@ pub enum NodeProtocolFeature {
     /// signed SemVer metadata so upgraded senders can select the authenticated
     /// endpoint without breaking rolling compatibility with legacy nodes.
     DirectPeerRelayAuthV2,
+    /// The node returns a target-signed direct relay v2 receipt bound to the
+    /// exact authenticated request after durable ciphertext acceptance.
+    ///
+    /// [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] This is intentionally
+    /// separate from request authentication so mixed-version v2 fleets can
+    /// upgrade the response contract without treating HTTP claims as trust.
+    DirectPeerRelayReceiptV2,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::BlindRelayFailureReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
         Self::DirectPeerRelayAuthV2,
+        Self::DirectPeerRelayReceiptV2,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -412,6 +425,7 @@ impl NodeProtocolFeature {
             Self::BlindRelayFailureReceiptV1 => "anpf1-brfr1",
             Self::PurposeBoundDeliveryReceiptV2 => "anpf1-pbdr2",
             Self::DirectPeerRelayAuthV2 => "anpf1-dpra2",
+            Self::DirectPeerRelayReceiptV2 => "anpf1-dprr2",
         }
     }
 }
@@ -3973,21 +3987,24 @@ mod tests {
         let failure_receipt = NodeProtocolFeature::BlindRelayFailureReceiptV1;
         let purpose_receipt = NodeProtocolFeature::PurposeBoundDeliveryReceiptV2;
         let direct_relay_auth = NodeProtocolFeature::DirectPeerRelayAuthV2;
+        let direct_relay_receipt = NodeProtocolFeature::DirectPeerRelayReceiptV2;
         let descriptor = descriptor_for(&identity).with_protocol_features([
             purpose_receipt,
             failure_receipt,
             direct_relay_auth,
+            direct_relay_receipt,
             purpose_receipt,
         ]);
 
         assert_eq!(descriptor.schema_version, NODE_DESCRIPTOR_SCHEMA_VERSION);
         assert_eq!(
             descriptor.software_version,
-            "test+anpf1-brfr1.anpf1-dpra2.anpf1-pbdr2"
+            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-pbdr2"
         );
         assert!(descriptor.advertises_protocol_feature(failure_receipt));
         assert!(descriptor.advertises_protocol_feature(purpose_receipt));
         assert!(descriptor.advertises_protocol_feature(direct_relay_auth));
+        assert!(descriptor.advertises_protocol_feature(direct_relay_receipt));
 
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
         let encoded = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {
@@ -4008,6 +4025,9 @@ mod tests {
         assert!(descriptor
             .descriptor
             .advertises_protocol_feature(direct_relay_auth));
+        assert!(descriptor
+            .descriptor
+            .advertises_protocol_feature(direct_relay_receipt));
 
         let mut stripped = signed;
         stripped.descriptor.software_version = "test".to_string();

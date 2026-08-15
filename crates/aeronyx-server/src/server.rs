@@ -508,8 +508,15 @@
 //   - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Never turn an
 //     explicitly enabled Chat Relay initialization failure into `None`.
 //     Capability readiness and the configured service contract must agree.
+//   - [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] HTTP success is not
+//     durable custody. When the signed target descriptor advertises receipt
+//     v2, require a fresh target signature bound to the exact authenticated
+//     request before route health records success. Legacy negotiation remains
+//     descriptor-driven and must never be inferred from an HTTP response.
 //
 // Last Modified:
+//   [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Added target-signed direct
+//     relay durable-custody evidence with explicit rolling compatibility.
 //   [CHAT-SESSION-SENDER-BINDING 2026-08-15 by Codex] Bound every accepted
 //     client ChatRelay sender to its authenticated VPN session identity.
 //   [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Made configured Chat
@@ -798,7 +805,7 @@ use crate::api::blind_vault::build_blind_vault_router;
 use crate::api::chat_handlers::build_chat_router;
 use crate::api::chat_peer::{
     build_chat_peer_router, PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
-    PeerChatRelayRequestV2, PeerChatRelayResponse,
+    PeerChatRelayRequestV2, PeerChatRelayResponse, PeerChatRelayResponseV2,
 };
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
@@ -10909,6 +10916,53 @@ impl Server {
         outcome
     }
 
+    /// Validates durable peer custody before route health records success.
+    ///
+    /// [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Signed receipts are
+    /// required only when the selected descriptor advertises that contract;
+    /// rolling auth-only v2 and legacy v1 peers retain their response shape.
+    async fn validate_direct_peer_relay_ack(
+        response: reqwest::Response,
+        authenticated_request: Option<&PeerChatRelayRequestV2>,
+        expected_node_id: &[u8; 32],
+        require_signed_receipt: bool,
+        observed_at: u64,
+    ) -> std::result::Result<(), String> {
+        if require_signed_receipt {
+            let request = authenticated_request
+                .ok_or_else(|| "peer_relay_receipt_request_missing".to_string())?;
+            let response = decode_bounded_json_response::<PeerChatRelayResponseV2>(
+                response,
+                PEER_ACK_RESPONSE_MAX_BYTES,
+            )
+            .await
+            .map_err(|error| format!("peer_relay_ack_{}", error.as_str()))?;
+            if !response.relay.accepted || !response.relay.stored_pending {
+                return Err("peer_relay_ack_rejected".to_string());
+            }
+            let receipt = response
+                .receipt
+                .as_ref()
+                .ok_or_else(|| "peer_relay_receipt_missing".to_string())?;
+            receipt
+                .verify_expected(request, expected_node_id, observed_at)
+                .map_err(|reason| format!("peer_relay_{reason}"))?;
+            return Ok(());
+        }
+
+        let response = decode_bounded_json_response::<PeerChatRelayResponse>(
+            response,
+            PEER_ACK_RESPONSE_MAX_BYTES,
+        )
+        .await
+        .map_err(|error| format!("peer_relay_ack_{}", error.as_str()))?;
+        if response.accepted && response.stored_pending {
+            Ok(())
+        } else {
+            Err("peer_relay_ack_rejected".to_string())
+        }
+    }
+
     async fn relay_chat_envelope_to_discovered_peers(
         client: Option<&reqwest::Client>,
         relay: Option<&ChatRelayService>,
@@ -10934,11 +10988,8 @@ impl Server {
         let mut last_failure_reason: Option<String> = None;
 
         let excluded_node_ids = [node_identity.public_key_bytes()];
-        let authenticated_request = PeerChatRelayRequestV2::sign(
-            envelope.clone(),
-            node_identity,
-        )
-        .ok();
+        let authenticated_request =
+            PeerChatRelayRequestV2::sign(envelope.clone(), node_identity).ok();
         for peer in peer_store
             .route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
@@ -10964,6 +11015,10 @@ impl Server {
             let use_authenticated_relay = peer
                 .descriptor
                 .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayAuthV2);
+            let require_signed_receipt = use_authenticated_relay
+                && peer
+                    .descriptor
+                    .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayReceiptV2);
             let url = if use_authenticated_relay {
                 Self::chat_peer_relay_v2_url(endpoint)
             } else {
@@ -11003,39 +11058,29 @@ impl Server {
 
             match response {
                 Ok(response) if response.status().is_success() => {
-                    match decode_bounded_json_response::<PeerChatRelayResponse>(
+                    let observed_at = unix_now_secs();
+                    match Self::validate_direct_peer_relay_ack(
                         response,
-                        PEER_ACK_RESPONSE_MAX_BYTES,
+                        authenticated_request.as_ref(),
+                        &peer.node_id(),
+                        require_signed_receipt,
+                        observed_at,
                     )
                     .await
                     {
-                        Ok(ack) if ack.accepted => {
+                        Ok(()) => {
                             accepted += 1;
-                            let _ =
-                                peer_store.record_route_forward_success_for_descriptor(&peer, now);
+                            let _ = peer_store
+                                .record_route_forward_success_for_descriptor(&peer, observed_at);
                         }
-                        Ok(_ack) => {
-                            let reason = "peer_relay_ack_rejected".to_string();
+                        Err(reason) => {
                             let _ = peer_store.record_route_forward_failure_for_descriptor(
                                 &peer,
-                                now,
+                                observed_at,
                                 reason.clone(),
                             );
-                            last_failure_reason = Some(reason);
-                            debug!("[CHAT_RELAY] Peer relay ACK rejected encrypted envelope");
-                        }
-                        Err(error) => {
-                            let reason = format!("peer_relay_ack_{}", error.as_str());
-                            let _ = peer_store.record_route_forward_failure_for_descriptor(
-                                &peer,
-                                now,
-                                reason.clone(),
-                            );
-                            last_failure_reason = Some(reason);
-                            debug!(
-                                reason = error.as_str(),
-                                "[CHAT_RELAY] Peer relay ACK rejected"
-                            );
+                            last_failure_reason = Some(reason.clone());
+                            debug!(reason, "[CHAT_RELAY] Peer relay ACK rejected");
                         }
                     }
                 }
@@ -11412,6 +11457,7 @@ impl Server {
             NodeProtocolFeature::BlindRelayFailureReceiptV1,
             NodeProtocolFeature::PurposeBoundDeliveryReceiptV2,
             NodeProtocolFeature::DirectPeerRelayAuthV2,
+            NodeProtocolFeature::DirectPeerRelayReceiptV2,
         ]);
 
         descriptor.public_endpoint = config
@@ -13791,8 +13837,9 @@ mod tests {
     use std::os::unix::net::UnixDatagram;
 
     use crate::api::chat_peer::{
-        PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayRequest,
-        PeerChatRelayRequestV2, PeerChatRelayResponse,
+        PeerBlindRelayRequest, PeerBlindRelayResponse, PeerChatRelayReceiptV2,
+        PeerChatRelayRequest, PeerChatRelayRequestV2, PeerChatRelayResponse,
+        PeerChatRelayResponseV2,
     };
     use crate::api::discovery::GossipResponse;
     use crate::config::{DiscoveryConfig, ServerConfig};
@@ -15558,6 +15605,24 @@ mod tests {
         features: &[NodeProtocolFeature],
     ) -> SignedNodeDescriptor {
         let peer_identity = IdentityKeyPair::generate();
+        signed_chat_relay_peer_descriptor_for_identity(
+            endpoint,
+            sequence,
+            expires_at,
+            features,
+            &peer_identity,
+        )
+    }
+
+    fn signed_chat_relay_peer_descriptor_for_identity(
+        endpoint: String,
+        sequence: u64,
+        expires_at: u64,
+        features: &[NodeProtocolFeature],
+        peer_identity: &IdentityKeyPair,
+    ) -> SignedNodeDescriptor {
+        // [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Receipt tests need the
+        // signed descriptor and HTTP ACK to share one explicit target identity.
         let mut descriptor = NodeDescriptor::new(
             peer_identity.public_key_bytes(),
             sequence,
@@ -15573,7 +15638,7 @@ mod tests {
             max_bps: None,
             max_pps: None,
         };
-        SignedNodeDescriptor::sign(descriptor, &peer_identity).unwrap()
+        SignedNodeDescriptor::sign(descriptor, peer_identity).unwrap()
     }
 
     fn signed_probe_peer_descriptor(
@@ -16767,6 +16832,9 @@ mod tests {
         assert!(signed
             .descriptor
             .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayAuthV2));
+        assert!(signed
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayReceiptV2));
         assert_eq!(
             signed.descriptor.capacity.max_sessions,
             server.config.max_sessions() as u32
@@ -17840,7 +17908,161 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovered_chat_relay_peer_rejected_ack_marks_route_failure() {
+    async fn discovered_chat_relay_requires_signed_receipt_when_advertised() {
+        // [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] The descriptor and
+        // custody acknowledgement share the selected target identity; route
+        // success is recorded only after that signature and request binding.
+        let target_identity = Arc::new(IdentityKeyPair::generate());
+        let identity_for_handler = Arc::clone(&target_identity);
+        let app = Router::new().route(
+            "/api/chat/peer/relay-v2",
+            post(move |Json(request): Json<PeerChatRelayRequestV2>| {
+                let identity_for_handler = Arc::clone(&identity_for_handler);
+                async move {
+                    let commitment = request
+                        .verified_request_commitment()
+                        .expect("source-authenticated request should verify");
+                    Json(PeerChatRelayResponseV2 {
+                        relay: PeerChatRelayResponse {
+                            accepted: true,
+                            duplicate: false,
+                            delivered_online: 0,
+                            stored_pending: true,
+                        },
+                        receipt: Some(PeerChatRelayReceiptV2::accepted(
+                            commitment,
+                            unix_now_secs(),
+                            identity_for_handler.as_ref(),
+                        )),
+                    })
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock_peer = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let now = unix_now_secs();
+        let peer_store = PeerStore::new();
+        let peer_descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            endpoint,
+            now.saturating_sub(1),
+            now + 300,
+            &[
+                NodeProtocolFeature::DirectPeerRelayAuthV2,
+                NodeProtocolFeature::DirectPeerRelayReceiptV2,
+            ],
+            target_identity.as_ref(),
+        );
+        let peer_node_id = peer_descriptor.node_id();
+        peer_store
+            .upsert_verified(peer_descriptor, now)
+            .expect("receipt-capable peer descriptor should verify");
+        peer_store.record_route_forward_success(&peer_node_id, now.saturating_sub(1));
+
+        let accepted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(&reqwest::Client::new()),
+            None,
+            &peer_store,
+            &IdentityKeyPair::generate(),
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+
+        assert_eq!(accepted, 1);
+        let row = peer_store
+            .route_candidate_status(now + 1)
+            .chat_relay
+            .into_iter()
+            .find(|row| row.node_id_prefix == hex::encode(&peer_node_id[..4]))
+            .expect("receipt-capable peer should remain visible");
+        assert_eq!(row.route_health, "healthy");
+        assert_eq!(row.route_consecutive_failures, 0);
+        mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn discovered_chat_relay_rejects_forged_signed_receipt() {
+        let target_identity = Arc::new(IdentityKeyPair::generate());
+        let identity_for_handler = Arc::clone(&target_identity);
+        let app = Router::new().route(
+            "/api/chat/peer/relay-v2",
+            post(move |Json(request): Json<PeerChatRelayRequestV2>| {
+                let identity_for_handler = Arc::clone(&identity_for_handler);
+                async move {
+                    let commitment = request.request_commitment().unwrap();
+                    let mut receipt = PeerChatRelayReceiptV2::accepted(
+                        commitment,
+                        unix_now_secs(),
+                        identity_for_handler.as_ref(),
+                    );
+                    receipt.signature[0] ^= 0x01;
+                    Json(PeerChatRelayResponseV2 {
+                        relay: PeerChatRelayResponse {
+                            accepted: true,
+                            duplicate: false,
+                            delivered_online: 0,
+                            stored_pending: true,
+                        },
+                        receipt: Some(receipt),
+                    })
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock_peer = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let now = unix_now_secs();
+        let peer_store = PeerStore::new();
+        let peer_descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            endpoint,
+            now.saturating_sub(1),
+            now + 300,
+            &[
+                NodeProtocolFeature::DirectPeerRelayAuthV2,
+                NodeProtocolFeature::DirectPeerRelayReceiptV2,
+            ],
+            target_identity.as_ref(),
+        );
+        let peer_node_id = peer_descriptor.node_id();
+        let peer_prefix = hex::encode(&peer_node_id[..4]);
+        peer_store
+            .upsert_verified(peer_descriptor, now)
+            .expect("receipt-capable peer descriptor should verify");
+        peer_store.record_route_forward_success(&peer_node_id, now.saturating_sub(1));
+
+        let accepted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(&reqwest::Client::new()),
+            None,
+            &peer_store,
+            &IdentityKeyPair::generate(),
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+
+        assert_eq!(accepted, 0);
+        let row = peer_store
+            .route_candidate_status(now + 1)
+            .chat_relay
+            .into_iter()
+            .find(|row| row.node_id_prefix == peer_prefix)
+            .expect("forged-receipt peer should remain visible for diagnostics");
+        assert_eq!(row.route_health, "degraded");
+        assert_eq!(row.route_consecutive_failures, 1);
+        assert_eq!(
+            row.last_route_failure_reason.as_deref(),
+            Some("peer_relay_receipt_signature_invalid")
+        );
+        mock_peer.abort();
+    }
+
+    #[tokio::test]
+    async fn discovered_chat_relay_non_durable_ack_marks_route_failure() {
         let received = Arc::new(AtomicUsize::new(0));
         let received_for_handler = Arc::clone(&received);
         let app = Router::new().route(
@@ -17851,7 +18073,9 @@ mod tests {
                     assert_eq!(request.envelope.message_id, [0x55; 16]);
                     received_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
                     Json(PeerChatRelayResponse {
-                        accepted: false,
+                        // [DIRECT-RELAY-DURABILITY 2026-08-15 by Codex] An
+                        // HTTP acceptance without durable custody is failure.
+                        accepted: true,
                         duplicate: false,
                         delivered_online: 0,
                         stored_pending: false,
