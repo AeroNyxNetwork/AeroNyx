@@ -539,6 +539,9 @@
 //     recovery admits one generation-bound v3 delivery at a time.
 //
 // Last Modified:
+//   [DIRECT-RELAY-CRASH-DRILL 2026-08-15 by Codex] Added a test-only,
+//     multi-process crash/restart drill proving encrypted mailbox custody and
+//     no-downgrade circuit state survive abrupt source-node termination.
 //   [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] Wired source-blind open and
 //     half-open admission into direct relay without protocol downgrade.
 //   [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Extended exact v3 retries
@@ -18833,6 +18836,287 @@ mod tests {
         assert_eq!(recovered_status.last_outbound_attempted, 1);
         v3_node.abort();
         v2_node.abort();
+    }
+
+    const DIRECT_RELAY_RESTART_DRILL_STAGE_ENV: &str =
+        "AERONYX_TEST_DIRECT_RELAY_RESTART_DRILL_STAGE";
+    const DIRECT_RELAY_RESTART_DRILL_DB_ENV: &str = "AERONYX_TEST_DIRECT_RELAY_RESTART_DRILL_DB";
+    const DIRECT_RELAY_RESTART_DRILL_V3_ENV: &str = "AERONYX_TEST_DIRECT_RELAY_RESTART_DRILL_V3";
+    const DIRECT_RELAY_RESTART_DRILL_V2_ENV: &str = "AERONYX_TEST_DIRECT_RELAY_RESTART_DRILL_V2";
+    const DIRECT_RELAY_RESTART_DRILL_WORKER: &str =
+        "server::tests::target_bound_v3_restart_drill_subprocess_worker";
+    const DIRECT_RELAY_RESTART_DRILL_CRASH_EXIT_CODE: i32 = 73;
+
+    async fn run_direct_relay_restart_drill_child(
+        stage: &str,
+        db_path: &std::path::Path,
+        v3_endpoint: Option<&str>,
+        v2_endpoint: Option<&str>,
+    ) -> std::process::Output {
+        // [DIRECT-RELAY-CRASH-DRILL 2026-08-15 by Codex] Re-execute this exact
+        // test binary so each phase owns a genuinely fresh process and no
+        // process-local relay state can cross the restart boundary. Reuse the
+        // production child isolation policy so the drill cannot inherit
+        // systemd readiness, watchdog, or socket-activation authority.
+        let executable = std::env::current_exe().expect("resolve restart drill test binary");
+        let mut child = crate::isolated_child_command(executable);
+        child
+            .arg(DIRECT_RELAY_RESTART_DRILL_WORKER)
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(DIRECT_RELAY_RESTART_DRILL_STAGE_ENV, stage)
+            .env(DIRECT_RELAY_RESTART_DRILL_DB_ENV, db_path)
+            .kill_on_drop(true);
+        if let Some(endpoint) = v3_endpoint {
+            child.env(DIRECT_RELAY_RESTART_DRILL_V3_ENV, endpoint);
+        }
+        if let Some(endpoint) = v2_endpoint {
+            child.env(DIRECT_RELAY_RESTART_DRILL_V2_ENV, endpoint);
+        }
+        tokio::time::timeout(Duration::from_secs(20), child.output())
+            .await
+            .expect("restart drill child exceeded its bounded deadline")
+            .expect("start restart drill child")
+    }
+
+    #[tokio::test]
+    async fn target_bound_v3_circuit_and_custody_survive_abrupt_process_restart() {
+        // [DIRECT-RELAY-CRASH-DRILL 2026-08-15 by Codex] This is deliberately
+        // stronger than dropping and recreating ChatRelayService in one test
+        // process. The seed worker exits without running Rust destructors, then
+        // an independent worker must recover both ciphertext custody and the
+        // source-blind outage gate from the same SQLite database.
+        let directory = tempfile::tempdir().expect("restart drill directory");
+        let db_path = directory.path().join("direct-relay-restart.sqlite3");
+
+        let v3_calls = Arc::new(AtomicUsize::new(0));
+        let v3_calls_for_handler = Arc::clone(&v3_calls);
+        let v3_app = Router::new().route(
+            "/api/chat/peer/relay-v3",
+            post(move || {
+                let v3_calls_for_handler = Arc::clone(&v3_calls_for_handler);
+                async move {
+                    v3_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let v3_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind restart drill v3 target");
+        let v3_endpoint = format!(
+            "http://{}",
+            v3_listener
+                .local_addr()
+                .expect("read restart drill v3 address")
+        );
+        let v3_node = tokio::spawn(async move {
+            axum::serve(v3_listener, v3_app)
+                .await
+                .expect("serve restart drill v3 target");
+        });
+
+        let v2_calls = Arc::new(AtomicUsize::new(0));
+        let v2_calls_for_handler = Arc::clone(&v2_calls);
+        let v2_app = Router::new().route(
+            "/api/chat/peer/relay-v2",
+            post(move || {
+                let v2_calls_for_handler = Arc::clone(&v2_calls_for_handler);
+                async move {
+                    v2_calls_for_handler.fetch_add(1, AtomicOrdering::SeqCst);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let v2_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind restart drill v2 target");
+        let v2_endpoint = format!(
+            "http://{}",
+            v2_listener
+                .local_addr()
+                .expect("read restart drill v2 address")
+        );
+        let v2_node = tokio::spawn(async move {
+            axum::serve(v2_listener, v2_app)
+                .await
+                .expect("serve restart drill v2 target");
+        });
+
+        let crashed =
+            run_direct_relay_restart_drill_child("seed_crash", &db_path, None, None).await;
+        assert_eq!(
+            crashed.status.code(),
+            Some(DIRECT_RELAY_RESTART_DRILL_CRASH_EXIT_CODE),
+            "seed worker must terminate through the intentional crash boundary"
+        );
+
+        let restarted = run_direct_relay_restart_drill_child(
+            "verify_restart",
+            &db_path,
+            Some(&v3_endpoint),
+            Some(&v2_endpoint),
+        )
+        .await;
+        assert!(
+            restarted.status.success(),
+            "fresh worker rejected durable restart invariants with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            restarted.status.code(),
+            String::from_utf8_lossy(&restarted.stdout),
+            String::from_utf8_lossy(&restarted.stderr)
+        );
+        assert_eq!(
+            v3_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "open restart checkpoint must deny v3 network I/O"
+        );
+        assert_eq!(
+            v2_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "open restart checkpoint must not downgrade to v2"
+        );
+
+        v3_node.abort();
+        v2_node.abort();
+        let _ = v3_node.await;
+        let _ = v2_node.await;
+    }
+
+    fn seed_direct_relay_restart_drill_crash(relay: &ChatRelayService) -> ! {
+        let now = unix_now_secs();
+        relay
+            .store_pending(&signed_test_chat_envelope(now))
+            .expect("persist encrypted custody before crash");
+        for offset in 0..3 {
+            let observed_at = now.saturating_add(offset);
+            let permit = relay
+                .begin_direct_peer_delivery(observed_at)
+                .expect("closed circuit should admit failure seed");
+            let allows_more = relay.complete_direct_peer_delivery(
+                observed_at,
+                permit,
+                false,
+                false,
+                true,
+            );
+            assert_eq!(allows_more, offset < 2);
+        }
+        let status = relay.peer_status().direct_peer_retry.circuit;
+        assert_eq!(status.state, "open");
+        assert!(status.restart_protected);
+
+        // [DIRECT-RELAY-CRASH-DRILL 2026-08-15 by Codex] `process::exit`
+        // intentionally skips Rust destructors while preserving committed
+        // SQLite transactions. This is a bounded crash injection, not a
+        // graceful service recreation.
+        std::process::exit(DIRECT_RELAY_RESTART_DRILL_CRASH_EXIT_CODE);
+    }
+
+    async fn verify_direct_relay_restart_drill(relay: &ChatRelayService) {
+        let circuit = relay.peer_status().direct_peer_retry.circuit;
+        assert_eq!(circuit.state, "open");
+        assert!(circuit.restart_protected);
+        assert!(circuit.checkpoint_loaded_at.is_some());
+        assert!(circuit.checkpoint_persisted_at.is_some());
+
+        let receiver = [0x66; 32];
+        let (pending, has_more) = relay
+            .pull_pending(&receiver, 0, &[0; 16], 2)
+            .expect("recover encrypted mailbox after restart");
+        assert_eq!(pending.len(), 1);
+        assert!(!has_more);
+        let recovered_envelope = pending[0].envelope.clone();
+        relay
+            .store_pending(&recovered_envelope)
+            .expect("exact post-restart retry remains idempotent");
+        let (after_retry, has_more) = relay
+            .pull_pending(&receiver, 0, &[0; 16], 2)
+            .expect("read idempotent mailbox after restart");
+        assert_eq!(after_retry.len(), 1);
+        assert!(!has_more);
+
+        let v3_endpoint = std::env::var(DIRECT_RELAY_RESTART_DRILL_V3_ENV)
+            .expect("restart drill v3 endpoint");
+        let v2_endpoint = std::env::var(DIRECT_RELAY_RESTART_DRILL_V2_ENV)
+            .expect("restart drill v2 endpoint");
+        let now = unix_now_secs();
+        let v3_descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            v3_endpoint,
+            now.saturating_sub(1),
+            now.saturating_add(300),
+            &[NodeProtocolFeature::DirectPeerRelayTargetBindingV3],
+            &IdentityKeyPair::generate(),
+        );
+        let v2_descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            v2_endpoint,
+            now.saturating_sub(1),
+            now.saturating_add(300),
+            &[NodeProtocolFeature::DirectPeerRelayAuthV2],
+            &IdentityKeyPair::generate(),
+        );
+        let v3_node_id = v3_descriptor.node_id();
+        let v2_node_id = v2_descriptor.node_id();
+        let peer_store = PeerStore::new();
+        peer_store
+            .upsert_verified(v3_descriptor, now)
+            .expect("install restart drill v3 descriptor");
+        peer_store
+            .upsert_verified(v2_descriptor, now)
+            .expect("install restart drill v2 descriptor");
+        peer_store.record_route_forward_success(&v3_node_id, now.saturating_sub(1));
+        peer_store.record_route_forward_success(&v2_node_id, now.saturating_sub(1));
+
+        let client = test_peer_http_client();
+        let accepted = Server::relay_chat_envelope_to_discovered_peers(
+            Some(client.as_ref()),
+            Some(relay),
+            &peer_store,
+            &IdentityKeyPair::generate(),
+            &signed_test_chat_envelope(now),
+        )
+        .await;
+        assert_eq!(accepted, 0);
+        let post_attempt = relay.peer_status();
+        assert_eq!(post_attempt.direct_peer_retry.circuit.state, "open");
+        assert_eq!(post_attempt.last_outbound_attempted, 0);
+        assert_eq!(
+            post_attempt.last_outbound_failure_reason.as_deref(),
+            Some("peer_relay_circuit_open")
+        );
+
+        assert_eq!(
+            relay
+                .ack_messages(&[recovered_envelope.message_id], &receiver)
+                .expect("ack recovered encrypted custody"),
+            1
+        );
+        let (after_ack, has_more) = relay
+            .pull_pending(&receiver, 0, &[0; 16], 1)
+            .expect("verify recovered custody deletion");
+        assert!(after_ack.is_empty());
+        assert!(!has_more);
+    }
+
+    #[tokio::test]
+    #[ignore = "invoked only as an isolated child of the restart drill"]
+    async fn target_bound_v3_restart_drill_subprocess_worker() {
+        let Ok(stage) = std::env::var(DIRECT_RELAY_RESTART_DRILL_STAGE_ENV) else {
+            // Ordinary test-suite execution exercises orchestration through the
+            // parent above. Only its explicitly scoped child has worker input.
+            return;
+        };
+        let db_path = std::env::var_os(DIRECT_RELAY_RESTART_DRILL_DB_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("restart drill database path");
+        let relay = test_chat_relay_service(&db_path, [0x79; 32]);
+
+        match stage.as_str() {
+            "seed_crash" => seed_direct_relay_restart_drill_crash(relay.as_ref()),
+            "verify_restart" => verify_direct_relay_restart_drill(relay.as_ref()).await,
+            other => panic!("unsupported restart drill stage: {other}"),
+        }
     }
 
     #[tokio::test]
