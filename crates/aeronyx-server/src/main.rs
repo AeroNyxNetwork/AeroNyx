@@ -49,6 +49,8 @@
 //!   immutable segment/checkpoint and interrupted-rotation status.
 //! - [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] Add create-new export and
 //!   fail-closed offline verification for exact node-signed custody anchors.
+//! - [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Add durable independent-node
+//!   countersigning and exact offline verification for custody audit anchors.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -78,6 +80,7 @@
 //! v1.15.0-CustodyAuditVerify - Add aggregate maintenance-chain verification
 //! v1.16.0-CustodyAuditRotation - Report authenticated audit segment state
 //! v1.17.0-CustodyAuditAnchor - Export and verify portable checkpoint anchors
+//! v1.18.0-CustodyAuditWitness - Persist and verify independent witness receipts
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read};
@@ -93,8 +96,12 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::chat::{
-    decode_custody_audit_anchor, encode_custody_audit_anchor, CustodyAuditAnchorV1,
-    MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+    decode_custody_audit_anchor, decode_custody_audit_witness_receipt, encode_custody_audit_anchor,
+    encode_custody_audit_witness_receipt, CustodyAuditAnchorV1, CustodyAuditWitnessReceiptV1,
+    CUSTODY_AUDIT_WITNESS_ADVANCED_V1, CUSTODY_AUDIT_WITNESS_CONFLICT_V1,
+    CUSTODY_AUDIT_WITNESS_GAP_V1, CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1,
+    CUSTODY_AUDIT_WITNESS_STALE_V1, MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+    MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
 };
 use aeronyx_core::protocol::discovery::MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES;
 use aeronyx_server::api::auth::ensure_api_secret;
@@ -105,6 +112,9 @@ use aeronyx_server::management::models::{NodeRegistrationProfile, StoredNodeInfo
 use aeronyx_server::services::directory_replica::{
     verify_directory_observation_certificate_frame as verify_portable_observation_certificate_frame,
     DirectoryObservationCertificateTrustPolicy,
+};
+use aeronyx_server::services::memchain::{
+    derive_record_key, CustodyAuditAnchorWitnessOutcome, MemoryStorage,
 };
 use aeronyx_server::services::{
     derive_node_secret, AofWriter, ChatRelayBackupPruneRequest, ChatRelayRestorePlanReceipt,
@@ -312,6 +322,72 @@ enum RelayCustodyCommands {
         expected_node: String,
 
         /// Lowest checkpoint generation already trusted by this verifier
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        minimum_checkpoint_generation: u64,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Persist and countersign one producer anchor on an independent node
+    WitnessAuditAnchor {
+        /// Path to this witness node's local configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Path to the producer's canonical binary anchor frame
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Expected SHA-256 of the exact producer anchor frame
+        #[arg(long)]
+        expected_sha256: String,
+
+        /// Pinned producer node identity (64 hexadecimal characters)
+        #[arg(long)]
+        expected_producer: String,
+
+        /// Lowest producer generation accepted on first witness observation
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        minimum_checkpoint_generation: u64,
+
+        /// New path for the signed witness receipt; existing files are refused
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify one accepted independent witness receipt against its exact anchor
+    VerifyAuditWitness {
+        /// Path to the producer's canonical binary anchor frame
+        #[arg(long)]
+        anchor: PathBuf,
+
+        /// Expected SHA-256 of the exact producer anchor frame
+        #[arg(long)]
+        anchor_sha256: String,
+
+        /// Path to the canonical binary witness receipt
+        #[arg(long)]
+        receipt: PathBuf,
+
+        /// Expected SHA-256 of the exact witness receipt frame
+        #[arg(long)]
+        receipt_sha256: String,
+
+        /// Pinned producer node identity (64 hexadecimal characters)
+        #[arg(long)]
+        expected_producer: String,
+
+        /// Pinned independent witness identity (64 hexadecimal characters)
+        #[arg(long)]
+        expected_witness: String,
+
+        /// Lowest checkpoint generation trusted by this verifier
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         minimum_checkpoint_generation: u64,
 
@@ -1165,6 +1241,47 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
                 json,
             )?;
         }
+        RelayCustodyCommands::WitnessAuditAnchor {
+            config,
+            input,
+            expected_sha256,
+            expected_producer,
+            minimum_checkpoint_generation,
+            output,
+            json,
+        } => {
+            cmd_relay_witness_audit_anchor(
+                &config,
+                &input,
+                &expected_sha256,
+                &expected_producer,
+                minimum_checkpoint_generation,
+                &output,
+                json,
+            )
+            .await?;
+        }
+        RelayCustodyCommands::VerifyAuditWitness {
+            anchor,
+            anchor_sha256,
+            receipt,
+            receipt_sha256,
+            expected_producer,
+            expected_witness,
+            minimum_checkpoint_generation,
+            json,
+        } => {
+            cmd_relay_verify_audit_witness(
+                &anchor,
+                &anchor_sha256,
+                &receipt,
+                &receipt_sha256,
+                &expected_producer,
+                &expected_witness,
+                minimum_checkpoint_generation,
+                json,
+            )?;
+        }
         RelayCustodyCommands::RestoreReadiness { config, json } => {
             let server_config = load_relay_custody_config(&config).await?;
             let receipt = ChatRelayService::audit_latest_restore_readiness_for_config(
@@ -1404,6 +1521,272 @@ fn print_relay_custody_audit_anchor(
     Ok(())
 }
 
+#[derive(Debug, serde::Serialize)]
+struct RelayCustodyAuditWitnessReport {
+    contract_version: &'static str,
+    status: &'static str,
+    accepted: bool,
+    outcome: &'static str,
+    producer_node_id: String,
+    witness_node_id: String,
+    checkpoint_generation: u64,
+    observed_at: u64,
+    retained_checkpoint_generation: u64,
+    anchor_frame_sha256: String,
+    retained_frame_sha256: String,
+    receipt_sha256: String,
+    receipt_bytes: usize,
+    security_model: &'static str,
+    privacy_boundary: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_relay_witness_audit_anchor(
+    config_path: &Path,
+    input_path: &Path,
+    expected_sha256_hex: &str,
+    expected_producer_hex: &str,
+    minimum_checkpoint_generation: u64,
+    output_path: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    let config = ServerConfig::load(config_path).await?;
+    anyhow::ensure!(
+        config.memchain.is_enabled() && config.memchain.db_path.trim() != ":memory:",
+        "custody audit witnessing requires persistent local MemChain storage"
+    );
+    let witness_identity = load_relay_custody_identity(&config, "audit witness").await?;
+    let expected_sha256 = parse_hex32(expected_sha256_hex, "audit anchor SHA-256")?;
+    let expected_producer = parse_hex32(expected_producer_hex, "expected producer node identity")?;
+    anyhow::ensure!(
+        witness_identity.public_key_bytes() != expected_producer,
+        "custody audit anchor must be witnessed by an independent node identity"
+    );
+
+    let anchor_frame = read_bounded_relay_custody_artifact(
+        input_path,
+        MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+        "audit anchor",
+    )?;
+    let anchor = verify_relay_custody_anchor_frame(
+        &anchor_frame,
+        &expected_sha256,
+        &expected_producer,
+        minimum_checkpoint_generation,
+    )?;
+    let observed_at = unix_timestamp_now()?;
+    anyhow::ensure!(observed_at > 0, "custody audit witness clock is invalid");
+
+    // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Persist the witness
+    // high-water decision before signing or publishing its receipt. A failed
+    // output write is safely retryable as an idempotent observation.
+    let record_key = derive_record_key(&witness_identity.to_bytes());
+    let storage = MemoryStorage::open(&config.memchain.db_path, Some(record_key))
+        .map_err(|_| anyhow::anyhow!("unable to open custody audit witness storage"))?;
+    let decision = storage
+        .witness_custody_audit_anchor(
+            &expected_producer,
+            anchor.checkpoint_generation,
+            &expected_sha256,
+            observed_at,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("unable to persist custody audit witness decision"))?;
+    let (outcome, retained_generation, retained_sha256) =
+        custody_audit_witness_decision_fields(decision);
+    let receipt = CustodyAuditWitnessReceiptV1::signed(
+        expected_producer,
+        anchor.checkpoint_generation,
+        expected_sha256,
+        observed_at,
+        retained_generation,
+        retained_sha256,
+        outcome,
+        &witness_identity,
+    )
+    .map_err(|_| anyhow::anyhow!("unable to sign custody audit witness receipt"))?;
+    let receipt_frame = encode_custody_audit_witness_receipt(&receipt)
+        .map_err(|_| anyhow::anyhow!("unable to encode custody audit witness receipt"))?;
+    let receipt_sha256: [u8; 32] = Sha256::digest(&receipt_frame).into();
+    write_new_relay_custody_artifact(
+        output_path,
+        &receipt_frame,
+        MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
+        "audit witness receipt",
+    )?;
+    print_relay_custody_audit_witness(
+        &receipt,
+        &receipt_sha256,
+        receipt_frame.len(),
+        "created",
+        json,
+    )?;
+    anyhow::ensure!(
+        receipt.accepted(),
+        "custody audit witness rejected the producer anchor; retain the signed negative receipt"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_relay_verify_audit_witness(
+    anchor_path: &Path,
+    anchor_sha256_hex: &str,
+    receipt_path: &Path,
+    receipt_sha256_hex: &str,
+    expected_producer_hex: &str,
+    expected_witness_hex: &str,
+    minimum_checkpoint_generation: u64,
+    json: bool,
+) -> anyhow::Result<()> {
+    let anchor_sha256 = parse_hex32(anchor_sha256_hex, "audit anchor SHA-256")?;
+    let receipt_sha256 = parse_hex32(receipt_sha256_hex, "audit witness receipt SHA-256")?;
+    let expected_producer = parse_hex32(expected_producer_hex, "expected producer node identity")?;
+    let expected_witness = parse_hex32(expected_witness_hex, "expected witness node identity")?;
+    anyhow::ensure!(
+        expected_producer != expected_witness,
+        "producer and independent witness identities must differ"
+    );
+
+    let anchor_frame = read_bounded_relay_custody_artifact(
+        anchor_path,
+        MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+        "audit anchor",
+    )?;
+    let anchor = verify_relay_custody_anchor_frame(
+        &anchor_frame,
+        &anchor_sha256,
+        &expected_producer,
+        minimum_checkpoint_generation,
+    )?;
+    let receipt_frame = read_bounded_relay_custody_artifact(
+        receipt_path,
+        MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
+        "audit witness receipt",
+    )?;
+    let actual_receipt_sha256: [u8; 32] = Sha256::digest(&receipt_frame).into();
+    anyhow::ensure!(
+        actual_receipt_sha256 == receipt_sha256,
+        "custody audit witness receipt SHA-256 does not match the explicit pin"
+    );
+    let receipt = decode_custody_audit_witness_receipt(&receipt_frame)
+        .map_err(|_| anyhow::anyhow!("custody audit witness receipt is malformed"))?;
+    let canonical = encode_custody_audit_witness_receipt(&receipt)
+        .map_err(|_| anyhow::anyhow!("custody audit witness receipt cannot be canonicalized"))?;
+    anyhow::ensure!(
+        canonical == receipt_frame,
+        "custody audit witness receipt is not canonically encoded"
+    );
+    receipt
+        .verify_accepted_for_anchor(
+            &anchor,
+            &anchor_sha256,
+            &expected_producer,
+            &expected_witness,
+            minimum_checkpoint_generation,
+        )
+        .map_err(|_| anyhow::anyhow!("custody audit witness receipt trust policy failed"))?;
+    print_relay_custody_audit_witness(
+        &receipt,
+        &receipt_sha256,
+        receipt_frame.len(),
+        "verified",
+        json,
+    )
+}
+
+const fn custody_audit_witness_decision_fields(
+    decision: CustodyAuditAnchorWitnessOutcome,
+) -> (u8, u64, [u8; 32]) {
+    match decision {
+        CustodyAuditAnchorWitnessOutcome::Advanced {
+            generation,
+            anchor_digest,
+        } => (CUSTODY_AUDIT_WITNESS_ADVANCED_V1, generation, anchor_digest),
+        CustodyAuditAnchorWitnessOutcome::Idempotent {
+            generation,
+            anchor_digest,
+        } => (
+            CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1,
+            generation,
+            anchor_digest,
+        ),
+        CustodyAuditAnchorWitnessOutcome::Stale {
+            generation,
+            anchor_digest,
+        } => (CUSTODY_AUDIT_WITNESS_STALE_V1, generation, anchor_digest),
+        CustodyAuditAnchorWitnessOutcome::Conflict {
+            generation,
+            anchor_digest,
+        } => (CUSTODY_AUDIT_WITNESS_CONFLICT_V1, generation, anchor_digest),
+        CustodyAuditAnchorWitnessOutcome::Gap {
+            generation,
+            anchor_digest,
+        } => (CUSTODY_AUDIT_WITNESS_GAP_V1, generation, anchor_digest),
+    }
+}
+
+const fn custody_audit_witness_outcome_label(outcome: u8) -> &'static str {
+    match outcome {
+        CUSTODY_AUDIT_WITNESS_ADVANCED_V1 => "advanced",
+        CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1 => "idempotent",
+        CUSTODY_AUDIT_WITNESS_STALE_V1 => "stale",
+        CUSTODY_AUDIT_WITNESS_CONFLICT_V1 => "conflict",
+        CUSTODY_AUDIT_WITNESS_GAP_V1 => "gap",
+        _ => "invalid",
+    }
+}
+
+fn print_relay_custody_audit_witness(
+    receipt: &CustodyAuditWitnessReceiptV1,
+    receipt_sha256: &[u8; 32],
+    receipt_bytes: usize,
+    status: &'static str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = RelayCustodyAuditWitnessReport {
+        contract_version: "relay_custody_audit_witness.v1",
+        status,
+        accepted: receipt.accepted(),
+        outcome: custody_audit_witness_outcome_label(receipt.outcome),
+        producer_node_id: hex::encode(receipt.producer_node_id),
+        witness_node_id: hex::encode(receipt.witness_node_id),
+        checkpoint_generation: receipt.requested_checkpoint_generation,
+        observed_at: receipt.observed_at,
+        retained_checkpoint_generation: receipt.retained_checkpoint_generation,
+        anchor_frame_sha256: hex::encode(receipt.requested_frame_sha256),
+        retained_frame_sha256: hex::encode(receipt.retained_frame_sha256),
+        receipt_sha256: hex::encode(receipt_sha256),
+        receipt_bytes,
+        security_model: "independent node signature over a durable producer-scoped monotonic decision; accepted receipts detect later rollback only while the witness high-water state and verifier pins remain available; not consensus or global finality",
+        privacy_boundary: "producer and witness node identities, checkpoint generation, exact opaque frame digests, witness time, and coarse outcome only; no private HMAC, custody path, message, route, endpoint, payload, ciphertext, memory, destination, DNS, or social graph metadata",
+    };
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("Relay custody independent witness receipt");
+        println!("════════════════════════════════════════");
+        println!("Status:               {}", report.status);
+        println!("Accepted:             {}", report.accepted);
+        println!("Outcome:              {}", report.outcome);
+        println!("Producer node:        {}", report.producer_node_id);
+        println!("Witness node:         {}", report.witness_node_id);
+        println!("Checkpoint generation: {}", report.checkpoint_generation);
+        println!("Witness observed at:  {}", report.observed_at);
+        println!(
+            "Retained generation:   {}",
+            report.retained_checkpoint_generation
+        );
+        println!("Anchor frame SHA-256: {}", report.anchor_frame_sha256);
+        println!("Receipt SHA-256:      {}", report.receipt_sha256);
+        println!("Receipt bytes:        {}", report.receipt_bytes);
+        println!();
+        println!("Security model: {}", report.security_model);
+        println!("Privacy: {}", report.privacy_boundary);
+    }
+    Ok(())
+}
+
 // [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Keep credential issuance and
 // verification isolated from the command dispatcher and all network surfaces.
 async fn cmd_relay_restore_plan(config_path: &Path, json: bool) -> anyhow::Result<()> {
@@ -1497,13 +1880,27 @@ fn print_relay_restore_plan(plan: &ChatRelayRestorePlanReceipt, json: bool) -> a
 }
 
 fn write_new_relay_custody_anchor(path: &Path, frame: &[u8]) -> anyhow::Result<()> {
+    write_new_relay_custody_artifact(
+        path,
+        frame,
+        MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+        "audit anchor",
+    )
+}
+
+fn write_new_relay_custody_artifact(
+    path: &Path,
+    frame: &[u8],
+    max_frame_bytes: usize,
+    artifact_label: &'static str,
+) -> anyhow::Result<()> {
     use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
     anyhow::ensure!(
-        !frame.is_empty() && frame.len() <= MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
-        "relay custody audit anchor violates its write bound"
+        !frame.is_empty() && frame.len() <= max_frame_bytes,
+        "relay custody {artifact_label} violates its write bound"
     );
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1513,23 +1910,24 @@ fn write_new_relay_custody_anchor(path: &Path, frame: &[u8]) -> anyhow::Result<(
         .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
     let mut file = options
         .open(path)
-        .map_err(|_| anyhow::anyhow!("unable to create new relay custody audit anchor"))?;
+        .map_err(|_| anyhow::anyhow!("unable to create new relay custody {artifact_label}"))?;
 
-    // [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] If the exact frame is not
-    // durable, remove only the inode this invocation created. A later verifier
-    // still requires the separately retained SHA-256 and canonical full frame.
+    // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Anchors and witness receipts
+    // share one create-new, no-final-symlink, file+directory durability
+    // boundary. If the exact frame is not durable, remove only the inode this
+    // invocation created; a retry can safely reproduce or re-witness it.
     let write_result = (|| -> anyhow::Result<()> {
         file.write_all(frame)
-            .map_err(|_| anyhow::anyhow!("unable to write relay custody audit anchor"))?;
+            .map_err(|_| anyhow::anyhow!("unable to write relay custody {artifact_label}"))?;
         file.sync_all()
-            .map_err(|_| anyhow::anyhow!("unable to sync relay custody audit anchor"))?;
+            .map_err(|_| anyhow::anyhow!("unable to sync relay custody {artifact_label}"))?;
         let final_len = file
             .metadata()
-            .map_err(|_| anyhow::anyhow!("unable to inspect relay custody audit anchor"))?
+            .map_err(|_| anyhow::anyhow!("unable to inspect relay custody {artifact_label}"))?
             .len();
         anyhow::ensure!(
             final_len == frame.len() as u64,
-            "relay custody audit anchor changed during publication"
+            "relay custody {artifact_label} changed during publication"
         );
         Ok(())
     })();
@@ -1546,15 +1944,23 @@ fn write_new_relay_custody_anchor(path: &Path, frame: &[u8]) -> anyhow::Result<(
             .filter(|candidate| !candidate.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let directory = File::open(parent)
-            .map_err(|_| anyhow::anyhow!("unable to open audit anchor parent directory"))?;
+            .map_err(|_| anyhow::anyhow!("unable to open custody artifact parent directory"))?;
         directory
             .sync_all()
-            .map_err(|_| anyhow::anyhow!("unable to sync audit anchor parent directory"))?;
+            .map_err(|_| anyhow::anyhow!("unable to sync custody artifact parent directory"))?;
     }
     Ok(())
 }
 
 fn read_bounded_relay_custody_anchor(path: &Path) -> anyhow::Result<Vec<u8>> {
+    read_bounded_relay_custody_artifact(path, MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES, "audit anchor")
+}
+
+fn read_bounded_relay_custody_artifact(
+    path: &Path,
+    max_frame_bytes: usize,
+    artifact_label: &'static str,
+) -> anyhow::Result<Vec<u8>> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1564,33 +1970,31 @@ fn read_bounded_relay_custody_anchor(path: &Path) -> anyhow::Result<Vec<u8>> {
     options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
     let mut file = options
         .open(path)
-        .map_err(|_| anyhow::anyhow!("unable to open relay custody audit anchor"))?;
+        .map_err(|_| anyhow::anyhow!("unable to open relay custody {artifact_label}"))?;
     let metadata = file
         .metadata()
-        .map_err(|_| anyhow::anyhow!("unable to inspect relay custody audit anchor"))?;
+        .map_err(|_| anyhow::anyhow!("unable to inspect relay custody {artifact_label}"))?;
     anyhow::ensure!(
-        metadata.is_file()
-            && metadata.len() > 0
-            && metadata.len() <= MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES as u64,
-        "relay custody audit anchor has an invalid file boundary"
+        metadata.is_file() && metadata.len() > 0 && metadata.len() <= max_frame_bytes as u64,
+        "relay custody {artifact_label} has an invalid file boundary"
     );
 
     let capacity = usize::try_from(metadata.len())
-        .map_err(|_| anyhow::anyhow!("relay custody audit anchor exceeds platform capacity"))?;
+        .map_err(|_| anyhow::anyhow!("relay custody {artifact_label} exceeds platform capacity"))?;
     let mut frame = Vec::with_capacity(capacity);
     file.by_ref()
-        .take(MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES as u64 + 1)
+        .take(max_frame_bytes as u64 + 1)
         .read_to_end(&mut frame)
-        .map_err(|_| anyhow::anyhow!("unable to read relay custody audit anchor"))?;
+        .map_err(|_| anyhow::anyhow!("unable to read relay custody {artifact_label}"))?;
     let final_len = file
         .metadata()
-        .map_err(|_| anyhow::anyhow!("unable to re-inspect relay custody audit anchor"))?
+        .map_err(|_| anyhow::anyhow!("unable to re-inspect relay custody {artifact_label}"))?
         .len();
     anyhow::ensure!(
         frame.len() as u64 == metadata.len()
             && final_len == metadata.len()
-            && frame.len() <= MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
-        "relay custody audit anchor changed during bounded read"
+            && frame.len() <= max_frame_bytes,
+        "relay custody {artifact_label} changed during bounded read"
     );
     Ok(frame)
 }
@@ -2882,6 +3286,91 @@ mod tests {
         ])
         .is_err());
 
+        // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Countersigning requires
+        // a producer pin, exact frame pin, first-observation floor, and a new
+        // output. Offline acceptance additionally pins the witness and exact
+        // receipt bytes.
+        let witness = "85".repeat(32);
+        let witness_anchor = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "witness-audit-anchor",
+            "--input",
+            "/root/custody-anchor.bin",
+            "--expected-sha256",
+            &digest,
+            "--expected-producer",
+            &node,
+            "--minimum-checkpoint-generation",
+            "7",
+            "--output",
+            "/root/custody-witness.bin",
+            "--json",
+        ])
+        .expect("audit witness creation form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::WitnessAuditAnchor {
+            config,
+            input,
+            expected_sha256,
+            expected_producer,
+            minimum_checkpoint_generation,
+            output,
+            json,
+        }) = witness_anchor.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert_eq!(input, PathBuf::from("/root/custody-anchor.bin"));
+        assert_eq!(expected_sha256, digest);
+        assert_eq!(expected_producer, node);
+        assert_eq!(minimum_checkpoint_generation, 7);
+        assert_eq!(output, PathBuf::from("/root/custody-witness.bin"));
+        assert!(json);
+
+        let verify_witness = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "verify-audit-witness",
+            "--anchor",
+            "/root/custody-anchor.bin",
+            "--anchor-sha256",
+            &"86".repeat(32),
+            "--receipt",
+            "/root/custody-witness.bin",
+            "--receipt-sha256",
+            &"87".repeat(32),
+            "--expected-producer",
+            &node,
+            "--expected-witness",
+            &witness,
+            "--minimum-checkpoint-generation",
+            "7",
+            "--json",
+        ])
+        .expect("audit witness verification form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::VerifyAuditWitness {
+            anchor,
+            anchor_sha256,
+            receipt,
+            receipt_sha256,
+            expected_producer,
+            expected_witness,
+            minimum_checkpoint_generation,
+            json,
+        }) = verify_witness.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(anchor, PathBuf::from("/root/custody-anchor.bin"));
+        assert_eq!(anchor_sha256, "86".repeat(32));
+        assert_eq!(receipt, PathBuf::from("/root/custody-witness.bin"));
+        assert_eq!(receipt_sha256, "87".repeat(32));
+        assert_eq!(expected_producer, node);
+        assert_eq!(expected_witness, witness);
+        assert_eq!(minimum_checkpoint_generation, 7);
+        assert!(json);
+
         let readiness = Cli::try_parse_from([
             "aeronyx-server",
             "relay-custody",
@@ -3038,6 +3527,88 @@ mod tests {
                 .expect("create audit anchor symlink fixture");
             assert!(read_bounded_relay_custody_anchor(&symlink_path).is_err());
         }
+    }
+
+    #[test]
+    fn relay_custody_witness_receipt_file_boundary_and_anchor_binding_are_exact() {
+        let directory = tempfile::tempdir().expect("audit witness CLI directory");
+        let receipt_path = directory.path().join("witness.bin");
+        let producer = IdentityKeyPair::from_bytes(&[0x88; 32]).expect("anchor producer");
+        let witness = IdentityKeyPair::from_bytes(&[0x89; 32]).expect("anchor witness");
+        let anchor =
+            CustodyAuditAnchorV1::signed(5, 65_541, 256 * 1024 * 1024, [0x8a; 32], &producer)
+                .expect("sign anchor fixture");
+        let anchor_frame = encode_custody_audit_anchor(&anchor).expect("encode anchor fixture");
+        let anchor_sha256: [u8; 32] = Sha256::digest(&anchor_frame).into();
+        let receipt = CustodyAuditWitnessReceiptV1::signed(
+            producer.public_key_bytes(),
+            5,
+            anchor_sha256,
+            1_787_200_100,
+            5,
+            anchor_sha256,
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+            &witness,
+        )
+        .expect("sign witness fixture");
+        let receipt_frame =
+            encode_custody_audit_witness_receipt(&receipt).expect("encode witness fixture");
+
+        write_new_relay_custody_artifact(
+            &receipt_path,
+            &receipt_frame,
+            MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
+            "audit witness receipt",
+        )
+        .expect("publish witness receipt");
+        assert!(write_new_relay_custody_artifact(
+            &receipt_path,
+            &receipt_frame,
+            MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
+            "audit witness receipt",
+        )
+        .is_err());
+        let loaded = read_bounded_relay_custody_artifact(
+            &receipt_path,
+            MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
+            "audit witness receipt",
+        )
+        .expect("read witness receipt");
+        let decoded =
+            decode_custody_audit_witness_receipt(&loaded).expect("decode witness receipt");
+        decoded
+            .verify_accepted_for_anchor(
+                &anchor,
+                &anchor_sha256,
+                &producer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                5,
+            )
+            .expect("verify witness receipt binding");
+
+        let wrong_anchor_sha256 = [0x8b; 32];
+        assert!(decoded
+            .verify_accepted_for_anchor(
+                &anchor,
+                &wrong_anchor_sha256,
+                &producer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                5,
+            )
+            .is_err());
+
+        let oversized_path = directory.path().join("oversized-witness.bin");
+        std::fs::write(
+            &oversized_path,
+            vec![0u8; MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES + 1],
+        )
+        .expect("write oversized receipt fixture");
+        assert!(read_bounded_relay_custody_artifact(
+            &oversized_path,
+            MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
+            "audit witness receipt",
+        )
+        .is_err());
     }
 
     #[test]

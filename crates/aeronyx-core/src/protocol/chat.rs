@@ -77,8 +77,13 @@
 //!   It contains no audit MAC, path, message metadata, identity relationship,
 //!   ciphertext, or backup name. External retainers compare its monotonic
 //!   generation; the anchor alone is not a witness receipt or global finality.
+//! - [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] `CustodyAuditWitnessReceiptV1`
+//!   binds one exact producer anchor to an independently signed, durable
+//!   monotonic witness decision. Accepted and rejected outcomes remain
+//!   fixed-size and disclose no additional custody or user information.
 //!
 //! ## Last Modified
+//! v1.7.0-CustodyAuditWitness - Added independent signed checkpoint receipts
 //! v1.6.0-CustodyAuditAnchor - Added portable opaque custody checkpoint anchors
 //! v1.5.0-SignedFailureReceipt - Authenticate hop-local failure ACKs without exposing route topology
 //! v1.4.0-PurposeBoundReceipt - Bound terminal receipts to route purpose with a v2 domain
@@ -116,6 +121,8 @@ const BLIND_RELAY_FAILURE_REQUEST_COMMITMENT_DOMAIN: &[u8] =
     b"AeroNyx-BlindRelay-FailureRequest-v1";
 const BLIND_RELAY_FAILURE_REASON_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-FailureReason-v1";
 const CUSTODY_AUDIT_ANCHOR_SIGNING_DOMAIN: &[u8] = b"AeroNyx-CustodyAuditAnchor-v1";
+const CUSTODY_AUDIT_WITNESS_RECEIPT_SIGNING_DOMAIN: &[u8] =
+    b"AeroNyx-CustodyAuditWitnessReceipt-v1";
 
 /// Initial signed blind-relay terminal receipt version.
 pub const BLIND_RELAY_DELIVERY_RECEIPT_VERSION: u8 = 1;
@@ -127,6 +134,20 @@ pub const BLIND_RELAY_FAILURE_RECEIPT_VERSION: u8 = 1;
 pub const CUSTODY_AUDIT_ANCHOR_VERSION: u8 = 1;
 /// Exact upper bound for one canonical custody audit anchor frame.
 pub const MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES: usize = 256;
+/// Initial independent custody audit witness receipt version.
+pub const CUSTODY_AUDIT_WITNESS_RECEIPT_VERSION: u8 = 1;
+/// Exact upper bound for one canonical custody audit witness receipt frame.
+pub const MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES: usize = 320;
+/// Witness durably accepted its first observation or exact next generation.
+pub const CUSTODY_AUDIT_WITNESS_ADVANCED_V1: u8 = 0;
+/// Witness already retained the exact generation and frame digest.
+pub const CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1: u8 = 1;
+/// Requested generation is below the witness's durable high-water mark.
+pub const CUSTODY_AUDIT_WITNESS_STALE_V1: u8 = 2;
+/// Requested generation reused the high-water generation with another frame.
+pub const CUSTODY_AUDIT_WITNESS_CONFLICT_V1: u8 = 3;
+/// Requested generation skipped one or more established witness generations.
+pub const CUSTODY_AUDIT_WITNESS_GAP_V1: u8 = 4;
 /// Terminal accepted the opaque payload into online or durable pending delivery.
 pub const BLIND_RELAY_DELIVERY_ACCEPTED: u8 = 1;
 
@@ -888,6 +909,220 @@ pub fn decode_custody_audit_anchor(bytes: &[u8]) -> Result<CustodyAuditAnchorV1,
     .map_err(|error| CoreError::malformed(format!("custody audit anchor decode: {error}")))
 }
 
+// ============================================
+// CustodyAuditWitnessReceiptV1
+// ============================================
+
+/// Independent node's signed durable decision for one exact custody anchor.
+///
+/// [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] The witness retains one
+/// high-water generation and exact producer-frame SHA-256 per producer. The
+/// receipt signs both the requested and retained states so rollback,
+/// same-generation equivocation, and generation gaps produce portable evidence
+/// without disclosing the producer's private audit HMAC or custody contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyAuditWitnessReceiptV1 {
+    /// Receipt schema version.
+    pub version: u8,
+    /// Producer identity copied from the verified anchor.
+    pub producer_node_id: [u8; 32],
+    /// Requested producer checkpoint generation.
+    pub requested_checkpoint_generation: u64,
+    /// SHA-256 of the exact canonical producer anchor frame.
+    pub requested_frame_sha256: [u8; 32],
+    /// Independent witness Ed25519 identity.
+    pub witness_node_id: [u8; 32],
+    /// Witness wall-clock time after its durable decision, in Unix seconds.
+    pub observed_at: u64,
+    /// Witness's durable high-water generation after evaluating the request.
+    pub retained_checkpoint_generation: u64,
+    /// Exact producer-frame SHA-256 retained at the high-water generation.
+    pub retained_frame_sha256: [u8; 32],
+    /// One `CUSTODY_AUDIT_WITNESS_*_V1` decision bucket.
+    pub outcome: u8,
+    /// Witness signature over [`Self::signing_data`].
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl CustodyAuditWitnessReceiptV1 {
+    /// Creates one independently signed witness decision.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::MalformedMessage`] when the decision is internally
+    /// inconsistent, uses sentinel values, or is self-witnessed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn signed(
+        producer_node_id: [u8; 32],
+        requested_checkpoint_generation: u64,
+        requested_frame_sha256: [u8; 32],
+        observed_at: u64,
+        retained_checkpoint_generation: u64,
+        retained_frame_sha256: [u8; 32],
+        outcome: u8,
+        witness: &IdentityKeyPair,
+    ) -> Result<Self, CoreError> {
+        let mut receipt = Self {
+            version: CUSTODY_AUDIT_WITNESS_RECEIPT_VERSION,
+            producer_node_id,
+            requested_checkpoint_generation,
+            requested_frame_sha256,
+            witness_node_id: witness.public_key_bytes(),
+            observed_at,
+            retained_checkpoint_generation,
+            retained_frame_sha256,
+            outcome,
+            signature: [0u8; 64],
+        };
+        receipt.validate_structure()?;
+        receipt.signature = witness.sign(&receipt.signing_data());
+        Ok(receipt)
+    }
+
+    /// Returns whether this receipt proves the witness retained this request.
+    #[must_use]
+    pub const fn accepted(&self) -> bool {
+        matches!(
+            self.outcome,
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1 | CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1
+        )
+    }
+
+    /// Builds the canonical fixed-width domain-separated witness signing frame.
+    #[must_use]
+    pub fn signing_data(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(
+            CUSTODY_AUDIT_WITNESS_RECEIPT_SIGNING_DOMAIN.len() + 1 + (32 * 4) + (8 * 3) + 1,
+        );
+        data.extend_from_slice(CUSTODY_AUDIT_WITNESS_RECEIPT_SIGNING_DOMAIN);
+        data.push(self.version);
+        data.extend_from_slice(&self.producer_node_id);
+        data.extend_from_slice(&self.requested_checkpoint_generation.to_le_bytes());
+        data.extend_from_slice(&self.requested_frame_sha256);
+        data.extend_from_slice(&self.witness_node_id);
+        data.extend_from_slice(&self.observed_at.to_le_bytes());
+        data.extend_from_slice(&self.retained_checkpoint_generation.to_le_bytes());
+        data.extend_from_slice(&self.retained_frame_sha256);
+        data.push(self.outcome);
+        data
+    }
+
+    fn validate_structure(&self) -> Result<(), CoreError> {
+        let request_matches_retained = self.requested_checkpoint_generation
+            == self.retained_checkpoint_generation
+            && self.requested_frame_sha256 == self.retained_frame_sha256;
+        let outcome_is_consistent = match self.outcome {
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1 | CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1 => {
+                request_matches_retained
+            }
+            CUSTODY_AUDIT_WITNESS_STALE_V1 => {
+                self.requested_checkpoint_generation < self.retained_checkpoint_generation
+            }
+            CUSTODY_AUDIT_WITNESS_CONFLICT_V1 => {
+                self.requested_checkpoint_generation == self.retained_checkpoint_generation
+                    && self.requested_frame_sha256 != self.retained_frame_sha256
+            }
+            CUSTODY_AUDIT_WITNESS_GAP_V1 => self
+                .retained_checkpoint_generation
+                .checked_add(1)
+                .is_some_and(|next| self.requested_checkpoint_generation > next),
+            _ => false,
+        };
+        if self.version != CUSTODY_AUDIT_WITNESS_RECEIPT_VERSION
+            || self.producer_node_id == [0u8; 32]
+            || self.witness_node_id == [0u8; 32]
+            || self.producer_node_id == self.witness_node_id
+            || self.requested_checkpoint_generation == 0
+            || self.retained_checkpoint_generation == 0
+            || self.requested_frame_sha256 == [0u8; 32]
+            || self.retained_frame_sha256 == [0u8; 32]
+            || self.observed_at == 0
+            || !outcome_is_consistent
+        {
+            return Err(CoreError::malformed(
+                "custody audit witness receipt: invalid structural state",
+            ));
+        }
+        IdentityPublicKey::from_bytes(&self.producer_node_id)?;
+        Ok(())
+    }
+
+    /// Verifies structural constraints and the independent witness signature.
+    ///
+    /// # Errors
+    /// Returns a malformed/signature error for tampered or inconsistent state.
+    pub fn verify_signature(&self) -> Result<(), CoreError> {
+        self.validate_structure()?;
+        IdentityPublicKey::from_bytes(&self.witness_node_id)?
+            .verify(&self.signing_data(), &self.signature)
+    }
+
+    /// Verifies an accepted receipt against one exact producer anchor and pins.
+    ///
+    /// # Errors
+    /// Returns a malformed/signature error for a negative witness decision,
+    /// wrong producer/witness, rollback below the verifier floor, or an anchor
+    /// frame digest that is not exactly the request signed by the witness.
+    pub fn verify_accepted_for_anchor(
+        &self,
+        anchor: &CustodyAuditAnchorV1,
+        anchor_frame_sha256: &[u8; 32],
+        expected_producer: &[u8; 32],
+        expected_witness: &[u8; 32],
+        minimum_checkpoint_generation: u64,
+    ) -> Result<(), CoreError> {
+        self.verify_signature()?;
+        anchor.verify_expected(expected_producer, minimum_checkpoint_generation)?;
+        // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Recompute the canonical
+        // frame digest inside the verifier. Future network callers must not be
+        // able to satisfy exact-frame binding by supplying their own digest.
+        let canonical_anchor_frame = encode_custody_audit_anchor(anchor)?;
+        let canonical_anchor_sha256: [u8; 32] = Sha256::digest(&canonical_anchor_frame).into();
+        if !self.accepted()
+            || &self.producer_node_id != expected_producer
+            || &self.witness_node_id != expected_witness
+            || self.requested_checkpoint_generation != anchor.checkpoint_generation
+            || &canonical_anchor_sha256 != anchor_frame_sha256
+            || &self.requested_frame_sha256 != anchor_frame_sha256
+        {
+            return Err(CoreError::malformed(
+                "custody audit witness receipt: trust policy mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Encodes one custody audit witness receipt as a canonical bounded frame.
+///
+/// # Errors
+/// Returns [`CoreError::MalformedMessage`] when bounded encoding fails.
+pub fn encode_custody_audit_witness_receipt(
+    receipt: &CustodyAuditWitnessReceiptV1,
+) -> Result<Vec<u8>, CoreError> {
+    encode_bincode_bounded(
+        receipt,
+        MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES as u64,
+    )
+    .map_err(|error| CoreError::malformed(format!("custody audit witness receipt encode: {error}")))
+}
+
+/// Decodes one complete canonical custody audit witness receipt frame.
+///
+/// # Errors
+/// Returns [`CoreError::MalformedMessage`] for malformed, padded, or oversized
+/// input. Signature and trust-policy verification remain explicit caller steps.
+pub fn decode_custody_audit_witness_receipt(
+    bytes: &[u8],
+) -> Result<CustodyAuditWitnessReceiptV1, CoreError> {
+    decode_bincode_bounded(
+        bytes,
+        MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES as u64,
+        TrailingBytesPolicy::Reject,
+    )
+    .map_err(|error| CoreError::malformed(format!("custody audit witness receipt decode: {error}")))
+}
+
 /// Encodes a blind relay envelope with a bounded bincode cap.
 ///
 /// # Errors
@@ -1097,6 +1332,160 @@ mod tests {
         padded.push(0);
         assert!(decode_custody_audit_anchor(&padded).is_err());
         assert!(CustodyAuditAnchorV1::signed(0, 1, 1, [0x44; 32], &producer).is_err());
+    }
+
+    // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Lock exact-frame binding,
+    // independent identity, and negative-outcome consistency before the
+    // receipt is accepted by any host-local or network witness workflow.
+    #[test]
+    fn custody_audit_witness_receipt_roundtrips_and_binds_exact_anchor() {
+        let producer = IdentityKeyPair::from_bytes(&[0x74; 32]).expect("producer identity");
+        let witness = IdentityKeyPair::from_bytes(&[0x75; 32]).expect("witness identity");
+        let anchor =
+            CustodyAuditAnchorV1::signed(4, 65_540, 256 * 1024 * 1024, [0x45; 32], &producer)
+                .expect("sign custody anchor");
+        let anchor_frame = encode_custody_audit_anchor(&anchor).expect("encode custody anchor");
+        let anchor_sha256: [u8; 32] = Sha256::digest(&anchor_frame).into();
+        let receipt = CustodyAuditWitnessReceiptV1::signed(
+            producer.public_key_bytes(),
+            4,
+            anchor_sha256,
+            1_787_200_001,
+            4,
+            anchor_sha256,
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+            &witness,
+        )
+        .expect("sign custody witness receipt");
+        receipt
+            .verify_accepted_for_anchor(
+                &anchor,
+                &anchor_sha256,
+                &producer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                4,
+            )
+            .expect("verify custody witness receipt");
+
+        let caller_controlled_digest = [0x99; 32];
+        let caller_controlled_receipt = CustodyAuditWitnessReceiptV1::signed(
+            producer.public_key_bytes(),
+            4,
+            caller_controlled_digest,
+            1_787_200_002,
+            4,
+            caller_controlled_digest,
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+            &witness,
+        )
+        .expect("sign caller-controlled digest receipt");
+        assert!(caller_controlled_receipt
+            .verify_accepted_for_anchor(
+                &anchor,
+                &caller_controlled_digest,
+                &producer.public_key_bytes(),
+                &witness.public_key_bytes(),
+                4,
+            )
+            .is_err());
+
+        let encoded = encode_custody_audit_witness_receipt(&receipt).expect("encode receipt");
+        assert_eq!(encoded.len(), 218);
+        assert!(encoded.len() <= MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES);
+        let decoded =
+            decode_custody_audit_witness_receipt(&encoded).expect("decode custody witness receipt");
+        assert_eq!(decoded, receipt);
+        assert_eq!(
+            encode_custody_audit_witness_receipt(&decoded).expect("re-encode receipt"),
+            encoded
+        );
+    }
+
+    #[test]
+    fn custody_audit_witness_receipt_rejects_self_witness_and_invalid_outcomes() {
+        let producer = IdentityKeyPair::from_bytes(&[0x76; 32]).expect("producer identity");
+        let witness = IdentityKeyPair::from_bytes(&[0x77; 32]).expect("witness identity");
+        let producer_id = producer.public_key_bytes();
+        let requested_sha = [0x46; 32];
+        let retained_sha = [0x47; 32];
+
+        assert!(CustodyAuditWitnessReceiptV1::signed(
+            producer_id,
+            3,
+            requested_sha,
+            1,
+            3,
+            requested_sha,
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+            &producer,
+        )
+        .is_err());
+        assert!(CustodyAuditWitnessReceiptV1::signed(
+            producer_id,
+            3,
+            requested_sha,
+            1,
+            3,
+            retained_sha,
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+            &witness,
+        )
+        .is_err());
+
+        for (outcome, requested_generation, retained_generation, requested, retained) in [
+            (
+                CUSTODY_AUDIT_WITNESS_STALE_V1,
+                3,
+                4,
+                requested_sha,
+                retained_sha,
+            ),
+            (
+                CUSTODY_AUDIT_WITNESS_CONFLICT_V1,
+                4,
+                4,
+                requested_sha,
+                retained_sha,
+            ),
+            (
+                CUSTODY_AUDIT_WITNESS_GAP_V1,
+                6,
+                4,
+                requested_sha,
+                retained_sha,
+            ),
+        ] {
+            let receipt = CustodyAuditWitnessReceiptV1::signed(
+                producer_id,
+                requested_generation,
+                requested,
+                2,
+                retained_generation,
+                retained,
+                outcome,
+                &witness,
+            )
+            .expect("sign consistent negative outcome");
+            receipt.verify_signature().expect("verify negative receipt");
+            assert!(!receipt.accepted());
+        }
+
+        let mut padded = encode_custody_audit_witness_receipt(
+            &CustodyAuditWitnessReceiptV1::signed(
+                producer_id,
+                4,
+                requested_sha,
+                3,
+                4,
+                requested_sha,
+                CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1,
+                &witness,
+            )
+            .expect("sign idempotent receipt"),
+        )
+        .expect("encode receipt");
+        padded.push(0);
+        assert!(decode_custody_audit_witness_receipt(&padded).is_err());
     }
 
     // ── ChatContentType ──

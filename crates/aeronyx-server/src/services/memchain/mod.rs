@@ -58,6 +58,8 @@
 //!   another independently configured inference engine.
 //!
 //! ## Last Modified
+//! [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Re-exported the independent
+//! custody checkpoint witness decision used by the host-local CLI.
 //! [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Re-exported the typed,
 //! privacy-safe LLM provider initialization error.
 //! [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Re-exported the internal
@@ -168,7 +170,7 @@ pub(crate) use storage::{
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{
-    OverviewData, OverviewRecord, RecordCommitmentAppendOutcome,
+    CustodyAuditAnchorWitnessOutcome, OverviewData, OverviewRecord, RecordCommitmentAppendOutcome,
     RecordCommitmentBatchAppendOutcome, RecordCommitmentChainAudit,
     RecordCommitmentChainIntegrityStatus, RecordCommitmentChainStatus,
     RecordCommitmentCheckpointEvidenceAudit, VerifiedRecordCommitmentBlockPage,

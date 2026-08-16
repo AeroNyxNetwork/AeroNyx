@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Document independent-node
+  countersigning, durable producer-scoped high-water state, signed negative
+  decisions, and exact offline producer/witness verification.
 - [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] Document exact create-new export,
   offline verification, rollback-floor retention, and the boundary between a
   producer-signed anchor and future independent witness evidence.
@@ -819,8 +822,69 @@ time rather than treating the producer clock as trusted time.
 This portable anchor makes complete local rollback detectable only when an
 independent retainer compares it with previously retained evidence. It is still
 not a witness receipt, validator vote, consensus checkpoint, transaction proof,
-or global finality. A future witness phase may countersign the same exact frame,
-but must not gain access to the private audit or user data.
+or global finality. The optional independent witness workflow below countersigns
+the exact frame without gaining access to the private audit or user data.
+
+### Independent custody checkpoint witness
+
+Copy the exact anchor frame to a separately administered AeroNyx node whose
+Ed25519 identity differs from the producer. On that witness node, pin the
+producer identity and exact anchor SHA-256 shown by `create-audit-anchor`:
+
+```bash
+sudo /opt/aeronyx/aeronyx-server relay-custody witness-audit-anchor \
+  -c /etc/aeronyx/server.toml \
+  --input ./relay-custody-anchor.bin \
+  --expected-sha256 <64-hex-anchor-frame-sha256> \
+  --expected-producer <64-hex-producer-node-id> \
+  --minimum-checkpoint-generation <operator-trusted-first-generation> \
+  --output ./relay-custody-witness.bin \
+  --json
+```
+
+<!-- [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] -->
+The command verifies the producer signature, exact canonical anchor bytes,
+producer pin, and operator-owned bootstrap floor before touching witness state.
+It then atomically persists one high-water generation and exact anchor-frame
+SHA-256 for that producer in the witness node's local MemChain SQLite database.
+The custody witness table is physically separate from delivery-cache witness
+state because those generation counters advance independently.
+
+After the first accepted observation, only the exact next generation advances.
+Repeating the same frame is idempotent. Older, same-generation-different-frame,
+and skipped-generation requests produce signed `stale`, `conflict`, or `gap`
+receipts without replacing the retained high-water row. The CLI writes those
+negative receipts before returning failure so an operator can preserve the
+evidence. A failed receipt-file write is safely retryable: durable state has
+already advanced and the retry becomes an authenticated idempotent decision.
+
+Copy the exact receipt frame and its JSON report back to the evidence retainer.
+Verify the complete producer-to-witness binding offline:
+
+```bash
+/opt/aeronyx/aeronyx-server relay-custody verify-audit-witness \
+  --anchor ./relay-custody-anchor.bin \
+  --anchor-sha256 <64-hex-anchor-frame-sha256> \
+  --receipt ./relay-custody-witness.bin \
+  --receipt-sha256 <64-hex-receipt-frame-sha256> \
+  --expected-producer <64-hex-producer-node-id> \
+  --expected-witness <64-hex-independent-witness-node-id> \
+  --minimum-checkpoint-generation <last-trusted-generation> \
+  --json
+```
+
+Successful verification requires an `advanced` or `idempotent` receipt and
+checks both Ed25519 signatures, both exact frame hashes, canonical encoding,
+independent producer/witness identities, the producer generation floor, and
+the receipt-to-anchor binding. The witness supplies its own signed observation
+time; the producer still supplies no trusted timestamp.
+
+The witness stores only producer identity, checkpoint generation, exact opaque
+frame SHA-256, and observation time. It never receives the private audit HMAC,
+custody paths, messages, routes, endpoints, payloads, ciphertext, memory,
+destinations, DNS, or social graph. One receipt proves one independent node's
+durable observation. Multiple receipts improve administrative independence but
+are not consensus, fork choice, validator voting, or global finality.
 
 Verify whether the newest recovery image is usable before planning a restore:
 

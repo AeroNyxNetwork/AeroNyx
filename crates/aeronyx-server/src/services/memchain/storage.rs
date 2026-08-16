@@ -54,6 +54,10 @@
 //!   lease grants retained by audited follower witnesses.
 //! - v14 (v2.8.28-VerifiedDeliveryAnchorWitness): One bounded durable
 //!   generation-and-digest high-water row per admitted node identity.
+//! - v15 (v2.8.14-CoordinatorHandover): Replayable dual-signed coordinator
+//!   authority history.
+//! - v16 (v2.8.29-CustodyAuditWitness): Separate producer-scoped custody
+//!   checkpoint high-water rows containing exact opaque frame digests only.
 //! - v2.7.23-CertificateExchange: Snapshot-audited internal bundle export for
 //!   the admitted fixed-size peer protocol; the schema remains v12.
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
@@ -235,6 +239,8 @@
 //!   No SQLite schema change; aggregate public fence status was added.
 //! v2.7.26-CoordinatorLease - Added durable witness-side coordinator lease
 //!   grants and process-local lease validity state for cross-host fencing.
+//! v2.8.29-CustodyAuditWitness - Schema v16 separate producer-scoped custody
+//!   checkpoint witness high-water decisions containing exact frame digests.
 //! v2.8.28-VerifiedDeliveryAnchorWitness - Schema v14 durable aggregate-only
 //!   delivery-anchor high-water decisions for admitted node peers.
 //! v2.8.12-LeaseFailClosedTelemetry - Added process-local lease attempt,
@@ -276,12 +282,16 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v12 → v13: durable exclusive coordinator lease grants on follower witnesses
 /// v13 → v14: durable verified-delivery anchor high-water decisions
 /// v14 → v15: append-only dual-signed coordinator authority history
+/// v15 → v16: independent custody audit anchor witness high-water decisions
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
 /// (not this constant) for UPDATE schema_version, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
-const SCHEMA_VERSION: u32 = 15;
+// [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Keep this visible only inside
+// the memchain module so cross-file migration tests assert the authoritative
+// current version without coupling production migration steps to this value.
+pub(super) const SCHEMA_VERSION: u32 = 16;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -1520,12 +1530,10 @@ pub struct MemoryStorage {
     pub(crate) commitment_durability: AtomicU64,
     /// Kernel-owned exclusive coordinator lock. It prevents a second local
     /// process from producing blocks or replacing sidecars for this database.
-    pub(crate) commitment_coordinator_fence:
-        RwLock<RecordCommitmentCoordinatorFenceRuntime>,
+    pub(crate) commitment_coordinator_fence: RwLock<RecordCommitmentCoordinatorFenceRuntime>,
     /// Witness-backed cross-host production authority. This remains disabled
     /// unless the operator explicitly enables strict coordinator leasing.
-    pub(crate) commitment_coordinator_lease:
-        RwLock<RecordCommitmentCoordinatorLeaseRuntime>,
+    pub(crate) commitment_coordinator_lease: RwLock<RecordCommitmentCoordinatorLeaseRuntime>,
     /// Signed local high-water mark outside SQLite. The private config never
     /// leaves this process; only aggregate status is reportable.
     pub(crate) commitment_tip_anchor: RwLock<RecordCommitmentTipAnchorRuntime>,
@@ -1812,6 +1820,19 @@ impl MemoryStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_record_coordinator_handovers_activation
                 ON record_coordinator_handovers(activation_height);
+
+            -- v16: one opaque custody-checkpoint high-water decision per
+            -- producer. This namespace is intentionally independent from the
+            -- delivery-cache witness table because their generations have no
+            -- semantic relationship.
+            CREATE TABLE IF NOT EXISTS custody_audit_anchor_witnesses (
+                producer       BLOB PRIMARY KEY CHECK(length(producer) = 32),
+                generation     INTEGER NOT NULL CHECK(generation > 0),
+                frame_sha256   BLOB NOT NULL CHECK(length(frame_sha256) = 32),
+                observed_at    INTEGER NOT NULL CHECK(observed_at > 0)
+            );
+            CREATE INDEX IF NOT EXISTS idx_custody_audit_anchor_witnesses_observed
+                ON custody_audit_anchor_witnesses(observed_at);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2981,6 +3002,55 @@ impl MemoryStorage {
             conn.execute("UPDATE schema_version SET version = 15", [])
                 .map_err(|error| format!("Update schema version to v15: {error}"))?;
             info!("[STORAGE] Migration to v15 (coordinator authority history) complete");
+        }
+
+        // v15 -> v16: an independent high-water namespace for externally
+        // witnessed relay-custody checkpoints. [CUSTODY-AUDIT-WITNESS
+        // 2026-08-16 by Codex] Do not merge this with delivery-cache witness
+        // state: both counters begin at one and advance independently.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(15);
+
+        if current < 16 {
+            info!(
+                "[STORAGE] Migrating schema v{} -> v16 (custody audit anchor witnesses)",
+                current
+            );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS custody_audit_anchor_witnesses (
+                    producer       BLOB PRIMARY KEY CHECK(length(producer) = 32),
+                    generation     INTEGER NOT NULL CHECK(generation > 0),
+                    frame_sha256   BLOB NOT NULL CHECK(length(frame_sha256) = 32),
+                    observed_at    INTEGER NOT NULL CHECK(observed_at > 0)
+                );
+                CREATE INDEX IF NOT EXISTS idx_custody_audit_anchor_witnesses_observed
+                    ON custody_audit_anchor_witnesses(observed_at);",
+            )
+            .map_err(|error| {
+                format!("v16 migration: create custody audit anchor witnesses: {error}")
+            })?;
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='custody_audit_anchor_witnesses'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !exists {
+                return Err(
+                    "v16 migration: required table 'custody_audit_anchor_witnesses' was not created"
+                        .to_string(),
+                );
+            }
+            // Hardcoded 16 preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 16", [])
+                .map_err(|error| format!("Update schema version to v16: {error}"))?;
+            info!("[STORAGE] Migration to v16 (custody audit anchor witnesses) complete");
         }
 
         Ok(())
@@ -4929,9 +4999,10 @@ mod tests {
         // v11 adds sticky trusted-divergence incidents, v12 adds immutable
         // checkpoint certificates, v13 adds durable coordinator leases, and
         // v14 adds aggregate-only delivery-anchor witness high-water state,
-        // and v15 adds replayable coordinator authority history
+        // v15 adds replayable coordinator authority history, and v16 adds an
+        // independent custody-audit witness high-water namespace
         // even when create_schema() was not called.
-        assert_eq!(v, 15);
+        assert_eq!(v, 16);
         for table in [
             "record_commitment_blocks",
             "record_block_commitments",
@@ -4943,6 +5014,7 @@ mod tests {
             "record_coordinator_leases",
             "verified_delivery_anchor_witnesses",
             "record_coordinator_handovers",
+            "custody_audit_anchor_witnesses",
         ] {
             let exists: bool = conn
                 .query_row(
@@ -4954,6 +5026,60 @@ mod tests {
                 > 0;
             assert!(exists, "missing migrated table: {table}");
         }
+    }
+
+    #[test]
+    fn test_v15_to_v16_migration_preserves_existing_witness_state() {
+        // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] The additive migration
+        // must not rewrite or conflate the established delivery-cache witness
+        // namespace while creating the independent custody table.
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (15);
+             CREATE TABLE verified_delivery_anchor_witnesses (
+                 requester BLOB PRIMARY KEY,
+                 generation INTEGER NOT NULL,
+                 anchor_digest BLOB NOT NULL,
+                 observed_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verified_delivery_anchor_witnesses
+             (requester, generation, anchor_digest, observed_at)
+             VALUES (?1, 41, ?2, 1000)",
+            params![[0x91u8; 32].as_slice(), [0x92u8; 32].as_slice()],
+        )
+        .unwrap();
+
+        MemoryStorage::maybe_migrate(&conn).unwrap();
+
+        let version: u32 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        let delivery_generation: i64 = conn
+            .query_row(
+                "SELECT generation FROM verified_delivery_anchor_witnesses
+                 WHERE requester=?1",
+                params![[0x91u8; 32].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let custody_table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='custody_audit_anchor_witnesses'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
+        assert_eq!(version, 16);
+        assert_eq!(delivery_generation, 41);
+        assert!(custody_table_exists);
     }
 
     // ========================================

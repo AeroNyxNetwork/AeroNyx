@@ -71,6 +71,9 @@
 //!   coverage and lag from the audited local tip without claiming finality
 //! - v2.8.28-VerifiedDeliveryAnchorWitness: atomic, bounded, generation-
 //!   contiguous external high-water decisions for signed delivery-cache anchors
+//! - [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Generalizes the durable
+//!   opaque monotonic witness transition while keeping delivery and custody
+//!   generations in separate schema-v16 tables.
 //! - v2.8.31-FollowerCertificatePolicy: re-audits current-tip certificate
 //!   membership against the follower's current local witness pins
 //! - v2.8.59-FollowerEffectiveReadiness: derives one fail-closed follower
@@ -251,16 +254,14 @@ use crate::error::RuntimeTaskJoinFailureKind;
 
 use super::storage::{
     LayerCounts, MemoryStorage, RawLogRow, RecordCommitmentAnnouncementDisposition,
-    RecordCommitmentAuthoritySyncDisposition,
-    RecordCommitmentBlockPagePullDisposition, RecordCommitmentCertificatePolicyReadiness,
-    RecordCommitmentCertificateBackfillDisposition, RecordCommitmentCertificateSyncDisposition,
-    RecordCommitmentFollowerReadiness,
-    RecordCommitmentCheckpointCertificateAnchorConfig,
+    RecordCommitmentAuthoritySyncDisposition, RecordCommitmentBlockPagePullDisposition,
+    RecordCommitmentCertificateBackfillDisposition, RecordCommitmentCertificatePolicyReadiness,
+    RecordCommitmentCertificateSyncDisposition, RecordCommitmentCheckpointCertificateAnchorConfig,
     RecordCommitmentCheckpointCertificateAnchorRuntime,
     RecordCommitmentCheckpointCertificateBundle, RecordCommitmentCheckpointStatus,
-    RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent, RecordCommitmentSyncRuntime,
-    RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig, StorageStats,
-    CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
+    RecordCommitmentFollowerReadiness, RecordCommitmentIntegrityRuntime, RecordCommitmentSyncEvent,
+    RecordCommitmentSyncRuntime, RecordCommitmentSyncStatus, RecordCommitmentTipAnchorConfig,
+    StorageStats, CHECKPOINT_CERTIFICATE_CAPACITY, CHECKPOINT_EQUIVOCATION_CAPACITY,
     CHECKPOINT_EVIDENCE_CAPACITY, CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS,
     CHECKPOINT_TRUSTED_DIVERGENCE_CAPACITY, COMMITMENT_SYNC_EVENT_CAPACITY,
     MAX_CHECKPOINT_CERTIFICATE_SIGNERS, MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES,
@@ -424,13 +425,13 @@ pub struct RecordCoordinatorHandoverPage {
     pub latest_authority_epoch: u64,
 }
 
-/// Result of one serialized verified-delivery anchor witness decision.
+/// Result of one serialized opaque monotonic anchor witness decision.
 ///
 /// Every variant returns the witness's durable high-water state. Callers must
 /// treat `Stale`, `Conflict`, and `Gap` as evidence that the requester cannot
 /// safely claim continuity; none of those outcomes mutates the high-water row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifiedDeliveryAnchorWitnessOutcome {
+pub enum MonotonicAnchorWitnessOutcome {
     /// First observation, or an exact one-generation advance, was committed.
     Advanced {
         generation: u64,
@@ -456,6 +457,83 @@ pub enum VerifiedDeliveryAnchorWitnessOutcome {
         generation: u64,
         anchor_digest: [u8; 32],
     },
+}
+
+/// Backward-compatible name for delivery-cache witness decisions.
+pub type VerifiedDeliveryAnchorWitnessOutcome = MonotonicAnchorWitnessOutcome;
+
+/// Custody-checkpoint witness decision in its independent durable namespace.
+pub type CustodyAuditAnchorWitnessOutcome = MonotonicAnchorWitnessOutcome;
+
+#[derive(Debug, Clone, Copy)]
+enum MonotonicAnchorWitnessNamespace {
+    VerifiedDelivery,
+    CustodyAudit,
+}
+
+impl MonotonicAnchorWitnessNamespace {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::VerifiedDelivery => "verified-delivery",
+            Self::CustodyAudit => "custody-audit",
+        }
+    }
+
+    const fn select_sql(self) -> &'static str {
+        match self {
+            Self::VerifiedDelivery => {
+                "SELECT generation, anchor_digest
+                 FROM verified_delivery_anchor_witnesses WHERE requester=?1"
+            }
+            Self::CustodyAudit => {
+                "SELECT generation, frame_sha256
+                 FROM custody_audit_anchor_witnesses WHERE producer=?1"
+            }
+        }
+    }
+
+    const fn refresh_sql(self) -> &'static str {
+        match self {
+            Self::VerifiedDelivery => {
+                "UPDATE verified_delivery_anchor_witnesses
+                 SET observed_at=MAX(observed_at, ?2) WHERE requester=?1"
+            }
+            Self::CustodyAudit => {
+                "UPDATE custody_audit_anchor_witnesses
+                 SET observed_at=MAX(observed_at, ?2) WHERE producer=?1"
+            }
+        }
+    }
+
+    const fn advance_sql(self) -> &'static str {
+        match self {
+            Self::VerifiedDelivery => {
+                "UPDATE verified_delivery_anchor_witnesses
+                 SET generation=?2, anchor_digest=?3, observed_at=?4
+                 WHERE requester=?1"
+            }
+            Self::CustodyAudit => {
+                "UPDATE custody_audit_anchor_witnesses
+                 SET generation=?2, frame_sha256=?3, observed_at=?4
+                 WHERE producer=?1"
+            }
+        }
+    }
+
+    const fn insert_sql(self) -> &'static str {
+        match self {
+            Self::VerifiedDelivery => {
+                "INSERT INTO verified_delivery_anchor_witnesses
+                 (requester, generation, anchor_digest, observed_at)
+                 VALUES (?1, ?2, ?3, ?4)"
+            }
+            Self::CustodyAudit => {
+                "INSERT INTO custody_audit_anchor_witnesses
+                 (producer, generation, frame_sha256, observed_at)
+                 VALUES (?1, ?2, ?3, ?4)"
+            }
+        }
+    }
 }
 
 /// Aggregate result of one atomic bounded commitment-block append.
@@ -1081,14 +1159,12 @@ fn read_record_coordinator_handover_history_transaction(
                 )
             })?;
         let previous_tip_hash: [u8; 32] =
-            previous_tip_hash
-                .try_into()
-                .map_err(|value: Vec<u8>| {
-                    format!(
-                        "coordinator handover predecessor hash length {}",
-                        value.len()
-                    )
-                })?;
+            previous_tip_hash.try_into().map_err(|value: Vec<u8>| {
+                format!(
+                    "coordinator handover predecessor hash length {}",
+                    value.len()
+                )
+            })?;
         proof
             .verify_successor(
                 &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
@@ -1144,7 +1220,10 @@ fn verify_record_commitment_proposer_history_transaction(
             .get::<_, Vec<u8>>(1)
             .map_err(|error| format!("decode commitment proposer: {error}"))?;
         let proposer: [u8; 32] = proposer.try_into().map_err(|value: Vec<u8>| {
-            format!("commitment proposer length {} at height {height}", value.len())
+            format!(
+                "commitment proposer length {} at height {height}",
+                value.len()
+            )
         })?;
 
         if let Some(transition) = transitions.peek() {
@@ -3690,11 +3769,11 @@ impl MemoryStorage {
         }
 
         let (report, anchor_state) = {
-        let mut conn = self.conn.lock().await;
-        let transaction = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|error| format!("begin checkpoint certificate transaction: {error}"))?;
-        let (tip_height_i64, tip_hash): (i64, Vec<u8>) = transaction
+            let mut conn = self.conn.lock().await;
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| format!("begin checkpoint certificate transaction: {error}"))?;
+            let (tip_height_i64, tip_hash): (i64, Vec<u8>) = transaction
             .query_row(
                 "SELECT height,block_hash FROM record_commitment_blocks ORDER BY height DESC LIMIT 1",
                 [],
@@ -3703,175 +3782,175 @@ impl MemoryStorage {
             .optional()
             .map_err(|error| format!("read checkpoint certificate local tip: {error}"))?
             .ok_or_else(|| "checkpoint certificate local tip is unavailable".to_string())?;
-        let tip_height = u64::try_from(tip_height_i64)
-            .map_err(|_| "checkpoint certificate local tip is invalid".to_string())?;
-        let tip_hash: [u8; 32] = tip_hash
-            .as_slice()
-            .try_into()
-            .map_err(|_| "checkpoint certificate local hash has invalid length".to_string())?;
-        if tip_height == 0 {
-            return Ok(false);
-        }
-
-        let mut members = Vec::with_capacity(evidence_digests.len());
-        for evidence_digest in evidence_digests {
-            let (relation, local_tip_height_i64, frame): (String, i64, Vec<u8>) = transaction
-                .query_row(
-                    "SELECT relation,local_tip_height,signed_response
-                     FROM record_checkpoint_evidence WHERE evidence_digest=?1",
-                    params![evidence_digest.as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .map_err(|_| "checkpoint certificate evidence is unavailable".to_string())?;
-            let local_tip_height = u64::try_from(local_tip_height_i64)
-                .map_err(|_| "checkpoint certificate evidence height is invalid".to_string())?;
-            let claim = decode_checkpoint_evidence_claims(&frame)?;
-            if !matches!(relation.as_str(), "converged" | "remote_ahead")
-                || local_tip_height != tip_height
-                || claim.checkpoint_height != tip_height
-                || claim.checkpoint_hash != tip_hash
-                || !allowed_witnesses.contains(&claim.responder)
-                || members
-                    .iter()
-                    .any(|(responder, _)| *responder == claim.responder)
-            {
-                continue;
+            let tip_height = u64::try_from(tip_height_i64)
+                .map_err(|_| "checkpoint certificate local tip is invalid".to_string())?;
+            let tip_hash: [u8; 32] = tip_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| "checkpoint certificate local hash has invalid length".to_string())?;
+            if tip_height == 0 {
+                return Ok(false);
             }
-            members.push((claim.responder, *evidence_digest));
-        }
-        members.sort_unstable_by_key(|member| member.0);
-        if members.len() < required_signers {
-            return Ok(false);
-        }
-        let certificate_digest = record_checkpoint_certificate_digest_v1(
-            &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
-            tip_height,
-            &tip_hash,
-            required_signers,
-            &members,
-        );
 
-        let existing: Option<(Vec<u8>, i64, i64, Vec<u8>)> = transaction
-            .query_row(
-                "SELECT checkpoint_hash,required_signers,signer_count,certificate_digest
+            let mut members = Vec::with_capacity(evidence_digests.len());
+            for evidence_digest in evidence_digests {
+                let (relation, local_tip_height_i64, frame): (String, i64, Vec<u8>) = transaction
+                    .query_row(
+                        "SELECT relation,local_tip_height,signed_response
+                     FROM record_checkpoint_evidence WHERE evidence_digest=?1",
+                        params![evidence_digest.as_slice()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(|_| "checkpoint certificate evidence is unavailable".to_string())?;
+                let local_tip_height = u64::try_from(local_tip_height_i64)
+                    .map_err(|_| "checkpoint certificate evidence height is invalid".to_string())?;
+                let claim = decode_checkpoint_evidence_claims(&frame)?;
+                if !matches!(relation.as_str(), "converged" | "remote_ahead")
+                    || local_tip_height != tip_height
+                    || claim.checkpoint_height != tip_height
+                    || claim.checkpoint_hash != tip_hash
+                    || !allowed_witnesses.contains(&claim.responder)
+                    || members
+                        .iter()
+                        .any(|(responder, _)| *responder == claim.responder)
+                {
+                    continue;
+                }
+                members.push((claim.responder, *evidence_digest));
+            }
+            members.sort_unstable_by_key(|member| member.0);
+            if members.len() < required_signers {
+                return Ok(false);
+            }
+            let certificate_digest = record_checkpoint_certificate_digest_v1(
+                &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+                tip_height,
+                &tip_hash,
+                required_signers,
+                &members,
+            );
+
+            let existing: Option<(Vec<u8>, i64, i64, Vec<u8>)> = transaction
+                .query_row(
+                    "SELECT checkpoint_hash,required_signers,signer_count,certificate_digest
                  FROM record_checkpoint_certificates WHERE checkpoint_height=?1",
-                params![tip_height_i64],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(|error| format!("read existing checkpoint certificate: {error}"))?;
-        if let Some((stored_hash, stored_required, stored_count, stored_digest)) = existing {
+                    params![tip_height_i64],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|error| format!("read existing checkpoint certificate: {error}"))?;
+            if let Some((stored_hash, stored_required, stored_count, stored_digest)) = existing {
                 let stored_required = usize::try_from(stored_required).map_err(|_| {
                     "existing checkpoint certificate threshold is invalid".to_string()
                 })?;
-            let stored_count = usize::try_from(stored_count).map_err(|_| {
-                "existing checkpoint certificate signer count is invalid".to_string()
-            })?;
-            if stored_hash.as_slice() != tip_hash
-                || !(2..=MAX_CHECKPOINT_CERTIFICATE_SIGNERS).contains(&stored_required)
-                || stored_count < stored_required
-                || stored_count > MAX_CHECKPOINT_CERTIFICATE_SIGNERS
-                || stored_digest.len() != 32
-            {
+                let stored_count = usize::try_from(stored_count).map_err(|_| {
+                    "existing checkpoint certificate signer count is invalid".to_string()
+                })?;
+                if stored_hash.as_slice() != tip_hash
+                    || !(2..=MAX_CHECKPOINT_CERTIFICATE_SIGNERS).contains(&stored_required)
+                    || stored_count < stored_required
+                    || stored_count > MAX_CHECKPOINT_CERTIFICATE_SIGNERS
+                    || stored_digest.len() != 32
+                {
                     return Err(
                         "existing checkpoint certificate conflicts with local tip".to_string()
                     );
-            }
-            let report = audit_checkpoint_evidence_snapshot(&transaction)?;
-            let mut current_policy_members = 0usize;
-            {
-                let mut statement = transaction
-                    .prepare(
-                        "SELECT responder FROM record_checkpoint_certificate_members
+                }
+                let report = audit_checkpoint_evidence_snapshot(&transaction)?;
+                let mut current_policy_members = 0usize;
+                {
+                    let mut statement = transaction
+                        .prepare(
+                            "SELECT responder FROM record_checkpoint_certificate_members
                          WHERE checkpoint_height=?1 ORDER BY responder ASC",
-                    )
-                    .map_err(|error| {
-                        format!("prepare existing checkpoint certificate members: {error}")
+                        )
+                        .map_err(|error| {
+                            format!("prepare existing checkpoint certificate members: {error}")
+                        })?;
+                    let mut rows = statement.query(params![tip_height_i64]).map_err(|error| {
+                        format!("query existing checkpoint certificate members: {error}")
                     })?;
-                let mut rows = statement.query(params![tip_height_i64]).map_err(|error| {
-                    format!("query existing checkpoint certificate members: {error}")
-                })?;
-                while let Some(row) = rows.next().map_err(|error| {
-                    format!("read existing checkpoint certificate member: {error}")
-                })? {
-                    let responder: Vec<u8> = row.get(0).map_err(|error| {
-                        format!("read existing checkpoint certificate responder: {error}")
-                    })?;
+                    while let Some(row) = rows.next().map_err(|error| {
+                        format!("read existing checkpoint certificate member: {error}")
+                    })? {
+                        let responder: Vec<u8> = row.get(0).map_err(|error| {
+                            format!("read existing checkpoint certificate responder: {error}")
+                        })?;
                         let responder: [u8; 32] =
                             responder.as_slice().try_into().map_err(|_| {
                                 "existing checkpoint certificate responder has invalid length"
                                     .to_string()
-                    })?;
-                    if allowed_witnesses.contains(&responder) {
-                        current_policy_members = current_policy_members.saturating_add(1);
+                            })?;
+                        if allowed_witnesses.contains(&responder) {
+                            current_policy_members = current_policy_members.saturating_add(1);
+                        }
                     }
                 }
+                let satisfies_current_policy = stored_required >= required_signers
+                    && stored_count >= required_signers
+                    && current_policy_members == stored_count;
+                transaction
+                    .commit()
+                    .map_err(|error| format!("finish existing checkpoint certificate: {error}"))?;
+                self.apply_record_commitment_checkpoint_audit(&report);
+                return Ok(satisfies_current_policy);
             }
-            let satisfies_current_policy = stored_required >= required_signers
-                && stored_count >= required_signers
-                && current_policy_members == stored_count;
-            transaction
-                .commit()
-                .map_err(|error| format!("finish existing checkpoint certificate: {error}"))?;
-            self.apply_record_commitment_checkpoint_audit(&report);
-            return Ok(satisfies_current_policy);
-        }
 
-        let certificate_count = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM record_checkpoint_certificates",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| format!("count checkpoint certificates: {error}"))?;
-        let excess = certificate_count
-            .saturating_add(1)
-            .saturating_sub(CHECKPOINT_CERTIFICATE_CAPACITY as i64);
-        if excess > 0 {
-            transaction
-                .execute(
-                    "DELETE FROM record_checkpoint_certificates WHERE checkpoint_height IN (
+            let certificate_count = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM record_checkpoint_certificates",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("count checkpoint certificates: {error}"))?;
+            let excess = certificate_count
+                .saturating_add(1)
+                .saturating_sub(CHECKPOINT_CERTIFICATE_CAPACITY as i64);
+            if excess > 0 {
+                transaction
+                    .execute(
+                        "DELETE FROM record_checkpoint_certificates WHERE checkpoint_height IN (
                         SELECT checkpoint_height FROM record_checkpoint_certificates
                         ORDER BY checkpoint_height ASC LIMIT ?1
                     )",
-                    params![excess],
-                )
-                .map_err(|error| format!("prune checkpoint certificates: {error}"))?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO record_checkpoint_certificates
+                        params![excess],
+                    )
+                    .map_err(|error| format!("prune checkpoint certificates: {error}"))?;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO record_checkpoint_certificates
                  (checkpoint_height,chain_id,checkpoint_hash,certificate_digest,
                   required_signers,signer_count,certified_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    tip_height_i64,
-                    AERONYX_MEMCHAIN_MAINNET_CHAIN_ID.as_slice(),
-                    tip_hash.as_slice(),
-                    certificate_digest.as_slice(),
-                    i64::try_from(required_signers)
-                        .map_err(|_| "checkpoint certificate threshold exceeds SQLite range")?,
+                    params![
+                        tip_height_i64,
+                        AERONYX_MEMCHAIN_MAINNET_CHAIN_ID.as_slice(),
+                        tip_hash.as_slice(),
+                        certificate_digest.as_slice(),
+                        i64::try_from(required_signers)
+                            .map_err(|_| "checkpoint certificate threshold exceeds SQLite range")?,
                         i64::try_from(members.len()).map_err(|_| {
                             "checkpoint certificate signer count exceeds SQLite range"
                         })?,
-                    certified_at,
-                ],
-            )
-            .map_err(|error| format!("insert checkpoint certificate: {error}"))?;
-        for (responder, evidence_digest) in &members {
-            transaction
-                .execute(
-                    "INSERT INTO record_checkpoint_certificate_members
-                     (checkpoint_height,responder,evidence_digest) VALUES (?1,?2,?3)",
-                    params![
-                        tip_height_i64,
-                        responder.as_slice(),
-                        evidence_digest.as_slice(),
+                        certified_at,
                     ],
                 )
-                .map_err(|error| format!("insert checkpoint certificate member: {error}"))?;
-        }
-        let report = audit_checkpoint_evidence_snapshot(&transaction)?;
+                .map_err(|error| format!("insert checkpoint certificate: {error}"))?;
+            for (responder, evidence_digest) in &members {
+                transaction
+                    .execute(
+                        "INSERT INTO record_checkpoint_certificate_members
+                     (checkpoint_height,responder,evidence_digest) VALUES (?1,?2,?3)",
+                        params![
+                            tip_height_i64,
+                            responder.as_slice(),
+                            evidence_digest.as_slice(),
+                        ],
+                    )
+                    .map_err(|error| format!("insert checkpoint certificate member: {error}"))?;
+            }
+            let report = audit_checkpoint_evidence_snapshot(&transaction)?;
             let anchor_state = CheckpointCertificateAnchorState {
                 certificate_height: tip_height,
                 checkpoint_hash: tip_hash,
@@ -3879,9 +3958,9 @@ impl MemoryStorage {
                 required_signers: required_signers as u64,
                 signer_count: members.len() as u64,
             };
-        transaction
-            .commit()
-            .map_err(|error| format!("commit checkpoint certificate: {error}"))?;
+            transaction
+                .commit()
+                .map_err(|error| format!("commit checkpoint certificate: {error}"))?;
             (report, anchor_state)
         };
         self.apply_record_commitment_checkpoint_audit(&report);
@@ -4032,109 +4111,151 @@ impl MemoryStorage {
         anchor_digest: &[u8; 32],
         observed_at: u64,
     ) -> Result<VerifiedDeliveryAnchorWitnessOutcome, String> {
-        if generation == 0 {
-            return Err("verified-delivery witness generation must be positive".to_string());
+        self.witness_monotonic_anchor(
+            MonotonicAnchorWitnessNamespace::VerifiedDelivery,
+            requester,
+            generation,
+            anchor_digest,
+            observed_at,
+        )
+        .await
+    }
+
+    /// Atomically witnesses one exact producer-signed custody checkpoint frame.
+    ///
+    /// [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] This uses the same audited
+    /// monotonic transition as delivery evidence but a physically separate
+    /// table and producer key. The row stores only producer identity,
+    /// checkpoint generation, exact frame SHA-256, and witness observation
+    /// time. Custody counts, paths, private HMACs, messages, routes, payloads,
+    /// endpoints, and user identities never enter this database boundary.
+    ///
+    /// # Errors
+    /// Returns an error for sentinel/out-of-range state, corrupt durable state,
+    /// integer conversion failure, or SQLite transaction failure.
+    pub async fn witness_custody_audit_anchor(
+        &self,
+        producer: &[u8; 32],
+        checkpoint_generation: u64,
+        frame_sha256: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<CustodyAuditAnchorWitnessOutcome, String> {
+        self.witness_monotonic_anchor(
+            MonotonicAnchorWitnessNamespace::CustodyAudit,
+            producer,
+            checkpoint_generation,
+            frame_sha256,
+            observed_at,
+        )
+        .await
+    }
+
+    async fn witness_monotonic_anchor(
+        &self,
+        namespace: MonotonicAnchorWitnessNamespace,
+        subject: &[u8; 32],
+        generation: u64,
+        digest: &[u8; 32],
+        observed_at: u64,
+    ) -> Result<MonotonicAnchorWitnessOutcome, String> {
+        let label = namespace.label();
+        if subject == &[0u8; 32] {
+            return Err(format!("{label} witness subject must be non-zero"));
         }
-        if anchor_digest == &[0u8; 32] {
-            return Err("verified-delivery witness digest must be non-zero".to_string());
+        if generation == 0 {
+            return Err(format!("{label} witness generation must be positive"));
+        }
+        if digest == &[0u8; 32] {
+            return Err(format!("{label} witness digest must be non-zero"));
+        }
+        if observed_at == 0 {
+            return Err(format!("{label} witness time must be positive"));
         }
         let generation_i64 = i64::try_from(generation)
-            .map_err(|_| "verified-delivery witness generation is outside SQLite range")?;
+            .map_err(|_| format!("{label} witness generation is outside SQLite range"))?;
         let observed_at_i64 = i64::try_from(observed_at)
-            .map_err(|_| "verified-delivery witness time is outside SQLite range")?;
+            .map_err(|_| format!("{label} witness time is outside SQLite range"))?;
 
         let mut conn = self.conn.lock().await;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|error| format!("begin verified-delivery witness transaction: {error}"))?;
+            .map_err(|error| format!("begin {label} witness transaction: {error}"))?;
         let existing = tx
-            .query_row(
-                "SELECT generation, anchor_digest
-                 FROM verified_delivery_anchor_witnesses WHERE requester=?1",
-                params![requester.as_slice()],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
+            .query_row(namespace.select_sql(), params![subject.as_slice()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
             .optional()
-            .map_err(|error| format!("read verified-delivery witness high-water: {error}"))?;
+            .map_err(|error| format!("read {label} witness high-water: {error}"))?;
 
         let outcome = if let Some((stored_generation, stored_digest)) = existing {
             let stored_generation = u64::try_from(stored_generation)
-                .map_err(|_| "verified-delivery witness generation is invalid".to_string())?;
-            let stored_digest: [u8; 32] = stored_digest.try_into().map_err(|digest: Vec<u8>| {
-                format!("verified-delivery witness digest length {}", digest.len())
+                .map_err(|_| format!("{label} witness generation is invalid"))?;
+            let stored_digest: [u8; 32] = stored_digest.try_into().map_err(|value: Vec<u8>| {
+                format!("{label} witness digest length {}", value.len())
             })?;
 
             if generation < stored_generation {
-                VerifiedDeliveryAnchorWitnessOutcome::Stale {
+                MonotonicAnchorWitnessOutcome::Stale {
                     generation: stored_generation,
                     anchor_digest: stored_digest,
                 }
             } else if generation == stored_generation {
-                if anchor_digest == &stored_digest {
+                if digest == &stored_digest {
                     tx.execute(
-                        "UPDATE verified_delivery_anchor_witnesses
-                         SET observed_at=MAX(observed_at, ?2) WHERE requester=?1",
-                        params![requester.as_slice(), observed_at_i64],
+                        namespace.refresh_sql(),
+                        params![subject.as_slice(), observed_at_i64],
                     )
-                    .map_err(|error| {
-                        format!("refresh verified-delivery witness observation: {error}")
-                    })?;
-                    VerifiedDeliveryAnchorWitnessOutcome::Idempotent {
+                    .map_err(|error| format!("refresh {label} witness observation: {error}"))?;
+                    MonotonicAnchorWitnessOutcome::Idempotent {
                         generation: stored_generation,
                         anchor_digest: stored_digest,
                     }
                 } else {
-                    VerifiedDeliveryAnchorWitnessOutcome::Conflict {
+                    MonotonicAnchorWitnessOutcome::Conflict {
                         generation: stored_generation,
                         anchor_digest: stored_digest,
                     }
                 }
             } else if stored_generation.checked_add(1) == Some(generation) {
                 tx.execute(
-                    "UPDATE verified_delivery_anchor_witnesses
-                     SET generation=?2, anchor_digest=?3, observed_at=?4
-                     WHERE requester=?1",
+                    namespace.advance_sql(),
                     params![
-                        requester.as_slice(),
+                        subject.as_slice(),
                         generation_i64,
-                        anchor_digest.as_slice(),
+                        digest.as_slice(),
                         observed_at_i64
                     ],
                 )
-                .map_err(|error| {
-                    format!("advance verified-delivery witness high-water: {error}")
-                })?;
-                VerifiedDeliveryAnchorWitnessOutcome::Advanced {
+                .map_err(|error| format!("advance {label} witness high-water: {error}"))?;
+                MonotonicAnchorWitnessOutcome::Advanced {
                     generation,
-                    anchor_digest: *anchor_digest,
+                    anchor_digest: *digest,
                 }
             } else {
-                VerifiedDeliveryAnchorWitnessOutcome::Gap {
+                MonotonicAnchorWitnessOutcome::Gap {
                     generation: stored_generation,
                     anchor_digest: stored_digest,
                 }
             }
         } else {
             tx.execute(
-                "INSERT INTO verified_delivery_anchor_witnesses
-                 (requester, generation, anchor_digest, observed_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                namespace.insert_sql(),
                 params![
-                    requester.as_slice(),
+                    subject.as_slice(),
                     generation_i64,
-                    anchor_digest.as_slice(),
+                    digest.as_slice(),
                     observed_at_i64
                 ],
             )
-            .map_err(|error| format!("insert verified-delivery witness high-water: {error}"))?;
-            VerifiedDeliveryAnchorWitnessOutcome::Advanced {
+            .map_err(|error| format!("insert {label} witness high-water: {error}"))?;
+            MonotonicAnchorWitnessOutcome::Advanced {
                 generation,
-                anchor_digest: *anchor_digest,
+                anchor_digest: *digest,
             }
         };
 
         tx.commit()
-            .map_err(|error| format!("commit verified-delivery witness decision: {error}"))?;
+            .map_err(|error| format!("commit {label} witness decision: {error}"))?;
         Ok(outcome)
     }
 
@@ -4405,9 +4526,9 @@ impl MemoryStorage {
             .find(|entry| entry.header.authority_epoch == proof.header.authority_epoch)
         {
             if existing == proof {
-                transaction.commit().map_err(|error| {
-                    format!("commit idempotent coordinator handover: {error}")
-                })?;
+                transaction
+                    .commit()
+                    .map_err(|error| format!("commit idempotent coordinator handover: {error}"))?;
                 return Ok(RecordCoordinatorHandoverPersistOutcome::AlreadyPresent);
             }
             return Err(format!(
@@ -4416,15 +4537,10 @@ impl MemoryStorage {
             ));
         }
 
-        let (current_epoch, current_coordinator) = history.last().map_or(
-            (0, *root_coordinator),
-            |entry| {
-                (
-                    entry.header.authority_epoch,
-                    entry.header.next_coordinator,
-                )
-            },
-        );
+        let (current_epoch, current_coordinator) =
+            history.last().map_or((0, *root_coordinator), |entry| {
+                (entry.header.authority_epoch, entry.header.next_coordinator)
+            });
         proof
             .verify_successor(
                 &AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
@@ -4873,9 +4989,7 @@ impl MemoryStorage {
         let mut configured = self.commitment_authority_root.write();
         match (*configured, root) {
             (Some(existing), Some(candidate)) if existing != candidate => {
-                return Err(
-                    "commitment authority root is immutable after installation".to_string(),
-                );
+                return Err("commitment authority root is immutable after installation".to_string());
             }
             (Some(_), None) => {
                 return Err(
@@ -4922,10 +5036,7 @@ impl MemoryStorage {
     /// [FOLLOWER-READINESS-FRESHNESS 2026-07-30 by Codex] Three missed
     /// operator-configured poll windows are tolerated. This process-local
     /// deadline cannot affect chain choice, certificate policy, or storage.
-    pub fn configure_record_commitment_sync_readiness_freshness(
-        &self,
-        poll_interval_secs: u64,
-    ) {
+    pub fn configure_record_commitment_sync_readiness_freshness(&self, poll_interval_secs: u64) {
         const MISSED_POLL_WINDOWS_BEFORE_STALE: u64 = 3;
 
         let mut runtime = self.commitment_sync.write();
@@ -5346,7 +5457,7 @@ impl MemoryStorage {
                 identity: identity.clone(),
             });
             runtime.state = "checking";
-    }
+        }
 
         let (report, current_state) = {
             let mut conn = self.conn.lock().await;
@@ -5379,7 +5490,7 @@ impl MemoryStorage {
             Err(error) => {
                 self.fail_record_commitment_checkpoint_certificate_anchor("invalid", 0, false);
                 return Err(error);
-        }
+            }
         };
         let now = unix_now_secs();
         match stored {
@@ -5908,8 +6019,7 @@ impl MemoryStorage {
         if !runtime.enabled || runtime.role != "follower" {
             return;
         }
-        let observed_at =
-            record_monotonic_observation(&mut runtime.last_block_page_pull_at, now);
+        let observed_at = record_monotonic_observation(&mut runtime.last_block_page_pull_at, now);
         let carrier_attempts = u64::try_from(carrier_attempts).unwrap_or(u64::MAX);
 
         runtime.last_block_page_pull_result = Some(disposition.as_str());
@@ -6020,8 +6130,7 @@ impl MemoryStorage {
         if !runtime.enabled || runtime.role != "follower" {
             return;
         }
-        let observed_at =
-            record_monotonic_observation(&mut runtime.last_certificate_sync_at, now);
+        let observed_at = record_monotonic_observation(&mut runtime.last_certificate_sync_at, now);
         let carrier_attempts = u64::try_from(carrier_attempts).unwrap_or(u64::MAX);
 
         runtime.last_certificate_sync_result = Some(disposition.as_str());
@@ -6125,8 +6234,7 @@ impl MemoryStorage {
                     .saturating_add(1);
             }
             RecordCommitmentCertificateBackfillDisposition::SecurityStopped => {
-                runtime.last_coordinator_certificate_backfill_security_stop_at =
-                    Some(observed_at);
+                runtime.last_coordinator_certificate_backfill_security_stop_at = Some(observed_at);
                 runtime.coordinator_certificate_backfill_security_stops_total = runtime
                     .coordinator_certificate_backfill_security_stops_total
                     .saturating_add(1);
@@ -6223,10 +6331,9 @@ impl MemoryStorage {
             .as_ref()
             .map(|integrity| integrity.verified_tip_height);
         let runtime = self.commitment_sync.read();
-        let certificate_policy_evaluation_is_stale = runtime
-            .certificate_policy_evaluated_tip_height
-            .is_some()
-            && runtime.certificate_policy_evaluated_tip_height != audited_tip_height;
+        let certificate_policy_evaluation_is_stale =
+            runtime.certificate_policy_evaluated_tip_height.is_some()
+                && runtime.certificate_policy_evaluated_tip_height != audited_tip_height;
         let certificate_policy_state = if certificate_policy_evaluation_is_stale {
             if audited_tip_height.is_some() {
                 "waiting_for_certificate"
@@ -6862,9 +6969,7 @@ impl MemoryStorage {
         };
         let authority_history = authority_root
             .as_ref()
-            .map(|root| {
-                read_record_coordinator_handover_history_transaction(&transaction, root)
-            })
+            .map(|root| read_record_coordinator_handover_history_transaction(&transaction, root))
             .transpose()?;
         let appended_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7764,6 +7869,10 @@ impl MemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] File-migration fixtures
+    // must follow the authoritative latest schema while each migration step
+    // continues to advance through hardcoded intermediate versions.
+    use super::super::storage::SCHEMA_VERSION;
     use aeronyx_core::crypto::IdentityKeyPair;
     use aeronyx_core::ledger::MemoryRecord;
     use tempfile::TempDir;
@@ -8267,6 +8376,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custody_audit_witness_is_contiguous_restart_durable_and_domain_isolated() {
+        // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] The same producer may
+        // legitimately have unrelated delivery-cache and custody generation
+        // values. Each state machine must therefore advance independently.
+        let directory = TempDir::new().unwrap();
+        let db_path = directory.path().join("custody-audit-witness.db");
+        let producer = [0x73; 32];
+        let frame_3 = [0x74; 32];
+        let frame_4 = [0x75; 32];
+        let storage = MemoryStorage::open(&db_path, None).unwrap();
+
+        assert_eq!(
+            storage
+                .witness_verified_delivery_anchor(&producer, 40, &[0x76; 32], 900)
+                .await
+                .unwrap(),
+            VerifiedDeliveryAnchorWitnessOutcome::Advanced {
+                generation: 40,
+                anchor_digest: [0x76; 32],
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_custody_audit_anchor(&producer, 3, &frame_3, 1_000)
+                .await
+                .unwrap(),
+            CustodyAuditAnchorWitnessOutcome::Advanced {
+                generation: 3,
+                anchor_digest: frame_3,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_custody_audit_anchor(&producer, 3, &frame_3, 1_001)
+                .await
+                .unwrap(),
+            CustodyAuditAnchorWitnessOutcome::Idempotent {
+                generation: 3,
+                anchor_digest: frame_3,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_custody_audit_anchor(&producer, 3, &[0x77; 32], 1_002)
+                .await
+                .unwrap(),
+            CustodyAuditAnchorWitnessOutcome::Conflict {
+                generation: 3,
+                anchor_digest: frame_3,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_custody_audit_anchor(&producer, 2, &[0x78; 32], 1_003)
+                .await
+                .unwrap(),
+            CustodyAuditAnchorWitnessOutcome::Stale {
+                generation: 3,
+                anchor_digest: frame_3,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_custody_audit_anchor(&producer, 5, &[0x79; 32], 1_004)
+                .await
+                .unwrap(),
+            CustodyAuditAnchorWitnessOutcome::Gap {
+                generation: 3,
+                anchor_digest: frame_3,
+            }
+        );
+        assert_eq!(
+            storage
+                .witness_custody_audit_anchor(&producer, 4, &frame_4, 1_005)
+                .await
+                .unwrap(),
+            CustodyAuditAnchorWitnessOutcome::Advanced {
+                generation: 4,
+                anchor_digest: frame_4,
+            }
+        );
+        drop(storage);
+
+        let reopened = MemoryStorage::open(&db_path, None).unwrap();
+        assert_eq!(
+            reopened
+                .witness_custody_audit_anchor(&producer, 4, &frame_4, 1_006)
+                .await
+                .unwrap(),
+            CustodyAuditAnchorWitnessOutcome::Idempotent {
+                generation: 4,
+                anchor_digest: frame_4,
+            }
+        );
+        let (custody_rows, delivery_generation): (i64, i64) = {
+            let conn = reopened.conn_lock().await;
+            let custody_rows = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM custody_audit_anchor_witnesses",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let delivery_generation = conn
+                .query_row(
+                    "SELECT generation FROM verified_delivery_anchor_witnesses WHERE requester=?1",
+                    params![producer.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (custody_rows, delivery_generation)
+        };
+        assert_eq!(
+            custody_rows, 1,
+            "custody witness stays bounded per producer"
+        );
+        assert_eq!(delivery_generation, 40, "witness domains must not collide");
+    }
+
+    #[tokio::test]
+    async fn custody_audit_witness_rejects_sentinel_values() {
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+        assert_eq!(
+            storage
+                .witness_custody_audit_anchor(&[0u8; 32], 1, &[0x7a; 32], 1)
+                .await
+                .unwrap_err(),
+            "custody-audit witness subject must be non-zero"
+        );
+        assert_eq!(
+            storage
+                .witness_custody_audit_anchor(&[0x7b; 32], 1, &[0x7c; 32], 0)
+                .await
+                .unwrap_err(),
+            "custody-audit witness time must be positive"
+        );
+    }
+
+    #[tokio::test]
     async fn test_commitment_coordinator_upgrades_sqlite_durability() {
         let storage = MemoryStorage::open(":memory:", None).unwrap();
         assert_eq!(
@@ -8517,11 +8765,7 @@ mod tests {
             &next,
         );
         storage
-            .persist_record_coordinator_handover(
-                &root.public_key_bytes(),
-                &handover,
-                7_001,
-            )
+            .persist_record_coordinator_handover(&root.public_key_bytes(), &handover, 7_001)
             .await
             .unwrap();
 
@@ -8742,11 +8986,7 @@ mod tests {
                 &next,
             );
             legacy
-                .persist_record_coordinator_handover(
-                    &root.public_key_bytes(),
-                    &handover,
-                    8_001,
-                )
+                .persist_record_coordinator_handover(&root.public_key_bytes(), &handover, 8_001)
                 .await
                 .unwrap();
             let stale_authority = signed_commitment_block(2, first_block.hash(), 0x67, &root);
@@ -8765,9 +9005,7 @@ mod tests {
             "commitment block has an unauthorized proposer at height 2"
         );
         assert_eq!(
-            upgraded
-                .record_commitment_chain_integrity_status()
-                .state,
+            upgraded.record_commitment_chain_integrity_status().state,
             "not_verified"
         );
     }
@@ -8794,11 +9032,7 @@ mod tests {
             &next,
         );
         assert!(storage
-            .persist_record_coordinator_handover(
-                &root.public_key_bytes(),
-                &skipped_epoch,
-                3_001,
-            )
+            .persist_record_coordinator_handover(&root.public_key_bytes(), &skipped_epoch, 3_001,)
             .await
             .unwrap_err()
             .contains("authority epoch is not contiguous"));
@@ -8830,11 +9064,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .persist_record_coordinator_handover(
-                    &root.public_key_bytes(),
-                    &valid,
-                    3_004,
-                )
+                .persist_record_coordinator_handover(&root.public_key_bytes(), &valid, 3_004,)
                 .await
                 .unwrap_err(),
             "coordinator handover rejected while a witness lease remains active"
@@ -8853,11 +9083,7 @@ mod tests {
         ));
         assert_eq!(
             storage
-                .persist_record_coordinator_handover(
-                    &root.public_key_bytes(),
-                    &valid,
-                    3_006,
-                )
+                .persist_record_coordinator_handover(&root.public_key_bytes(), &valid, 3_006,)
                 .await
                 .unwrap(),
             RecordCoordinatorHandoverPersistOutcome::Inserted
@@ -8958,8 +9184,7 @@ mod tests {
         let root = IdentityKeyPair::generate();
         let unauthorized = IdentityKeyPair::generate();
         let next = IdentityKeyPair::generate();
-        let first_block =
-            signed_commitment_block(1, GENESIS_PREV_HASH, 0x45, &unauthorized);
+        let first_block = signed_commitment_block(1, GENESIS_PREV_HASH, 0x45, &unauthorized);
         storage
             .append_record_commitment_block(&first_block, None)
             .await
@@ -9337,7 +9562,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row_count, 1);
-        assert_eq!(stored_coordinator.as_slice(), replacement_coordinator.as_slice());
+        assert_eq!(
+            stored_coordinator.as_slice(),
+            replacement_coordinator.as_slice()
+        );
         assert_eq!(stored_epoch, 8);
     }
 
@@ -10988,10 +11216,7 @@ mod tests {
         let coordinator = storage.record_commitment_sync_status();
         assert_eq!(coordinator.certificate_carrier_cooling_slots, 0);
         assert_eq!(coordinator.certificate_carrier_cooldown_skips_total, 0);
-        assert_eq!(
-            coordinator.certificate_carrier_half_open_attempts_total,
-            0
-        );
+        assert_eq!(coordinator.certificate_carrier_half_open_attempts_total, 0);
     }
 
     #[test]
@@ -11283,14 +11508,7 @@ mod tests {
             RecordCommitmentFollowerReadiness::Stopped
         );
         assert_eq!(
-            record_commitment_follower_readiness(
-                "follower",
-                true,
-                "current",
-                "ready",
-                true,
-                true,
-            ),
+            record_commitment_follower_readiness("follower", true, "current", "ready", true, true,),
             RecordCommitmentFollowerReadiness::Stale
         );
     }
@@ -11356,10 +11574,7 @@ mod tests {
         storage.configure_record_commitment_certificate_policy(2, 2);
         let waiting = storage.record_commitment_sync_status();
         assert_eq!(waiting.state, "current");
-        assert_eq!(
-            waiting.follower_readiness_state,
-            "waiting_for_certificate"
-        );
+        assert_eq!(waiting.follower_readiness_state, "waiting_for_certificate");
         assert!(!waiting.follower_fully_ready);
         assert_eq!(waiting.certificate_policy_state, "waiting_for_convergence");
         assert!(!waiting.certificate_policy_ready);
@@ -11399,10 +11614,7 @@ mod tests {
         assert!(refreshed.follower_fully_ready);
         assert_eq!(refreshed.certificate_policy_state, "ready");
         assert!(refreshed.certificate_policy_ready);
-        assert_eq!(
-            refreshed.certificate_policy_evaluated_tip_height,
-            Some(2)
-        );
+        assert_eq!(refreshed.certificate_policy_evaluated_tip_height, Some(2));
 
         storage.record_commitment_sync_certified_recovery_success(111, 2);
         let certified_recovered = storage.record_commitment_sync_status();
@@ -11436,8 +11648,7 @@ mod tests {
         );
         let stale_unavailable = storage.record_commitment_sync_status();
         assert_eq!(
-            stale_unavailable.certificate_policy_state,
-            "waiting_for_certificate",
+            stale_unavailable.certificate_policy_state, "waiting_for_certificate",
             "a transport result for an older tip must not describe current policy state"
         );
         assert!(!stale_unavailable.certificate_policy_ready);
@@ -11457,10 +11668,7 @@ mod tests {
         );
         let unavailable = storage.record_commitment_sync_status();
         assert_eq!(unavailable.certificate_policy_state, "source_unavailable");
-        assert_eq!(
-            unavailable.follower_readiness_state,
-            "source_unavailable"
-        );
+        assert_eq!(unavailable.follower_readiness_state, "source_unavailable");
         assert!(!unavailable.follower_fully_ready);
 
         storage.record_commitment_certificate_policy_evaluation(
@@ -11480,10 +11688,7 @@ mod tests {
 
         storage.configure_record_commitment_certificate_policy(1, 2);
         let invalid = storage.record_commitment_sync_status();
-        assert_eq!(
-            invalid.follower_readiness_state,
-            "configuration_error"
-        );
+        assert_eq!(invalid.follower_readiness_state, "configuration_error");
         assert!(!invalid.follower_fully_ready);
         assert_eq!(invalid.certificate_policy_state, "configuration_error");
         assert!(!invalid.certificate_policy_ready);
@@ -12333,7 +12538,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 15);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(handover_table_exists, 1);
         let chain = migrated.audit_record_commitment_chain().await.unwrap();
         assert_eq!(chain.block_count, 1);
@@ -12380,7 +12585,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 15);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -12424,7 +12629,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 15);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(incident_table_exists, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
         let evidence = migrated
@@ -12475,7 +12680,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        assert_eq!(version, 15);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(certificates, 1);
         assert_eq!(members, 1);
         migrated.audit_record_commitment_chain().await.unwrap();
