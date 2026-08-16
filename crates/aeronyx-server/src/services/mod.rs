@@ -74,11 +74,13 @@ pub use blind_vault::{
     BlindVaultService, BlindVaultServiceError, BlindVaultStatus, BlindVaultStoredObject,
     SharedBlindVaultService,
 };
-// [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Expose only aggregate local
-// maintenance contracts; artifact paths and private audit internals stay here.
+// [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Expose only aggregate,
+// host-local maintenance contracts; artifact paths and private audit internals
+// remain confined to the relay service.
 pub use chat_relay::{
     derive_node_secret, ChatRelayBackupPruneReceipt, ChatRelayBackupPruneRequest,
-    ChatRelayBackupRetentionReceipt, ChatRelayService, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
+    ChatRelayBackupRetentionReceipt, ChatRelayRestoreReadinessReceipt, ChatRelayService,
+    CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
 };
 pub use deny_list::{DenyList, DenyReason};
 pub use directory_chain::{

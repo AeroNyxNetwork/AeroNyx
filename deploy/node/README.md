@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Document the
+  non-destructive latest-image recovery preflight and stable blocker codes.
 - [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Document host-local custody
   backup audit, default dry-run, mandatory stop/confirmation gates, and the
   private HMAC-chained aggregate maintenance log.
@@ -117,6 +119,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.51.0-node-deploy - Documented read-only relay restore readiness.
 v1.50.0-node-deploy - Documented confirmation-gated relay custody pruning.
 v1.49.0-node-deploy - Documented post-start network admission acceptance.
 v1.48.0-node-deploy - Documented secret-safe registration-code input for the
@@ -717,6 +720,23 @@ Audit the private backup boundary without deleting or writing an audit record:
 sudo /root/open/AeroNyx/target/release/aeronyx-server \
   relay-custody audit -c /etc/aeronyx/server.toml --json
 ```
+
+Verify whether the newest recovery image is usable before planning a restore:
+
+```bash
+sudo /root/open/AeroNyx/target/release/aeronyx-server \
+  relay-custody restore-readiness -c /etc/aeronyx/server.toml --json
+```
+
+This preflight fully verifies every managed recovery image and reports only
+aggregate counts, bytes, active-main-file presence, and whether SQLite
+`-journal`/`-wal`/`-shm` sidecars are present. `ready=true` means a verified
+latest image exists and no active sidecar blocks a future stopped-node restore.
+Stable blockers are `no_verified_backup` and
+`active_sqlite_sidecars_present`. The command never opens or replaces active
+custody, never deletes an artifact, and does not claim that restoration ran.
+An execution-capable restore remains intentionally unavailable until its
+rollback and explicit operator-approval contract are separately reviewed.
 
 Preview the exact policy candidates. This is the default and deletes nothing:
 

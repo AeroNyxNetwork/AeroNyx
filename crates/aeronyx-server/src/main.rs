@@ -39,6 +39,8 @@
 //! - [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Add host-local custody
 //!   retention audit and confirmation-gated prune commands with aggregate-only
 //!   output; no management-plane or HTTP mutation endpoint is introduced.
+//! - [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Add a non-destructive
+//!   latest-backup restore preflight with path-free aggregate output.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -63,6 +65,7 @@
 //! management HTTP client cannot initialize
 //! v1.11.0-LiveRelaySmoke - Add a bounded authenticated live relay smoke
 //! v1.12.0-CustodyBackupPrune - Add host-local relay custody maintenance
+//! v1.13.0-CustodyRestoreReadiness - Add read-only recovery preflight
 
 use std::fs::File;
 use std::io::{BufRead, Read};
@@ -87,9 +90,9 @@ use aeronyx_server::services::directory_replica::{
     DirectoryObservationCertificateTrustPolicy,
 };
 use aeronyx_server::services::{
-    derive_node_secret, AofWriter, ChatRelayBackupPruneRequest, ChatRelayService,
-    DirectoryReplicaResolutionCommand, DirectoryReplicaStore, DirectoryReplicaTip,
-    CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
+    derive_node_secret, AofWriter, ChatRelayBackupPruneRequest, ChatRelayRestoreReadinessReceipt,
+    ChatRelayService, DirectoryReplicaResolutionCommand, DirectoryReplicaStore,
+    DirectoryReplicaTip, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
 };
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
 
@@ -241,6 +244,17 @@ enum MemchainCommands {
 enum RelayCustodyCommands {
     /// Verify and report aggregate private backup retention state
     Audit {
+        /// Path to the local node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify latest-backup restore readiness without changing storage
+    RestoreReadiness {
         /// Path to the local node configuration file
         #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
         config: PathBuf,
@@ -1009,8 +1023,9 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
 
 /// Runs host-local relay custody maintenance without opening an HTTP surface.
 async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> {
-    // [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Keep this boundary local:
-    // it reads node-owned config/key material and never calls CMS or HTTP.
+    // [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Keep this boundary
+    // local: it reads node-owned config/key material and never calls CMS or
+    // HTTP. Restore readiness is metadata/read-only and cannot replace data.
     match command {
         RelayCustodyCommands::Audit { config, json } => {
             let server_config = load_relay_custody_config(&config).await?;
@@ -1031,6 +1046,14 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
                 println!("Interrupted bytes:  {}", receipt.partial_bytes);
                 println!("Budget exceeded:    {}", receipt.budget_exceeded);
             }
+        }
+        RelayCustodyCommands::RestoreReadiness { config, json } => {
+            let server_config = load_relay_custody_config(&config).await?;
+            let receipt = ChatRelayService::audit_latest_restore_readiness_for_config(
+                &server_config.memchain.chat_relay,
+            )
+            .map_err(|error| anyhow::anyhow!("relay custody restore preflight failed: {error}"))?;
+            print_relay_restore_readiness(&receipt, json)?;
         }
         RelayCustodyCommands::Prune {
             config,
@@ -1084,6 +1107,32 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
             }
         }
     }
+    Ok(())
+}
+
+fn print_relay_restore_readiness(
+    receipt: &ChatRelayRestoreReadinessReceipt,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(receipt)?);
+        return Ok(());
+    }
+
+    println!("Relay custody restore readiness");
+    println!("════════════════════════════════════════");
+    println!("Ready:               {}", receipt.ready);
+    println!("Verified backups:    {}", receipt.verified_backup_count);
+    println!("Selected bytes:      {}", receipt.selected_backup_bytes);
+    println!("Active DB present:   {}", receipt.active_database_present);
+    println!("Active DB bytes:     {}", receipt.active_database_bytes);
+    println!("Active sidecars:     {}", receipt.active_sidecars_present);
+    println!(
+        "Blocker:              {}",
+        receipt.blocker.unwrap_or("none")
+    );
+    println!();
+    println!("Read-only preflight; no custody data was replaced.");
     Ok(())
 }
 
@@ -2224,6 +2273,21 @@ mod tests {
         let audit =
             Cli::try_parse_from(["aeronyx-server", "relay-custody", "audit", "--json"]).unwrap();
         let Commands::RelayCustody(RelayCustodyCommands::Audit { config, json }) = audit.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert!(json);
+
+        let readiness = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "restore-readiness",
+            "--json",
+        ])
+        .expect("read-only restore readiness form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::RestoreReadiness { config, json }) =
+            readiness.command
         else {
             panic!("unexpected CLI command")
         };

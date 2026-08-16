@@ -170,10 +170,15 @@
 //     remote. Require the host-local confirmation contract, cross-process lock,
 //     pre-delete identity/integrity recheck, durable directory sync, and the
 //     private HMAC-chained aggregate audit around every explicit prune.
+//   - [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Recovery readiness is
+//     non-destructive: verify every managed image, select the newest valid
+//     image, and inspect only aggregate active-file/sidecar state. It must not
+//     copy, rename, remove, open active storage, or imply restore execution.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.3.0-CustodyRestoreReadiness — Read-only latest-image recovery preflight
 //   v3.2.0-CustodyBackupPrune — Confirmation-gated local recovery maintenance
 //   v3.1.0-CustodyBackupRetention — Bounded verified recovery-image retention
 //   v3.0.0-IdempotentCustodyBackup — Restart-safe audited backup replay
@@ -1722,7 +1727,32 @@ pub struct ChatRelayBackupPruneReceipt {
     pub remaining: ChatRelayBackupRetentionReceipt,
 }
 
+/// Aggregate, path-free result of a read-only recovery preflight.
+///
+/// [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] This contract never
+/// identifies an artifact and never replaces or removes active/backup storage.
+/// A ready result means an operator may evaluate a separately approved restore
+/// flow; it does not mean a restore has happened.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ChatRelayRestoreReadinessReceipt {
+    /// Whether all preflight gates needed by a future restore are satisfied.
+    pub ready: bool,
+    /// Number of fully verified recovery images in the private boundary.
+    pub verified_backup_count: usize,
+    /// Size of the newest fully verified recovery image.
+    pub selected_backup_bytes: u64,
+    /// Whether the configured active main database currently exists.
+    pub active_database_present: bool,
+    /// Size of the active main database, or zero when absent.
+    pub active_database_bytes: u64,
+    /// Whether any active SQLite journal/WAL/SHM sidecar exists.
+    pub active_sidecars_present: bool,
+    /// Stable aggregate blocker code; absent when `ready=true`.
+    pub blocker: Option<&'static str>,
+}
+
 /// Private filesystem metadata used only while enforcing backup retention.
+#[derive(Clone)]
 struct ChatRelayBackupArtifact {
     path: PathBuf,
     file_name: String,
@@ -1736,6 +1766,7 @@ struct ChatRelayBackupArtifact {
 
 struct ChatRelayBackupRetentionInspection {
     receipt: ChatRelayBackupRetentionReceipt,
+    newest_backup: Option<ChatRelayBackupArtifact>,
     excess_backups: Vec<ChatRelayBackupArtifact>,
     stale_partials: Vec<ChatRelayBackupArtifact>,
 }
@@ -2547,6 +2578,7 @@ impl ChatRelayService {
                 .cmp(&left.modified_at)
                 .then_with(|| right.file_name.cmp(&left.file_name))
         });
+        let newest_backup = artifacts.first().cloned();
         let mut retained_count = 0usize;
         let mut retained_bytes = 0u64;
         let mut excess_count = 0usize;
@@ -2620,9 +2652,80 @@ impl ChatRelayService {
                     || retained_count > config.custody_backup_retention_target_artifacts
                     || retained_bytes > config.custody_backup_retention_target_bytes,
             },
+            newest_backup,
             excess_backups,
             stale_partials,
         })
+    }
+
+    fn inspect_active_restore_boundary(
+        config: &ChatRelayConfig,
+    ) -> ChatRelayResult<(bool, u64, bool)> {
+        // [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] This preflight
+        // uses metadata only. Opening an active WAL database read-only can
+        // still create shared-memory sidecars, which would violate the
+        // command's no-mutation contract.
+        let active_path = Path::new(&config.db_path);
+        let (active_database_present, active_database_bytes) =
+            match std::fs::symlink_metadata(active_path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                        return Err(Self::backup_io_error(
+                            rusqlite::ffi::SQLITE_PERM,
+                            "active relay custody boundary is not a regular file",
+                        ));
+                    }
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+
+                        if metadata.permissions().mode() & 0o077 != 0 {
+                            return Err(Self::backup_io_error(
+                                rusqlite::ffi::SQLITE_PERM,
+                                "active relay custody file is not owner-private",
+                            ));
+                        }
+                    }
+                    (true, metadata.len())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, 0),
+                Err(_) => {
+                    return Err(Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_CANTOPEN,
+                        "unable to inspect active relay custody boundary",
+                    ));
+                }
+            };
+
+        let mut active_sidecars_present = false;
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = active_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            match std::fs::symlink_metadata(PathBuf::from(sidecar)) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_file() {
+                        return Err(Self::backup_io_error(
+                            rusqlite::ffi::SQLITE_PERM,
+                            "active relay custody sidecar boundary is unsafe",
+                        ));
+                    }
+                    active_sidecars_present = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_CANTOPEN,
+                        "unable to inspect active relay custody sidecar boundary",
+                    ));
+                }
+            }
+        }
+
+        Ok((
+            active_database_present,
+            active_database_bytes,
+            active_sidecars_present,
+        ))
     }
 
     fn backup_artifact_identity_matches(
@@ -5890,6 +5993,62 @@ impl ChatRelayService {
         Ok(Self::inspect_verified_backup_retention(config, &backup_directory, now_secs())?.receipt)
     }
 
+    /// Verifies whether the newest private recovery image is ready for a
+    /// separately approved host-local restore operation.
+    ///
+    /// The command fully verifies every managed backup under the same
+    /// cross-process lock used by publication and prune, then inspects the
+    /// configured active main file and sidecars through metadata only. It never
+    /// opens active storage, writes a maintenance audit record, or changes
+    /// custody/backup artifacts. The shared control lock may be initialized.
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free storage error when the private boundary is unsafe,
+    /// any managed image is corrupt, or active-file metadata cannot be trusted.
+    pub fn audit_latest_restore_readiness_for_config(
+        config: &ChatRelayConfig,
+    ) -> ChatRelayResult<ChatRelayRestoreReadinessReceipt> {
+        let backup_directory = Self::private_backup_directory_for_config(config)?;
+        let _filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
+        let inspection =
+            Self::inspect_verified_backup_retention(config, &backup_directory, now_secs())?;
+        let verified_backup_count = inspection
+            .receipt
+            .retained_count
+            .checked_add(inspection.receipt.excess_count)
+            .ok_or_else(|| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_FULL,
+                    "relay restore-readiness backup count overflow",
+                )
+            })?;
+        let selected_backup_bytes = inspection
+            .newest_backup
+            .as_ref()
+            .map(|artifact| artifact.size_bytes)
+            .unwrap_or_default();
+        let (active_database_present, active_database_bytes, active_sidecars_present) =
+            Self::inspect_active_restore_boundary(config)?;
+        let blocker = if inspection.newest_backup.is_none() {
+            Some("no_verified_backup")
+        } else if active_sidecars_present {
+            Some("active_sqlite_sidecars_present")
+        } else {
+            None
+        };
+
+        Ok(ChatRelayRestoreReadinessReceipt {
+            ready: blocker.is_none(),
+            verified_backup_count,
+            selected_backup_bytes,
+            active_database_present,
+            active_database_bytes,
+            active_sidecars_present,
+            blocker,
+        })
+    }
+
     /// Runs a host-local retention dry-run or explicitly-confirmed prune.
     ///
     /// Dry-run is the default request state. Deletion requires the exact
@@ -6045,8 +6204,30 @@ mod tests {
 
     fn remove_test_db(path: &Path) {
         let _ = std::fs::remove_file(path);
+        remove_test_db_sidecars(path);
+    }
+
+    fn remove_test_db_sidecars(path: &Path) {
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        let _ = std::fs::remove_file(format!("{}-journal", path.display()));
+    }
+
+    fn backup_directory_snapshot(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut snapshot = std::fs::read_dir(path)
+            .expect("read backup directory snapshot")
+            .map(|entry| {
+                let entry = entry.expect("read backup directory entry");
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .expect("test backup name is UTF-8");
+                let bytes = std::fs::read(entry.path()).expect("read backup artifact");
+                (name, bytes)
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+        snapshot
     }
 
     fn insert_expired_pending_rows(svc: &ChatRelayService, count: usize, prefix: u8) {
@@ -6307,6 +6488,114 @@ mod tests {
         drop(restored);
         remove_test_db(&backup_path);
         remove_test_db(&source_path);
+    }
+
+    #[test]
+    fn restore_readiness_selects_verified_backup_without_mutating_artifacts() {
+        // [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] A positive
+        // preflight proves the newest image is fully usable while preserving
+        // both active custody and every recovery artifact byte-for-byte.
+        let directory = tempfile::tempdir().expect("restore readiness directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let source = make_service_with_config(config.clone());
+        source
+            .create_verified_backup_for_operation("restore-readiness")
+            .expect("create verified readiness image");
+        drop(source);
+        remove_test_db_sidecars(&source_path);
+
+        let backup_directory = directory.path().join(".aeronyx-relay-backups");
+        let before = backup_directory_snapshot(&backup_directory);
+        let active_before = std::fs::read(&source_path).expect("read active custody before audit");
+        let receipt = ChatRelayService::audit_latest_restore_readiness_for_config(&config)
+            .expect("audit restore readiness");
+        let after = backup_directory_snapshot(&backup_directory);
+
+        assert!(receipt.ready);
+        assert_eq!(receipt.verified_backup_count, 1);
+        assert!(receipt.selected_backup_bytes > 0);
+        assert!(receipt.active_database_present);
+        assert_eq!(receipt.active_database_bytes, active_before.len() as u64);
+        assert!(!receipt.active_sidecars_present);
+        assert_eq!(receipt.blocker, None);
+        assert_eq!(before, after);
+        assert_eq!(
+            std::fs::read(&source_path).expect("read active custody after audit"),
+            active_before
+        );
+
+        // [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Pin the public
+        // aggregate contract: operators may automate against these fields,
+        // while custody and recovery paths must remain private.
+        let json = serde_json::to_value(&receipt).expect("serialize restore readiness receipt");
+        let object = json.as_object().expect("readiness JSON is an object");
+        assert_eq!(object.len(), 7);
+        for field in [
+            "ready",
+            "verified_backup_count",
+            "selected_backup_bytes",
+            "active_database_present",
+            "active_database_bytes",
+            "active_sidecars_present",
+            "blocker",
+        ] {
+            assert!(object.contains_key(field), "missing JSON field: {field}");
+        }
+        let encoded = serde_json::to_string(&receipt).expect("encode readiness JSON");
+        assert!(!encoded.contains(source_path.to_string_lossy().as_ref()));
+        assert!(!encoded.contains(".aeronyx-relay-backups"));
+    }
+
+    #[test]
+    fn restore_readiness_reports_missing_verified_backup_without_execution() {
+        let directory = tempfile::tempdir().expect("missing restore image directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let source = make_service_with_config(config.clone());
+        drop(source);
+        remove_test_db_sidecars(&source_path);
+
+        let active_before = std::fs::read(&source_path).expect("read active custody");
+        let receipt = ChatRelayService::audit_latest_restore_readiness_for_config(&config)
+            .expect("report missing verified backup");
+
+        assert!(!receipt.ready);
+        assert_eq!(receipt.verified_backup_count, 0);
+        assert_eq!(receipt.selected_backup_bytes, 0);
+        assert_eq!(receipt.blocker, Some("no_verified_backup"));
+        assert_eq!(
+            std::fs::read(&source_path).expect("read unchanged active custody"),
+            active_before
+        );
+    }
+
+    #[test]
+    fn restore_readiness_fails_closed_while_active_sidecar_exists() {
+        let directory = tempfile::tempdir().expect("restore sidecar directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let source = make_service_with_config(config.clone());
+        source
+            .create_verified_backup_for_operation("restore-sidecar")
+            .expect("create verified sidecar image");
+        drop(source);
+        remove_test_db_sidecars(&source_path);
+        let wal_path = PathBuf::from(format!("{}-wal", source_path.display()));
+        std::fs::write(&wal_path, b"stopped-state-sidecar-marker").expect("create sidecar marker");
+
+        let receipt = ChatRelayService::audit_latest_restore_readiness_for_config(&config)
+            .expect("report active sidecar blocker");
+        assert!(!receipt.ready);
+        assert!(receipt.active_sidecars_present);
+        assert_eq!(receipt.blocker, Some("active_sqlite_sidecars_present"));
+        assert!(
+            wal_path.exists(),
+            "readiness must not remove active sidecars"
+        );
     }
 
     #[test]
