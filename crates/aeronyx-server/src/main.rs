@@ -41,6 +41,8 @@
 //!   output; no management-plane or HTTP mutation endpoint is introduced.
 //! - [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Add a non-destructive
 //!   latest-backup restore preflight with path-free aggregate output.
+//! - [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Add short-lived,
+//!   node-secret-authenticated restore plans bound to private storage state.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -66,6 +68,7 @@
 //! v1.11.0-LiveRelaySmoke - Add a bounded authenticated live relay smoke
 //! v1.12.0-CustodyBackupPrune - Add host-local relay custody maintenance
 //! v1.13.0-CustodyRestoreReadiness - Add read-only recovery preflight
+//! v1.14.0-CustodyRestorePlan - Add authenticated host-local recovery plans
 
 use std::fs::File;
 use std::io::{BufRead, Read};
@@ -90,9 +93,10 @@ use aeronyx_server::services::directory_replica::{
     DirectoryObservationCertificateTrustPolicy,
 };
 use aeronyx_server::services::{
-    derive_node_secret, AofWriter, ChatRelayBackupPruneRequest, ChatRelayRestoreReadinessReceipt,
-    ChatRelayService, DirectoryReplicaResolutionCommand, DirectoryReplicaStore,
-    DirectoryReplicaTip, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
+    derive_node_secret, AofWriter, ChatRelayBackupPruneRequest, ChatRelayRestorePlanReceipt,
+    ChatRelayRestoreReadinessReceipt, ChatRelayService, DirectoryReplicaResolutionCommand,
+    DirectoryReplicaStore, DirectoryReplicaTip, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
+    CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS,
 };
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
 
@@ -260,6 +264,32 @@ enum RelayCustodyCommands {
         config: PathBuf,
 
         /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Create a ten-minute state-bound restore plan without changing storage
+    RestorePlan {
+        /// Path to the local node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Emit the stable path-free JSON plan contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Re-verify one private restore plan against current node storage state
+    VerifyRestorePlan {
+        /// Path to the local node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Owner-private JSON plan emitted by `restore-plan --json`
+        #[arg(long)]
+        plan_file: PathBuf,
+
+        /// Emit a minimal verification result
         #[arg(long)]
         json: bool,
     },
@@ -1023,9 +1053,9 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
 
 /// Runs host-local relay custody maintenance without opening an HTTP surface.
 async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> {
-    // [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Keep this boundary
-    // local: it reads node-owned config/key material and never calls CMS or
-    // HTTP. Restore readiness is metadata/read-only and cannot replace data.
+    // [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Keep this boundary local:
+    // it reads node-owned config/key material and never calls CMS or HTTP.
+    // Plans and readiness checks cannot replace or remove custody data.
     match command {
         RelayCustodyCommands::Audit { config, json } => {
             let server_config = load_relay_custody_config(&config).await?;
@@ -1055,6 +1085,16 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
             .map_err(|error| anyhow::anyhow!("relay custody restore preflight failed: {error}"))?;
             print_relay_restore_readiness(&receipt, json)?;
         }
+        RelayCustodyCommands::RestorePlan { config, json } => {
+            cmd_relay_restore_plan(&config, json).await?;
+        }
+        RelayCustodyCommands::VerifyRestorePlan {
+            config,
+            plan_file,
+            json,
+        } => {
+            cmd_relay_verify_restore_plan(&config, &plan_file, json).await?;
+        }
         RelayCustodyCommands::Prune {
             config,
             execute,
@@ -1063,11 +1103,7 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
             json,
         } => {
             let server_config = load_relay_custody_config(&config).await?;
-            let identity_path = PathBuf::from(&server_config.server_key.key_file);
-            let identity = load_key(&identity_path).await.map_err(|_| {
-                anyhow::anyhow!("relay custody prune requires the node identity key")
-            })?;
-            let node_secret = derive_node_secret(&identity.to_bytes());
+            let node_secret = load_relay_custody_node_secret(&server_config, "prune").await?;
             let request = ChatRelayBackupPruneRequest {
                 execute,
                 confirmation: confirm_prune,
@@ -1110,6 +1146,49 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
     Ok(())
 }
 
+// [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Keep credential issuance and
+// verification isolated from the command dispatcher and all network surfaces.
+async fn cmd_relay_restore_plan(config_path: &Path, json: bool) -> anyhow::Result<()> {
+    let server_config = load_relay_custody_config(config_path).await?;
+    let node_secret = load_relay_custody_node_secret(&server_config, "restore plan").await?;
+    let plan = ChatRelayService::create_latest_restore_plan_for_config(
+        &server_config.memchain.chat_relay,
+        &node_secret,
+    )
+    .map_err(|error| anyhow::anyhow!("relay custody restore planning failed: {error}"))?;
+    print_relay_restore_plan(&plan, json)
+}
+
+async fn cmd_relay_verify_restore_plan(
+    config_path: &Path,
+    plan_path: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    let server_config = load_relay_custody_config(config_path).await?;
+    let node_secret =
+        load_relay_custody_node_secret(&server_config, "restore-plan verification").await?;
+    let plan = load_private_restore_plan(plan_path)?;
+    ChatRelayService::verify_latest_restore_plan_for_config(
+        &server_config.memchain.chat_relay,
+        &node_secret,
+        &plan,
+    )
+    .map_err(|error| anyhow::anyhow!("relay custody restore-plan verification failed: {error}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"valid": true, "expires_at": plan.expires_at})
+        );
+    } else {
+        println!(
+            "Relay custody restore plan is valid until {}.",
+            plan.expires_at
+        );
+        println!("Verification is read-only and does not authorize restoration.");
+    }
+    Ok(())
+}
+
 fn print_relay_restore_readiness(
     receipt: &ChatRelayRestoreReadinessReceipt,
     json: bool,
@@ -1136,6 +1215,29 @@ fn print_relay_restore_readiness(
     Ok(())
 }
 
+fn print_relay_restore_plan(plan: &ChatRelayRestorePlanReceipt, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(plan)?);
+        return Ok(());
+    }
+
+    println!("Relay custody authenticated restore plan");
+    println!("════════════════════════════════════════");
+    println!("Version:             {}", plan.version);
+    println!("Issued at:           {}", plan.issued_at);
+    println!("Expires at:          {}", plan.expires_at);
+    println!("Validity:            {CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS}s");
+    println!("Verified backups:    {}", plan.verified_backup_count);
+    println!("Selected bytes:      {}", plan.selected_backup_bytes);
+    println!("Active DB present:   {}", plan.active_database_present);
+    println!("Active DB bytes:     {}", plan.active_database_bytes);
+    println!("Nonce:               {}", plan.nonce);
+    println!("Commitment:          {}", plan.commitment);
+    println!();
+    println!("Preflight credential only; this does not authorize or execute restoration.");
+    Ok(())
+}
+
 async fn load_relay_custody_config(config_path: &Path) -> anyhow::Result<ServerConfig> {
     let config = ServerConfig::load(config_path).await?;
     if !config.memchain.is_chat_relay_enabled() {
@@ -1145,6 +1247,58 @@ async fn load_relay_custody_config(config_path: &Path) -> anyhow::Result<ServerC
         anyhow::bail!("in-memory relay custody has no recoverable backup boundary");
     }
     Ok(config)
+}
+
+async fn load_relay_custody_node_secret(
+    config: &ServerConfig,
+    operation: &str,
+) -> anyhow::Result<[u8; 32]> {
+    let identity_path = PathBuf::from(&config.server_key.key_file);
+    let identity = load_key(&identity_path)
+        .await
+        .map_err(|_| anyhow::anyhow!("relay custody {operation} requires the node identity key"))?;
+    Ok(derive_node_secret(&identity.to_bytes()))
+}
+
+fn load_private_restore_plan(path: &Path) -> anyhow::Result<ChatRelayRestorePlanReceipt> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    const MAX_RESTORE_PLAN_BYTES: u64 = 4096;
+
+    // [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Treat the plan as a local
+    // maintenance credential. Never follow its final symlink or include its
+    // path/content in an error returned to an operator surface.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    let mut file = options
+        .open(path)
+        .map_err(|_| anyhow::anyhow!("unable to open private relay restore plan"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("unable to inspect private relay restore plan"))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_RESTORE_PLAN_BYTES {
+        anyhow::bail!("private relay restore plan has an invalid file boundary");
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        anyhow::bail!("private relay restore plan must be owner-private");
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| anyhow::anyhow!("private relay restore plan exceeds platform capacity"))?;
+    let mut encoded = Vec::with_capacity(capacity);
+    file.by_ref()
+        .take(MAX_RESTORE_PLAN_BYTES + 1)
+        .read_to_end(&mut encoded)
+        .map_err(|_| anyhow::anyhow!("unable to read private relay restore plan"))?;
+    if encoded.len() as u64 != metadata.len() || encoded.len() as u64 > MAX_RESTORE_PLAN_BYTES {
+        anyhow::bail!("private relay restore plan changed during bounded read");
+    }
+    serde_json::from_slice(&encoded)
+        .map_err(|_| anyhow::anyhow!("private relay restore plan is malformed"))
 }
 
 /// Runs read-only `MemChain` operator commands.
@@ -2294,6 +2448,38 @@ mod tests {
         assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
         assert!(json);
 
+        let plan =
+            Cli::try_parse_from(["aeronyx-server", "relay-custody", "restore-plan", "--json"])
+                .expect("authenticated restore plan form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::RestorePlan { config, json }) =
+            plan.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert!(json);
+
+        let verify_plan = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "verify-restore-plan",
+            "--plan-file",
+            "/root/relay-restore-plan.json",
+            "--json",
+        ])
+        .expect("restore-plan verification form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::VerifyRestorePlan {
+            config,
+            plan_file,
+            json,
+        }) = verify_plan.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert_eq!(plan_file, PathBuf::from("/root/relay-restore-plan.json"));
+        assert!(json);
+
         let dry_run = Cli::try_parse_from(["aeronyx-server", "relay-custody", "prune"])
             .expect("dry-run form must parse");
         let Commands::RelayCustody(RelayCustodyCommands::Prune {
@@ -2346,6 +2532,75 @@ mod tests {
             "--confirm-node-stopped",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn private_restore_plan_loader_is_bounded_and_strict() {
+        // [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Credential loading
+        // rejects permission drift, symlinks, and schema extension smuggling.
+        let directory = tempfile::tempdir().expect("private plan directory");
+        let path = directory.path().join("restore-plan.json");
+        let plan = ChatRelayRestorePlanReceipt {
+            version: 1,
+            issued_at: 1_800_000_000,
+            expires_at: 1_800_000_600,
+            verified_backup_count: 2,
+            selected_backup_bytes: 4096,
+            active_database_present: true,
+            active_database_bytes: 8192,
+            nonce: "11".repeat(16),
+            commitment: "22".repeat(32),
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&plan).expect("encode private plan"),
+        )
+        .expect("write private plan");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("secure private plan permissions");
+        }
+        assert_eq!(
+            load_private_restore_plan(&path).expect("load strict private plan"),
+            plan
+        );
+
+        let mut extended = serde_json::to_value(&plan).expect("encode extended plan");
+        extended.as_object_mut().expect("plan JSON object").insert(
+            "selected_backup_path".to_string(),
+            serde_json::json!("secret"),
+        );
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&extended).expect("encode extended plan JSON"),
+        )
+        .expect("write extended plan");
+        assert!(load_private_restore_plan(&path).is_err());
+
+        std::fs::write(&path, vec![b' '; 4097]).expect("write oversized private plan");
+        assert!(load_private_restore_plan(&path).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&plan).expect("re-encode private plan"),
+            )
+            .expect("restore private plan");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("make plan non-private");
+            assert!(load_private_restore_plan(&path).is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("restore plan privacy");
+            let link = directory.path().join("restore-plan-link.json");
+            symlink(&path, &link).expect("create plan symlink");
+            assert!(load_private_restore_plan(&link).is_err());
+        }
     }
 
     #[test]

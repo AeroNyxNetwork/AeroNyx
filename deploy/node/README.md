@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Document short-lived,
+  state-bound restore plans and their non-authorization security boundary.
 - [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Document the
   non-destructive latest-image recovery preflight and stable blocker codes.
 - [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Document host-local custody
@@ -119,6 +121,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.52.0-node-deploy - Documented authenticated relay restore planning.
 v1.51.0-node-deploy - Documented read-only relay restore readiness.
 v1.50.0-node-deploy - Documented confirmation-gated relay custody pruning.
 v1.49.0-node-deploy - Documented post-start network admission acceptance.
@@ -737,6 +740,39 @@ Stable blockers are `no_verified_backup` and
 custody, never deletes an artifact, and does not claim that restoration ran.
 An execution-capable restore remains intentionally unavailable until its
 rollback and explicit operator-approval contract are separately reviewed.
+
+After readiness succeeds, create a short-lived state-bound plan:
+
+```bash
+umask 077
+sudo /root/open/AeroNyx/target/release/aeronyx-server \
+  relay-custody restore-plan -c /etc/aeronyx/server.toml --json \
+  > /root/relay-restore-plan.json
+
+sudo /root/open/AeroNyx/target/release/aeronyx-server \
+  relay-custody verify-restore-plan -c /etc/aeronyx/server.toml \
+  --plan-file /root/relay-restore-plan.json --json
+```
+
+The command loads the node identity key locally and emits a ten-minute HMAC
+commitment. It binds the selected verified image, configured database boundary,
+active-file identity, aggregate sizes/counts, issue/expiry times, and a random
+nonce. Paths, filenames, message identifiers, wallet identities, ciphertext,
+and routing metadata are never emitted. Any backup rotation, database/config
+change, tampering, wrong node key, or expiry invalidates the plan.
+Verification accepts only a bounded regular JSON file; on Unix it must be
+owner-private and the final path component must not be a symlink. Unknown JSON
+fields are rejected so a credential cannot smuggle uncommitted state.
+
+Treat the JSON as a host-local maintenance credential and do not send it to the
+CMS, nodeboard, logs, or public APIs. A valid plan is only stale-state evidence:
+it does not prove the process is stopped and does not authorize or execute a
+restore. Future restoration must still require an explicit stopped-node gate,
+an exact confirmation phrase, a rollback image of the current boundary, atomic
+replacement, and post-start custody/health verification. CLI verification
+releases the shared maintenance lock before returning; an execution path must
+therefore re-verify the plan and replace storage inside one uninterrupted lock
+scope to prevent a time-of-check/time-of-use race.
 
 Preview the exact policy candidates. This is the default and deletes nothing:
 
