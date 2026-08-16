@@ -14,6 +14,7 @@
 //! - Reuses the production `ClientHello`, transport AEAD, and `MemChain` codecs.
 //! - Sends random E2E ciphertext between two ephemeral identities.
 //! - Requires an idle, healthy, two-hop-ready node before execution.
+//! - Requires verified FULL encrypted-custody durability before protocol traffic.
 //! - Verifies exact mailbox bytes, E2E decryption, ACK deletion, and aggregate
 //!   verified-client onion-delivery evidence.
 //!
@@ -35,8 +36,11 @@
 //! - Terminal replicas are TTL-managed today; entry-node ACK does not delete a
 //!   terminal replica and the report must preserve that limitation.
 //! - This is real protocol traffic, not a synthetic counter mutation.
+//! - [CHAT-RELAY-DURABILITY-PREFLIGHT 2026-08-16 by Codex] Missing or
+//!   unverified custody durability must fail before ephemeral sessions exist.
 //!
-//! Last Modified: v1.0.0-LiveRelaySmoke - Initial authenticated implementation.
+//! Last Modified: v1.1.0-DurableCustodyPreflight - Requires verified FULL
+//! durability before authenticated relay traffic.
 // ============================================
 
 use std::net::{IpAddr, SocketAddr};
@@ -164,11 +168,21 @@ struct ChatRelayHealth {
 
 #[derive(Debug, Deserialize)]
 struct ChatRelayOutboundStatus {
+    /// Verified aggregate custody durability from the Rust relay service.
+    #[serde(default)]
+    custody_durability: Option<ChatRelayCustodyDurabilityStatus>,
     /// [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] Optional preserves
     /// readable failure output against an older local binary, but never falls
     /// back to the ambiguous aggregate/direct relay status.
     #[serde(default)]
     authenticated_onion_outbound: Option<ChatRelayRouteStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatRelayCustodyDurabilityStatus {
+    state: String,
+    full_durability_verified: bool,
+    synchronous_level: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,6 +334,15 @@ impl HealthSnapshot {
             "chat relay is disabled in node configuration"
         );
         anyhow::ensure!(relay.runtime_ready, "chat relay runtime is not ready");
+        let durability = relay.peer_relay.custody_durability.as_ref().context(
+            "encrypted custody durability is unavailable; restart the node with the current binary",
+        )?;
+        anyhow::ensure!(
+            durability.state == "full"
+                && durability.full_durability_verified
+                && durability.synchronous_level.is_some_and(|level| level >= 2),
+            "encrypted custody durability is not FULL-or-stronger"
+        );
         anyhow::ensure!(
             relay.peer_relay.authenticated_onion_outbound.is_some(),
             "authenticated onion relay health is unavailable; restart the node with the current binary"
@@ -1175,6 +1198,66 @@ mod tests {
     }
 
     #[test]
+    fn idle_two_hop_preflight_rejects_unverified_custody_durability() {
+        // [CHAT-RELAY-DURABILITY-PREFLIGHT 2026-08-16 by Codex] A rolling
+        // upgrade may expose otherwise healthy relay fields from an older
+        // binary. It must not create smoke-test sessions without FULL evidence.
+        let mut fixture = serde_json::json!({
+            "status": "ok",
+            "active_sessions": 0,
+            "privacy_protocol_health": { "failed_checks": 0 },
+            "discovery_status": {
+                "peer_store": {
+                    "blind_relay_quality": {
+                        "verified_client_onion_deliveries": 0,
+                        "delivery_receipt_capable_peers": 2,
+                        "authenticated_delivery_path_ready": true,
+                        "authenticated_delivery_path_reason": "authenticated_receipt_path_ready"
+                    },
+                    "peer_quorum": { "quorum_ready": true },
+                    "route_governance": { "route_pool_ready": true },
+                    "network_story": { "chat_two_hop_onion_ready": true }
+                }
+            },
+            "chat_relay_status": {
+                "configured_enabled": true,
+                "runtime_ready": true,
+                "peer_relay": {
+                    "authenticated_onion_outbound": {
+                        "rounds": 0,
+                        "last_attempted": 0,
+                        "last_accepted": 0,
+                        "last_failed": 0,
+                        "last_status": null,
+                        "last_failure_reason": null
+                    }
+                }
+            }
+        });
+        let snapshot: HealthSnapshot =
+            serde_json::from_value(fixture.clone()).expect("health fixture");
+
+        let error = snapshot
+            .ensure_idle_two_hop_ready()
+            .expect_err("missing custody durability must fail before creating sessions");
+        assert!(error
+            .to_string()
+            .contains("custody durability is unavailable"));
+
+        fixture["chat_relay_status"]["peer_relay"]["custody_durability"] = serde_json::json!({
+            "state": "normal",
+            "full_durability_verified": false,
+            "synchronous_level": 1
+        });
+        let downgraded: HealthSnapshot =
+            serde_json::from_value(fixture).expect("downgraded health fixture");
+        let error = downgraded
+            .ensure_idle_two_hop_ready()
+            .expect_err("NORMAL custody must fail before creating sessions");
+        assert!(error.to_string().contains("not FULL-or-stronger"));
+    }
+
+    #[test]
     fn idle_two_hop_preflight_requires_route_class_health_contract() {
         let snapshot: HealthSnapshot = serde_json::from_value(serde_json::json!({
             "status": "ok",
@@ -1196,7 +1279,13 @@ mod tests {
             "chat_relay_status": {
                 "configured_enabled": true,
                 "runtime_ready": true,
-                "peer_relay": {}
+                "peer_relay": {
+                    "custody_durability": {
+                        "state": "full",
+                        "full_durability_verified": true,
+                        "synchronous_level": 2
+                    }
+                }
             }
         }))
         .expect("health fixture");

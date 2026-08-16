@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.5.0-PowerLossDurability
+// Version: 2.6.0-CustodyDurabilityStatus
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -41,6 +41,8 @@
 //   deleted circuit checkpoint table cannot be mistaken for a first upgrade.
 //   v2.5.0-PowerLossDurability — Requires SQLite FULL durability before the
 //   node may acknowledge encrypted custody or persist relay safety state.
+//   v2.6.0-CustodyDurabilityStatus — Publishes only the verified aggregate
+//   durability mode so operators can audit custody readiness.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -61,6 +63,7 @@
 //   - Durable circuit checkpoint: fixed-size anonymous restart protection
 //   - Durable schema sentinel: rejects post-install checkpoint table loss
 //   - Power-loss durability: WAL + FULL is verified before relay activation
+//   - Custody durability status: anonymous verified mode in relay health
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -121,10 +124,14 @@
 //   - [CHAT-RELAY-FULL-DURABILITY 2026-08-16 by Codex] Signed custody ACKs and
 //     direct-relay safety checkpoints share one SQLite connection. It must
 //     remain FULL-or-stronger; NORMAL can lose acknowledged writes on power loss.
+//   - [CHAT-RELAY-DURABILITY-STATUS 2026-08-16 by Codex] Durability telemetry
+//     contains only a fixed state, protection boolean, and SQLite mode number.
+//     Never add database paths, row counts, message IDs, or owner dimensions.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.6.0-CustodyDurabilityStatus — Aggregate verified durability evidence
 //   v2.5.0-PowerLossDurability — Verified FULL durability for custody writes
 //   v2.4.0-DurableSchemaSentinel — Fail-closed checkpoint installation marker
 //   v2.3.0-DurableDirectRelayCircuit — Anonymous restart-safe circuit checkpoint
@@ -1025,6 +1032,41 @@ enum OutboundRouteClass {
     DirectPeer,
 }
 
+/// Aggregate commit-durability evidence for encrypted relay custody.
+///
+/// [CHAT-RELAY-DURABILITY-STATUS 2026-08-16 by Codex] This is configuration
+/// evidence, not traffic telemetry. It intentionally carries no database path,
+/// message, wallet, peer, endpoint, payload, or row-count dimensions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRelayCustodyDurabilityStatus {
+    /// Stable state bucket: `unknown` or `full`.
+    pub state: String,
+    /// Whether activation read back SQLite FULL-or-stronger commit durability.
+    pub full_durability_verified: bool,
+    /// Effective SQLite synchronous level, when verified by the service.
+    pub synchronous_level: Option<u8>,
+}
+
+impl Default for ChatRelayCustodyDurabilityStatus {
+    fn default() -> Self {
+        Self {
+            state: "unknown".to_string(),
+            full_durability_verified: false,
+            synchronous_level: None,
+        }
+    }
+}
+
+impl ChatRelayCustodyDurabilityStatus {
+    fn verified_full(synchronous_level: u8) -> Self {
+        Self {
+            state: "full".to_string(),
+            full_durability_verified: true,
+            synchronous_level: Some(synchronous_level),
+        }
+    }
+}
+
 /// Privacy-safe node-to-node encrypted chat relay health snapshot.
 ///
 /// This structure intentionally contains only aggregate counters and stable
@@ -1035,6 +1077,9 @@ enum OutboundRouteClass {
 pub struct ChatRelayPeerStatus {
     /// Whether chat relay is enabled in local config.
     pub enabled: bool,
+    /// Verified aggregate commit durability for encrypted custody.
+    #[serde(default)]
+    pub custody_durability: ChatRelayCustodyDurabilityStatus,
     /// Total outbound peer relay attempts.
     pub outbound_attempted_total: u64,
     /// Total outbound peer relay requests accepted by peer nodes.
@@ -1096,6 +1141,7 @@ impl ChatRelayPeerStatus {
     pub(crate) fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            custody_durability: ChatRelayCustodyDurabilityStatus::default(),
             outbound_attempted_total: 0,
             outbound_accepted_total: 0,
             outbound_failed_total: 0,
@@ -1605,7 +1651,7 @@ pub struct ChatRelayService {
 }
 
 impl ChatRelayService {
-    fn configure_sqlite_durability(conn: &Connection) -> ChatRelayResult<()> {
+    fn configure_sqlite_durability(conn: &Connection) -> ChatRelayResult<u8> {
         // [CHAT-RELAY-FULL-DURABILITY 2026-08-16 by Codex] NORMAL protects
         // SQLite consistency across process failure but may lose a recently
         // acknowledged transaction after host power loss. The relay signs
@@ -1619,7 +1665,9 @@ impl ChatRelayService {
                 field: "sqlite_synchronous_level",
             });
         }
-        Ok(())
+        u8::try_from(synchronous_level).map_err(|_| ChatRelayError::CorruptStoredData {
+            field: "sqlite_synchronous_level",
+        })
     }
 
     /// Creates a new `ChatRelayService`, opening (or creating) the SQLite database.
@@ -1639,18 +1687,21 @@ impl ChatRelayService {
         // A short bounded wait absorbs transient locks from an operator backup
         // or diagnostic reader without allowing relay requests to hang forever.
         conn.busy_timeout(Duration::from_secs(5))?;
-        Self::configure_sqlite_durability(&conn)?;
+        let synchronous_level = Self::configure_sqlite_durability(&conn)?;
 
         let dedup_capacity = config.dedup_lru_capacity;
         let relay_enabled = config.enabled;
         let pull_cursor_key = Self::derive_pull_cursor_key(&node_secret)?;
+        let mut peer_status = ChatRelayPeerStatus::new(relay_enabled);
+        peer_status.custody_durability =
+            ChatRelayCustodyDurabilityStatus::verified_full(synchronous_level);
         let svc = Self {
             config,
             conn: Mutex::new(conn),
             node_secret,
             pull_cursor_key,
             dedup: MessageDedup::new(dedup_capacity),
-            peer_status: RwLock::new(ChatRelayPeerStatus::new(relay_enabled)),
+            peer_status: RwLock::new(peer_status),
             direct_peer_retry_slo: Mutex::new(DirectPeerRetrySloWindow::default()),
             direct_peer_relay_circuit: Mutex::new(DirectPeerRelayCircuit::default()),
             maintenance_status: RwLock::new(ChatRelayMaintenanceStatus::default()),
@@ -4284,6 +4335,13 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
             .expect("read effective relay durability");
         assert!(synchronous_level >= CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL);
+        let durability = svc.peer_status().custody_durability;
+        assert_eq!(durability.state, "full");
+        assert!(durability.full_durability_verified);
+        assert_eq!(
+            durability.synchronous_level,
+            Some(u8::try_from(synchronous_level).expect("SQLite level fits u8"))
+        );
     }
 
     #[test]
@@ -4376,6 +4434,7 @@ mod tests {
         svc.record_peer_relay_outbound(1_800_000_050, 1, 1, None);
         let mut encoded = serde_json::to_value(svc.peer_status()).expect("serialize peer status");
         let object = encoded.as_object_mut().expect("peer status JSON object");
+        object.remove("custody_durability");
         object.remove("authenticated_onion_outbound");
         object.remove("direct_peer_outbound");
         object.remove("direct_peer_retry");
@@ -4387,6 +4446,10 @@ mod tests {
             serde_json::from_value(encoded).expect("deserialize legacy peer status");
         assert_eq!(decoded.outbound_rounds, 1);
         assert_eq!(decoded.last_outbound_status.as_deref(), Some("healthy"));
+        assert_eq!(
+            decoded.custody_durability,
+            ChatRelayCustodyDurabilityStatus::default()
+        );
         assert_eq!(decoded.authenticated_onion_outbound.rounds, 0);
         assert_eq!(decoded.direct_peer_outbound.rounds, 0);
         assert_eq!(

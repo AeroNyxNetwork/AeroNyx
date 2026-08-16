@@ -73,6 +73,9 @@
 //! the existing typed ChatRelay peer status. It exposes aggregate counters and
 //! stable reason buckets only, allowing relay smoke failures to be diagnosed
 //! without identifiers, endpoints, ciphertext, or payload-derived metadata.
+//! [CHAT-RELAY-DURABILITY-STATUS 2026-08-16 by Codex] The same typed snapshot
+//! carries verified aggregate custody durability. A missing relay runtime stays
+//! `unknown`; health must never infer FULL durability from configuration alone.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -3136,6 +3139,14 @@ mod tests {
             status.peer_relay.last_outbound_failure_reason.as_deref(),
             Some("chat_relay_runtime_unavailable")
         );
+        assert_eq!(status.peer_relay.custody_durability.state, "unknown");
+        assert!(
+            !status
+                .peer_relay
+                .custody_durability
+                .full_durability_verified
+        );
+        assert_eq!(status.peer_relay.custody_durability.synchronous_level, None);
         assert_eq!(status.source, "rust_chat_relay_runtime_unavailable");
     }
 
@@ -3150,6 +3161,9 @@ mod tests {
         peer_status.direct_peer_retry.retry_recovered_total = 1;
         peer_status.direct_peer_retry.retry_exhausted_total = 1;
         peer_status.direct_peer_retry.last_outcome = Some("exhausted".to_string());
+        peer_status.custody_durability.state = "full".to_string();
+        peer_status.custody_durability.full_durability_verified = true;
+        peer_status.custody_durability.synchronous_level = Some(2);
 
         // [RELAY-HEALTH-DIAGNOSTICS 2026-08-15 by Codex] Health consumes the
         // service snapshot verbatim instead of maintaining parallel counters.
@@ -3160,6 +3174,11 @@ mod tests {
         let encoded = serde_json::to_value(&status).expect("serialize relay health");
         assert_eq!(encoded["runtime_ready"], true);
         assert_eq!(encoded["peer_relay"]["outbound_attempted_total"], 4);
+        assert_eq!(encoded["peer_relay"]["custody_durability"]["state"], "full");
+        assert_eq!(
+            encoded["peer_relay"]["custody_durability"]["full_durability_verified"],
+            true
+        );
         assert_eq!(
             encoded["peer_relay"]["direct_peer_retry"]["retry_triggered_total"],
             2
