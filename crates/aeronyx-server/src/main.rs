@@ -43,6 +43,8 @@
 //!   latest-backup restore preflight with path-free aggregate output.
 //! - [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Add short-lived,
 //!   node-secret-authenticated restore plans bound to private storage state.
+//! - [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Add bounded, host-local
+//!   verification for the private HMAC-chained custody maintenance history.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -69,6 +71,7 @@
 //! v1.12.0-CustodyBackupPrune - Add host-local relay custody maintenance
 //! v1.13.0-CustodyRestoreReadiness - Add read-only recovery preflight
 //! v1.14.0-CustodyRestorePlan - Add authenticated host-local recovery plans
+//! v1.15.0-CustodyAuditVerify - Add aggregate maintenance-chain verification
 
 use std::fs::File;
 use std::io::{BufRead, Read};
@@ -248,6 +251,17 @@ enum MemchainCommands {
 enum RelayCustodyCommands {
     /// Verify and report aggregate private backup retention state
     Audit {
+        /// Path to the local node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Authenticate the complete private custody-maintenance audit chain
+    VerifyAudit {
         /// Path to the local node configuration file
         #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
         config: PathBuf,
@@ -1077,6 +1091,9 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
                 println!("Budget exceeded:    {}", receipt.budget_exceeded);
             }
         }
+        RelayCustodyCommands::VerifyAudit { config, json } => {
+            cmd_relay_verify_audit(&config, json).await?;
+        }
         RelayCustodyCommands::RestoreReadiness { config, json } => {
             let server_config = load_relay_custody_config(&config).await?;
             let receipt = ChatRelayService::audit_latest_restore_readiness_for_config(
@@ -1142,6 +1159,40 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
                 }
             }
         }
+    }
+    Ok(())
+}
+
+// [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Verification owns no network
+// client and emits only fixed aggregate fields. Keep node-secret loading and
+// chain authentication outside the general command dispatcher.
+async fn cmd_relay_verify_audit(config_path: &Path, json: bool) -> anyhow::Result<()> {
+    let server_config = load_relay_custody_config(config_path).await?;
+    let node_secret =
+        load_relay_custody_node_secret(&server_config, "maintenance audit verification").await?;
+    let receipt = ChatRelayService::verify_backup_maintenance_audit_for_config(
+        &server_config.memchain.chat_relay,
+        &node_secret,
+    )
+    .map_err(|error| anyhow::anyhow!("relay custody audit verification failed: {error}"))?;
+    if json {
+        println!("{}", serde_json::to_string(&receipt)?);
+    } else {
+        println!("Relay custody maintenance audit");
+        println!("════════════════════════════════════════");
+        println!("Verified:            {}", receipt.verified);
+        println!("Records:             {}", receipt.record_count);
+        println!(
+            "Last recorded at:    {}",
+            receipt.last_recorded_at.unwrap_or(0)
+        );
+        println!("Dry runs:            {}", receipt.dry_run_count);
+        println!("Planned executions:  {}", receipt.planned_count);
+        println!("Completed:           {}", receipt.completed_count);
+        println!("Failed:              {}", receipt.failed_count);
+        println!("Verified bytes:      {}", receipt.verified_bytes);
+        println!();
+        println!("Read-only verification; no audit or custody data was changed.");
     }
     Ok(())
 }
@@ -2427,6 +2478,20 @@ mod tests {
         let audit =
             Cli::try_parse_from(["aeronyx-server", "relay-custody", "audit", "--json"]).unwrap();
         let Commands::RelayCustody(RelayCustodyCommands::Audit { config, json }) = audit.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert!(json);
+
+        // [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Integrity
+        // verification is a separate, read-only command because retention
+        // inspection alone does not authenticate prior prune decisions.
+        let verify_audit =
+            Cli::try_parse_from(["aeronyx-server", "relay-custody", "verify-audit", "--json"])
+                .expect("maintenance audit verification form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::VerifyAudit { config, json }) =
+            verify_audit.command
         else {
             panic!("unexpected CLI command")
         };

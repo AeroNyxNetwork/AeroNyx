@@ -9,8 +9,11 @@
 //   Registered `peer_store` for Phase 1 decentralized node discovery.
 //   Re-exported `PeerStoreImportReport` for Phase 2 bootstrap snapshot loading.
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
+//   [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Re-exported the aggregate,
+//   path-free relay custody maintenance audit verification receipt.
 //
 // Last Modified:
+//   v0.18.0-CustodyAuditVerify - Re-exported host-local audit verification
 //   v0.17.0-BlindVaultPutFailureClass - Re-exported the privacy-safe retry
 //     classification used by multi-hop anonymous ciphertext delivery
 //   v0.16.0-RouteDomainCertificateRecovery - [ROUTE-DOMAIN-CERTIFICATE-RECOVERY
@@ -74,13 +77,14 @@ pub use blind_vault::{
     BlindVaultService, BlindVaultServiceError, BlindVaultStatus, BlindVaultStoredObject,
     SharedBlindVaultService,
 };
-// [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Expose only aggregate,
+// [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Expose only aggregate,
 // host-local maintenance contracts and authenticated path-free plans; artifact
 // paths and private identity metadata remain confined to the relay service.
 pub use chat_relay::{
-    derive_node_secret, ChatRelayBackupPruneReceipt, ChatRelayBackupPruneRequest,
-    ChatRelayBackupRetentionReceipt, ChatRelayRestorePlanReceipt, ChatRelayRestoreReadinessReceipt,
-    ChatRelayService, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION, CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS,
+    derive_node_secret, ChatRelayBackupAuditVerificationReceipt, ChatRelayBackupPruneReceipt,
+    ChatRelayBackupPruneRequest, ChatRelayBackupRetentionReceipt, ChatRelayRestorePlanReceipt,
+    ChatRelayRestoreReadinessReceipt, ChatRelayService, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
+    CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS,
 };
 pub use deny_list::{DenyList, DenyReason};
 pub use directory_chain::{

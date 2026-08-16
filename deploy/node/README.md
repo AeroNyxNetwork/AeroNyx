@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Document bounded verification
+  of the private HMAC-chained custody maintenance history.
 - [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Document short-lived,
   state-bound restore plans and their non-authorization security boundary.
 - [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] Document the
@@ -121,6 +123,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.53.0-node-deploy - Documented custody maintenance audit verification.
 v1.52.0-node-deploy - Documented authenticated relay restore planning.
 v1.51.0-node-deploy - Documented read-only relay restore readiness.
 v1.50.0-node-deploy - Documented confirmation-gated relay custody pruning.
@@ -723,6 +726,25 @@ Audit the private backup boundary without deleting or writing an audit record:
 sudo /root/open/AeroNyx/target/release/aeronyx-server \
   relay-custody audit -c /etc/aeronyx/server.toml --json
 ```
+
+Authenticate the complete private maintenance history independently of the
+current backup inventory:
+
+```bash
+sudo /root/open/AeroNyx/target/release/aeronyx-server \
+  relay-custody verify-audit -c /etc/aeronyx/server.toml --json
+```
+
+<!-- [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] -->
+`verify-audit` loads the node identity key locally and replays the audit from
+genesis under the same cross-process maintenance lock used by backup and prune.
+It rejects truncation, malformed or unknown records, sequence/hash-chain
+discontinuity, an invalid HMAC or wrong node key, permission drift, oversized
+records/files, and a file whose length changes during verification. An absent
+audit is a valid verified history with zero records; the command does not create
+or repair the audit file. Output is limited to aggregate record/phase/byte
+counts and the last timestamp. It never emits paths, filenames, MACs, operation
+IDs, identities, routes, ciphertext, or custody contents.
 
 Verify whether the newest recovery image is usable before planning a restore:
 

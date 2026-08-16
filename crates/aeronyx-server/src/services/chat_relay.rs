@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.2.0-CustodyBackupPrune
+// Version: 3.5.0-CustodyAuditVerify
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -178,10 +178,14 @@
 //     short-lived, node-secret HMAC commitment to one verified image and the
 //     active custody boundary observed at issuance. It is not authorization to
 //     replace data and must remain host-local.
+//   - [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Maintenance audit reads
+//     enforce per-record and whole-file byte ceilings while checking that the
+//     opened file did not grow, shrink, or truncate during verification.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.5.0-CustodyAuditVerify — Bounded public maintenance-chain verification
 //   v3.4.0-CustodyRestorePlan — Authenticated, state-bound recovery planning
 //   v3.3.0-CustodyRestoreReadiness — Read-only latest-image recovery preflight
 //   v3.2.0-CustodyBackupPrune — Confirmation-gated local recovery maintenance
@@ -215,7 +219,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1740,6 +1744,31 @@ pub struct ChatRelayBackupPruneReceipt {
     pub remaining: ChatRelayBackupRetentionReceipt,
 }
 
+/// Aggregate result of verifying the private maintenance audit HMAC chain.
+///
+/// [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] No chain MAC, path, artifact
+/// identity, message metadata, wallet identity, or ciphertext may cross this
+/// host-local boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ChatRelayBackupAuditVerificationReceipt {
+    /// Always true on success; corruption is returned as an error.
+    pub verified: bool,
+    /// Number of authenticated audit records.
+    pub record_count: u64,
+    /// Timestamp of the final authenticated record, absent for an empty chain.
+    pub last_recorded_at: Option<u64>,
+    /// Number of authenticated retention dry-run records.
+    pub dry_run_count: u64,
+    /// Number of authenticated destructive plans.
+    pub planned_count: u64,
+    /// Number of authenticated completed destructive operations.
+    pub completed_count: u64,
+    /// Number of authenticated failed destructive operations.
+    pub failed_count: u64,
+    /// Exact bytes consumed by authenticated newline-delimited records.
+    pub verified_bytes: u64,
+}
+
 /// Aggregate, path-free result of a read-only recovery preflight.
 ///
 /// [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] This contract never
@@ -1848,7 +1877,11 @@ struct ChatRelayRestorePlanSigningState<'a> {
     active_database_inode: u64,
 }
 
+// [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Unknown fields are not covered
+// by the canonical v1 signing frame and must therefore fail closed instead of
+// being silently ignored by Serde.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChatRelayBackupMaintenanceAuditRecord {
     version: u8,
     sequence: u64,
@@ -1877,6 +1910,23 @@ struct ChatRelayBackupMaintenanceAuditCounts {
     completed_backup_bytes: u64,
     completed_partial_count: usize,
     completed_partial_bytes: u64,
+}
+
+struct ChatRelayBackupAuditVerificationState {
+    receipt: ChatRelayBackupAuditVerificationReceipt,
+    head_mac: String,
+}
+
+impl ChatRelayBackupAuditVerificationState {
+    fn empty() -> Self {
+        Self {
+            receipt: ChatRelayBackupAuditVerificationReceipt {
+                verified: true,
+                ..Default::default()
+            },
+            head_mac: "0".repeat(64),
+        }
+    }
 }
 
 impl ExpiredNotification {
@@ -2220,6 +2270,64 @@ impl ChatRelayService {
         Ok(file)
     }
 
+    fn open_existing_private_backup_control_file(path: &Path) -> ChatRelayResult<Option<File>> {
+        #[cfg(unix)]
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        #[cfg(not(unix))]
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_PERM,
+                    "relay backup control boundary is not a private regular file",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CANTOPEN,
+                    "unable to inspect private relay backup control file",
+                ));
+            }
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CANTOPEN,
+                    "unable to open private relay backup control file",
+                ));
+            }
+        };
+        let metadata = file.metadata().map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_IOERR,
+                "unable to inspect private relay backup control file",
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_PERM,
+                "relay backup control boundary is not a private regular file",
+            ));
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_PERM,
+                "relay backup control file is not owner-private",
+            ));
+        }
+        Ok(Some(file))
+    }
+
     fn acquire_backup_filesystem_lock(backup_directory: &Path) -> ChatRelayResult<File> {
         let parent = backup_directory.parent().ok_or_else(|| {
             Self::backup_io_error(
@@ -2266,10 +2374,10 @@ impl ChatRelayService {
         })
     }
 
-    fn backup_audit_mac(
+    fn backup_audit_mac_engine(
         node_secret: &[u8; 32],
         record: &ChatRelayBackupMaintenanceAuditRecord,
-    ) -> ChatRelayResult<String> {
+    ) -> ChatRelayResult<HmacSha256> {
         let mut mac = HmacSha256::new_from_slice(node_secret).map_err(|_| {
             Self::backup_io_error(
                 rusqlite::ffi::SQLITE_AUTH,
@@ -2278,13 +2386,24 @@ impl ChatRelayService {
         })?;
         mac.update(CHAT_RELAY_BACKUP_AUDIT_HMAC_DOMAIN);
         mac.update(&Self::backup_audit_signing_bytes(record)?);
-        Ok(hex::encode(mac.finalize().into_bytes()))
+        Ok(mac)
+    }
+
+    fn backup_audit_mac(
+        node_secret: &[u8; 32],
+        record: &ChatRelayBackupMaintenanceAuditRecord,
+    ) -> ChatRelayResult<String> {
+        Ok(hex::encode(
+            Self::backup_audit_mac_engine(node_secret, record)?
+                .finalize()
+                .into_bytes(),
+        ))
     }
 
     fn verify_backup_audit_log(
         file: &mut File,
         node_secret: &[u8; 32],
-    ) -> ChatRelayResult<(u64, String)> {
+    ) -> ChatRelayResult<ChatRelayBackupAuditVerificationState> {
         let metadata = file.metadata().map_err(|_| {
             Self::backup_io_error(
                 rusqlite::ffi::SQLITE_IOERR,
@@ -2297,6 +2416,7 @@ impl ChatRelayService {
                 "relay backup maintenance audit exceeds its bounded size",
             ));
         }
+        let initial_len = metadata.len();
         file.seek(SeekFrom::Start(0)).map_err(|_| {
             Self::backup_io_error(
                 rusqlite::ffi::SQLITE_IOERR,
@@ -2310,17 +2430,23 @@ impl ChatRelayService {
                 "unable to read relay backup maintenance audit",
             )
         })?);
-        let mut expected_sequence = 1u64;
-        let mut previous_mac = "0".repeat(64);
+        let mut state = ChatRelayBackupAuditVerificationState::empty();
         let mut line = String::new();
         loop {
             line.clear();
-            let bytes = reader.read_line(&mut line).map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to read relay backup maintenance audit",
-                )
-            })?;
+            // [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Metadata length is
+            // not a read bound: a concurrent writer can grow the file after
+            // inspection. Limit every record before allocation and separately
+            // account total authenticated bytes.
+            let bytes = Read::by_ref(&mut reader)
+                .take((CHAT_RELAY_BACKUP_AUDIT_MAX_RECORD_BYTES + 1) as u64)
+                .read_line(&mut line)
+                .map_err(|_| {
+                    Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_IOERR,
+                        "unable to read relay backup maintenance audit",
+                    )
+                })?;
             if bytes == 0 {
                 break;
             }
@@ -2330,12 +2456,33 @@ impl ChatRelayService {
                     "relay backup maintenance audit record is malformed",
                 ));
             }
-            if usize::try_from(expected_sequence).unwrap_or(usize::MAX)
-                > CHAT_RELAY_BACKUP_AUDIT_MAX_RECORDS
+            if state.receipt.record_count
+                >= u64::try_from(CHAT_RELAY_BACKUP_AUDIT_MAX_RECORDS).unwrap_or(u64::MAX)
             {
                 return Err(Self::backup_io_error(
                     rusqlite::ffi::SQLITE_FULL,
                     "relay backup maintenance audit record limit reached",
+                ));
+            }
+            state.receipt.verified_bytes = state
+                .receipt
+                .verified_bytes
+                .checked_add(u64::try_from(bytes).map_err(|_| {
+                    Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_FULL,
+                        "relay backup maintenance audit byte count overflow",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_FULL,
+                        "relay backup maintenance audit byte count overflow",
+                    )
+                })?;
+            if state.receipt.verified_bytes > CHAT_RELAY_BACKUP_AUDIT_MAX_BYTES {
+                return Err(Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_FULL,
+                    "relay backup maintenance audit exceeds its bounded size",
                 ));
             }
             let record: ChatRelayBackupMaintenanceAuditRecord =
@@ -2346,8 +2493,8 @@ impl ChatRelayService {
                     )
                 })?;
             if record.version != 1
-                || record.sequence != expected_sequence
-                || record.previous_mac != previous_mac
+                || record.sequence != state.receipt.record_count + 1
+                || record.previous_mac != state.head_mac
                 || !Self::is_lower_hex(&record.previous_mac, 64)
                 || !Self::is_lower_hex(&record.mac, 64)
                 || record.action != "prune"
@@ -2355,22 +2502,55 @@ impl ChatRelayService {
                     record.phase.as_str(),
                     "dry_run" | "planned" | "completed" | "failed"
                 )
-                || Self::backup_audit_mac(node_secret, &record)? != record.mac
             {
                 return Err(Self::backup_io_error(
                     rusqlite::ffi::SQLITE_CORRUPT,
                     "relay backup maintenance audit verification failed",
                 ));
             }
-            previous_mac = record.mac;
-            expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            let decoded_mac = hex::decode(&record.mac).map_err(|_| {
                 Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_FULL,
-                    "relay backup maintenance audit sequence overflow",
+                    rusqlite::ffi::SQLITE_CORRUPT,
+                    "relay backup maintenance audit verification failed",
                 )
             })?;
+            Self::backup_audit_mac_engine(node_secret, &record)?
+                .verify_slice(&decoded_mac)
+                .map_err(|_| {
+                    Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_CORRUPT,
+                        "relay backup maintenance audit verification failed",
+                    )
+                })?;
+            if record.phase == "dry_run" {
+                state.receipt.dry_run_count += 1;
+            } else if record.phase == "planned" {
+                state.receipt.planned_count += 1;
+            } else if record.phase == "completed" {
+                state.receipt.completed_count += 1;
+            } else {
+                state.receipt.failed_count += 1;
+            }
+            state.receipt.record_count += 1;
+            state.receipt.last_recorded_at = Some(record.timestamp);
+            state.head_mac = record.mac;
         }
-        Ok((expected_sequence - 1, previous_mac))
+        let final_len = file
+            .metadata()
+            .map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_IOERR,
+                    "unable to re-inspect relay backup maintenance audit",
+                )
+            })?
+            .len();
+        if final_len != initial_len || state.receipt.verified_bytes != initial_len {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CORRUPT,
+                "relay backup maintenance audit changed during verification",
+            ));
+        }
+        Ok(state)
     }
 
     fn append_backup_maintenance_audit(
@@ -2388,7 +2568,9 @@ impl ChatRelayService {
         })?;
         let audit_path = parent.join(CHAT_RELAY_BACKUP_AUDIT_FILE_NAME);
         let mut file = Self::open_private_backup_control_file(&audit_path, true)?;
-        let (last_sequence, previous_mac) = Self::verify_backup_audit_log(&mut file, node_secret)?;
+        let verification = Self::verify_backup_audit_log(&mut file, node_secret)?;
+        let last_sequence = verification.receipt.record_count;
+        let previous_mac = verification.head_mac;
         if usize::try_from(last_sequence).unwrap_or(usize::MAX)
             >= CHAT_RELAY_BACKUP_AUDIT_MAX_RECORDS
         {
@@ -6176,6 +6358,44 @@ impl ChatRelayService {
         Ok(Self::inspect_verified_backup_retention(config, &backup_directory, now_secs())?.receipt)
     }
 
+    /// Verifies the private relay-custody maintenance audit from genesis.
+    ///
+    /// [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] The verifier authenticates
+    /// every bounded record under the node identity secret, checks sequence and
+    /// hash-chain continuity, rejects schema drift, and detects file length
+    /// changes during the read. It returns aggregate phase counts only. Audit
+    /// MACs, operation identifiers, paths, payloads, and custody metadata never
+    /// cross this service boundary. An absent audit is a valid empty history;
+    /// this method does not create or repair the audit file.
+    ///
+    /// The host-local CLI is the intended caller. This synchronous filesystem
+    /// operation must run on a blocking worker when invoked from async code.
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free storage error if the private control boundary is
+    /// unsafe, the audit exceeds its fixed limits, a record is malformed or
+    /// unauthenticated, chain continuity fails, or the file changes while it
+    /// is being verified.
+    pub fn verify_backup_maintenance_audit_for_config(
+        config: &ChatRelayConfig,
+        node_secret: &[u8; 32],
+    ) -> ChatRelayResult<ChatRelayBackupAuditVerificationReceipt> {
+        let backup_directory = Self::private_backup_directory_for_config(config)?;
+        let _filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
+        let parent = backup_directory.parent().ok_or_else(|| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "relay backup directory has no private audit parent",
+            )
+        })?;
+        let audit_path = parent.join(CHAT_RELAY_BACKUP_AUDIT_FILE_NAME);
+        let Some(mut audit) = Self::open_existing_private_backup_control_file(&audit_path)? else {
+            return Ok(ChatRelayBackupAuditVerificationState::empty().receipt);
+        };
+        Ok(Self::verify_backup_audit_log(&mut audit, node_secret)?.receipt)
+    }
+
     /// Verifies whether the newest private recovery image is ready for a
     /// separately approved host-local restore operation.
     ///
@@ -7459,9 +7679,124 @@ mod tests {
         assert_eq!(
             ChatRelayService::verify_backup_audit_log(&mut audit, &secret)
                 .expect("verify maintenance audit")
-                .0,
+                .receipt
+                .record_count,
             1
         );
+        drop(audit);
+
+        // [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Pin the public
+        // aggregate contract and prove that verification uses this node's
+        // secret without exposing the chain MAC or private filesystem state.
+        let verification =
+            ChatRelayService::verify_backup_maintenance_audit_for_config(&config, &secret)
+                .expect("verify public maintenance audit contract");
+        assert!(verification.verified);
+        assert_eq!(verification.record_count, 1);
+        assert!(verification.last_recorded_at.is_some());
+        assert_eq!(verification.dry_run_count, 1);
+        assert_eq!(verification.planned_count, 0);
+        assert_eq!(verification.completed_count, 0);
+        assert_eq!(verification.failed_count, 0);
+        assert!(verification.verified_bytes > 0);
+
+        let json = serde_json::to_value(verification).expect("serialize audit verification");
+        let object = json.as_object().expect("verification JSON is an object");
+        assert_eq!(object.len(), 8);
+        for field in [
+            "verified",
+            "record_count",
+            "last_recorded_at",
+            "dry_run_count",
+            "planned_count",
+            "completed_count",
+            "failed_count",
+            "verified_bytes",
+        ] {
+            assert!(object.contains_key(field), "missing JSON field: {field}");
+        }
+        let encoded = serde_json::to_string(&json).expect("encode verification JSON");
+        assert!(!encoded.contains(directory.path().to_string_lossy().as_ref()));
+        assert!(!encoded.contains("previous_mac"));
+        assert!(!encoded.contains("operation"));
+
+        let error =
+            ChatRelayService::verify_backup_maintenance_audit_for_config(&config, &[0xffu8; 32])
+                .expect_err("wrong node secret must not authenticate maintenance history");
+        assert_eq!(error.reason_bucket(), "sqlite_error");
+
+        let audit_record = std::fs::read_to_string(&audit_path).expect("read audit schema fixture");
+        let extended = audit_record.replacen(
+            "\"version\":1",
+            "\"version\":1,\"uncommitted_extension\":true",
+            1,
+        );
+        assert_ne!(extended, audit_record, "fixture must gain an unknown field");
+        std::fs::write(&audit_path, extended).expect("write extended audit schema fixture");
+        let error = ChatRelayService::verify_backup_maintenance_audit_for_config(&config, &secret)
+            .expect_err("unknown audit fields must not bypass canonical authentication");
+        assert_eq!(error.reason_bucket(), "sqlite_error");
+    }
+
+    #[test]
+    fn backup_audit_verification_accepts_absent_history_without_creating_it() {
+        let directory = tempfile::tempdir().expect("empty backup audit directory");
+        let mut config = test_config();
+        config.db_path = directory
+            .path()
+            .join("source.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let audit_path = directory.path().join(CHAT_RELAY_BACKUP_AUDIT_FILE_NAME);
+
+        let receipt =
+            ChatRelayService::verify_backup_maintenance_audit_for_config(&config, &[0xb1u8; 32])
+                .expect("verify absent maintenance history");
+
+        assert_eq!(
+            receipt,
+            ChatRelayBackupAuditVerificationReceipt {
+                verified: true,
+                ..Default::default()
+            }
+        );
+        assert!(
+            !audit_path.exists(),
+            "read-only verification must not initialize an audit history"
+        );
+    }
+
+    #[test]
+    fn backup_audit_verification_rejects_oversized_and_truncated_records() {
+        let directory = tempfile::tempdir().expect("bounded backup audit directory");
+        let mut config = test_config();
+        config.db_path = directory
+            .path()
+            .join("source.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let secret = [0xb2u8; 32];
+        ChatRelayService::verify_backup_maintenance_audit_for_config(&config, &secret)
+            .expect("initialize private maintenance boundary");
+        let audit_path = directory.path().join(CHAT_RELAY_BACKUP_AUDIT_FILE_NAME);
+
+        let mut oversized = vec![b'x'; CHAT_RELAY_BACKUP_AUDIT_MAX_RECORD_BYTES + 1];
+        oversized.push(b'\n');
+        std::fs::write(&audit_path, oversized).expect("write oversized audit record");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&audit_path, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict oversized audit fixture");
+        }
+        let error = ChatRelayService::verify_backup_maintenance_audit_for_config(&config, &secret)
+            .expect_err("oversized audit record must fail before JSON parsing");
+        assert_eq!(error.reason_bucket(), "sqlite_error");
+
+        std::fs::write(&audit_path, b"{}").expect("replace fixture with unterminated audit record");
+        let error = ChatRelayService::verify_backup_maintenance_audit_for_config(&config, &secret)
+            .expect_err("truncated audit record must fail closed");
+        assert_eq!(error.reason_bucket(), "sqlite_error");
     }
 
     #[test]
@@ -7575,10 +7910,19 @@ mod tests {
         assert_eq!(
             ChatRelayService::verify_backup_audit_log(&mut audit, &secret)
                 .expect("verify maintenance audit")
-                .0,
+                .receipt
+                .record_count,
             4,
             "two successful executions write planned and completed records"
         );
+        drop(audit);
+        let verification =
+            ChatRelayService::verify_backup_maintenance_audit_for_config(&config, &secret)
+                .expect("verify completed maintenance history");
+        assert_eq!(verification.planned_count, 2);
+        assert_eq!(verification.completed_count, 2);
+        assert_eq!(verification.dry_run_count, 0);
+        assert_eq!(verification.failed_count, 0);
     }
 
     #[test]
