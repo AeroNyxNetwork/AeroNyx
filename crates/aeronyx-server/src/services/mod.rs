@@ -11,8 +11,11 @@
 //   Re-exported PeerStoreStatus for nodeboard discovery status.
 //   [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Re-exported the aggregate,
 //   path-free relay custody maintenance audit verification receipt.
+//   [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] Extended that stable
+//   receipt with aggregate immutable-segment and recovery state.
 //
 // Last Modified:
+//   v0.19.0-CustodyAuditRotation - Aggregate segmented-audit observability
 //   v0.18.0-CustodyAuditVerify - Re-exported host-local audit verification
 //   v0.17.0-BlindVaultPutFailureClass - Re-exported the privacy-safe retry
 //     classification used by multi-hop anonymous ciphertext delivery

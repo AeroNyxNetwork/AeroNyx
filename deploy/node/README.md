@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] Document automatic,
+  crash-safe maintenance audit segmentation and authenticated checkpoints.
 - [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Document bounded verification
   of the private HMAC-chained custody maintenance history.
 - [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Document short-lived,
@@ -123,6 +125,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.54.0-node-deploy - Documented segmented custody audit checkpoints.
 v1.53.0-node-deploy - Documented custody maintenance audit verification.
 v1.52.0-node-deploy - Documented authenticated relay restore planning.
 v1.51.0-node-deploy - Documented read-only relay restore readiness.
@@ -745,6 +748,25 @@ audit is a valid verified history with zero records; the command does not create
 or repair the audit file. Output is limited to aggregate record/phase/byte
 counts and the last timestamp. It never emits paths, filenames, MACs, operation
 IDs, identities, routes, ciphertext, or custody contents.
+
+<!-- [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] -->
+When the active audit reaches 64 MiB or 65,536 records, the next append rotates
+it automatically. The node preserves the global v1 sequence and record-MAC
+chain, hashes the immutable segment with SHA-256, and publishes a separate
+node-secret HMAC checkpoint containing only cumulative aggregates. Checkpoint
+publication, immutable hard-link publication, active-name retirement, and
+parent-directory fsync are ordered so a power loss leaves one of two detectable
+recovery states. `verify-audit` reports either state through `rotation_pending`;
+the next locked maintenance append finishes the publication before writing a
+new record and removes only strictly named, owner-private checkpoint
+temporaries abandoned by an interrupted publication. Verification remains
+bounded to 16 immutable segments and 1 GiB of authenticated audit bytes.
+
+These are host-local integrity checkpoints, not public consensus or an external
+timestamp witness. They detect modification, gaps, and partial publication in
+the retained local history, but a root operator who deletes or rolls back every
+audit/checkpoint artifact cannot be detected without a separately anchored
+witness. Do not describe this mechanism as a blockchain or third-party proof.
 
 Verify whether the newest recovery image is usable before planning a restore:
 

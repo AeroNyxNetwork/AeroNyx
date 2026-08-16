@@ -45,6 +45,8 @@
 //!   node-secret-authenticated restore plans bound to private storage state.
 //! - [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Add bounded, host-local
 //!   verification for the private HMAC-chained custody maintenance history.
+//! - [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] Surface aggregate-only
+//!   immutable segment/checkpoint and interrupted-rotation status.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -72,6 +74,7 @@
 //! v1.13.0-CustodyRestoreReadiness - Add read-only recovery preflight
 //! v1.14.0-CustodyRestorePlan - Add authenticated host-local recovery plans
 //! v1.15.0-CustodyAuditVerify - Add aggregate maintenance-chain verification
+//! v1.16.0-CustodyAuditRotation - Report authenticated audit segment state
 
 use std::fs::File;
 use std::io::{BufRead, Read};
@@ -1191,6 +1194,11 @@ async fn cmd_relay_verify_audit(config_path: &Path, json: bool) -> anyhow::Resul
         println!("Completed:           {}", receipt.completed_count);
         println!("Failed:              {}", receipt.failed_count);
         println!("Verified bytes:      {}", receipt.verified_bytes);
+        println!("Checkpoints:         {}", receipt.checkpoint_count);
+        println!("Archived records:    {}", receipt.archived_record_count);
+        println!("Active records:      {}", receipt.active_record_count);
+        println!("Archived bytes:      {}", receipt.archived_bytes);
+        println!("Rotation pending:    {}", receipt.rotation_pending);
         println!();
         println!("Read-only verification; no audit or custody data was changed.");
     }
