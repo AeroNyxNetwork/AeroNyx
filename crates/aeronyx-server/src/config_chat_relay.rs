@@ -23,6 +23,8 @@
 //! pre-migration SQLite physical-integrity activation gate.
 //! v1.8.0-VerifiedCustodyBackup — Documented the WAL-aware, owner-private
 //! recovery artifact boundary exposed by the relay service.
+//! v1.9.0-IdempotentCustodyBackup — Documented restart-safe audited command
+//! replay and immutable re-verification of existing recovery artifacts.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -76,10 +78,12 @@
 //! - [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] Verified backups are
 //!   created only inside the owner-private `.aeronyx-relay-backups` directory
 //!   beside `db_path`; callers cannot supply an arbitrary destination. The
-//!   core service does not schedule backups or expose them over HTTP. A future
-//!   operator command must add authorization, audit and retention policy
-//!   without weakening this storage boundary, and must use `spawn_blocking`
-//!   because snapshot creation is synchronous filesystem and SQLite work.
+//!   core service does not schedule backups or expose them over HTTP. The CMS
+//!   operator command is HTTPS-only, confirmation-gated, audited, and runs via
+//!   `spawn_blocking`. Its command ID is HMAC-derived into a private artifact
+//!   key so retries across restart re-verify and reuse one immutable image.
+//!   Retention, restore, listing, and download remain local-only and are not
+//!   part of this command boundary.
 //! - `expired_notification_ttl_secs`: after this TTL, undelivered expiry
 //!   notifications are silently discarded. Flutter client local timeout is
 //!   the fallback.
@@ -88,6 +92,7 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.9.0-IdempotentCustodyBackup — Restart-safe audited backup replay.
 //! v1.8.0-VerifiedCustodyBackup — Declared the private recovery boundary.
 //! v1.7.0-StartupCustodyIntegrity — Fail-closed physical storage activation.
 //! v1.6.0-DurableCustody — Declared FULL durability a custody invariant.

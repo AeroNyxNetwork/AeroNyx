@@ -17,6 +17,9 @@
 //! - [CHAT-RELAY-BACKUP-COMMAND 2026-08-16 by Codex] Added the audited,
 //!   confirmation-gated command surface for verified node-private relay
 //!   custody backups. Backup artifacts remain unavailable over HTTP.
+//! - [CHAT-RELAY-BACKUP-IDEMPOTENCY 2026-08-16 by Codex] Made audited custody
+//!   backup replay restart-safe by binding each CMS command ID to one opaque,
+//!   node-local verified artifact without persisting the raw command ID.
 //!
 //! ## Main Functionality
 //! - `CommandHandler`: Background async task that consumes commands
@@ -37,6 +40,7 @@
 //! 4. Deduplication check (skip if `command.id` already processed)
 //! 5. Match on `command.action` → dispatch to bounded VPN operation handlers
 //! 6. Report `CommandStatusReport` back to CMS
+//! 7. Sensitive backup commands enter dedup only after terminal audit delivery
 //!
 //! ## Dependencies
 //! - `super::client::ManagementClient` — for status reporting to CMS
@@ -44,9 +48,9 @@
 //! - `crate::services::*` — VPN sessions, deny list, and retained runtime state
 //!
 //! ## ⚠️ Important Note for Next Developer
-//! - The deduplication set (`processed_ids`) is in-memory only.
-//!   On server restart it will be empty, so CMS should handle
-//!   idempotency on its side as well.
+//! - The general deduplication set (`processed_ids`) is in-memory only. CMS
+//!   should preserve idempotency for all commands. The custody-backup command
+//!   additionally has durable service-layer replay protection across restart.
 //! - The set is capped at `MAX_PROCESSED_IDS` (1000) to prevent
 //!   unbounded memory growth. When full, the oldest half is evicted.
 //! - Unknown actions are logged and reported as `failed` — never panic.
@@ -59,6 +63,7 @@
 //! v1.6.0 - Added two_hop_smoke aggregate relay proof command
 //! v1.7.0 - Removed inherited systemd authority from operation subprocesses
 //! v1.8.0 - Added audited create_custody_backup operator command
+//! v1.9.0 - Added restart-safe custody backup command idempotency
 //! ============================================
 
 use std::collections::HashSet;
@@ -93,6 +98,7 @@ const CUSTODY_BACKUP_CONFIRMATION: &str = "create";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CustodyBackupReceipt {
     size_bytes: u64,
+    created: bool,
 }
 
 fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) -> SessionQuality {
@@ -306,7 +312,6 @@ impl CommandHandler {
                 );
                 return;
             }
-            self.mark_processed(cmd_id.clone());
         } else {
             // Existing commands retain their historical fail-open reporting
             // behavior for backward compatibility.
@@ -339,7 +344,17 @@ impl CommandHandler {
                 self.handle_two_hop_smoke(&command).await;
             }
             "create_custody_backup" => {
-                self.handle_create_custody_backup(&command).await;
+                // [CHAT-RELAY-BACKUP-IDEMPOTENCY 2026-08-16 by Codex] Keep the
+                // command retryable until CMS accepts its terminal audit state.
+                // A retry safely re-verifies the same HMAC-bound artifact.
+                if self.handle_create_custody_backup(&command).await {
+                    self.mark_processed(cmd_id.clone());
+                } else {
+                    warn!(
+                        command_id = %cmd_id,
+                        "[CMD_HANDLER] Custody backup remains retryable because terminal audit delivery failed"
+                    );
+                }
             }
             "ban_wallet" => {
                 self.handle_ban_wallet(&command).await;
@@ -731,7 +746,7 @@ impl CommandHandler {
     /// fixes the destination to its owner-private backup directory and verifies
     /// the isolated image before publication. CMS receives only aggregate
     /// receipt data, never a path, object identifier, wallet, route, or payload.
-    async fn handle_create_custody_backup(&self, command: &Command) {
+    async fn handle_create_custody_backup(&self, command: &Command) -> bool {
         info!(
             command_id = %command.id,
             "[CMD_HANDLER] create_custody_backup"
@@ -741,15 +756,13 @@ impl CommandHandler {
         // node request signatures alone do not authenticate a plaintext HTTP
         // response. Refuse this durable side effect on insecure CMS transport.
         if !management_endpoint_is_https(&self.client.config().cms_url) {
-            self.report_status_for_agent_type(
-                "vpn",
-                &command.id,
-                CommandExecutionStatus::Failed,
-                0,
-                "create_custody_backup requires an HTTPS management endpoint",
-            )
-            .await;
-            return;
+            return self
+                .report_custody_backup_terminal_status(
+                    &command.id,
+                    CommandExecutionStatus::Failed,
+                    "create_custody_backup requires an HTTPS management endpoint",
+                )
+                .await;
         }
 
         let confirmation = command
@@ -758,27 +771,23 @@ impl CommandHandler {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         if confirmation != CUSTODY_BACKUP_CONFIRMATION {
-            self.report_status_for_agent_type(
-                "vpn",
-                &command.id,
-                CommandExecutionStatus::Failed,
-                0,
-                "create_custody_backup requires confirm=create",
-            )
-            .await;
-            return;
+            return self
+                .report_custody_backup_terminal_status(
+                    &command.id,
+                    CommandExecutionStatus::Failed,
+                    "create_custody_backup requires confirm=create",
+                )
+                .await;
         }
 
         let Some(chat_relay) = self.chat_relay.as_ref().map(Arc::clone) else {
-            self.report_status_for_agent_type(
-                "vpn",
-                &command.id,
-                CommandExecutionStatus::Failed,
-                0,
-                "relay custody storage is not enabled on this node",
-            )
-            .await;
-            return;
+            return self
+                .report_custody_backup_terminal_status(
+                    &command.id,
+                    CommandExecutionStatus::Failed,
+                    "relay custody storage is not enabled on this node",
+                )
+                .await;
         };
 
         self.report_status_for_agent_type(
@@ -790,29 +799,63 @@ impl CommandHandler {
         )
         .await;
 
-        match create_verified_custody_backup(chat_relay).await {
+        match create_verified_custody_backup(chat_relay, command.id.clone()).await {
             Ok(receipt) => {
-                self.report_status_for_agent_type(
-                    "vpn",
+                let disposition = if receipt.created {
+                    "created"
+                } else {
+                    "existing_verified"
+                };
+                self.report_custody_backup_terminal_status(
                     &command.id,
                     CommandExecutionStatus::Completed,
-                    100,
                     &format!(
-                        "Verified relay custody backup created; scope=node_local_private; size_bytes={}",
-                        receipt.size_bytes
+                        "Verified relay custody backup available; scope=node_local_private; disposition={disposition}; size_bytes={}",
+                        receipt.size_bytes,
                     ),
                 )
-                .await;
+                .await
             }
             Err(message) => {
-                self.report_status_for_agent_type(
-                    "vpn",
+                self.report_custody_backup_terminal_status(
                     &command.id,
                     CommandExecutionStatus::Failed,
-                    0,
                     &message,
                 )
-                .await;
+                .await
+            }
+        }
+    }
+
+    /// Reports the terminal custody-backup state and preserves retryability.
+    ///
+    /// A successful local backup is not the end of the audited operation. CMS
+    /// must accept `completed` or `failed` before the process-local dedup set may
+    /// suppress another delivery of the command.
+    async fn report_custody_backup_terminal_status(
+        &self,
+        command_id: &str,
+        status: CommandExecutionStatus,
+        message: &str,
+    ) -> bool {
+        let progress = if status == CommandExecutionStatus::Completed {
+            100
+        } else {
+            0
+        };
+        match self
+            .try_report_status_for_agent_type("vpn", command_id, status, progress, message)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    command_id = %command_id,
+                    error = %error,
+                    status = ?status,
+                    "[CMD_HANDLER] Custody backup terminal audit delivery failed"
+                );
+                false
             }
         }
     }
@@ -1189,26 +1232,21 @@ fn management_endpoint_is_https(endpoint: &str) -> bool {
 /// operator operation until a separately authorized restore protocol exists.
 async fn create_verified_custody_backup(
     chat_relay: Arc<ChatRelayService>,
+    operation_id: String,
 ) -> Result<CustodyBackupReceipt, String> {
     tokio::task::spawn_blocking(move || {
-        let backup_path = chat_relay.create_verified_backup().map_err(|error| {
-            warn!(
-                error = %error,
-                "[CMD_HANDLER] Verified relay custody backup failed"
-            );
-            "verified relay custody backup failed closed".to_string()
-        })?;
-        let metadata = std::fs::metadata(&backup_path).map_err(|_| {
-            "verified relay custody backup was published but its receipt is unavailable".to_string()
-        })?;
-        if !metadata.is_file() || metadata.len() == 0 {
-            return Err(
-                "verified relay custody backup was published without a valid file receipt"
-                    .to_string(),
-            );
-        }
+        let receipt = chat_relay
+            .create_verified_backup_for_operation(&operation_id)
+            .map_err(|error| {
+                warn!(
+                    error = %error,
+                    "[CMD_HANDLER] Verified relay custody backup failed"
+                );
+                "verified relay custody backup failed closed".to_string()
+            })?;
         Ok(CustodyBackupReceipt {
-            size_bytes: metadata.len(),
+            size_bytes: receipt.size_bytes,
+            created: receipt.created,
         })
     })
     .await
@@ -1623,11 +1661,17 @@ mod tests {
         let relay =
             Arc::new(ChatRelayService::new(config, [0x8a; 32]).expect("initialize relay custody"));
 
-        let receipt = create_verified_custody_backup(relay)
+        let first = create_verified_custody_backup(Arc::clone(&relay), "backup-command-1".into())
             .await
             .expect("create operator backup");
+        let replay = create_verified_custody_backup(relay, "backup-command-1".into())
+            .await
+            .expect("reuse operator backup after command replay");
 
-        assert!(receipt.size_bytes > 0);
+        assert!(first.created);
+        assert!(!replay.created);
+        assert!(first.size_bytes > 0);
+        assert_eq!(replay.size_bytes, first.size_bytes);
         let artifacts = std::fs::read_dir(directory.path().join(".aeronyx-relay-backups"))
             .expect("read private backup directory")
             .count();
@@ -1642,7 +1686,7 @@ mod tests {
         let relay =
             Arc::new(ChatRelayService::new(config, [0x8b; 32]).expect("initialize memory relay"));
 
-        let error = create_verified_custody_backup(relay)
+        let error = create_verified_custody_backup(relay, "backup-command-2".into())
             .await
             .expect_err("memory storage cannot create operator backup");
 

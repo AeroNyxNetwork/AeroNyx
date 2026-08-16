@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.9.0-VerifiedCustodyBackup
+// Version: 3.0.0-IdempotentCustodyBackup
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -49,6 +49,8 @@
 //   bounded startup quick-check cannot prove the custody file is intact.
 //   v2.9.0-VerifiedCustodyBackup — Added a private, transactionally consistent
 //   SQLite backup artifact with pre-publication physical and logical checks.
+//   v3.0.0-IdempotentCustodyBackup — Bound audited backup commands to a stable,
+//   node-secret HMAC artifact key so restart replay reuses one verified image.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -73,6 +75,7 @@
 //   - Private custody file: Unix database/WAL material is owner-only
 //   - Startup physical integrity: corruption fails closed before migrations
 //   - Verified custody backup: WAL-aware, private, no-overwrite recovery image
+//   - Idempotent custody backup: restart-safe command replay without raw IDs
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -149,10 +152,16 @@
 //     must remain owner-only, validate physical integrity, usage counters and
 //     anonymous circuit safety state, then publish without replacing a prior
 //     artifact. Backup paths and raw SQLite findings are operator-private.
+//   - [CHAT-RELAY-BACKUP-IDEMPOTENCY 2026-08-16 by Codex] CMS command IDs are
+//     untrusted routing metadata. Derive operation artifact names with a
+//     domain-separated node-secret HMAC; never persist or expose the raw ID.
+//     Existing operation artifacts must be re-verified and reused, never
+//     overwritten, including after process restart or concurrent replay.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.0.0-IdempotentCustodyBackup — Restart-safe audited backup replay
 //   v2.9.0-VerifiedCustodyBackup — Atomic validated SQLite recovery artifact
 //   v2.8.0-StartupPhysicalIntegrity — Pre-migration SQLite quick-check gate
 //   v2.7.0-PrivateCustodyFile — Owner-only SQLite custody files on Unix
@@ -195,7 +204,7 @@ use parking_lot::{Mutex, RwLock};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{
     backup::{Backup, StepResult},
-    params, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -276,6 +285,10 @@ const CHAT_RELAY_BACKUP_PAGES_PER_STEP: i32 = 256;
 const CHAT_RELAY_BACKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Delay between bounded retries while another process holds a SQLite lock.
 const CHAT_RELAY_BACKUP_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// Maximum UTF-8 bytes accepted from one management-plane operation ID.
+const CHAT_RELAY_BACKUP_OPERATION_ID_MAX_BYTES: usize = 128;
+/// Domain separation for opaque, node-local backup operation artifact keys.
+const CHAT_RELAY_BACKUP_OPERATION_HMAC_DOMAIN: &[u8] = b"AeroNyx-RelayCustodyBackup-Operation-v1";
 /// Small tolerated wall-clock adjustment before restart recovery fails closed.
 const DIRECT_PEER_RELAY_CIRCUIT_CLOCK_SKEW_SECS: u64 = 5;
 
@@ -1599,6 +1612,19 @@ pub struct ExpiredNotification {
     pub message_ids_raw: Vec<u8>,
 }
 
+/// Aggregate result of one audited, idempotent custody backup operation.
+///
+/// [CHAT-RELAY-BACKUP-IDEMPOTENCY 2026-08-16 by Codex] This intentionally
+/// excludes the filesystem path and opaque artifact key. Management callers
+/// may report only whether a verified image was created or reused and its size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChatRelayBackupReceipt {
+    /// Size of the verified SQLite recovery image.
+    pub(crate) size_bytes: u64,
+    /// `true` only when this invocation published the artifact.
+    pub(crate) created: bool,
+}
+
 impl ExpiredNotification {
     /// Deserialise the stored message IDs.
     pub fn message_ids(&self) -> ChatRelayResult<Vec<[u8; 16]>> {
@@ -1830,12 +1856,18 @@ impl ChatRelayService {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // The active database parent already exists. A single-level,
                 // owner-private create avoids a world-readable umask window.
-                Self::create_backup_directory(path).map_err(|_| {
-                    Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_CANTOPEN,
-                        "unable to create private relay backup directory",
-                    )
-                })?;
+                // A concurrent backup may win this create; re-inspection below
+                // is the authority for an AlreadyExists race.
+                match Self::create_backup_directory(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => {
+                        return Err(Self::backup_io_error(
+                            rusqlite::ffi::SQLITE_CANTOPEN,
+                            "unable to create private relay backup directory",
+                        ));
+                    }
+                }
             }
             Err(_) => {
                 return Err(Self::backup_io_error(
@@ -1857,6 +1889,245 @@ impl ChatRelayService {
             ));
         }
         Self::restrict_backup_directory_permissions(path)
+    }
+
+    fn private_backup_directory(&self) -> ChatRelayResult<PathBuf> {
+        if self.config.db_path == ":memory:" {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "in-memory relay storage has no private backup boundary",
+            ));
+        }
+        let source_path = Path::new(&self.config.db_path);
+        let source_parent = source_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let backup_directory = source_parent.join(".aeronyx-relay-backups");
+        Self::ensure_private_backup_directory(&backup_directory)?;
+        Ok(backup_directory)
+    }
+
+    fn verify_existing_backup_artifact(path: &Path) -> ChatRelayResult<u64> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "unable to inspect existing relay backup artifact",
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "existing relay backup artifact is not a private regular file",
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_PERM,
+                    "existing relay backup artifact is not owner-private",
+                ));
+            }
+        }
+
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            match std::fs::symlink_metadata(PathBuf::from(sidecar)) {
+                Ok(_) => {
+                    return Err(Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_CORRUPT,
+                        "existing relay backup artifact has mutable sidecar state",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_CANTOPEN,
+                        "unable to inspect existing relay backup sidecar state",
+                    ));
+                }
+            }
+        }
+
+        // Resolve only the already-verified private directory. macOS temp paths
+        // commonly contain a system-managed ancestor symlink (`/var`), while
+        // SQLite NOFOLLOW rejects any symlink component. Keeping the filename
+        // separate preserves the final-component race defense.
+        let parent = path.parent().ok_or_else(|| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "existing relay backup artifact has no private parent",
+            )
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "existing relay backup artifact has no private name",
+            )
+        })?;
+        let canonical_parent = std::fs::canonicalize(parent).map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "unable to resolve private relay backup directory",
+            )
+        })?;
+        let nofollow_path = canonical_parent.join(file_name);
+
+        // NOFOLLOW closes the final-component symlink race between metadata
+        // inspection and SQLite open. Read-only verification must never create
+        // journal/WAL sidecars next to an immutable recovery image.
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let backup_conn = Connection::open_with_flags(&nofollow_path, flags).map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "unable to open existing relay backup artifact",
+            )
+        })?;
+        Self::verify_sqlite_backup(&backup_conn)?;
+        drop(backup_conn);
+
+        let verified_metadata = std::fs::symlink_metadata(&nofollow_path).map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_IOERR,
+                "verified relay backup artifact became unavailable",
+            )
+        })?;
+        if verified_metadata.file_type().is_symlink()
+            || !verified_metadata.is_file()
+            || verified_metadata.len() != metadata.len()
+        {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CORRUPT,
+                "verified relay backup artifact changed during inspection",
+            ));
+        }
+
+        // In a concurrent hard-link publication, this verifier may run before
+        // the creator reaches its directory fsync. Syncing here makes either
+        // successful receipt sufficient to durably publish the shared name.
+        Self::sync_backup_parent(&canonical_parent)?;
+        Ok(verified_metadata.len())
+    }
+
+    fn create_verified_backup_artifact(
+        &self,
+        backup_directory: &Path,
+        destination: &Path,
+        reuse_existing: bool,
+    ) -> ChatRelayResult<ChatRelayBackupReceipt> {
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) if reuse_existing => {
+                return Ok(ChatRelayBackupReceipt {
+                    size_bytes: Self::verify_existing_backup_artifact(destination)?,
+                    created: false,
+                });
+            }
+            Ok(_) => {
+                return Err(Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CONSTRAINT,
+                    "relay backup destination already exists",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CANTOPEN,
+                    "unable to inspect relay backup destination",
+                ));
+            }
+        }
+
+        let temporary_nonce = rand::random::<u64>();
+        let temporary = backup_directory.join(format!(
+            ".relay-custody-{}-{temporary_nonce:016x}.tmp",
+            now_secs()
+        ));
+        Self::reserve_private_backup_file(&temporary)?;
+
+        let mut destination_published = false;
+        let outcome = (|| {
+            let mut backup_conn = Connection::open(&temporary).map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CANTOPEN,
+                    "unable to open private relay backup file",
+                )
+            })?;
+            Self::restrict_sqlite_file_permissions(&temporary)?;
+            {
+                let source = self.conn.lock();
+                Self::copy_sqlite_backup(&source, &mut backup_conn)?;
+            }
+            Self::normalize_sqlite_backup_journal(&backup_conn)?;
+            Self::verify_sqlite_backup(&backup_conn)?;
+            drop(backup_conn);
+
+            Self::restrict_sqlite_file_permissions(&temporary)?;
+            std::fs::File::open(&temporary)
+                .and_then(|file| file.sync_all())
+                .map_err(|_| {
+                    Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_IOERR,
+                        "unable to synchronize relay backup file",
+                    )
+                })?;
+
+            match std::fs::hard_link(&temporary, destination) {
+                Ok(()) => destination_published = true,
+                Err(error)
+                    if reuse_existing && error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    Self::remove_sqlite_artifact(&temporary);
+                    return Ok(ChatRelayBackupReceipt {
+                        size_bytes: Self::verify_existing_backup_artifact(destination)?,
+                        created: false,
+                    });
+                }
+                Err(_) => {
+                    return Err(Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_CONSTRAINT,
+                        "unable to publish relay backup without replacement",
+                    ));
+                }
+            }
+
+            Self::restrict_sqlite_file_permissions(destination)?;
+            std::fs::remove_file(&temporary).map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_IOERR,
+                    "unable to finalize relay backup publication",
+                )
+            })?;
+            Self::sync_backup_parent(backup_directory)?;
+            let metadata = std::fs::symlink_metadata(destination).map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_IOERR,
+                    "unable to inspect published relay backup artifact",
+                )
+            })?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                return Err(Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CORRUPT,
+                    "published relay backup artifact is invalid",
+                ));
+            }
+            Ok(ChatRelayBackupReceipt {
+                size_bytes: metadata.len(),
+                created: true,
+            })
+        })();
+
+        Self::remove_sqlite_artifact(&temporary);
+        if outcome.is_err() && destination_published {
+            // Never remove a destination created by another replay. Ownership
+            // begins only after this invocation's hard-link publication.
+            Self::remove_sqlite_artifact(destination);
+        }
+        outcome
     }
 
     fn remove_sqlite_artifact(path: &Path) {
@@ -1974,6 +2245,27 @@ impl ChatRelayService {
                 field: "sqlite_backup_logical_integrity",
             }
         })
+    }
+
+    fn normalize_sqlite_backup_journal(conn: &Connection) -> ChatRelayResult<()> {
+        // [CHAT-RELAY-BACKUP-IDEMPOTENCY 2026-08-16 by Codex] SQLite may copy
+        // the source WAL mode into the isolated image. A later read-only open
+        // can then create `-wal`/`-shm`, violating immutable artifact replay.
+        // Normalize only the offline copy; restored service startup explicitly
+        // re-enables WAL + FULL before accepting custody.
+        let journal_mode = conn
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|_| ChatRelayError::CorruptStoredData {
+                field: "sqlite_backup_journal_mode",
+            })?;
+        if !journal_mode.eq_ignore_ascii_case("delete") {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "sqlite_backup_journal_mode",
+            });
+        }
+        Ok(())
     }
 
     /// Creates a new `ChatRelayService`, opening (or creating) the SQLite database.
@@ -4533,78 +4825,56 @@ impl ChatRelayService {
     /// in-memory database, the private backup area cannot be secured, the
     /// source remains locked, validation fails, or durable publication fails.
     pub fn create_verified_backup(&self) -> ChatRelayResult<PathBuf> {
-        if self.config.db_path == ":memory:" {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "in-memory relay storage has no private backup boundary",
-            ));
-        }
-        let source_path = Path::new(&self.config.db_path);
-        let source_parent = source_path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let backup_directory = source_parent.join(".aeronyx-relay-backups");
-        Self::ensure_private_backup_directory(&backup_directory)?;
-
+        let backup_directory = self.private_backup_directory()?;
         let created_at = now_secs();
         let nonce = rand::random::<u64>();
         let destination =
             backup_directory.join(format!("relay-custody-{created_at}-{nonce:016x}.sqlite"));
-        let temporary =
-            backup_directory.join(format!(".relay-custody-{created_at}-{nonce:016x}.tmp"));
-        Self::reserve_private_backup_file(&temporary)?;
+        self.create_verified_backup_artifact(&backup_directory, &destination, false)?;
+        Ok(destination)
+    }
 
-        let mut destination_published = false;
-        let outcome = (|| {
-            let mut backup_conn = Connection::open(&temporary).map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CANTOPEN,
-                    "unable to open private relay backup file",
-                )
-            })?;
-            Self::restrict_sqlite_file_permissions(&temporary)?;
-            {
-                let source = self.conn.lock();
-                Self::copy_sqlite_backup(&source, &mut backup_conn)?;
-            }
-            Self::verify_sqlite_backup(&backup_conn)?;
-            drop(backup_conn);
-
-            Self::restrict_sqlite_file_permissions(&temporary)?;
-            std::fs::File::open(&temporary)
-                .and_then(|file| file.sync_all())
-                .map_err(|_| {
-                    Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_IOERR,
-                        "unable to synchronize relay backup file",
-                    )
-                })?;
-            std::fs::hard_link(&temporary, &destination).map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CONSTRAINT,
-                    "unable to publish relay backup without replacement",
-                )
-            })?;
-            destination_published = true;
-            Self::restrict_sqlite_file_permissions(&destination)?;
-            std::fs::remove_file(&temporary).map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to finalize relay backup publication",
-                )
-            })?;
-            Self::sync_backup_parent(&backup_directory)?;
-            Ok(destination.clone())
-        })();
-
-        Self::remove_sqlite_artifact(&temporary);
-        if outcome.is_err() && destination_published {
-            // Never remove a name that `hard_link` reported as pre-existing:
-            // this invocation owns the destination only after publication.
-            Self::remove_sqlite_artifact(&destination);
+    /// Creates or reuses one verified backup for an audited operation ID.
+    ///
+    /// The raw ID is never persisted. A domain-separated HMAC under the stable
+    /// node secret selects one private destination, so CMS replay after ACK
+    /// loss or process restart cannot create a second recovery image. An
+    /// existing artifact is opened read-only with `NOFOLLOW` and fully verified
+    /// before it is accepted. Corrupt or non-private artifacts fail closed.
+    ///
+    /// [CHAT-RELAY-BACKUP-IDEMPOTENCY 2026-08-16 by Codex] This method returns
+    /// aggregate receipt data only; callers cannot learn the artifact key or
+    /// path. It is synchronous and must run through `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free storage error when the operation ID is empty or too
+    /// large, the private boundary is unavailable, snapshot certification or
+    /// publication fails, or a replay artifact cannot be re-verified.
+    pub(crate) fn create_verified_backup_for_operation(
+        &self,
+        operation_id: &str,
+    ) -> ChatRelayResult<ChatRelayBackupReceipt> {
+        if operation_id.is_empty() || operation_id.len() > CHAT_RELAY_BACKUP_OPERATION_ID_MAX_BYTES
+        {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_MISUSE,
+                "invalid relay backup operation identifier",
+            ));
         }
-        outcome
+
+        let mut mac =
+            HmacSha256::new_from_slice(&self.node_secret).expect("HMAC accepts any key length");
+        mac.update(CHAT_RELAY_BACKUP_OPERATION_HMAC_DOMAIN);
+        mac.update(&(operation_id.len() as u64).to_be_bytes());
+        mac.update(operation_id.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        let opaque_key = hex::encode(&digest[..16]);
+
+        let backup_directory = self.private_backup_directory()?;
+        let destination =
+            backup_directory.join(format!("relay-custody-operation-{opaque_key}.sqlite"));
+        self.create_verified_backup_artifact(&backup_directory, &destination, true)
     }
 }
 
@@ -5049,6 +5319,161 @@ mod tests {
         assert!(error
             .to_string()
             .contains("in-memory relay storage has no private backup boundary"));
+    }
+
+    #[test]
+    fn audited_backup_replay_reuses_one_verified_artifact_across_restart() {
+        // [CHAT-RELAY-BACKUP-IDEMPOTENCY 2026-08-16 by Codex] The durable
+        // artifact key depends only on the stable node secret and opaque
+        // operation ID. Process-local command deduplication is not involved.
+        let directory = tempfile::tempdir().expect("idempotent backup directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let secret = [0x91u8; 32];
+
+        let source = ChatRelayService::new(config.clone(), secret).expect("create relay store");
+        let first = source
+            .create_verified_backup_for_operation("cms-command-42")
+            .expect("create audited backup");
+        assert!(first.created);
+        assert!(first.size_bytes > 0);
+        drop(source);
+
+        let restarted = ChatRelayService::new(config, secret).expect("restart relay store");
+        let replay = restarted
+            .create_verified_backup_for_operation("cms-command-42")
+            .expect("reuse verified backup after restart");
+        assert!(!replay.created);
+        assert_eq!(replay.size_bytes, first.size_bytes);
+
+        let second = restarted
+            .create_verified_backup_for_operation("cms-command-43")
+            .expect("different operation creates a distinct backup");
+        assert!(second.created);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join(".aeronyx-relay-backups"))
+                .expect("inspect operation artifacts")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_audited_backup_replay_publishes_exactly_once() {
+        let directory = tempfile::tempdir().expect("concurrent backup directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let source = Arc::new(
+            ChatRelayService::new(config, [0x93u8; 32]).expect("create concurrent relay store"),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let source = Arc::clone(&source);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    source
+                        .create_verified_backup_for_operation("cms-command-concurrent")
+                        .expect("complete concurrent audited backup")
+                })
+            })
+            .collect();
+        barrier.wait();
+        let receipts: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("join backup worker"))
+            .collect();
+
+        assert_eq!(receipts.iter().filter(|receipt| receipt.created).count(), 1);
+        assert_eq!(receipts[0].size_bytes, receipts[1].size_bytes);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join(".aeronyx-relay-backups"))
+                .expect("inspect concurrent operation artifacts")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn audited_backup_replay_rejects_corrupt_existing_artifact_without_overwrite() {
+        let directory = tempfile::tempdir().expect("corrupt replay directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let source = ChatRelayService::new(config, [0x92u8; 32]).expect("create relay store");
+        source
+            .create_verified_backup_for_operation("cms-command-corrupt")
+            .expect("create audited backup");
+        let backup_directory = directory.path().join(".aeronyx-relay-backups");
+        let artifact = std::fs::read_dir(&backup_directory)
+            .expect("read audited backup directory")
+            .next()
+            .expect("one audited backup")
+            .expect("valid directory entry")
+            .path();
+        std::fs::write(&artifact, b"corrupt-replay-fixture").expect("corrupt backup fixture");
+
+        let error = source
+            .create_verified_backup_for_operation("cms-command-corrupt")
+            .expect_err("corrupt replay artifact must fail closed");
+        assert_eq!(error.reason_bucket(), "corrupt_stored_data");
+        assert_eq!(
+            std::fs::read(&artifact).expect("read preserved corrupt artifact"),
+            b"corrupt-replay-fixture"
+        );
+        assert_eq!(
+            std::fs::read_dir(&backup_directory)
+                .expect("inspect preserved backup directory")
+                .count(),
+            1,
+            "replay must not replace or duplicate a corrupt artifact"
+        );
+    }
+
+    #[test]
+    fn audited_backup_replay_rejects_mutable_sidecar_state() {
+        let directory = tempfile::tempdir().expect("sidecar replay directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let source = ChatRelayService::new(config, [0x94u8; 32]).expect("create relay store");
+        source
+            .create_verified_backup_for_operation("cms-command-sidecar")
+            .expect("create audited backup");
+        let backup_directory = directory.path().join(".aeronyx-relay-backups");
+        let artifact = std::fs::read_dir(&backup_directory)
+            .expect("read audited backup directory")
+            .next()
+            .expect("one audited backup")
+            .expect("valid directory entry")
+            .path();
+        let mut wal_path = artifact.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        std::fs::write(PathBuf::from(wal_path), b"mutable-sidecar-fixture")
+            .expect("install mutable sidecar fixture");
+
+        let error = source
+            .create_verified_backup_for_operation("cms-command-sidecar")
+            .expect_err("mutable sidecar state must fail closed");
+        assert_eq!(error.reason_bucket(), "sqlite_error");
+        assert!(error.to_string().contains("mutable sidecar state"));
+    }
+
+    #[test]
+    fn audited_backup_rejects_unbounded_operation_ids_before_storage_access() {
+        let source = make_service();
+        for operation_id in ["".to_string(), "x".repeat(129)] {
+            let error = source
+                .create_verified_backup_for_operation(&operation_id)
+                .expect_err("invalid operation ID must fail closed");
+            assert_eq!(error.reason_bucket(), "sqlite_error");
+            if !operation_id.is_empty() {
+                assert!(!error.to_string().contains(&operation_id));
+            }
+        }
     }
 
     #[cfg(unix)]
