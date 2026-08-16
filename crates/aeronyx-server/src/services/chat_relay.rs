@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.7.0-PrivateCustodyFile
+// Version: 2.8.0-StartupPhysicalIntegrity
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -45,6 +45,8 @@
 //   durability mode so operators can audit custody readiness.
 //   v2.7.0-PrivateCustodyFile — Restricts the SQLite custody database and its
 //   WAL sidecars to the node service account on Unix hosts.
+//   v2.8.0-StartupPhysicalIntegrity — Rejects relay activation when SQLite's
+//   bounded startup quick-check cannot prove the custody file is intact.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -67,6 +69,7 @@
 //   - Power-loss durability: WAL + FULL is verified before relay activation
 //   - Custody durability status: anonymous verified mode in relay health
 //   - Private custody file: Unix database/WAL material is owner-only
+//   - Startup physical integrity: corruption fails closed before migrations
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -77,10 +80,11 @@
 //   ChatRelayService::new():
 //     1. Open/create SQLite database
 //     2. Restrict the durable file to the node account on Unix
-//     3. Set and verify WAL + FULL pragmas
-//     4. init_schema() creates tables if missing
-//     5. Initialise MessageDedup (online-path LRU)
-//     6. Initialise WalletRouteCache (in-memory, empty on startup)
+//     3. Verify bounded SQLite physical integrity without exposing findings
+//     4. Set and verify WAL + FULL pragmas
+//     5. init_schema() creates tables if missing
+//     6. Initialise MessageDedup (online-path LRU)
+//     7. Initialise WalletRouteCache (in-memory, empty on startup)
 //
 // ⚠️ Important Notes for Next Developer:
 //   - wallet_routes is Arc<WalletRouteCache> so server.rs can hold a separate
@@ -134,10 +138,14 @@
 //   - [CHAT-RELAY-PRIVATE-FILE 2026-08-16 by Codex] Restrict the primary DB
 //     before enabling WAL so SQLite derives owner-only permissions for `-wal`
 //     and `-shm`. Permission failures reject activation without logging paths.
+//   - [CHAT-RELAY-STARTUP-QUICK-CHECK 2026-08-16 by Codex] Run the physical
+//     integrity gate before WAL changes and schema migrations. Never log raw
+//     SQLite findings; they may disclose schema and storage-layout details.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.8.0-StartupPhysicalIntegrity — Pre-migration SQLite quick-check gate
 //   v2.7.0-PrivateCustodyFile — Owner-only SQLite custody files on Unix
 //   v2.6.0-CustodyDurabilityStatus — Aggregate verified durability evidence
 //   v2.5.0-PowerLossDurability — Verified FULL durability for custody writes
@@ -1683,6 +1691,23 @@ impl ChatRelayService {
         Ok(())
     }
 
+    fn verify_sqlite_startup_integrity(conn: &Connection) -> ChatRelayResult<()> {
+        // [CHAT-RELAY-STARTUP-QUICK-CHECK 2026-08-16 by Codex] `quick_check(1)`
+        // bounds returned findings while still traversing the database. Both a
+        // non-`ok` finding and an SQLite error collapse to one path-free bucket.
+        let outcome = conn
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+            .map_err(|_| ChatRelayError::CorruptStoredData {
+                field: "sqlite_startup_integrity",
+            })?;
+        if outcome != "ok" {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "sqlite_startup_integrity",
+            });
+        }
+        Ok(())
+    }
+
     fn configure_sqlite_durability(conn: &Connection) -> ChatRelayResult<u8> {
         // [CHAT-RELAY-FULL-DURABILITY 2026-08-16 by Codex] NORMAL protects
         // SQLite consistency across process failure but may lose a recently
@@ -1720,6 +1745,7 @@ impl ChatRelayService {
         // A short bounded wait absorbs transient locks from an operator backup
         // or diagnostic reader without allowing relay requests to hang forever.
         conn.busy_timeout(Duration::from_secs(5))?;
+        Self::verify_sqlite_startup_integrity(&conn)?;
         let synchronous_level = Self::configure_sqlite_durability(&conn)?;
 
         let dedup_capacity = config.dedup_lru_capacity;
@@ -4427,6 +4453,43 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("unable to restrict relay database permissions"));
         assert!(!rendered.contains(db_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn chat_relay_startup_integrity_rejects_corrupt_schema_before_activation() {
+        // [CHAT-RELAY-STARTUP-QUICK-CHECK 2026-08-16 by Codex] Build a valid
+        // production-shaped store, corrupt one schema root page through
+        // SQLite's test-only writable schema, then exercise a real restart.
+        let db_path = unique_test_db_path("startup-integrity-corrupt-schema");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = derive_node_secret(&[0x42u8; 32]);
+
+        let service = ChatRelayService::new(config.clone(), secret).expect("create relay store");
+        drop(service);
+
+        let corruptor = Connection::open(&db_path).expect("open relay store for corruption drill");
+        corruptor
+            .execute_batch(
+                "PRAGMA writable_schema=ON;
+                 UPDATE sqlite_schema
+                 SET rootpage=2147483647
+                 WHERE type='table' AND name='pending_messages';
+                 PRAGMA writable_schema=OFF;",
+            )
+            .expect("install malformed root page fixture");
+        drop(corruptor);
+
+        let error = match ChatRelayService::new(config, secret) {
+            Ok(_) => panic!("corrupt custody database must not activate"),
+            Err(error) => error,
+        };
+        assert_eq!(error.reason_bucket(), "corrupt_stored_data");
+        let rendered = error.to_string();
+        assert!(rendered.contains("sqlite_startup_integrity"));
+        assert!(!rendered.contains(db_path.to_string_lossy().as_ref()));
+
+        remove_test_db(&db_path);
     }
 
     #[test]

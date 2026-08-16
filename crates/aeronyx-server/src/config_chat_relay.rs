@@ -19,6 +19,8 @@
 //! ceiling behind direct peer-relay v2 signature verification.
 //! v1.6.0-DurableCustody — Documented the non-configurable FULL SQLite
 //! durability boundary required by signed custody acknowledgements.
+//! v1.7.0-StartupCustodyIntegrity — Documented owner-only Unix storage and the
+//! pre-migration SQLite physical-integrity activation gate.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -65,6 +67,10 @@
 //!   verifies SQLite FULL-or-stronger durability before activation. Do not add
 //!   a NORMAL/OFF operator override while the protocol issues signed custody
 //!   acknowledgements from successful durable writes.
+//! - [CHAT-RELAY-STARTUP-QUICK-CHECK 2026-08-16 by Codex] The service restricts
+//!   Unix custody files to the node account and runs a bounded SQLite physical
+//!   integrity check before WAL changes or migrations. Failure disables relay;
+//!   raw findings and configured paths must not enter logs or public health.
 //! - `expired_notification_ttl_secs`: after this TTL, undelivered expiry
 //!   notifications are silently discarded. Flutter client local timeout is
 //!   the fallback.
@@ -73,6 +79,7 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.7.0-StartupCustodyIntegrity — Fail-closed physical storage activation.
 //! v1.6.0-DurableCustody — Declared FULL durability a custody invariant.
 //! v1.5.0-AuthenticatedPeerFairness — Added configurable post-signature
 //! per-node admission for direct peer-relay v2.
@@ -131,7 +138,9 @@ pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
 /// the main MemChain database. This ensures chat relay failures cannot
 /// corrupt MemChain state and simplifies backup/purge. The service enforces
 /// WAL + FULL durability before it can acknowledge encrypted custody; this is
-/// intentionally not an operator-tunable downgrade.
+/// intentionally not an operator-tunable downgrade. On Unix, the database and
+/// WAL sidecars are owner-only; startup physical-integrity failure rejects
+/// activation before migrations or custody receipts.
 ///
 /// ## Configuration Example
 /// ```toml
@@ -155,6 +164,7 @@ pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
 /// ```
 ///
 /// ## Last Modified
+/// v1.7.0-StartupCustodyIntegrity — Owner-only files and startup quick-check.
 /// v1.2.0-GlobalStorageQuotas — Added node-wide durable queue ceilings.
 /// v1.1.0-ChatRelay — Initial implementation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,7 +208,9 @@ pub struct ChatRelayConfig {
     /// Path to the SQLite database file for chat relay storage.
     ///
     /// Stores `pending_messages`, `pending_blobs`, and
-    /// `expired_notifications` tables.
+    /// `expired_notifications` tables. Unix deployments restrict this file
+    /// and SQLite sidecars to the node account and fail closed when startup
+    /// physical-integrity verification does not return `ok`.
     ///
     /// ⚠️ Not linked to `saas.data_root` — must be updated independently.
     /// Default: `"data/chat_pending.db"`.
