@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.3.0-DurableDirectRelayCircuit
+// Version: 2.4.0-DurableSchemaSentinel
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -37,6 +37,8 @@
 //   breaker for target-bound direct relay delivery.
 //   v2.3.0-DurableDirectRelayCircuit — Persisted the anonymous circuit safety
 //   state so process restarts cannot silently bypass an active outage gate.
+//   v2.4.0-DurableSchemaSentinel — Added an atomic installation marker so a
+//   deleted circuit checkpoint table cannot be mistaken for a first upgrade.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -55,6 +57,7 @@
 //   - Direct retry SLO: five fixed minute buckets, no event log or timer task
 //   - Direct relay circuit: bounded open/half-open recovery without downgrade
 //   - Durable circuit checkpoint: fixed-size anonymous restart protection
+//   - Durable schema sentinel: rejects post-install checkpoint table loss
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -109,10 +112,14 @@
 //     must open the in-memory circuit, deny new admission, and stop fanout.
 //     Runtime transitions lock circuit -> SQLite; never acquire the circuit
 //     while holding `conn`.
+//   - [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] The fixed feature
+//     marker and checkpoint singleton are one atomic migration. Once installed,
+//     a missing checkpoint table is corruption and must never reset to closed.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.4.0-DurableSchemaSentinel — Fail-closed checkpoint installation marker
 //   v2.3.0-DurableDirectRelayCircuit — Anonymous restart-safe circuit checkpoint
 //   v2.2.0-DirectRelayCircuit — Generation-safe fail-closed delivery circuit
 //   v2.1.0-DirectRetrySlo — Fixed-memory five-minute delivery health window
@@ -216,6 +223,8 @@ const DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS: u64 = 15;
 const DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES: u8 = 2;
 /// Durable singleton format for source-blind direct relay circuit state.
 const DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION: i64 = 1;
+/// Fixed schema marker proving the durable circuit checkpoint was installed.
+const DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE: &str = "direct_peer_relay_circuit_checkpoint";
 /// Small tolerated wall-clock adjustment before restart recovery fails closed.
 const DIRECT_PEER_RELAY_CIRCUIT_CLOCK_SKEW_SECS: u64 = 5;
 
@@ -1673,6 +1682,12 @@ impl ChatRelayService {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(
             "
+            CREATE TABLE IF NOT EXISTS relay_schema_features (
+                feature        TEXT    PRIMARY KEY,
+                schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+                installed_at   INTEGER NOT NULL CHECK(installed_at >= 0)
+            );
+
             CREATE TABLE IF NOT EXISTS relay_direct_peer_circuit_checkpoint (
                 singleton                     INTEGER PRIMARY KEY CHECK(singleton = 1),
                 schema_version                INTEGER NOT NULL CHECK(schema_version > 0),
@@ -1692,6 +1707,28 @@ impl ChatRelayService {
             );
             ",
         )?;
+        let installed_version = tx
+            .query_row(
+                "SELECT schema_version FROM relay_schema_features WHERE feature = ?1",
+                params![DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if installed_version
+            .is_some_and(|version| version != DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION)
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "direct_peer_circuit_checkpoint_installation_version",
+            });
+        }
+        if !table_existed && installed_version.is_some() {
+            // [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] CREATE TABLE
+            // above is transactional. Returning here rolls it back instead of
+            // manufacturing a closed checkpoint after an installed table loss.
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "direct_peer_circuit_checkpoint_table",
+            });
+        }
         if table_existed {
             let row_count = tx.query_row(
                 "SELECT COUNT(*) FROM relay_direct_peer_circuit_checkpoint",
@@ -1719,6 +1756,21 @@ impl ChatRelayService {
         {
             return Err(ChatRelayError::CorruptStoredData {
                 field: "direct_peer_circuit_checkpoint_singleton",
+            });
+        }
+        if installed_version.is_none()
+            && tx.execute(
+                "INSERT INTO relay_schema_features (feature, schema_version, installed_at)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE,
+                    DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION,
+                    sqlite_integer(now, "direct_peer_circuit_schema_installed_at")?
+                ],
+            )? != 1
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "direct_peer_circuit_checkpoint_installation_marker",
             });
         }
         tx.commit()?;
@@ -4769,6 +4821,69 @@ mod tests {
                 field: "direct_peer_circuit_checkpoint_singleton"
             })
         ));
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn direct_peer_circuit_missing_checkpoint_table_rejects_installed_schema() {
+        // [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] The installation
+        // marker distinguishes destructive table loss from a first upgrade.
+        // Restart must not manufacture a closed checkpoint after that loss.
+        let path = unique_test_db_path("direct-circuit-missing-table");
+        let mut config = test_config();
+        config.db_path = path.to_string_lossy().into_owned();
+        let secret = derive_node_secret(&[0x78; 32]);
+        {
+            let svc = ChatRelayService::new(config.clone(), secret).expect("create relay");
+            svc.conn
+                .lock()
+                .execute("DROP TABLE relay_direct_peer_circuit_checkpoint", [])
+                .expect("remove installed checkpoint table");
+        }
+        assert!(matches!(
+            ChatRelayService::new(config, secret),
+            Err(ChatRelayError::CorruptStoredData {
+                field: "direct_peer_circuit_checkpoint_table"
+            })
+        ));
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn direct_peer_circuit_existing_checkpoint_installs_missing_schema_sentinel() {
+        // [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] Deployed v2.3
+        // databases already have a validated checkpoint but no feature marker.
+        // Their first v2.4 startup installs the marker in the same transaction.
+        let path = unique_test_db_path("direct-circuit-marker-upgrade");
+        let mut config = test_config();
+        config.db_path = path.to_string_lossy().into_owned();
+        let secret = derive_node_secret(&[0x79; 32]);
+        {
+            let svc = ChatRelayService::new(config.clone(), secret).expect("create relay");
+            svc.conn
+                .lock()
+                .execute(
+                    "DELETE FROM relay_schema_features WHERE feature = ?1",
+                    params![DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE],
+                )
+                .expect("simulate pre-sentinel database");
+        }
+        {
+            let svc = ChatRelayService::new(config, secret).expect("upgrade existing relay");
+            let installed_version = svc
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT schema_version FROM relay_schema_features WHERE feature = ?1",
+                    params![DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read installed schema sentinel");
+            assert_eq!(
+                installed_version,
+                DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION
+            );
+        }
         remove_test_db(&path);
     }
 

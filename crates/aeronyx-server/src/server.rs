@@ -370,6 +370,9 @@
 // 139. [DIRECT-RELAY-RETRY-TELEMETRY 2026-08-15 by Codex] Publishes only
 //      aggregate direct-relay retry recovery, exhaustion, and deterministic
 //      failure evidence through the existing relay health contract.
+// 140. [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] Proves in a fresh
+//      process that post-install checkpoint table loss rejects Chat Relay
+//      activation instead of resetting the outage circuit to closed.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -537,8 +540,14 @@
 //     opens a source-blind circuit. While cooling, direct fallback fails closed
 //     into local pending storage and must never downgrade to v2/v1. Half-open
 //     recovery admits one generation-bound v3 delivery at a time.
+//   - [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] The anonymous schema
+//     marker is part of relay startup integrity. If it proves prior checkpoint
+//     installation but the checkpoint table is absent, startup must fail.
 //
 // Last Modified:
+//   [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] Added a two-process
+//     crash drill proving destructive checkpoint table loss cannot reactivate
+//     direct relay with an invented closed circuit.
 //   [DIRECT-RELAY-HALF-OPEN-PROGRESS 2026-08-15 by Codex] Added a
 //     three-process drill proving one committed half-open success survives a
 //     crash, requires one new serial probe, and durably closes the circuit.
@@ -14251,15 +14260,20 @@ mod tests {
         )
     }
 
+    fn test_chat_relay_config(db_path: &std::path::Path) -> ChatRelayConfig {
+        let mut config = ChatRelayConfig::default();
+        config.enabled = true;
+        config.db_path = db_path.to_string_lossy().into_owned();
+        config
+    }
+
     fn test_chat_relay_service(
         db_path: &std::path::Path,
         node_secret: [u8; 32],
     ) -> Arc<ChatRelayService> {
-        let mut config = ChatRelayConfig::default();
-        config.enabled = true;
-        config.db_path = db_path.to_string_lossy().into_owned();
         Arc::new(
-            ChatRelayService::new(config, node_secret).expect("initialize test chat relay service"),
+            ChatRelayService::new(test_chat_relay_config(db_path), node_secret)
+                .expect("initialize test chat relay service"),
         )
     }
 
@@ -19065,6 +19079,34 @@ mod tests {
         assert_restart_drill_child_succeeded("closed circuit restart", &verified);
     }
 
+    #[tokio::test]
+    async fn missing_checkpoint_table_rejects_fresh_process_activation() {
+        // [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] The first child
+        // installs the checkpoint and sentinel, destroys only the checkpoint
+        // table, then exits abruptly. A new process must observe corruption
+        // before constructing any active ChatRelayService.
+        let directory = tempfile::tempdir().expect("checkpoint loss drill directory");
+        let db_path = directory.path().join("direct-relay-checkpoint-loss.sqlite3");
+
+        let crashed = run_direct_relay_restart_drill_child(
+            "seed_checkpoint_table_loss_crash",
+            &db_path,
+            None,
+            None,
+        )
+        .await;
+        assert_restart_drill_child_crashed(&crashed);
+
+        let rejected = run_direct_relay_restart_drill_child(
+            "verify_missing_checkpoint_table_restart",
+            &db_path,
+            None,
+            None,
+        )
+        .await;
+        assert_restart_drill_child_succeeded("missing checkpoint table restart", &rejected);
+    }
+
     fn open_direct_relay_restart_drill_circuit(
         relay: &ChatRelayService,
         first_failure_at: u64,
@@ -19161,6 +19203,36 @@ mod tests {
         // [DIRECT-RELAY-HALF-OPEN-PROGRESS 2026-08-15 by Codex] Terminate only
         // after the successful completion transition has reached SQLite.
         terminate_direct_relay_restart_drill_process();
+    }
+
+    fn seed_direct_relay_checkpoint_table_loss_crash(
+        relay: &ChatRelayService,
+        db_path: &std::path::Path,
+    ) -> ! {
+        let circuit = relay.peer_status().direct_peer_retry.circuit;
+        assert_eq!(circuit.state, "closed");
+        assert!(circuit.restart_protected);
+
+        let conn =
+            rusqlite::Connection::open(db_path).expect("open relay database for crash drill");
+        conn.execute("DROP TABLE relay_direct_peer_circuit_checkpoint", [])
+            .expect("remove installed checkpoint table before crash");
+        drop(conn);
+
+        // [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] Exit without
+        // destructors after SQLite commits the destructive schema change.
+        terminate_direct_relay_restart_drill_process();
+    }
+
+    fn verify_missing_checkpoint_table_restart(db_path: &std::path::Path) {
+        assert!(matches!(
+            ChatRelayService::new(test_chat_relay_config(db_path), [0x79; 32]),
+            Err(
+                crate::services::chat_relay::ChatRelayError::CorruptStoredData {
+                    field: "direct_peer_circuit_checkpoint_table"
+                }
+            )
+        ));
     }
 
     async fn verify_direct_relay_restart_drill(relay: &ChatRelayService) {
@@ -19329,10 +19401,17 @@ mod tests {
         let db_path = std::env::var_os(DIRECT_RELAY_RESTART_DRILL_DB_ENV)
             .map(std::path::PathBuf::from)
             .expect("restart drill database path");
+        if stage == "verify_missing_checkpoint_table_restart" {
+            verify_missing_checkpoint_table_restart(&db_path);
+            return;
+        }
         let relay = test_chat_relay_service(&db_path, [0x79; 32]);
 
         match stage.as_str() {
             "seed_crash" => seed_direct_relay_restart_drill_crash(relay.as_ref()),
+            "seed_checkpoint_table_loss_crash" => {
+                seed_direct_relay_checkpoint_table_loss_crash(relay.as_ref(), &db_path)
+            }
             "seed_half_open_crash" => seed_direct_relay_half_open_crash(relay.as_ref()),
             "seed_half_open_progress_crash" => {
                 seed_direct_relay_half_open_progress_crash(relay.as_ref())
