@@ -529,6 +529,10 @@ mod tests {
             expired_notification_ttl_secs: 604_800,
             peer_relay_requests_per_minute: 1_200,
             peer_relay_authenticated_requests_per_minute: 240,
+            // [CHAT-RELAY-BACKUP-RETENTION 2026-08-16 by Codex] This API
+            // fixture does not exercise local recovery retention; inherit its
+            // backward-compatible defaults as future config fields evolve.
+            ..ChatRelayConfig::default()
         }
     }
 

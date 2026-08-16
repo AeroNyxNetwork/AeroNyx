@@ -25,6 +25,8 @@
 //! recovery artifact boundary exposed by the relay service.
 //! v1.9.0-IdempotentCustodyBackup — Documented restart-safe audited command
 //! replay and immutable re-verification of existing recovery artifacts.
+//! v1.10.0-CustodyBackupRetention — Added bounded count/byte retention targets
+//! and the non-destructive audit command contract for private recovery images.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -82,8 +84,11 @@
 //!   operator command is HTTPS-only, confirmation-gated, audited, and runs via
 //!   `spawn_blocking`. Its command ID is HMAC-derived into a private artifact
 //!   key so retries across restart re-verify and reuse one immutable image.
-//!   Retention, restore, listing, and download remain local-only and are not
-//!   part of this command boundary.
+//! - [CHAT-RELAY-BACKUP-RETENTION 2026-08-16 by Codex] Verified recovery
+//!   images have count and aggregate-byte planning targets. The local service
+//!   audit verifies all images and reports excess capacity without deleting
+//!   it or publishing it over HTTP/CMS. Restore, prune, listing, and download
+//!   remain separate local operator concerns.
 //! - `expired_notification_ttl_secs`: after this TTL, undelivered expiry
 //!   notifications are silently discarded. Flutter client local timeout is
 //!   the fallback.
@@ -92,6 +97,7 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.10.0-CustodyBackupRetention — Bounded private backup retention.
 //! v1.9.0-IdempotentCustodyBackup — Restart-safe audited backup replay.
 //! v1.8.0-VerifiedCustodyBackup — Declared the private recovery boundary.
 //! v1.7.0-StartupCustodyIntegrity — Fail-closed physical storage activation.
@@ -130,6 +136,15 @@ pub const DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 1_200;
 /// parser-front limit remains mandatory because permissionless node identities
 /// can be rotated and therefore cannot provide Sybil resistance by themselves.
 pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
+
+/// Default planning target for verified relay-custody recovery-image count.
+pub const DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS: usize = 8;
+
+/// Default planning target for aggregate verified recovery-image bytes.
+pub const DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Defensive ceiling for the count planning target.
+pub const MAX_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS: usize = 64;
 
 // ============================================
 // ChatRelayConfig
@@ -178,9 +193,12 @@ pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
 /// expired_notification_ttl_secs = 604800  # 7 days
 /// peer_relay_requests_per_minute = 1200
 /// peer_relay_authenticated_requests_per_minute = 240
+/// custody_backup_retention_target_artifacts = 8
+/// custody_backup_retention_target_bytes = 8589934592  # 8 GiB
 /// ```
 ///
 /// ## Last Modified
+/// v1.10.0-CustodyBackupRetention — Bounded private recovery-image retention.
 /// v1.8.0-VerifiedCustodyBackup — Private WAL-aware recovery artifacts.
 /// v1.7.0-StartupCustodyIntegrity — Owner-only files and startup quick-check.
 /// v1.2.0-GlobalStorageQuotas — Added node-wide durable queue ceilings.
@@ -324,6 +342,26 @@ pub struct ChatRelayConfig {
     /// Default: 240.
     #[serde(default = "default_authenticated_peer_relay_requests_per_minute")]
     pub peer_relay_authenticated_requests_per_minute: u32,
+
+    /// Planning target for verified relay-custody recovery-image count.
+    ///
+    /// The audited retention inspection models an oldest-first policy. The
+    /// newest image is always counted as retained even when its size alone
+    /// exceeds the byte budget. The inspection never deletes files.
+    /// Default: 8; hard maximum: 64.
+    ///
+    /// [CHAT-RELAY-BACKUP-RETENTION 2026-08-16 by Codex] This field does not
+    /// delete or reject backups; it only defines the local audit comparison.
+    #[serde(default = "default_custody_backup_retention_target_artifacts")]
+    pub custody_backup_retention_target_artifacts: usize,
+
+    /// Planning target for aggregate verified recovery-image bytes.
+    ///
+    /// The newest verified image is always modeled as retained even when it
+    /// alone exceeds this planning target. Such a condition is reported as
+    /// `budget_exceeded`; no image is removed. Default: 8 GiB.
+    #[serde(default = "default_custody_backup_retention_target_bytes")]
+    pub custody_backup_retention_target_bytes: u64,
 }
 
 // ── Default functions ──
@@ -373,6 +411,12 @@ fn default_peer_relay_requests_per_minute() -> u32 {
 fn default_authenticated_peer_relay_requests_per_minute() -> u32 {
     DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
 }
+fn default_custody_backup_retention_target_artifacts() -> usize {
+    DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS
+}
+fn default_custody_backup_retention_target_bytes() -> u64 {
+    DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_BYTES
+}
 
 impl Default for ChatRelayConfig {
     fn default() -> Self {
@@ -394,6 +438,9 @@ impl Default for ChatRelayConfig {
             peer_relay_requests_per_minute: default_peer_relay_requests_per_minute(),
             peer_relay_authenticated_requests_per_minute:
                 default_authenticated_peer_relay_requests_per_minute(),
+            custody_backup_retention_target_artifacts:
+                default_custody_backup_retention_target_artifacts(),
+            custody_backup_retention_target_bytes: default_custody_backup_retention_target_bytes(),
         }
     }
 }
@@ -550,6 +597,23 @@ impl ChatRelayConfig {
             ));
         }
 
+        if self.custody_backup_retention_target_artifacts == 0
+            || self.custody_backup_retention_target_artifacts
+                > MAX_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS
+        {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.custody_backup_retention_target_artifacts",
+                format!("must be between 1 and {MAX_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS}"),
+            ));
+        }
+
+        if self.custody_backup_retention_target_bytes == 0 {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.custody_backup_retention_target_bytes",
+                "must be > 0",
+            ));
+        }
+
         Ok(())
     }
 }
@@ -592,6 +656,14 @@ mod tests {
             cr.peer_relay_authenticated_requests_per_minute,
             DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
         );
+        assert_eq!(
+            cr.custody_backup_retention_target_artifacts,
+            DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS
+        );
+        assert_eq!(
+            cr.custody_backup_retention_target_bytes,
+            DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_BYTES
+        );
     }
 
     #[test]
@@ -614,6 +686,8 @@ mod tests {
             expired_notification_ttl_secs: 0,
             peer_relay_requests_per_minute: 0,
             peer_relay_authenticated_requests_per_minute: 0,
+            custody_backup_retention_target_artifacts: 0,
+            custody_backup_retention_target_bytes: 0,
         };
         assert!(cr.validate().is_ok());
     }
@@ -812,6 +886,28 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_relay_backup_retention_bounds_rejected() {
+        // [CHAT-RELAY-BACKUP-RETENTION 2026-08-16 by Codex] Keep both the
+        // planning target sane; the service separately hard-bounds directory
+        // traversal so an operator value cannot weaken scan limits.
+        for target_artifacts in [0, MAX_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS + 1] {
+            let cr = ChatRelayConfig {
+                enabled: true,
+                custody_backup_retention_target_artifacts: target_artifacts,
+                ..Default::default()
+            };
+            assert!(cr.validate().is_err());
+        }
+
+        let cr = ChatRelayConfig {
+            enabled: true,
+            custody_backup_retention_target_bytes: 0,
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
+    }
+
+    #[test]
     fn test_chat_relay_toml_parsing() {
         // We can't call `toml::from_str::<ServerConfig>` here (circular dep),
         // but we can test raw TOML → ChatRelayConfig deserialization.
@@ -832,6 +928,8 @@ dedup_lru_capacity = 5000
 expired_notification_ttl_secs = 172800
 peer_relay_requests_per_minute = 2400
 peer_relay_authenticated_requests_per_minute = 480
+custody_backup_retention_target_artifacts = 4
+custody_backup_retention_target_bytes = 4294967296
 "#;
         let cr: ChatRelayConfig = toml::from_str(toml_str).unwrap();
         assert!(cr.enabled);
@@ -850,6 +948,8 @@ peer_relay_authenticated_requests_per_minute = 480
         assert_eq!(cr.expired_notification_ttl_secs, 172_800);
         assert_eq!(cr.peer_relay_requests_per_minute, 2_400);
         assert_eq!(cr.peer_relay_authenticated_requests_per_minute, 480);
+        assert_eq!(cr.custody_backup_retention_target_artifacts, 4);
+        assert_eq!(cr.custody_backup_retention_target_bytes, 4_294_967_296);
         assert!(cr.validate().is_ok());
     }
 
@@ -875,6 +975,14 @@ peer_relay_requests_per_minute = 1200
         assert_eq!(
             cr.peer_relay_authenticated_requests_per_minute,
             DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE
+        );
+        assert_eq!(
+            cr.custody_backup_retention_target_artifacts,
+            DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS
+        );
+        assert_eq!(
+            cr.custody_backup_retention_target_bytes,
+            DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_BYTES
         );
         assert!(cr.validate().is_ok());
     }
