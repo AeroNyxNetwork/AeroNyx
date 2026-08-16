@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.4.0-DurableSchemaSentinel
+// Version: 2.5.0-PowerLossDurability
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -39,6 +39,8 @@
 //   state so process restarts cannot silently bypass an active outage gate.
 //   v2.4.0-DurableSchemaSentinel — Added an atomic installation marker so a
 //   deleted circuit checkpoint table cannot be mistaken for a first upgrade.
+//   v2.5.0-PowerLossDurability — Requires SQLite FULL durability before the
+//   node may acknowledge encrypted custody or persist relay safety state.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -58,6 +60,7 @@
 //   - Direct relay circuit: bounded open/half-open recovery without downgrade
 //   - Durable circuit checkpoint: fixed-size anonymous restart protection
 //   - Durable schema sentinel: rejects post-install checkpoint table loss
+//   - Power-loss durability: WAL + FULL is verified before relay activation
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -115,10 +118,14 @@
 //   - [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] The fixed feature
 //     marker and checkpoint singleton are one atomic migration. Once installed,
 //     a missing checkpoint table is corruption and must never reset to closed.
+//   - [CHAT-RELAY-FULL-DURABILITY 2026-08-16 by Codex] Signed custody ACKs and
+//     direct-relay safety checkpoints share one SQLite connection. It must
+//     remain FULL-or-stronger; NORMAL can lose acknowledged writes on power loss.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.5.0-PowerLossDurability — Verified FULL durability for custody writes
 //   v2.4.0-DurableSchemaSentinel — Fail-closed checkpoint installation marker
 //   v2.3.0-DurableDirectRelayCircuit — Anonymous restart-safe circuit checkpoint
 //   v2.2.0-DirectRelayCircuit — Generation-safe fail-closed delivery circuit
@@ -225,6 +232,8 @@ const DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES: u8 = 2;
 const DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION: i64 = 1;
 /// Fixed schema marker proving the durable circuit checkpoint was installed.
 const DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE: &str = "direct_peer_relay_circuit_checkpoint";
+/// Minimum SQLite synchronous level permitted for acknowledged relay custody.
+const CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL: i64 = 2;
 /// Small tolerated wall-clock adjustment before restart recovery fails closed.
 const DIRECT_PEER_RELAY_CIRCUIT_CLOCK_SKEW_SECS: u64 = 5;
 
@@ -1596,6 +1605,23 @@ pub struct ChatRelayService {
 }
 
 impl ChatRelayService {
+    fn configure_sqlite_durability(conn: &Connection) -> ChatRelayResult<()> {
+        // [CHAT-RELAY-FULL-DURABILITY 2026-08-16 by Codex] NORMAL protects
+        // SQLite consistency across process failure but may lose a recently
+        // acknowledged transaction after host power loss. The relay signs
+        // custody receipts and persists its outage circuit from this database,
+        // so activation requires FULL-or-stronger durability.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+        let synchronous_level =
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))?;
+        if synchronous_level < CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "sqlite_synchronous_level",
+            });
+        }
+        Ok(())
+    }
+
     /// Creates a new `ChatRelayService`, opening (or creating) the SQLite database.
     pub fn new(config: ChatRelayConfig, node_secret: [u8; 32]) -> ChatRelayResult<Self> {
         if let Some(parent) = std::path::Path::new(&config.db_path).parent() {
@@ -1613,7 +1639,7 @@ impl ChatRelayService {
         // A short bounded wait absorbs transient locks from an operator backup
         // or diagnostic reader without allowing relay requests to hang forever.
         conn.busy_timeout(Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        Self::configure_sqlite_durability(&conn)?;
 
         let dedup_capacity = config.dedup_lru_capacity;
         let relay_enabled = config.enabled;
@@ -4244,6 +4270,20 @@ mod tests {
             }
         }
         tx.commit().expect("commit bulk pending insert");
+    }
+
+    #[test]
+    fn chat_relay_custody_uses_full_sqlite_durability() {
+        // [CHAT-RELAY-FULL-DURABILITY 2026-08-16 by Codex] A successful
+        // service construction is also the activation gate for signed custody
+        // receipts, so the effective connection mode must be FULL or EXTRA.
+        let svc = make_service();
+        let synchronous_level = svc
+            .conn
+            .lock()
+            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .expect("read effective relay durability");
+        assert!(synchronous_level >= CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL);
     }
 
     #[test]

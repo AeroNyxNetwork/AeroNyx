@@ -17,6 +17,8 @@
 //! ceiling for the legacy direct peer-relay endpoint.
 //! v1.5.0-AuthenticatedPeerFairness — Added a bounded per-authenticated-node
 //! ceiling behind direct peer-relay v2 signature verification.
+//! v1.6.0-DurableCustody — Documented the non-configurable FULL SQLite
+//! durability boundary required by signed custody acknowledgements.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -59,6 +61,10 @@
 //!   after node-signature verification. This node-id bucket is bounded and is
 //!   not a substitute for the global guard because permissionless identities
 //!   remain Sybil-able.
+//! - [CHAT-RELAY-FULL-DURABILITY 2026-08-16 by Codex] `ChatRelayService`
+//!   verifies SQLite FULL-or-stronger durability before activation. Do not add
+//!   a NORMAL/OFF operator override while the protocol issues signed custody
+//!   acknowledgements from successful durable writes.
 //! - `expired_notification_ttl_secs`: after this TTL, undelivered expiry
 //!   notifications are silently discarded. Flutter client local timeout is
 //!   the fallback.
@@ -67,6 +73,7 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.6.0-DurableCustody — Declared FULL durability a custody invariant.
 //! v1.5.0-AuthenticatedPeerFairness — Added configurable post-signature
 //! per-node admission for direct peer-relay v2.
 //! v1.4.0-PeerRelayAdmission — Added configurable parser-front admission for
@@ -122,7 +129,9 @@ pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
 /// ## Storage
 /// Chat data is stored in a separate SQLite file (`db_path`) isolated from
 /// the main MemChain database. This ensures chat relay failures cannot
-/// corrupt MemChain state and simplifies backup/purge.
+/// corrupt MemChain state and simplifies backup/purge. The service enforces
+/// WAL + FULL durability before it can acknowledge encrypted custody; this is
+/// intentionally not an operator-tunable downgrade.
 ///
 /// ## Configuration Example
 /// ```toml
