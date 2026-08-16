@@ -184,10 +184,15 @@
 //   - [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] Full audit segments are
 //     published immutably behind HMAC-authenticated SHA-256 checkpoints; the
 //     global v1 sequence/MAC chain continues across crash-safe rotations.
+//   - [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] A verified immutable
+//     checkpoint may be compressed into one opaque digest and signed by the
+//     node identity for external retention. No private MAC or audit path crosses
+//     that boundary, and interrupted rotations cannot be exported.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.7.0-CustodyAuditAnchor — Portable node-signed checkpoint commitment
 //   v3.6.0-CustodyAuditRotation — Crash-safe segmented maintenance audit
 //   v3.5.0-CustodyAuditVerify — Bounded public maintenance-chain verification
 //   v3.4.0-CustodyRestorePlan — Authenticated, state-bound recovery planning
@@ -246,7 +251,10 @@ use sha2::{Digest, Sha256};
 
 use tracing::{debug, info, warn};
 
-use aeronyx_core::protocol::chat::{decode_envelope, encode_envelope, ChatEnvelope};
+use aeronyx_core::crypto::IdentityKeyPair;
+use aeronyx_core::protocol::chat::{
+    decode_envelope, encode_envelope, ChatEnvelope, CustodyAuditAnchorV1,
+};
 
 use crate::config::ChatRelayConfig;
 use crate::services::wallet_routes::WalletRouteCache;
@@ -342,6 +350,9 @@ const CHAT_RELAY_BACKUP_AUDIT_HMAC_DOMAIN: &[u8] =
 /// Domain separation for immutable audit-segment checkpoints.
 const CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_HMAC_DOMAIN: &[u8] =
     b"AeroNyx-RelayCustodyBackup-MaintenanceAuditCheckpoint-v1";
+/// Domain separation for the public opaque digest of one private checkpoint.
+const CHAT_RELAY_BACKUP_AUDIT_ANCHOR_DIGEST_DOMAIN: &[u8] =
+    b"AeroNyx-RelayCustodyBackup-MaintenanceAuditAnchorDigest-v1";
 /// Private sibling file holding aggregate-only maintenance audit records.
 const CHAT_RELAY_BACKUP_AUDIT_FILE_NAME: &str = ".aeronyx-relay-backup-maintenance-audit.jsonl";
 /// Prefix for immutable, sequence-addressed audit segments.
@@ -2844,6 +2855,43 @@ impl ChatRelayService {
                 .finalize()
                 .into_bytes(),
         ))
+    }
+
+    fn backup_audit_anchor_digest(
+        state: &ChatRelayBackupAuditVerificationState,
+    ) -> ChatRelayResult<[u8; 32]> {
+        if state.receipt.checkpoint_count == 0
+            || state.receipt.archived_record_count == 0
+            || state.receipt.archived_bytes == 0
+        {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_NOTFOUND,
+                "relay backup maintenance audit has no immutable checkpoint to anchor",
+            ));
+        }
+        let checkpoint_mac = hex::decode(&state.checkpoint_head_mac).map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CORRUPT,
+                "relay backup maintenance audit checkpoint anchor is invalid",
+            )
+        })?;
+        let checkpoint_mac: [u8; 32] = checkpoint_mac.try_into().map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CORRUPT,
+                "relay backup maintenance audit checkpoint anchor is invalid",
+            )
+        })?;
+        // [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] The private checkpoint
+        // MAC authenticates the full cumulative chain. Hash it into a separate
+        // public domain so exporting an anchor cannot turn the HMAC itself into
+        // a reusable capability or reveal the private signing frame.
+        let mut hasher = Sha256::new();
+        hasher.update(CHAT_RELAY_BACKUP_AUDIT_ANCHOR_DIGEST_DOMAIN);
+        hasher.update(state.receipt.checkpoint_count.to_le_bytes());
+        hasher.update(state.receipt.archived_record_count.to_le_bytes());
+        hasher.update(state.receipt.archived_bytes.to_le_bytes());
+        hasher.update(checkpoint_mac);
+        Ok(hasher.finalize().into())
     }
 
     fn read_backup_audit_checkpoint(
@@ -7404,6 +7452,58 @@ impl ChatRelayService {
             .receipt)
     }
 
+    /// Creates a portable identity-signed anchor for the latest immutable
+    /// relay-custody audit checkpoint.
+    ///
+    /// [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] The returned protocol frame
+    /// commits to the private checkpoint through a domain-separated opaque
+    /// digest. It exposes only the producer identity, monotonic checkpoint
+    /// generation, aggregate covered records/bytes, and signature. The frame is
+    /// deterministic for a checkpoint; independent witnesses own time evidence.
+    /// Active records are deliberately excluded until their segment is
+    /// checkpointed. An interrupted rotation must be recovered by the next
+    /// locked maintenance append before an anchor can be issued.
+    ///
+    /// # Errors
+    /// Returns a path-free storage error when the private chain is unsafe,
+    /// unauthenticated, has no immutable checkpoint, or rotation publication is
+    /// incomplete.
+    pub fn create_backup_maintenance_audit_anchor_for_config(
+        config: &ChatRelayConfig,
+        identity: &IdentityKeyPair,
+    ) -> ChatRelayResult<CustodyAuditAnchorV1> {
+        let backup_directory = Self::private_backup_directory_for_config(config)?;
+        let _filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
+        let parent = backup_directory.parent().ok_or_else(|| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "relay backup directory has no private audit parent",
+            )
+        })?;
+        let node_secret = derive_node_secret(&identity.to_bytes());
+        let chain = Self::verify_backup_audit_chain(parent, &node_secret)?;
+        if chain.pending_rotation.is_some() {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_BUSY,
+                "relay backup maintenance audit rotation must complete before anchoring",
+            ));
+        }
+        let anchor_digest = Self::backup_audit_anchor_digest(&chain.state)?;
+        CustodyAuditAnchorV1::signed(
+            chain.state.receipt.checkpoint_count,
+            chain.state.receipt.archived_record_count,
+            chain.state.receipt.archived_bytes,
+            anchor_digest,
+            identity,
+        )
+        .map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_AUTH,
+                "unable to sign relay backup maintenance audit anchor",
+            )
+        })
+    }
+
     /// Verifies whether the newest private recovery image is ready for a
     /// separately approved host-local restore operation.
     ///
@@ -8876,6 +8976,102 @@ mod tests {
         assert_eq!(continued.active_record_count, 1);
         assert!(continued.verified_bytes > continued.archived_bytes);
         assert!(!continued.rotation_pending);
+    }
+
+    #[test]
+    fn backup_audit_anchor_covers_only_complete_authenticated_checkpoints() {
+        // [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] Portable evidence must
+        // advance only at an immutable checkpoint. Active-tail writes cannot
+        // silently change an already exportable generation, and either the
+        // wrong node identity or a crash-window publication state fails closed.
+        let directory = tempfile::tempdir().expect("anchored backup audit directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        config.custody_backup_retention_target_artifacts = 1;
+        let identity = IdentityKeyPair::from_bytes(&[0xb6; 32]).expect("anchor identity");
+        let secret = derive_node_secret(&identity.to_bytes());
+        let source = ChatRelayService::new(config.clone(), secret).expect("create relay store");
+        for operation in ["anchor-audit-1", "anchor-audit-2"] {
+            source
+                .create_verified_backup_for_operation(operation)
+                .expect("create anchor recovery fixture");
+        }
+
+        let no_checkpoint =
+            ChatRelayService::create_backup_maintenance_audit_anchor_for_config(&config, &identity)
+                .expect_err("active or absent audit cannot produce a portable anchor");
+        assert_eq!(no_checkpoint.reason_bucket(), "sqlite_error");
+
+        ChatRelayService::prune_verified_backup_retention_at(
+            &config,
+            &secret,
+            &ChatRelayBackupPruneRequest::default(),
+            1_787_100_001,
+        )
+        .expect("write anchor audit record");
+        let backup_directory = ChatRelayService::private_backup_directory_for_config(&config)
+            .expect("anchor backup boundary");
+        let parent = backup_directory.parent().expect("anchor audit parent");
+        let range = ChatRelayBackupAuditSegmentRange {
+            first_sequence: 1,
+            last_sequence: 1,
+        };
+        let segment_path = parent.join(ChatRelayService::backup_audit_segment_file_name(range));
+        let active_path = parent.join(CHAT_RELAY_BACKUP_AUDIT_FILE_NAME);
+        {
+            let _lock = ChatRelayService::acquire_backup_filesystem_lock(&backup_directory)
+                .expect("hold anchor rotation lock");
+            let chain = ChatRelayService::verify_backup_audit_chain(parent, &secret)
+                .expect("verify anchor precondition");
+            ChatRelayService::rotate_backup_audit_segment(parent, &secret, &chain.state)
+                .expect("publish anchor checkpoint");
+        }
+
+        let first =
+            ChatRelayService::create_backup_maintenance_audit_anchor_for_config(&config, &identity)
+                .expect("create portable checkpoint anchor");
+        first
+            .verify_expected(&identity.public_key_bytes(), 1)
+            .expect("verify producer and rollback floor");
+        assert_eq!(first.checkpoint_generation, 1);
+        assert_eq!(first.archived_record_count, 1);
+        assert!(first.archived_bytes > 0);
+
+        ChatRelayService::prune_verified_backup_retention_at(
+            &config,
+            &secret,
+            &ChatRelayBackupPruneRequest::default(),
+            1_787_100_003,
+        )
+        .expect("append uncheckpointed audit tail");
+        let with_active_tail =
+            ChatRelayService::create_backup_maintenance_audit_anchor_for_config(&config, &identity)
+                .expect("anchor latest complete checkpoint");
+        assert_eq!(with_active_tail.checkpoint_generation, 1);
+        assert_eq!(with_active_tail.archived_record_count, 1);
+        assert_eq!(with_active_tail.archived_bytes, first.archived_bytes);
+        assert_eq!(with_active_tail.anchor_digest, first.anchor_digest);
+        assert_eq!(
+            with_active_tail, first,
+            "one complete checkpoint must always export the same signed frame"
+        );
+
+        let wrong_identity = IdentityKeyPair::from_bytes(&[0xb7; 32]).expect("wrong identity");
+        let wrong_key = ChatRelayService::create_backup_maintenance_audit_anchor_for_config(
+            &config,
+            &wrong_identity,
+        )
+        .expect_err("wrong node key cannot authenticate the private checkpoint");
+        assert_eq!(wrong_key.reason_bucket(), "sqlite_error");
+
+        std::fs::remove_file(&active_path).expect("remove active tail fixture");
+        std::fs::rename(&segment_path, &active_path)
+            .expect("reproduce interrupted segment publication");
+        let pending =
+            ChatRelayService::create_backup_maintenance_audit_anchor_for_config(&config, &identity)
+                .expect_err("pending rotation cannot produce external evidence");
+        assert_eq!(pending.reason_bucket(), "sqlite_error");
     }
 
     #[test]

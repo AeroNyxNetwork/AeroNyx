@@ -72,8 +72,14 @@
 //! - [BOUNDED-WIRE-CODEC 2026-07-23 by Codex] Chat and blind-relay encoders
 //!   share the same byte ceilings as their decoders. Keep legacy small trailing
 //!   bytes only for `ChatEnvelope`; blind-relay frames remain canonical.
+//! - [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] `CustodyAuditAnchorV1` is a
+//!   fixed-size, node-signed commitment to one opaque relay-custody checkpoint.
+//!   It contains no audit MAC, path, message metadata, identity relationship,
+//!   ciphertext, or backup name. External retainers compare its monotonic
+//!   generation; the anchor alone is not a witness receipt or global finality.
 //!
 //! ## Last Modified
+//! v1.6.0-CustodyAuditAnchor - Added portable opaque custody checkpoint anchors
 //! v1.5.0-SignedFailureReceipt - Authenticate hop-local failure ACKs without exposing route topology
 //! v1.4.0-PurposeBoundReceipt - Bound terminal receipts to route purpose with a v2 domain
 //! v1.3.0-BoundedWireCodec - Symmetric frame limits and padded-input rejection
@@ -109,6 +115,7 @@ const BLIND_RELAY_FAILURE_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-F
 const BLIND_RELAY_FAILURE_REQUEST_COMMITMENT_DOMAIN: &[u8] =
     b"AeroNyx-BlindRelay-FailureRequest-v1";
 const BLIND_RELAY_FAILURE_REASON_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-FailureReason-v1";
+const CUSTODY_AUDIT_ANCHOR_SIGNING_DOMAIN: &[u8] = b"AeroNyx-CustodyAuditAnchor-v1";
 
 /// Initial signed blind-relay terminal receipt version.
 pub const BLIND_RELAY_DELIVERY_RECEIPT_VERSION: u8 = 1;
@@ -116,6 +123,10 @@ pub const BLIND_RELAY_DELIVERY_RECEIPT_VERSION: u8 = 1;
 pub const BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION: u8 = 2;
 /// Initial hop-local signed blind-relay failure receipt version.
 pub const BLIND_RELAY_FAILURE_RECEIPT_VERSION: u8 = 1;
+/// Initial portable relay-custody checkpoint anchor version.
+pub const CUSTODY_AUDIT_ANCHOR_VERSION: u8 = 1;
+/// Exact upper bound for one canonical custody audit anchor frame.
+pub const MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES: usize = 256;
 /// Terminal accepted the opaque payload into online or durable pending delivery.
 pub const BLIND_RELAY_DELIVERY_ACCEPTED: u8 = 1;
 
@@ -733,6 +744,150 @@ impl BlindRelayFailureReceipt {
     }
 }
 
+// ============================================
+// CustodyAuditAnchorV1
+// ============================================
+
+/// Portable node-signed commitment to one relay-custody audit checkpoint.
+///
+/// [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] The producer computes
+/// `anchor_digest` from private checkpoint authentication state, then discards
+/// that private state at this protocol boundary. External retainers receive a
+/// fixed-size opaque commitment and monotonic generation only. Comparing an
+/// already retained generation/digest can reveal rollback or equivocation, but
+/// this producer signature alone is not an independent witness receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyAuditAnchorV1 {
+    /// Anchor schema version.
+    pub version: u8,
+    /// Ed25519 identity of the node that owns the private audit.
+    pub producer_node_id: [u8; 32],
+    /// Positive monotonic checkpoint generation.
+    pub checkpoint_generation: u64,
+    /// Aggregate maintenance records covered by this checkpoint.
+    pub archived_record_count: u64,
+    /// Aggregate authenticated audit bytes covered by this checkpoint.
+    pub archived_bytes: u64,
+    /// Domain-separated opaque digest of the private checkpoint state.
+    pub anchor_digest: [u8; 32],
+    /// Producer signature over [`Self::signing_data`].
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl CustodyAuditAnchorV1 {
+    /// Creates and signs one structurally valid portable anchor.
+    ///
+    /// # Errors
+    /// Returns [`CoreError::MalformedMessage`] for zero/sentinel state or an
+    /// impossible generation-to-record relation.
+    pub fn signed(
+        checkpoint_generation: u64,
+        archived_record_count: u64,
+        archived_bytes: u64,
+        anchor_digest: [u8; 32],
+        producer: &IdentityKeyPair,
+    ) -> Result<Self, CoreError> {
+        let mut anchor = Self {
+            version: CUSTODY_AUDIT_ANCHOR_VERSION,
+            producer_node_id: producer.public_key_bytes(),
+            checkpoint_generation,
+            archived_record_count,
+            archived_bytes,
+            anchor_digest,
+            signature: [0u8; 64],
+        };
+        anchor.validate_structure()?;
+        anchor.signature = producer.sign(&anchor.signing_data());
+        Ok(anchor)
+    }
+
+    /// Builds the canonical fixed-width, domain-separated signing frame.
+    #[must_use]
+    pub fn signing_data(&self) -> Vec<u8> {
+        let mut data =
+            Vec::with_capacity(CUSTODY_AUDIT_ANCHOR_SIGNING_DOMAIN.len() + 1 + 32 + (8 * 3) + 32);
+        data.extend_from_slice(CUSTODY_AUDIT_ANCHOR_SIGNING_DOMAIN);
+        data.push(self.version);
+        data.extend_from_slice(&self.producer_node_id);
+        data.extend_from_slice(&self.checkpoint_generation.to_le_bytes());
+        data.extend_from_slice(&self.archived_record_count.to_le_bytes());
+        data.extend_from_slice(&self.archived_bytes.to_le_bytes());
+        data.extend_from_slice(&self.anchor_digest);
+        data
+    }
+
+    fn validate_structure(&self) -> Result<(), CoreError> {
+        if self.version != CUSTODY_AUDIT_ANCHOR_VERSION
+            || self.checkpoint_generation == 0
+            || self.archived_record_count == 0
+            || self.archived_bytes == 0
+            || self.checkpoint_generation > self.archived_record_count
+            || self.anchor_digest == [0u8; 32]
+        {
+            return Err(CoreError::malformed(
+                "custody audit anchor: invalid structural state",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verifies structural constraints and the embedded producer signature.
+    ///
+    /// # Errors
+    /// Returns a malformed/signature error when any covered field is invalid.
+    pub fn verify_signature(&self) -> Result<(), CoreError> {
+        self.validate_structure()?;
+        IdentityPublicKey::from_bytes(&self.producer_node_id)?
+            .verify(&self.signing_data(), &self.signature)
+    }
+
+    /// Verifies signature plus an explicit producer pin and rollback floor.
+    ///
+    /// # Errors
+    /// Returns a malformed error when identity or checkpoint generation does
+    /// not satisfy the verifier's local trust policy.
+    pub fn verify_expected(
+        &self,
+        expected_producer: &[u8; 32],
+        minimum_checkpoint_generation: u64,
+    ) -> Result<(), CoreError> {
+        self.verify_signature()?;
+        if minimum_checkpoint_generation == 0
+            || &self.producer_node_id != expected_producer
+            || self.checkpoint_generation < minimum_checkpoint_generation
+        {
+            return Err(CoreError::malformed(
+                "custody audit anchor: trust policy mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Encodes one custody audit anchor with a canonical bounded bincode frame.
+///
+/// # Errors
+/// Returns [`CoreError::MalformedMessage`] when bounded encoding fails.
+pub fn encode_custody_audit_anchor(anchor: &CustodyAuditAnchorV1) -> Result<Vec<u8>, CoreError> {
+    encode_bincode_bounded(anchor, MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES as u64)
+        .map_err(|error| CoreError::malformed(format!("custody audit anchor encode: {error}")))
+}
+
+/// Decodes one complete canonical custody audit anchor frame.
+///
+/// # Errors
+/// Returns [`CoreError::MalformedMessage`] for malformed, padded, or oversized
+/// input. Signature and trust-policy verification remain explicit caller steps.
+pub fn decode_custody_audit_anchor(bytes: &[u8]) -> Result<CustodyAuditAnchorV1, CoreError> {
+    decode_bincode_bounded(
+        bytes,
+        MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES as u64,
+        TrailingBytesPolicy::Reject,
+    )
+    .map_err(|error| CoreError::malformed(format!("custody audit anchor decode: {error}")))
+}
+
 /// Encodes a blind relay envelope with a bounded bincode cap.
 ///
 /// # Errors
@@ -894,6 +1049,54 @@ mod tests {
         let data = env.sign_data();
         env.signature = kp.sign(&data);
         env
+    }
+
+    // [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] These tests lock the
+    // canonical fixed-size frame and explicit rollback-floor semantics before
+    // any network witness endpoint is allowed to consume the primitive.
+    #[test]
+    fn custody_audit_anchor_roundtrips_canonically_and_verifies() {
+        let producer = IdentityKeyPair::from_bytes(&[0x71; 32]).expect("producer identity");
+        let anchor =
+            CustodyAuditAnchorV1::signed(3, 65_538, 128 * 1024 * 1024, [0x42; 32], &producer)
+                .expect("sign custody audit anchor");
+        anchor
+            .verify_expected(&producer.public_key_bytes(), 3)
+            .expect("verify exact producer and generation");
+
+        let encoded = encode_custody_audit_anchor(&anchor).expect("encode anchor");
+        assert_eq!(encoded.len(), 153);
+        assert!(encoded.len() <= MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES);
+        let decoded = decode_custody_audit_anchor(&encoded).expect("decode anchor");
+        assert_eq!(decoded, anchor);
+        assert_eq!(
+            encode_custody_audit_anchor(&decoded).expect("re-encode anchor"),
+            encoded
+        );
+    }
+
+    #[test]
+    fn custody_audit_anchor_rejects_tamper_padding_and_rollback_floor() {
+        let producer = IdentityKeyPair::from_bytes(&[0x72; 32]).expect("producer identity");
+        let other = IdentityKeyPair::from_bytes(&[0x73; 32]).expect("other identity");
+        let anchor =
+            CustodyAuditAnchorV1::signed(2, 65_537, 64 * 1024 * 1024, [0x43; 32], &producer)
+                .expect("sign custody audit anchor");
+
+        assert!(anchor
+            .verify_expected(&producer.public_key_bytes(), 3)
+            .is_err());
+        assert!(anchor
+            .verify_expected(&other.public_key_bytes(), 1)
+            .is_err());
+        let mut tampered = anchor.clone();
+        tampered.archived_bytes += 1;
+        assert!(tampered.verify_signature().is_err());
+
+        let mut padded = encode_custody_audit_anchor(&anchor).expect("encode anchor");
+        padded.push(0);
+        assert!(decode_custody_audit_anchor(&padded).is_err());
+        assert!(CustodyAuditAnchorV1::signed(0, 1, 1, [0x44; 32], &producer).is_err());
     }
 
     // ── ChatContentType ──

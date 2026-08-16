@@ -47,6 +47,8 @@
 //!   verification for the private HMAC-chained custody maintenance history.
 //! - [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] Surface aggregate-only
 //!   immutable segment/checkpoint and interrupted-rotation status.
+//! - [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] Add create-new export and
+//!   fail-closed offline verification for exact node-signed custody anchors.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -75,8 +77,9 @@
 //! v1.14.0-CustodyRestorePlan - Add authenticated host-local recovery plans
 //! v1.15.0-CustodyAuditVerify - Add aggregate maintenance-chain verification
 //! v1.16.0-CustodyAuditRotation - Report authenticated audit segment state
+//! v1.17.0-CustodyAuditAnchor - Export and verify portable checkpoint anchors
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -84,10 +87,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aeronyx_core::crypto::IdentityKeyPair;
+use aeronyx_core::protocol::chat::{
+    decode_custody_audit_anchor, encode_custody_audit_anchor, CustodyAuditAnchorV1,
+    MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+};
 use aeronyx_core::protocol::discovery::MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES;
 use aeronyx_server::api::auth::ensure_api_secret;
 use aeronyx_server::api::directory_replica_sync::{
@@ -268,6 +276,44 @@ enum RelayCustodyCommands {
         /// Path to the local node configuration file
         #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
         config: PathBuf,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export the latest immutable custody checkpoint as a signed binary anchor
+    CreateAuditAnchor {
+        /// Path to the local node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// New path for the canonical binary anchor; existing files are refused
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify one exact custody anchor offline against local trust pins
+    VerifyAuditAnchor {
+        /// Path to the canonical binary anchor frame
+        #[arg(long)]
+        input: PathBuf,
+
+        /// Expected SHA-256 of the exact binary frame
+        #[arg(long)]
+        expected_sha256: String,
+
+        /// Trusted producer node identity (64 hexadecimal characters)
+        #[arg(long)]
+        expected_node: String,
+
+        /// Lowest checkpoint generation already trusted by this verifier
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        minimum_checkpoint_generation: u64,
 
         /// Emit the stable aggregate JSON contract
         #[arg(long)]
@@ -1097,6 +1143,28 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
         RelayCustodyCommands::VerifyAudit { config, json } => {
             cmd_relay_verify_audit(&config, json).await?;
         }
+        RelayCustodyCommands::CreateAuditAnchor {
+            config,
+            output,
+            json,
+        } => {
+            cmd_relay_create_audit_anchor(&config, &output, json).await?;
+        }
+        RelayCustodyCommands::VerifyAuditAnchor {
+            input,
+            expected_sha256,
+            expected_node,
+            minimum_checkpoint_generation,
+            json,
+        } => {
+            cmd_relay_verify_audit_anchor(
+                &input,
+                &expected_sha256,
+                &expected_node,
+                minimum_checkpoint_generation,
+                json,
+            )?;
+        }
         RelayCustodyCommands::RestoreReadiness { config, json } => {
             let server_config = load_relay_custody_config(&config).await?;
             let receipt = ChatRelayService::audit_latest_restore_readiness_for_config(
@@ -1205,6 +1273,137 @@ async fn cmd_relay_verify_audit(config_path: &Path, json: bool) -> anyhow::Resul
     Ok(())
 }
 
+#[derive(Debug, serde::Serialize)]
+struct RelayCustodyAuditAnchorReport {
+    contract_version: &'static str,
+    status: &'static str,
+    protocol_version: u8,
+    producer_node_id: String,
+    checkpoint_generation: u64,
+    archived_record_count: u64,
+    archived_bytes: u64,
+    anchor_digest: String,
+    frame_sha256: String,
+    frame_bytes: usize,
+    security_model: &'static str,
+    privacy_boundary: &'static str,
+}
+
+// [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] Export remains host-local and
+// create-new. The exact frame digest is intended for a separately administered
+// retainer; the producer must not silently replace evidence already retained.
+async fn cmd_relay_create_audit_anchor(
+    config_path: &Path,
+    output_path: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    let server_config = load_relay_custody_config(config_path).await?;
+    let identity = load_relay_custody_identity(&server_config, "audit anchor export").await?;
+    let anchor = ChatRelayService::create_backup_maintenance_audit_anchor_for_config(
+        &server_config.memchain.chat_relay,
+        &identity,
+    )
+    .map_err(|error| anyhow::anyhow!("relay custody audit anchor export failed: {error}"))?;
+    let frame = encode_custody_audit_anchor(&anchor)
+        .map_err(|_| anyhow::anyhow!("unable to encode relay custody audit anchor"))?;
+    anyhow::ensure!(
+        !frame.is_empty() && frame.len() <= MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+        "encoded relay custody audit anchor violates its protocol bound"
+    );
+    let frame_sha256: [u8; 32] = Sha256::digest(&frame).into();
+    write_new_relay_custody_anchor(output_path, &frame)?;
+    print_relay_custody_audit_anchor(&anchor, &frame_sha256, frame.len(), "created", json)
+}
+
+fn cmd_relay_verify_audit_anchor(
+    input_path: &Path,
+    expected_sha256_hex: &str,
+    expected_node_hex: &str,
+    minimum_checkpoint_generation: u64,
+    json: bool,
+) -> anyhow::Result<()> {
+    let expected_sha256 = parse_hex32(expected_sha256_hex, "audit anchor SHA-256")?;
+    let expected_node = parse_hex32(expected_node_hex, "expected producer node identity")?;
+    let frame = read_bounded_relay_custody_anchor(input_path)?;
+    let anchor = verify_relay_custody_anchor_frame(
+        &frame,
+        &expected_sha256,
+        &expected_node,
+        minimum_checkpoint_generation,
+    )?;
+    print_relay_custody_audit_anchor(&anchor, &expected_sha256, frame.len(), "verified", json)
+}
+
+fn verify_relay_custody_anchor_frame(
+    frame: &[u8],
+    expected_sha256: &[u8; 32],
+    expected_node: &[u8; 32],
+    minimum_checkpoint_generation: u64,
+) -> anyhow::Result<CustodyAuditAnchorV1> {
+    anyhow::ensure!(
+        !frame.is_empty() && frame.len() <= MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+        "relay custody audit anchor violates its complete-frame bound"
+    );
+    let actual_sha256: [u8; 32] = Sha256::digest(frame).into();
+    anyhow::ensure!(
+        &actual_sha256 == expected_sha256,
+        "relay custody audit anchor SHA-256 does not match the explicit pin"
+    );
+    let anchor = decode_custody_audit_anchor(frame)
+        .map_err(|_| anyhow::anyhow!("relay custody audit anchor is malformed"))?;
+    let canonical = encode_custody_audit_anchor(&anchor)
+        .map_err(|_| anyhow::anyhow!("relay custody audit anchor cannot be canonicalized"))?;
+    anyhow::ensure!(
+        canonical == frame,
+        "relay custody audit anchor is not canonically encoded"
+    );
+    anchor
+        .verify_expected(expected_node, minimum_checkpoint_generation)
+        .map_err(|_| anyhow::anyhow!("relay custody audit anchor trust policy failed"))?;
+    Ok(anchor)
+}
+
+fn print_relay_custody_audit_anchor(
+    anchor: &CustodyAuditAnchorV1,
+    frame_sha256: &[u8; 32],
+    frame_bytes: usize,
+    status: &'static str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = RelayCustodyAuditAnchorReport {
+        contract_version: "relay_custody_audit_anchor.v1",
+        status,
+        protocol_version: anchor.version,
+        producer_node_id: hex::encode(anchor.producer_node_id),
+        checkpoint_generation: anchor.checkpoint_generation,
+        archived_record_count: anchor.archived_record_count,
+        archived_bytes: anchor.archived_bytes,
+        anchor_digest: hex::encode(anchor.anchor_digest),
+        frame_sha256: hex::encode(frame_sha256),
+        frame_bytes,
+        security_model: "producer-signed opaque checkpoint commitment with explicit identity, exact-frame digest, and verifier-owned rollback floor; not an independent witness receipt, validator vote, consensus, or global finality",
+        privacy_boundary: "checkpoint generation and aggregate archived record/byte counts only; no private HMAC, path, operation id, message id, endpoint, route, identity owner, payload, ciphertext, memory, destination, DNS, or social graph metadata",
+    };
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("Relay custody audit anchor");
+        println!("════════════════════════════════════════");
+        println!("Status:               {}", report.status);
+        println!("Producer node:        {}", report.producer_node_id);
+        println!("Checkpoint generation: {}", report.checkpoint_generation);
+        println!("Archived records:     {}", report.archived_record_count);
+        println!("Archived bytes:       {}", report.archived_bytes);
+        println!("Anchor digest:        {}", report.anchor_digest);
+        println!("Frame SHA-256:        {}", report.frame_sha256);
+        println!("Frame bytes:          {}", report.frame_bytes);
+        println!();
+        println!("Security model: {}", report.security_model);
+        println!("Privacy: {}", report.privacy_boundary);
+    }
+    Ok(())
+}
+
 // [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] Keep credential issuance and
 // verification isolated from the command dispatcher and all network surfaces.
 async fn cmd_relay_restore_plan(config_path: &Path, json: bool) -> anyhow::Result<()> {
@@ -1297,6 +1496,105 @@ fn print_relay_restore_plan(plan: &ChatRelayRestorePlanReceipt, json: bool) -> a
     Ok(())
 }
 
+fn write_new_relay_custody_anchor(path: &Path, frame: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    anyhow::ensure!(
+        !frame.is_empty() && frame.len() <= MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+        "relay custody audit anchor violates its write bound"
+    );
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    let mut file = options
+        .open(path)
+        .map_err(|_| anyhow::anyhow!("unable to create new relay custody audit anchor"))?;
+
+    // [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] If the exact frame is not
+    // durable, remove only the inode this invocation created. A later verifier
+    // still requires the separately retained SHA-256 and canonical full frame.
+    let write_result = (|| -> anyhow::Result<()> {
+        file.write_all(frame)
+            .map_err(|_| anyhow::anyhow!("unable to write relay custody audit anchor"))?;
+        file.sync_all()
+            .map_err(|_| anyhow::anyhow!("unable to sync relay custody audit anchor"))?;
+        let final_len = file
+            .metadata()
+            .map_err(|_| anyhow::anyhow!("unable to inspect relay custody audit anchor"))?
+            .len();
+        anyhow::ensure!(
+            final_len == frame.len() as u64,
+            "relay custody audit anchor changed during publication"
+        );
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|candidate| !candidate.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = File::open(parent)
+            .map_err(|_| anyhow::anyhow!("unable to open audit anchor parent directory"))?;
+        directory
+            .sync_all()
+            .map_err(|_| anyhow::anyhow!("unable to sync audit anchor parent directory"))?;
+    }
+    Ok(())
+}
+
+fn read_bounded_relay_custody_anchor(path: &Path) -> anyhow::Result<Vec<u8>> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    let mut file = options
+        .open(path)
+        .map_err(|_| anyhow::anyhow!("unable to open relay custody audit anchor"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("unable to inspect relay custody audit anchor"))?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.len() > 0
+            && metadata.len() <= MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES as u64,
+        "relay custody audit anchor has an invalid file boundary"
+    );
+
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| anyhow::anyhow!("relay custody audit anchor exceeds platform capacity"))?;
+    let mut frame = Vec::with_capacity(capacity);
+    file.by_ref()
+        .take(MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES as u64 + 1)
+        .read_to_end(&mut frame)
+        .map_err(|_| anyhow::anyhow!("unable to read relay custody audit anchor"))?;
+    let final_len = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("unable to re-inspect relay custody audit anchor"))?
+        .len();
+    anyhow::ensure!(
+        frame.len() as u64 == metadata.len()
+            && final_len == metadata.len()
+            && frame.len() <= MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+        "relay custody audit anchor changed during bounded read"
+    );
+    Ok(frame)
+}
+
 async fn load_relay_custody_config(config_path: &Path) -> anyhow::Result<ServerConfig> {
     let config = ServerConfig::load(config_path).await?;
     if !config.memchain.is_chat_relay_enabled() {
@@ -1312,11 +1610,18 @@ async fn load_relay_custody_node_secret(
     config: &ServerConfig,
     operation: &str,
 ) -> anyhow::Result<[u8; 32]> {
-    let identity_path = PathBuf::from(&config.server_key.key_file);
-    let identity = load_key(&identity_path)
-        .await
-        .map_err(|_| anyhow::anyhow!("relay custody {operation} requires the node identity key"))?;
+    let identity = load_relay_custody_identity(config, operation).await?;
     Ok(derive_node_secret(&identity.to_bytes()))
+}
+
+async fn load_relay_custody_identity(
+    config: &ServerConfig,
+    operation: &str,
+) -> anyhow::Result<IdentityKeyPair> {
+    let identity_path = PathBuf::from(&config.server_key.key_file);
+    load_key(&identity_path)
+        .await
+        .map_err(|_| anyhow::anyhow!("relay custody {operation} requires the node identity key"))
 }
 
 fn load_private_restore_plan(path: &Path) -> anyhow::Result<ChatRelayRestorePlanReceipt> {
@@ -2506,6 +2811,77 @@ mod tests {
         assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
         assert!(json);
 
+        // [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] Creation requires a new
+        // explicit output, while offline verification requires all three local
+        // trust pins: exact bytes, producer identity, and rollback floor.
+        let create_anchor = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "create-audit-anchor",
+            "--output",
+            "/root/custody-anchor.bin",
+            "--json",
+        ])
+        .expect("audit anchor creation form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::CreateAuditAnchor {
+            config,
+            output,
+            json,
+        }) = create_anchor.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert_eq!(output, PathBuf::from("/root/custody-anchor.bin"));
+        assert!(json);
+
+        let node = "81".repeat(32);
+        let digest = "82".repeat(32);
+        let verify_anchor = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "verify-audit-anchor",
+            "--input",
+            "/root/custody-anchor.bin",
+            "--expected-sha256",
+            &digest,
+            "--expected-node",
+            &node,
+            "--minimum-checkpoint-generation",
+            "7",
+            "--json",
+        ])
+        .expect("audit anchor verification form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::VerifyAuditAnchor {
+            input,
+            expected_sha256,
+            expected_node,
+            minimum_checkpoint_generation,
+            json,
+        }) = verify_anchor.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(input, PathBuf::from("/root/custody-anchor.bin"));
+        assert_eq!(expected_sha256, digest);
+        assert_eq!(expected_node, node);
+        assert_eq!(minimum_checkpoint_generation, 7);
+        assert!(json);
+        assert!(Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "verify-audit-anchor",
+            "--input",
+            "/root/custody-anchor.bin",
+            "--expected-sha256",
+            &"83".repeat(32),
+            "--expected-node",
+            &"84".repeat(32),
+            "--minimum-checkpoint-generation",
+            "0",
+        ])
+        .is_err());
+
         let readiness = Cli::try_parse_from([
             "aeronyx-server",
             "relay-custody",
@@ -2605,6 +2981,63 @@ mod tests {
             "--confirm-node-stopped",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn relay_custody_anchor_file_boundary_is_exact_and_no_overwrite() {
+        let directory = tempfile::tempdir().expect("audit anchor CLI directory");
+        let path = directory.path().join("anchor.bin");
+        let producer = IdentityKeyPair::from_bytes(&[0x85; 32]).expect("anchor producer");
+        let anchor =
+            CustodyAuditAnchorV1::signed(4, 65_540, 128 * 1024 * 1024, [0x86; 32], &producer)
+                .expect("sign CLI anchor fixture");
+        let frame = encode_custody_audit_anchor(&anchor).expect("encode CLI anchor fixture");
+        let frame_sha256: [u8; 32] = Sha256::digest(&frame).into();
+
+        write_new_relay_custody_anchor(&path, &frame).expect("publish exact CLI anchor");
+        assert!(write_new_relay_custody_anchor(&path, &frame).is_err());
+        let loaded = read_bounded_relay_custody_anchor(&path).expect("read bounded CLI anchor");
+        let verified = verify_relay_custody_anchor_frame(
+            &loaded,
+            &frame_sha256,
+            &producer.public_key_bytes(),
+            4,
+        )
+        .expect("verify exact CLI anchor");
+        assert_eq!(verified, anchor);
+
+        let mut wrong_sha256 = frame_sha256;
+        wrong_sha256[0] ^= 1;
+        assert!(verify_relay_custody_anchor_frame(
+            &loaded,
+            &wrong_sha256,
+            &producer.public_key_bytes(),
+            4,
+        )
+        .is_err());
+        assert!(verify_relay_custody_anchor_frame(
+            &loaded,
+            &frame_sha256,
+            &producer.public_key_bytes(),
+            5,
+        )
+        .is_err());
+
+        let oversized_path = directory.path().join("oversized.bin");
+        std::fs::write(
+            &oversized_path,
+            vec![0u8; MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES + 1],
+        )
+        .expect("write oversized CLI anchor fixture");
+        assert!(read_bounded_relay_custody_anchor(&oversized_path).is_err());
+
+        #[cfg(unix)]
+        {
+            let symlink_path = directory.path().join("anchor-link.bin");
+            std::os::unix::fs::symlink(&path, &symlink_path)
+                .expect("create audit anchor symlink fixture");
+            assert!(read_bounded_relay_custody_anchor(&symlink_path).is_err());
+        }
     }
 
     #[test]

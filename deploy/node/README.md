@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] Document exact create-new export,
+  offline verification, rollback-floor retention, and the boundary between a
+  producer-signed anchor and future independent witness evidence.
 - [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] Document automatic,
   crash-safe maintenance audit segmentation and authenticated checkpoints.
 - [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Document bounded verification
@@ -767,6 +770,57 @@ timestamp witness. They detect modification, gaps, and partial publication in
 the retained local history, but a root operator who deletes or rolls back every
 audit/checkpoint artifact cannot be detected without a separately anchored
 witness. Do not describe this mechanism as a blockchain or third-party proof.
+
+Export the latest complete checkpoint as a portable producer-signed anchor:
+
+```bash
+sudo /root/open/AeroNyx/target/release/aeronyx-server \
+  relay-custody create-audit-anchor \
+  -c /etc/aeronyx/server.toml \
+  --output /root/relay-custody-anchor.bin \
+  --json
+```
+
+<!-- [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] -->
+The command first verifies the entire private audit under the cross-process
+maintenance lock, then signs a fixed-size canonical frame with the node Ed25519
+identity. It refuses an absent checkpoint, a wrong identity key, an incomplete
+rotation, malformed private state, and an existing output path. On Unix the new
+binary file is owner-private, opened without following the final symlink, synced
+before success, and its parent directory is synced. The output report contains
+the exact frame SHA-256, producer node identity, checkpoint generation,
+aggregate archived record/byte counts, and opaque anchor digest. It never emits
+the private checkpoint HMAC, operation IDs, paths, messages, routes, endpoints,
+ciphertext, memory contents, destinations, DNS, or social-graph metadata.
+
+Copy both the exact binary frame and its JSON report to a separately
+administered evidence retainer. That retainer must preserve the highest accepted
+`checkpoint_generation` and the corresponding frame SHA-256 for each pinned
+producer. Verify without the producer config or private key:
+
+```bash
+/opt/aeronyx/aeronyx-server relay-custody verify-audit-anchor \
+  --input ./relay-custody-anchor.bin \
+  --expected-sha256 <64-hex-frame-sha256> \
+  --expected-node <64-hex-producer-node-id> \
+  --minimum-checkpoint-generation <last-trusted-generation> \
+  --json
+```
+
+Verification rejects a non-regular or symlinked input, empty/oversized/changed
+file, wrong exact-frame hash, padded or non-canonical encoding, invalid
+signature, unexpected producer, and generation below the verifier-owned floor.
+Active audit-tail records are intentionally not covered until their segment is
+checkpointed. The anchor has no producer-controlled timestamp: repeated exports
+of the same checkpoint are byte-for-byte identical and keep the same frame
+SHA-256. A future independent witness must add and sign its own observation
+time rather than treating the producer clock as trusted time.
+
+This portable anchor makes complete local rollback detectable only when an
+independent retainer compares it with previously retained evidence. It is still
+not a witness receipt, validator vote, consensus checkpoint, transaction proof,
+or global finality. A future witness phase may countersign the same exact frame,
+but must not gain access to the private audit or user data.
 
 Verify whether the newest recovery image is usable before planning a restore:
 
