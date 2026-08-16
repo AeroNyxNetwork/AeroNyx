@@ -36,6 +36,9 @@
 //! - [LIVE-RELAY-SMOKE 2026-08-15 by Codex] Add a host-local operator command
 //!   that proves the production authenticated UDP, E2E relay, terminal receipt,
 //!   mailbox pull, and ACK path without exposing protocol secrets.
+//! - [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Add host-local custody
+//!   retention audit and confirmation-gated prune commands with aggregate-only
+//!   output; no management-plane or HTTP mutation endpoint is introduced.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -59,6 +62,7 @@
 //! v1.10.0-ManagementClientStartup - Fail registration cleanly when the
 //! management HTTP client cannot initialize
 //! v1.11.0-LiveRelaySmoke - Add a bounded authenticated live relay smoke
+//! v1.12.0-CustodyBackupPrune - Add host-local relay custody maintenance
 
 use std::fs::File;
 use std::io::{BufRead, Read};
@@ -83,7 +87,9 @@ use aeronyx_server::services::directory_replica::{
     DirectoryObservationCertificateTrustPolicy,
 };
 use aeronyx_server::services::{
-    AofWriter, DirectoryReplicaResolutionCommand, DirectoryReplicaStore, DirectoryReplicaTip,
+    derive_node_secret, AofWriter, ChatRelayBackupPruneRequest, ChatRelayService,
+    DirectoryReplicaResolutionCommand, DirectoryReplicaStore, DirectoryReplicaTip,
+    CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
 };
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
 
@@ -181,6 +187,10 @@ enum Commands {
     #[command(subcommand)]
     DirectoryReplica(DirectoryReplicaCommands),
 
+    /// Inspect or explicitly prune private relay-custody recovery artifacts
+    #[command(subcommand)]
+    RelayCustody(RelayCustodyCommands),
+
     /// Prove one host-local authenticated multi-hop ciphertext relay
     RelaySmoke {
         /// Running node UDP listener; only loopback addresses are accepted
@@ -224,6 +234,46 @@ enum MemchainCommands {
         /// Path to configuration file
         #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
         config: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RelayCustodyCommands {
+    /// Verify and report aggregate private backup retention state
+    Audit {
+        /// Path to the local node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Dry-run retention by default; delete only after explicit confirmation
+    Prune {
+        /// Path to the local node configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Delete verified policy candidates instead of only planning them
+        #[arg(
+            long,
+            requires_all = ["confirm_node_stopped", "confirm_prune"]
+        )]
+        execute: bool,
+
+        /// Confirm the serving node process has been stopped
+        #[arg(long, requires = "execute")]
+        confirm_node_stopped: bool,
+
+        /// Must exactly equal PRUNE-VERIFIED-RELAY-BACKUPS
+        #[arg(long, requires = "execute", value_name = "PHRASE")]
+        confirm_prune: Option<String>,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -415,6 +465,7 @@ async fn main() {
         Commands::Memchain(command) => cmd_memchain(command).await,
         Commands::Pubkey { config, format } => cmd_pubkey(config, format).await,
         Commands::DirectoryReplica(command) => cmd_directory_replica(command).await,
+        Commands::RelayCustody(command) => cmd_relay_custody(command).await,
         Commands::RelaySmoke {
             server,
             health_url,
@@ -911,6 +962,34 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
         println!("   AOF Path:         {}", config.memchain.aof_path);
     }
     println!();
+    println!("Relay custody:");
+    println!(
+        "   Enabled:          {}",
+        config.memchain.chat_relay.enabled
+    );
+    if config.memchain.chat_relay.enabled {
+        // [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Surface policy during
+        // config validation without exposing artifact names or audit contents.
+        println!(
+            "   Retained backups: {}",
+            config
+                .memchain
+                .chat_relay
+                .custody_backup_retention_target_artifacts
+        );
+        println!(
+            "   Retained bytes:   {}",
+            config
+                .memchain
+                .chat_relay
+                .custody_backup_retention_target_bytes
+        );
+        println!(
+            "   Partial grace:    {}s",
+            config.memchain.chat_relay.custody_backup_partial_grace_secs
+        );
+    }
+    println!();
     println!("Discovery:");
     println!("   Enabled:          {}", config.discovery.enabled);
     if let Some(path) = &config.discovery.bootstrap_snapshot_path {
@@ -926,6 +1005,97 @@ async fn cmd_validate(config_path: PathBuf) -> anyhow::Result<()> {
     println!();
 
     Ok(())
+}
+
+/// Runs host-local relay custody maintenance without opening an HTTP surface.
+async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> {
+    // [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Keep this boundary local:
+    // it reads node-owned config/key material and never calls CMS or HTTP.
+    match command {
+        RelayCustodyCommands::Audit { config, json } => {
+            let server_config = load_relay_custody_config(&config).await?;
+            let receipt = ChatRelayService::audit_verified_backup_retention_for_config(
+                &server_config.memchain.chat_relay,
+            )
+            .map_err(|error| anyhow::anyhow!("relay custody audit failed: {error}"))?;
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!("Relay custody retention audit");
+                println!("════════════════════════════════════════");
+                println!("Retained backups:   {}", receipt.retained_count);
+                println!("Retained bytes:     {}", receipt.retained_bytes);
+                println!("Excess backups:     {}", receipt.excess_count);
+                println!("Excess bytes:       {}", receipt.excess_bytes);
+                println!("Interrupted files:  {}", receipt.partial_count);
+                println!("Interrupted bytes:  {}", receipt.partial_bytes);
+                println!("Budget exceeded:    {}", receipt.budget_exceeded);
+            }
+        }
+        RelayCustodyCommands::Prune {
+            config,
+            execute,
+            confirm_node_stopped,
+            confirm_prune,
+            json,
+        } => {
+            let server_config = load_relay_custody_config(&config).await?;
+            let identity_path = PathBuf::from(&server_config.server_key.key_file);
+            let identity = load_key(&identity_path).await.map_err(|_| {
+                anyhow::anyhow!("relay custody prune requires the node identity key")
+            })?;
+            let node_secret = derive_node_secret(&identity.to_bytes());
+            let request = ChatRelayBackupPruneRequest {
+                execute,
+                confirmation: confirm_prune,
+                node_stopped_confirmed: confirm_node_stopped,
+            };
+            let receipt = ChatRelayService::prune_verified_backup_retention_for_config(
+                &server_config.memchain.chat_relay,
+                &node_secret,
+                &request,
+            )
+            .map_err(|error| anyhow::anyhow!("relay custody prune failed: {error}"))?;
+            if json {
+                println!("{}", serde_json::to_string(&receipt)?);
+            } else {
+                println!(
+                    "Relay custody retention {}",
+                    if receipt.executed { "prune" } else { "dry-run" }
+                );
+                println!("════════════════════════════════════════");
+                println!("Planned backups:    {}", receipt.planned_backup_count);
+                println!("Planned bytes:      {}", receipt.planned_backup_bytes);
+                println!("Planned partials:   {}", receipt.planned_partial_count);
+                println!("Partial bytes:      {}", receipt.planned_partial_bytes);
+                println!("Deleted backups:    {}", receipt.deleted_backup_count);
+                println!("Deleted bytes:      {}", receipt.deleted_backup_bytes);
+                println!("Deleted partials:   {}", receipt.deleted_partial_count);
+                println!("Partial bytes freed: {}", receipt.deleted_partial_bytes);
+                println!("Remaining backups:  {}", receipt.remaining.retained_count);
+                println!("Remaining excess:   {}", receipt.remaining.excess_count);
+                if !receipt.executed {
+                    println!();
+                    println!("Dry-run only; no recovery artifact was deleted.");
+                    println!(
+                        "Execution requires --execute --confirm-node-stopped --confirm-prune {CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn load_relay_custody_config(config_path: &Path) -> anyhow::Result<ServerConfig> {
+    let config = ServerConfig::load(config_path).await?;
+    if !config.memchain.is_chat_relay_enabled() {
+        anyhow::bail!("relay custody maintenance requires chat relay to be enabled");
+    }
+    if config.memchain.chat_relay.db_path == ":memory:" {
+        anyhow::bail!("in-memory relay custody has no recoverable backup boundary");
+    }
+    Ok(config)
 }
 
 /// Runs read-only `MemChain` operator commands.
@@ -2044,6 +2214,73 @@ mod tests {
         assert!(Cli::try_parse_from(
             ["aeronyx-server", "relay-smoke", "--timeout-seconds", "121",]
         )
+        .is_err());
+    }
+
+    #[test]
+    fn relay_custody_cli_defaults_to_dry_run_and_gates_execution() {
+        // [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] The destructive form
+        // must be impossible to express accidentally through a single flag.
+        let audit =
+            Cli::try_parse_from(["aeronyx-server", "relay-custody", "audit", "--json"]).unwrap();
+        let Commands::RelayCustody(RelayCustodyCommands::Audit { config, json }) = audit.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert!(json);
+
+        let dry_run = Cli::try_parse_from(["aeronyx-server", "relay-custody", "prune"])
+            .expect("dry-run form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::Prune {
+            execute,
+            confirm_node_stopped,
+            confirm_prune,
+            ..
+        }) = dry_run.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert!(!execute);
+        assert!(!confirm_node_stopped);
+        assert!(confirm_prune.is_none());
+
+        let execute = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "prune",
+            "--execute",
+            "--confirm-node-stopped",
+            "--confirm-prune",
+            CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
+        ])
+        .expect("fully-confirmed execution form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::Prune {
+            execute,
+            confirm_node_stopped,
+            confirm_prune,
+            ..
+        }) = execute.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert!(execute);
+        assert!(confirm_node_stopped);
+        assert_eq!(
+            confirm_prune.as_deref(),
+            Some(CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION)
+        );
+
+        assert!(
+            Cli::try_parse_from(["aeronyx-server", "relay-custody", "prune", "--execute",])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "prune",
+            "--confirm-node-stopped",
+        ])
         .is_err());
     }
 

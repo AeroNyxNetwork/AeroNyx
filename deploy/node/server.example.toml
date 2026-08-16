@@ -6,6 +6,9 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Document bounded custody
+#   backup retention and the minimum partial-file grace used only by explicit
+#   host-local maintenance commands.
 # - [RUNTIME-IDENTITY-POLICY 2026-07-29 by Codex] Clarify that every pinned
 #   coordinator/witness identity must be external to the configured node.
 # - [FOLLOWER-CERTIFICATE-CONFIG 2026-07-29 by Codex] Document the independent
@@ -54,6 +57,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.11.0-node-deploy - Documented relay custody retention/prune policy.
 # v1.10.0-node-deploy - Documented runtime identity separation for trust pins.
 # v1.9.0-node-deploy - Documented follower checkpoint-certificate witness policy.
 # v1.8.0-node-deploy - Added Directory proof gossip maturity guidance.
@@ -344,3 +348,11 @@ peer_relay_requests_per_minute = 1200
 # [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] Post-signature fairness
 # ceiling for one verified direct-relay v2 previous-hop node identity.
 peer_relay_authenticated_requests_per_minute = 240
+# [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] These are planning targets,
+# not background deletion triggers. The host-local prune command defaults to
+# dry-run, always preserves the newest verified recovery image, and requires
+# explicit confirmation before deleting policy-excess artifacts.
+custody_backup_retention_target_artifacts = 8
+custody_backup_retention_target_bytes = 8589934592
+# Interrupted private SQLite files remain untouched for at least 24 hours.
+custody_backup_partial_grace_secs = 86400

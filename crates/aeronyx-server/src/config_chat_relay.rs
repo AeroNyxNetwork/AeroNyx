@@ -27,6 +27,8 @@
 //! replay and immutable re-verification of existing recovery artifacts.
 //! v1.10.0-CustodyBackupRetention — Added bounded count/byte retention targets
 //! and the non-destructive audit command contract for private recovery images.
+//! v1.11.0-CustodyBackupPrune — Added the minimum interrupted-backup grace
+//! period used only by explicit host-local dry-run/prune commands.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -87,7 +89,8 @@
 //! - [CHAT-RELAY-BACKUP-RETENTION 2026-08-16 by Codex] Verified recovery
 //!   images have count and aggregate-byte planning targets. The local service
 //!   audit verifies all images and reports excess capacity without deleting
-//!   it or publishing it over HTTP/CMS. Restore, prune, listing, and download
+//!   it or publishing it over HTTP/CMS. Explicit pruning is host-local,
+//!   confirmation-gated, and never automatic; restore, listing, and download
 //!   remain separate local operator concerns.
 //! - `expired_notification_ttl_secs`: after this TTL, undelivered expiry
 //!   notifications are silently discarded. Flutter client local timeout is
@@ -97,6 +100,7 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.11.0-CustodyBackupPrune — Host-local, confirmation-gated prune policy.
 //! v1.10.0-CustodyBackupRetention — Bounded private backup retention.
 //! v1.9.0-IdempotentCustodyBackup — Restart-safe audited backup replay.
 //! v1.8.0-VerifiedCustodyBackup — Declared the private recovery boundary.
@@ -145,6 +149,12 @@ pub const DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_BYTES: u64 = 8 * 1024 * 1024 *
 
 /// Defensive ceiling for the count planning target.
 pub const MAX_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS: usize = 64;
+
+/// Default grace period before an interrupted private backup may be pruned.
+pub const DEFAULT_CUSTODY_BACKUP_PARTIAL_GRACE_SECS: u64 = 24 * 60 * 60;
+
+/// Hard minimum grace period for interrupted private backup files.
+pub const MIN_CUSTODY_BACKUP_PARTIAL_GRACE_SECS: u64 = 24 * 60 * 60;
 
 // ============================================
 // ChatRelayConfig
@@ -195,6 +205,7 @@ pub const MAX_CUSTODY_BACKUP_RETENTION_TARGET_ARTIFACTS: usize = 64;
 /// peer_relay_authenticated_requests_per_minute = 240
 /// custody_backup_retention_target_artifacts = 8
 /// custody_backup_retention_target_bytes = 8589934592  # 8 GiB
+/// custody_backup_partial_grace_secs = 86400             # 24 hours
 /// ```
 ///
 /// ## Last Modified
@@ -362,6 +373,18 @@ pub struct ChatRelayConfig {
     /// `budget_exceeded`; no image is removed. Default: 8 GiB.
     #[serde(default = "default_custody_backup_retention_target_bytes")]
     pub custody_backup_retention_target_bytes: u64,
+
+    /// Minimum age before an interrupted private backup file becomes eligible
+    /// for an explicitly-confirmed host-local prune command.
+    ///
+    /// No timer is created by this setting. Dry-run and prune evaluate it only
+    /// when an operator invokes the local command. Default/minimum: 24 hours.
+    ///
+    /// [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] A lower value is rejected
+    /// so a clock adjustment or slow backup cannot make a live temporary file
+    /// immediately eligible for deletion.
+    #[serde(default = "default_custody_backup_partial_grace_secs")]
+    pub custody_backup_partial_grace_secs: u64,
 }
 
 // ── Default functions ──
@@ -417,6 +440,9 @@ fn default_custody_backup_retention_target_artifacts() -> usize {
 fn default_custody_backup_retention_target_bytes() -> u64 {
     DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_BYTES
 }
+fn default_custody_backup_partial_grace_secs() -> u64 {
+    DEFAULT_CUSTODY_BACKUP_PARTIAL_GRACE_SECS
+}
 
 impl Default for ChatRelayConfig {
     fn default() -> Self {
@@ -441,6 +467,7 @@ impl Default for ChatRelayConfig {
             custody_backup_retention_target_artifacts:
                 default_custody_backup_retention_target_artifacts(),
             custody_backup_retention_target_bytes: default_custody_backup_retention_target_bytes(),
+            custody_backup_partial_grace_secs: default_custody_backup_partial_grace_secs(),
         }
     }
 }
@@ -614,6 +641,13 @@ impl ChatRelayConfig {
             ));
         }
 
+        if self.custody_backup_partial_grace_secs < MIN_CUSTODY_BACKUP_PARTIAL_GRACE_SECS {
+            return Err(ServerError::config_invalid(
+                "memchain.chat_relay.custody_backup_partial_grace_secs",
+                format!("must be >= {MIN_CUSTODY_BACKUP_PARTIAL_GRACE_SECS}"),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -664,6 +698,10 @@ mod tests {
             cr.custody_backup_retention_target_bytes,
             DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_BYTES
         );
+        assert_eq!(
+            cr.custody_backup_partial_grace_secs,
+            DEFAULT_CUSTODY_BACKUP_PARTIAL_GRACE_SECS
+        );
     }
 
     #[test]
@@ -688,6 +726,7 @@ mod tests {
             peer_relay_authenticated_requests_per_minute: 0,
             custody_backup_retention_target_artifacts: 0,
             custody_backup_retention_target_bytes: 0,
+            custody_backup_partial_grace_secs: 0,
         };
         assert!(cr.validate().is_ok());
     }
@@ -905,6 +944,13 @@ mod tests {
             ..Default::default()
         };
         assert!(cr.validate().is_err());
+
+        let cr = ChatRelayConfig {
+            enabled: true,
+            custody_backup_partial_grace_secs: MIN_CUSTODY_BACKUP_PARTIAL_GRACE_SECS - 1,
+            ..Default::default()
+        };
+        assert!(cr.validate().is_err());
     }
 
     #[test]
@@ -930,6 +976,7 @@ peer_relay_requests_per_minute = 2400
 peer_relay_authenticated_requests_per_minute = 480
 custody_backup_retention_target_artifacts = 4
 custody_backup_retention_target_bytes = 4294967296
+custody_backup_partial_grace_secs = 172800
 "#;
         let cr: ChatRelayConfig = toml::from_str(toml_str).unwrap();
         assert!(cr.enabled);
@@ -950,6 +997,7 @@ custody_backup_retention_target_bytes = 4294967296
         assert_eq!(cr.peer_relay_authenticated_requests_per_minute, 480);
         assert_eq!(cr.custody_backup_retention_target_artifacts, 4);
         assert_eq!(cr.custody_backup_retention_target_bytes, 4_294_967_296);
+        assert_eq!(cr.custody_backup_partial_grace_secs, 172_800);
         assert!(cr.validate().is_ok());
     }
 
@@ -983,6 +1031,10 @@ peer_relay_requests_per_minute = 1200
         assert_eq!(
             cr.custody_backup_retention_target_bytes,
             DEFAULT_CUSTODY_BACKUP_RETENTION_TARGET_BYTES
+        );
+        assert_eq!(
+            cr.custody_backup_partial_grace_secs,
+            DEFAULT_CUSTODY_BACKUP_PARTIAL_GRACE_SECS
         );
         assert!(cr.validate().is_ok());
     }

@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Document host-local custody
+  backup audit, default dry-run, mandatory stop/confirmation gates, and the
+  private HMAC-chained aggregate maintenance log.
 - [NODE-ADMISSION-GATE 2026-08-02 by Codex] Document the bounded acceptance
   gate that prevents systemd-only starts from being reported as successful
   network admission.
@@ -114,6 +117,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.50.0-node-deploy - Documented confirmation-gated relay custody pruning.
 v1.49.0-node-deploy - Documented post-start network admission acceptance.
 v1.48.0-node-deploy - Documented secret-safe registration-code input for the
                      unified quickstart and lower-level installer.
@@ -663,6 +667,9 @@ enabled = true
 db_path = "/var/lib/aeronyx/chat_pending.db"
 peer_relay_requests_per_minute = 1200
 peer_relay_authenticated_requests_per_minute = 240
+custody_backup_retention_target_artifacts = 8
+custody_backup_retention_target_bytes = 8589934592
+custody_backup_partial_grace_secs = 86400
 ```
 
 <!-- [PEER-RELAY-ADMISSION 2026-08-15 by Codex] -->
@@ -695,6 +702,50 @@ To disable the blind relay capability:
 ```bash
 sudo ./deploy/node/aeronyx-node.sh chat-relay --disable-chat-relay --restart
 ```
+
+### Relay custody backup maintenance
+
+<!-- [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] -->
+Relay custody maintenance is host-local. It does not add a CMS, HTTP, or
+Nodeboard deletion endpoint. The retention settings are planning targets, not
+background timers, and the newest fully verified recovery image is always
+preserved even when it alone exceeds the configured byte target.
+
+Audit the private backup boundary without deleting or writing an audit record:
+
+```bash
+sudo /root/open/AeroNyx/target/release/aeronyx-server \
+  relay-custody audit -c /etc/aeronyx/server.toml --json
+```
+
+Preview the exact policy candidates. This is the default and deletes nothing:
+
+```bash
+sudo /root/open/AeroNyx/target/release/aeronyx-server \
+  relay-custody prune -c /etc/aeronyx/server.toml
+```
+
+Execution requires a maintenance window and all three explicit gates. Stop the
+node first so an older binary that predates the cross-process lock cannot be
+publishing a backup concurrently:
+
+```bash
+sudo systemctl stop aeronyx-server
+sudo /root/open/AeroNyx/target/release/aeronyx-server \
+  relay-custody prune -c /etc/aeronyx/server.toml \
+  --execute \
+  --confirm-node-stopped \
+  --confirm-prune PRUNE-VERIFIED-RELAY-BACKUPS
+sudo systemctl start aeronyx-server
+```
+
+The command deletes only fully re-verified policy-excess recovery images and
+interrupted private SQLite files older than
+`custody_backup_partial_grace_secs` (minimum 86,400 seconds). It rechecks file
+identity immediately before deletion, syncs the private directory afterward,
+and records only aggregate counts/bytes in a node-secret HMAC-chained local
+audit. Paths, filenames, operation IDs, identities, routes, and encrypted
+payload data are never written to that audit.
 
 ### No-exit OnionMiddle readiness
 
