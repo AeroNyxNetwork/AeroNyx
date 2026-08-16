@@ -144,7 +144,10 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", features = ["ring"], default-features = false }
 
 # v2.0.0: SQLite persistence for MemoryRecord (MRS-1)
-rusqlite = { version = "0.31", features = ["bundled"] }
+# [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] Use SQLite's online backup
+# API so a custody snapshot includes committed WAL pages without copying live
+# database sidecars or depending on a system sqlite3 executable.
+rusqlite = { version = "0.31", features = ["backup", "bundled"] }
 
 # v2.1.0: MVF + Rule Engine + RawLog encryption
 regex = "1.10"

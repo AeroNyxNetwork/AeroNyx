@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.8.0-StartupPhysicalIntegrity
+// Version: 2.9.0-VerifiedCustodyBackup
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -47,6 +47,8 @@
 //   WAL sidecars to the node service account on Unix hosts.
 //   v2.8.0-StartupPhysicalIntegrity — Rejects relay activation when SQLite's
 //   bounded startup quick-check cannot prove the custody file is intact.
+//   v2.9.0-VerifiedCustodyBackup — Added a private, transactionally consistent
+//   SQLite backup artifact with pre-publication physical and logical checks.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -70,6 +72,7 @@
 //   - Custody durability status: anonymous verified mode in relay health
 //   - Private custody file: Unix database/WAL material is owner-only
 //   - Startup physical integrity: corruption fails closed before migrations
+//   - Verified custody backup: WAL-aware, private, no-overwrite recovery image
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -141,10 +144,16 @@
 //   - [CHAT-RELAY-STARTUP-QUICK-CHECK 2026-08-16 by Codex] Run the physical
 //     integrity gate before WAL changes and schema migrations. Never log raw
 //     SQLite findings; they may disclose schema and storage-layout details.
+//   - [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] Never copy the live DB
+//     file directly: committed custody can still reside in its WAL. Backups
+//     must remain owner-only, validate physical integrity, usage counters and
+//     anonymous circuit safety state, then publish without replacing a prior
+//     artifact. Backup paths and raw SQLite findings are operator-private.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.9.0-VerifiedCustodyBackup — Atomic validated SQLite recovery artifact
 //   v2.8.0-StartupPhysicalIntegrity — Pre-migration SQLite quick-check gate
 //   v2.7.0-PrivateCustodyFile — Owner-only SQLite custody files on Unix
 //   v2.6.0-CustodyDurabilityStatus — Aggregate verified durability evidence
@@ -171,9 +180,10 @@
 // ============================================================================
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::{
     aead::{Aead, NewAead, Payload},
@@ -183,7 +193,10 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use hmac::{Hmac, Mac};
 use parking_lot::{Mutex, RwLock};
 use rand::{rngs::OsRng, RngCore};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    backup::{Backup, StepResult},
+    params, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -257,6 +270,12 @@ const DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION: i64 = 1;
 const DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE: &str = "direct_peer_relay_circuit_checkpoint";
 /// Minimum SQLite synchronous level permitted for acknowledged relay custody.
 const CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL: i64 = 2;
+/// Pages copied per online-backup step before SQLite releases its read lock.
+const CHAT_RELAY_BACKUP_PAGES_PER_STEP: i32 = 256;
+/// Maximum consecutive SQLite busy time before a backup fails closed.
+const CHAT_RELAY_BACKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Delay between bounded retries while another process holds a SQLite lock.
+const CHAT_RELAY_BACKUP_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 /// Small tolerated wall-clock adjustment before restart recovery fails closed.
 const DIRECT_PEER_RELAY_CIRCUIT_CLOCK_SKEW_SECS: u64 = 5;
 
@@ -1668,12 +1687,8 @@ pub struct ChatRelayService {
 
 impl ChatRelayService {
     #[cfg(unix)]
-    fn restrict_sqlite_file_permissions(path: &str) -> ChatRelayResult<()> {
+    fn restrict_sqlite_file_permissions(path: &Path) -> ChatRelayResult<()> {
         use std::os::unix::fs::PermissionsExt;
-
-        if path.is_empty() || path == ":memory:" {
-            return Ok(());
-        }
 
         // [CHAT-RELAY-PRIVATE-FILE 2026-08-16 by Codex] SQLite creates WAL
         // sidecars using the primary database mode. Tighten the primary file
@@ -1687,22 +1702,25 @@ impl ChatRelayService {
     }
 
     #[cfg(not(unix))]
-    fn restrict_sqlite_file_permissions(_path: &str) -> ChatRelayResult<()> {
+    fn restrict_sqlite_file_permissions(_path: &Path) -> ChatRelayResult<()> {
         Ok(())
     }
 
-    fn verify_sqlite_startup_integrity(conn: &Connection) -> ChatRelayResult<()> {
+    fn verify_sqlite_integrity(
+        conn: &Connection,
+        failure_field: &'static str,
+    ) -> ChatRelayResult<()> {
         // [CHAT-RELAY-STARTUP-QUICK-CHECK 2026-08-16 by Codex] `quick_check(1)`
         // bounds returned findings while still traversing the database. Both a
         // non-`ok` finding and an SQLite error collapse to one path-free bucket.
         let outcome = conn
             .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
             .map_err(|_| ChatRelayError::CorruptStoredData {
-                field: "sqlite_startup_integrity",
+                field: failure_field,
             })?;
         if outcome != "ok" {
             return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_startup_integrity",
+                field: failure_field,
             });
         }
         Ok(())
@@ -1727,25 +1745,261 @@ impl ChatRelayService {
         })
     }
 
+    fn backup_io_error(code: i32, message: &'static str) -> ChatRelayError {
+        ChatRelayError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some(message.to_string()),
+        ))
+    }
+
+    #[cfg(unix)]
+    fn reserve_private_backup_file(path: &Path) -> ChatRelayResult<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map(drop)
+            .map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CANTOPEN,
+                    "unable to reserve private relay backup file",
+                )
+            })
+    }
+
+    #[cfg(not(unix))]
+    fn reserve_private_backup_file(path: &Path) -> ChatRelayResult<()> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map(drop)
+            .map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CANTOPEN,
+                    "unable to reserve private relay backup file",
+                )
+            })
+    }
+
+    #[cfg(unix)]
+    fn create_backup_directory(path: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700).create(path)
+    }
+
+    #[cfg(not(unix))]
+    fn create_backup_directory(path: &Path) -> std::io::Result<()> {
+        std::fs::create_dir(path)
+    }
+
+    #[cfg(unix)]
+    fn restrict_backup_directory_permissions(path: &Path) -> ChatRelayResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_PERM,
+                "unable to restrict relay backup directory permissions",
+            )
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn restrict_backup_directory_permissions(_path: &Path) -> ChatRelayResult<()> {
+        Ok(())
+    }
+
+    fn ensure_private_backup_directory(path: &Path) -> ChatRelayResult<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_CANTOPEN,
+                        "relay backup boundary is not a private directory",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The active database parent already exists. A single-level,
+                // owner-private create avoids a world-readable umask window.
+                Self::create_backup_directory(path).map_err(|_| {
+                    Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_CANTOPEN,
+                        "unable to create private relay backup directory",
+                    )
+                })?;
+            }
+            Err(_) => {
+                return Err(Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CANTOPEN,
+                    "unable to inspect private relay backup directory",
+                ));
+            }
+        }
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "unable to inspect private relay backup directory",
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "relay backup boundary is not a private directory",
+            ));
+        }
+        Self::restrict_backup_directory_permissions(path)
+    }
+
+    fn remove_sqlite_artifact(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(sidecar));
+        }
+    }
+
+    #[cfg(unix)]
+    fn sync_backup_parent(parent: &Path) -> ChatRelayResult<()> {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_IOERR,
+                    "unable to synchronize relay backup directory",
+                )
+            })
+    }
+
+    #[cfg(not(unix))]
+    fn sync_backup_parent(_parent: &Path) -> ChatRelayResult<()> {
+        Ok(())
+    }
+
+    fn copy_sqlite_backup(
+        source: &Connection,
+        destination: &mut Connection,
+    ) -> ChatRelayResult<()> {
+        let backup = Backup::new(source, destination)?;
+        let mut busy_since = None;
+        loop {
+            match backup.step(CHAT_RELAY_BACKUP_PAGES_PER_STEP)? {
+                StepResult::Done => return Ok(()),
+                StepResult::More => busy_since = None,
+                StepResult::Busy | StepResult::Locked => {
+                    let started = busy_since.get_or_insert_with(Instant::now);
+                    if started.elapsed() >= CHAT_RELAY_BACKUP_BUSY_TIMEOUT {
+                        return Err(Self::backup_io_error(
+                            rusqlite::ffi::SQLITE_BUSY,
+                            "relay backup remained busy",
+                        ));
+                    }
+                    std::thread::sleep(CHAT_RELAY_BACKUP_BUSY_RETRY_DELAY);
+                }
+                _ => {
+                    return Err(Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_ERROR,
+                        "unsupported relay backup step result",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn verify_sqlite_backup_logical_integrity(conn: &Connection) -> ChatRelayResult<()> {
+        let installed_version = conn
+            .query_row(
+                "SELECT schema_version
+                 FROM relay_schema_features
+                 WHERE feature = ?1",
+                params![DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if installed_version != Some(DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION) {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "sqlite_backup_schema_sentinel",
+            });
+        }
+
+        let _ = Self::read_direct_peer_relay_circuit_checkpoint(conn, now_secs())?;
+
+        let stored_usage = Self::read_storage_usage(conn)?;
+        let canonical_usage = Self::read_canonical_storage_usage(conn)?;
+        if stored_usage != canonical_usage {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "sqlite_backup_storage_usage",
+            });
+        }
+
+        let (last_sequence, max_sequence, missing_sequences) = conn.query_row(
+            "SELECT
+                (SELECT last_sequence FROM relay_queue_sequence WHERE singleton = 1),
+                (SELECT COALESCE(MAX(queue_sequence), 0) FROM pending_messages),
+                (SELECT COUNT(*) FROM pending_messages WHERE queue_sequence IS NULL)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        if last_sequence < 0
+            || max_sequence < 0
+            || missing_sequences != 0
+            || last_sequence < max_sequence
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "sqlite_backup_queue_sequence",
+            });
+        }
+        Ok(())
+    }
+
+    fn verify_sqlite_backup(conn: &Connection) -> ChatRelayResult<()> {
+        Self::verify_sqlite_integrity(conn, "sqlite_backup_integrity")?;
+        Self::verify_sqlite_backup_logical_integrity(conn).map_err(|_| {
+            ChatRelayError::CorruptStoredData {
+                field: "sqlite_backup_logical_integrity",
+            }
+        })
+    }
+
     /// Creates a new `ChatRelayService`, opening (or creating) the SQLite database.
     pub fn new(config: ChatRelayConfig, node_secret: [u8; 32]) -> ChatRelayResult<Self> {
         if let Some(parent) = std::path::Path::new(&config.db_path).parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| {
+                // [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] A raw IO
+                // error can include an operator path. Preserve one stable,
+                // path-free failure at this storage trust boundary.
+                std::fs::create_dir_all(parent).map_err(|_| {
                     rusqlite::Error::SqliteFailure(
                         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
-                        Some(format!("Cannot create dir {}: {}", parent.display(), e)),
+                        Some("unable to create relay database directory".to_string()),
                     )
                 })?;
             }
         }
 
         let conn = Connection::open(&config.db_path)?;
-        Self::restrict_sqlite_file_permissions(&config.db_path)?;
+        if config.db_path != ":memory:" {
+            Self::restrict_sqlite_file_permissions(Path::new(&config.db_path))?;
+        }
         // A short bounded wait absorbs transient locks from an operator backup
         // or diagnostic reader without allowing relay requests to hang forever.
         conn.busy_timeout(Duration::from_secs(5))?;
-        Self::verify_sqlite_startup_integrity(&conn)?;
+        Self::verify_sqlite_integrity(&conn, "sqlite_startup_integrity")?;
         let synchronous_level = Self::configure_sqlite_durability(&conn)?;
 
         let dedup_capacity = config.dedup_lru_capacity;
@@ -1913,39 +2167,50 @@ impl ChatRelayService {
         Ok(())
     }
 
+    fn read_direct_peer_relay_circuit_checkpoint(
+        conn: &Connection,
+        now: u64,
+    ) -> ChatRelayResult<(DirectPeerRelayCircuit, bool)> {
+        // [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] Startup recovery
+        // and backup certification must validate exactly the same anonymous
+        // checkpoint semantics. Keep this reader free of in-memory locks.
+        let row = conn.query_row(
+            "SELECT schema_version, state, successful_probes, deadline_at,
+                    opened_total, blocked_total, half_open_attempted_total,
+                    half_open_succeeded_total, half_open_failed_total,
+                    recovered_total, last_transition_at,
+                    checkpoint_failures_total, last_checkpoint_failure_at,
+                    updated_at
+             FROM relay_direct_peer_circuit_checkpoint
+             WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(DirectPeerRelayCircuitCheckpointRow {
+                    schema_version: row.get(0)?,
+                    state: row.get(1)?,
+                    successful_probes: row.get(2)?,
+                    deadline_at: row.get(3)?,
+                    opened_total: row.get(4)?,
+                    blocked_total: row.get(5)?,
+                    half_open_attempted_total: row.get(6)?,
+                    half_open_succeeded_total: row.get(7)?,
+                    half_open_failed_total: row.get(8)?,
+                    recovered_total: row.get(9)?,
+                    last_transition_at: row.get(10)?,
+                    checkpoint_failures_total: row.get(11)?,
+                    last_checkpoint_failure_at: row.get(12)?,
+                    updated_at: row.get(13)?,
+                })
+            },
+        )?;
+        row.into_circuit(now)
+    }
+
     fn restore_direct_peer_relay_circuit(&self, now: u64) -> ChatRelayResult<()> {
         let mut circuit = {
             let conn = self.conn.lock();
-            let row = conn.query_row(
-                "SELECT schema_version, state, successful_probes, deadline_at,
-                        opened_total, blocked_total, half_open_attempted_total,
-                        half_open_succeeded_total, half_open_failed_total,
-                        recovered_total, last_transition_at,
-                        checkpoint_failures_total, last_checkpoint_failure_at,
-                        updated_at
-                 FROM relay_direct_peer_circuit_checkpoint
-                 WHERE singleton = 1",
-                [],
-                |row| {
-                    Ok(DirectPeerRelayCircuitCheckpointRow {
-                        schema_version: row.get(0)?,
-                        state: row.get(1)?,
-                        successful_probes: row.get(2)?,
-                        deadline_at: row.get(3)?,
-                        opened_total: row.get(4)?,
-                        blocked_total: row.get(5)?,
-                        half_open_attempted_total: row.get(6)?,
-                        half_open_succeeded_total: row.get(7)?,
-                        half_open_failed_total: row.get(8)?,
-                        recovered_total: row.get(9)?,
-                        last_transition_at: row.get(10)?,
-                        checkpoint_failures_total: row.get(11)?,
-                        last_checkpoint_failure_at: row.get(12)?,
-                        updated_at: row.get(13)?,
-                    })
-                },
-            )?;
-            let (mut circuit, needs_rewrite) = row.into_circuit(now)?;
+            let (mut circuit, needs_rewrite) =
+                Self::read_direct_peer_relay_circuit_checkpoint(&conn, now)?;
             if needs_rewrite {
                 circuit.mark_checkpoint_persisted(now);
                 Self::write_direct_peer_circuit_checkpoint(&conn, &circuit, now)?;
@@ -2355,6 +2620,7 @@ impl ChatRelayService {
         // Reconcile from canonical rows at every startup. This makes upgrades
         // and restored databases deterministic even if an older process never
         // maintained the aggregate usage row.
+        let usage = Self::read_canonical_storage_usage(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO relay_storage_usage (
                 singleton,
@@ -2363,14 +2629,13 @@ impl ChatRelayService {
                 pending_blob_count,
                 pending_blob_bytes
              )
-             SELECT
-                1,
-                (SELECT COUNT(*) FROM pending_messages WHERE status = 0),
-                (SELECT COALESCE(SUM(LENGTH(envelope)), 0)
-                   FROM pending_messages WHERE status = 0),
-                (SELECT COUNT(*) FROM pending_blobs),
-                (SELECT COALESCE(SUM(size), 0) FROM pending_blobs)",
-            [],
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            params![
+                sqlite_integer(usage.pending_messages, "pending_message_count")?,
+                sqlite_integer(usage.pending_message_bytes, "pending_message_bytes")?,
+                sqlite_integer(usage.pending_blobs, "pending_blob_count")?,
+                sqlite_integer(usage.pending_blob_bytes, "pending_blob_bytes")?,
+            ],
         )?;
         Ok(())
     }
@@ -2512,7 +2777,7 @@ impl ChatRelayService {
     // ============================================
 
     fn read_storage_usage(conn: &Connection) -> ChatRelayResult<ChatRelayStorageUsage> {
-        conn.query_row(
+        let counters = conn.query_row(
             "SELECT
                 pending_message_count,
                 pending_message_bytes,
@@ -2522,15 +2787,55 @@ impl ChatRelayService {
              WHERE singleton = 1",
             [],
             |row| {
-                Ok(ChatRelayStorageUsage {
-                    pending_messages: nonnegative_sqlite_counter(row.get(0)?),
-                    pending_message_bytes: nonnegative_sqlite_counter(row.get(1)?),
-                    pending_blobs: nonnegative_sqlite_counter(row.get(2)?),
-                    pending_blob_bytes: nonnegative_sqlite_counter(row.get(3)?),
-                })
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
             },
-        )
-        .map_err(ChatRelayError::from)
+        )?;
+        Ok(ChatRelayStorageUsage {
+            pending_messages: nonnegative_sqlite_value(counters.0, "pending_message_count")?,
+            pending_message_bytes: nonnegative_sqlite_value(counters.1, "pending_message_bytes")?,
+            pending_blobs: nonnegative_sqlite_value(counters.2, "pending_blob_count")?,
+            pending_blob_bytes: nonnegative_sqlite_value(counters.3, "pending_blob_bytes")?,
+        })
+    }
+
+    fn read_canonical_storage_usage(conn: &Connection) -> ChatRelayResult<ChatRelayStorageUsage> {
+        let counters = conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM pending_messages WHERE status = 0),
+                (SELECT COALESCE(SUM(LENGTH(envelope)), 0)
+                   FROM pending_messages WHERE status = 0),
+                (SELECT COUNT(*) FROM pending_blobs),
+                (SELECT COALESCE(SUM(size), 0) FROM pending_blobs)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+        Ok(ChatRelayStorageUsage {
+            pending_messages: nonnegative_sqlite_value(
+                counters.0,
+                "canonical_pending_message_count",
+            )?,
+            pending_message_bytes: nonnegative_sqlite_value(
+                counters.1,
+                "canonical_pending_message_bytes",
+            )?,
+            pending_blobs: nonnegative_sqlite_value(counters.2, "canonical_pending_blob_count")?,
+            pending_blob_bytes: nonnegative_sqlite_value(
+                counters.3,
+                "canonical_pending_blob_bytes",
+            )?,
+        })
     }
 
     fn quarantine_retention_cutoff(&self, now: i64) -> i64 {
@@ -4199,11 +4504,107 @@ impl ChatRelayService {
     ///
     /// # Errors
     ///
-    /// Returns a SQLite error if the reconciled singleton usage row cannot be
+    /// Returns a `SQLite` error if the reconciled singleton usage row cannot be
     /// read. Callers must treat that as unavailable telemetry, not zero usage.
     pub fn storage_usage(&self) -> ChatRelayResult<ChatRelayStorageUsage> {
         let conn = self.conn.lock();
         Self::read_storage_usage(&conn)
+    }
+
+    /// Creates an owner-private, verified recovery image of relay custody.
+    ///
+    /// The artifact is confined to `.aeronyx-relay-backups` beside the active
+    /// database; callers cannot redirect encrypted custody to an arbitrary
+    /// path. `SQLite`'s online-backup API includes committed WAL pages. Before
+    /// publication, the isolated image must pass physical integrity, schema
+    /// sentinel, canonical usage, queue sequence, and anonymous circuit-state
+    /// validation. Existing artifacts are never replaced.
+    ///
+    /// [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] The source connection
+    /// mutex remains held only during page copying. Validation and publication
+    /// operate on the isolated artifact and never inspect E2E ciphertext,
+    /// wallet identities, routes, or message identifiers. This is synchronous
+    /// storage work; async operator surfaces must invoke it through
+    /// `spawn_blocking`, never from an Axum request executor directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free SQLite/storage error if the service uses an
+    /// in-memory database, the private backup area cannot be secured, the
+    /// source remains locked, validation fails, or durable publication fails.
+    pub fn create_verified_backup(&self) -> ChatRelayResult<PathBuf> {
+        if self.config.db_path == ":memory:" {
+            return Err(Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CANTOPEN,
+                "in-memory relay storage has no private backup boundary",
+            ));
+        }
+        let source_path = Path::new(&self.config.db_path);
+        let source_parent = source_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let backup_directory = source_parent.join(".aeronyx-relay-backups");
+        Self::ensure_private_backup_directory(&backup_directory)?;
+
+        let created_at = now_secs();
+        let nonce = rand::random::<u64>();
+        let destination =
+            backup_directory.join(format!("relay-custody-{created_at}-{nonce:016x}.sqlite"));
+        let temporary =
+            backup_directory.join(format!(".relay-custody-{created_at}-{nonce:016x}.tmp"));
+        Self::reserve_private_backup_file(&temporary)?;
+
+        let mut destination_published = false;
+        let outcome = (|| {
+            let mut backup_conn = Connection::open(&temporary).map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CANTOPEN,
+                    "unable to open private relay backup file",
+                )
+            })?;
+            Self::restrict_sqlite_file_permissions(&temporary)?;
+            {
+                let source = self.conn.lock();
+                Self::copy_sqlite_backup(&source, &mut backup_conn)?;
+            }
+            Self::verify_sqlite_backup(&backup_conn)?;
+            drop(backup_conn);
+
+            Self::restrict_sqlite_file_permissions(&temporary)?;
+            std::fs::File::open(&temporary)
+                .and_then(|file| file.sync_all())
+                .map_err(|_| {
+                    Self::backup_io_error(
+                        rusqlite::ffi::SQLITE_IOERR,
+                        "unable to synchronize relay backup file",
+                    )
+                })?;
+            std::fs::hard_link(&temporary, &destination).map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_CONSTRAINT,
+                    "unable to publish relay backup without replacement",
+                )
+            })?;
+            destination_published = true;
+            Self::restrict_sqlite_file_permissions(&destination)?;
+            std::fs::remove_file(&temporary).map_err(|_| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_IOERR,
+                    "unable to finalize relay backup publication",
+                )
+            })?;
+            Self::sync_backup_parent(&backup_directory)?;
+            Ok(destination.clone())
+        })();
+
+        Self::remove_sqlite_artifact(&temporary);
+        if outcome.is_err() && destination_published {
+            // Never remove a name that `hard_link` reported as pre-existing:
+            // this invocation owns the destination only after publication.
+            Self::remove_sqlite_artifact(&destination);
+        }
+        outcome
     }
 }
 
@@ -4446,9 +4847,8 @@ mod tests {
         let db_path = unique_test_db_path("missing-private-custody-file");
         remove_test_db(&db_path);
 
-        let error =
-            ChatRelayService::restrict_sqlite_file_permissions(db_path.to_string_lossy().as_ref())
-                .expect_err("unrestrictable relay database must fail closed");
+        let error = ChatRelayService::restrict_sqlite_file_permissions(&db_path)
+            .expect_err("unrestrictable relay database must fail closed");
         assert_eq!(error.reason_bucket(), "sqlite_error");
         let rendered = error.to_string();
         assert!(rendered.contains("unable to restrict relay database permissions"));
@@ -4490,6 +4890,195 @@ mod tests {
         assert!(!rendered.contains(db_path.to_string_lossy().as_ref()));
 
         remove_test_db(&db_path);
+    }
+
+    #[test]
+    fn verified_backup_restores_committed_custody_and_circuit_state() {
+        // [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] Disable automatic
+        // checkpoints so this drill proves the backup API reads committed WAL
+        // pages rather than merely copying the primary database file.
+        let directory = tempfile::tempdir().expect("verified backup directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut source_config = test_config();
+        source_config.db_path = source_path.to_string_lossy().into_owned();
+        let secret = derive_node_secret(&[0x8Au8; 32]);
+        let identity = IdentityKeyPair::generate();
+        let receiver = [0x8Bu8; 32];
+        let first = make_envelope(&identity, receiver);
+        let second = make_envelope(&identity, receiver);
+        let blob_data = b"opaque-encrypted-backup-blob";
+        let blob_hash = Sha256::digest(blob_data);
+        let mut blob_hash_array = [0u8; 32];
+        blob_hash_array.copy_from_slice(&blob_hash);
+        let circuit_started_at = now_secs();
+
+        let source = ChatRelayService::new(source_config.clone(), secret)
+            .expect("create source relay store");
+        source
+            .conn
+            .lock()
+            .execute_batch("PRAGMA wal_autocheckpoint=0")
+            .expect("keep committed custody in WAL");
+        source.store_pending(&first).expect("store pending message");
+        let blob_id = source
+            .put_blob(
+                &identity.public_key_bytes(),
+                &receiver,
+                blob_data,
+                &blob_hash_array,
+            )
+            .expect("store encrypted blob");
+        for offset in 0..3 {
+            complete_direct_peer_test_delivery(
+                &source,
+                circuit_started_at.saturating_add(offset),
+                false,
+                false,
+                true,
+            );
+        }
+        assert_eq!(source.peer_status().direct_peer_retry.circuit.state, "open");
+
+        let backup_path = source
+            .create_verified_backup()
+            .expect("create verified backup");
+        source
+            .store_pending(&second)
+            .expect("store post-snapshot message");
+        drop(source);
+
+        let mut restored_config = source_config.clone();
+        restored_config.db_path = backup_path.to_string_lossy().into_owned();
+        let restored = ChatRelayService::new(restored_config, secret)
+            .expect("activate verified recovery image");
+        let (messages, has_more) = restored
+            .pull_pending(&receiver, 0, &[0u8; 16], 10)
+            .expect("read restored custody");
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, first.message_id);
+        assert_eq!(messages[0].envelope.ciphertext, first.ciphertext);
+        assert_eq!(restored.get_blob(&blob_id).unwrap(), blob_data);
+        assert_eq!(
+            restored.storage_usage().unwrap(),
+            ChatRelayStorageUsage {
+                pending_messages: 1,
+                pending_message_bytes: encode_envelope(&first).unwrap().len() as u64,
+                pending_blobs: 1,
+                pending_blob_bytes: blob_data.len() as u64,
+            }
+        );
+        let circuit = restored.peer_status().direct_peer_retry.circuit;
+        assert_eq!(circuit.state, "open");
+        assert!(circuit.restart_protected);
+        assert_eq!(circuit.opened_total, 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let backup_mode = std::fs::metadata(&backup_path)
+                .expect("inspect backup file")
+                .permissions()
+                .mode()
+                & 0o777;
+            let backup_directory_mode = std::fs::metadata(backup_path.parent().unwrap())
+                .expect("inspect backup directory")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(backup_mode, 0o600);
+            assert_eq!(backup_directory_mode, 0o700);
+        }
+
+        drop(restored);
+        remove_test_db(&backup_path);
+        remove_test_db(&source_path);
+    }
+
+    #[test]
+    fn verified_backup_rejects_inconsistent_usage_without_partial_artifact() {
+        let directory = tempfile::tempdir().expect("counter mismatch backup directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let source = make_service_with_config(config);
+        let identity = IdentityKeyPair::generate();
+        source
+            .store_pending(&make_envelope(&identity, [0x8Cu8; 32]))
+            .expect("store canonical custody row");
+        source
+            .conn
+            .lock()
+            .execute(
+                "UPDATE relay_storage_usage
+                 SET pending_message_count = 0, pending_message_bytes = 0
+                 WHERE singleton = 1",
+                [],
+            )
+            .expect("tamper derived usage counters");
+
+        let error = source
+            .create_verified_backup()
+            .expect_err("inconsistent backup must fail closed");
+        assert!(matches!(
+            error,
+            ChatRelayError::CorruptStoredData {
+                field: "sqlite_backup_logical_integrity"
+            }
+        ));
+        let backup_directory = source_path.parent().unwrap().join(".aeronyx-relay-backups");
+        assert_eq!(
+            std::fs::read_dir(&backup_directory)
+                .expect("inspect private backup directory")
+                .count(),
+            0,
+            "failed certification must remove all partial artifacts"
+        );
+
+        drop(source);
+        remove_test_db(&source_path);
+    }
+
+    #[test]
+    fn verified_backup_rejects_in_memory_storage() {
+        let error = make_service()
+            .create_verified_backup()
+            .expect_err("in-memory relay must not escape its storage boundary");
+        assert_eq!(error.reason_bucket(), "sqlite_error");
+        assert!(error
+            .to_string()
+            .contains("in-memory relay storage has no private backup boundary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_backup_rejects_symlinked_storage_boundary() {
+        use std::os::unix::fs::symlink;
+
+        // [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] A process with
+        // access to the database parent must not redirect ciphertext custody
+        // through a pre-created symlink before an operator backup runs.
+        let directory = tempfile::tempdir().expect("symlink backup boundary directory");
+        let source_path = directory.path().join("source.sqlite");
+        let outside = directory.path().join("redirect-target");
+        std::fs::create_dir(&outside).expect("create redirect target");
+        symlink(&outside, directory.path().join(".aeronyx-relay-backups"))
+            .expect("install backup boundary symlink");
+
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let source = make_service_with_config(config);
+        let error = source
+            .create_verified_backup()
+            .expect_err("symlinked backup boundary must fail closed");
+        assert_eq!(error.reason_bucket(), "sqlite_error");
+        assert_eq!(
+            std::fs::read_dir(&outside)
+                .expect("inspect redirect target")
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -5729,6 +6318,29 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn storage_usage_rejects_negative_durable_counter() {
+        // [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] The previous
+        // conversion silently mapped a negative tampered counter to zero,
+        // which could disguise unavailable quota state as spare capacity.
+        let svc = make_service();
+        svc.conn
+            .lock()
+            .execute_batch(
+                "PRAGMA ignore_check_constraints=ON;
+                 UPDATE relay_storage_usage
+                 SET pending_blob_bytes = -1
+                 WHERE singleton = 1;",
+            )
+            .expect("install negative usage fixture");
+        assert!(matches!(
+            svc.storage_usage(),
+            Err(ChatRelayError::CorruptStoredData {
+                field: "pending_blob_bytes"
+            })
+        ));
     }
 
     #[test]

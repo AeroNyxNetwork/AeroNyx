@@ -21,6 +21,8 @@
 //! durability boundary required by signed custody acknowledgements.
 //! v1.7.0-StartupCustodyIntegrity — Documented owner-only Unix storage and the
 //! pre-migration SQLite physical-integrity activation gate.
+//! v1.8.0-VerifiedCustodyBackup — Documented the WAL-aware, owner-private
+//! recovery artifact boundary exposed by the relay service.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -71,6 +73,13 @@
 //!   Unix custody files to the node account and runs a bounded SQLite physical
 //!   integrity check before WAL changes or migrations. Failure disables relay;
 //!   raw findings and configured paths must not enter logs or public health.
+//! - [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] Verified backups are
+//!   created only inside the owner-private `.aeronyx-relay-backups` directory
+//!   beside `db_path`; callers cannot supply an arbitrary destination. The
+//!   core service does not schedule backups or expose them over HTTP. A future
+//!   operator command must add authorization, audit and retention policy
+//!   without weakening this storage boundary, and must use `spawn_blocking`
+//!   because snapshot creation is synchronous filesystem and SQLite work.
 //! - `expired_notification_ttl_secs`: after this TTL, undelivered expiry
 //!   notifications are silently discarded. Flutter client local timeout is
 //!   the fallback.
@@ -79,6 +88,7 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.8.0-VerifiedCustodyBackup — Declared the private recovery boundary.
 //! v1.7.0-StartupCustodyIntegrity — Fail-closed physical storage activation.
 //! v1.6.0-DurableCustody — Declared FULL durability a custody invariant.
 //! v1.5.0-AuthenticatedPeerFairness — Added configurable post-signature
@@ -140,7 +150,9 @@ pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
 /// WAL + FULL durability before it can acknowledge encrypted custody; this is
 /// intentionally not an operator-tunable downgrade. On Unix, the database and
 /// WAL sidecars are owner-only; startup physical-integrity failure rejects
-/// activation before migrations or custody receipts.
+/// activation before migrations or custody receipts. Verified recovery images
+/// are WAL-aware and remain confined beside this database in an owner-private
+/// directory; no automatic schedule or remote download interface is enabled.
 ///
 /// ## Configuration Example
 /// ```toml
@@ -164,6 +176,7 @@ pub const DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE: u32 = 240;
 /// ```
 ///
 /// ## Last Modified
+/// v1.8.0-VerifiedCustodyBackup — Private WAL-aware recovery artifacts.
 /// v1.7.0-StartupCustodyIntegrity — Owner-only files and startup quick-check.
 /// v1.2.0-GlobalStorageQuotas — Added node-wide durable queue ceilings.
 /// v1.1.0-ChatRelay — Initial implementation.
