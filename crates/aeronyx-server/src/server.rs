@@ -5464,7 +5464,11 @@ impl Server {
         let cmd_handler = CommandHandler::new(cmd_rx, Arc::clone(&mgmt_client))
             .with_session_control(Arc::clone(sessions), session_event_sender.clone())
             .with_deny_list(Arc::clone(&deny_list))
-            .with_node_policy(Arc::clone(&node_policy));
+            .with_node_policy(Arc::clone(&node_policy))
+            // [CHAT-RELAY-BACKUP-COMMAND 2026-08-16 by Codex] The signed CMS
+            // command pipeline may trigger a verified local backup, but no
+            // public API gains access to the resulting custody artifact.
+            .with_chat_relay(chat_relay.clone());
         let cmd_shutdown = self.shutdown_tx.subscribe();
         let command_handler_task = tokio::spawn(async move {
             cmd_handler.run(cmd_shutdown).await;

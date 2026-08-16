@@ -525,6 +525,8 @@ pub struct NodePolicy {
 /// - `"restart_service"` — Restart the fixed VPN service after audit reporting
 /// - `"apply_policy"` — Acknowledge and report the current runtime policy snapshot
 /// - `"two_hop_smoke"` — Trigger the local aggregate two-hop relay smoke check
+/// [CHAT-RELAY-BACKUP-COMMAND 2026-08-16 by Codex]
+/// - `"create_custody_backup"` — Create one verified, node-private relay recovery image
 ///
 /// ⚠️ `id` MUST be included in all status reports back to CMS.
 /// Unknown actions should be logged and reported as `failed`, never panic.

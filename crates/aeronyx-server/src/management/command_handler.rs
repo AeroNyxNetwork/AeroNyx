@@ -14,6 +14,9 @@
 //!   plane.
 //! - [SYSTEMD-CHILD-ISOLATION 2026-08-11 by Codex] Routes every node-operation
 //!   subprocess through the crate-owned environment isolation boundary.
+//! - [CHAT-RELAY-BACKUP-COMMAND 2026-08-16 by Codex] Added the audited,
+//!   confirmation-gated command surface for verified node-private relay
+//!   custody backups. Backup artifacts remain unavailable over HTTP.
 //!
 //! ## Main Functionality
 //! - `CommandHandler`: Background async task that consumes commands
@@ -24,6 +27,8 @@
 //! - Runs the operator two-hop smoke command through the local-only Rust API
 //!   and reports aggregate proof counters without route IDs, endpoints,
 //!   payloads, receiver keys, client IPs, or social graph metadata.
+//! - Creates verified relay custody backups through synchronous storage work
+//!   isolated with `spawn_blocking`; CMS receives no filesystem paths.
 //!
 //! ## Main Logical Flow
 //! 1. `HeartbeatReporter` receives `HeartbeatResponse` with `commands`
@@ -53,6 +58,7 @@
 //! v1.5.0 - VPN-only operations dispatch
 //! v1.6.0 - Added two_hop_smoke aggregate relay proof command
 //! v1.7.0 - Removed inherited systemd authority from operation subprocesses
+//! v1.8.0 - Added audited create_custody_backup operator command
 //! ============================================
 
 use std::collections::HashSet;
@@ -68,7 +74,7 @@ use super::client::ManagementClient;
 use super::models::{Command, CommandExecutionStatus, CommandStatusReport};
 use super::reporter::{SessionEventSender, SessionQuality};
 use crate::isolated_child_command;
-use crate::services::{DenyList, DenyReason, NodePolicyRuntime, SessionManager};
+use crate::services::{ChatRelayService, DenyList, DenyReason, NodePolicyRuntime, SessionManager};
 use aeronyx_common::types::SessionId;
 
 // ============================================
@@ -82,6 +88,12 @@ const VPN_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const TWO_HOP_SMOKE_TIMEOUT: Duration = Duration::from_secs(20);
 const TWO_HOP_SMOKE_URL: &str = "http://127.0.0.1:8421/api/discovery/smoke/two-hop";
 const MAX_DIAGNOSTIC_MESSAGE: usize = 3800;
+const CUSTODY_BACKUP_CONFIRMATION: &str = "create";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CustodyBackupReceipt {
+    size_bytes: u64,
+}
 
 fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) -> SessionQuality {
     let rejects = snap.replays_rejected + snap.too_old_rejected;
@@ -128,6 +140,7 @@ fn session_quality_from_stats(snap: &crate::services::session::StatsSnapshot) ->
 ///       │     ├── "refresh_config"  → validate management config
 ///       │     ├── "kick_session"    → disconnect one active tunnel
 ///       │     ├── "two_hop_smoke"   → local aggregate relay proof trigger
+///       │     ├── "create_custody_backup" → verified private recovery image
 ///       │     ├── "ban_wallet"      → block a wallet on this node
 ///       │     ├── "unban_wallet"    → remove a wallet block
 ///       │     ├── "restart_service" → restart the fixed VPN service
@@ -155,6 +168,10 @@ pub struct CommandHandler {
     /// Runtime operator policy used by handshake and bandwidth hot paths.
     node_policy: Option<Arc<NodePolicyRuntime>>,
 
+    /// Optional blind relay custody store used by the audited backup command.
+    /// The service owns the only permitted backup directory boundary.
+    chat_relay: Option<Arc<ChatRelayService>>,
+
     /// Set of already-processed command IDs for deduplication.
     /// CMS may resend commands in consecutive heartbeats until
     /// it receives an acknowledgement.
@@ -181,6 +198,7 @@ impl CommandHandler {
             session_events: SessionEventSender::disabled(),
             deny_list: None,
             node_policy: None,
+            chat_relay: None,
             processed_ids: HashSet::with_capacity(128),
             processed_ids_order: Vec::with_capacity(128),
         }
@@ -203,6 +221,17 @@ impl CommandHandler {
 
     pub fn with_node_policy(mut self, node_policy: Arc<NodePolicyRuntime>) -> Self {
         self.node_policy = Some(node_policy);
+        self
+    }
+
+    /// Injects the optional relay custody service into the management plane.
+    ///
+    /// [CHAT-RELAY-BACKUP-COMMAND 2026-08-16 by Codex] Keeping this as an
+    /// optional dependency preserves startup behavior on nodes where blind
+    /// relay custody is disabled. It does not expose the service through a
+    /// public router.
+    pub fn with_chat_relay(mut self, chat_relay: Option<Arc<ChatRelayService>>) -> Self {
+        self.chat_relay = chat_relay;
         self
     }
 
@@ -255,18 +284,42 @@ impl CommandHandler {
             "[CMD_HANDLER] 📥 Received command"
         );
 
-        // Mark as processed (before execution to prevent re-entry)
-        self.mark_processed(cmd_id.clone());
-
-        // Report "received" status to CMS
-        self.report_status_for_agent_type(
-            "vpn",
-            cmd_id,
-            CommandExecutionStatus::Received,
-            0,
-            "Command received by node",
-        )
-        .await;
+        // [CHAT-RELAY-BACKUP-AUDIT-GATE 2026-08-16 by Codex] Custody backup is
+        // a durable operator side effect. Do not execute or deduplicate it
+        // unless CMS first accepted the audit receipt; a transient reporting
+        // failure must leave the command eligible for a later heartbeat retry.
+        if action == "create_custody_backup" {
+            if let Err(error) = self
+                .try_report_status_for_agent_type(
+                    "vpn",
+                    cmd_id,
+                    CommandExecutionStatus::Received,
+                    0,
+                    "Command received by node",
+                )
+                .await
+            {
+                warn!(
+                    command_id = %cmd_id,
+                    error = %error,
+                    "[CMD_HANDLER] Custody backup deferred because audit receipt failed"
+                );
+                return;
+            }
+            self.mark_processed(cmd_id.clone());
+        } else {
+            // Existing commands retain their historical fail-open reporting
+            // behavior for backward compatibility.
+            self.mark_processed(cmd_id.clone());
+            self.report_status_for_agent_type(
+                "vpn",
+                cmd_id,
+                CommandExecutionStatus::Received,
+                0,
+                "Command received by node",
+            )
+            .await;
+        }
 
         // ===== Dispatch by action =====
         match action.as_str() {
@@ -284,6 +337,9 @@ impl CommandHandler {
             }
             "two_hop_smoke" => {
                 self.handle_two_hop_smoke(&command).await;
+            }
+            "create_custody_backup" => {
+                self.handle_create_custody_backup(&command).await;
             }
             "ban_wallet" => {
                 self.handle_ban_wallet(&command).await;
@@ -668,6 +724,99 @@ impl CommandHandler {
         }
     }
 
+    /// Handles `create_custody_backup` without exposing custody over HTTP.
+    ///
+    /// The command is accepted only from the existing authenticated management
+    /// channel and requires an explicit confirmation token. The relay service
+    /// fixes the destination to its owner-private backup directory and verifies
+    /// the isolated image before publication. CMS receives only aggregate
+    /// receipt data, never a path, object identifier, wallet, route, or payload.
+    async fn handle_create_custody_backup(&self, command: &Command) {
+        info!(
+            command_id = %command.id,
+            "[CMD_HANDLER] create_custody_backup"
+        );
+
+        // The heartbeat response is authenticated by the CMS TLS endpoint;
+        // node request signatures alone do not authenticate a plaintext HTTP
+        // response. Refuse this durable side effect on insecure CMS transport.
+        if !management_endpoint_is_https(&self.client.config().cms_url) {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "create_custody_backup requires an HTTPS management endpoint",
+            )
+            .await;
+            return;
+        }
+
+        let confirmation = command
+            .params
+            .get("confirm")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if confirmation != CUSTODY_BACKUP_CONFIRMATION {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "create_custody_backup requires confirm=create",
+            )
+            .await;
+            return;
+        }
+
+        let Some(chat_relay) = self.chat_relay.as_ref().map(Arc::clone) else {
+            self.report_status_for_agent_type(
+                "vpn",
+                &command.id,
+                CommandExecutionStatus::Failed,
+                0,
+                "relay custody storage is not enabled on this node",
+            )
+            .await;
+            return;
+        };
+
+        self.report_status_for_agent_type(
+            "vpn",
+            &command.id,
+            CommandExecutionStatus::InProgress,
+            35,
+            "Creating and verifying node-private relay custody backup",
+        )
+        .await;
+
+        match create_verified_custody_backup(chat_relay).await {
+            Ok(receipt) => {
+                self.report_status_for_agent_type(
+                    "vpn",
+                    &command.id,
+                    CommandExecutionStatus::Completed,
+                    100,
+                    &format!(
+                        "Verified relay custody backup created; scope=node_local_private; size_bytes={}",
+                        receipt.size_bytes
+                    ),
+                )
+                .await;
+            }
+            Err(message) => {
+                self.report_status_for_agent_type(
+                    "vpn",
+                    &command.id,
+                    CommandExecutionStatus::Failed,
+                    0,
+                    &message,
+                )
+                .await;
+            }
+        }
+    }
+
     /// Handles `apply_policy` command.
     ///
     /// The CMS sends policy values in the heartbeat response; the runtime
@@ -946,24 +1095,6 @@ impl CommandHandler {
     // Status Reporting
     // ============================================
 
-    /// Reports command execution status to CMS.
-    ///
-    /// Uses `ManagementClient::report_command_status()` which sends
-    /// a signed `POST /node/vpn/status` request.
-    ///
-    /// Failures are logged but do not block command processing —
-    /// CMS can always re-query via the next heartbeat.
-    async fn report_status(
-        &self,
-        command_id: &str,
-        status: CommandExecutionStatus,
-        progress: u8,
-        message: &str,
-    ) {
-        self.report_status_for_agent_type("vpn", command_id, status, progress, message)
-            .await;
-    }
-
     async fn report_status_for_agent_type(
         &self,
         agent_type: &str,
@@ -972,6 +1103,30 @@ impl CommandHandler {
         progress: u8,
         message: &str,
     ) {
+        if let Err(error) = self
+            .try_report_status_for_agent_type(agent_type, command_id, status, progress, message)
+            .await
+        {
+            warn!(
+                command_id = %command_id,
+                error = %error,
+                "[CMD_HANDLER] Failed to report command status to CMS"
+            );
+        }
+    }
+
+    /// Sends one signed command audit transition and preserves delivery error.
+    ///
+    /// Most historical commands intentionally ignore this error. Sensitive
+    /// durable operations may use it as a fail-closed pre-execution audit gate.
+    async fn try_report_status_for_agent_type(
+        &self,
+        agent_type: &str,
+        command_id: &str,
+        status: CommandExecutionStatus,
+        progress: u8,
+        message: &str,
+    ) -> Result<(), String> {
         let report = CommandStatusReport {
             command_id: command_id.to_string(),
             agent_type: agent_type.to_string(),
@@ -991,13 +1146,7 @@ impl CommandHandler {
             "[CMD_HANDLER] 📤 Reporting status to CMS"
         );
 
-        if let Err(e) = self.client.report_command_status(&report).await {
-            warn!(
-                command_id = %command_id,
-                error = %e,
-                "[CMD_HANDLER] ⚠️ Failed to report command status to CMS"
-            );
-        }
+        self.client.report_command_status(&report).await
     }
 
     // ============================================
@@ -1024,6 +1173,46 @@ impl CommandHandler {
         self.processed_ids.insert(id.clone());
         self.processed_ids_order.push(id);
     }
+}
+
+fn management_endpoint_is_https(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .map(|url| url.scheme() == "https")
+        .unwrap_or(false)
+}
+
+/// Runs synchronous SQLite/filesystem backup work outside Tokio executors.
+///
+/// [CHAT-RELAY-BACKUP-COMMAND 2026-08-16 by Codex] The return contract is
+/// deliberately path-free. Even management-plane callers learn only whether a
+/// verified artifact exists and its byte size; recovery remains a local node
+/// operator operation until a separately authorized restore protocol exists.
+async fn create_verified_custody_backup(
+    chat_relay: Arc<ChatRelayService>,
+) -> Result<CustodyBackupReceipt, String> {
+    tokio::task::spawn_blocking(move || {
+        let backup_path = chat_relay.create_verified_backup().map_err(|error| {
+            warn!(
+                error = %error,
+                "[CMD_HANDLER] Verified relay custody backup failed"
+            );
+            "verified relay custody backup failed closed".to_string()
+        })?;
+        let metadata = std::fs::metadata(&backup_path).map_err(|_| {
+            "verified relay custody backup was published but its receipt is unavailable".to_string()
+        })?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(
+                "verified relay custody backup was published without a valid file receipt"
+                    .to_string(),
+            );
+        }
+        Ok(CustodyBackupReceipt {
+            size_bytes: metadata.len(),
+        })
+    })
+    .await
+    .map_err(|_| "verified relay custody backup worker stopped unexpectedly".to_string())?
 }
 
 async fn run_local_two_hop_smoke() -> Result<serde_json::Value, String> {
@@ -1400,4 +1589,65 @@ fn sanitize_and_truncate(input: &str) -> String {
         text.push_str("\n...truncated");
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config_chat_relay::ChatRelayConfig;
+
+    #[test]
+    fn sensitive_management_transport_accepts_only_https_urls() {
+        // [CHAT-RELAY-BACKUP-AUDIT-GATE 2026-08-16 by Codex] Request signing
+        // authenticates this node to CMS; TLS authenticates command responses
+        // in the opposite direction.
+        assert!(management_endpoint_is_https(
+            "https://api.aeronyx.network/api/privacy_network"
+        ));
+        assert!(!management_endpoint_is_https(
+            "http://api.aeronyx.network/api/privacy_network"
+        ));
+        assert!(!management_endpoint_is_https("https-not-a-url"));
+    }
+
+    #[tokio::test]
+    async fn custody_backup_worker_returns_only_aggregate_receipt() {
+        // [CHAT-RELAY-BACKUP-COMMAND 2026-08-16 by Codex] Exercise the exact
+        // spawn_blocking boundary used by CMS without introducing a test-only
+        // destination override.
+        let directory = tempfile::tempdir().expect("backup command directory");
+        let database_path = directory.path().join("relay.sqlite");
+        let mut config = ChatRelayConfig::default();
+        config.enabled = true;
+        config.db_path = database_path.to_string_lossy().into_owned();
+        let relay =
+            Arc::new(ChatRelayService::new(config, [0x8a; 32]).expect("initialize relay custody"));
+
+        let receipt = create_verified_custody_backup(relay)
+            .await
+            .expect("create operator backup");
+
+        assert!(receipt.size_bytes > 0);
+        let artifacts = std::fs::read_dir(directory.path().join(".aeronyx-relay-backups"))
+            .expect("read private backup directory")
+            .count();
+        assert_eq!(artifacts, 1);
+    }
+
+    #[tokio::test]
+    async fn custody_backup_worker_keeps_storage_errors_path_private() {
+        let mut config = ChatRelayConfig::default();
+        config.enabled = true;
+        config.db_path = ":memory:".to_string();
+        let relay =
+            Arc::new(ChatRelayService::new(config, [0x8b; 32]).expect("initialize memory relay"));
+
+        let error = create_verified_custody_backup(relay)
+            .await
+            .expect_err("memory storage cannot create operator backup");
+
+        assert_eq!(error, "verified relay custody backup failed closed");
+        assert!(!error.contains('/'));
+        assert!(!error.contains("memory"));
+    }
 }
