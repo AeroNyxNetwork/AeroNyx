@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.23.0-CustodyWitnessReceiptVault - Clarified that explicit durable rounds
+//! use producer pins while configuration alone never schedules transmission
 //! v0.22.0-CustodyWitnessPlanner - Added independent producer witness pins and
 //! a validated local quorum target without enabling outbound transmission
 //! v0.21.0-CustodyWitnessAdmission - Added an independent fail-closed producer
@@ -294,9 +296,10 @@ pub struct DiscoveryConfig {
     pub verified_delivery_witness_requester_node_ids: Vec<String>,
     /// Operator-pinned independent nodes considered for custody witnessing.
     ///
-    /// [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] This producer-side list
-    /// is used only by the local dry-run planner in this protocol milestone.
-    /// Merely configuring candidates never transmits an anchor or receipt.
+    /// [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] This producer-side
+    /// list feeds local eligibility planning and the explicit durable witness
+    /// transport primitive. Merely configuring candidates still never starts
+    /// a scheduler or transmits an anchor; callers must invoke a bounded round.
     #[serde(default)]
     pub custody_audit_witness_node_ids: Vec<String>,
     /// Minimum independently eligible custody witnesses required by policy.

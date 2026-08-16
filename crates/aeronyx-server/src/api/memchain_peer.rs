@@ -170,6 +170,8 @@
 //!   and audited predecessor; never trust responder identity as authority.
 //!
 //! ## Last Modified
+//! v2.8.64-CustodyWitnessReceiptVault - Added fail-closed producer receipt
+//! persistence and restart-safe exact-anchor policy reconstruction.
 //! v2.8.63-CustodyWitnessTransport - Added explicit pinned witness transport
 //! and adverse-evidence-aware bounded quorum rounds without a scheduler.
 //! v2.8.62-CustodyWitnessPlanner - Added local aggregate-only eligibility
@@ -2151,8 +2153,11 @@ where
 
 /// Sends one custody anchor to a hard-bounded set of exact witness pins.
 ///
-/// The return value is aggregate-only operational evidence. This function is
-/// explicit and has no startup/runtime scheduler integration in this release.
+/// [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] The return value is
+/// aggregate-only diagnostic evidence. This non-persisting variant must never
+/// back a startup/runtime safety gate; gates must use
+/// [`witness_custody_audit_anchor_round_durable`]. No scheduler invokes either
+/// primitive in this release.
 ///
 /// # Errors
 ///
@@ -2173,6 +2178,41 @@ pub async fn witness_custody_audit_anchor_round(
         witness_node_ids,
         minimum_verified,
         anchor,
+        None,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+/// Sends one custody anchor and durably retains every verified signed receipt.
+///
+/// [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] This is the only round
+/// suitable for a future startup/runtime safety gate: a receipt contributes to
+/// the aggregate result only after atomic producer-side persistence and full
+/// vault re-audit. No scheduler invokes this primitive in this release.
+///
+/// # Errors
+///
+/// Returns an error when local policy/anchor validation fails or a verified
+/// receipt cannot be durably retained. Individual transport failures remain
+/// bounded aggregate counters.
+pub async fn witness_custody_audit_anchor_round_durable(
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+    minimum_verified: usize,
+    anchor: &CustodyAuditAnchorV1,
+) -> Result<CustodyAuditWitnessRound, String> {
+    witness_custody_audit_anchor_round_with_endpoint_policy(
+        peer_store,
+        identity,
+        client,
+        witness_node_ids,
+        minimum_verified,
+        anchor,
+        Some(storage),
         &commitment_peer_endpoint_is_public,
     )
     .await
@@ -2186,6 +2226,7 @@ async fn witness_custody_audit_anchor_round_with_endpoint_policy<F>(
     witness_node_ids: &[[u8; 32]],
     minimum_verified: usize,
     anchor: &CustodyAuditAnchorV1,
+    receipt_storage: Option<&MemoryStorage>,
     endpoint_allowed: &F,
 ) -> Result<CustodyAuditWitnessRound, String>
 where
@@ -2198,7 +2239,7 @@ where
         return Err("custody_witness_pin_limit_exceeded".to_string());
     }
     let producer_node_id = identity.public_key_bytes();
-    validate_custody_anchor_for_producer(anchor, &producer_node_id)?;
+    let anchor_frame_sha256 = validate_custody_anchor_for_producer(anchor, &producer_node_id)?;
 
     let mut round = CustodyAuditWitnessRound {
         minimum_verified,
@@ -2231,6 +2272,18 @@ where
                 continue;
             }
         };
+        if let Some(storage) = receipt_storage {
+            storage
+                .persist_custody_audit_witness_receipt(
+                    &receipt,
+                    &producer_node_id,
+                    anchor.checkpoint_generation,
+                    &anchor_frame_sha256,
+                    now_secs(),
+                )
+                .await
+                .map_err(|_| "custody_witness_receipt_persist_failed".to_string())?;
+        }
         round.verified = round.verified.saturating_add(1);
         match receipt.outcome {
             CUSTODY_AUDIT_WITNESS_ADVANCED_V1 => {
@@ -8715,6 +8768,7 @@ mod tests {
         // quorum and a valid adverse receipt cannot be outvoted.
         let now = now_secs();
         let producer = IdentityKeyPair::from_bytes(&[0x95; 32]).expect("producer identity");
+        let producer_storage = MemoryStorage::open(":memory:", None).unwrap();
         let witness = Arc::new(IdentityKeyPair::from_bytes(&[0x96; 32]).expect("witness identity"));
         let second_witness =
             Arc::new(IdentityKeyPair::from_bytes(&[0x9C; 32]).expect("second witness identity"));
@@ -8780,6 +8834,7 @@ mod tests {
             ],
             1,
             &anchor_1,
+            Some(&producer_storage),
             &allow_test_endpoint,
         )
         .await
@@ -8806,6 +8861,7 @@ mod tests {
             &[witness_node_id],
             1,
             &anchor_1,
+            Some(&producer_storage),
             &allow_test_endpoint,
         )
         .await
@@ -8814,6 +8870,23 @@ mod tests {
         assert_eq!(idempotent.accepted, 1);
         assert_eq!(idempotent.idempotent, 1);
         assert!(idempotent.quorum_satisfied);
+        let anchor_1_sha256 = custody_audit_anchor_frame_sha256(&anchor_1).unwrap();
+        let anchor_1_evidence = producer_storage
+            .evaluate_custody_audit_witness_receipt_policy(
+                &producer.public_key_bytes(),
+                1,
+                &anchor_1_sha256,
+                &[witness_node_id],
+                1,
+                now_secs(),
+                60,
+            )
+            .await
+            .expect("reconstruct accepted anchor policy from durable receipts");
+        assert_eq!(anchor_1_evidence.fresh_verified, 1);
+        assert_eq!(anchor_1_evidence.accepted, 1);
+        assert_eq!(anchor_1_evidence.adverse, 0);
+        assert!(anchor_1_evidence.quorum_satisfied);
 
         let gap_anchor = CustodyAuditAnchorV1::signed(3, 300, 30_000, [0x98; 32], &producer)
             .expect("sign generation gap anchor");
@@ -8824,6 +8897,7 @@ mod tests {
             &[witness_node_id, second_witness_node_id],
             1,
             &gap_anchor,
+            Some(&producer_storage),
             &allow_test_endpoint,
         )
         .await
@@ -8834,6 +8908,23 @@ mod tests {
         assert_eq!(mixed.gaps, 1);
         assert!(mixed.adverse_evidence);
         assert!(!mixed.quorum_satisfied);
+        let gap_anchor_sha256 = custody_audit_anchor_frame_sha256(&gap_anchor).unwrap();
+        let gap_evidence = producer_storage
+            .evaluate_custody_audit_witness_receipt_policy(
+                &producer.public_key_bytes(),
+                3,
+                &gap_anchor_sha256,
+                &[witness_node_id, second_witness_node_id],
+                1,
+                now_secs(),
+                60,
+            )
+            .await
+            .expect("reconstruct mixed anchor policy from durable receipts");
+        assert_eq!(gap_evidence.fresh_verified, 2);
+        assert_eq!(gap_evidence.accepted, 1);
+        assert_eq!(gap_evidence.adverse, 1);
+        assert!(!gap_evidence.quorum_satisfied);
 
         let unrelated = IdentityKeyPair::from_bytes(&[0x99; 32]).expect("unrelated identity");
         let unrelated_anchor = CustodyAuditAnchorV1::signed(2, 200, 20_000, [0x9A; 32], &unrelated)
@@ -8845,6 +8936,7 @@ mod tests {
             &[witness_node_id],
             1,
             &unrelated_anchor,
+            Some(&producer_storage),
             &allow_test_endpoint,
         )
         .await
@@ -8865,6 +8957,7 @@ mod tests {
             &[witness_node_id],
             1,
             &unpersistable_generation,
+            Some(&producer_storage),
             &allow_test_endpoint,
         )
         .await

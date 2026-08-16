@@ -6,6 +6,9 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Clarify that explicit
+#   witness rounds persist portable signed receipts, while configuration alone
+#   still performs no network transmission.
 # - [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Document bounded custody
 #   backup retention and the minimum partial-file grace used only by explicit
 #   host-local maintenance commands.
@@ -57,6 +60,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.12.0-node-deploy - Documented durable producer custody witness evidence.
 # v1.11.0-node-deploy - Documented relay custody retention/prune policy.
 # v1.10.0-node-deploy - Documented runtime identity separation for trust pins.
 # v1.9.0-node-deploy - Documented follower checkpoint-certificate witness policy.
@@ -188,11 +192,13 @@ verified_delivery_witness_required_for_restore = false
 # discovery. List only requester node identities this node explicitly agrees
 # to protect. Empty means the witness endpoint refuses every write.
 verified_delivery_witness_requester_node_ids = []
-# [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Producer-side independent
+# [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Producer-side independent
 # custody witness candidates. Startup evaluates only fresh authenticated
 # EncryptedStorage descriptors with public-safe endpoints and logs aggregate
-# readiness. Configuration/startup never sends anchors; the explicit bounded
-# transport primitive has no scheduler in this release. An empty list stays off.
+# readiness. An explicitly invoked durable round stores canonical signed
+# receipts in a bounded local vault and revalidates them after restart.
+# Configuration/startup still sends nothing: no scheduler exists in this
+# release, and an empty list remains fully off.
 custody_audit_witness_node_ids = []
 # Required eligible candidates for the local dry-run plan. Valid range 1-3 and
 # never greater than custody_audit_witness_node_ids.

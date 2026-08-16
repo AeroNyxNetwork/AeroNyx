@@ -58,6 +58,8 @@
 //!   authority history.
 //! - v16 (v2.8.29-CustodyAuditWitness): Separate producer-scoped custody
 //!   checkpoint high-water rows containing exact opaque frame digests only.
+//! - v17 (v2.8.64-CustodyWitnessReceiptVault): Bounded immutable producer-side
+//!   receipt frames for restart-safe signature and policy revalidation.
 //! - v2.7.23-CertificateExchange: Snapshot-audited internal bundle export for
 //!   the admitted fixed-size peer protocol; the schema remains v12.
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
@@ -166,8 +168,14 @@
 //! - [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] The commitment
 //!   authority root is process-local and immutable after installation. It must
 //!   never be inferred from SQLite, serialized, logged, or exposed in status.
+//! - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Producer-side
+//!   receipt evidence stores only canonical signed witness decisions. Normal
+//!   receipts may rotate at the hard capacity; adverse evidence is never
+//!   silently pruned to make a later round appear healthy.
 //!
 //! ## Last Modified
+//! v2.8.64-CustodyWitnessReceiptVault - Added schema-v17 bounded immutable
+//! producer-side witness receipt evidence for restart-safe audit.
 //! [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Added follower-only,
 //! source-blind authority-proof recovery and circuit telemetry.
 //! [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Added the process-local
@@ -283,6 +291,7 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v13 → v14: durable verified-delivery anchor high-water decisions
 /// v14 → v15: append-only dual-signed coordinator authority history
 /// v15 → v16: independent custody audit anchor witness high-water decisions
+/// v16 → v17: bounded producer-side custody witness receipt evidence
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
 /// in maybe_migrate(). The migrate block MUST use a hardcoded integer
@@ -291,7 +300,7 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Keep this visible only inside
 // the memchain module so cross-file migration tests assert the authoritative
 // current version without coupling production migration steps to this value.
-pub(super) const SCHEMA_VERSION: u32 = 16;
+pub(super) const SCHEMA_VERSION: u32 = 17;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -1002,6 +1011,10 @@ pub(crate) const MAX_CHECKPOINT_EVIDENCE_FRAME_BYTES: usize = 4 * 1024;
 /// missed rounds make the last durable signed observation stale without
 /// overreacting to one transient transport failure.
 pub(crate) const CHECKPOINT_OBSERVATION_FRESHNESS_SECONDS: u64 = 15 * 60;
+/// Maximum canonical custody witness receipt frames retained by one producer.
+/// Normal accepted evidence rotates oldest-first; adverse evidence reserves
+/// capacity and forces operator review instead of being silently erased.
+pub(crate) const CUSTODY_WITNESS_RECEIPT_EVIDENCE_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RecordCommitmentSyncRuntime {
@@ -1833,6 +1846,31 @@ impl MemoryStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_custody_audit_anchor_witnesses_observed
                 ON custody_audit_anchor_witnesses(observed_at);
+
+            -- v17: immutable producer-side portable witness receipts. The
+            -- exact bounded frame is retained for restart-time signature and
+            -- column revalidation; no custody counts or payload data enter it.
+            CREATE TABLE IF NOT EXISTS custody_audit_witness_receipt_evidence (
+                receipt_digest        BLOB PRIMARY KEY CHECK(length(receipt_digest) = 32),
+                producer              BLOB NOT NULL CHECK(length(producer) = 32),
+                witness               BLOB NOT NULL CHECK(length(witness) = 32),
+                requested_generation  INTEGER NOT NULL CHECK(requested_generation > 0),
+                requested_frame_sha256 BLOB NOT NULL CHECK(length(requested_frame_sha256) = 32),
+                retained_generation   INTEGER NOT NULL CHECK(retained_generation > 0),
+                retained_frame_sha256 BLOB NOT NULL CHECK(length(retained_frame_sha256) = 32),
+                outcome               INTEGER NOT NULL CHECK(outcome BETWEEN 0 AND 4),
+                observed_at           INTEGER NOT NULL CHECK(observed_at > 0),
+                receipt_frame         BLOB NOT NULL CHECK(length(receipt_frame) > 0
+                    AND length(receipt_frame) <= 320),
+                persisted_at          INTEGER NOT NULL CHECK(persisted_at > 0),
+                CHECK(producer != witness)
+            );
+            CREATE INDEX IF NOT EXISTS idx_custody_witness_receipts_anchor
+                ON custody_audit_witness_receipt_evidence(
+                    producer, requested_generation, requested_frame_sha256, observed_at
+                );
+            CREATE INDEX IF NOT EXISTS idx_custody_witness_receipts_observed
+                ON custody_audit_witness_receipt_evidence(observed_at);
 
             CREATE TABLE IF NOT EXISTS raw_logs (
                 log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3051,6 +3089,68 @@ impl MemoryStorage {
             conn.execute("UPDATE schema_version SET version = 16", [])
                 .map_err(|error| format!("Update schema version to v16: {error}"))?;
             info!("[STORAGE] Migration to v16 (custody audit anchor witnesses) complete");
+        }
+
+        // v16 -> v17: producer-side immutable receipt evidence. [CUSTODY-
+        // WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] This table is distinct
+        // from witness-side high-water state: it proves what independent
+        // witnesses signed and is re-audited after every restart.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(16);
+
+        if current < 17 {
+            info!(
+                "[STORAGE] Migrating schema v{} -> v17 (custody witness receipt evidence)",
+                current
+            );
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS custody_audit_witness_receipt_evidence (
+                    receipt_digest         BLOB PRIMARY KEY CHECK(length(receipt_digest) = 32),
+                    producer               BLOB NOT NULL CHECK(length(producer) = 32),
+                    witness                BLOB NOT NULL CHECK(length(witness) = 32),
+                    requested_generation   INTEGER NOT NULL CHECK(requested_generation > 0),
+                    requested_frame_sha256 BLOB NOT NULL CHECK(length(requested_frame_sha256) = 32),
+                    retained_generation    INTEGER NOT NULL CHECK(retained_generation > 0),
+                    retained_frame_sha256  BLOB NOT NULL CHECK(length(retained_frame_sha256) = 32),
+                    outcome                INTEGER NOT NULL CHECK(outcome BETWEEN 0 AND 4),
+                    observed_at            INTEGER NOT NULL CHECK(observed_at > 0),
+                    receipt_frame          BLOB NOT NULL CHECK(length(receipt_frame) > 0
+                        AND length(receipt_frame) <= 320),
+                    persisted_at           INTEGER NOT NULL CHECK(persisted_at > 0),
+                    CHECK(producer != witness)
+                );
+                CREATE INDEX IF NOT EXISTS idx_custody_witness_receipts_anchor
+                    ON custody_audit_witness_receipt_evidence(
+                        producer, requested_generation, requested_frame_sha256, observed_at
+                    );
+                CREATE INDEX IF NOT EXISTS idx_custody_witness_receipts_observed
+                    ON custody_audit_witness_receipt_evidence(observed_at);",
+            )
+            .map_err(|error| {
+                format!("v17 migration: create custody witness receipt evidence: {error}")
+            })?;
+            let exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='custody_audit_witness_receipt_evidence'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if !exists {
+                return Err(
+                    "v17 migration: required table 'custody_audit_witness_receipt_evidence' was not created"
+                        .to_string(),
+                );
+            }
+            // Hardcoded 17 preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 17", [])
+                .map_err(|error| format!("Update schema version to v17: {error}"))?;
+            info!("[STORAGE] Migration to v17 (custody witness receipt evidence) complete");
         }
 
         Ok(())
@@ -4999,10 +5099,11 @@ mod tests {
         // v11 adds sticky trusted-divergence incidents, v12 adds immutable
         // checkpoint certificates, v13 adds durable coordinator leases, and
         // v14 adds aggregate-only delivery-anchor witness high-water state,
-        // v15 adds replayable coordinator authority history, and v16 adds an
-        // independent custody-audit witness high-water namespace
+        // v15 adds replayable coordinator authority history, v16 adds an
+        // independent custody-audit witness high-water namespace, and v17
+        // adds bounded producer-side signed witness receipt evidence
         // even when create_schema() was not called.
-        assert_eq!(v, 16);
+        assert_eq!(v, 17);
         for table in [
             "record_commitment_blocks",
             "record_block_commitments",
@@ -5015,6 +5116,7 @@ mod tests {
             "verified_delivery_anchor_witnesses",
             "record_coordinator_handovers",
             "custody_audit_anchor_witnesses",
+            "custody_audit_witness_receipt_evidence",
         ] {
             let exists: bool = conn
                 .query_row(
@@ -5029,7 +5131,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v15_to_v16_migration_preserves_existing_witness_state() {
+    fn test_v15_to_current_migration_preserves_existing_witness_state() {
         // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] The additive migration
         // must not rewrite or conflate the established delivery-cache witness
         // namespace while creating the independent custody table.
@@ -5077,9 +5179,73 @@ mod tests {
             )
             .unwrap()
             > 0;
-        assert_eq!(version, 16);
+        let receipt_table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='custody_audit_witness_receipt_evidence'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
+        assert_eq!(version, 17);
         assert_eq!(delivery_generation, 41);
         assert!(custody_table_exists);
+        assert!(receipt_table_exists);
+    }
+
+    #[test]
+    fn test_v16_to_v17_migration_preserves_custody_witness_high_water() {
+        // [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Producer-side
+        // receipt evidence is additive and must not rewrite the independent
+        // witness-side monotonic high-water namespace during upgrade.
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (16);
+             CREATE TABLE custody_audit_anchor_witnesses (
+                 producer BLOB PRIMARY KEY,
+                 generation INTEGER NOT NULL,
+                 frame_sha256 BLOB NOT NULL,
+                 observed_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO custody_audit_anchor_witnesses
+             (producer,generation,frame_sha256,observed_at)
+             VALUES (?1,7,?2,1001)",
+            params![[0x93u8; 32].as_slice(), [0x94u8; 32].as_slice()],
+        )
+        .unwrap();
+
+        MemoryStorage::maybe_migrate(&conn).unwrap();
+
+        let version: u32 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        let retained: (i64, Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT generation,frame_sha256,observed_at
+                 FROM custody_audit_anchor_witnesses WHERE producer=?1",
+                params![[0x93u8; 32].as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let receipt_table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='custody_audit_witness_receipt_evidence'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
+        assert_eq!(version, 17);
+        assert_eq!(retained, (7, vec![0x94; 32], 1001));
+        assert!(receipt_table_exists);
     }
 
     // ========================================

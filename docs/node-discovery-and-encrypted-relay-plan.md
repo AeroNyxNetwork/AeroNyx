@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.97.0 - Added explicit bounded custody witness transport
-with exact pin/capability/endpoint checks and adverse-evidence-aware quorum,
-without enabling a startup or background scheduler.
+Modification Reason: v0.98.0 - Added bounded producer-side custody witness
+receipt persistence, full restart-time cryptographic audit, and exact-anchor
+policy reconstruction without enabling a startup or background scheduler.
 
 Main Functionality:
 
@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.97.0 - [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] Sends an exact producer-signed anchor only when explicitly invoked, verifies portable request-bound receipts, and never lets adverse evidence be outvoted.
+Last Modified: v0.98.0 - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Persists exact portable witness receipts atomically, revalidates every frame after restart, and reconstructs fresh exact-anchor policy without exposing custody contents.
+Previous: v0.97.0 - [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] Sends an exact producer-signed anchor only when explicitly invoked, verifies portable request-bound receipts, and never lets adverse evidence be outvoted.
 Previous: v0.96.0 - [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Validates independent producer witness eligibility locally and authenticates witness requests before consulting private trust pins.
 Previous: v0.95.0 - [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Accepts exact producer-signed custody anchors only from independently pinned, currently verified peers and returns portable request-bound witness evidence.
 Previous: v0.94.0 - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents configured cognitive providers or workers from silently disappearing behind healthy node readiness.
@@ -132,6 +133,36 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
 
+### v0.98 Producer receipt evidence is durable and restart-verifiable
+
+[CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex]
+
+- A verified witness receipt contributes to the durable round only after one
+  immediate SQLite transaction stores its exact canonical frame and re-audits
+  the complete producer-side vault. Local persistence failure aborts the round
+  instead of publishing a verified count that cannot survive restart.
+- Schema v17 stores a maximum of 256 receipt frames. The signed frame remains
+  authoritative; producer id, witness id, generations, digests, outcome, and
+  observation time are redundant indexes that must match it byte-for-byte.
+- Startup/recovery callers can reconstruct policy for one exact producer,
+  generation, and canonical anchor SHA-256. Only fresh receipts from distinct
+  non-self operator pins count; duplicate pins never inflate coverage.
+- `advanced` and `idempotent` both prove the requested exact anchor. Fresh
+  `stale` and `conflict` decisions are sticky for that exact anchor because a
+  monotonic witness cannot legitimately reverse either state. A `gap` may be
+  resolved only by a later accepted receipt after intermediate generations
+  have advanced. Same-time accepted/adverse ambiguity always fails closed.
+- At capacity, only the oldest normal accepted receipt may rotate. Adverse
+  evidence is never automatically deleted; an all-adverse vault rejects new
+  writes and requires operator review.
+- Audit/status structures expose only aggregate record, accepted, adverse,
+  freshness, missing, and threshold counts. They do not expose identities,
+  endpoints, signatures, anchor hashes, archive counts, messages, or users.
+- The diagnostic non-persisting round remains available for tests and manual
+  inspection. A future scheduler/startup gate must use the durable primitive.
+  This milestone deliberately adds no timer, background transmission, voting,
+  consensus, finality, leader election, or fork choice.
+
 ### v0.97 Custody witness transport is explicit, bounded, and fail-closed
 
 [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex]
@@ -150,9 +181,8 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 - `advanced` and `idempotent` receipts count as accepted. Any authentic
   `stale`, `conflict`, or `gap` receipt sets adverse evidence and prevents the
   round from reporting quorum, even if enough other witnesses accepted.
-- This milestone does not persist producer-side receipts and does not schedule
-  network transmission. Those require a separate rollout with retention,
-  restart recovery, and operator incident policy.
+- Producer-side persistence and restart policy are implemented by v0.98. This
+  transport milestone still does not schedule network transmission.
 
 ### v0.96 Producer custody witness planning is local and non-transmitting
 
