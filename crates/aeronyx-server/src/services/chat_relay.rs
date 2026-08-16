@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 2.6.0-CustodyDurabilityStatus
+// Version: 2.7.0-PrivateCustodyFile
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
@@ -43,6 +43,8 @@
 //   node may acknowledge encrypted custody or persist relay safety state.
 //   v2.6.0-CustodyDurabilityStatus — Publishes only the verified aggregate
 //   durability mode so operators can audit custody readiness.
+//   v2.7.0-PrivateCustodyFile — Restricts the SQLite custody database and its
+//   WAL sidecars to the node service account on Unix hosts.
 //
 // Main Functionality:
 //   - ChatRelayService: Central service managing all chat relay state
@@ -64,6 +66,7 @@
 //   - Durable schema sentinel: rejects post-install checkpoint table loss
 //   - Power-loss durability: WAL + FULL is verified before relay activation
 //   - Custody durability status: anonymous verified mode in relay health
+//   - Private custody file: Unix database/WAL material is owner-only
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -73,10 +76,11 @@
 // Main Logical Flow:
 //   ChatRelayService::new():
 //     1. Open/create SQLite database
-//     2. Set WAL + NORMAL pragmas
-//     3. init_schema() creates tables if missing
-//     4. Initialise MessageDedup (online-path LRU)
-//     5. Initialise WalletRouteCache (in-memory, empty on startup)
+//     2. Restrict the durable file to the node account on Unix
+//     3. Set and verify WAL + FULL pragmas
+//     4. init_schema() creates tables if missing
+//     5. Initialise MessageDedup (online-path LRU)
+//     6. Initialise WalletRouteCache (in-memory, empty on startup)
 //
 // ⚠️ Important Notes for Next Developer:
 //   - wallet_routes is Arc<WalletRouteCache> so server.rs can hold a separate
@@ -127,10 +131,14 @@
 //   - [CHAT-RELAY-DURABILITY-STATUS 2026-08-16 by Codex] Durability telemetry
 //     contains only a fixed state, protection boolean, and SQLite mode number.
 //     Never add database paths, row counts, message IDs, or owner dimensions.
+//   - [CHAT-RELAY-PRIVATE-FILE 2026-08-16 by Codex] Restrict the primary DB
+//     before enabling WAL so SQLite derives owner-only permissions for `-wal`
+//     and `-shm`. Permission failures reject activation without logging paths.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v2.7.0-PrivateCustodyFile — Owner-only SQLite custody files on Unix
 //   v2.6.0-CustodyDurabilityStatus — Aggregate verified durability evidence
 //   v2.5.0-PowerLossDurability — Verified FULL durability for custody writes
 //   v2.4.0-DurableSchemaSentinel — Fail-closed checkpoint installation marker
@@ -1651,6 +1659,30 @@ pub struct ChatRelayService {
 }
 
 impl ChatRelayService {
+    #[cfg(unix)]
+    fn restrict_sqlite_file_permissions(path: &str) -> ChatRelayResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if path.is_empty() || path == ":memory:" {
+            return Ok(());
+        }
+
+        // [CHAT-RELAY-PRIVATE-FILE 2026-08-16 by Codex] SQLite creates WAL
+        // sidecars using the primary database mode. Tighten the primary file
+        // before enabling WAL, and keep the configured path out of the error.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|_| {
+            ChatRelayError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_PERM),
+                Some("unable to restrict relay database permissions".to_string()),
+            ))
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn restrict_sqlite_file_permissions(_path: &str) -> ChatRelayResult<()> {
+        Ok(())
+    }
+
     fn configure_sqlite_durability(conn: &Connection) -> ChatRelayResult<u8> {
         // [CHAT-RELAY-FULL-DURABILITY 2026-08-16 by Codex] NORMAL protects
         // SQLite consistency across process failure but may lose a recently
@@ -1684,6 +1716,7 @@ impl ChatRelayService {
         }
 
         let conn = Connection::open(&config.db_path)?;
+        Self::restrict_sqlite_file_permissions(&config.db_path)?;
         // A short bounded wait absorbs transient locks from an operator backup
         // or diagnostic reader without allowing relay requests to hang forever.
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -4342,6 +4375,58 @@ mod tests {
             durability.synchronous_level,
             Some(u8::try_from(synchronous_level).expect("SQLite level fits u8"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_relay_custody_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // [CHAT-RELAY-PRIVATE-FILE 2026-08-16 by Codex] Cover both an existing
+        // permissive database and the WAL/SHM files SQLite creates after the
+        // primary mode is tightened. This test never changes process umask.
+        let db_path = unique_test_db_path("private-custody-file");
+        std::fs::write(&db_path, []).expect("create permissive relay database");
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o666))
+            .expect("make relay database permissive");
+
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let service = make_service_with_config(config);
+
+        for path in [
+            db_path.clone(),
+            PathBuf::from(format!("{}-wal", db_path.display())),
+            PathBuf::from(format!("{}-shm", db_path.display())),
+        ] {
+            let mode = std::fs::metadata(&path)
+                .unwrap_or_else(|error| panic!("inspect {}: {error}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{} must be owner-only", path.display());
+        }
+
+        drop(service);
+        remove_test_db(&db_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_relay_permission_failure_is_path_private_and_fail_closed() {
+        // [CHAT-RELAY-PRIVATE-FILE 2026-08-16 by Codex] A missing target
+        // deterministically exercises the activation error without relying on
+        // process-global umask, root privileges, or platform ACL behavior.
+        let db_path = unique_test_db_path("missing-private-custody-file");
+        remove_test_db(&db_path);
+
+        let error =
+            ChatRelayService::restrict_sqlite_file_permissions(db_path.to_string_lossy().as_ref())
+                .expect_err("unrestrictable relay database must fail closed");
+        assert_eq!(error.reason_bucket(), "sqlite_error");
+        let rendered = error.to_string();
+        assert!(rendered.contains("unable to restrict relay database permissions"));
+        assert!(!rendered.contains(db_path.to_string_lossy().as_ref()));
     }
 
     #[test]
