@@ -545,6 +545,8 @@
 //     installation but the checkpoint table is absent, startup must fail.
 //
 // Last Modified:
+//   [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Added a local aggregate-only
+//     startup eligibility plan without enabling witness network transmission.
 //   [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Installed independent
 //     custody requester pins and advertised the fail-closed peer route.
 //   [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] Added a two-process
@@ -876,8 +878,8 @@ use crate::api::discovery::{
 };
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
-    publish_current_descriptor_to_commitment_witnesses, pull_record_commitment_checkpoint,
-    pull_record_commitment_page_with_carrier_runtime_bounded,
+    plan_custody_audit_witnesses, publish_current_descriptor_to_commitment_witnesses,
+    pull_record_commitment_checkpoint, pull_record_commitment_page_with_carrier_runtime_bounded,
     reconcile_record_commitment_pinned_witnesses_with_certificate_threshold,
     reconcile_record_commitment_witnesses,
     recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime,
@@ -885,9 +887,8 @@ use crate::api::memchain_peer::{
     sync_follower_record_commitment_checkpoint_certificate_with_carrier_runtime,
     sync_next_record_coordinator_handover_with_carrier_runtime, witness_verified_delivery_anchor,
     CommitmentAuthorityCarrierCircuitBreaker, CommitmentAuthorityCarrierCursor,
-    CommitmentAuthoritySyncSource,
-    CommitmentBlockCarrierCircuitBreaker, CommitmentBlockCarrierCursor,
-    CommitmentCertificateCarrierCircuitBreaker,
+    CommitmentAuthoritySyncSource, CommitmentBlockCarrierCircuitBreaker,
+    CommitmentBlockCarrierCursor, CommitmentCertificateCarrierCircuitBreaker,
     CommitmentCertificateCarrierRecoveryDisposition, CommitmentCheckpointRelation,
     CommitmentFollowerCertificateSyncOutcome, CommitmentReconciliationOutcome,
     CommitmentSyncPageSource, VerifiedDeliveryAnchorWitnessRound, MAX_BLOCKS_PER_RESPONSE_WIRE,
@@ -6256,6 +6257,32 @@ impl Server {
             public_exit_peers = snapshot.public_exit_peers,
             "[DISCOVERY] PeerStore bootstrap complete"
         );
+
+        let custody_witness_ids = self.config.discovery.custody_audit_witness_node_id_bytes();
+        if !custody_witness_ids.is_empty() {
+            // [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Planning is a
+            // local, read-only startup check. No anchor, identity list, digest,
+            // endpoint, or request leaves the process.
+            match plan_custody_audit_witnesses(
+                &peer_store,
+                &self.identity.public_key_bytes(),
+                &custody_witness_ids,
+                self.config.discovery.custody_audit_witness_min_verified,
+                now,
+            ) {
+                Ok(plan) => info!(
+                    configured = plan.configured,
+                    eligible = plan.eligible,
+                    unavailable = plan.unavailable,
+                    minimum_verified = plan.minimum_verified,
+                    quorum_ready = plan.quorum_ready,
+                    self_excluded = plan.self_excluded,
+                    duplicates_ignored = plan.duplicates_ignored,
+                    "[MEMCHAIN] Custody witness dry-run plan evaluated"
+                ),
+                Err(reason) => warn!(reason, "[MEMCHAIN] Custody witness dry-run policy rejected"),
+            }
+        }
 
         if let Some(path) = &self.config.discovery.peer_cache_path {
             let cache_save_at = unix_now_secs();

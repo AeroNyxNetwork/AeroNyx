@@ -170,6 +170,8 @@
 //!   and audited predecessor; never trust responder identity as authority.
 //!
 //! ## Last Modified
+//! v2.8.62-CustodyWitnessPlanner - Added local aggregate-only eligibility
+//! planning and authenticated witness admission before private pin checks.
 //! v2.8.61-CustodyWitnessNetwork - Added independently pinned canonical
 //! custody-anchor admission and portable positive/adverse receipt responses.
 //! v2.8.60-AuthorityHandoverCarrier - Recovered exact dual-signed authority
@@ -698,6 +700,29 @@ pub struct VerifiedDeliveryAnchorWitnessRound {
     pub gaps: usize,
     /// Admission, endpoint, transport, decoding, or signature failures.
     pub failed: usize,
+}
+
+/// Privacy-safe dry-run plan for independent custody witnesses.
+///
+/// [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] This value contains only
+/// aggregate policy counts. Planning never signs, serializes, or transmits a
+/// custody anchor and cannot reveal node identities or endpoints to callers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CustodyAuditWitnessPlan {
+    /// Distinct non-self operator pins considered after validation.
+    pub configured: usize,
+    /// Pins with a fresh descriptor, storage capability, and safe endpoint.
+    pub eligible: usize,
+    /// Configured pins that are currently unavailable or ineligible.
+    pub unavailable: usize,
+    /// Duplicate identities ignored defensively by the runtime planner.
+    pub duplicates_ignored: usize,
+    /// Local identity pins excluded because self-witnessing is invalid.
+    pub self_excluded: usize,
+    /// Independent eligible witnesses required by operator policy.
+    pub minimum_verified: usize,
+    /// Whether the current local peer view can satisfy the policy threshold.
+    pub quorum_ready: bool,
 }
 
 /// Relationship proven by one valid signed checkpoint response.
@@ -1883,6 +1908,93 @@ pub async fn release_record_commitment_coordinator_lease(
         &commitment_peer_endpoint_is_public,
     )
     .await
+}
+
+/// Builds a bounded local eligibility plan for custody-audit witnesses.
+///
+/// This function performs no network I/O and does not construct an anchor.
+/// It evaluates only operator pins against the current authenticated PeerStore
+/// view and the production public-endpoint policy.
+///
+/// # Errors
+///
+/// Returns a stable error when the local threshold is zero, exceeds the hard
+/// witness bound, or the caller bypasses configuration validation with too
+/// many pins.
+pub fn plan_custody_audit_witnesses(
+    peer_store: &PeerStore,
+    producer_node_id: &[u8; 32],
+    witness_node_ids: &[[u8; 32]],
+    minimum_verified: usize,
+    now: u64,
+) -> Result<CustodyAuditWitnessPlan, String> {
+    plan_custody_audit_witnesses_with_endpoint_policy(
+        peer_store,
+        producer_node_id,
+        witness_node_ids,
+        minimum_verified,
+        now,
+        &commitment_peer_endpoint_is_public,
+    )
+}
+
+fn plan_custody_audit_witnesses_with_endpoint_policy<F>(
+    peer_store: &PeerStore,
+    producer_node_id: &[u8; 32],
+    witness_node_ids: &[[u8; 32]],
+    minimum_verified: usize,
+    now: u64,
+    endpoint_allowed: &F,
+) -> Result<CustodyAuditWitnessPlan, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    if minimum_verified == 0 || minimum_verified > MAX_PINNED_WITNESSES_PER_ROUND {
+        return Err("custody_witness_minimum_invalid".to_string());
+    }
+    if witness_node_ids.len() > MAX_PINNED_WITNESSES_PER_ROUND {
+        return Err("custody_witness_pin_limit_exceeded".to_string());
+    }
+
+    let mut plan = CustodyAuditWitnessPlan {
+        minimum_verified,
+        ..CustodyAuditWitnessPlan::default()
+    };
+    let mut distinct = HashSet::with_capacity(witness_node_ids.len());
+    for witness_node_id in witness_node_ids {
+        if witness_node_id == producer_node_id {
+            plan.self_excluded = plan.self_excluded.saturating_add(1);
+            continue;
+        }
+        if !distinct.insert(*witness_node_id) {
+            plan.duplicates_ignored = plan.duplicates_ignored.saturating_add(1);
+            continue;
+        }
+        plan.configured = plan.configured.saturating_add(1);
+
+        let eligible = peer_store
+            .get_valid(witness_node_id, now)
+            .is_some_and(|peer| {
+                peer.descriptor
+                    .capabilities
+                    .contains(&NodeCapability::EncryptedStorage)
+                    && peer
+                        .descriptor
+                        .public_endpoint
+                        .as_deref()
+                        .is_some_and(|endpoint| {
+                            endpoint_allowed(endpoint)
+                                && custody_audit_anchor_witness_url(endpoint).is_ok()
+                        })
+            });
+        if eligible {
+            plan.eligible = plan.eligible.saturating_add(1);
+        } else {
+            plan.unavailable = plan.unavailable.saturating_add(1);
+        }
+    }
+    plan.quorum_ready = plan.configured >= minimum_verified && plan.eligible >= minimum_verified;
+    Ok(plan)
 }
 
 /// Sends one signed aggregate-only cache anchor to operator-pinned witnesses.
@@ -4517,6 +4629,10 @@ fn verified_delivery_anchor_witness_url(endpoint: &str) -> Result<Url, String> {
     )
 }
 
+fn custody_audit_anchor_witness_url(endpoint: &str) -> Result<Url, String> {
+    commitment_peer_url(endpoint, "/api/memchain/peer/custody-audit-anchor-witness")
+}
+
 pub(crate) fn commitment_peer_url(endpoint: &str, path: &str) -> Result<Url, String> {
     canonical_peer_http_url(endpoint, path).map_err(|error| match error {
         PeerEndpointUrlError::Missing => "pinned_coordinator_missing_endpoint".to_string(),
@@ -5802,6 +5918,16 @@ async fn verified_delivery_anchor_witness_handler(
         Ok(message) => message,
         Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
     };
+    let canonical = match encode_memchain(&message) {
+        Ok(canonical) => canonical,
+        Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
+    };
+    if canonical.as_slice() != body.as_ref() {
+        // [WITNESS-ADMISSION-PRIVACY 2026-08-16 by Codex] Witness writes are
+        // security evidence. Reject alternate encodings instead of allowing
+        // one signed request to acquire multiple replay identities.
+        return protocol_error(StatusCode::BAD_REQUEST, "noncanonical_frame");
+    }
     let MemChainMessage::VerifiedDeliveryAnchorWitnessRequestV1 {
         requester,
         generation,
@@ -5821,15 +5947,6 @@ async fn verified_delivery_anchor_witness_handler(
     if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
         return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
     }
-    if !state
-        .peer_store
-        .verified_delivery_witness_requester_allowed(&requester)
-    {
-        return protocol_error(StatusCode::FORBIDDEN, "witness_requester_not_pinned");
-    }
-    if state.peer_store.get_valid(&requester, now).is_none() {
-        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
-    }
     let signing_bytes = verified_delivery_anchor_witness_request_signing_bytes(
         &requester,
         generation,
@@ -5842,6 +5959,17 @@ async fn verified_delivery_anchor_witness_handler(
         .is_err()
     {
         return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    // [WITNESS-ADMISSION-PRIVACY 2026-08-16 by Codex] Authenticate before
+    // consulting private operator pins, then collapse pin and discovery
+    // failures into one response. An unauthenticated caller cannot use status
+    // differences to enumerate a witness node's trust relationships.
+    if !state
+        .peer_store
+        .verified_delivery_witness_requester_allowed(&requester)
+        || state.peer_store.get_valid(&requester, now).is_none()
+    {
+        return protocol_error(StatusCode::FORBIDDEN, "witness_requester_not_authorized");
     }
     if !state.guard.lock().await.admit(requester, request_id, now) {
         return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
@@ -5980,24 +6108,7 @@ async fn custody_audit_anchor_witness_handler(
     if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
         return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
     }
-    if !state
-        .peer_store
-        .custody_audit_witness_requester_allowed(&requester)
-    {
-        return protocol_error(
-            StatusCode::FORBIDDEN,
-            "custody_witness_requester_not_pinned",
-        );
-    }
     let witness = state.identity.public_key_bytes();
-    if requester == witness {
-        // [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Reject before the
-        // monotonic row changes; a self-witness receipt is invalid by design.
-        return protocol_error(StatusCode::FORBIDDEN, "independent_witness_required");
-    }
-    if state.peer_store.get_valid(&requester, now).is_none() {
-        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
-    }
     if anchor
         .verify_expected(&requester, anchor.checkpoint_generation)
         .is_err()
@@ -6019,6 +6130,19 @@ async fn custody_audit_anchor_witness_handler(
         .is_err()
     {
         return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    if requester == witness {
+        // [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Reject only after
+        // authentication and before monotonic state changes. Self-witness
+        // evidence remains invalid without becoming a signature oracle.
+        return protocol_error(StatusCode::FORBIDDEN, "independent_witness_required");
+    }
+    if !state
+        .peer_store
+        .custody_audit_witness_requester_allowed(&requester)
+        || state.peer_store.get_valid(&requester, now).is_none()
+    {
+        return protocol_error(StatusCode::FORBIDDEN, "custody_witness_not_authorized");
     }
     if !state.guard.lock().await.admit(requester, request_id, now) {
         return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
@@ -6436,6 +6560,32 @@ mod tests {
         .expect("encode custody witness request")
     }
 
+    fn delivery_witness_request_frame(
+        requester: &IdentityKeyPair,
+        generation: u64,
+        anchor_digest: [u8; 32],
+        request_id: [u8; 16],
+        request_timestamp: u64,
+    ) -> Vec<u8> {
+        let requester_id = requester.public_key_bytes();
+        let signing_bytes = verified_delivery_anchor_witness_request_signing_bytes(
+            &requester_id,
+            generation,
+            &anchor_digest,
+            &request_id,
+            request_timestamp,
+        );
+        encode_memchain(&MemChainMessage::VerifiedDeliveryAnchorWitnessRequestV1 {
+            requester: requester_id,
+            generation,
+            anchor_digest,
+            request_id,
+            request_timestamp,
+            signature: requester.sign(&signing_bytes),
+        })
+        .expect("encode delivery witness request")
+    }
+
     async fn post_custody_witness(router: &Router, frame: Vec<u8>) -> Response {
         router
             .clone()
@@ -6449,6 +6599,21 @@ mod tests {
             )
             .await
             .expect("custody witness HTTP response")
+    }
+
+    async fn post_delivery_witness(router: &Router, frame: Vec<u8>) -> Response {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/discovery/peer/verified-delivery-anchor-witness")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(frame))
+                    .expect("delivery witness HTTP request"),
+            )
+            .await
+            .expect("delivery witness HTTP response")
     }
 
     fn signed_handover_response_frame(
@@ -8096,6 +8261,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_witness_authenticates_before_admission_and_rejects_padding() {
+        // [WITNESS-ADMISSION-PRIVACY 2026-08-16 by Codex] The same forged
+        // identity receives the same signature failure before and after local
+        // admission. Alternate encodings never reach durable state.
+        let now = now_secs();
+        let requester = IdentityKeyPair::from_bytes(&[0x81; 32]).expect("requester identity");
+        let witness = Arc::new(IdentityKeyPair::from_bytes(&[0x82; 32]).expect("witness identity"));
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let peers = Arc::new(PeerStore::new());
+        admit_peer(&peers, &requester, None, now);
+        let router = build_memchain_peer_router(storage, Arc::clone(&peers), witness);
+        let valid_frame =
+            delivery_witness_request_frame(&requester, 1, [0x83; 32], [0x84; 16], now);
+
+        let mut forged_message =
+            decode_memchain(&valid_frame[1..]).expect("decode delivery request for tamper");
+        let MemChainMessage::VerifiedDeliveryAnchorWitnessRequestV1 {
+            ref mut signature, ..
+        } = forged_message
+        else {
+            panic!("expected delivery witness request");
+        };
+        signature[0] ^= 0x01;
+        let forged_frame =
+            encode_memchain(&forged_message).expect("encode forged delivery request");
+        assert_eq!(
+            post_delivery_witness(&router, forged_frame.clone())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut padded_frame = valid_frame.clone();
+        padded_frame.push(0);
+        assert_eq!(
+            post_delivery_witness(&router, padded_frame).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_delivery_witness(&router, valid_frame.clone())
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        peers.configure_verified_delivery_witness_requesters(&[requester.public_key_bytes()]);
+        assert_eq!(
+            post_delivery_witness(&router, forged_frame).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_delivery_witness(&router, valid_frame).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn custody_witness_planner_is_bounded_independent_and_non_transmitting() {
+        // [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] A pure plan is safe
+        // to run in unit tests without an HTTP client or custody anchor.
+        let now = now_secs();
+        let producer = IdentityKeyPair::from_bytes(&[0x91; 32]).expect("producer identity");
+        let eligible = IdentityKeyPair::from_bytes(&[0x92; 32]).expect("eligible witness");
+        let unavailable = IdentityKeyPair::from_bytes(&[0x93; 32]).expect("unavailable witness");
+        let wrong_capability =
+            IdentityKeyPair::from_bytes(&[0x94; 32]).expect("wrong-capability witness");
+        let peers = PeerStore::new();
+        admit_peer(
+            &peers,
+            &eligible,
+            Some("http://127.0.0.1:8422".to_string()),
+            now,
+        );
+        admit_peer(&peers, &unavailable, None, now);
+        let mut wrong_capability_descriptor = NodeDescriptor::new(
+            wrong_capability.public_key_bytes(),
+            1,
+            now.saturating_sub(1),
+            now.saturating_add(600),
+            "memchain-sync-test",
+        );
+        wrong_capability_descriptor.public_endpoint = Some("http://127.0.0.1:8422".to_string());
+        wrong_capability_descriptor.capabilities = vec![NodeCapability::ChatRelay];
+        let wrong_capability_descriptor =
+            SignedNodeDescriptor::sign(wrong_capability_descriptor, &wrong_capability)
+                .expect("sign wrong-capability descriptor");
+        let import = peers.apply_discovery_message(
+            &NodeDiscoveryMessage::DescriptorAnnounce {
+                descriptor: wrong_capability_descriptor,
+            },
+            now,
+        );
+        assert_eq!(import.inserted, 1);
+
+        let deduplicated = plan_custody_audit_witnesses_with_endpoint_policy(
+            &peers,
+            &producer.public_key_bytes(),
+            &[
+                eligible.public_key_bytes(),
+                eligible.public_key_bytes(),
+                producer.public_key_bytes(),
+            ],
+            1,
+            now,
+            &allow_test_endpoint,
+        )
+        .expect("plan duplicate and self pins");
+        assert_eq!(
+            deduplicated,
+            CustodyAuditWitnessPlan {
+                configured: 1,
+                eligible: 1,
+                unavailable: 0,
+                duplicates_ignored: 1,
+                self_excluded: 1,
+                minimum_verified: 1,
+                quorum_ready: true,
+            }
+        );
+
+        let insufficient = plan_custody_audit_witnesses_with_endpoint_policy(
+            &peers,
+            &producer.public_key_bytes(),
+            &[eligible.public_key_bytes(), unavailable.public_key_bytes()],
+            2,
+            now,
+            &allow_test_endpoint,
+        )
+        .expect("plan insufficient current eligibility");
+        assert_eq!(insufficient.configured, 2);
+        assert_eq!(insufficient.eligible, 1);
+        assert_eq!(insufficient.unavailable, 1);
+        assert!(!insufficient.quorum_ready);
+
+        let wrong_capability_plan = plan_custody_audit_witnesses_with_endpoint_policy(
+            &peers,
+            &producer.public_key_bytes(),
+            &[wrong_capability.public_key_bytes()],
+            1,
+            now,
+            &allow_test_endpoint,
+        )
+        .expect("plan rejects a witness without encrypted-storage capability");
+        assert_eq!(wrong_capability_plan.eligible, 0);
+        assert_eq!(wrong_capability_plan.unavailable, 1);
+        assert!(!wrong_capability_plan.quorum_ready);
+
+        assert!(plan_custody_audit_witnesses_with_endpoint_policy(
+            &peers,
+            &producer.public_key_bytes(),
+            &[],
+            0,
+            now,
+            &allow_test_endpoint,
+        )
+        .is_err());
+        assert!(plan_custody_audit_witnesses_with_endpoint_policy(
+            &peers,
+            &producer.public_key_bytes(),
+            &[[0x01; 32], [0x02; 32], [0x03; 32], [0x04; 32]],
+            1,
+            now,
+            &allow_test_endpoint,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn custody_audit_witness_endpoint_is_pinned_signed_and_contiguous() {
         // [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Exercise the public
         // handler in process: no external endpoint or custody metadata leaves
@@ -8117,15 +8450,6 @@ mod tests {
         let anchor_10_sha =
             custody_audit_anchor_frame_sha256(&anchor_10).expect("hash generation 10 anchor");
 
-        let denied = post_custody_witness(
-            &router,
-            custody_witness_request_frame(&producer, &anchor_10, [0xA4; 16], now),
-        )
-        .await;
-        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-
-        peers.configure_custody_audit_witness_requesters(&[producer.public_key_bytes()]);
-
         let mut forged_message = decode_memchain(
             &custody_witness_request_frame(&producer, &anchor_10, [0xC1; 16], now)[1..],
         )
@@ -8137,11 +8461,20 @@ mod tests {
             panic!("expected custody witness request");
         };
         signature[0] ^= 0x01;
-        let forged = post_custody_witness(
+        let forged_frame =
+            encode_memchain(&forged_message).expect("encode signature-tampered request");
+        let forged_unpinned = post_custody_witness(&router, forged_frame.clone()).await;
+        assert_eq!(forged_unpinned.status(), StatusCode::UNAUTHORIZED);
+
+        let denied = post_custody_witness(
             &router,
-            encode_memchain(&forged_message).expect("encode signature-tampered request"),
+            custody_witness_request_frame(&producer, &anchor_10, [0xA4; 16], now),
         )
         .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        peers.configure_custody_audit_witness_requesters(&[producer.public_key_bytes()]);
+        let forged = post_custody_witness(&router, forged_frame).await;
         assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
 
         let stale = post_custody_witness(

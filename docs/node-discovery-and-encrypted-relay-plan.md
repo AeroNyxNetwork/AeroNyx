@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.95.0 - Added a fail-closed node-to-node custody-audit
-witness endpoint with exact-frame signatures, independent admission pins, and
-portable signed positive/adverse receipts.
+Modification Reason: v0.96.0 - Added a local aggregate-only custody witness
+planner and closed witness pin-oracle/noncanonical-frame admission gaps without
+enabling outbound anchor transmission.
 
 Main Functionality:
 
@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.95.0 - [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Accepts exact producer-signed custody anchors only from independently pinned, currently verified peers and returns portable request-bound witness evidence.
+Last Modified: v0.96.0 - [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Validates independent producer witness eligibility locally and authenticates witness requests before consulting private trust pins.
+Previous: v0.95.0 - [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Accepts exact producer-signed custody anchors only from independently pinned, currently verified peers and returns portable request-bound witness evidence.
 Previous: v0.94.0 - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents configured cognitive providers or workers from silently disappearing behind healthy node readiness.
 Previous: v0.93.0 - [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Keeps storage and rollout readiness observable without exporting operator filesystem identity.
 Previous: v0.92.0 - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents an explicitly enabled Chat Relay from silently disappearing after durable initialization failure.
@@ -129,6 +130,43 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.96 Producer custody witness planning is local and non-transmitting
+
+[CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex]
+
+- `custody_audit_witness_node_ids` is a producer-side pin set independent from
+  delivery witnesses and from witness-side requester admission. The validated
+  list is bounded to three identities; `custody_audit_witness_min_verified`
+  must be between one and the configured count.
+- Startup performs a read-only dry run against the authenticated local
+  PeerStore. A candidate is eligible only when its signed descriptor is fresh,
+  advertises `EncryptedStorage`, contains a canonical endpoint, and passes the
+  public-IP SSRF policy. Self pins and duplicates never satisfy the threshold.
+- The resulting plan contains only aggregate counts: configured, eligible,
+  unavailable, excluded, minimum, and ready. It contains no node id, endpoint,
+  anchor, hash, archive count, byte count, user, route, or message metadata.
+- Planning does not construct, sign, encode, or transmit a custody anchor. The
+  network exchange remains disabled until a separate explicit rollout enables
+  bounded sends and defines receipt persistence/reconciliation policy.
+- Both custody and verified-delivery witness endpoints now require canonical
+  frames and authenticate signatures before consulting private operator pins.
+  Pin and PeerStore failures share one response, preventing unauthenticated
+  callers from enumerating local trust relationships through status codes.
+
+Producer-side dry-run example:
+
+```toml
+[memchain.chat_relay]
+enabled = true
+
+[discovery]
+enabled = true
+custody_audit_witness_node_ids = [
+  "<reviewed-independent-witness-ed25519-node-id-hex>",
+]
+custody_audit_witness_min_verified = 1
+```
 
 ### v0.95 Independent custody evidence has a fail-closed peer endpoint
 

@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.22.0-CustodyWitnessPlanner - Added independent producer witness pins and
+//! a validated local quorum target without enabling outbound transmission
 //! v0.21.0-CustodyWitnessAdmission - Added an independent fail-closed producer
 //! pin set for custody-audit witness writes
 //! v0.20.0-RouteDomainAttestors - Added opt-in pinned attestor quorum and
@@ -101,6 +103,7 @@ use crate::management::ManagementConfig;
 
 const MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS: usize = 3;
 const MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS: usize = 64;
+const MAX_CUSTODY_AUDIT_WITNESS_NODE_IDS: usize = 3;
 const MAX_CUSTODY_AUDIT_WITNESS_REQUESTER_NODE_IDS: usize = 64;
 const MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS: usize = 16;
 const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
@@ -109,12 +112,12 @@ const MAX_DISCOVERY_GOSSIP_CONCURRENCY: u16 = 64;
 const MAX_PINNED_ROUTE_DOMAINS: usize = 256;
 const MAX_ROUTE_DOMAIN_ATTESTOR_NODE_IDS: usize = 16;
 
-/// Validates one fail-closed witness requester pin set.
+/// Validates one bounded fail-closed node identity pin set.
 ///
 /// [WITNESS-ADMISSION-PINS 2026-08-16 by Codex] Delivery and custody witnesses
 /// remain separate policy domains, but must share identical parsing and
 /// duplicate rejection so one endpoint cannot accidentally become weaker.
-fn validate_witness_requester_node_ids(
+fn validate_node_id_pin_set(
     field: &'static str,
     configured: &[String],
     max_entries: usize,
@@ -122,7 +125,7 @@ fn validate_witness_requester_node_ids(
     if configured.len() > max_entries {
         return Err(ServerError::config_invalid(
             field,
-            format!("supports at most {max_entries} requester identities"),
+            format!("supports at most {max_entries} pinned identities"),
         ));
     }
     let mut validated = Vec::<[u8; 32]>::with_capacity(configured.len());
@@ -146,7 +149,7 @@ fn validate_witness_requester_node_ids(
         if validated.contains(&node_id) {
             return Err(ServerError::config_invalid(
                 field,
-                "duplicate requester identities are not allowed",
+                "duplicate identities are not allowed",
             ));
         }
         validated.push(node_id);
@@ -289,6 +292,16 @@ pub struct DiscoveryConfig {
     /// ordinary descriptor discovery and encrypted relay participation.
     #[serde(default)]
     pub verified_delivery_witness_requester_node_ids: Vec<String>,
+    /// Operator-pinned independent nodes considered for custody witnessing.
+    ///
+    /// [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] This producer-side list
+    /// is used only by the local dry-run planner in this protocol milestone.
+    /// Merely configuring candidates never transmits an anchor or receipt.
+    #[serde(default)]
+    pub custody_audit_witness_node_ids: Vec<String>,
+    /// Minimum independently eligible custody witnesses required by policy.
+    #[serde(default = "DiscoveryConfig::default_custody_audit_witness_min_verified")]
+    pub custody_audit_witness_min_verified: usize,
     /// Producer identities this node explicitly agrees to witness for custody.
     ///
     /// [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] These pins are separate
@@ -486,6 +499,12 @@ impl DiscoveryConfig {
     /// Default external cache-anchor witness threshold.
     #[must_use]
     pub const fn default_verified_delivery_witness_min_verified() -> usize {
+        1
+    }
+
+    /// Default independent custody witness eligibility threshold.
+    #[must_use]
+    pub const fn default_custody_audit_witness_min_verified() -> usize {
         1
     }
 
@@ -856,11 +875,42 @@ impl DiscoveryConfig {
                     "requires discovery.enabled = true",
                 ));
             }
-            validate_witness_requester_node_ids(
+            validate_node_id_pin_set(
                 "discovery.verified_delivery_witness_requester_node_ids",
                 &self.verified_delivery_witness_requester_node_ids,
                 MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS,
             )?;
+        }
+
+        if !self.custody_audit_witness_node_ids.is_empty()
+            || self.custody_audit_witness_min_verified
+                != Self::default_custody_audit_witness_min_verified()
+        {
+            if !self.enabled {
+                return Err(ServerError::config_invalid(
+                    "discovery.custody_audit_witness_node_ids",
+                    "requires discovery.enabled = true",
+                ));
+            }
+            if self.custody_audit_witness_node_ids.is_empty() {
+                return Err(ServerError::config_invalid(
+                    "discovery.custody_audit_witness_node_ids",
+                    "requires at least one pinned independent witness identity",
+                ));
+            }
+            let validated = validate_node_id_pin_set(
+                "discovery.custody_audit_witness_node_ids",
+                &self.custody_audit_witness_node_ids,
+                MAX_CUSTODY_AUDIT_WITNESS_NODE_IDS,
+            )?;
+            if self.custody_audit_witness_min_verified == 0
+                || self.custody_audit_witness_min_verified > validated.len()
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.custody_audit_witness_min_verified",
+                    "must be between one and the number of configured custody witnesses",
+                ));
+            }
         }
 
         if !self.custody_audit_witness_requester_node_ids.is_empty() {
@@ -870,7 +920,7 @@ impl DiscoveryConfig {
                     "requires discovery.enabled = true",
                 ));
             }
-            validate_witness_requester_node_ids(
+            validate_node_id_pin_set(
                 "discovery.custody_audit_witness_requester_node_ids",
                 &self.custody_audit_witness_requester_node_ids,
                 MAX_CUSTODY_AUDIT_WITNESS_REQUESTER_NODE_IDS,
@@ -1261,6 +1311,18 @@ impl DiscoveryConfig {
             .collect()
     }
 
+    /// Returns producer-side custody witness candidates in operator pin order.
+    #[must_use]
+    pub fn custody_audit_witness_node_id_bytes(&self) -> Vec<[u8; 32]> {
+        self.custody_audit_witness_node_ids
+            .iter()
+            .filter_map(|value| {
+                let decoded = hex::decode(value.trim()).ok()?;
+                decoded.try_into().ok()
+            })
+            .collect()
+    }
+
     fn validate_seed_endpoint(endpoint: &str) -> Result<()> {
         let trimmed = endpoint.trim();
         if trimmed.is_empty() {
@@ -1310,6 +1372,8 @@ impl Default for DiscoveryConfig {
                 Self::default_directory_observation_witness_min_verified(),
             verified_delivery_witness_node_ids: Vec::new(),
             verified_delivery_witness_requester_node_ids: Vec::new(),
+            custody_audit_witness_node_ids: Vec::new(),
+            custody_audit_witness_min_verified: Self::default_custody_audit_witness_min_verified(),
             custody_audit_witness_requester_node_ids: Vec::new(),
             verified_delivery_witness_min_verified:
                 Self::default_verified_delivery_witness_min_verified(),
@@ -1444,20 +1508,45 @@ impl ServerConfig {
                 ));
             }
         }
-        if (!self.discovery.verified_delivery_witness_node_ids.is_empty()
-            || !self
+        // [WITNESS-CONFIG-DIAGNOSTICS 2026-08-16 by Codex] Keep cross-module
+        // errors bound to real TOML fields so installers can report and repair
+        // the exact unsafe policy instead of receiving a wildcard pseudo-key.
+        if !self.memchain.is_enabled()
+            && !self.discovery.verified_delivery_witness_node_ids.is_empty()
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.verified_delivery_witness_node_ids",
+                "authenticated witness transport requires a local MemChain storage mode",
+            ));
+        }
+        if !self.memchain.is_enabled()
+            && !self
                 .discovery
                 .verified_delivery_witness_requester_node_ids
                 .is_empty()
-            || !self
-                .discovery
-                .custody_audit_witness_requester_node_ids
-                .is_empty())
-            && !self.memchain.is_enabled()
         {
             return Err(ServerError::config_invalid(
-                "discovery.verified_delivery_witness_*",
-                "authenticated witness endpoints require a local MemChain storage mode",
+                "discovery.verified_delivery_witness_requester_node_ids",
+                "the authenticated delivery witness endpoint requires a local MemChain storage mode",
+            ));
+        }
+        if !self.memchain.is_enabled()
+            && !self
+                .discovery
+                .custody_audit_witness_requester_node_ids
+                .is_empty()
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.custody_audit_witness_requester_node_ids",
+                "the authenticated custody witness endpoint requires a local MemChain storage mode",
+            ));
+        }
+        if !self.discovery.custody_audit_witness_node_ids.is_empty()
+            && !self.memchain.is_chat_relay_enabled()
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.custody_audit_witness_node_ids",
+                "requires memchain.chat_relay.enabled = true to produce custody anchors",
             ));
         }
         Ok(())
@@ -1582,6 +1671,11 @@ mod tests {
             .discovery
             .custody_audit_witness_requester_node_ids
             .is_empty());
+        assert!(config.discovery.custody_audit_witness_node_ids.is_empty());
+        assert_eq!(
+            config.discovery.custody_audit_witness_min_verified,
+            DiscoveryConfig::default_custody_audit_witness_min_verified()
+        );
         assert_eq!(
             config.discovery.verified_delivery_witness_min_verified,
             DiscoveryConfig::default_verified_delivery_witness_min_verified()
@@ -1894,6 +1988,9 @@ advertise_onion_middle = true
 mode = "local"
 db_path = "/var/lib/aeronyx/memchain.db"
 
+[memchain.chat_relay]
+enabled = true
+
 [discovery]
 enabled = true
 peer_cache_path = "/var/lib/aeronyx/peers-cache.json"
@@ -1907,6 +2004,11 @@ verified_delivery_witness_requester_node_ids = [
 custody_audit_witness_requester_node_ids = [
   "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 ]
+custody_audit_witness_node_ids = [
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+]
+custody_audit_witness_min_verified = 2
 verified_delivery_witness_min_verified = 2
 verified_delivery_witness_required_for_restore = true
 "#;
@@ -1927,6 +2029,11 @@ verified_delivery_witness_required_for_restore = true
                 .custody_audit_witness_requester_node_id_bytes(),
             vec![[0xDD; 32]]
         );
+        assert_eq!(
+            config.discovery.custody_audit_witness_node_id_bytes(),
+            vec![[0xEE; 32], [0xFF; 32]]
+        );
+        assert_eq!(config.discovery.custody_audit_witness_min_verified, 2);
         assert_eq!(config.discovery.verified_delivery_witness_min_verified, 2);
         assert!(
             config
@@ -2025,6 +2132,50 @@ custody_audit_witness_requester_node_ids = [
 ]
 "#;
         assert!(ServerConfig::from_str(disabled_custody_witness_service).is_err());
+
+        let duplicate_custody_witnesses = r#"
+[memchain]
+mode = "local"
+
+[memchain.chat_relay]
+enabled = true
+
+[discovery]
+enabled = true
+custody_audit_witness_node_ids = [
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+]
+"#;
+        assert!(ServerConfig::from_str(duplicate_custody_witnesses).is_err());
+
+        let impossible_custody_quorum = r#"
+[memchain]
+mode = "local"
+
+[memchain.chat_relay]
+enabled = true
+
+[discovery]
+enabled = true
+custody_audit_witness_node_ids = [
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+]
+custody_audit_witness_min_verified = 2
+"#;
+        assert!(ServerConfig::from_str(impossible_custody_quorum).is_err());
+
+        let custody_without_relay = r#"
+[memchain]
+mode = "local"
+
+[discovery]
+enabled = true
+custody_audit_witness_node_ids = [
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+]
+"#;
+        assert!(ServerConfig::from_str(custody_without_relay).is_err());
 
         let missing_pins = r#"
 [memchain]
