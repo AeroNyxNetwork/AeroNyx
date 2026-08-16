@@ -170,6 +170,8 @@
 //!   and audited predecessor; never trust responder identity as authority.
 //!
 //! ## Last Modified
+//! v2.8.63-CustodyWitnessTransport - Added explicit pinned witness transport
+//! and adverse-evidence-aware bounded quorum rounds without a scheduler.
 //! v2.8.62-CustodyWitnessPlanner - Added local aggregate-only eligibility
 //! planning and authenticated witness admission before private pin checks.
 //! v2.8.61-CustodyWitnessNetwork - Added independently pinned canonical
@@ -303,6 +305,7 @@ const MAX_PINNED_WITNESSES_PER_ROUND: usize = 3;
 const PINNED_CARRIER_FAILURES_BEFORE_COOLDOWN: u32 = 2;
 const PINNED_CARRIER_RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_DESCRIPTOR_PREFLIGHT_RESPONSE_BYTES: usize = 16 * 1024;
+const MAX_CUSTODY_WITNESS_RESPONSE_BYTES: usize = 1024;
 const TIP_ANNOUNCEMENT_MAX_ATTEMPTS: usize = 3;
 const TIP_ANNOUNCEMENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
@@ -723,6 +726,44 @@ pub struct CustodyAuditWitnessPlan {
     pub minimum_verified: usize,
     /// Whether the current local peer view can satisfy the policy threshold.
     pub quorum_ready: bool,
+}
+
+/// Privacy-safe aggregate result of one bounded custody witness round.
+///
+/// [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] The round intentionally
+/// retains no witness ids, endpoints, frame hashes, receipt signatures, or
+/// custody counters. A verified adverse receipt always prevents quorum from
+/// being reported, even when enough other witnesses accept the same anchor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CustodyAuditWitnessRound {
+    /// Distinct non-self operator pins considered by this round.
+    pub configured: usize,
+    /// Cryptographically valid request-bound witness receipts.
+    pub verified: usize,
+    /// Valid receipts proving the exact requested anchor was retained.
+    pub accepted: usize,
+    /// Witnesses that durably advanced to the requested generation.
+    pub advanced: usize,
+    /// Witnesses that already retained the exact requested anchor.
+    pub idempotent: usize,
+    /// Witnesses proving the producer requested an older generation.
+    pub stale: usize,
+    /// Witnesses proving same-generation anchor equivocation.
+    pub conflicts: usize,
+    /// Witnesses refusing a discontinuous generation advance.
+    pub gaps: usize,
+    /// Admission, endpoint, transport, decoding, or signature failures.
+    pub failed: usize,
+    /// Duplicate identities ignored defensively by the runtime round.
+    pub duplicates_ignored: usize,
+    /// Local identity pins excluded because self-witnessing is invalid.
+    pub self_excluded: usize,
+    /// Independent accepted receipts required by local policy.
+    pub minimum_verified: usize,
+    /// Whether any authentic stale, conflict, or gap evidence was observed.
+    pub adverse_evidence: bool,
+    /// Whether enough receipts accepted and no adverse evidence was observed.
+    pub quorum_satisfied: bool,
 }
 
 /// Relationship proven by one valid signed checkpoint response.
@@ -1995,6 +2036,245 @@ where
     }
     plan.quorum_ready = plan.configured >= minimum_verified && plan.eligible >= minimum_verified;
     Ok(plan)
+}
+
+/// Sends one producer-signed custody anchor to one exact caller-pinned witness.
+///
+/// This explicit primitive is not called by node startup or a background
+/// scheduler. The configured witness list therefore remains non-transmitting
+/// until a later rollout deliberately invokes this function. It never selects
+/// an arbitrary discovery peer or falls back to a different witness identity.
+///
+/// # Errors
+///
+/// Returns a stable privacy-safe error when the anchor is invalid, the exact
+/// witness is unavailable or ineligible, transport fails, or either response
+/// signature does not bind the expected request, producer, witness, and anchor.
+pub async fn witness_custody_audit_anchor(
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_id: &[u8; 32],
+    anchor: &CustodyAuditAnchorV1,
+) -> Result<CustodyAuditWitnessReceiptV1, String> {
+    witness_custody_audit_anchor_with_endpoint_policy(
+        peer_store,
+        identity,
+        client,
+        witness_node_id,
+        anchor,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+async fn witness_custody_audit_anchor_with_endpoint_policy<F>(
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_id: &[u8; 32],
+    anchor: &CustodyAuditAnchorV1,
+    endpoint_allowed: &F,
+) -> Result<CustodyAuditWitnessReceiptV1, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    let producer_node_id = identity.public_key_bytes();
+    if witness_node_id == &producer_node_id {
+        return Err("custody_witness_independence_required".to_string());
+    }
+    let anchor_frame_sha256 = validate_custody_anchor_for_producer(anchor, &producer_node_id)?;
+    let request_timestamp = now_secs();
+    let peer = peer_store
+        .get_valid(witness_node_id, request_timestamp)
+        .ok_or_else(|| "custody_witness_unavailable".to_string())?;
+    if !peer
+        .descriptor
+        .capabilities
+        .contains(&NodeCapability::EncryptedStorage)
+    {
+        return Err("custody_witness_capability_missing".to_string());
+    }
+    let endpoint = peer
+        .descriptor
+        .public_endpoint
+        .as_deref()
+        .ok_or_else(|| "custody_witness_endpoint_missing".to_string())?;
+    if !endpoint_allowed(endpoint) {
+        return Err("custody_witness_endpoint_unsafe".to_string());
+    }
+    let url = custody_audit_anchor_witness_url(endpoint)?;
+
+    let mut request_id = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut request_id);
+    let signing_bytes = custody_audit_anchor_witness_request_signing_bytes(
+        &request_id,
+        &producer_node_id,
+        request_timestamp,
+        &anchor_frame_sha256,
+    );
+    let request = MemChainMessage::CustodyAuditAnchorWitnessRequestV1 {
+        request_id,
+        requester: producer_node_id,
+        request_timestamp,
+        anchor: anchor.clone(),
+        signature: identity.sign(&signing_bytes),
+    };
+    let frame =
+        encode_memchain(&request).map_err(|_| "custody_witness_encode_failed".to_string())?;
+    let response = client
+        .post(url)
+        .header("content-type", "application/octet-stream")
+        .body(frame)
+        .send()
+        .await
+        .map_err(|error| classify_http_error("custody_witness", &error))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "custody_witness_http_status_{}",
+            response.status().as_u16()
+        ));
+    }
+    let body = read_bounded_http_response(response, MAX_CUSTODY_WITNESS_RESPONSE_BYTES)
+        .await
+        .map_err(|_| "custody_witness_response_body_invalid".to_string())?;
+    verify_custody_audit_anchor_witness_response(
+        &body,
+        &request_id,
+        &producer_node_id,
+        witness_node_id,
+        anchor,
+        &anchor_frame_sha256,
+        now_secs(),
+    )
+}
+
+/// Sends one custody anchor to a hard-bounded set of exact witness pins.
+///
+/// The return value is aggregate-only operational evidence. This function is
+/// explicit and has no startup/runtime scheduler integration in this release.
+///
+/// # Errors
+///
+/// Returns an error only when the local anchor or threshold policy is invalid.
+/// Individual witness failures remain bounded aggregate counters.
+pub async fn witness_custody_audit_anchor_round(
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+    minimum_verified: usize,
+    anchor: &CustodyAuditAnchorV1,
+) -> Result<CustodyAuditWitnessRound, String> {
+    witness_custody_audit_anchor_round_with_endpoint_policy(
+        peer_store,
+        identity,
+        client,
+        witness_node_ids,
+        minimum_verified,
+        anchor,
+        &commitment_peer_endpoint_is_public,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn witness_custody_audit_anchor_round_with_endpoint_policy<F>(
+    peer_store: &PeerStore,
+    identity: &IdentityKeyPair,
+    client: &reqwest::Client,
+    witness_node_ids: &[[u8; 32]],
+    minimum_verified: usize,
+    anchor: &CustodyAuditAnchorV1,
+    endpoint_allowed: &F,
+) -> Result<CustodyAuditWitnessRound, String>
+where
+    F: Fn(&str) -> bool + Send + Sync + ?Sized,
+{
+    if minimum_verified == 0 || minimum_verified > MAX_PINNED_WITNESSES_PER_ROUND {
+        return Err("custody_witness_minimum_invalid".to_string());
+    }
+    if witness_node_ids.len() > MAX_PINNED_WITNESSES_PER_ROUND {
+        return Err("custody_witness_pin_limit_exceeded".to_string());
+    }
+    let producer_node_id = identity.public_key_bytes();
+    validate_custody_anchor_for_producer(anchor, &producer_node_id)?;
+
+    let mut round = CustodyAuditWitnessRound {
+        minimum_verified,
+        ..CustodyAuditWitnessRound::default()
+    };
+    let mut distinct = HashSet::with_capacity(witness_node_ids.len());
+    for witness_node_id in witness_node_ids {
+        if witness_node_id == &producer_node_id {
+            round.self_excluded = round.self_excluded.saturating_add(1);
+            continue;
+        }
+        if !distinct.insert(*witness_node_id) {
+            round.duplicates_ignored = round.duplicates_ignored.saturating_add(1);
+            continue;
+        }
+        round.configured = round.configured.saturating_add(1);
+        let receipt = match witness_custody_audit_anchor_with_endpoint_policy(
+            peer_store,
+            identity,
+            client,
+            witness_node_id,
+            anchor,
+            endpoint_allowed,
+        )
+        .await
+        {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                round.failed = round.failed.saturating_add(1);
+                continue;
+            }
+        };
+        round.verified = round.verified.saturating_add(1);
+        match receipt.outcome {
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1 => {
+                round.advanced = round.advanced.saturating_add(1);
+                round.accepted = round.accepted.saturating_add(1);
+            }
+            CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1 => {
+                round.idempotent = round.idempotent.saturating_add(1);
+                round.accepted = round.accepted.saturating_add(1);
+            }
+            CUSTODY_AUDIT_WITNESS_STALE_V1 => {
+                round.stale = round.stale.saturating_add(1);
+            }
+            CUSTODY_AUDIT_WITNESS_CONFLICT_V1 => {
+                round.conflicts = round.conflicts.saturating_add(1);
+            }
+            CUSTODY_AUDIT_WITNESS_GAP_V1 => {
+                round.gaps = round.gaps.saturating_add(1);
+            }
+            _ => unreachable!("verified custody receipt outcome was validated"),
+        }
+    }
+    round.adverse_evidence = round.stale > 0 || round.conflicts > 0 || round.gaps > 0;
+    round.quorum_satisfied = round.accepted >= minimum_verified && !round.adverse_evidence;
+    Ok(round)
+}
+
+fn validate_custody_anchor_for_producer(
+    anchor: &CustodyAuditAnchorV1,
+    producer_node_id: &[u8; 32],
+) -> Result<[u8; 32], String> {
+    // [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] Validate the nested
+    // producer signature before endpoint selection or network I/O. A caller
+    // cannot turn the node into an oracle for an unrelated producer anchor.
+    if anchor.checkpoint_generation > i64::MAX as u64 {
+        return Err("custody_witness_anchor_invalid".to_string());
+    }
+    anchor
+        .verify_expected(producer_node_id, anchor.checkpoint_generation)
+        .map_err(|_| "custody_witness_anchor_invalid".to_string())?;
+    match custody_audit_anchor_frame_sha256(anchor) {
+        Ok(digest) if digest != [0u8; 32] => Ok(digest),
+        Ok(_) | Err(_) => Err("custody_witness_anchor_invalid".to_string()),
+    }
 }
 
 /// Sends one signed aggregate-only cache anchor to operator-pinned witnesses.
@@ -8426,6 +8706,172 @@ mod tests {
             &allow_test_endpoint,
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn custody_witness_transport_is_bounded_and_adverse_evidence_fails_closed() {
+        // [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] Exercise the exact
+        // public wire path while proving duplicate/self pins cannot inflate
+        // quorum and a valid adverse receipt cannot be outvoted.
+        let now = now_secs();
+        let producer = IdentityKeyPair::from_bytes(&[0x95; 32]).expect("producer identity");
+        let witness = Arc::new(IdentityKeyPair::from_bytes(&[0x96; 32]).expect("witness identity"));
+        let second_witness =
+            Arc::new(IdentityKeyPair::from_bytes(&[0x9C; 32]).expect("second witness identity"));
+        let witness_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let witness_peers = Arc::new(PeerStore::new());
+        admit_peer(&witness_peers, &producer, None, now);
+        witness_peers.configure_custody_audit_witness_requesters(&[producer.public_key_bytes()]);
+        let router = build_memchain_peer_router(
+            witness_storage,
+            Arc::clone(&witness_peers),
+            Arc::clone(&witness),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let second_storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let second_peers = Arc::new(PeerStore::new());
+        admit_peer(&second_peers, &producer, None, now);
+        second_peers.configure_custody_audit_witness_requesters(&[producer.public_key_bytes()]);
+        let second_router = build_memchain_peer_router(
+            second_storage,
+            Arc::clone(&second_peers),
+            Arc::clone(&second_witness),
+        );
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = second_listener.local_addr().unwrap();
+        let second_server = tokio::spawn(async move {
+            axum::serve(second_listener, second_router).await.unwrap();
+        });
+
+        let producer_peers = PeerStore::new();
+        admit_peer(
+            &producer_peers,
+            &witness,
+            Some(format!("http://{address}")),
+            now,
+        );
+        admit_peer(
+            &producer_peers,
+            &second_witness,
+            Some(format!("http://{second_address}")),
+            now,
+        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let witness_node_id = witness.public_key_bytes();
+        let second_witness_node_id = second_witness.public_key_bytes();
+        let anchor_1 = CustodyAuditAnchorV1::signed(1, 100, 10_000, [0x97; 32], &producer)
+            .expect("sign generation one anchor");
+
+        let advanced = witness_custody_audit_anchor_round_with_endpoint_policy(
+            &producer_peers,
+            &producer,
+            &client,
+            &[
+                witness_node_id,
+                witness_node_id,
+                producer.public_key_bytes(),
+            ],
+            1,
+            &anchor_1,
+            &allow_test_endpoint,
+        )
+        .await
+        .expect("advance exact custody anchor");
+        assert_eq!(
+            advanced,
+            CustodyAuditWitnessRound {
+                configured: 1,
+                verified: 1,
+                accepted: 1,
+                advanced: 1,
+                duplicates_ignored: 1,
+                self_excluded: 1,
+                minimum_verified: 1,
+                quorum_satisfied: true,
+                ..CustodyAuditWitnessRound::default()
+            }
+        );
+
+        let idempotent = witness_custody_audit_anchor_round_with_endpoint_policy(
+            &producer_peers,
+            &producer,
+            &client,
+            &[witness_node_id],
+            1,
+            &anchor_1,
+            &allow_test_endpoint,
+        )
+        .await
+        .expect("retry exact custody anchor");
+        assert_eq!(idempotent.verified, 1);
+        assert_eq!(idempotent.accepted, 1);
+        assert_eq!(idempotent.idempotent, 1);
+        assert!(idempotent.quorum_satisfied);
+
+        let gap_anchor = CustodyAuditAnchorV1::signed(3, 300, 30_000, [0x98; 32], &producer)
+            .expect("sign generation gap anchor");
+        let mixed = witness_custody_audit_anchor_round_with_endpoint_policy(
+            &producer_peers,
+            &producer,
+            &client,
+            &[witness_node_id, second_witness_node_id],
+            1,
+            &gap_anchor,
+            &allow_test_endpoint,
+        )
+        .await
+        .expect("receive accepted and adverse portable evidence");
+        assert_eq!(mixed.verified, 2);
+        assert_eq!(mixed.accepted, 1);
+        assert_eq!(mixed.advanced, 1);
+        assert_eq!(mixed.gaps, 1);
+        assert!(mixed.adverse_evidence);
+        assert!(!mixed.quorum_satisfied);
+
+        let unrelated = IdentityKeyPair::from_bytes(&[0x99; 32]).expect("unrelated identity");
+        let unrelated_anchor = CustodyAuditAnchorV1::signed(2, 200, 20_000, [0x9A; 32], &unrelated)
+            .expect("sign unrelated anchor");
+        assert!(witness_custody_audit_anchor_round_with_endpoint_policy(
+            &producer_peers,
+            &producer,
+            &client,
+            &[witness_node_id],
+            1,
+            &unrelated_anchor,
+            &allow_test_endpoint,
+        )
+        .await
+        .is_err());
+
+        let unpersistable_generation = CustodyAuditAnchorV1::signed(
+            i64::MAX as u64 + 1,
+            i64::MAX as u64 + 1,
+            1,
+            [0x9B; 32],
+            &producer,
+        )
+        .expect("sign out-of-storage-range anchor");
+        assert!(witness_custody_audit_anchor_round_with_endpoint_policy(
+            &producer_peers,
+            &producer,
+            &client,
+            &[witness_node_id],
+            1,
+            &unpersistable_generation,
+            &allow_test_endpoint,
+        )
+        .await
+        .is_err());
+
+        server.abort();
+        second_server.abort();
     }
 
     #[tokio::test]

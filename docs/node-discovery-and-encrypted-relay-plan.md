@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.96.0 - Added a local aggregate-only custody witness
-planner and closed witness pin-oracle/noncanonical-frame admission gaps without
-enabling outbound anchor transmission.
+Modification Reason: v0.97.0 - Added explicit bounded custody witness transport
+with exact pin/capability/endpoint checks and adverse-evidence-aware quorum,
+without enabling a startup or background scheduler.
 
 Main Functionality:
 
@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.96.0 - [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Validates independent producer witness eligibility locally and authenticates witness requests before consulting private trust pins.
+Last Modified: v0.97.0 - [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] Sends an exact producer-signed anchor only when explicitly invoked, verifies portable request-bound receipts, and never lets adverse evidence be outvoted.
+Previous: v0.96.0 - [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Validates independent producer witness eligibility locally and authenticates witness requests before consulting private trust pins.
 Previous: v0.95.0 - [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Accepts exact producer-signed custody anchors only from independently pinned, currently verified peers and returns portable request-bound witness evidence.
 Previous: v0.94.0 - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents configured cognitive providers or workers from silently disappearing behind healthy node readiness.
 Previous: v0.93.0 - [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Keeps storage and rollout readiness observable without exporting operator filesystem identity.
@@ -130,6 +131,28 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.97 Custody witness transport is explicit, bounded, and fail-closed
+
+[CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex]
+
+- The producer now has an explicit library primitive for sending one canonical
+  custody anchor to one exact operator pin. It is not called by startup, a
+  timer, or a background task; merely configuring witness ids sends nothing.
+- Immediately before the request, the node requires a fresh authenticated
+  descriptor, `EncryptedStorage`, a canonical endpoint, and the shared public-
+  IP SSRF policy. Self-witnessing remains impossible.
+- The request signs the canonical anchor SHA-256, request id, producer, and
+  timestamp. The response is capped at 1 KiB and must pass both the witness's
+  outer request-bound signature and the nested portable receipt signature.
+- A bounded round accepts at most three configured pins and exposes only
+  aggregate counters. Duplicate and self pins cannot inflate the threshold.
+- `advanced` and `idempotent` receipts count as accepted. Any authentic
+  `stale`, `conflict`, or `gap` receipt sets adverse evidence and prevents the
+  round from reporting quorum, even if enough other witnesses accepted.
+- This milestone does not persist producer-side receipts and does not schedule
+  network transmission. Those require a separate rollout with retention,
+  restart recovery, and operator incident policy.
 
 ### v0.96 Producer custody witness planning is local and non-transmitting
 

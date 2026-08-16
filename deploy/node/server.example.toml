@@ -191,7 +191,8 @@ verified_delivery_witness_requester_node_ids = []
 # [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Producer-side independent
 # custody witness candidates. Startup evaluates only fresh authenticated
 # EncryptedStorage descriptors with public-safe endpoints and logs aggregate
-# readiness. This milestone does not send anchors; an empty list stays off.
+# readiness. Configuration/startup never sends anchors; the explicit bounded
+# transport primitive has no scheduler in this release. An empty list stays off.
 custody_audit_witness_node_ids = []
 # Required eligible candidates for the local dry-run plan. Valid range 1-3 and
 # never greater than custody_audit_witness_node_ids.
