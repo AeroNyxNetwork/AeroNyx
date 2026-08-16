@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.94.0 - Made explicitly enabled SuperNode providers
-and their worker a fail-closed runtime contract, while honoring configured
-Anthropic Messages endpoints.
+Modification Reason: v0.95.0 - Added a fail-closed node-to-node custody-audit
+witness endpoint with exact-frame signatures, independent admission pins, and
+portable signed positive/adverse receipts.
 
 Main Functionality:
 
@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.94.0 - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents configured cognitive providers or workers from silently disappearing behind healthy node readiness.
+Last Modified: v0.95.0 - [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Accepts exact producer-signed custody anchors only from independently pinned, currently verified peers and returns portable request-bound witness evidence.
+Previous: v0.94.0 - [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents configured cognitive providers or workers from silently disappearing behind healthy node readiness.
 Previous: v0.93.0 - [OPERATOR-PATH-PRIVACY 2026-08-14 by Codex] Keeps storage and rollout readiness observable without exporting operator filesystem identity.
 Previous: v0.92.0 - [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] Prevents an explicitly enabled Chat Relay from silently disappearing after durable initialization failure.
 Previous: v0.91.0 - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Resolves authority-carrier policy once and prevents a configured follower from disappearing behind healthy process startup.
@@ -128,6 +129,51 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.95 Independent custody evidence has a fail-closed peer endpoint
+
+[CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex]
+
+- `POST /api/memchain/peer/custody-audit-anchor-witness` accepts only canonical
+  `MemChainMessage` variant 36. The producer-signed nested anchor and the outer
+  request signature are verified independently; variant 37 returns both a
+  portable signed receipt and a request-bound outer response signature.
+- Admission is bilateral. `custody_audit_witness_requester_node_ids` is a
+  separate exact Ed25519 pin set from permissionless discovery and from
+  `verified_delivery_witness_requester_node_ids`. Empty is the default and
+  rejects every custody write. A current signed PeerStore descriptor is also
+  required, but discovery alone never grants write authority.
+- A witness cannot witness itself. This check runs before durable mutation.
+  Requests also pass canonical encoding, 60-second freshness, signature,
+  shared replay, and per-peer rate checks before the independent schema-v16
+  monotonic custody table is touched.
+- `advanced`, `idempotent`, `stale`, `conflict`, and `gap` are all signed and
+  portable. Adverse outcomes prove continuity failure; they are not transport
+  errors and never mutate the retained high-water row.
+- The witness stores only producer node id, checkpoint generation, canonical
+  anchor-frame SHA-256, and observation time. The signed anchor contains only
+  aggregate archived-entry count, aggregate archived bytes, private audit-root
+  commitment, and producer identity/signature. It contains no archive content,
+  record id, owner, user, route, message, endpoint, destination, or plaintext.
+- Producer-side automatic outbound exchange remains intentionally disabled in
+  this milestone. Upgrading a node exposes a fail-closed receiving endpoint but
+  does not transmit custody anchors anywhere. Outbound rollout requires an
+  explicit bounded witness list, privacy review, and operator activation.
+- This is independent anti-rollback evidence. It is not a vote, quorum,
+  consensus, fork choice, finality, proof of storage, or financial blockchain.
+
+Witness-side example:
+
+```toml
+[memchain]
+mode = "local"
+
+[discovery]
+enabled = true
+custody_audit_witness_requester_node_ids = [
+  "<reviewed-producer-ed25519-node-id-hex>",
+]
+```
 
 ### v0.94 Explicit SuperNode activation is a runtime contract
 

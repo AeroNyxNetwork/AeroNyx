@@ -199,6 +199,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.82.0-CustodyWitnessAdmission - Isolated custody requester pins from
+//! permissionless discovery and verified-delivery witness authority
 //! v0.81.0-SignedProtocolFeatures - Bound negotiated response contracts into
 //! route-surface fingerprints while preserving legacy cache compatibility
 //! v0.80.0-SignedFailureReceipt - Classify invalid authenticated failure ACKs
@@ -2571,6 +2573,7 @@ impl PeerStoreRouteDomainCertificateCacheReport {
 pub struct PeerStore {
     peers: RwLock<HashMap<[u8; 32], SignedNodeDescriptor>>,
     verified_delivery_witness_requesters: RwLock<HashSet<[u8; 32]>>,
+    custody_audit_witness_requesters: RwLock<HashSet<[u8; 32]>>,
     peer_runtime: RwLock<HashMap<[u8; 32], PeerRuntimeMetadata>>,
     route_health: RwLock<HashMap<[u8; 32], PeerRouteHealth>>,
     relay_protection_health: RwLock<HashMap<[u8; 32], PeerRelayProtectionHealth>>,
@@ -2596,6 +2599,7 @@ impl PeerStore {
         Self {
             peers: RwLock::new(HashMap::new()),
             verified_delivery_witness_requesters: RwLock::new(HashSet::new()),
+            custody_audit_witness_requesters: RwLock::new(HashSet::new()),
             peer_runtime: RwLock::new(HashMap::new()),
             route_health: RwLock::new(HashMap::new()),
             relay_protection_health: RwLock::new(HashMap::new()),
@@ -2650,6 +2654,23 @@ impl PeerStore {
     #[must_use]
     pub fn verified_delivery_witness_requester_allowed(&self, requester: &[u8; 32]) -> bool {
         self.verified_delivery_witness_requesters
+            .read()
+            .contains(requester)
+    }
+
+    /// Replaces identities allowed to store a custody-audit anchor decision.
+    ///
+    /// [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] This admission set is
+    /// intentionally independent from delivery witnesses and permissionless
+    /// discovery. Reusing either would silently broaden state-write authority.
+    pub fn configure_custody_audit_witness_requesters(&self, requesters: &[[u8; 32]]) {
+        *self.custody_audit_witness_requesters.write() = requesters.iter().copied().collect();
+    }
+
+    /// Returns whether this producer is explicitly pinned for custody witness writes.
+    #[must_use]
+    pub fn custody_audit_witness_requester_allowed(&self, requester: &[u8; 32]) -> bool {
+        self.custody_audit_witness_requesters
             .read()
             .contains(requester)
     }
@@ -12334,6 +12355,26 @@ mod tests {
         store.configure_verified_delivery_witness_requesters(&[second]);
         assert!(!store.verified_delivery_witness_requester_allowed(&first));
         assert!(store.verified_delivery_witness_requester_allowed(&second));
+    }
+
+    #[test]
+    fn test_custody_witness_requester_admission_is_independent_and_replaceable() {
+        let store = PeerStore::new();
+        let delivery = [0x31; 32];
+        let custody = [0x32; 32];
+        let replacement = [0x33; 32];
+
+        store.configure_verified_delivery_witness_requesters(&[delivery]);
+        store.configure_custody_audit_witness_requesters(&[custody]);
+        assert!(store.verified_delivery_witness_requester_allowed(&delivery));
+        assert!(!store.custody_audit_witness_requester_allowed(&delivery));
+        assert!(store.custody_audit_witness_requester_allowed(&custody));
+        assert!(!store.verified_delivery_witness_requester_allowed(&custody));
+
+        store.configure_custody_audit_witness_requesters(&[replacement]);
+        assert!(!store.custody_audit_witness_requester_allowed(&custody));
+        assert!(store.custody_audit_witness_requester_allowed(&replacement));
+        assert!(store.verified_delivery_witness_requester_allowed(&delivery));
     }
 
     #[test]

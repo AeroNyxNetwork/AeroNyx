@@ -545,6 +545,8 @@
 //     installation but the checkpoint table is absent, startup must fail.
 //
 // Last Modified:
+//   [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Installed independent
+//     custody requester pins and advertised the fail-closed peer route.
 //   [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] Added a two-process
 //     crash drill proving destructive checkpoint table loss cannot reactivate
 //     direct relay with an invented closed circuit.
@@ -5400,7 +5402,7 @@ impl Server {
         shutdown_rx: broadcast::Receiver<()>,
     ) -> RequiredApiListenerExit {
         info!(
-            "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/discovery/peer/directory/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/discovery/peer/verified-delivery-anchor-witness)",
+            "[DISCOVERY] Public node API on http://{} (routes: /api/discovery/*, /api/discovery/peer/directory/*, /api/chat/peer/*, /api/memchain/peer/block-announce, /api/memchain/peer/block-range, /api/memchain/peer/checkpoint, /api/memchain/peer/coordinator-lease, /api/memchain/peer/custody-audit-anchor-witness, /api/discovery/peer/verified-delivery-anchor-witness)",
             listen_addr
         );
         Self::serve_required_api_listener(
@@ -6039,6 +6041,15 @@ impl Server {
                 .config
                 .discovery
                 .verified_delivery_witness_requester_node_id_bytes(),
+        );
+        // [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Install custody pins
+        // independently. A delivery-witness relationship must never imply
+        // authority to advance durable custody evidence.
+        peer_store.configure_custody_audit_witness_requesters(
+            &self
+                .config
+                .discovery
+                .custody_audit_witness_requester_node_id_bytes(),
         );
         // [ROUTE-DOMAIN-ATTESTED-SELECTION 2026-08-03 by Codex] Install the
         // verifier-local policy before importing any peer descriptor. Invalid

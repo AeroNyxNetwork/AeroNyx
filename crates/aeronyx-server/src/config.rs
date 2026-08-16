@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.21.0-CustodyWitnessAdmission - Added an independent fail-closed producer
+//! pin set for custody-audit witness writes
 //! v0.20.0-RouteDomainAttestors - Added opt-in pinned attestor quorum and
 //! fail-closed certificate requirement for multi-hop route-domain assignments
 //! v0.19.0-PinnedRouteDomains - Added optional fail-closed, operator-audited
@@ -99,12 +101,58 @@ use crate::management::ManagementConfig;
 
 const MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS: usize = 3;
 const MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS: usize = 64;
+const MAX_CUSTODY_AUDIT_WITNESS_REQUESTER_NODE_IDS: usize = 64;
 const MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS: usize = 16;
 const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
 const MAX_DIRECTORY_GOSSIP_PROOF_MIN_AGE_SECS: u64 = 48 * 60 * 60;
 const MAX_DISCOVERY_GOSSIP_CONCURRENCY: u16 = 64;
 const MAX_PINNED_ROUTE_DOMAINS: usize = 256;
 const MAX_ROUTE_DOMAIN_ATTESTOR_NODE_IDS: usize = 16;
+
+/// Validates one fail-closed witness requester pin set.
+///
+/// [WITNESS-ADMISSION-PINS 2026-08-16 by Codex] Delivery and custody witnesses
+/// remain separate policy domains, but must share identical parsing and
+/// duplicate rejection so one endpoint cannot accidentally become weaker.
+fn validate_witness_requester_node_ids(
+    field: &'static str,
+    configured: &[String],
+    max_entries: usize,
+) -> Result<Vec<[u8; 32]>> {
+    if configured.len() > max_entries {
+        return Err(ServerError::config_invalid(
+            field,
+            format!("supports at most {max_entries} requester identities"),
+        ));
+    }
+    let mut validated = Vec::<[u8; 32]>::with_capacity(configured.len());
+    for configured_id in configured {
+        let value = configured_id.trim();
+        let decoded = hex::decode(value).map_err(|_| {
+            ServerError::config_invalid(
+                field,
+                "each entry must be a 64-character Ed25519 public key in hexadecimal",
+            )
+        })?;
+        let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
+            ServerError::config_invalid(field, "each entry must decode to exactly 32 bytes")
+        })?;
+        if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
+            return Err(ServerError::config_invalid(
+                field,
+                "each entry must be a non-zero 64-character Ed25519 public key",
+            ));
+        }
+        if validated.contains(&node_id) {
+            return Err(ServerError::config_invalid(
+                field,
+                "duplicate requester identities are not allowed",
+            ));
+        }
+        validated.push(node_id);
+    }
+    Ok(validated)
+}
 
 /// One validated, canonical local route-domain assignment.
 ///
@@ -241,6 +289,14 @@ pub struct DiscoveryConfig {
     /// ordinary descriptor discovery and encrypted relay participation.
     #[serde(default)]
     pub verified_delivery_witness_requester_node_ids: Vec<String>,
+    /// Producer identities this node explicitly agrees to witness for custody.
+    ///
+    /// [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] These pins are separate
+    /// from delivery witnesses and permissionless discovery. An empty list
+    /// keeps custody witness writes fail-closed without affecting relay or
+    /// descriptor participation.
+    #[serde(default)]
+    pub custody_audit_witness_requester_node_ids: Vec<String>,
     /// Minimum valid signed witness responses required to protect a generation.
     #[serde(default = "DiscoveryConfig::default_verified_delivery_witness_min_verified")]
     pub verified_delivery_witness_min_verified: usize,
@@ -800,47 +856,25 @@ impl DiscoveryConfig {
                     "requires discovery.enabled = true",
                 ));
             }
-            if self.verified_delivery_witness_requester_node_ids.len()
-                > MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS
-            {
+            validate_witness_requester_node_ids(
+                "discovery.verified_delivery_witness_requester_node_ids",
+                &self.verified_delivery_witness_requester_node_ids,
+                MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS,
+            )?;
+        }
+
+        if !self.custody_audit_witness_requester_node_ids.is_empty() {
+            if !self.enabled {
                 return Err(ServerError::config_invalid(
-                    "discovery.verified_delivery_witness_requester_node_ids",
-                    format!(
-                        "supports at most {MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS} requester identities"
-                    ),
+                    "discovery.custody_audit_witness_requester_node_ids",
+                    "requires discovery.enabled = true",
                 ));
             }
-            let mut validated = Vec::<[u8; 32]>::with_capacity(
-                self.verified_delivery_witness_requester_node_ids.len(),
-            );
-            for configured in &self.verified_delivery_witness_requester_node_ids {
-                let value = configured.trim();
-                let decoded = hex::decode(value).map_err(|_| {
-                    ServerError::config_invalid(
-                        "discovery.verified_delivery_witness_requester_node_ids",
-                        "each entry must be a 64-character Ed25519 public key in hexadecimal",
-                    )
-                })?;
-                let node_id: [u8; 32] = decoded.try_into().map_err(|_| {
-                    ServerError::config_invalid(
-                        "discovery.verified_delivery_witness_requester_node_ids",
-                        "each entry must decode to exactly 32 bytes",
-                    )
-                })?;
-                if value.len() != 64 || node_id.iter().all(|byte| *byte == 0) {
-                    return Err(ServerError::config_invalid(
-                        "discovery.verified_delivery_witness_requester_node_ids",
-                        "each entry must be a non-zero 64-character Ed25519 public key",
-                    ));
-                }
-                if validated.contains(&node_id) {
-                    return Err(ServerError::config_invalid(
-                        "discovery.verified_delivery_witness_requester_node_ids",
-                        "duplicate requester identities are not allowed",
-                    ));
-                }
-                validated.push(node_id);
-            }
+            validate_witness_requester_node_ids(
+                "discovery.custody_audit_witness_requester_node_ids",
+                &self.custody_audit_witness_requester_node_ids,
+                MAX_CUSTODY_AUDIT_WITNESS_REQUESTER_NODE_IDS,
+            )?;
         }
 
         if self.peer_cache_write_interval_secs < 30 {
@@ -1215,6 +1249,18 @@ impl DiscoveryConfig {
             .collect()
     }
 
+    /// Returns validated producer identities allowed to request custody proof.
+    #[must_use]
+    pub fn custody_audit_witness_requester_node_id_bytes(&self) -> Vec<[u8; 32]> {
+        self.custody_audit_witness_requester_node_ids
+            .iter()
+            .filter_map(|value| {
+                let decoded = hex::decode(value.trim()).ok()?;
+                decoded.try_into().ok()
+            })
+            .collect()
+    }
+
     fn validate_seed_endpoint(endpoint: &str) -> Result<()> {
         let trimmed = endpoint.trim();
         if trimmed.is_empty() {
@@ -1264,6 +1310,7 @@ impl Default for DiscoveryConfig {
                 Self::default_directory_observation_witness_min_verified(),
             verified_delivery_witness_node_ids: Vec::new(),
             verified_delivery_witness_requester_node_ids: Vec::new(),
+            custody_audit_witness_requester_node_ids: Vec::new(),
             verified_delivery_witness_min_verified:
                 Self::default_verified_delivery_witness_min_verified(),
             verified_delivery_witness_required_for_restore: false,
@@ -1401,12 +1448,16 @@ impl ServerConfig {
             || !self
                 .discovery
                 .verified_delivery_witness_requester_node_ids
+                .is_empty()
+            || !self
+                .discovery
+                .custody_audit_witness_requester_node_ids
                 .is_empty())
             && !self.memchain.is_enabled()
         {
             return Err(ServerError::config_invalid(
                 "discovery.verified_delivery_witness_*",
-                "requires a local MemChain storage mode for the authenticated witness endpoint",
+                "authenticated witness endpoints require a local MemChain storage mode",
             ));
         }
         Ok(())
@@ -1526,6 +1577,10 @@ mod tests {
         assert!(config
             .discovery
             .verified_delivery_witness_requester_node_ids
+            .is_empty());
+        assert!(config
+            .discovery
+            .custody_audit_witness_requester_node_ids
             .is_empty());
         assert_eq!(
             config.discovery.verified_delivery_witness_min_verified,
@@ -1849,6 +1904,9 @@ verified_delivery_witness_node_ids = [
 verified_delivery_witness_requester_node_ids = [
   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 ]
+custody_audit_witness_requester_node_ids = [
+  "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+]
 verified_delivery_witness_min_verified = 2
 verified_delivery_witness_required_for_restore = true
 "#;
@@ -1862,6 +1920,12 @@ verified_delivery_witness_required_for_restore = true
                 .discovery
                 .verified_delivery_witness_requester_node_id_bytes(),
             vec![[0xCC; 32]]
+        );
+        assert_eq!(
+            config
+                .discovery
+                .custody_audit_witness_requester_node_id_bytes(),
+            vec![[0xDD; 32]]
         );
         assert_eq!(config.discovery.verified_delivery_witness_min_verified, 2);
         assert!(
@@ -1936,6 +2000,31 @@ verified_delivery_witness_requester_node_ids = [
 ]
 "#;
         assert!(ServerConfig::from_str(disabled_witness_service).is_err());
+
+        let duplicate_custody_requesters = r#"
+[memchain]
+mode = "local"
+
+[discovery]
+enabled = true
+custody_audit_witness_requester_node_ids = [
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+]
+"#;
+        assert!(ServerConfig::from_str(duplicate_custody_requesters).is_err());
+
+        let disabled_custody_witness_service = r#"
+[memchain]
+mode = "off"
+
+[discovery]
+enabled = true
+custody_audit_witness_requester_node_ids = [
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+]
+"#;
+        assert!(ServerConfig::from_str(disabled_custody_witness_service).is_err());
 
         let missing_pins = r#"
 [memchain]

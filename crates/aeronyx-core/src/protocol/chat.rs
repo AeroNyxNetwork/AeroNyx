@@ -83,6 +83,8 @@
 //!   fixed-size and disclose no additional custody or user information.
 //!
 //! ## Last Modified
+//! v1.8.0-CustodyWitnessNetwork - Added canonical anchor/receipt frame digests
+//! and verification of portable adverse outcomes for node-to-node exchange
 //! v1.7.0-CustodyAuditWitness - Added independent signed checkpoint receipts
 //! v1.6.0-CustodyAuditAnchor - Added portable opaque custody checkpoint anchors
 //! v1.5.0-SignedFailureReceipt - Authenticate hop-local failure ACKs without exposing route topology
@@ -895,6 +897,20 @@ pub fn encode_custody_audit_anchor(anchor: &CustodyAuditAnchorV1) -> Result<Vec<
         .map_err(|error| CoreError::malformed(format!("custody audit anchor encode: {error}")))
 }
 
+/// Returns the SHA-256 of the canonical bounded custody anchor frame.
+///
+/// [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Network request signatures,
+/// receipt bindings, and operator pins must all derive the same digest inside
+/// the protocol crate instead of trusting caller-specific serialization.
+///
+/// # Errors
+/// Returns [`CoreError::MalformedMessage`] when canonical encoding fails.
+pub fn custody_audit_anchor_frame_sha256(
+    anchor: &CustodyAuditAnchorV1,
+) -> Result<[u8; 32], CoreError> {
+    Ok(Sha256::digest(encode_custody_audit_anchor(anchor)?).into())
+}
+
 /// Decodes one complete canonical custody audit anchor frame.
 ///
 /// # Errors
@@ -1057,6 +1073,43 @@ impl CustodyAuditWitnessReceiptV1 {
             .verify(&self.signing_data(), &self.signature)
     }
 
+    /// Verifies any signed witness decision against one exact anchor and pins.
+    ///
+    /// Negative `stale`, `conflict`, and `gap` decisions remain valid portable
+    /// evidence. Call [`Self::verify_accepted_for_anchor`] when policy requires
+    /// the witness to have retained the requested anchor.
+    ///
+    /// # Errors
+    /// Returns a malformed/signature error for a wrong producer/witness,
+    /// rollback below the verifier floor, or an anchor digest that does not
+    /// match the request signed by the witness.
+    pub fn verify_for_anchor(
+        &self,
+        anchor: &CustodyAuditAnchorV1,
+        anchor_frame_sha256: &[u8; 32],
+        expected_producer: &[u8; 32],
+        expected_witness: &[u8; 32],
+        minimum_checkpoint_generation: u64,
+    ) -> Result<(), CoreError> {
+        self.verify_signature()?;
+        anchor.verify_expected(expected_producer, minimum_checkpoint_generation)?;
+        // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Recompute the canonical
+        // frame digest inside the verifier. Future network callers must not be
+        // able to satisfy exact-frame binding by supplying their own digest.
+        let canonical_anchor_sha256 = custody_audit_anchor_frame_sha256(anchor)?;
+        if &self.producer_node_id != expected_producer
+            || &self.witness_node_id != expected_witness
+            || self.requested_checkpoint_generation != anchor.checkpoint_generation
+            || &canonical_anchor_sha256 != anchor_frame_sha256
+            || &self.requested_frame_sha256 != anchor_frame_sha256
+        {
+            return Err(CoreError::malformed(
+                "custody audit witness receipt: trust policy mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     /// Verifies an accepted receipt against one exact producer anchor and pins.
     ///
     /// # Errors
@@ -1071,22 +1124,16 @@ impl CustodyAuditWitnessReceiptV1 {
         expected_witness: &[u8; 32],
         minimum_checkpoint_generation: u64,
     ) -> Result<(), CoreError> {
-        self.verify_signature()?;
-        anchor.verify_expected(expected_producer, minimum_checkpoint_generation)?;
-        // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Recompute the canonical
-        // frame digest inside the verifier. Future network callers must not be
-        // able to satisfy exact-frame binding by supplying their own digest.
-        let canonical_anchor_frame = encode_custody_audit_anchor(anchor)?;
-        let canonical_anchor_sha256: [u8; 32] = Sha256::digest(&canonical_anchor_frame).into();
-        if !self.accepted()
-            || &self.producer_node_id != expected_producer
-            || &self.witness_node_id != expected_witness
-            || self.requested_checkpoint_generation != anchor.checkpoint_generation
-            || &canonical_anchor_sha256 != anchor_frame_sha256
-            || &self.requested_frame_sha256 != anchor_frame_sha256
-        {
+        self.verify_for_anchor(
+            anchor,
+            anchor_frame_sha256,
+            expected_producer,
+            expected_witness,
+            minimum_checkpoint_generation,
+        )?;
+        if !self.accepted() {
             return Err(CoreError::malformed(
-                "custody audit witness receipt: trust policy mismatch",
+                "custody audit witness receipt: witness did not accept anchor",
             ));
         }
         Ok(())
@@ -1105,6 +1152,16 @@ pub fn encode_custody_audit_witness_receipt(
         MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES as u64,
     )
     .map_err(|error| CoreError::malformed(format!("custody audit witness receipt encode: {error}")))
+}
+
+/// Returns the SHA-256 of the canonical bounded witness receipt frame.
+///
+/// # Errors
+/// Returns [`CoreError::MalformedMessage`] when canonical encoding fails.
+pub fn custody_audit_witness_receipt_frame_sha256(
+    receipt: &CustodyAuditWitnessReceiptV1,
+) -> Result<[u8; 32], CoreError> {
+    Ok(Sha256::digest(encode_custody_audit_witness_receipt(receipt)?).into())
 }
 
 /// Decodes one complete canonical custody audit witness receipt frame.

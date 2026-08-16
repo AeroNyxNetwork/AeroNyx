@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.15-AuthenticatedSessionClose
+// Version: 2.8.16-CustodyAuditWitnessNetwork
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -30,6 +30,9 @@
 //   v2.8.15-AuthenticatedSessionClose — Appended a signed, fixed-size graceful
 //   UDP session close request. Existing discriminants and wire bytes remain
 //   unchanged.
+//   v2.8.16-CustodyAuditWitnessNetwork — Appended fixed-size signed request and
+//   response frames for independent custody-audit anchor witnesses. Existing
+//   discriminants and wire bytes remain unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -54,9 +57,10 @@
 //   - v1.3.0 is a BREAKING CHANGE: DeviceRegister, ChatPull, ChatAck wire
 //     format changed — old clients cannot talk to new servers and vice versa
 //   - WalletPresence (17) is a lightweight heartbeat — node never replies
-//   - Record block/checkpoint/certificate/lease, delivery-anchor witness, and
-//     authority-handover frames (19-22, 25-34) are node-peer control messages and MUST NOT be
-//     accepted from ordinary client tunnels
+//   - Record block/checkpoint/certificate/lease, delivery-anchor witness,
+//     authority-handover, and custody-witness frames (19-22, 25-34, 36-37) are
+//     node-peer control messages and MUST NOT be accepted from ordinary client
+//     tunnels
 //   - SessionCloseV1 (35) is a client-tunnel control frame. It must match both
 //     the outer encrypted session ID and its handshake Ed25519 identity.
 //   - Commitment blocks contain opaque record IDs only; sealed memory payload
@@ -68,6 +72,8 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.16-CustodyAuditWitnessNetwork — Appended variants 36-37 and canonical
+//                        exact-anchor/receipt request bindings
 //   v2.8.15-AuthenticatedSessionClose — Appended variant 35 for bounded,
 //                        signed graceful UDP tunnel cleanup
 //   v2.8.14-AuthorityHandoverExchange — Appended variants 33-34 and canonical
@@ -100,7 +106,9 @@ use crate::ledger::{
     BlockHeader, MemoryRecord, RecordCommitmentBlockV1, RecordCommitmentHeaderV1,
     RecordCoordinatorHandoverV1,
 };
-use crate::protocol::chat::ChatEnvelope;
+use crate::protocol::chat::{
+    ChatEnvelope, CustodyAuditAnchorV1, CustodyAuditWitnessReceiptV1,
+};
 use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
 
 // ============================================
@@ -259,6 +267,8 @@ pub struct RecordCheckpointCertificateMemberV1 {
 /// | 33    | RecordCoordinatorHandoverRequestV1 | v2.8.14-HandoverExchange |
 /// | 34    | RecordCoordinatorHandoverResponseV1| v2.8.14-HandoverExchange |
 /// | 35    | SessionCloseV1       | v2.8.15-AuthenticatedSessionClose |
+/// | 36    | CustodyAuditAnchorWitnessRequestV1 | v2.8.16-CustodyWitnessNetwork |
+/// | 37    | CustodyAuditAnchorWitnessResponseV1| v2.8.16-CustodyWitnessNetwork |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -842,6 +852,48 @@ pub enum MemChainMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+
+    // ── v2.8.16: independent custody-audit witness exchange (36-37) ─────
+    /// [index 36] Requests an independent signed decision for one exact anchor.
+    ///
+    /// [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] The nested anchor proves
+    /// producer authorship. This outer signature separately binds the anchor
+    /// to a fresh request id so a captured anchor cannot be replayed as a new
+    /// witness request by another peer.
+    CustodyAuditAnchorWitnessRequestV1 {
+        /// Per-request random identifier used by the witness replay guard.
+        request_id: [u8; 16],
+        /// Requesting producer identity; must equal `anchor.producer_node_id`.
+        requester: [u8; 32],
+        /// Unix epoch seconds; witnesses reject stale requests.
+        request_timestamp: u64,
+        /// Exact producer-signed aggregate custody anchor being witnessed.
+        anchor: CustodyAuditAnchorV1,
+        /// Requester signature over the canonical anchor digest and request.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
+
+    /// [index 37] Returns one portable receipt and request-bound signature.
+    ///
+    /// The nested receipt is independently portable evidence. The outer
+    /// signature prevents a valid receipt from being substituted into a
+    /// different in-flight request. Neither layer carries archive contents.
+    CustodyAuditAnchorWitnessResponseV1 {
+        /// Exact request identifier copied from the admitted request.
+        request_id: [u8; 16],
+        /// Producer identity copied from the admitted request.
+        requester: [u8; 32],
+        /// Responding witness identity and receipt signer.
+        witness: [u8; 32],
+        /// Unix epoch seconds; must equal `receipt.observed_at`.
+        response_timestamp: u64,
+        /// Signed monotonic accept/stale/conflict/gap evidence.
+        receipt: CustodyAuditWitnessReceiptV1,
+        /// Witness signature binding the portable receipt to this request.
+        #[serde(with = "serde_bytes64")]
+        signature: [u8; 64],
+    },
 }
 
 fn deserialize_chat_pull_cursor_v2<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -1221,6 +1273,49 @@ pub fn verified_delivery_anchor_witness_response_signing_bytes(
     bytes.extend_from_slice(&witness_generation.to_le_bytes());
     bytes.extend_from_slice(witness_anchor_digest);
     bytes.push(outcome);
+    bytes
+}
+
+/// Canonical bytes signed by `CustodyAuditAnchorWitnessRequestV1.requester`.
+///
+/// The caller must supply the SHA-256 returned by
+/// `custody_audit_anchor_frame_sha256`; transport code must never hash an
+/// alternate representation of the nested anchor.
+#[must_use]
+pub fn custody_audit_anchor_witness_request_signing_bytes(
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    request_timestamp: u64,
+    anchor_frame_sha256: &[u8; 32],
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(160);
+    bytes.extend_from_slice(b"AeroNyx-CustodyAuditAnchorWitnessRequest-v1");
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(requester);
+    bytes.extend_from_slice(&request_timestamp.to_le_bytes());
+    bytes.extend_from_slice(anchor_frame_sha256);
+    bytes
+}
+
+/// Canonical bytes signed by `CustodyAuditAnchorWitnessResponseV1.witness`.
+///
+/// The nested receipt remains independently verifiable; this second signature
+/// binds its canonical digest to the exact request and response timestamp.
+#[must_use]
+pub fn custody_audit_anchor_witness_response_signing_bytes(
+    request_id: &[u8; 16],
+    requester: &[u8; 32],
+    witness: &[u8; 32],
+    response_timestamp: u64,
+    receipt_frame_sha256: &[u8; 32],
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(192);
+    bytes.extend_from_slice(b"AeroNyx-CustodyAuditAnchorWitnessResponse-v1");
+    bytes.extend_from_slice(request_id);
+    bytes.extend_from_slice(requester);
+    bytes.extend_from_slice(witness);
+    bytes.extend_from_slice(&response_timestamp.to_le_bytes());
+    bytes.extend_from_slice(receipt_frame_sha256);
     bytes
 }
 
@@ -1799,6 +1894,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(disc(&b), 35, "SessionCloseV1 must be discriminant 35");
+
+        let anchor = CustodyAuditAnchorV1::signed(1, 8, 4_096, [0xC6; 32], &identity)
+            .expect("sign custody anchor");
+        let b = bincode::serialize(&MemChainMessage::CustodyAuditAnchorWitnessRequestV1 {
+            request_id: [0xC7; 16],
+            requester: identity.public_key_bytes(),
+            request_timestamp: 1_700_000_010,
+            anchor: anchor.clone(),
+            signature: [0xC8; 64],
+        })
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            36,
+            "CustodyAuditAnchorWitnessRequestV1 must be discriminant 36"
+        );
+
+        let receipt = CustodyAuditWitnessReceiptV1::signed(
+            identity.public_key_bytes(),
+            1,
+            [0xC9; 32],
+            1_700_000_011,
+            1,
+            [0xC9; 32],
+            crate::protocol::chat::CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+            &IdentityKeyPair::from_bytes(&[0xCA; 32]).expect("witness identity"),
+        )
+        .expect("sign custody receipt");
+        let b = bincode::serialize(&MemChainMessage::CustodyAuditAnchorWitnessResponseV1 {
+            request_id: [0xC7; 16],
+            requester: identity.public_key_bytes(),
+            witness: receipt.witness_node_id,
+            response_timestamp: receipt.observed_at,
+            receipt,
+            signature: [0xCB; 64],
+        })
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            37,
+            "CustodyAuditAnchorWitnessResponseV1 must be discriminant 37"
+        );
     }
 
     #[test]
@@ -2497,6 +2634,142 @@ mod tests {
             ),
             request_signing_bytes,
             "generation must be covered by the request signature"
+        );
+    }
+
+    #[test]
+    fn test_custody_audit_anchor_witness_messages_roundtrip_and_signatures() {
+        // [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Lock both nested
+        // portable signatures and outer request correlation before any HTTP
+        // endpoint consumes these append-only wire variants.
+        let requester = IdentityKeyPair::from_bytes(&[0xD1; 32]).expect("requester identity");
+        let witness = IdentityKeyPair::from_bytes(&[0xD2; 32]).expect("witness identity");
+        let anchor =
+            CustodyAuditAnchorV1::signed(7, 65_600, 512 * 1024 * 1024, [0xD3; 32], &requester)
+                .expect("sign custody anchor");
+        let anchor_sha256 = crate::protocol::chat::custody_audit_anchor_frame_sha256(&anchor)
+            .expect("hash custody anchor");
+        let request_id = [0xD4; 16];
+        let request_timestamp = 1_787_300_000;
+        let request_signing_bytes = custody_audit_anchor_witness_request_signing_bytes(
+            &request_id,
+            &requester.public_key_bytes(),
+            request_timestamp,
+            &anchor_sha256,
+        );
+        let request = MemChainMessage::CustodyAuditAnchorWitnessRequestV1 {
+            request_id,
+            requester: requester.public_key_bytes(),
+            request_timestamp,
+            anchor: anchor.clone(),
+            signature: requester.sign(&request_signing_bytes),
+        };
+        let encoded = encode_memchain(&request).expect("encode custody witness request");
+        assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()), 36);
+        let decoded = decode_memchain(&encoded[1..]).expect("decode custody witness request");
+        let MemChainMessage::CustodyAuditAnchorWitnessRequestV1 {
+            request_id: decoded_request_id,
+            requester: decoded_requester,
+            request_timestamp: decoded_timestamp,
+            anchor: decoded_anchor,
+            signature,
+        } = decoded
+        else {
+            panic!("expected custody witness request");
+        };
+        assert_eq!(decoded_anchor, anchor);
+        requester
+            .verify(
+                &custody_audit_anchor_witness_request_signing_bytes(
+                    &decoded_request_id,
+                    &decoded_requester,
+                    decoded_timestamp,
+                    &crate::protocol::chat::custody_audit_anchor_frame_sha256(&decoded_anchor)
+                        .expect("hash decoded anchor"),
+                ),
+                &signature,
+            )
+            .expect("verify custody witness request");
+
+        let response_timestamp = request_timestamp + 1;
+        let receipt = CustodyAuditWitnessReceiptV1::signed(
+            requester.public_key_bytes(),
+            anchor.checkpoint_generation,
+            anchor_sha256,
+            response_timestamp,
+            anchor.checkpoint_generation,
+            anchor_sha256,
+            crate::protocol::chat::CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+            &witness,
+        )
+        .expect("sign custody witness receipt");
+        let receipt_sha256 =
+            crate::protocol::chat::custody_audit_witness_receipt_frame_sha256(&receipt)
+                .expect("hash custody witness receipt");
+        let response_signing_bytes = custody_audit_anchor_witness_response_signing_bytes(
+            &request_id,
+            &requester.public_key_bytes(),
+            &witness.public_key_bytes(),
+            response_timestamp,
+            &receipt_sha256,
+        );
+        let response = MemChainMessage::CustodyAuditAnchorWitnessResponseV1 {
+            request_id,
+            requester: requester.public_key_bytes(),
+            witness: witness.public_key_bytes(),
+            response_timestamp,
+            receipt: receipt.clone(),
+            signature: witness.sign(&response_signing_bytes),
+        };
+        let encoded = encode_memchain(&response).expect("encode custody witness response");
+        assert_eq!(u32::from_le_bytes(encoded[1..5].try_into().unwrap()), 37);
+        let decoded = decode_memchain(&encoded[1..]).expect("decode custody witness response");
+        let MemChainMessage::CustodyAuditAnchorWitnessResponseV1 {
+            request_id: decoded_request_id,
+            requester: decoded_requester,
+            witness: decoded_witness,
+            response_timestamp: decoded_timestamp,
+            receipt: decoded_receipt,
+            signature,
+        } = decoded
+        else {
+            panic!("expected custody witness response");
+        };
+        assert_eq!(decoded_receipt, receipt);
+        witness
+            .verify(
+                &custody_audit_anchor_witness_response_signing_bytes(
+                    &decoded_request_id,
+                    &decoded_requester,
+                    &decoded_witness,
+                    decoded_timestamp,
+                    &crate::protocol::chat::custody_audit_witness_receipt_frame_sha256(
+                        &decoded_receipt,
+                    )
+                    .expect("hash decoded receipt"),
+                ),
+                &signature,
+            )
+            .expect("verify custody witness response");
+        decoded_receipt
+            .verify_accepted_for_anchor(
+                &anchor,
+                &anchor_sha256,
+                &requester.public_key_bytes(),
+                &witness.public_key_bytes(),
+                anchor.checkpoint_generation,
+            )
+            .expect("verify portable custody witness receipt");
+
+        assert_ne!(
+            custody_audit_anchor_witness_request_signing_bytes(
+                &[0xFF; 16],
+                &requester.public_key_bytes(),
+                request_timestamp,
+                &anchor_sha256,
+            ),
+            request_signing_bytes,
+            "request id must be covered by the outer signature"
         );
     }
 

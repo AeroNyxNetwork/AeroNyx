@@ -17,6 +17,7 @@
 //! - `POST /api/memchain/peer/coordinator-lease`
 //! - `POST /api/memchain/peer/coordinator-lease/release`
 //! - `POST /api/memchain/peer/coordinator-handover`
+//! - `POST /api/memchain/peer/custody-audit-anchor-witness`
 //! - `POST /api/discovery/peer/verified-delivery-anchor-witness`
 //! - Bincode `MemChainMessage` request/response with the existing magic byte.
 //! - Signed discovery-peer admission, timestamp freshness, stateful-request
@@ -105,6 +106,10 @@
 //! generation, opaque anchor digest, and observation time. Delivery counts,
 //! delivery timestamps, routes, message ids, payloads, and client metadata
 //! never cross the node-to-node witness boundary.
+//! The custody witness endpoint stores only a producer node id, monotonic
+//! checkpoint generation, canonical aggregate-anchor digest, and observation
+//! time. It never receives archive content, record ids, owners, users, routes,
+//! messages, endpoints, destinations, or plaintext.
 //!
 //! ## Important Note for Next Developer
 //! - Do not mount this handler without `PeerStore` admission.
@@ -165,6 +170,8 @@
 //!   and audited predecessor; never trust responder identity as authority.
 //!
 //! ## Last Modified
+//! v2.8.61-CustodyWitnessNetwork - Added independently pinned canonical
+//! custody-anchor admission and portable positive/adverse receipt responses.
 //! v2.8.60-AuthorityHandoverCarrier - Recovered exact dual-signed authority
 //! proofs through bounded operator-pinned transport carriers.
 //! v2.8.59-AuthorityHandoverExchange - Added bounded authenticated next-proof
@@ -230,15 +237,21 @@ use tracing::{debug, warn};
 
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::ledger::{
-    RecordCommitmentBlockV1, RecordCoordinatorHandoverV1,
-    AERONYX_MEMCHAIN_MAINNET_CHAIN_ID, GENESIS_PREV_HASH,
-    MAX_RECORD_COMMITMENTS_PER_BLOCK, RECORD_COMMITMENT_BLOCK_VERSION_V1,
+    RecordCommitmentBlockV1, RecordCoordinatorHandoverV1, AERONYX_MEMCHAIN_MAINNET_CHAIN_ID,
+    GENESIS_PREV_HASH, MAX_RECORD_COMMITMENTS_PER_BLOCK, RECORD_COMMITMENT_BLOCK_VERSION_V1,
+};
+use aeronyx_core::protocol::chat::{
+    custody_audit_anchor_frame_sha256, custody_audit_witness_receipt_frame_sha256,
+    CustodyAuditAnchorV1, CustodyAuditWitnessReceiptV1, CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+    CUSTODY_AUDIT_WITNESS_CONFLICT_V1, CUSTODY_AUDIT_WITNESS_GAP_V1,
+    CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1, CUSTODY_AUDIT_WITNESS_STALE_V1,
 };
 use aeronyx_core::protocol::memchain::{
-    decode_memchain, encode_memchain, record_block_range_request_signing_bytes,
-    record_block_range_response_signing_bytes, record_chain_checkpoint_request_signing_bytes,
-    record_chain_checkpoint_response_signing_bytes, record_checkpoint_certificate_digest_v1,
-    record_checkpoint_certificate_request_signing_bytes,
+    custody_audit_anchor_witness_request_signing_bytes,
+    custody_audit_anchor_witness_response_signing_bytes, decode_memchain, encode_memchain,
+    record_block_range_request_signing_bytes, record_block_range_response_signing_bytes,
+    record_chain_checkpoint_request_signing_bytes, record_chain_checkpoint_response_signing_bytes,
+    record_checkpoint_certificate_digest_v1, record_checkpoint_certificate_request_signing_bytes,
     record_checkpoint_certificate_response_signing_bytes,
     record_coordinator_handover_request_signing_bytes,
     record_coordinator_handover_response_signing_bytes,
@@ -263,9 +276,10 @@ use super::{
 };
 use crate::api::discovery::GossipResponse;
 use crate::services::memchain::storage_ops::{
-    RecordCommitmentAuthorityState, RecordCommitmentCheckpointEvidencePersistOutcome,
-    RecordCoordinatorHandoverPersistOutcome, RecordCoordinatorLeaseGrantOutcome,
-    RecordCoordinatorLeaseReleaseOutcome, VerifiedDeliveryAnchorWitnessOutcome,
+    CustodyAuditAnchorWitnessOutcome, RecordCommitmentAuthorityState,
+    RecordCommitmentCheckpointEvidencePersistOutcome, RecordCoordinatorHandoverPersistOutcome,
+    RecordCoordinatorLeaseGrantOutcome, RecordCoordinatorLeaseReleaseOutcome,
+    VerifiedDeliveryAnchorWitnessOutcome,
 };
 use crate::services::memchain::{
     MemoryStorage, RecordCommitmentAnnouncementDisposition,
@@ -1139,6 +1153,10 @@ pub fn build_memchain_peer_router_with_runtime(
         .route(
             "/api/discovery/peer/verified-delivery-anchor-witness",
             post(verified_delivery_anchor_witness_handler),
+        )
+        .route(
+            "/api/memchain/peer/custody-audit-anchor-witness",
+            post(custody_audit_anchor_witness_handler),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
@@ -4745,6 +4763,80 @@ fn verify_delivery_anchor_witness_response(
     Ok(outcome)
 }
 
+/// Verifies one request-bound portable custody witness receipt.
+///
+/// [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Negative receipts are valid
+/// evidence, so this verifier authenticates their exact relation rather than
+/// collapsing them into transport errors. The outer signature binds the
+/// portable receipt to one request; the nested signature remains independently
+/// verifiable by later auditors.
+#[allow(clippy::too_many_arguments)]
+fn verify_custody_audit_anchor_witness_response(
+    body: &[u8],
+    expected_request_id: &[u8; 16],
+    expected_requester: &[u8; 32],
+    expected_witness: &[u8; 32],
+    anchor: &CustodyAuditAnchorV1,
+    anchor_frame_sha256: &[u8; 32],
+    now: u64,
+) -> Result<CustodyAuditWitnessReceiptV1, String> {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return Err("invalid_custody_witness_frame".to_string());
+    }
+    let response =
+        decode_memchain(&body[1..]).map_err(|_| "invalid_custody_witness_frame".to_string())?;
+    let canonical =
+        encode_memchain(&response).map_err(|_| "invalid_custody_witness_frame".to_string())?;
+    if canonical != body {
+        return Err("noncanonical_custody_witness_frame".to_string());
+    }
+    let MemChainMessage::CustodyAuditAnchorWitnessResponseV1 {
+        request_id,
+        requester,
+        witness,
+        response_timestamp,
+        receipt,
+        signature,
+    } = response
+    else {
+        return Err("unexpected_custody_witness_message".to_string());
+    };
+    if request_id != *expected_request_id || requester != *expected_requester {
+        return Err("custody_witness_request_mismatch".to_string());
+    }
+    if witness != *expected_witness {
+        return Err("custody_witness_identity_mismatch".to_string());
+    }
+    if response_timestamp != receipt.observed_at
+        || now.abs_diff(response_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS
+    {
+        return Err("custody_witness_timestamp_invalid".to_string());
+    }
+
+    let receipt_sha256 = custody_audit_witness_receipt_frame_sha256(&receipt)
+        .map_err(|_| "invalid_custody_witness_receipt".to_string())?;
+    let signing_bytes = custody_audit_anchor_witness_response_signing_bytes(
+        &request_id,
+        &requester,
+        &witness,
+        response_timestamp,
+        &receipt_sha256,
+    );
+    IdentityPublicKey::from_bytes(&witness)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .map_err(|_| "invalid_custody_witness_response_signature".to_string())?;
+    receipt
+        .verify_for_anchor(
+            anchor,
+            anchor_frame_sha256,
+            expected_requester,
+            expected_witness,
+            1,
+        )
+        .map_err(|_| "invalid_custody_witness_receipt".to_string())?;
+    Ok(receipt)
+}
+
 fn verify_checkpoint_certificate_response(
     body: &[u8],
     expected_request_id: &[u8; 16],
@@ -5846,6 +5938,201 @@ async fn verified_delivery_anchor_witness_handler(
         .into_response()
 }
 
+async fn custody_audit_anchor_witness_handler(
+    State(state): State<MemChainPeerState>,
+    body: Bytes,
+) -> Response {
+    if body.first().copied() != Some(MEMCHAIN_MAGIC) {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
+    }
+    let message = match decode_memchain(&body[1..]) {
+        Ok(message) => message,
+        Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
+    };
+    let canonical = match encode_memchain(&message) {
+        Ok(canonical) => canonical,
+        Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame"),
+    };
+    if canonical.as_slice() != body.as_ref() {
+        return protocol_error(StatusCode::BAD_REQUEST, "noncanonical_frame");
+    }
+    let MemChainMessage::CustodyAuditAnchorWitnessRequestV1 {
+        request_id,
+        requester,
+        request_timestamp,
+        anchor,
+        signature,
+    } = message
+    else {
+        return protocol_error(StatusCode::BAD_REQUEST, "unexpected_message");
+    };
+
+    let now = now_secs();
+    if anchor.checkpoint_generation == 0
+        || anchor.checkpoint_generation > i64::MAX as u64
+        || requester != anchor.producer_node_id
+    {
+        return protocol_error(StatusCode::BAD_REQUEST, "invalid_custody_witness_request");
+    }
+    // [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Keep freshness failures
+    // distinct from structural failures so operators can identify replay or
+    // clock-skew incidents without exposing request identities in logs.
+    if now.abs_diff(request_timestamp) > REQUEST_TIMESTAMP_SKEW_SECS {
+        return protocol_error(StatusCode::UNAUTHORIZED, "stale_request");
+    }
+    if !state
+        .peer_store
+        .custody_audit_witness_requester_allowed(&requester)
+    {
+        return protocol_error(
+            StatusCode::FORBIDDEN,
+            "custody_witness_requester_not_pinned",
+        );
+    }
+    let witness = state.identity.public_key_bytes();
+    if requester == witness {
+        // [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Reject before the
+        // monotonic row changes; a self-witness receipt is invalid by design.
+        return protocol_error(StatusCode::FORBIDDEN, "independent_witness_required");
+    }
+    if state.peer_store.get_valid(&requester, now).is_none() {
+        return protocol_error(StatusCode::FORBIDDEN, "unknown_peer");
+    }
+    if anchor
+        .verify_expected(&requester, anchor.checkpoint_generation)
+        .is_err()
+    {
+        return protocol_error(StatusCode::UNAUTHORIZED, "invalid_anchor_signature");
+    }
+    let anchor_sha256 = match custody_audit_anchor_frame_sha256(&anchor) {
+        Ok(digest) if digest != [0u8; 32] => digest,
+        Ok(_) | Err(_) => return protocol_error(StatusCode::BAD_REQUEST, "invalid_custody_anchor"),
+    };
+    let signing_bytes = custody_audit_anchor_witness_request_signing_bytes(
+        &request_id,
+        &requester,
+        request_timestamp,
+        &anchor_sha256,
+    );
+    if IdentityPublicKey::from_bytes(&requester)
+        .and_then(|key| key.verify(&signing_bytes, &signature))
+        .is_err()
+    {
+        return protocol_error(StatusCode::UNAUTHORIZED, "invalid_signature");
+    }
+    if !state.guard.lock().await.admit(requester, request_id, now) {
+        return protocol_error(StatusCode::TOO_MANY_REQUESTS, "rate_or_replay_limited");
+    }
+
+    let (outcome, witness_generation, witness_anchor_sha256) = match state
+        .storage
+        .witness_custody_audit_anchor(
+            &requester,
+            anchor.checkpoint_generation,
+            &anchor_sha256,
+            now,
+        )
+        .await
+    {
+        Ok(CustodyAuditAnchorWitnessOutcome::Advanced {
+            generation,
+            anchor_digest,
+        }) => (CUSTODY_AUDIT_WITNESS_ADVANCED_V1, generation, anchor_digest),
+        Ok(CustodyAuditAnchorWitnessOutcome::Idempotent {
+            generation,
+            anchor_digest,
+        }) => (
+            CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1,
+            generation,
+            anchor_digest,
+        ),
+        Ok(CustodyAuditAnchorWitnessOutcome::Stale {
+            generation,
+            anchor_digest,
+        }) => (CUSTODY_AUDIT_WITNESS_STALE_V1, generation, anchor_digest),
+        Ok(CustodyAuditAnchorWitnessOutcome::Conflict {
+            generation,
+            anchor_digest,
+        }) => (CUSTODY_AUDIT_WITNESS_CONFLICT_V1, generation, anchor_digest),
+        Ok(CustodyAuditAnchorWitnessOutcome::Gap {
+            generation,
+            anchor_digest,
+        }) => (CUSTODY_AUDIT_WITNESS_GAP_V1, generation, anchor_digest),
+        Err(_) => {
+            warn!(
+                generation = anchor.checkpoint_generation,
+                "[MEMCHAIN] Custody-anchor witness persistence failed"
+            );
+            return protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "custody_witness_persist_failed",
+            );
+        }
+    };
+
+    let receipt = match CustodyAuditWitnessReceiptV1::signed(
+        requester,
+        anchor.checkpoint_generation,
+        anchor_sha256,
+        now,
+        witness_generation,
+        witness_anchor_sha256,
+        outcome,
+        &state.identity,
+    ) {
+        Ok(receipt) => receipt,
+        Err(_) => return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "receipt_sign_failed"),
+    };
+    let receipt_sha256 = match custody_audit_witness_receipt_frame_sha256(&receipt) {
+        Ok(digest) => digest,
+        Err(_) => return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_error"),
+    };
+    let response_signing_bytes = custody_audit_anchor_witness_response_signing_bytes(
+        &request_id,
+        &requester,
+        &witness,
+        receipt.observed_at,
+        &receipt_sha256,
+    );
+    let response = MemChainMessage::CustodyAuditAnchorWitnessResponseV1 {
+        request_id,
+        requester,
+        witness,
+        response_timestamp: receipt.observed_at,
+        receipt,
+        signature: state.identity.sign(&response_signing_bytes),
+    };
+    let encoded = match encode_memchain(&response) {
+        Ok(encoded) => encoded,
+        Err(_) => return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_error"),
+    };
+    if verify_custody_audit_anchor_witness_response(
+        &encoded,
+        &request_id,
+        &requester,
+        &witness,
+        &anchor,
+        &anchor_sha256,
+        now,
+    )
+    .is_err()
+    {
+        // A locally generated frame that fails the public verification
+        // contract must never leave the process or become apparent evidence.
+        return protocol_error(StatusCode::INTERNAL_SERVER_ERROR, "receipt_verify_failed");
+    }
+    debug!(
+        generation = anchor.checkpoint_generation,
+        outcome, "[MEMCHAIN] Served authenticated custody-anchor witness decision"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        encoded,
+    )
+        .into_response()
+}
+
 async fn checkpoint_handler(State(state): State<MemChainPeerState>, body: Bytes) -> Response {
     if body.first().copied() != Some(MEMCHAIN_MAGIC) {
         return protocol_error(StatusCode::BAD_REQUEST, "invalid_frame");
@@ -6122,6 +6409,46 @@ mod tests {
 
     fn allow_test_endpoint(_endpoint: &str) -> bool {
         true
+    }
+
+    fn custody_witness_request_frame(
+        producer: &IdentityKeyPair,
+        anchor: &CustodyAuditAnchorV1,
+        request_id: [u8; 16],
+        request_timestamp: u64,
+    ) -> Vec<u8> {
+        let producer_id = producer.public_key_bytes();
+        let anchor_sha256 =
+            custody_audit_anchor_frame_sha256(anchor).expect("hash custody audit anchor");
+        let signing_bytes = custody_audit_anchor_witness_request_signing_bytes(
+            &request_id,
+            &producer_id,
+            request_timestamp,
+            &anchor_sha256,
+        );
+        encode_memchain(&MemChainMessage::CustodyAuditAnchorWitnessRequestV1 {
+            request_id,
+            requester: producer_id,
+            request_timestamp,
+            anchor: anchor.clone(),
+            signature: producer.sign(&signing_bytes),
+        })
+        .expect("encode custody witness request")
+    }
+
+    async fn post_custody_witness(router: &Router, frame: Vec<u8>) -> Response {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/memchain/peer/custody-audit-anchor-witness")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(frame))
+                    .expect("custody witness HTTP request"),
+            )
+            .await
+            .expect("custody witness HTTP response")
     }
 
     fn signed_handover_response_frame(
@@ -7766,6 +8093,216 @@ mod tests {
         assert_eq!(advanced_next.verified, 1);
         assert_eq!(advanced_next.advanced, 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn custody_audit_witness_endpoint_is_pinned_signed_and_contiguous() {
+        // [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Exercise the public
+        // handler in process: no external endpoint or custody metadata leaves
+        // this test while admission, durable outcomes, and signatures remain
+        // identical to production routing.
+        let now = now_secs();
+        let producer = IdentityKeyPair::from_bytes(&[0xA1; 32]).expect("producer identity");
+        let witness = Arc::new(IdentityKeyPair::from_bytes(&[0xA2; 32]).expect("witness identity"));
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let peers = Arc::new(PeerStore::new());
+        admit_peer(&peers, &producer, None, now);
+        let router = build_memchain_peer_router(
+            Arc::clone(&storage),
+            Arc::clone(&peers),
+            Arc::clone(&witness),
+        );
+        let anchor_10 = CustodyAuditAnchorV1::signed(10, 100, 10_000, [0xA3; 32], &producer)
+            .expect("sign generation 10 anchor");
+        let anchor_10_sha =
+            custody_audit_anchor_frame_sha256(&anchor_10).expect("hash generation 10 anchor");
+
+        let denied = post_custody_witness(
+            &router,
+            custody_witness_request_frame(&producer, &anchor_10, [0xA4; 16], now),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        peers.configure_custody_audit_witness_requesters(&[producer.public_key_bytes()]);
+
+        let mut forged_message = decode_memchain(
+            &custody_witness_request_frame(&producer, &anchor_10, [0xC1; 16], now)[1..],
+        )
+        .expect("decode request for signature tamper");
+        let MemChainMessage::CustodyAuditAnchorWitnessRequestV1 {
+            ref mut signature, ..
+        } = forged_message
+        else {
+            panic!("expected custody witness request");
+        };
+        signature[0] ^= 0x01;
+        let forged = post_custody_witness(
+            &router,
+            encode_memchain(&forged_message).expect("encode signature-tampered request"),
+        )
+        .await;
+        assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+
+        let stale = post_custody_witness(
+            &router,
+            custody_witness_request_frame(
+                &producer,
+                &anchor_10,
+                [0xC2; 16],
+                now.saturating_sub(REQUEST_TIMESTAMP_SKEW_SECS + 1),
+            ),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+
+        let advanced_request_id = [0xA4; 16];
+        let advanced = post_custody_witness(
+            &router,
+            custody_witness_request_frame(&producer, &anchor_10, advanced_request_id, now),
+        )
+        .await;
+        assert_eq!(advanced.status(), StatusCode::OK);
+        let advanced_body = axum::body::to_bytes(advanced.into_body(), MAX_RESPONSE_BODY_BYTES)
+            .await
+            .unwrap();
+        let advanced_receipt = verify_custody_audit_anchor_witness_response(
+            &advanced_body,
+            &advanced_request_id,
+            &producer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            &anchor_10,
+            &anchor_10_sha,
+            now,
+        )
+        .expect("verify advanced custody receipt");
+        assert_eq!(advanced_receipt.outcome, CUSTODY_AUDIT_WITNESS_ADVANCED_V1);
+
+        let replayed = post_custody_witness(
+            &router,
+            custody_witness_request_frame(&producer, &anchor_10, advanced_request_id, now),
+        )
+        .await;
+        assert_eq!(replayed.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let idempotent_request_id = [0xA5; 16];
+        let idempotent = post_custody_witness(
+            &router,
+            custody_witness_request_frame(&producer, &anchor_10, idempotent_request_id, now),
+        )
+        .await;
+        assert_eq!(idempotent.status(), StatusCode::OK);
+        let idempotent_body = axum::body::to_bytes(idempotent.into_body(), MAX_RESPONSE_BODY_BYTES)
+            .await
+            .unwrap();
+        let idempotent_receipt = verify_custody_audit_anchor_witness_response(
+            &idempotent_body,
+            &idempotent_request_id,
+            &producer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            &anchor_10,
+            &anchor_10_sha,
+            now,
+        )
+        .expect("verify idempotent custody receipt");
+        assert_eq!(
+            idempotent_receipt.outcome,
+            CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1
+        );
+
+        let conflicting_anchor =
+            CustodyAuditAnchorV1::signed(10, 101, 10_001, [0xA6; 32], &producer)
+                .expect("sign conflicting anchor");
+        let conflict_request_id = [0xA7; 16];
+        let conflict = post_custody_witness(
+            &router,
+            custody_witness_request_frame(&producer, &conflicting_anchor, conflict_request_id, now),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::OK);
+        let conflict_body = axum::body::to_bytes(conflict.into_body(), MAX_RESPONSE_BODY_BYTES)
+            .await
+            .unwrap();
+        let conflict_receipt = verify_custody_audit_anchor_witness_response(
+            &conflict_body,
+            &conflict_request_id,
+            &producer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            &conflicting_anchor,
+            &custody_audit_anchor_frame_sha256(&conflicting_anchor)
+                .expect("hash conflicting anchor"),
+            now,
+        )
+        .expect("verify conflict custody receipt");
+        assert_eq!(conflict_receipt.outcome, CUSTODY_AUDIT_WITNESS_CONFLICT_V1);
+
+        let gap_anchor = CustodyAuditAnchorV1::signed(12, 120, 12_000, [0xA8; 32], &producer)
+            .expect("sign gap anchor");
+        let gap_request_id = [0xA9; 16];
+        let gap = post_custody_witness(
+            &router,
+            custody_witness_request_frame(&producer, &gap_anchor, gap_request_id, now),
+        )
+        .await;
+        assert_eq!(gap.status(), StatusCode::OK);
+        let gap_body = axum::body::to_bytes(gap.into_body(), MAX_RESPONSE_BODY_BYTES)
+            .await
+            .unwrap();
+        let gap_receipt = verify_custody_audit_anchor_witness_response(
+            &gap_body,
+            &gap_request_id,
+            &producer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            &gap_anchor,
+            &custody_audit_anchor_frame_sha256(&gap_anchor).expect("hash gap anchor"),
+            now,
+        )
+        .expect("verify gap custody receipt");
+        assert_eq!(gap_receipt.outcome, CUSTODY_AUDIT_WITNESS_GAP_V1);
+
+        let anchor_11 = CustodyAuditAnchorV1::signed(11, 110, 11_000, [0xAA; 32], &producer)
+            .expect("sign generation 11 anchor");
+        let next_request_id = [0xAB; 16];
+        let next = post_custody_witness(
+            &router,
+            custody_witness_request_frame(&producer, &anchor_11, next_request_id, now),
+        )
+        .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        let next_body = axum::body::to_bytes(next.into_body(), MAX_RESPONSE_BODY_BYTES)
+            .await
+            .unwrap();
+        let next_receipt = verify_custody_audit_anchor_witness_response(
+            &next_body,
+            &next_request_id,
+            &producer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            &anchor_11,
+            &custody_audit_anchor_frame_sha256(&anchor_11).expect("hash generation 11 anchor"),
+            now,
+        )
+        .expect("verify generation 11 custody receipt");
+        assert_eq!(next_receipt.outcome, CUSTODY_AUDIT_WITNESS_ADVANCED_V1);
+    }
+
+    #[tokio::test]
+    async fn custody_audit_witness_endpoint_rejects_self_witness_before_persistence() {
+        let now = now_secs();
+        let identity =
+            Arc::new(IdentityKeyPair::from_bytes(&[0xB1; 32]).expect("self witness identity"));
+        let storage = Arc::new(MemoryStorage::open(":memory:", None).unwrap());
+        let peers = Arc::new(PeerStore::new());
+        admit_peer(&peers, &identity, None, now);
+        peers.configure_custody_audit_witness_requesters(&[identity.public_key_bytes()]);
+        let router = build_memchain_peer_router(storage, peers, Arc::clone(&identity));
+        let anchor = CustodyAuditAnchorV1::signed(1, 1, 1, [0xB2; 32], &identity)
+            .expect("sign self custody anchor");
+        let response = post_custody_witness(
+            &router,
+            custody_witness_request_frame(&identity, &anchor, [0xB3; 16], now),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

@@ -188,6 +188,12 @@ verified_delivery_witness_required_for_restore = false
 # discovery. List only requester node identities this node explicitly agrees
 # to protect. Empty means the witness endpoint refuses every write.
 verified_delivery_witness_requester_node_ids = []
+# [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Independent producer pins for
+# POST /api/memchain/peer/custody-audit-anchor-witness. The endpoint stores
+# only producer id, monotonic generation, canonical anchor SHA-256, and time.
+# It never receives archive content, record ids, routes, messages, or users.
+# Keep empty until a separately operated producer is explicitly reviewed.
+custody_audit_witness_requester_node_ids = []
 gossip_enabled = true
 gossip_interval_secs = 45
 gossip_peer_limit = 8
