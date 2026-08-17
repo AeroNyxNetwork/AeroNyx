@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Document restart-safe,
+  current-checkpoint local receipt-vault auditing and optional readiness exit.
 - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Document bounded
   producer-side import of an operator-carried signed witness receipt, current
   checkpoint binding, durable vault re-audit, and adverse-evidence retention.
@@ -134,6 +136,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.56.0-node-deploy - Documented current-checkpoint witness vault re-audit.
 v1.55.0-node-deploy - Documented host-local custody witness receipt import.
 v1.54.0-node-deploy - Documented segmented custody audit checkpoints.
 v1.53.0-node-deploy - Documented custody maintenance audit verification.
@@ -926,6 +929,44 @@ custody paths, messages, routes, endpoints, payloads, ciphertext, memory,
 destinations, DNS, or social graph. One receipt proves one independent node's
 durable observation. Multiple receipts improve administrative independence but
 are not consensus, fork choice, validator voting, or global finality.
+
+Re-audit the current checkpoint after restart or before a maintenance window:
+
+```bash
+sudo /opt/aeronyx/aeronyx-server relay-custody audit-witness-vault \
+  -c /etc/aeronyx/server.toml \
+  --max-age-seconds 7200 \
+  --json
+```
+
+<!-- [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] -->
+The command holds the cross-process custody maintenance lock, regenerates the
+current immutable checkpoint, verifies every retained canonical receipt, and
+reconstructs the configured threshold from distinct current witness pins. It
+does not contact any witness, transmit an anchor, start a scheduler, or modify
+receipt rows. Opening an older local MemChain database may still perform its
+normal backward-compatible schema migration before the audit.
+
+The stable states are `ready`, `collecting`, and `adverse`. By default the
+command reports policy state and exits successfully when storage is intact.
+Add `--require-ready` for a systemd `ExecStartPre`, deployment health gate, or
+operator script that must return non-zero unless the current checkpoint has
+enough fresh accepted receipts and no adverse evidence:
+
+```bash
+sudo /opt/aeronyx/aeronyx-server relay-custody audit-witness-vault \
+  -c /etc/aeronyx/server.toml \
+  --max-age-seconds 7200 \
+  --require-ready \
+  --json
+```
+
+Output is aggregate-only: current generation, freshness window, vault totals,
+accepted/adverse/missing counts, threshold, and readiness. It excludes node
+identities, hashes, signatures, paths, endpoints, messages, users, routes,
+payloads, memory, destinations, DNS, IP addresses, and social-graph metadata.
+This command is an operator health primitive, not an enabled-by-default startup
+gate and not evidence of consensus or global finality.
 
 Verify whether the newest recovery image is usable before planning a restore:
 

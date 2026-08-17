@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Document the explicit
+#   host-local command that re-audits current-checkpoint receipt readiness.
 # - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Document that manual
 #   producer import is current-checkpoint and pin gated while remaining local.
 # - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Clarify that explicit
@@ -62,6 +64,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.14.0-node-deploy - Documented local current-checkpoint receipt auditing.
 # v1.13.0-node-deploy - Documented bounded host-local witness receipt import.
 # v1.12.0-node-deploy - Documented durable producer custody witness evidence.
 # v1.11.0-node-deploy - Documented relay custody retention/prune policy.
@@ -203,7 +206,10 @@ verified_delivery_witness_requester_node_ids = []
 # host-local import command accepts only a current producer checkpoint and a
 # witness from this pin set; it does not contact the witness over the network.
 # Configuration/startup still sends nothing: no scheduler exists in this
-# release, and an empty list remains fully off.
+# release, and an empty list remains fully off. After importing receipts, use
+# `relay-custody audit-witness-vault --max-age-seconds 7200 --json` to re-audit
+# the current checkpoint locally; add `--require-ready` only to an explicitly
+# operator-managed health gate.
 custody_audit_witness_node_ids = []
 # Required eligible candidates for the local dry-run plan. Valid range 1-3 and
 # never greater than custody_audit_witness_node_ids.

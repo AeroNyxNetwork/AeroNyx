@@ -4,9 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.99.0 - Added bounded operator-carried custody witness
-receipt import, exact-current-checkpoint binding, and per-row admission policy
-evidence without enabling a startup or background scheduler.
+Modification Reason: v1.00.0 - Added aggregate current-checkpoint witness-vault
+auditing with an explicit readiness exit and no network transmission.
 
 Main Functionality:
 
@@ -31,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.99.0 - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Imports operator-carried signed receipts only for the current local checkpoint and preserves their typed admission policy for restart audit.
+Last Modified: v1.00.0 - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Re-audits the complete local receipt vault against the current custody checkpoint with an optional fail-closed operator readiness exit.
+Previous: v0.99.0 - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Imports operator-carried signed receipts only for the current local checkpoint and preserves their typed admission policy for restart audit.
 Previous: v0.98.0 - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Persists exact portable witness receipts atomically, revalidates every frame after restart, and reconstructs fresh exact-anchor policy without exposing custody contents.
 Previous: v0.97.0 - [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] Sends an exact producer-signed anchor only when explicitly invoked, verifies portable request-bound receipts, and never lets adverse evidence be outvoted.
 Previous: v0.96.0 - [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Validates independent producer witness eligibility locally and authenticates witness requests before consulting private trust pins.
@@ -133,6 +133,33 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.00 Current-checkpoint witness policy is restart-observable
+
+[CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex]
+
+- `relay-custody audit-witness-vault` derives the node identity locally, holds
+  the same cross-process maintenance lock used by receipt import, regenerates
+  the exact current custody checkpoint, and revalidates every retained signed
+  receipt before reconstructing policy.
+- The command performs no witness request, anchor transmission, descriptor
+  gossip, retry, startup callback, or background scheduling. It cannot widen
+  the live transport admission window or create receipt evidence.
+- `--max-age-seconds` is parser-bounded from 60 seconds through seven days and
+  applies only to current policy freshness. Per-row import/live admission
+  evidence remains independently enforced by the complete vault audit.
+- Stable aggregate states are `ready`, `collecting`, and `adverse`. Any adverse
+  evidence wins over readiness defensively. `--require-ready` is an explicit
+  operator health gate; without it, intact-but-incomplete policy is reportable
+  without making a diagnostic command indistinguishable from corruption.
+- Output includes only evaluation time, current generation, configured/fresh/
+  accepted/adverse/missing counts, vault totals, threshold, and readiness. It
+  excludes node identities, hashes, signatures, paths, endpoints, messages,
+  users, routes, payloads, memory, destinations, DNS, IP addresses, and social
+  graph metadata.
+- This closes restart observability for the manually transported receipt path.
+  It deliberately does not enable a default startup gate, consensus, validator
+  voting, fork choice, leader election, settlement, or global finality.
 
 ### v0.99 Air-gapped witness receipts can safely rejoin producer state
 
