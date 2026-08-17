@@ -60,6 +60,9 @@
 //!   checkpoint high-water rows containing exact opaque frame digests only.
 //! - v17 (v2.8.64-CustodyWitnessReceiptVault): Bounded immutable producer-side
 //!   receipt frames for restart-safe signature and policy revalidation.
+//! - v18 (v2.8.65-CustodyWitnessReceiptImport): Explicit per-row admission
+//!   evidence keeps live transport at 60 seconds while permitting bounded,
+//!   operator-approved air-gapped receipt import without weakening re-audit.
 //! - v2.7.23-CertificateExchange: Snapshot-audited internal bundle export for
 //!   the admitted fixed-size peer protocol; the schema remains v12.
 //! - v2.7.4-BlockIntegrityStatus: Runtime-only evidence for the most recent
@@ -172,10 +175,14 @@
 //!   receipt evidence stores only canonical signed witness decisions. Normal
 //!   receipts may rotate at the hard capacity; adverse evidence is never
 //!   silently pruned to make a later round appear healthy.
+//! - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Every receipt row
+//!   records whether it entered through strict live transport or an explicit
+//!   operator import, plus that admission's bounded delay. Never infer or
+//!   widen this policy during restart audit.
 //!
 //! ## Last Modified
-//! v2.8.64-CustodyWitnessReceiptVault - Added schema-v17 bounded immutable
-//! producer-side witness receipt evidence for restart-safe audit.
+//! v2.8.65-CustodyWitnessReceiptImport - Added schema-v18 typed receipt
+//! admission evidence for restart-safe live and air-gapped workflows.
 //! [AUTHORITY-HANDOVER-CARRIER 2026-08-14 by Codex] Added follower-only,
 //! source-blind authority-proof recovery and circuit telemetry.
 //! [COMMITMENT-AUTHORITY-RUNTIME 2026-08-14 by Codex] Added the process-local
@@ -292,15 +299,16 @@ use super::storage_crypto::{decrypt_record_content, encrypt_record_content};
 /// v14 → v15: append-only dual-signed coordinator authority history
 /// v15 → v16: independent custody audit anchor witness high-water decisions
 /// v16 → v17: bounded producer-side custody witness receipt evidence
+/// v17 → v18: per-receipt custody witness admission policy evidence
 ///
 /// ⚠️ CRITICAL: When bumping this, you MUST also add a new migrate block
-/// in maybe_migrate(). The migrate block MUST use a hardcoded integer
-/// (not this constant) for UPDATE schema_version, to prevent skipping
+/// in `maybe_migrate()`. The migrate block MUST use a hardcoded integer
+/// (not this constant) for `UPDATE schema_version`, to prevent skipping
 /// intermediate migrations on multi-version upgrades.
 // [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Keep this visible only inside
 // the memchain module so cross-file migration tests assert the authoritative
 // current version without coupling production migration steps to this value.
-pub(super) const SCHEMA_VERSION: u32 = 17;
+pub(super) const SCHEMA_VERSION: u32 = 18;
 
 const LRU_CACHE_CAPACITY: usize = 1000;
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -1863,6 +1871,10 @@ impl MemoryStorage {
                 receipt_frame         BLOB NOT NULL CHECK(length(receipt_frame) > 0
                     AND length(receipt_frame) <= 320),
                 persisted_at          INTEGER NOT NULL CHECK(persisted_at > 0),
+                admission_kind        INTEGER NOT NULL DEFAULT 0
+                    CHECK(admission_kind BETWEEN 0 AND 1),
+                admission_max_delay_secs INTEGER NOT NULL DEFAULT 60
+                    CHECK(admission_max_delay_secs BETWEEN 60 AND 604800),
                 CHECK(producer != witness)
             );
             CREATE INDEX IF NOT EXISTS idx_custody_witness_receipts_anchor
@@ -3151,6 +3163,79 @@ impl MemoryStorage {
             conn.execute("UPDATE schema_version SET version = 17", [])
                 .map_err(|error| format!("Update schema version to v17: {error}"))?;
             info!("[STORAGE] Migration to v17 (custody witness receipt evidence) complete");
+        }
+
+        // v17 -> v18: retain the exact admission policy used for each receipt.
+        // [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Existing rows
+        // are conservatively classified as strict live transport (60 seconds).
+        // Column probes make this migration restart-safe after an interrupted
+        // first ALTER and harmless for a freshly created v18 table.
+        let current: u32 = conn
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(17);
+
+        if current < 18 {
+            info!(
+                "[STORAGE] Migrating schema v{} -> v18 (custody witness receipt admission evidence)",
+                current
+            );
+            let has_admission_kind = conn
+                .prepare(
+                    "SELECT admission_kind
+                     FROM custody_audit_witness_receipt_evidence LIMIT 0",
+                )
+                .is_ok();
+            if !has_admission_kind {
+                conn.execute_batch(
+                    "ALTER TABLE custody_audit_witness_receipt_evidence
+                         ADD COLUMN admission_kind INTEGER NOT NULL DEFAULT 0
+                         CHECK(admission_kind BETWEEN 0 AND 1);",
+                )
+                .map_err(|error| {
+                    format!("v18 migration: add custody receipt admission kind: {error}")
+                })?;
+            }
+            let has_admission_delay = conn
+                .prepare(
+                    "SELECT admission_max_delay_secs
+                     FROM custody_audit_witness_receipt_evidence LIMIT 0",
+                )
+                .is_ok();
+            if !has_admission_delay {
+                conn.execute_batch(
+                    "ALTER TABLE custody_audit_witness_receipt_evidence
+                         ADD COLUMN admission_max_delay_secs INTEGER NOT NULL DEFAULT 60
+                         CHECK(admission_max_delay_secs BETWEEN 60 AND 604800);",
+                )
+                .map_err(|error| {
+                    format!("v18 migration: add custody receipt admission delay: {error}")
+                })?;
+            }
+            let admission_columns: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(
+                         'custody_audit_witness_receipt_evidence'
+                     ) WHERE name IN ('admission_kind','admission_max_delay_secs')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    format!("v18 migration: inspect custody receipt admission columns: {error}")
+                })?;
+            if admission_columns != 2 {
+                return Err(
+                    "v18 migration: required custody receipt admission columns were not created"
+                        .to_string(),
+                );
+            }
+            // Hardcoded 18 preserves sequential upgrades.
+            conn.execute("UPDATE schema_version SET version = 18", [])
+                .map_err(|error| format!("Update schema version to v18: {error}"))?;
+            info!(
+                "[STORAGE] Migration to v18 (custody witness receipt admission evidence) complete"
+            );
         }
 
         Ok(())
@@ -5103,7 +5188,10 @@ mod tests {
         // independent custody-audit witness high-water namespace, and v17
         // adds bounded producer-side signed witness receipt evidence
         // even when create_schema() was not called.
-        assert_eq!(v, 17);
+        // [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] This legacy
+        // fixture must follow the authoritative latest additive migration
+        // instead of freezing a prior schema version.
+        assert_eq!(v, SCHEMA_VERSION);
         for table in [
             "record_commitment_blocks",
             "record_block_commitments",
@@ -5188,7 +5276,7 @@ mod tests {
             )
             .unwrap()
             > 0;
-        assert_eq!(version, 17);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(delivery_generation, 41);
         assert!(custody_table_exists);
         assert!(receipt_table_exists);
@@ -5243,9 +5331,66 @@ mod tests {
             )
             .unwrap()
             > 0;
-        assert_eq!(version, 17);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(retained, (7, vec![0x94; 32], 1001));
         assert!(receipt_table_exists);
+    }
+
+    #[test]
+    fn test_v17_to_v18_migration_defaults_existing_receipts_to_live_policy() {
+        // [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Legacy rows
+        // were admitted only by the strict network path. Migration must retain
+        // them verbatim and must not grant the wider operator-import window.
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (17);
+             CREATE TABLE custody_audit_witness_receipt_evidence (
+                 receipt_digest BLOB PRIMARY KEY,
+                 producer BLOB NOT NULL,
+                 witness BLOB NOT NULL,
+                 requested_generation INTEGER NOT NULL,
+                 requested_frame_sha256 BLOB NOT NULL,
+                 retained_generation INTEGER NOT NULL,
+                 retained_frame_sha256 BLOB NOT NULL,
+                 outcome INTEGER NOT NULL,
+                 observed_at INTEGER NOT NULL,
+                 receipt_frame BLOB NOT NULL,
+                 persisted_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO custody_audit_witness_receipt_evidence
+             VALUES (?1,?2,?3,1,?4,1,?5,0,1000,?6,1001)",
+            params![
+                [0x95u8; 32].as_slice(),
+                [0x96u8; 32].as_slice(),
+                [0x97u8; 32].as_slice(),
+                [0x98u8; 32].as_slice(),
+                [0x99u8; 32].as_slice(),
+                [0x9au8; 8].as_slice(),
+            ],
+        )
+        .unwrap();
+
+        MemoryStorage::maybe_migrate(&conn).unwrap();
+
+        let version: u32 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        let admission: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT admission_kind,admission_max_delay_secs,persisted_at
+                 FROM custody_audit_witness_receipt_evidence",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(admission, (0, 60, 1001));
     }
 
     // ========================================

@@ -149,6 +149,8 @@
 //!   routes, message identifiers, payloads, endpoints, or user identities.
 //!
 //! ## Modification History
+//! v2.8.65-CustodyWitnessReceiptImport - Added bounded host-local receipt
+//! import without weakening the live network persistence freshness policy.
 //! v2.8.64-CustodyWitnessReceiptVault - Added bounded producer receipt
 //! persistence, restart audit, exact-anchor policy reconstruction, and
 //! adverse-evidence-preserving retention.
@@ -190,6 +192,8 @@
 //! v2.8.12-LeaseFailClosedTelemetry - Added partition/recovery state evidence.
 //!
 //! ## Last Modified
+//! v2.8.65-CustodyWitnessReceiptImport - Reused one atomic vault transaction
+//! for live receipts and explicitly time-bounded operator imports.
 //! v2.8.64-CustodyWitnessReceiptVault - Persisted and re-audited exact signed
 //! custody witness receipts before they can contribute to durable policy.
 //! [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Added a fixed startup carrier-policy failure code.
@@ -487,6 +491,18 @@ pub enum CustodyAuditWitnessReceiptPersistOutcome {
     InsertedAfterNormalPrune,
     /// The exact canonical receipt was already durable.
     AlreadyPresent,
+}
+
+impl CustodyAuditWitnessReceiptPersistOutcome {
+    /// Stable operator-facing disposition without exposing storage internals.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inserted => "inserted",
+            Self::InsertedAfterNormalPrune => "inserted_after_normal_prune",
+            Self::AlreadyPresent => "already_present",
+        }
+    }
 }
 
 /// Aggregate result of a complete producer receipt-vault cryptographic audit.
@@ -2728,6 +2744,167 @@ fn insert_trusted_checkpoint_divergence_incident(
     Ok(inserted)
 }
 
+const LIVE_CUSTODY_WITNESS_RECEIPT_MAX_DELAY_SECS: u64 = 60;
+const MAX_OPERATOR_CUSTODY_WITNESS_RECEIPT_IMPORT_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const CUSTODY_WITNESS_RECEIPT_ADMISSION_LIVE: i64 = 0;
+const CUSTODY_WITNESS_RECEIPT_ADMISSION_OPERATOR_IMPORT: i64 = 1;
+
+/// Typed local admission boundary for producer-side witness evidence.
+///
+/// [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Keeping this private
+/// prevents any network caller from accidentally selecting the wider manual
+/// import window. Its stable numeric evidence is persisted and revalidated on
+/// every vault audit; it is not part of the portable signed receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustodyWitnessReceiptAdmission {
+    LiveTransport,
+    OperatorImport { max_delay_secs: u64 },
+}
+
+/// Canonical, range-checked fields ready for one receipt-vault transaction.
+///
+/// [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Separating pure frame
+/// admission from transactional retention keeps the cryptographic boundary
+/// independently reviewable and the lock-held database path narrowly scoped.
+struct PreparedCustodyAuditWitnessReceipt {
+    frame: Vec<u8>,
+    receipt_digest: [u8; 32],
+    requested_generation: i64,
+    retained_generation: i64,
+    observed_at: i64,
+    persisted_at: i64,
+    admission_kind: i64,
+    admission_max_delay_secs: i64,
+}
+
+fn prepare_custody_audit_witness_receipt(
+    receipt: &CustodyAuditWitnessReceiptV1,
+    expected_producer: &[u8; 32],
+    expected_generation: u64,
+    expected_frame_sha256: &[u8; 32],
+    persisted_at: u64,
+    admission: CustodyWitnessReceiptAdmission,
+) -> Result<PreparedCustodyAuditWitnessReceipt, String> {
+    let (admission_kind, admission_max_delay_secs) = admission.evidence();
+    if expected_producer == &[0u8; 32]
+        || expected_frame_sha256 == &[0u8; 32]
+        || expected_generation == 0
+        || persisted_at == 0
+        || expected_generation > i64::MAX as u64
+        || persisted_at.abs_diff(receipt.observed_at) > admission.max_delay_secs()
+        || receipt.witness_node_id == *expected_producer
+    {
+        return Err("custody witness receipt persistence policy is invalid".to_string());
+    }
+    receipt
+        .verify_signature()
+        .map_err(|_| "custody witness receipt signature is invalid".to_string())?;
+    if &receipt.producer_node_id != expected_producer
+        || receipt.requested_checkpoint_generation != expected_generation
+        || &receipt.requested_frame_sha256 != expected_frame_sha256
+    {
+        return Err("custody witness receipt exact-anchor binding mismatch".to_string());
+    }
+    let frame = encode_custody_audit_witness_receipt(receipt)
+        .map_err(|_| "custody witness receipt encode failed".to_string())?;
+    if frame.is_empty() || frame.len() > MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES {
+        return Err("custody witness receipt frame violates bounds".to_string());
+    }
+    Ok(PreparedCustodyAuditWitnessReceipt {
+        receipt_digest: custody_audit_witness_receipt_frame_sha256(receipt)
+            .map_err(|_| "custody witness receipt digest failed".to_string())?,
+        frame,
+        requested_generation: i64::try_from(receipt.requested_checkpoint_generation)
+            .map_err(|_| "custody witness requested generation exceeds SQLite range".to_string())?,
+        retained_generation: i64::try_from(receipt.retained_checkpoint_generation)
+            .map_err(|_| "custody witness retained generation exceeds SQLite range".to_string())?,
+        observed_at: i64::try_from(receipt.observed_at)
+            .map_err(|_| "custody witness receipt time exceeds SQLite range".to_string())?,
+        persisted_at: i64::try_from(persisted_at)
+            .map_err(|_| "custody witness persistence time exceeds SQLite range".to_string())?,
+        admission_kind,
+        admission_max_delay_secs: i64::try_from(admission_max_delay_secs)
+            .map_err(|_| "custody witness admission delay exceeds SQLite range".to_string())?,
+    })
+}
+
+fn prune_oldest_normal_custody_witness_receipt_if_full(
+    transaction: &rusqlite::Transaction<'_>,
+    current_records: usize,
+) -> Result<bool, String> {
+    if current_records < CUSTODY_WITNESS_RECEIPT_EVIDENCE_CAPACITY {
+        return Ok(false);
+    }
+    // [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Capacity pressure
+    // may rotate only normal evidence. Adverse witness decisions remain sticky
+    // so a later successful receipt cannot erase evidence of prior divergence.
+    let removed = transaction
+        .execute(
+            "DELETE FROM custody_audit_witness_receipt_evidence WHERE receipt_digest=(
+                SELECT receipt_digest FROM custody_audit_witness_receipt_evidence
+                WHERE outcome IN (?1,?2)
+                ORDER BY observed_at ASC,persisted_at ASC,receipt_digest ASC
+                LIMIT 1
+            )",
+            params![
+                i64::from(CUSTODY_AUDIT_WITNESS_ADVANCED_V1),
+                i64::from(CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1),
+            ],
+        )
+        .map_err(|error| format!("rotate custody witness receipt evidence: {error}"))?;
+    if removed != 1 {
+        return Err(
+            "custody witness receipt evidence capacity is reserved by adverse evidence".to_string(),
+        );
+    }
+    Ok(true)
+}
+
+impl CustodyWitnessReceiptAdmission {
+    fn operator_import(max_delay_secs: u64) -> Result<Self, String> {
+        if !(LIVE_CUSTODY_WITNESS_RECEIPT_MAX_DELAY_SECS
+            ..=MAX_OPERATOR_CUSTODY_WITNESS_RECEIPT_IMPORT_AGE_SECS)
+            .contains(&max_delay_secs)
+        {
+            return Err("custody witness receipt import age policy is invalid".to_string());
+        }
+        Ok(Self::OperatorImport { max_delay_secs })
+    }
+
+    fn from_evidence(kind: i64, max_delay_secs: i64) -> Result<Self, String> {
+        let max_delay_secs = u64::try_from(max_delay_secs)
+            .map_err(|_| "custody witness receipt admission delay is invalid".to_string())?;
+        match kind {
+            CUSTODY_WITNESS_RECEIPT_ADMISSION_LIVE
+                if max_delay_secs == LIVE_CUSTODY_WITNESS_RECEIPT_MAX_DELAY_SECS =>
+            {
+                Ok(Self::LiveTransport)
+            }
+            CUSTODY_WITNESS_RECEIPT_ADMISSION_OPERATOR_IMPORT => {
+                Self::operator_import(max_delay_secs)
+            }
+            _ => Err("custody witness receipt admission evidence is invalid".to_string()),
+        }
+    }
+
+    const fn evidence(self) -> (i64, u64) {
+        match self {
+            Self::LiveTransport => (
+                CUSTODY_WITNESS_RECEIPT_ADMISSION_LIVE,
+                LIVE_CUSTODY_WITNESS_RECEIPT_MAX_DELAY_SECS,
+            ),
+            Self::OperatorImport { max_delay_secs } => (
+                CUSTODY_WITNESS_RECEIPT_ADMISSION_OPERATOR_IMPORT,
+                max_delay_secs,
+            ),
+        }
+    }
+
+    const fn max_delay_secs(self) -> u64 {
+        self.evidence().1
+    }
+}
+
 struct StoredCustodyAuditWitnessReceiptRow {
     receipt_digest: Vec<u8>,
     producer: Vec<u8>,
@@ -2740,6 +2917,8 @@ struct StoredCustodyAuditWitnessReceiptRow {
     observed_at: i64,
     receipt_frame: Vec<u8>,
     persisted_at: i64,
+    admission_kind: i64,
+    admission_max_delay_secs: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2791,7 +2970,8 @@ fn audit_custody_audit_witness_receipt_snapshot(
         .prepare(
             "SELECT receipt_digest,producer,witness,requested_generation,
                     requested_frame_sha256,retained_generation,retained_frame_sha256,
-                    outcome,observed_at,receipt_frame,persisted_at
+                    outcome,observed_at,receipt_frame,persisted_at,
+                    admission_kind,admission_max_delay_secs
              FROM custody_audit_witness_receipt_evidence
              ORDER BY observed_at ASC,receipt_digest ASC",
         )
@@ -2810,6 +2990,8 @@ fn audit_custody_audit_witness_receipt_snapshot(
                 observed_at: row.get(8)?,
                 receipt_frame: row.get(9)?,
                 persisted_at: row.get(10)?,
+                admission_kind: row.get(11)?,
+                admission_max_delay_secs: row.get(12)?,
             })
         })
         .map_err(|error| format!("query custody witness receipt audit: {error}"))?;
@@ -2847,7 +3029,13 @@ fn audit_custody_audit_witness_receipt_snapshot(
             .map_err(|_| "custody witness receipt observation time is invalid".to_string())?;
         let persisted_at = u64::try_from(row.persisted_at)
             .map_err(|_| "custody witness receipt persistence time is invalid".to_string())?;
-        if persisted_at == 0 || persisted_at.abs_diff(receipt.observed_at) > 60 {
+        let admission = CustodyWitnessReceiptAdmission::from_evidence(
+            row.admission_kind,
+            row.admission_max_delay_secs,
+        )?;
+        if persisted_at == 0
+            || persisted_at.abs_diff(receipt.observed_at) > admission.max_delay_secs()
+        {
             return Err("custody witness receipt persistence time is inconsistent".to_string());
         }
         if exact_32_bytes(&row.producer, "custody witness receipt producer")?
@@ -2904,6 +3092,11 @@ impl MemoryStorage {
     /// Normal accepted evidence may rotate oldest-first at capacity. Adverse
     /// `stale`, `conflict`, or `gap` evidence is never silently pruned; a vault
     /// containing only adverse evidence fails closed and requires review.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the signed receipt violates live admission or
+    /// exact-anchor policy, or when the transactional vault audit cannot finish.
     pub async fn persist_custody_audit_witness_receipt(
         &self,
         receipt: &CustodyAuditWitnessReceiptV1,
@@ -2912,40 +3105,77 @@ impl MemoryStorage {
         expected_frame_sha256: &[u8; 32],
         persisted_at: u64,
     ) -> Result<CustodyAuditWitnessReceiptPersistOutcome, String> {
-        if expected_producer == &[0u8; 32]
-            || expected_frame_sha256 == &[0u8; 32]
-            || expected_generation == 0
-            || persisted_at == 0
-            || expected_generation > i64::MAX as u64
-            || persisted_at.abs_diff(receipt.observed_at) > 60
-            || receipt.witness_node_id == *expected_producer
-        {
-            return Err("custody witness receipt persistence policy is invalid".to_string());
-        }
-        receipt
-            .verify_signature()
-            .map_err(|_| "custody witness receipt signature is invalid".to_string())?;
-        if &receipt.producer_node_id != expected_producer
-            || receipt.requested_checkpoint_generation != expected_generation
-            || &receipt.requested_frame_sha256 != expected_frame_sha256
-        {
-            return Err("custody witness receipt exact-anchor binding mismatch".to_string());
-        }
-        let frame = encode_custody_audit_witness_receipt(receipt)
-            .map_err(|_| "custody witness receipt encode failed".to_string())?;
-        if frame.is_empty() || frame.len() > MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES {
-            return Err("custody witness receipt frame violates bounds".to_string());
-        }
-        let receipt_digest = custody_audit_witness_receipt_frame_sha256(receipt)
-            .map_err(|_| "custody witness receipt digest failed".to_string())?;
-        let requested_generation = i64::try_from(receipt.requested_checkpoint_generation)
-            .map_err(|_| "custody witness requested generation exceeds SQLite range".to_string())?;
-        let retained_generation = i64::try_from(receipt.retained_checkpoint_generation)
-            .map_err(|_| "custody witness retained generation exceeds SQLite range".to_string())?;
-        let observed_at = i64::try_from(receipt.observed_at)
-            .map_err(|_| "custody witness receipt time exceeds SQLite range".to_string())?;
-        let persisted_at = i64::try_from(persisted_at)
-            .map_err(|_| "custody witness persistence time exceeds SQLite range".to_string())?;
+        self.persist_custody_audit_witness_receipt_with_admission(
+            receipt,
+            expected_producer,
+            expected_generation,
+            expected_frame_sha256,
+            persisted_at,
+            CustodyWitnessReceiptAdmission::LiveTransport,
+        )
+        .await
+    }
+
+    /// Imports one operator-carried signed receipt into the same bounded vault.
+    ///
+    /// [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Live transport
+    /// retains its strict 60-second persistence delay. This separate host-local
+    /// path permits an explicitly configured delay of at most seven days so an
+    /// air-gapped witness workflow can complete without falsifying
+    /// `persisted_at` or weakening automatic network admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the import window, signature, exact-anchor binding,
+    /// or transactional receipt-vault invariants cannot be verified.
+    pub async fn import_custody_audit_witness_receipt(
+        &self,
+        receipt: &CustodyAuditWitnessReceiptV1,
+        expected_producer: &[u8; 32],
+        expected_generation: u64,
+        expected_frame_sha256: &[u8; 32],
+        imported_at: u64,
+        max_receipt_age_secs: u64,
+    ) -> Result<CustodyAuditWitnessReceiptPersistOutcome, String> {
+        let admission = CustodyWitnessReceiptAdmission::operator_import(max_receipt_age_secs)?;
+        self.persist_custody_audit_witness_receipt_with_admission(
+            receipt,
+            expected_producer,
+            expected_generation,
+            expected_frame_sha256,
+            imported_at,
+            admission,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_custody_audit_witness_receipt_with_admission(
+        &self,
+        receipt: &CustodyAuditWitnessReceiptV1,
+        expected_producer: &[u8; 32],
+        expected_generation: u64,
+        expected_frame_sha256: &[u8; 32],
+        persisted_at: u64,
+        admission: CustodyWitnessReceiptAdmission,
+    ) -> Result<CustodyAuditWitnessReceiptPersistOutcome, String> {
+        let PreparedCustodyAuditWitnessReceipt {
+            frame,
+            receipt_digest,
+            requested_generation,
+            retained_generation,
+            observed_at,
+            persisted_at,
+            admission_kind,
+            admission_max_delay_secs,
+        } = prepare_custody_audit_witness_receipt(
+            receipt,
+            expected_producer,
+            expected_generation,
+            expected_frame_sha256,
+            persisted_at,
+            admission,
+        )?;
 
         let mut conn = self.conn.lock().await;
         let transaction = conn
@@ -2968,42 +3198,21 @@ impl MemoryStorage {
             transaction
                 .commit()
                 .map_err(|error| format!("finish custody witness receipt transaction: {error}"))?;
+            drop(conn);
             return Ok(CustodyAuditWitnessReceiptPersistOutcome::AlreadyPresent);
         }
 
-        let rotated = if before.records >= CUSTODY_WITNESS_RECEIPT_EVIDENCE_CAPACITY {
-            let removed = transaction
-                .execute(
-                    "DELETE FROM custody_audit_witness_receipt_evidence WHERE receipt_digest=(
-                        SELECT receipt_digest FROM custody_audit_witness_receipt_evidence
-                        WHERE outcome IN (?1,?2)
-                        ORDER BY observed_at ASC,persisted_at ASC,receipt_digest ASC
-                        LIMIT 1
-                    )",
-                    params![
-                        i64::from(CUSTODY_AUDIT_WITNESS_ADVANCED_V1),
-                        i64::from(CUSTODY_AUDIT_WITNESS_IDEMPOTENT_V1),
-                    ],
-                )
-                .map_err(|error| format!("rotate custody witness receipt evidence: {error}"))?;
-            if removed != 1 {
-                return Err(
-                    "custody witness receipt evidence capacity is reserved by adverse evidence"
-                        .to_string(),
-                );
-            }
-            true
-        } else {
-            false
-        };
+        let rotated =
+            prune_oldest_normal_custody_witness_receipt_if_full(&transaction, before.records)?;
 
         transaction
             .execute(
                 "INSERT INTO custody_audit_witness_receipt_evidence
                  (receipt_digest,producer,witness,requested_generation,
                   requested_frame_sha256,retained_generation,retained_frame_sha256,
-                  outcome,observed_at,receipt_frame,persisted_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                  outcome,observed_at,receipt_frame,persisted_at,admission_kind,
+                  admission_max_delay_secs)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 params![
                     receipt_digest.as_slice(),
                     receipt.producer_node_id.as_slice(),
@@ -3016,6 +3225,8 @@ impl MemoryStorage {
                     observed_at,
                     frame,
                     persisted_at,
+                    admission_kind,
+                    admission_max_delay_secs,
                 ],
             )
             .map_err(|error| format!("insert custody witness receipt evidence: {error}"))?;
@@ -3026,6 +3237,7 @@ impl MemoryStorage {
         transaction
             .commit()
             .map_err(|error| format!("commit custody witness receipt evidence: {error}"))?;
+        drop(conn);
         Ok(if rotated {
             CustodyAuditWitnessReceiptPersistOutcome::InsertedAfterNormalPrune
         } else {
@@ -9017,6 +9229,139 @@ mod tests {
                 .unwrap_err(),
             "custody-audit witness time must be positive"
         );
+    }
+
+    #[tokio::test]
+    async fn custody_witness_receipt_import_is_bounded_and_preserves_real_import_time() {
+        // [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Manual transfer
+        // may exceed the live 60-second window, but must retain the real import
+        // time, reject clock rollback/future evidence, and remain idempotent.
+        let producer = IdentityKeyPair::from_bytes(&[0x7d; 32]).unwrap();
+        let witness = IdentityKeyPair::from_bytes(&[0x7e; 32]).unwrap();
+        let producer_id = producer.public_key_bytes();
+        let frame_sha256 = [0x7f; 32];
+        let observed_at = 1_700_700_000;
+        let receipt = CustodyAuditWitnessReceiptV1::signed(
+            producer_id,
+            1,
+            frame_sha256,
+            observed_at,
+            1,
+            frame_sha256,
+            CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+            &witness,
+        )
+        .unwrap();
+        let storage = MemoryStorage::open(":memory:", None).unwrap();
+
+        assert!(storage
+            .persist_custody_audit_witness_receipt(
+                &receipt,
+                &producer_id,
+                1,
+                &frame_sha256,
+                observed_at + 120,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            storage
+                .import_custody_audit_witness_receipt(
+                    &receipt,
+                    &producer_id,
+                    1,
+                    &frame_sha256,
+                    observed_at + 120,
+                    300,
+                )
+                .await
+                .unwrap(),
+            CustodyAuditWitnessReceiptPersistOutcome::Inserted
+        );
+        assert_eq!(
+            storage
+                .import_custody_audit_witness_receipt(
+                    &receipt,
+                    &producer_id,
+                    1,
+                    &frame_sha256,
+                    observed_at + 121,
+                    300,
+                )
+                .await
+                .unwrap(),
+            CustodyAuditWitnessReceiptPersistOutcome::AlreadyPresent
+        );
+        assert!(storage
+            .import_custody_audit_witness_receipt(
+                &receipt,
+                &producer_id,
+                1,
+                &frame_sha256,
+                observed_at - 301,
+                300,
+            )
+            .await
+            .is_err());
+        assert!(storage
+            .import_custody_audit_witness_receipt(
+                &receipt,
+                &producer_id,
+                1,
+                &frame_sha256,
+                observed_at + 120,
+                7 * 24 * 60 * 60 + 1,
+            )
+            .await
+            .is_err());
+        assert!(storage
+            .import_custody_audit_witness_receipt(
+                &receipt,
+                &producer_id,
+                1,
+                &frame_sha256,
+                observed_at + 120,
+                LIVE_CUSTODY_WITNESS_RECEIPT_MAX_DELAY_SECS - 1,
+            )
+            .await
+            .is_err());
+
+        let persisted_policy: (i64, i64, i64) = {
+            let conn = storage.conn_lock().await;
+            conn.query_row(
+                "SELECT persisted_at,admission_kind,admission_max_delay_secs
+                 FROM custody_audit_witness_receipt_evidence",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            persisted_policy,
+            (
+                (observed_at + 120) as i64,
+                CUSTODY_WITNESS_RECEIPT_ADMISSION_OPERATOR_IMPORT,
+                300,
+            )
+        );
+
+        {
+            let conn = storage.conn_lock().await;
+            conn.execute(
+                "UPDATE custody_audit_witness_receipt_evidence
+                 SET admission_kind=?1,admission_max_delay_secs=?2",
+                params![
+                    CUSTODY_WITNESS_RECEIPT_ADMISSION_LIVE,
+                    LIVE_CUSTODY_WITNESS_RECEIPT_MAX_DELAY_SECS as i64,
+                ],
+            )
+            .unwrap();
+        }
+        assert!(storage
+            .audit_custody_audit_witness_receipt_evidence()
+            .await
+            .unwrap_err()
+            .contains("persistence time is inconsistent"));
     }
 
     #[tokio::test]

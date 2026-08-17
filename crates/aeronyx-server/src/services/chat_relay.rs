@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.6.0-CustodyAuditRotation
+// Version: 3.7.0-CustodyWitnessReceiptImport
 //
 // Modification Reason:
+//   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
+//   current-anchor guard so producer receipt import cannot race checkpoint
+//   publication after validating the exact signed anchor.
 //   v1.3.0-Sovereign — Added WalletRouteCache field to ChatRelayService.
 //   The route cache decouples wallet identity from session key, enabling
 //   per-message signature-based authentication for all chat operations.
@@ -1813,6 +1816,30 @@ pub struct ChatRelayBackupAuditVerificationReceipt {
     pub archived_bytes: u64,
     /// Whether a crash-safe rotation publication still needs housekeeping.
     pub rotation_pending: bool,
+}
+
+/// Cross-process guard binding one signed custody anchor to the current
+/// immutable maintenance checkpoint for the complete lifetime of the value.
+///
+/// [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] The private `SQLite`
+/// connection owns an exclusive maintenance transaction and is released by
+/// RAII. Callers may inspect only the signed aggregate anchor; no lock path,
+/// private audit state, HMAC, or custody metadata crosses this boundary.
+pub struct ChatRelayCustodyAuditAnchorGuard {
+    _filesystem_lock: Connection,
+    anchor: CustodyAuditAnchorV1,
+}
+
+impl ChatRelayCustodyAuditAnchorGuard {
+    /// Returns the exact current producer-signed anchor protected by the guard.
+    #[must_use]
+    pub const fn anchor(&self) -> &CustodyAuditAnchorV1 {
+        &self.anchor
+    }
+
+    fn into_anchor(self) -> CustodyAuditAnchorV1 {
+        self.anchor
+    }
 }
 
 /// Aggregate, path-free result of a read-only recovery preflight.
@@ -7472,8 +7499,29 @@ impl ChatRelayService {
         config: &ChatRelayConfig,
         identity: &IdentityKeyPair,
     ) -> ChatRelayResult<CustodyAuditAnchorV1> {
+        Ok(Self::hold_backup_maintenance_audit_anchor_for_config(config, identity)?.into_anchor())
+    }
+
+    /// Holds the cross-process custody maintenance lock while exposing the
+    /// exact current producer-signed checkpoint anchor.
+    ///
+    /// [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] This is the
+    /// transactional boundary for host-local receipt import. Keeping the guard
+    /// alive prevents a concurrent backup/prune operation from publishing a
+    /// newer immutable checkpoint between exact-anchor validation and evidence
+    /// persistence. It performs no network I/O and exposes no private audit
+    /// material.
+    ///
+    /// # Errors
+    /// Returns a path-free storage error under the same conditions as
+    /// [`Self::create_backup_maintenance_audit_anchor_for_config`], or when the
+    /// cross-process maintenance lock is already held.
+    pub fn hold_backup_maintenance_audit_anchor_for_config(
+        config: &ChatRelayConfig,
+        identity: &IdentityKeyPair,
+    ) -> ChatRelayResult<ChatRelayCustodyAuditAnchorGuard> {
         let backup_directory = Self::private_backup_directory_for_config(config)?;
-        let _filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
+        let filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
         let parent = backup_directory.parent().ok_or_else(|| {
             Self::backup_io_error(
                 rusqlite::ffi::SQLITE_CANTOPEN,
@@ -7489,7 +7537,7 @@ impl ChatRelayService {
             ));
         }
         let anchor_digest = Self::backup_audit_anchor_digest(&chain.state)?;
-        CustodyAuditAnchorV1::signed(
+        let anchor = CustodyAuditAnchorV1::signed(
             chain.state.receipt.checkpoint_count,
             chain.state.receipt.archived_record_count,
             chain.state.receipt.archived_bytes,
@@ -7501,6 +7549,10 @@ impl ChatRelayService {
                 rusqlite::ffi::SQLITE_AUTH,
                 "unable to sign relay backup maintenance audit anchor",
             )
+        })?;
+        Ok(ChatRelayCustodyAuditAnchorGuard {
+            _filesystem_lock: filesystem_lock,
+            anchor,
         })
     }
 
@@ -9037,6 +9089,23 @@ mod tests {
         assert_eq!(first.checkpoint_generation, 1);
         assert_eq!(first.archived_record_count, 1);
         assert!(first.archived_bytes > 0);
+
+        // [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] The producer
+        // import guard must bind the current anchor to the complete persistence
+        // phase by excluding every concurrent checkpoint-producing operation.
+        let guarded =
+            ChatRelayService::hold_backup_maintenance_audit_anchor_for_config(&config, &identity)
+                .expect("hold current custody anchor");
+        assert_eq!(guarded.anchor(), &first);
+        let concurrent = ChatRelayService::prune_verified_backup_retention_at(
+            &config,
+            &secret,
+            &ChatRelayBackupPruneRequest::default(),
+            1_787_100_002,
+        )
+        .expect_err("held current-anchor guard must exclude checkpoint maintenance");
+        assert_eq!(concurrent.reason_bucket(), "sqlite_error");
+        drop(guarded);
 
         ChatRelayService::prune_verified_backup_retention_at(
             &config,

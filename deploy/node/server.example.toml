@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Document that manual
+#   producer import is current-checkpoint and pin gated while remaining local.
 # - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Clarify that explicit
 #   witness rounds persist portable signed receipts, while configuration alone
 #   still performs no network transmission.
@@ -60,6 +62,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.13.0-node-deploy - Documented bounded host-local witness receipt import.
 # v1.12.0-node-deploy - Documented durable producer custody witness evidence.
 # v1.11.0-node-deploy - Documented relay custody retention/prune policy.
 # v1.10.0-node-deploy - Documented runtime identity separation for trust pins.
@@ -192,11 +195,13 @@ verified_delivery_witness_required_for_restore = false
 # discovery. List only requester node identities this node explicitly agrees
 # to protect. Empty means the witness endpoint refuses every write.
 verified_delivery_witness_requester_node_ids = []
-# [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Producer-side independent
+# [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Producer-side independent
 # custody witness candidates. Startup evaluates only fresh authenticated
 # EncryptedStorage descriptors with public-safe endpoints and logs aggregate
 # readiness. An explicitly invoked durable round stores canonical signed
-# receipts in a bounded local vault and revalidates them after restart.
+# receipts in a bounded local vault and revalidates them after restart. The
+# host-local import command accepts only a current producer checkpoint and a
+# witness from this pin set; it does not contact the witness over the network.
 # Configuration/startup still sends nothing: no scheduler exists in this
 # release, and an empty list remains fully off.
 custody_audit_witness_node_ids = []

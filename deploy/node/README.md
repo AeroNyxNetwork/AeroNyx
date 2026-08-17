@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Document bounded
+  producer-side import of an operator-carried signed witness receipt, current
+  checkpoint binding, durable vault re-audit, and adverse-evidence retention.
 - [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Document independent-node
   countersigning, durable producer-scoped high-water state, signed negative
   decisions, and exact offline producer/witness verification.
@@ -131,6 +134,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.55.0-node-deploy - Documented host-local custody witness receipt import.
 v1.54.0-node-deploy - Documented segmented custody audit checkpoints.
 v1.53.0-node-deploy - Documented custody maintenance audit verification.
 v1.52.0-node-deploy - Documented authenticated relay restore planning.
@@ -878,6 +882,43 @@ checks both Ed25519 signatures, both exact frame hashes, canonical encoding,
 independent producer/witness identities, the producer generation floor, and
 the receipt-to-anchor binding. The witness supplies its own signed observation
 time; the producer still supplies no trusted timestamp.
+
+Return the exact anchor, receipt, and both operator-recorded SHA-256 pins to the
+producer. Pin that independent witness in
+`discovery.custody_audit_witness_node_ids`, then import the receipt into the
+producer's durable evidence vault:
+
+```bash
+sudo /opt/aeronyx/aeronyx-server relay-custody import-audit-witness \
+  -c /etc/aeronyx/server.toml \
+  --anchor ./relay-custody-anchor.bin \
+  --anchor-sha256 <64-hex-anchor-frame-sha256> \
+  --receipt ./relay-custody-witness.bin \
+  --receipt-sha256 <64-hex-receipt-frame-sha256> \
+  --expected-witness <64-hex-independent-witness-node-id> \
+  --max-age-seconds 7200 \
+  --json
+```
+
+<!-- [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] -->
+Import is host-local and performs no HTTP request. It loads the producer
+identity from the local config, requires persistent MemChain storage, verifies
+both exact frame hashes and both signatures, requires the witness to be in the
+producer's current pin set, and regenerates the producer checkpoint before
+accepting the receipt. A correctly signed receipt for an older checkpoint is
+therefore rejected even when it was once valid.
+
+`--max-age-seconds` is explicit and bounded from 60 seconds to seven days. The
+selected value and `operator_import` admission type are persisted with that
+receipt and revalidated after restart. Automatic network receipt persistence
+remains a separate typed path fixed at 60 seconds. Existing schema-v17 rows
+migrate conservatively to that strict live policy.
+
+The command re-audits every canonical receipt before commit and evaluates the
+configured exact-anchor threshold afterward. An accepted receipt may report
+`ready` or `collecting`; a signed `stale`, `conflict`, or `gap` receipt is still
+retained for operator review and then returns a non-zero command result. Do not
+delete adverse evidence merely to make policy appear healthy.
 
 The witness stores only producer identity, checkpoint generation, exact opaque
 frame SHA-256, and observation time. It never receives the private audit HMAC,

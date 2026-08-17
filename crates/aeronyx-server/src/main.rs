@@ -51,6 +51,8 @@
 //!   fail-closed offline verification for exact node-signed custody anchors.
 //! - [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Add durable independent-node
 //!   countersigning and exact offline verification for custody audit anchors.
+//! - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Close the air-gapped
+//!   producer workflow with a bounded host-local signed-receipt import.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -81,6 +83,8 @@
 //! v1.16.0-CustodyAuditRotation - Report authenticated audit segment state
 //! v1.17.0-CustodyAuditAnchor - Export and verify portable checkpoint anchors
 //! v1.18.0-CustodyAuditWitness - Persist and verify independent witness receipts
+//! v1.19.0-CustodyWitnessReceiptImport - Import pinned receipts into the
+//! producer's fully re-audited bounded evidence vault
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read};
@@ -109,6 +113,7 @@ use aeronyx_server::api::directory_replica_sync::{
     build_directory_certificate_exchange_http_client, fetch_authenticated_observation_certificate,
 };
 use aeronyx_server::management::models::{NodeRegistrationProfile, StoredNodeInfo};
+use aeronyx_server::services::chat_relay::ChatRelayCustodyAuditAnchorGuard;
 use aeronyx_server::services::directory_replica::{
     verify_directory_observation_certificate_frame as verify_portable_observation_certificate_frame,
     DirectoryObservationCertificateTrustPolicy,
@@ -390,6 +395,45 @@ enum RelayCustodyCommands {
         /// Lowest checkpoint generation trusted by this verifier
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         minimum_checkpoint_generation: u64,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Import one pinned witness receipt into this producer's durable vault
+    ImportAuditWitness {
+        /// Path to this producer node's local configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Path to this producer's canonical binary anchor frame
+        #[arg(long)]
+        anchor: PathBuf,
+
+        /// Expected SHA-256 of the exact producer anchor frame
+        #[arg(long)]
+        anchor_sha256: String,
+
+        /// Path to the canonical binary witness receipt
+        #[arg(long)]
+        receipt: PathBuf,
+
+        /// Expected SHA-256 of the exact witness receipt frame
+        #[arg(long)]
+        receipt_sha256: String,
+
+        /// Configured independent witness identity (64 hexadecimal characters)
+        #[arg(long)]
+        expected_witness: String,
+
+        /// Maximum accepted age of the signed witness observation
+        #[arg(
+            long,
+            default_value_t = 7200,
+            value_parser = clap::value_parser!(u64).range(60..=604800)
+        )]
+        max_age_seconds: u64,
 
         /// Emit the stable aggregate JSON contract
         #[arg(long)]
@@ -1282,6 +1326,28 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
                 json,
             )?;
         }
+        RelayCustodyCommands::ImportAuditWitness {
+            config,
+            anchor,
+            anchor_sha256,
+            receipt,
+            receipt_sha256,
+            expected_witness,
+            max_age_seconds,
+            json,
+        } => {
+            cmd_relay_import_audit_witness(
+                &config,
+                &anchor,
+                &anchor_sha256,
+                &receipt,
+                &receipt_sha256,
+                &expected_witness,
+                max_age_seconds,
+                json,
+            )
+            .await?;
+        }
         RelayCustodyCommands::RestoreReadiness { config, json } => {
             let server_config = load_relay_custody_config(&config).await?;
             let receipt = ChatRelayService::audit_latest_restore_readiness_for_config(
@@ -1540,6 +1606,44 @@ struct RelayCustodyAuditWitnessReport {
     privacy_boundary: &'static str,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct RelayCustodyAuditWitnessImportReport {
+    contract_version: &'static str,
+    status: &'static str,
+    import_disposition: &'static str,
+    receipt_outcome: &'static str,
+    checkpoint_generation: u64,
+    observed_at: u64,
+    vault_records: usize,
+    vault_accepted_records: usize,
+    vault_adverse_records: usize,
+    configured_witnesses: usize,
+    fresh_verified: usize,
+    accepted: usize,
+    adverse: usize,
+    missing: usize,
+    minimum_verified: usize,
+    policy_ready: bool,
+    security_model: &'static str,
+    privacy_boundary: &'static str,
+}
+
+/// Fully verified pre-persistence context for one producer receipt import.
+///
+/// [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] File, identity, pin,
+/// signature, and exact-current-anchor checks complete before this value can
+/// exist. The value keeps the cross-process maintenance lock alive, while
+/// receipt-vault mutation remains a separate phase in the command handler.
+struct VerifiedRelayCustodyAuditWitnessImport {
+    config: ServerConfig,
+    identity: IdentityKeyPair,
+    producer: [u8; 32],
+    configured_witnesses: Vec<[u8; 32]>,
+    anchor_guard: ChatRelayCustodyAuditAnchorGuard,
+    anchor_sha256: [u8; 32],
+    receipt: CustodyAuditWitnessReceiptV1,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_relay_witness_audit_anchor(
     config_path: &Path,
@@ -1664,12 +1768,49 @@ fn cmd_relay_verify_audit_witness(
         MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
         "audit witness receipt",
     )?;
-    let actual_receipt_sha256: [u8; 32] = Sha256::digest(&receipt_frame).into();
+    let receipt = verify_relay_custody_witness_receipt_frame(
+        &receipt_frame,
+        &receipt_sha256,
+        &anchor,
+        &anchor_sha256,
+        &expected_producer,
+        &expected_witness,
+        minimum_checkpoint_generation,
+    )?;
     anyhow::ensure!(
-        actual_receipt_sha256 == receipt_sha256,
+        receipt.accepted(),
+        "custody audit witness receipt does not prove accepted custody"
+    );
+    print_relay_custody_audit_witness(
+        &receipt,
+        &receipt_sha256,
+        receipt_frame.len(),
+        "verified",
+        json,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_relay_custody_witness_receipt_frame(
+    receipt_frame: &[u8],
+    expected_receipt_sha256: &[u8; 32],
+    anchor: &CustodyAuditAnchorV1,
+    anchor_sha256: &[u8; 32],
+    expected_producer: &[u8; 32],
+    expected_witness: &[u8; 32],
+    minimum_checkpoint_generation: u64,
+) -> anyhow::Result<CustodyAuditWitnessReceiptV1> {
+    anyhow::ensure!(
+        !receipt_frame.is_empty()
+            && receipt_frame.len() <= MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
+        "custody audit witness receipt violates its complete-frame bound"
+    );
+    let actual_receipt_sha256: [u8; 32] = Sha256::digest(receipt_frame).into();
+    anyhow::ensure!(
+        &actual_receipt_sha256 == expected_receipt_sha256,
         "custody audit witness receipt SHA-256 does not match the explicit pin"
     );
-    let receipt = decode_custody_audit_witness_receipt(&receipt_frame)
+    let receipt = decode_custody_audit_witness_receipt(receipt_frame)
         .map_err(|_| anyhow::anyhow!("custody audit witness receipt is malformed"))?;
     let canonical = encode_custody_audit_witness_receipt(&receipt)
         .map_err(|_| anyhow::anyhow!("custody audit witness receipt cannot be canonicalized"))?;
@@ -1678,21 +1819,218 @@ fn cmd_relay_verify_audit_witness(
         "custody audit witness receipt is not canonically encoded"
     );
     receipt
-        .verify_accepted_for_anchor(
-            &anchor,
-            &anchor_sha256,
-            &expected_producer,
-            &expected_witness,
+        .verify_for_anchor(
+            anchor,
+            anchor_sha256,
+            expected_producer,
+            expected_witness,
             minimum_checkpoint_generation,
         )
         .map_err(|_| anyhow::anyhow!("custody audit witness receipt trust policy failed"))?;
-    print_relay_custody_audit_witness(
-        &receipt,
-        &receipt_sha256,
-        receipt_frame.len(),
-        "verified",
-        json,
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_relay_custody_audit_witness_import(
+    config_path: &Path,
+    anchor_path: &Path,
+    anchor_sha256_hex: &str,
+    receipt_path: &Path,
+    receipt_sha256_hex: &str,
+    expected_witness_hex: &str,
+) -> anyhow::Result<VerifiedRelayCustodyAuditWitnessImport> {
+    let config = load_relay_custody_config(config_path).await?;
+    anyhow::ensure!(
+        config.memchain.is_enabled() && config.memchain.db_path.trim() != ":memory:",
+        "custody witness receipt import requires persistent local MemChain storage"
+    );
+    let identity = load_relay_custody_identity(&config, "audit witness import").await?;
+    let producer = identity.public_key_bytes();
+    let expected_witness = parse_hex32(expected_witness_hex, "expected witness node identity")?;
+    anyhow::ensure!(
+        expected_witness != producer,
+        "producer and independent witness identities must differ"
+    );
+    let configured_witnesses = config.discovery.custody_audit_witness_node_id_bytes();
+    anyhow::ensure!(
+        configured_witnesses.contains(&expected_witness),
+        "witness identity is not pinned by discovery.custody_audit_witness_node_ids"
+    );
+
+    let anchor_sha256 = parse_hex32(anchor_sha256_hex, "audit anchor SHA-256")?;
+    let anchor_frame = read_bounded_relay_custody_artifact(
+        anchor_path,
+        MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
+        "audit anchor",
+    )?;
+    let anchor = verify_relay_custody_anchor_frame(&anchor_frame, &anchor_sha256, &producer, 1)?;
+
+    // A producer signature alone cannot make a historical checkpoint current.
+    // Recompute the immutable local checkpoint before any SQLite mutation.
+    let anchor_guard = ChatRelayService::hold_backup_maintenance_audit_anchor_for_config(
+        &config.memchain.chat_relay,
+        &identity,
     )
+    .map_err(|_| anyhow::anyhow!("unable to hold current relay custody anchor"))?;
+    let current_anchor_frame = encode_custody_audit_anchor(anchor_guard.anchor())
+        .map_err(|_| anyhow::anyhow!("unable to encode current relay custody anchor"))?;
+    let current_anchor_sha256: [u8; 32] = Sha256::digest(&current_anchor_frame).into();
+    anyhow::ensure!(
+        anchor_guard.anchor().checkpoint_generation == anchor.checkpoint_generation
+            && current_anchor_sha256 == anchor_sha256,
+        "custody witness receipt anchor is not the current local checkpoint"
+    );
+
+    let receipt_sha256 = parse_hex32(receipt_sha256_hex, "audit witness receipt SHA-256")?;
+    let receipt_frame = read_bounded_relay_custody_artifact(
+        receipt_path,
+        MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
+        "audit witness receipt",
+    )?;
+    let receipt = verify_relay_custody_witness_receipt_frame(
+        &receipt_frame,
+        &receipt_sha256,
+        &anchor,
+        &anchor_sha256,
+        &producer,
+        &expected_witness,
+        anchor.checkpoint_generation,
+    )?;
+    Ok(VerifiedRelayCustodyAuditWitnessImport {
+        config,
+        identity,
+        producer,
+        configured_witnesses,
+        anchor_guard,
+        anchor_sha256,
+        receipt,
+    })
+}
+
+fn print_relay_custody_audit_witness_import(
+    report: &RelayCustodyAuditWitnessImportReport,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(report)?);
+        return Ok(());
+    }
+    println!("Relay custody witness receipt import");
+    println!("════════════════════════════════════════");
+    println!("Status:               {}", report.status);
+    println!("Import disposition:   {}", report.import_disposition);
+    println!("Receipt outcome:      {}", report.receipt_outcome);
+    println!("Checkpoint generation: {}", report.checkpoint_generation);
+    println!("Vault records:        {}", report.vault_records);
+    println!("Configured witnesses: {}", report.configured_witnesses);
+    println!("Fresh verified:       {}", report.fresh_verified);
+    println!(
+        "Accepted / adverse:   {} / {}",
+        report.accepted, report.adverse
+    );
+    println!("Missing:              {}", report.missing);
+    println!("Minimum verified:     {}", report.minimum_verified);
+    println!("Policy ready:         {}", report.policy_ready);
+    println!();
+    println!("Security model: {}", report.security_model);
+    println!("Privacy: {}", report.privacy_boundary);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_relay_import_audit_witness(
+    config_path: &Path,
+    anchor_path: &Path,
+    anchor_sha256_hex: &str,
+    receipt_path: &Path,
+    receipt_sha256_hex: &str,
+    expected_witness_hex: &str,
+    max_age_seconds: u64,
+    json: bool,
+) -> anyhow::Result<()> {
+    let verified = verify_relay_custody_audit_witness_import(
+        config_path,
+        anchor_path,
+        anchor_sha256_hex,
+        receipt_path,
+        receipt_sha256_hex,
+        expected_witness_hex,
+    )
+    .await?;
+    let VerifiedRelayCustodyAuditWitnessImport {
+        config,
+        identity,
+        producer,
+        configured_witnesses,
+        anchor_guard,
+        anchor_sha256,
+        receipt,
+    } = verified;
+    let anchor = anchor_guard.anchor();
+    let imported_at = unix_timestamp_now()?;
+    let record_key = derive_record_key(&identity.to_bytes());
+    let storage = MemoryStorage::open(&config.memchain.db_path, Some(record_key))
+        .map_err(|_| anyhow::anyhow!("unable to open custody witness receipt vault"))?;
+    let disposition = storage
+        .import_custody_audit_witness_receipt(
+            &receipt,
+            &producer,
+            anchor.checkpoint_generation,
+            &anchor_sha256,
+            imported_at,
+            max_age_seconds,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("custody witness receipt import failed closed"))?;
+    let vault = storage
+        .audit_custody_audit_witness_receipt_evidence()
+        .await
+        .map_err(|_| anyhow::anyhow!("custody witness receipt vault audit failed closed"))?;
+    let policy = storage
+        .evaluate_custody_audit_witness_receipt_policy(
+            &producer,
+            anchor.checkpoint_generation,
+            &anchor_sha256,
+            &configured_witnesses,
+            config.discovery.custody_audit_witness_min_verified,
+            imported_at,
+            max_age_seconds,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("custody witness receipt policy audit failed closed"))?;
+    let status = if policy.quorum_satisfied {
+        "ready"
+    } else if policy.adverse > 0 {
+        "adverse"
+    } else {
+        "collecting"
+    };
+    let report = RelayCustodyAuditWitnessImportReport {
+        contract_version: "relay_custody_audit_witness_import.v1",
+        status,
+        import_disposition: disposition.as_str(),
+        receipt_outcome: custody_audit_witness_outcome_label(receipt.outcome),
+        checkpoint_generation: anchor.checkpoint_generation,
+        observed_at: receipt.observed_at,
+        vault_records: vault.records,
+        vault_accepted_records: vault.accepted_records,
+        vault_adverse_records: vault.adverse_records,
+        configured_witnesses: policy.configured,
+        fresh_verified: policy.fresh_verified,
+        accepted: policy.accepted,
+        adverse: policy.adverse,
+        missing: policy.missing,
+        minimum_verified: policy.minimum_verified,
+        policy_ready: policy.quorum_satisfied,
+        security_model: "host-local exact-current-anchor import; canonical signed receipts are re-audited before policy evaluation and do not establish consensus or global finality",
+        privacy_boundary: "aggregate vault and exact-anchor policy counts only; no message, user, route, endpoint, IP, payload, memory, DNS, destination, or social graph metadata",
+    };
+    print_relay_custody_audit_witness_import(&report, json)?;
+    anyhow::ensure!(
+        receipt.accepted(),
+        "signed adverse custody witness evidence was retained for operator review"
+    );
+    Ok(())
 }
 
 const fn custody_audit_witness_decision_fields(
@@ -3371,6 +3709,68 @@ mod tests {
         assert_eq!(minimum_checkpoint_generation, 7);
         assert!(json);
 
+        // [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Import is an
+        // explicit host-local operation with exact anchor, receipt, and
+        // configured witness pins plus a parser-bounded freshness window.
+        let import_witness = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "import-audit-witness",
+            "--anchor",
+            "/root/custody-anchor.bin",
+            "--anchor-sha256",
+            &"86".repeat(32),
+            "--receipt",
+            "/root/custody-witness.bin",
+            "--receipt-sha256",
+            &"87".repeat(32),
+            "--expected-witness",
+            &witness,
+            "--max-age-seconds",
+            "3600",
+            "--json",
+        ])
+        .expect("audit witness import form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::ImportAuditWitness {
+            config,
+            anchor,
+            anchor_sha256,
+            receipt,
+            receipt_sha256,
+            expected_witness,
+            max_age_seconds,
+            json,
+        }) = import_witness.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert_eq!(anchor, PathBuf::from("/root/custody-anchor.bin"));
+        assert_eq!(anchor_sha256, "86".repeat(32));
+        assert_eq!(receipt, PathBuf::from("/root/custody-witness.bin"));
+        assert_eq!(receipt_sha256, "87".repeat(32));
+        assert_eq!(expected_witness, witness);
+        assert_eq!(max_age_seconds, 3600);
+        assert!(json);
+        assert!(Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "import-audit-witness",
+            "--anchor",
+            "/root/custody-anchor.bin",
+            "--anchor-sha256",
+            &"86".repeat(32),
+            "--receipt",
+            "/root/custody-witness.bin",
+            "--receipt-sha256",
+            &"87".repeat(32),
+            "--expected-witness",
+            &"85".repeat(32),
+            "--max-age-seconds",
+            "604801",
+        ])
+        .is_err());
+
         let readiness = Cli::try_parse_from([
             "aeronyx-server",
             "relay-custody",
@@ -3574,8 +3974,17 @@ mod tests {
             "audit witness receipt",
         )
         .expect("read witness receipt");
-        let decoded =
-            decode_custody_audit_witness_receipt(&loaded).expect("decode witness receipt");
+        let receipt_sha256: [u8; 32] = Sha256::digest(&loaded).into();
+        let decoded = verify_relay_custody_witness_receipt_frame(
+            &loaded,
+            &receipt_sha256,
+            &anchor,
+            &anchor_sha256,
+            &producer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            5,
+        )
+        .expect("verify canonical witness receipt frame");
         decoded
             .verify_accepted_for_anchor(
                 &anchor,
@@ -3596,6 +4005,16 @@ mod tests {
                 5,
             )
             .is_err());
+        assert!(verify_relay_custody_witness_receipt_frame(
+            &loaded,
+            &[0x8c; 32],
+            &anchor,
+            &anchor_sha256,
+            &producer.public_key_bytes(),
+            &witness.public_key_bytes(),
+            5,
+        )
+        .is_err());
 
         let oversized_path = directory.path().join("oversized-witness.bin");
         std::fs::write(

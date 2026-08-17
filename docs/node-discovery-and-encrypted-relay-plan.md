@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v0.98.0 - Added bounded producer-side custody witness
-receipt persistence, full restart-time cryptographic audit, and exact-anchor
-policy reconstruction without enabling a startup or background scheduler.
+Modification Reason: v0.99.0 - Added bounded operator-carried custody witness
+receipt import, exact-current-checkpoint binding, and per-row admission policy
+evidence without enabling a startup or background scheduler.
 
 Main Functionality:
 
@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v0.98.0 - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Persists exact portable witness receipts atomically, revalidates every frame after restart, and reconstructs fresh exact-anchor policy without exposing custody contents.
+Last Modified: v0.99.0 - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Imports operator-carried signed receipts only for the current local checkpoint and preserves their typed admission policy for restart audit.
+Previous: v0.98.0 - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Persists exact portable witness receipts atomically, revalidates every frame after restart, and reconstructs fresh exact-anchor policy without exposing custody contents.
 Previous: v0.97.0 - [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] Sends an exact producer-signed anchor only when explicitly invoked, verifies portable request-bound receipts, and never lets adverse evidence be outvoted.
 Previous: v0.96.0 - [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Validates independent producer witness eligibility locally and authenticates witness requests before consulting private trust pins.
 Previous: v0.95.0 - [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Accepts exact producer-signed custody anchors only from independently pinned, currently verified peers and returns portable request-bound witness evidence.
@@ -132,6 +133,35 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v0.99 Air-gapped witness receipts can safely rejoin producer state
+
+[CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex]
+
+- An operator can carry one canonical producer anchor to an independent node,
+  return its signed receipt, and import that receipt into the producer without
+  adding a CMS, HTTP callback, startup transmission, or background scheduler.
+- Import requires exact SHA-256 pins for both files, canonical re-encoding, both
+  Ed25519 signatures, the locally configured witness pin, and the producer's
+  own current identity. The producer regenerates its current immutable custody
+  checkpoint; a historical receipt cannot become current readiness.
+- Schema v18 records a typed admission policy beside every immutable signed
+  receipt. `live_transport` is always fixed to 60 seconds. `operator_import`
+  stores the operator-selected bound from 60 seconds through seven days. The
+  complete vault audit applies each row's own bound after every restart.
+- Upgrading schema-v17 evidence is conservative: every existing row becomes
+  `live_transport` with a 60-second bound. Migration never infers an import or
+  widens historical evidence.
+- Accepted evidence is retained idempotently and exact-anchor policy is
+  reconstructed from distinct current pins. Signed adverse evidence is also
+  retained, reported in aggregate, and makes the command fail after durable
+  preservation so review cannot be bypassed by retrying.
+- The import report contains only aggregate vault/policy counts, disposition,
+  checkpoint generation, and witness observation time. It excludes identities,
+  hashes, paths, signatures, endpoints, messages, routes, payloads, memory,
+  destinations, DNS, IP addresses, and social-graph metadata.
+- This is independent evidence retention, not consensus, validator voting,
+  fork choice, leader election, transaction settlement, or global finality.
 
 ### v0.98 Producer receipt evidence is durable and restart-verifiable
 

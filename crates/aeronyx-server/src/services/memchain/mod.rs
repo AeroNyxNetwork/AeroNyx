@@ -58,6 +58,8 @@
 //!   another independently configured inference engine.
 //!
 //! ## Last Modified
+//! [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Re-exported only the
+//! aggregate producer-vault import, audit, and exact-anchor policy results.
 //! [CUSTODY-AUDIT-WITNESS 2026-08-16 by Codex] Re-exported the independent
 //! custody checkpoint witness decision used by the host-local CLI.
 //! [SUPERNODE-STARTUP-INTEGRITY 2026-08-14 by Codex] Re-exported the typed,
@@ -170,9 +172,10 @@ pub(crate) use storage::{
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
 pub use storage_ops::{
-    CustodyAuditAnchorWitnessOutcome, OverviewData, OverviewRecord, RecordCommitmentAppendOutcome,
-    RecordCommitmentBatchAppendOutcome, RecordCommitmentChainAudit,
-    RecordCommitmentChainIntegrityStatus, RecordCommitmentChainStatus,
+    CustodyAuditAnchorWitnessOutcome, CustodyAuditWitnessReceiptPersistOutcome,
+    CustodyAuditWitnessReceiptPolicyEvidence, CustodyAuditWitnessReceiptVaultAudit, OverviewData,
+    OverviewRecord, RecordCommitmentAppendOutcome, RecordCommitmentBatchAppendOutcome,
+    RecordCommitmentChainAudit, RecordCommitmentChainIntegrityStatus, RecordCommitmentChainStatus,
     RecordCommitmentCheckpointEvidenceAudit, VerifiedRecordCommitmentBlockPage,
 };
 
