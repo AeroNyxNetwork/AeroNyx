@@ -227,6 +227,8 @@
 //! v2.8.14-SyncObservability - Distinguish scheduled and authenticated follower wake-ups.
 //! v2.8.13-BlockConfirmation - Expose audited witness-certificate block coverage.
 //! v2.8.12-LeaseFailClosedTelemetry - Expose bounded fail-closed lease state.
+//! v2.8.16-CustodyQuorumExpiry - Derive the exact aggregate validity horizon
+//! for the newest accepted receipts sufficient to satisfy local custody policy.
 //! v2.8.11-CoordinatorLeaseRelease - Retain epochs while releasing planned restarts.
 //! v2.8.10-CoordinatorLease - Fence duplicate coordinators across witness hosts.
 //! v2.7.23-CertificateExchange - Export only fully re-audited certificate frames.
@@ -553,6 +555,12 @@ pub struct CustodyAuditWitnessReceiptPolicyEvidence {
     pub minimum_verified: usize,
     /// Whether the threshold is met with no fresh adverse evidence.
     pub quorum_satisfied: bool,
+    /// Inclusive expiry horizon of the newest accepted threshold set.
+    ///
+    /// [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] This aggregate timestamp
+    /// identifies no witness and lets local operations renew evidence before
+    /// strict runtime readiness fails.
+    pub quorum_valid_through: Option<u64>,
 }
 
 /// Typed readiness derived from one internally consistent custody policy.
@@ -613,6 +621,13 @@ impl CustodyAuditWitnessPolicyReadiness {
 }
 
 impl CustodyAuditWitnessReceiptPolicyEvidence {
+    /// Returns the remaining inclusive quorum validity at one evaluation time.
+    #[must_use]
+    pub fn quorum_valid_for_secs(&self, evaluated_at: u64) -> Option<u64> {
+        self.quorum_valid_through
+            .map(|valid_through| valid_through.saturating_sub(evaluated_at))
+    }
+
     /// Validates counter invariants and derives the authoritative readiness.
     ///
     /// # Errors
@@ -632,6 +647,7 @@ impl CustodyAuditWitnessReceiptPolicyEvidence {
             || classified != self.fresh_verified
             || self.missing != self.configured.saturating_sub(self.fresh_verified)
             || self.quorum_satisfied != expected_ready
+            || self.quorum_valid_through.is_some() != (self.accepted >= self.minimum_verified)
         {
             return Err("custody witness policy counters are inconsistent");
         }
@@ -656,6 +672,25 @@ pub struct CustodyAuditWitnessReceiptReadinessSnapshot {
     pub policy: CustodyAuditWitnessReceiptPolicyEvidence,
     /// Authoritative typed readiness derived from validated policy counters.
     pub readiness: CustodyAuditWitnessPolicyReadiness,
+}
+
+/// Returns the bounded local warning window before a ready quorum expires.
+///
+/// [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] One shared calculation keeps
+/// runtime logs and operator CLI reports consistent. It performs no storage or
+/// network operation and receives only the configured aggregate age window.
+#[must_use]
+pub const fn custody_witness_renewal_warning_window_secs(max_age_secs: u64) -> u64 {
+    const MIN_WARNING_SECS: u64 = 60;
+    const MAX_WARNING_SECS: u64 = 900;
+    let quarter_window = max_age_secs / 4;
+    if quarter_window < MIN_WARNING_SECS {
+        MIN_WARNING_SECS
+    } else if quarter_window > MAX_WARNING_SECS {
+        MAX_WARNING_SECS
+    } else {
+        quarter_window
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3390,13 +3425,23 @@ fn evaluate_custody_audit_witness_receipts(
     }
 
     evidence.fresh_verified = latest.len();
+    let mut accepted_observed_at = Vec::with_capacity(latest.len());
     for decision in latest.values() {
         if decision.accepted && !decision.same_time_ambiguous && !decision.sticky_adverse {
             evidence.accepted = evidence.accepted.saturating_add(1);
+            accepted_observed_at.push(decision.observed_at);
         } else {
             evidence.adverse = evidence.adverse.saturating_add(1);
         }
     }
+    // [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] The threshold-th newest
+    // accepted observation is the exact point at which the currently usable
+    // quorum loses one required member. Older surplus evidence must not make
+    // the renewal horizon look earlier than it really is.
+    accepted_observed_at.sort_unstable_by(|left, right| right.cmp(left));
+    evidence.quorum_valid_through = accepted_observed_at
+        .get(minimum_verified.saturating_sub(1))
+        .map(|observed_at| observed_at.saturating_add(max_age_secs));
     evidence.missing = evidence.configured.saturating_sub(evidence.fresh_verified);
     evidence.quorum_satisfied = evidence.accepted >= minimum_verified && evidence.adverse == 0;
     let readiness = evidence
@@ -9710,6 +9755,76 @@ mod tests {
             .contains("persistence time is inconsistent"));
     }
 
+    #[test]
+    fn custody_witness_quorum_expiry_tracks_threshold_newest_receipts() {
+        // [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] With three accepted
+        // witnesses and a threshold of two, the second-newest observation is
+        // the real renewal horizon; an older surplus receipt is irrelevant.
+        let producer = IdentityKeyPair::from_bytes(&[0x71; 32]).unwrap();
+        let producer_id = producer.public_key_bytes();
+        let frame_sha256 = [0x72; 32];
+        let witnesses = [
+            IdentityKeyPair::from_bytes(&[0x73; 32]).unwrap(),
+            IdentityKeyPair::from_bytes(&[0x74; 32]).unwrap(),
+            IdentityKeyPair::from_bytes(&[0x75; 32]).unwrap(),
+        ];
+        let observed_at = [100, 120, 140];
+        let receipts = witnesses
+            .iter()
+            .zip(observed_at)
+            .map(|(witness, observed_at)| {
+                CustodyAuditWitnessReceiptV1::signed(
+                    producer_id,
+                    1,
+                    frame_sha256,
+                    observed_at,
+                    1,
+                    frame_sha256,
+                    CUSTODY_AUDIT_WITNESS_ADVANCED_V1,
+                    witness,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let witness_ids = witnesses
+            .iter()
+            .map(IdentityKeyPair::public_key_bytes)
+            .collect::<Vec<_>>();
+
+        let (ready, readiness) = evaluate_custody_audit_witness_receipts(
+            receipts.clone(),
+            &producer_id,
+            1,
+            &frame_sha256,
+            &witness_ids,
+            2,
+            150,
+            100,
+        )
+        .unwrap();
+        assert_eq!(readiness, CustodyAuditWitnessPolicyReadiness::Ready);
+        assert_eq!(ready.quorum_valid_through, Some(220));
+        assert_eq!(ready.quorum_valid_for_secs(150), Some(70));
+
+        let (expired, readiness) = evaluate_custody_audit_witness_receipts(
+            receipts,
+            &producer_id,
+            1,
+            &frame_sha256,
+            &witness_ids,
+            2,
+            221,
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            readiness,
+            CustodyAuditWitnessPolicyReadiness::ThresholdUnmet
+        );
+        assert_eq!(expired.quorum_valid_through, None);
+        assert_eq!(expired.quorum_valid_for_secs(221), None);
+    }
+
     #[tokio::test]
     async fn custody_witness_receipt_vault_survives_restart_and_rejects_tampering() {
         // [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Exercise a real
@@ -9799,6 +9914,8 @@ mod tests {
         assert_eq!(policy.self_excluded, 1);
         assert_eq!(policy.accepted, 1);
         assert!(policy.quorum_satisfied);
+        assert_eq!(policy.quorum_valid_through, Some(observed_at + 60));
+        assert_eq!(policy.quorum_valid_for_secs(observed_at + 10), Some(50));
         assert_eq!(
             reopened
                 .audit_custody_audit_witness_receipt_readiness(

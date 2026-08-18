@@ -58,6 +58,8 @@
 //! - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Collect and
 //!   durably re-audit current-anchor witness receipts through one explicit,
 //!   snapshot-pinned operator command without enabling a background scheduler.
+//! - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Report the exact aggregate
+//!   threshold lifetime and a local renewal recommendation without networking.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -96,6 +98,8 @@
 //! witness receipts from signed snapshot-pinned peers and re-audit durability
 //! v1.22.0-CustodyWitnessAtomicReadiness - Use one typed SQLite snapshot for
 //! vault audit and current-anchor readiness across startup and operator tools
+//! v1.23.0-CustodyQuorumExpiry - Add privacy-safe quorum validity and renewal
+//! window fields to custody import, collection, and vault audit reports
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read};
@@ -135,8 +139,8 @@ use aeronyx_server::services::directory_replica::{
     DirectoryObservationCertificateTrustPolicy,
 };
 use aeronyx_server::services::memchain::{
-    derive_record_key, CustodyAuditAnchorWitnessOutcome, CustodyAuditWitnessReceiptPolicyEvidence,
-    MemoryStorage,
+    custody_witness_renewal_warning_window_secs, derive_record_key,
+    CustodyAuditAnchorWitnessOutcome, CustodyAuditWitnessReceiptPolicyEvidence, MemoryStorage,
 };
 use aeronyx_server::services::{
     derive_node_secret, AofWriter, ChatRelayBackupPruneRequest, ChatRelayRestorePlanReceipt,
@@ -1709,6 +1713,7 @@ struct RelayCustodyAuditWitnessImportReport {
     receipt_outcome: &'static str,
     checkpoint_generation: u64,
     observed_at: u64,
+    max_age_seconds: u64,
     vault_records: usize,
     vault_accepted_records: usize,
     vault_adverse_records: usize,
@@ -1719,6 +1724,10 @@ struct RelayCustodyAuditWitnessImportReport {
     missing: usize,
     minimum_verified: usize,
     policy_ready: bool,
+    quorum_valid_through: Option<u64>,
+    quorum_valid_for_seconds: Option<u64>,
+    renewal_warning_window_seconds: u64,
+    renewal_recommended: bool,
     security_model: &'static str,
     privacy_boundary: &'static str,
 }
@@ -1741,6 +1750,10 @@ struct RelayCustodyAuditWitnessVaultReport {
     minimum_verified: usize,
     policy_ready: bool,
     required_ready: bool,
+    quorum_valid_through: Option<u64>,
+    quorum_valid_for_seconds: Option<u64>,
+    renewal_warning_window_seconds: u64,
+    renewal_recommended: bool,
     security_model: &'static str,
     privacy_boundary: &'static str,
 }
@@ -1777,6 +1790,10 @@ struct RelayCustodyAuditWitnessCollectionReport {
     missing: usize,
     minimum_verified: usize,
     policy_ready: bool,
+    quorum_valid_through: Option<u64>,
+    quorum_valid_for_seconds: Option<u64>,
+    renewal_warning_window_seconds: u64,
+    renewal_recommended: bool,
     security_model: &'static str,
     privacy_boundary: &'static str,
 }
@@ -2111,6 +2128,20 @@ fn print_relay_custody_audit_witness_import(
     println!("Import disposition:   {}", report.import_disposition);
     println!("Receipt outcome:      {}", report.receipt_outcome);
     println!("Checkpoint generation: {}", report.checkpoint_generation);
+    println!("Freshness window:     {}s", report.max_age_seconds);
+    println!(
+        "Quorum valid through:  {}",
+        optional_u64_label(report.quorum_valid_through, "")
+    );
+    println!(
+        "Quorum valid for:      {}",
+        optional_u64_label(report.quorum_valid_for_seconds, "s")
+    );
+    println!(
+        "Renewal window:        {}s",
+        report.renewal_warning_window_seconds
+    );
+    println!("Renewal recommended:  {}", report.renewal_recommended);
     println!("Vault records:        {}", report.vault_records);
     println!("Configured witnesses: {}", report.configured_witnesses);
     println!("Fresh verified:       {}", report.fresh_verified);
@@ -2144,6 +2175,36 @@ fn custody_audit_witness_policy_status(
         .map_or("invalid", |readiness| readiness.status_label())
 }
 
+fn optional_u64_label(value: Option<u64>, suffix: &str) -> String {
+    // [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Human output must preserve
+    // the distinction between a real zero-second boundary and unavailable
+    // evidence. JSON already carries that distinction as a nullable number.
+    value.map_or_else(
+        || "unavailable".to_owned(),
+        |number| format!("{number}{suffix}"),
+    )
+}
+
+fn custody_audit_witness_renewal_fields(
+    policy: &CustodyAuditWitnessReceiptPolicyEvidence,
+    evaluated_at: u64,
+    max_age_seconds: u64,
+) -> (Option<u64>, Option<u64>, u64, bool) {
+    // [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] These are aggregate local
+    // operations fields only. They identify no witness and trigger no network
+    // request, evidence mutation, or automatic authority change.
+    let valid_for_seconds = policy.quorum_valid_for_secs(evaluated_at);
+    let warning_window_seconds = custody_witness_renewal_warning_window_secs(max_age_seconds);
+    let renewal_recommended =
+        valid_for_seconds.is_some_and(|valid_for| valid_for <= warning_window_seconds);
+    (
+        policy.quorum_valid_through,
+        valid_for_seconds,
+        warning_window_seconds,
+        renewal_recommended,
+    )
+}
+
 fn print_relay_custody_audit_witness_vault(
     report: &RelayCustodyAuditWitnessVaultReport,
     json: bool,
@@ -2158,6 +2219,19 @@ fn print_relay_custody_audit_witness_vault(
     println!("Evaluated at:         {}", report.evaluated_at);
     println!("Checkpoint generation: {}", report.checkpoint_generation);
     println!("Freshness window:     {}s", report.max_age_seconds);
+    println!(
+        "Quorum valid through:  {}",
+        optional_u64_label(report.quorum_valid_through, "")
+    );
+    println!(
+        "Quorum valid for:      {}",
+        optional_u64_label(report.quorum_valid_for_seconds, "s")
+    );
+    println!(
+        "Renewal window:        {}s",
+        report.renewal_warning_window_seconds
+    );
+    println!("Renewal recommended:  {}", report.renewal_recommended);
     println!("Vault records:        {}", report.vault_records);
     println!(
         "Vault accepted/adverse: {} / {}",
@@ -2194,6 +2268,19 @@ fn print_relay_custody_audit_witness_collection(
     println!("Checkpoint generation: {}", report.checkpoint_generation);
     println!("Request timeout:      {}s", report.timeout_seconds);
     println!("Freshness window:     {}s", report.max_age_seconds);
+    println!(
+        "Quorum valid through:  {}",
+        optional_u64_label(report.quorum_valid_through, "")
+    );
+    println!(
+        "Quorum valid for:      {}",
+        optional_u64_label(report.quorum_valid_for_seconds, "s")
+    );
+    println!(
+        "Renewal window:        {}s",
+        report.renewal_warning_window_seconds
+    );
+    println!("Renewal recommended:  {}", report.renewal_recommended);
     println!(
         "Snapshot total/pinned: {} / {}",
         report.snapshot_records, report.snapshot_pinned_records
@@ -2290,6 +2377,12 @@ fn build_relay_custody_audit_witness_collection_report(
     max_age_seconds: u64,
 ) -> RelayCustodyAuditWitnessCollectionReport {
     let status = custody_audit_witness_policy_status(policy);
+    let (
+        quorum_valid_through,
+        quorum_valid_for_seconds,
+        renewal_warning_window_seconds,
+        renewal_recommended,
+    ) = custody_audit_witness_renewal_fields(policy, evaluated_at, max_age_seconds);
     RelayCustodyAuditWitnessCollectionReport {
         contract_version: "relay_custody_audit_witness_collection.v1",
         status,
@@ -2321,6 +2414,10 @@ fn build_relay_custody_audit_witness_collection_report(
         missing: policy.missing,
         minimum_verified: policy.minimum_verified,
         policy_ready: status == "ready",
+        quorum_valid_through,
+        quorum_valid_for_seconds,
+        renewal_warning_window_seconds,
+        renewal_recommended,
         security_model: "explicit one-shot exact-pin witness transport with signed descriptor admission, durable receipt-before-counting, complete vault re-audit, and no background scheduler, voting, fork choice, consensus, or global finality",
         privacy_boundary: "aggregate snapshot, round, vault, and current policy counts only; no node identities, hashes, signatures, paths, endpoints, messages, users, routes, payloads, memory, destinations, DNS, IP addresses, or social graph metadata",
     }
@@ -2448,6 +2545,12 @@ async fn cmd_relay_audit_witness_vault(
     let policy = readiness.policy;
     let status = custody_audit_witness_policy_status(&policy);
     let policy_ready = status == "ready";
+    let (
+        quorum_valid_through,
+        quorum_valid_for_seconds,
+        renewal_warning_window_seconds,
+        renewal_recommended,
+    ) = custody_audit_witness_renewal_fields(&policy, evaluated_at, max_age_seconds);
     let report = RelayCustodyAuditWitnessVaultReport {
         contract_version: "relay_custody_audit_witness_vault.v1",
         status,
@@ -2465,6 +2568,10 @@ async fn cmd_relay_audit_witness_vault(
         minimum_verified: policy.minimum_verified,
         policy_ready,
         required_ready: require_ready,
+        quorum_valid_through,
+        quorum_valid_for_seconds,
+        renewal_warning_window_seconds,
+        renewal_recommended,
         security_model: "host-local current-checkpoint receipt re-audit under an exclusive maintenance guard; no witness contact, consensus, voting, fork choice, or global finality",
         privacy_boundary: "aggregate vault and current policy counts only; no node identities, hashes, signatures, paths, endpoints, messages, users, routes, payloads, memory, destinations, DNS, IP addresses, or social graph metadata",
     };
@@ -2534,6 +2641,12 @@ async fn cmd_relay_import_audit_witness(
     let vault = readiness.vault;
     let policy = readiness.policy;
     let status = custody_audit_witness_policy_status(&policy);
+    let (
+        quorum_valid_through,
+        quorum_valid_for_seconds,
+        renewal_warning_window_seconds,
+        renewal_recommended,
+    ) = custody_audit_witness_renewal_fields(&policy, imported_at, max_age_seconds);
     let report = RelayCustodyAuditWitnessImportReport {
         contract_version: "relay_custody_audit_witness_import.v1",
         status,
@@ -2541,6 +2654,7 @@ async fn cmd_relay_import_audit_witness(
         receipt_outcome: custody_audit_witness_outcome_label(receipt.outcome),
         checkpoint_generation: anchor.checkpoint_generation,
         observed_at: receipt.observed_at,
+        max_age_seconds,
         vault_records: vault.records,
         vault_accepted_records: vault.accepted_records,
         vault_adverse_records: vault.adverse_records,
@@ -2551,6 +2665,10 @@ async fn cmd_relay_import_audit_witness(
         missing: policy.missing,
         minimum_verified: policy.minimum_verified,
         policy_ready: status == "ready",
+        quorum_valid_through,
+        quorum_valid_for_seconds,
+        renewal_warning_window_seconds,
+        renewal_recommended,
         security_model: "host-local exact-current-anchor import; canonical signed receipts are re-audited before policy evaluation and do not establish consensus or global finality",
         privacy_boundary: "aggregate vault and exact-anchor policy counts only; no message, user, route, endpoint, IP, payload, memory, DNS, destination, or social graph metadata",
     };
@@ -4529,9 +4647,16 @@ mod tests {
             accepted: 1,
             minimum_verified: 1,
             quorum_satisfied: true,
+            quorum_valid_through: Some(1_100),
             ..CustodyAuditWitnessReceiptPolicyEvidence::default()
         };
         assert_eq!(custody_audit_witness_policy_status(&ready), "ready");
+        assert_eq!(
+            custody_audit_witness_renewal_fields(&ready, 1_000, 400),
+            (Some(1_100), Some(100), 100, true)
+        );
+        assert_eq!(optional_u64_label(None, "s"), "unavailable");
+        assert_eq!(optional_u64_label(Some(0), "s"), "0s");
 
         let threshold = CustodyAuditWitnessReceiptPolicyEvidence {
             configured: 2,

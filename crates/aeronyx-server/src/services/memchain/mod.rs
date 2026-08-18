@@ -173,12 +173,15 @@ pub(crate) use storage::{
     RecordCommitmentCertificateSyncDisposition,
 };
 pub use storage_crypto::{decrypt_rawlog_content_pub, derive_rawlog_key, derive_record_key};
+// [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Runtime and CLI reporting share
+// one aggregate-only renewal window calculation from the storage contract.
 pub use storage_ops::{
-    CustodyAuditAnchorWitnessOutcome, CustodyAuditWitnessPolicyReadiness,
-    CustodyAuditWitnessReadinessError, CustodyAuditWitnessReceiptPersistOutcome,
-    CustodyAuditWitnessReceiptPolicyEvidence, CustodyAuditWitnessReceiptReadinessSnapshot,
-    CustodyAuditWitnessReceiptVaultAudit, OverviewData, OverviewRecord,
-    RecordCommitmentAppendOutcome, RecordCommitmentBatchAppendOutcome, RecordCommitmentChainAudit,
+    custody_witness_renewal_warning_window_secs, CustodyAuditAnchorWitnessOutcome,
+    CustodyAuditWitnessPolicyReadiness, CustodyAuditWitnessReadinessError,
+    CustodyAuditWitnessReceiptPersistOutcome, CustodyAuditWitnessReceiptPolicyEvidence,
+    CustodyAuditWitnessReceiptReadinessSnapshot, CustodyAuditWitnessReceiptVaultAudit,
+    OverviewData, OverviewRecord, RecordCommitmentAppendOutcome,
+    RecordCommitmentBatchAppendOutcome, RecordCommitmentChainAudit,
     RecordCommitmentChainIntegrityStatus, RecordCommitmentChainStatus,
     RecordCommitmentCheckpointEvidenceAudit, VerifiedRecordCommitmentBlockPage,
 };

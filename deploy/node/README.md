@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Document exact aggregate
+  threshold lifetime and local-only pre-expiry renewal warnings.
 - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Document the opt-in,
   network-silent runtime re-audit and supervised fail-closed recovery policy.
 - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Document the bounded
@@ -147,6 +149,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.59.0-node-deploy - Documented custody quorum expiry preflight telemetry.
 v1.58.0-node-deploy - Documented strict runtime custody witness re-auditing.
 v1.57.0-node-deploy - Documented one-shot durable witness collection.
 v1.56.0-node-deploy - Documented current-checkpoint witness vault re-audit.
@@ -1072,6 +1075,16 @@ collect and durably import fresh exact-anchor receipts, run
 `audit-witness-vault --require-ready`, and then start the service. Repeated
 service-manager restarts cannot manufacture readiness and must not replace that
 operator workflow.
+
+<!-- [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] -->
+Every successful atomic audit also derives `quorum_valid_through` from the
+threshold-th newest accepted receipt, rather than from the newest vault row or
+the oldest surplus receipt. Operator JSON reports expose that inclusive Unix
+timestamp, `quorum_valid_for_seconds`, a bounded 60-to-900-second renewal
+window, and `renewal_recommended`. The runtime emits the fixed local warning
+reason `receipt_renewal_required` inside that window. This is advance notice
+only: it sends no anchor, contacts no witness, changes no trust pin, and does
+not postpone the existing fail-closed boundary.
 
 Re-audit the current checkpoint after restart or before a maintenance window:
 

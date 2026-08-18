@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.05.0 - Added an optional local-only runtime custody
-witness guard that stops the process when strict exact-anchor readiness is lost.
+Modification Reason: v1.06.0 - Added an exact aggregate custody quorum expiry
+horizon and local-only renewal warning before strict readiness is lost.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.05.0 - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Reuses exact startup readiness during runtime and triggers controlled process recovery when local durable evidence expires, changes, or fails audit, without contacting witnesses.
+Last Modified: v1.06.0 - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Derives the threshold set's exact aggregate lifetime and warns locally before expiry without contacting witnesses or changing authority.
+Previous: v1.05.0 - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Reuses exact startup readiness during runtime and triggers controlled process recovery when local durable evidence expires, changes, or fails audit, without contacting witnesses.
 Previous: v1.04.0 - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Copies a bounded immutable receipt snapshot under SQLite and performs read-only cryptographic verification after releasing the connection lock.
 Previous: v1.03.0 - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Makes startup and operator tools consume one cryptographically audited SQLite snapshot and one typed readiness decision.
 Previous: v1.02.0 - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Optionally blocks startup unless the exact current custody anchor has enough fresh durable signed receipts and no adverse evidence, without contacting witnesses.
@@ -138,6 +139,38 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.06 Custody quorum expiry is exact and locally actionable
+
+[CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex]
+
+- Atomic readiness sorts only accepted, non-ambiguous current-anchor receipts
+  by signed observation time. The threshold-th newest receipt defines the
+  inclusive `quorum_valid_through` boundary. Older surplus receipts cannot
+  produce a false early warning, and one unusually fresh receipt cannot hide
+  that the remaining threshold is about to expire.
+- Startup and runtime logs expose only the aggregate validity timestamp and
+  remaining seconds. Operator import, collection, and vault-audit JSON add the
+  same fields plus `renewal_recommended` under a shared bounded warning window.
+- The warning window is one quarter of configured receipt age, clamped between
+  60 and 900 seconds. It emits fixed reason `receipt_renewal_required`; it does
+  not contact a witness, export an anchor, alter a pin, mutate evidence, extend
+  validity, or defer the existing fail-closed runtime decision.
+- This is host-local operational readiness, not consensus, finality, voting,
+  reputation, liveness proof, or proof of user content.
+
+### v1.05 Strict custody readiness persists for the process lifetime
+
+[CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex]
+
+- An independently default-off runtime gate reuses the exact startup audit and
+  typed readiness contract against the current immutable custody anchor.
+- The task is owned by the required runtime supervisor, skips missed timer
+  ticks, and requests controlled process shutdown when evidence expires,
+  changes, becomes adverse, or fails vault/policy audit.
+- It is local-only and never performs automatic witness collection. Existing
+  deployments remain unchanged unless both strict startup and runtime policy
+  are explicitly enabled.
 
 ### v1.04 Custody vault reads use a bounded two-phase audit
 
