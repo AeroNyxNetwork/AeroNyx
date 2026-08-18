@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Document the opt-in,
+  network-silent runtime re-audit and supervised fail-closed recovery policy.
 - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Document the bounded
   row-copy and lock-free cryptographic verification boundary for read audits.
 - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Document that startup
@@ -145,6 +147,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.58.0-node-deploy - Documented strict runtime custody witness re-auditing.
 v1.57.0-node-deploy - Documented one-shot durable witness collection.
 v1.56.0-node-deploy - Documented current-checkpoint witness vault re-audit.
 v1.55.0-node-deploy - Documented host-local custody witness receipt import.
@@ -1038,6 +1041,37 @@ canonicalizes, hashes, and verifies every signed frame. Receipt insertion still
 performs its before/after vault audits inside the `Immediate` write transaction;
 that stronger lock is required so a malformed pre-state or post-state can never
 be committed.
+
+After the startup-only policy has been validated in production, operators may
+also require the same exact-anchor evidence throughout the process lifetime:
+
+```toml
+[discovery]
+custody_audit_witness_startup_required = true
+custody_audit_witness_runtime_required = true
+```
+
+<!-- [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] -->
+The runtime flag is independently default-off and is invalid unless the strict
+startup gate is also enabled. The node reuses the same atomic local-vault audit
+and typed readiness decision every 30 to 300 seconds; the cadence is one quarter
+of `custody_audit_witness_max_age_secs`, clamped to those bounds. Missed timer
+ticks are skipped rather than replayed in a burst.
+
+The runtime guard never discovers authority, contacts a witness, exports an
+anchor, or automatically collects evidence. If the immutable custody checkpoint
+advances, signed evidence expires, the configured threshold is no longer met,
+adverse evidence applies, or vault/policy integrity fails, the guard sends one
+privacy-safe reason bucket to the existing required-task supervisor. The main
+runtime then performs its normal bounded graceful shutdown and exits non-zero so
+the service manager can recover only after current evidence is present.
+
+Enable this flag only when the witness collection/import workflow is part of the
+node's maintenance procedure. Before a planned checkpoint rotation or restart,
+collect and durably import fresh exact-anchor receipts, run
+`audit-witness-vault --require-ready`, and then start the service. Repeated
+service-manager restarts cannot manufacture readiness and must not replace that
+operator workflow.
 
 Re-audit the current checkpoint after restart or before a maintenance window:
 

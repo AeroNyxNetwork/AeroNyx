@@ -379,6 +379,10 @@
 // 142. [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Consumes one
 //      typed SQLite snapshot for both vault audit telemetry and startup policy,
 //      preventing CLI/runtime interpretation or snapshot drift.
+// 143. [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Optionally
+//      re-audits exact-anchor custody evidence from the local durable vault
+//      while running and asks the required-task supervisor to stop the process
+//      when strict readiness is lost, without collecting over the network.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -439,6 +443,9 @@
 //     reject future-dated evidence beyond the fixed clock-skew allowance.
 //   - Custody readiness counters are not an open-coded API. Startup and tools
 //     must use the typed atomic snapshot and reject inconsistent aggregates.
+//   - Runtime custody strictness is separately default-off and requires the
+//     startup gate. Its audit is local-only; never add implicit witness
+//     collection, discovery authority, or identity-bearing failure output.
 //   - Certificate exchange is post-startup evidence transport only. Never use
 //     an imported historical bundle to satisfy the live startup witness gate.
 //   - Follower certificate synchronization runs only after signed convergence.
@@ -556,6 +563,8 @@
 //     installation but the checkpoint table is absent, startup must fail.
 //
 // Last Modified:
+//   [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Added a default-off,
+//     local-only runtime re-audit with supervised fail-closed process recovery.
 //   [CUSTODY-WITNESS-PLANNER 2026-08-16 by Codex] Added a local aggregate-only
 //     startup eligibility plan without enabling witness network transmission.
 //   [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Installed independent
@@ -937,7 +946,8 @@ use crate::services::memchain::NerEngine;
 use crate::services::memchain::RerankerEngine;
 use crate::services::memchain::{
     ensure_volumes_config, CustodyAuditWitnessPolicyReadiness, CustodyAuditWitnessReadinessError,
-    StoragePool, SystemDb, VectorIndexPool, VolumeRouter,
+    CustodyAuditWitnessReceiptReadinessSnapshot, StoragePool, SystemDb, VectorIndexPool,
+    VolumeRouter,
 };
 #[allow(deprecated)]
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
@@ -2437,13 +2447,14 @@ fn commitment_witness_startup_decision(
     Ok(CommitmentWitnessStartupDecision::Verified)
 }
 
-/// Stable fail-closed buckets for the local custody-receipt startup gate.
+/// Stable fail-closed buckets for strict local custody-receipt readiness.
 ///
-/// [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] These values are safe
+/// [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Startup and runtime use
+/// this same typed decision. These values are safe
 /// for process-health output: they contain no identity, path, anchor, digest,
 /// signature, endpoint, message, user, route, or payload information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CustodyWitnessStartupBlockReason {
+enum CustodyWitnessReadinessBlockReason {
     CurrentAnchorUnavailable,
     ReceiptVaultInvalid,
     ReceiptPolicyInvalid,
@@ -2452,7 +2463,7 @@ enum CustodyWitnessStartupBlockReason {
     ThresholdUnmet,
 }
 
-impl CustodyWitnessStartupBlockReason {
+impl CustodyWitnessReadinessBlockReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::CurrentAnchorUnavailable => "current_anchor_unavailable",
@@ -2465,27 +2476,96 @@ impl CustodyWitnessStartupBlockReason {
     }
 }
 
-impl std::fmt::Display for CustodyWitnessStartupBlockReason {
+impl std::fmt::Display for CustodyWitnessReadinessBlockReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
 
-const fn custody_witness_startup_decision(
+const fn custody_witness_readiness_decision(
     readiness: CustodyAuditWitnessPolicyReadiness,
-) -> std::result::Result<(), CustodyWitnessStartupBlockReason> {
+) -> std::result::Result<(), CustodyWitnessReadinessBlockReason> {
     match readiness {
         CustodyAuditWitnessPolicyReadiness::Ready => Ok(()),
         CustodyAuditWitnessPolicyReadiness::EvidenceUnavailable => {
-            Err(CustodyWitnessStartupBlockReason::EvidenceUnavailable)
+            Err(CustodyWitnessReadinessBlockReason::EvidenceUnavailable)
         }
         CustodyAuditWitnessPolicyReadiness::ThresholdUnmet => {
-            Err(CustodyWitnessStartupBlockReason::ThresholdUnmet)
+            Err(CustodyWitnessReadinessBlockReason::ThresholdUnmet)
         }
         CustodyAuditWitnessPolicyReadiness::AdverseEvidence => {
-            Err(CustodyWitnessStartupBlockReason::AdverseEvidence)
+            Err(CustodyWitnessReadinessBlockReason::AdverseEvidence)
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CustodyWitnessAuditEvidence {
+    checkpoint_generation: u64,
+    snapshot: CustodyAuditWitnessReceiptReadinessSnapshot,
+}
+
+const CUSTODY_WITNESS_RUNTIME_AUDIT_MIN_INTERVAL_SECS: u64 = 30;
+const CUSTODY_WITNESS_RUNTIME_AUDIT_MAX_INTERVAL_SECS: u64 = 300;
+
+/// Derives a bounded cadence from the operator's receipt freshness policy.
+///
+/// [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] A quarter-window keeps
+/// normal audits well ahead of expiry while fixed bounds prevent a hot loop or
+/// an excessively slow security reaction. Config validation guarantees that
+/// `max_age_secs` is at least 60 seconds.
+const fn custody_witness_runtime_audit_interval_secs(max_age_secs: u64) -> u64 {
+    let quarter_window = max_age_secs / 4;
+    if quarter_window < CUSTODY_WITNESS_RUNTIME_AUDIT_MIN_INTERVAL_SECS {
+        CUSTODY_WITNESS_RUNTIME_AUDIT_MIN_INTERVAL_SECS
+    } else if quarter_window > CUSTODY_WITNESS_RUNTIME_AUDIT_MAX_INTERVAL_SECS {
+        CUSTODY_WITNESS_RUNTIME_AUDIT_MAX_INTERVAL_SECS
+    } else {
+        quarter_window
+    }
+}
+
+async fn audit_chat_relay_custody_witness_state(
+    config: &ServerConfig,
+    identity: &IdentityKeyPair,
+    storage: &MemoryStorage,
+) -> std::result::Result<CustodyWitnessAuditEvidence, CustodyWitnessReadinessBlockReason> {
+    // [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] The maintenance
+    // guard binds the receipt policy to one immutable current custody anchor.
+    // This helper performs no network I/O and exposes no anchor material.
+    let anchor_guard = ChatRelayService::hold_backup_maintenance_audit_anchor_for_config(
+        &config.memchain.chat_relay,
+        identity,
+    )
+    .map_err(|_| CustodyWitnessReadinessBlockReason::CurrentAnchorUnavailable)?;
+    let checkpoint_generation = anchor_guard.anchor().checkpoint_generation;
+    let anchor_sha256 = custody_audit_anchor_frame_sha256(anchor_guard.anchor())
+        .map_err(|_| CustodyWitnessReadinessBlockReason::CurrentAnchorUnavailable)?;
+    let witness_node_ids = config.discovery.custody_audit_witness_node_id_bytes();
+    let snapshot = storage
+        .audit_custody_audit_witness_receipt_readiness(
+            &identity.public_key_bytes(),
+            checkpoint_generation,
+            &anchor_sha256,
+            &witness_node_ids,
+            config.discovery.custody_audit_witness_min_verified,
+            unix_now_secs(),
+            config.discovery.custody_audit_witness_max_age_secs,
+        )
+        .await
+        .map_err(|error| match error {
+            CustodyAuditWitnessReadinessError::VaultInvalid => {
+                CustodyWitnessReadinessBlockReason::ReceiptVaultInvalid
+            }
+            CustodyAuditWitnessReadinessError::PolicyInvalid => {
+                CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid
+            }
+        })?;
+    custody_witness_readiness_decision(snapshot.readiness)?;
+    Ok(CustodyWitnessAuditEvidence {
+        checkpoint_generation,
+        snapshot,
+    })
 }
 
 const COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS: u64 = 15;
@@ -2973,6 +3053,18 @@ struct CriticalRuntimeFailure {
     reason: String,
 }
 
+fn custody_witness_runtime_failure(
+    reason: CustodyWitnessReadinessBlockReason,
+) -> CriticalRuntimeFailure {
+    // [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Keep supervisor
+    // output constrained to stable local policy buckets. Do not pass through
+    // storage, cryptographic, path, witness, or anchor error values here.
+    CriticalRuntimeFailure {
+        task: "custody-witness-runtime",
+        reason: reason.as_str().to_string(),
+    }
+}
+
 fn required_runtime_supervisor_channel_closed() -> CriticalRuntimeFailure {
     CriticalRuntimeFailure {
         task: "required_runtime_task_group",
@@ -3327,6 +3419,26 @@ impl Server {
             })?;
             self.verify_chat_relay_custody_witness_startup(custody_storage)
                 .await?;
+        }
+        if self.config.discovery.custody_audit_witness_runtime_required {
+            let custody_storage = storage.as_ref().cloned().ok_or_else(|| {
+                ServerError::startup_failed(
+                    "Chat Relay custody witness runtime guard: local_storage_unavailable",
+                )
+            })?;
+            let custody_runtime_task = self.spawn_chat_relay_custody_witness_runtime_guard(
+                custody_storage,
+                critical_failure_tx.clone(),
+            );
+            tasks.push((
+                "custody-witness-runtime",
+                Self::supervise_required_runtime_task(
+                    "custody-witness-runtime",
+                    custody_runtime_task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
         }
 
         // [BLIND-VAULT-SERVICE 2026-07-23 by Codex] This store is independent
@@ -4489,7 +4601,7 @@ impl Server {
         &self,
         storage: &MemoryStorage,
     ) -> Result<()> {
-        let fail = |reason: CustodyWitnessStartupBlockReason| {
+        let fail = |reason: CustodyWitnessReadinessBlockReason| {
             warn!(
                 reason = reason.as_str(),
                 "[CHAT_RELAY] Custody witness startup guard rejected local state"
@@ -4498,39 +4610,13 @@ impl Server {
                 "Chat Relay custody witness startup guard: {reason}"
             ))
         };
-        let anchor_guard = ChatRelayService::hold_backup_maintenance_audit_anchor_for_config(
-            &self.config.memchain.chat_relay,
-            &self.identity,
-        )
-        .map_err(|_| fail(CustodyWitnessStartupBlockReason::CurrentAnchorUnavailable))?;
-        let anchor_sha256 = custody_audit_anchor_frame_sha256(anchor_guard.anchor())
-            .map_err(|_| fail(CustodyWitnessStartupBlockReason::CurrentAnchorUnavailable))?;
-        let witness_node_ids = self.config.discovery.custody_audit_witness_node_id_bytes();
-        let evaluated_at = unix_now_secs();
-        let snapshot = storage
-            .audit_custody_audit_witness_receipt_readiness(
-                &self.identity.public_key_bytes(),
-                anchor_guard.anchor().checkpoint_generation,
-                &anchor_sha256,
-                &witness_node_ids,
-                self.config.discovery.custody_audit_witness_min_verified,
-                evaluated_at,
-                self.config.discovery.custody_audit_witness_max_age_secs,
-            )
+        let audit = audit_chat_relay_custody_witness_state(&self.config, &self.identity, storage)
             .await
-            .map_err(|error| match error {
-                CustodyAuditWitnessReadinessError::VaultInvalid => {
-                    fail(CustodyWitnessStartupBlockReason::ReceiptVaultInvalid)
-                }
-                CustodyAuditWitnessReadinessError::PolicyInvalid => {
-                    fail(CustodyWitnessStartupBlockReason::ReceiptPolicyInvalid)
-                }
-            })?;
-        custody_witness_startup_decision(snapshot.readiness).map_err(fail)?;
-        let vault = snapshot.vault;
-        let evidence = snapshot.policy;
+            .map_err(fail)?;
+        let vault = audit.snapshot.vault;
+        let evidence = audit.snapshot.policy;
         info!(
-            checkpoint_generation = anchor_guard.anchor().checkpoint_generation,
+            checkpoint_generation = audit.checkpoint_generation,
             vault_records = vault.records,
             vault_accepted_records = vault.accepted_records,
             vault_adverse_records = vault.adverse_records,
@@ -4542,6 +4628,86 @@ impl Server {
             "[CHAT_RELAY] Custody witness startup guard passed"
         );
         Ok(())
+    }
+
+    /// Revalidates strict custody evidence throughout the process lifetime.
+    ///
+    /// [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] The task starts
+    /// only after the identical startup audit passed. It consumes durable
+    /// local evidence only, skips missed ticks, and reports one fixed failure
+    /// bucket to the existing required-task supervisor before waiting for the
+    /// shared shutdown signal.
+    fn spawn_chat_relay_custody_witness_runtime_guard(
+        &self,
+        storage: Arc<MemoryStorage>,
+        critical_failure_tx: mpsc::Sender<CriticalRuntimeFailure>,
+    ) -> JoinHandle<()> {
+        let config = self.config.clone();
+        let identity = self.identity.clone();
+        let interval_secs = custody_witness_runtime_audit_interval_secs(
+            config.discovery.custody_audit_witness_max_age_secs,
+        );
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let period = Duration::from_secs(interval_secs);
+            let start = tokio::time::Instant::now() + period;
+            let mut timer = tokio::time::interval_at(start, period);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            info!(
+                interval_secs,
+                freshness_window_secs = config.discovery.custody_audit_witness_max_age_secs,
+                "[CHAT_RELAY] Runtime custody witness guard started"
+            );
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => return,
+                    _ = timer.tick() => {
+                        match audit_chat_relay_custody_witness_state(
+                            &config,
+                            &identity,
+                            &storage,
+                        )
+                        .await
+                        {
+                            Ok(audit) => {
+                                let vault = audit.snapshot.vault;
+                                let evidence = audit.snapshot.policy;
+                                debug!(
+                                    checkpoint_generation = audit.checkpoint_generation,
+                                    vault_records = vault.records,
+                                    fresh_verified = evidence.fresh_verified,
+                                    accepted = evidence.accepted,
+                                    minimum_verified = evidence.minimum_verified,
+                                    "[CHAT_RELAY] Runtime custody witness guard passed"
+                                );
+                            }
+                            Err(reason) => {
+                                let failure = custody_witness_runtime_failure(reason);
+                                error!(
+                                    reason = reason.as_str(),
+                                    "[CHAT_RELAY] Runtime custody witness guard rejected local state"
+                                );
+                                if critical_failure_tx.send(failure).await.is_err() {
+                                    error!(
+                                        task = "custody-witness-runtime",
+                                        "[RUNTIME] Main task dropped the critical failure receiver"
+                                    );
+                                    return;
+                                }
+
+                                // Keep the required task alive until the main
+                                // runtime broadcasts the controlled stop. This
+                                // prevents its wrapper from racing the specific
+                                // policy failure with a generic exit failure.
+                                let _ = shutdown_rx.recv().await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 
     async fn init_memchain(
@@ -14302,22 +14468,24 @@ mod tests {
         await_commitment_tip_announcement_or_newer,
         commitment_coordinator_lease_degraded_retry_delay,
         commitment_coordinator_lease_production_valid_for, commitment_follower_success_retry_delay,
-        commitment_witness_startup_decision, custody_witness_startup_decision,
+        commitment_witness_startup_decision, custody_witness_readiness_decision,
+        custody_witness_runtime_audit_interval_secs, custody_witness_runtime_failure,
         data_plane_receive_failure_action, memchain_index_rejection_reason,
         peer_store_heartbeat_status_value, prefix_to_netmask,
         required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
         take_pre_ready_runtime_failure, unix_now_secs, CommitmentCoordinatorLeaseRound,
         CommitmentFollowerRoundOutcome, CommitmentSyncTaskLivenessGuard,
         CommitmentTipAnnouncementWaitOutcome, CommitmentWitnessStartupBlockReason,
-        CommitmentWitnessStartupDecision, CriticalRuntimeFailure, CustodyWitnessStartupBlockReason,
-        DataPlaneReceiveFailureAction, DirectPeerRelayAckFailure, DirectoryChainStore,
-        DirectoryProofGossipOutcome, DirectoryProofGossipPeerState, DirectoryProofGossipResult,
-        DiscoveryGossipExecution, DiscoveryGossipFailure, DiscoveryGossipFailureKind,
-        DiscoveryGossipPhase, DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport,
-        DiscoveryPeerIdentityHints, PeerHttpClients, PeerStoreCacheDocument,
-        PeerStoreCachePersistOutcome, PeerStoreVerifiedClientDeliveryAnchor,
-        PeerStoreVerifiedClientDeliveryCacheEvidence, RequiredApiListenerExit, RuntimeTaskRegistry,
-        RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server, SystemdNotifier,
+        CommitmentWitnessStartupDecision, CriticalRuntimeFailure,
+        CustodyWitnessReadinessBlockReason, DataPlaneReceiveFailureAction,
+        DirectPeerRelayAckFailure, DirectoryChainStore, DirectoryProofGossipOutcome,
+        DirectoryProofGossipPeerState, DirectoryProofGossipResult, DiscoveryGossipExecution,
+        DiscoveryGossipFailure, DiscoveryGossipFailureKind, DiscoveryGossipPhase,
+        DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints,
+        PeerHttpClients, PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
+        PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
+        RequiredApiListenerExit, RuntimeTaskRegistry, RuntimeTaskShutdownOutcome,
+        RuntimeTaskShutdownReport, Server, SystemdNotifier,
         TargetBoundPeerRelayFailure, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DATA_PLANE_RECV_FAILURE_LIMIT,
@@ -15922,32 +16090,51 @@ mod tests {
     }
 
     #[test]
-    fn custody_witness_startup_gate_requires_clean_current_anchor_quorum() {
-        // [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Authentic
-        // adverse evidence always wins over count, while absence and partial
-        // coverage remain distinct privacy-safe operator diagnostics.
+    fn custody_witness_guards_require_clean_current_anchor_quorum() {
+        // [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Startup and
+        // runtime share these fixed privacy-safe outcomes. Authentic adverse
+        // evidence always wins over count, while absence and partial coverage
+        // remain distinct operator diagnostics.
         assert_eq!(
-            CustodyWitnessStartupBlockReason::ReceiptVaultInvalid.as_str(),
+            CustodyWitnessReadinessBlockReason::ReceiptVaultInvalid.as_str(),
             "receipt_vault_invalid"
         );
         assert_eq!(
-            custody_witness_startup_decision(
+            custody_witness_readiness_decision(
                 CustodyAuditWitnessPolicyReadiness::EvidenceUnavailable
             ),
-            Err(CustodyWitnessStartupBlockReason::EvidenceUnavailable)
+            Err(CustodyWitnessReadinessBlockReason::EvidenceUnavailable)
         );
         assert_eq!(
-            custody_witness_startup_decision(CustodyAuditWitnessPolicyReadiness::ThresholdUnmet),
-            Err(CustodyWitnessStartupBlockReason::ThresholdUnmet)
+            custody_witness_readiness_decision(CustodyAuditWitnessPolicyReadiness::ThresholdUnmet),
+            Err(CustodyWitnessReadinessBlockReason::ThresholdUnmet)
         );
         assert_eq!(
-            custody_witness_startup_decision(CustodyAuditWitnessPolicyReadiness::AdverseEvidence),
-            Err(CustodyWitnessStartupBlockReason::AdverseEvidence)
+            custody_witness_readiness_decision(CustodyAuditWitnessPolicyReadiness::AdverseEvidence),
+            Err(CustodyWitnessReadinessBlockReason::AdverseEvidence)
         );
         assert_eq!(
-            custody_witness_startup_decision(CustodyAuditWitnessPolicyReadiness::Ready),
+            custody_witness_readiness_decision(CustodyAuditWitnessPolicyReadiness::Ready),
             Ok(())
         );
+    }
+
+    #[test]
+    fn custody_witness_runtime_audit_cadence_is_bounded() {
+        // [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Small
+        // freshness windows cannot create a hot loop and large windows cannot
+        // defer detection beyond five minutes.
+        assert_eq!(custody_witness_runtime_audit_interval_secs(60), 30);
+        assert_eq!(custody_witness_runtime_audit_interval_secs(120), 30);
+        assert_eq!(custody_witness_runtime_audit_interval_secs(600), 150);
+        assert_eq!(custody_witness_runtime_audit_interval_secs(1_200), 300);
+        assert_eq!(custody_witness_runtime_audit_interval_secs(7_200), 300);
+
+        let failure = custody_witness_runtime_failure(
+            CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid,
+        );
+        assert_eq!(failure.task, "custody-witness-runtime");
+        assert_eq!(failure.reason, "receipt_policy_invalid");
     }
 
     #[test]

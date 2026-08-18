@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Document the separate
+#   default-off local runtime re-audit and controlled shutdown policy.
 # - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Document the default-off
 #   local receipt threshold that can block startup without network I/O.
 # - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Document the
@@ -69,6 +71,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.16.0-node-deploy - Documented strict runtime custody witness re-auditing.
 # v1.15.0-node-deploy - Documented explicit durable witness collection.
 # v1.14.0-node-deploy - Documented local current-checkpoint receipt auditing.
 # v1.13.0-node-deploy - Documented bounded host-local witness receipt import.
@@ -230,6 +233,11 @@ custody_audit_witness_min_verified = 1
 # performs no network I/O; missing, expired, conflicting, stale, gap, malformed,
 # or rollback-mismatched evidence stops startup before listeners and gossip.
 custody_audit_witness_startup_required = false
+# Default false preserves startup-only deployments. When true, the running node
+# periodically re-audits the current anchor using only its local durable vault.
+# It requires startup_required=true, never collects over the network, and asks
+# the existing runtime supervisor to stop the process when readiness is lost.
+custody_audit_witness_runtime_required = false
 # Current-anchor receipt freshness window. Valid range 60..=604800 seconds.
 # Positive witness clock skew is always capped separately at 60 seconds.
 custody_audit_witness_max_age_secs = 7200

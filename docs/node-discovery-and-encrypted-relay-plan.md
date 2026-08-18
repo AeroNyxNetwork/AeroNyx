@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.04.0 - Moved read-only custody receipt cryptographic
-verification outside the SQLite connection lock without weakening snapshots.
+Modification Reason: v1.05.0 - Added an optional local-only runtime custody
+witness guard that stops the process when strict exact-anchor readiness is lost.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.04.0 - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Copies a bounded immutable receipt snapshot under SQLite and performs read-only cryptographic verification after releasing the connection lock.
+Last Modified: v1.05.0 - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Reuses exact startup readiness during runtime and triggers controlled process recovery when local durable evidence expires, changes, or fails audit, without contacting witnesses.
+Previous: v1.04.0 - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Copies a bounded immutable receipt snapshot under SQLite and performs read-only cryptographic verification after releasing the connection lock.
 Previous: v1.03.0 - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Makes startup and operator tools consume one cryptographically audited SQLite snapshot and one typed readiness decision.
 Previous: v1.02.0 - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Optionally blocks startup unless the exact current custody anchor has enough fresh durable signed receipts and no adverse evidence, without contacting witnesses.
 Previous: v1.01.0 - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Runs one explicit signed-snapshot-pinned witness round, persists every verified receipt before counting it, and re-audits current-checkpoint readiness without enabling a scheduler.
