@@ -55,6 +55,9 @@
 //!   producer workflow with a bounded host-local signed-receipt import.
 //! - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Re-audit current-anchor
 //!   witness policy locally after restart without scheduling network traffic.
+//! - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Collect and
+//!   durably re-audit current-anchor witness receipts through one explicit,
+//!   snapshot-pinned operator command without enabling a background scheduler.
 //!
 //! ## Last Modified
 //! v0.1.0 - Initial CLI implementation
@@ -89,6 +92,8 @@
 //! producer's fully re-audited bounded evidence vault
 //! v1.20.0-CustodyWitnessVaultAudit - Audit current-anchor receipt readiness
 //! locally with an optional fail-closed operator health gate
+//! v1.21.0-CustodyWitnessOperatorCollect - Explicitly collect current-anchor
+//! witness receipts from signed snapshot-pinned peers and re-audit durability
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read};
@@ -111,10 +116,15 @@ use aeronyx_core::protocol::chat::{
     CUSTODY_AUDIT_WITNESS_STALE_V1, MAX_CUSTODY_AUDIT_ANCHOR_FRAME_BYTES,
     MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES,
 };
-use aeronyx_core::protocol::discovery::MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES;
+use aeronyx_core::protocol::discovery::{
+    NodeBootstrapSnapshot, MAX_DIRECTORY_OBSERVATION_CERTIFICATE_FRAME_BYTES,
+};
 use aeronyx_server::api::auth::ensure_api_secret;
 use aeronyx_server::api::directory_replica_sync::{
     build_directory_certificate_exchange_http_client, fetch_authenticated_observation_certificate,
+};
+use aeronyx_server::api::memchain_peer::{
+    witness_custody_audit_anchor_round_durable, CustodyAuditWitnessRound,
 };
 use aeronyx_server::management::models::{NodeRegistrationProfile, StoredNodeInfo};
 use aeronyx_server::services::chat_relay::ChatRelayCustodyAuditAnchorGuard;
@@ -129,7 +139,7 @@ use aeronyx_server::services::memchain::{
 use aeronyx_server::services::{
     derive_node_secret, AofWriter, ChatRelayBackupPruneRequest, ChatRelayRestorePlanReceipt,
     ChatRelayRestoreReadinessReceipt, ChatRelayService, DirectoryReplicaResolutionCommand,
-    DirectoryReplicaStore, DirectoryReplicaTip, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
+    DirectoryReplicaStore, DirectoryReplicaTip, PeerStore, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
     CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS,
 };
 use aeronyx_server::{ManagementClient, Server, ServerConfig};
@@ -462,6 +472,37 @@ enum RelayCustodyCommands {
         /// Return failure unless the configured current-checkpoint policy is ready
         #[arg(long)]
         require_ready: bool,
+
+        /// Emit the stable aggregate JSON contract
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Explicitly collect and persist current-checkpoint witness receipts
+    CollectAuditWitnesses {
+        /// Path to this producer node's local configuration file
+        #[arg(short, long, default_value = "/etc/aeronyx/server.toml")]
+        config: PathBuf,
+
+        /// Signed discovery snapshot containing the configured witness descriptors
+        #[arg(long)]
+        discovery_snapshot: PathBuf,
+
+        /// Complete per-witness request timeout
+        #[arg(
+            long,
+            default_value_t = 15,
+            value_parser = clap::value_parser!(u64).range(1..=60)
+        )]
+        timeout_seconds: u64,
+
+        /// Maximum accepted age of signed witness observations
+        #[arg(
+            long,
+            default_value_t = 7200,
+            value_parser = clap::value_parser!(u64).range(60..=604800)
+        )]
+        max_age_seconds: u64,
 
         /// Emit the stable aggregate JSON contract
         #[arg(long)]
@@ -1384,6 +1425,22 @@ async fn cmd_relay_custody(command: RelayCustodyCommands) -> anyhow::Result<()> 
         } => {
             cmd_relay_audit_witness_vault(&config, max_age_seconds, require_ready, json).await?;
         }
+        RelayCustodyCommands::CollectAuditWitnesses {
+            config,
+            discovery_snapshot,
+            timeout_seconds,
+            max_age_seconds,
+            json,
+        } => {
+            cmd_relay_collect_audit_witnesses(
+                &config,
+                &discovery_snapshot,
+                timeout_seconds,
+                max_age_seconds,
+                json,
+            )
+            .await?;
+        }
         RelayCustodyCommands::RestoreReadiness { config, json } => {
             let server_config = load_relay_custody_config(&config).await?;
             let receipt = ChatRelayService::audit_latest_restore_readiness_for_config(
@@ -1684,6 +1741,55 @@ struct RelayCustodyAuditWitnessVaultReport {
     required_ready: bool,
     security_model: &'static str,
     privacy_boundary: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RelayCustodyAuditWitnessCollectionReport {
+    contract_version: &'static str,
+    status: &'static str,
+    evaluated_at: u64,
+    checkpoint_generation: u64,
+    timeout_seconds: u64,
+    max_age_seconds: u64,
+    snapshot_records: usize,
+    snapshot_pinned_records: usize,
+    snapshot_verified_records: usize,
+    snapshot_rejected_records: usize,
+    round_configured: usize,
+    round_verified: usize,
+    round_accepted: usize,
+    round_advanced: usize,
+    round_idempotent: usize,
+    round_stale: usize,
+    round_conflicts: usize,
+    round_gaps: usize,
+    round_failed: usize,
+    round_adverse: bool,
+    vault_records: usize,
+    vault_accepted_records: usize,
+    vault_adverse_records: usize,
+    configured_witnesses: usize,
+    fresh_verified: usize,
+    accepted: usize,
+    adverse: usize,
+    missing: usize,
+    minimum_verified: usize,
+    policy_ready: bool,
+    security_model: &'static str,
+    privacy_boundary: &'static str,
+}
+
+/// Operator-supplied, signature-verified witness descriptor view.
+///
+/// [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Only configured
+/// witness identities enter this ephemeral store. Unrelated snapshot peers
+/// cannot consume capacity, influence endpoint selection, or appear in output.
+struct RelayCustodyWitnessSnapshot {
+    peer_store: PeerStore,
+    records: usize,
+    pinned_records: usize,
+    verified_records: usize,
+    rejected_records: usize,
 }
 
 /// Current producer custody context protected from concurrent checkpoint change.
@@ -2072,6 +2178,240 @@ fn print_relay_custody_audit_witness_vault(
     println!();
     println!("Security model: {}", report.security_model);
     println!("Privacy: {}", report.privacy_boundary);
+    Ok(())
+}
+
+fn print_relay_custody_audit_witness_collection(
+    report: &RelayCustodyAuditWitnessCollectionReport,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(report)?);
+        return Ok(());
+    }
+    println!("Relay custody witness collection");
+    println!("════════════════════════════════════════");
+    println!("Status:               {}", report.status);
+    println!("Evaluated at:         {}", report.evaluated_at);
+    println!("Checkpoint generation: {}", report.checkpoint_generation);
+    println!("Request timeout:      {}s", report.timeout_seconds);
+    println!("Freshness window:     {}s", report.max_age_seconds);
+    println!(
+        "Snapshot total/pinned: {} / {}",
+        report.snapshot_records, report.snapshot_pinned_records
+    );
+    println!(
+        "Snapshot verified/rejected: {} / {}",
+        report.snapshot_verified_records, report.snapshot_rejected_records
+    );
+    println!(
+        "Round verified/accepted: {} / {}",
+        report.round_verified, report.round_accepted
+    );
+    println!(
+        "Round advanced/idempotent: {} / {}",
+        report.round_advanced, report.round_idempotent
+    );
+    println!(
+        "Round stale/conflict/gap: {} / {} / {}",
+        report.round_stale, report.round_conflicts, report.round_gaps
+    );
+    println!("Round transport failures: {}", report.round_failed);
+    println!("Round adverse:        {}", report.round_adverse);
+    println!("Vault records:        {}", report.vault_records);
+    println!(
+        "Vault accepted/adverse: {} / {}",
+        report.vault_accepted_records, report.vault_adverse_records
+    );
+    println!("Configured witnesses: {}", report.configured_witnesses);
+    println!("Fresh verified:       {}", report.fresh_verified);
+    println!(
+        "Accepted / adverse:   {} / {}",
+        report.accepted, report.adverse
+    );
+    println!("Missing:              {}", report.missing);
+    println!("Minimum verified:     {}", report.minimum_verified);
+    println!("Policy ready:         {}", report.policy_ready);
+    println!();
+    println!("Security model: {}", report.security_model);
+    println!("Privacy: {}", report.privacy_boundary);
+    Ok(())
+}
+
+const MAX_CUSTODY_WITNESS_DISCOVERY_SNAPSHOT_BYTES: usize = 512 * 1024;
+
+fn load_relay_custody_witness_snapshot(
+    path: &Path,
+    configured_witnesses: &[[u8; 32]],
+    max_peers: usize,
+    now: u64,
+) -> anyhow::Result<RelayCustodyWitnessSnapshot> {
+    let bytes = read_bounded_relay_custody_artifact(
+        path,
+        MAX_CUSTODY_WITNESS_DISCOVERY_SNAPSHOT_BYTES,
+        "discovery snapshot",
+    )?;
+    let snapshot = NodeBootstrapSnapshot::from_json_bytes(&bytes)
+        .map_err(|_| anyhow::anyhow!("relay custody discovery snapshot is malformed"))?;
+    let records = snapshot.peers.len();
+    let pinned_peers = snapshot
+        .peers
+        .into_iter()
+        .filter(|peer| configured_witnesses.contains(&peer.descriptor.node_id))
+        .collect::<Vec<_>>();
+    let pinned_records = pinned_peers.len();
+    let pinned_snapshot = NodeBootstrapSnapshot::new(snapshot.generated_at, pinned_peers);
+    let peer_store = PeerStore::with_max_peers(max_peers);
+    let imported = peer_store.load_bootstrap_snapshot_from_source(
+        &pinned_snapshot,
+        now,
+        "operator_custody_witness_snapshot",
+    );
+    let verified_records = imported.inserted.saturating_add(imported.unchanged);
+    let rejected_records = imported.rejected.saturating_add(imported.stale);
+    Ok(RelayCustodyWitnessSnapshot {
+        peer_store,
+        records,
+        pinned_records,
+        verified_records,
+        rejected_records,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_relay_custody_audit_witness_collection_report(
+    round: CustodyAuditWitnessRound,
+    snapshot: &RelayCustodyWitnessSnapshot,
+    policy: &CustodyAuditWitnessReceiptPolicyEvidence,
+    vault_records: usize,
+    vault_accepted_records: usize,
+    vault_adverse_records: usize,
+    evaluated_at: u64,
+    checkpoint_generation: u64,
+    timeout_seconds: u64,
+    max_age_seconds: u64,
+) -> RelayCustodyAuditWitnessCollectionReport {
+    let status = custody_audit_witness_policy_status(policy);
+    RelayCustodyAuditWitnessCollectionReport {
+        contract_version: "relay_custody_audit_witness_collection.v1",
+        status,
+        evaluated_at,
+        checkpoint_generation,
+        timeout_seconds,
+        max_age_seconds,
+        snapshot_records: snapshot.records,
+        snapshot_pinned_records: snapshot.pinned_records,
+        snapshot_verified_records: snapshot.verified_records,
+        snapshot_rejected_records: snapshot.rejected_records,
+        round_configured: round.configured,
+        round_verified: round.verified,
+        round_accepted: round.accepted,
+        round_advanced: round.advanced,
+        round_idempotent: round.idempotent,
+        round_stale: round.stale,
+        round_conflicts: round.conflicts,
+        round_gaps: round.gaps,
+        round_failed: round.failed,
+        round_adverse: round.adverse_evidence,
+        vault_records,
+        vault_accepted_records,
+        vault_adverse_records,
+        configured_witnesses: policy.configured,
+        fresh_verified: policy.fresh_verified,
+        accepted: policy.accepted,
+        adverse: policy.adverse,
+        missing: policy.missing,
+        minimum_verified: policy.minimum_verified,
+        policy_ready: status == "ready",
+        security_model: "explicit one-shot exact-pin witness transport with signed descriptor admission, durable receipt-before-counting, complete vault re-audit, and no background scheduler, voting, fork choice, consensus, or global finality",
+        privacy_boundary: "aggregate snapshot, round, vault, and current policy counts only; no node identities, hashes, signatures, paths, endpoints, messages, users, routes, payloads, memory, destinations, DNS, IP addresses, or social graph metadata",
+    }
+}
+
+async fn cmd_relay_collect_audit_witnesses(
+    config_path: &Path,
+    discovery_snapshot_path: &Path,
+    timeout_seconds: u64,
+    max_age_seconds: u64,
+    json: bool,
+) -> anyhow::Result<()> {
+    let current =
+        load_current_relay_custody_audit_witness_context(config_path, "collect audit witnesses")
+            .await?;
+    let CurrentRelayCustodyAuditWitnessContext {
+        config,
+        identity,
+        producer,
+        configured_witnesses,
+        anchor_guard,
+        anchor_sha256,
+    } = current;
+    let started_at = unix_timestamp_now()?;
+    let snapshot = load_relay_custody_witness_snapshot(
+        discovery_snapshot_path,
+        &configured_witnesses,
+        config.discovery.max_peers,
+        started_at,
+    )?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(timeout_seconds))
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| anyhow::anyhow!("unable to build custody witness transport"))?;
+    let storage = open_relay_custody_witness_storage(&config, &identity)?;
+
+    // [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] The maintenance
+    // guard remains held across network contact and durable re-audit. The
+    // command therefore cannot report receipts for a checkpoint that changed
+    // while witnesses were responding.
+    let round = witness_custody_audit_anchor_round_durable(
+        &storage,
+        &snapshot.peer_store,
+        &identity,
+        &client,
+        &configured_witnesses,
+        config.discovery.custody_audit_witness_min_verified,
+        anchor_guard.anchor(),
+    )
+    .await
+    .map_err(|reason| anyhow::anyhow!("custody witness collection failed: {reason}"))?;
+    let evaluated_at = unix_timestamp_now()?;
+    let vault = storage
+        .audit_custody_audit_witness_receipt_evidence()
+        .await
+        .map_err(|_| anyhow::anyhow!("custody witness receipt vault audit failed closed"))?;
+    let policy = storage
+        .evaluate_custody_audit_witness_receipt_policy(
+            &producer,
+            anchor_guard.anchor().checkpoint_generation,
+            &anchor_sha256,
+            &configured_witnesses,
+            config.discovery.custody_audit_witness_min_verified,
+            evaluated_at,
+            max_age_seconds,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("custody witness receipt policy audit failed closed"))?;
+    let report = build_relay_custody_audit_witness_collection_report(
+        round,
+        &snapshot,
+        &policy,
+        vault.records,
+        vault.accepted_records,
+        vault.adverse_records,
+        evaluated_at,
+        anchor_guard.anchor().checkpoint_generation,
+        timeout_seconds,
+        max_age_seconds,
+    );
+    let policy_ready = report.policy_ready;
+    print_relay_custody_audit_witness_collection(&report, json)?;
+    anyhow::ensure!(
+        policy_ready,
+        "current custody witness policy is not ready after collection"
+    );
     Ok(())
 }
 
@@ -3649,7 +3989,8 @@ mod tests {
         directory_observation_witness_response_signing_bytes,
         encode_directory_observation_certificate, DirectoryObservationCertificateV1,
         DirectoryObservationCheckpointV1, DirectoryObservationTipV1,
-        DirectoryObservationWitnessReceiptV1, DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
+        DirectoryObservationWitnessReceiptV1, NodeCapability, NodeDescriptor, SignedNodeDescriptor,
+        DIRECTORY_OBSERVATION_WITNESS_ACCEPTED_V1,
     };
     use sha2::{Digest, Sha256};
 
@@ -4003,6 +4344,53 @@ mod tests {
             .is_err());
         }
 
+        // [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Network
+        // collection is explicit, snapshot-bound, time-bounded, and always
+        // re-audits receipts under a bounded freshness policy.
+        let collect_witnesses = Cli::try_parse_from([
+            "aeronyx-server",
+            "relay-custody",
+            "collect-audit-witnesses",
+            "--discovery-snapshot",
+            "/root/witness-snapshot.json",
+            "--timeout-seconds",
+            "12",
+            "--max-age-seconds",
+            "3600",
+            "--json",
+        ])
+        .expect("custody witness collection form must parse");
+        let Commands::RelayCustody(RelayCustodyCommands::CollectAuditWitnesses {
+            config,
+            discovery_snapshot,
+            timeout_seconds,
+            max_age_seconds,
+            json,
+        }) = collect_witnesses.command
+        else {
+            panic!("unexpected CLI command")
+        };
+        assert_eq!(config, PathBuf::from("/etc/aeronyx/server.toml"));
+        assert_eq!(
+            discovery_snapshot,
+            PathBuf::from("/root/witness-snapshot.json")
+        );
+        assert_eq!(timeout_seconds, 12);
+        assert_eq!(max_age_seconds, 3600);
+        assert!(json);
+        for invalid_timeout in ["0", "61"] {
+            assert!(Cli::try_parse_from([
+                "aeronyx-server",
+                "relay-custody",
+                "collect-audit-witnesses",
+                "--discovery-snapshot",
+                "/root/witness-snapshot.json",
+                "--timeout-seconds",
+                invalid_timeout,
+            ])
+            .is_err());
+        }
+
         let readiness = Cli::try_parse_from([
             "aeronyx-server",
             "relay-custody",
@@ -4136,6 +4524,80 @@ mod tests {
             ..CustodyAuditWitnessReceiptPolicyEvidence::default()
         };
         assert_eq!(custody_audit_witness_policy_status(&ready), "ready");
+    }
+
+    #[test]
+    fn custody_witness_operator_snapshot_imports_only_exact_pins() {
+        // [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] A valid but
+        // unrelated descriptor must not enter the ephemeral transport view;
+        // a bad pinned signature must remain visible as aggregate rejection.
+        let now = 1_700_000_100;
+        let pinned_identity =
+            IdentityKeyPair::from_bytes(&[0x91; 32]).expect("pinned witness identity");
+        let unrelated_identity =
+            IdentityKeyPair::from_bytes(&[0x92; 32]).expect("unrelated peer identity");
+        let signed_descriptor = |identity: &IdentityKeyPair, endpoint: &str| {
+            let mut descriptor =
+                NodeDescriptor::new(identity.public_key_bytes(), 1, now - 10, now + 600, "0.1.0");
+            descriptor.public_endpoint = Some(endpoint.to_string());
+            descriptor
+                .capabilities
+                .push(NodeCapability::EncryptedStorage);
+            SignedNodeDescriptor::sign(descriptor, identity).expect("sign witness descriptor")
+        };
+        let pinned = signed_descriptor(&pinned_identity, "https://witness.example");
+        let unrelated = signed_descriptor(&unrelated_identity, "https://unrelated.example");
+        let snapshot = NodeBootstrapSnapshot::new(now, vec![unrelated, pinned.clone()]);
+        let directory = tempfile::tempdir().expect("witness snapshot directory");
+        let path = directory.path().join("snapshot.json");
+        std::fs::write(
+            &path,
+            snapshot
+                .to_json_pretty()
+                .expect("serialize witness snapshot"),
+        )
+        .expect("write witness snapshot");
+
+        let loaded = load_relay_custody_witness_snapshot(
+            &path,
+            &[pinned_identity.public_key_bytes()],
+            4,
+            now,
+        )
+        .expect("load pinned witness snapshot");
+        assert_eq!(loaded.records, 2);
+        assert_eq!(loaded.pinned_records, 1);
+        assert_eq!(loaded.verified_records, 1);
+        assert_eq!(loaded.rejected_records, 0);
+        assert!(loaded
+            .peer_store
+            .get_valid(&pinned_identity.public_key_bytes(), now)
+            .is_some());
+        assert!(loaded
+            .peer_store
+            .get_valid(&unrelated_identity.public_key_bytes(), now)
+            .is_none());
+
+        let mut tampered = pinned;
+        tampered.signature[0] ^= 0x01;
+        let invalid_path = directory.path().join("invalid-snapshot.json");
+        std::fs::write(
+            &invalid_path,
+            NodeBootstrapSnapshot::new(now, vec![tampered])
+                .to_json_pretty()
+                .expect("serialize invalid witness snapshot"),
+        )
+        .expect("write invalid witness snapshot");
+        let rejected = load_relay_custody_witness_snapshot(
+            &invalid_path,
+            &[pinned_identity.public_key_bytes()],
+            4,
+            now,
+        )
+        .expect("audit invalid pinned snapshot");
+        assert_eq!(rejected.pinned_records, 1);
+        assert_eq!(rejected.verified_records, 0);
+        assert_eq!(rejected.rejected_records, 1);
     }
 
     #[test]

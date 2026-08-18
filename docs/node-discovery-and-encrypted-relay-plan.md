@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.00.0 - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Re-audits the complete local receipt vault against the current custody checkpoint with an optional fail-closed operator readiness exit.
+Last Modified: v1.01.0 - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Runs one explicit signed-snapshot-pinned witness round, persists every verified receipt before counting it, and re-audits current-checkpoint readiness without enabling a scheduler.
+Previous: v1.00.0 - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Re-audits the complete local receipt vault against the current custody checkpoint with an optional fail-closed operator readiness exit.
 Previous: v0.99.0 - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Imports operator-carried signed receipts only for the current local checkpoint and preserves their typed admission policy for restart audit.
 Previous: v0.98.0 - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Persists exact portable witness receipts atomically, revalidates every frame after restart, and reconstructs fresh exact-anchor policy without exposing custody contents.
 Previous: v0.97.0 - [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] Sends an exact producer-signed anchor only when explicitly invoked, verifies portable request-bound receipts, and never lets adverse evidence be outvoted.
@@ -133,6 +134,42 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.01 Witness collection is explicit, pinned, and durable
+
+[CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex]
+
+- `relay-custody collect-audit-witnesses` is the first operator-invoked online
+  composition of the already tested custody witness transport and durable
+  receipt vault. Configuration and normal startup still perform no custody
+  witness transmission, retry, timer, callback, or scheduler work.
+- The caller supplies one bounded signed `NodeBootstrapSnapshot`. The command
+  filters it to current `discovery.custody_audit_witness_node_ids` before
+  PeerStore import, then independently verifies descriptor signatures,
+  validity windows, `EncryptedStorage` capability, and public-safe endpoint
+  policy. Unrelated descriptors cannot consume this ephemeral transport view.
+- The HTTP client has an operator-bounded 1-60 second complete request timeout,
+  disables redirects and environment proxies, and never falls back from an
+  unavailable pin to an arbitrary discovered peer. Only exact configured
+  identities can receive the current anchor: producer identity, generation,
+  coarse archived record/byte totals, opaque digest, and signatures only.
+- The current checkpoint maintenance guard remains held across descriptor
+  admission, network requests, receipt persistence, and final policy audit.
+  A concurrent custody maintenance process therefore cannot change the anchor
+  between signing and the command's readiness decision.
+- A verified receipt is counted only after durable producer-side persistence.
+  After the round, the complete vault is revalidated and current policy is
+  reconstructed. The command exits zero only for `ready`; transport shortfall
+  and authentic stale/conflict/gap evidence produce aggregate diagnostics then
+  fail closed. Adverse receipts remain durable and cannot be outvoted.
+- Output contains aggregate snapshot/round/vault/policy counters only. It
+  excludes node identities, endpoint strings, hashes, signatures, paths,
+  messages, users, routes, payloads, memory, DNS, destinations, IP addresses,
+  and social-graph metadata.
+- This closes the reviewed online operator workflow. It is independent
+  corroboration for an opaque custody checkpoint, not a validator round,
+  consensus, fork choice, leader election, transaction settlement, or global
+  finality.
 
 ### v1.00 Current-checkpoint witness policy is restart-observable
 

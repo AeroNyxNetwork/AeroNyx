@@ -9,6 +9,9 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Document explicit,
+  signed-snapshot-pinned network collection with durable receipt re-audit and
+  fail-closed command status, without enabling a background scheduler.
 - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Document restart-safe,
   current-checkpoint local receipt-vault auditing and optional readiness exit.
 - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Document bounded
@@ -136,6 +139,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.57.0-node-deploy - Documented one-shot durable witness collection.
 v1.56.0-node-deploy - Documented current-checkpoint witness vault re-audit.
 v1.55.0-node-deploy - Documented host-local custody witness receipt import.
 v1.54.0-node-deploy - Documented segmented custody audit checkpoints.
@@ -929,6 +933,50 @@ custody paths, messages, routes, endpoints, payloads, ciphertext, memory,
 destinations, DNS, or social graph. One receipt proves one independent node's
 durable observation. Multiple receipts improve administrative independence but
 are not consensus, fork choice, validator voting, or global finality.
+
+For an explicit online round, obtain a fresh signed discovery snapshot from a
+trusted AeroNyx discovery source and keep it as a regular local file. The
+command parses at most 512 KiB, verifies descriptors again at execution time,
+and discards every descriptor whose identity is not currently pinned in
+`discovery.custody_audit_witness_node_ids`:
+
+```bash
+curl --fail --proto '=https' --tlsv1.2 --max-time 20 \
+  https://<trusted-discovery-node>/api/discovery/snapshot \
+  --output ./aeronyx-witness-snapshot.json
+
+sudo /opt/aeronyx/aeronyx-server relay-custody collect-audit-witnesses \
+  -c /etc/aeronyx/server.toml \
+  --discovery-snapshot ./aeronyx-witness-snapshot.json \
+  --timeout-seconds 15 \
+  --max-age-seconds 7200 \
+  --json
+```
+
+<!-- [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] -->
+This is a deliberate one-shot network operation. It does not read environment
+proxy settings, follow redirects, gossip the snapshot, contact unconfigured
+peers, or install a retry/background scheduler. Each selected descriptor must
+have a valid Ed25519 signature, be fresh, advertise `EncryptedStorage`, and
+carry a public-safe witness endpoint. The request contains only producer
+identity, current checkpoint generation, coarse archived record/byte totals,
+the opaque anchor digest, a random request id, timestamp, and signatures. It
+never contains messages, archive contents, paths, users, routes, payloads,
+memory, DNS, destinations, client IPs, or social-graph data.
+
+Every valid response is request-bound and witness-signed. A receipt contributes
+to the round only after durable producer-side insertion. The command then
+re-audits the complete vault under the still-held checkpoint maintenance lock.
+It exits zero only when the configured current-checkpoint threshold is ready;
+transport shortfall and all authentic `stale`, `conflict`, or `gap` evidence
+produce aggregate output followed by non-zero exit. Valid adverse receipts stay
+stored for investigation and cannot be outvoted by accepted receipts.
+
+The JSON contract reports only aggregate snapshot, round, vault, and policy
+counts. It does not expose witness identities or endpoints. This operator
+command removes manual receipt shuttling when reviewed nodes are online, but it
+does not establish consensus, finality, validator voting, fork choice, or
+automatic startup transmission.
 
 Re-audit the current checkpoint after restart or before a maintenance window:
 

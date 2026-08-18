@@ -6,6 +6,9 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Document the
+#   explicit signed-snapshot network collection command and its non-scheduled
+#   transport boundary.
 # - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Document the explicit
 #   host-local command that re-audits current-checkpoint receipt readiness.
 # - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Document that manual
@@ -64,6 +67,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.15.0-node-deploy - Documented explicit durable witness collection.
 # v1.14.0-node-deploy - Documented local current-checkpoint receipt auditing.
 # v1.13.0-node-deploy - Documented bounded host-local witness receipt import.
 # v1.12.0-node-deploy - Documented durable producer custody witness evidence.
@@ -206,7 +210,11 @@ verified_delivery_witness_requester_node_ids = []
 # host-local import command accepts only a current producer checkpoint and a
 # witness from this pin set; it does not contact the witness over the network.
 # Configuration/startup still sends nothing: no scheduler exists in this
-# release, and an empty list remains fully off. After importing receipts, use
+# release, and an empty list remains fully off. Operators may explicitly run
+# `relay-custody collect-audit-witnesses --discovery-snapshot <signed-json>`;
+# it filters the snapshot to this exact pin set, verifies every descriptor,
+# persists signed receipts before counting them, and exits non-zero unless the
+# current checkpoint threshold is ready. After collecting/importing receipts, use
 # `relay-custody audit-witness-vault --max-age-seconds 7200 --json` to re-audit
 # the current checkpoint locally; add `--require-ready` only to an explicitly
 # operator-managed health gate.

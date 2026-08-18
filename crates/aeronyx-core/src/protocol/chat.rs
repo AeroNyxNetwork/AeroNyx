@@ -81,8 +81,13 @@
 //!   binds one exact producer anchor to an independently signed, durable
 //!   monotonic witness decision. Accepted and rejected outcomes remain
 //!   fixed-size and disclose no additional custody or user information.
+//! - [CUSTODY-ANCHOR-METADATA-ACCURACY 2026-08-18 by Codex] The portable
+//!   anchor also carries coarse archived record and byte totals. Keep that
+//!   disclosure explicit; it still contains no user- or message-level data.
 //!
 //! ## Last Modified
+//! v1.9.0-CustodyAnchorMetadataAccuracy - Correct the documented aggregate
+//! metadata visible to an external custody witness
 //! v1.8.0-CustodyWitnessNetwork - Added canonical anchor/receipt frame digests
 //! and verification of portable adverse outcomes for node-to-node exchange
 //! v1.7.0-CustodyAuditWitness - Added independent signed checkpoint receipts
@@ -776,9 +781,10 @@ impl BlindRelayFailureReceipt {
 /// [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] The producer computes
 /// `anchor_digest` from private checkpoint authentication state, then discards
 /// that private state at this protocol boundary. External retainers receive a
-/// fixed-size opaque commitment and monotonic generation only. Comparing an
-/// already retained generation/digest can reveal rollback or equivocation, but
-/// this producer signature alone is not an independent witness receipt.
+/// fixed-size opaque commitment, monotonic generation, and coarse aggregate
+/// archived record/byte totals. Comparing already retained evidence can reveal
+/// rollback or equivocation, but this producer signature alone is not an
+/// independent witness receipt and exposes no message- or user-level data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustodyAuditAnchorV1 {
     /// Anchor schema version.
