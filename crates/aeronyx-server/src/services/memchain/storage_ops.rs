@@ -93,6 +93,8 @@
 //! - [CUSTODY-WITNESS-TIME-HARDENING 2026-08-18 by Codex] Uses one-sided
 //!   receipt age with a bounded future-clock tolerance so imported future
 //!   timestamps cannot extend startup evidence freshness.
+//! - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Derives typed
+//!   exact-anchor readiness and aggregate vault audit from one SQLite snapshot.
 //! - [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Runs signed local-anchor
 //!   writes through one privacy-safe blocking worker boundary.
 //!
@@ -111,6 +113,8 @@
 //!
 //! ⚠️ Important Note for Next Developer:
 //! - All methods here access self.conn (TokioMutex<Connection>) and self.cache (RwLock<LruCache>)
+//! - Custody startup and operator surfaces must consume the atomic readiness
+//!   snapshot; do not independently reinterpret its aggregate counters.
 //! - When adding new query methods, use self.query_rows() for SELECT queries that
 //!   return MemoryRecord (it handles record_key decryption transparently)
 //! - For raw SQL that reads encrypted_content directly (like get_overview), you MUST
@@ -546,6 +550,109 @@ pub struct CustodyAuditWitnessReceiptPolicyEvidence {
     pub minimum_verified: usize,
     /// Whether the threshold is met with no fresh adverse evidence.
     pub quorum_satisfied: bool,
+}
+
+/// Typed readiness derived from one internally consistent custody policy.
+///
+/// [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Startup and every
+/// operator command consume this single contract instead of independently
+/// interpreting aggregate counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyAuditWitnessPolicyReadiness {
+    /// The configured independent witness threshold is satisfied.
+    Ready,
+    /// No configured witness has a fresh exact-anchor receipt.
+    EvidenceUnavailable,
+    /// Some fresh accepted evidence exists, but it is below the threshold.
+    ThresholdUnmet,
+    /// Fresh adverse or ambiguous evidence exists for the exact anchor.
+    AdverseEvidence,
+}
+
+/// Privacy-safe failure class for one atomic custody-readiness snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyAuditWitnessReadinessError {
+    /// The durable receipt vault failed canonical cryptographic audit.
+    VaultInvalid,
+    /// Effective pins, thresholds, or derived counters are inconsistent.
+    PolicyInvalid,
+}
+
+impl CustodyAuditWitnessReadinessError {
+    /// Stable aggregate reason code containing no private evidence.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VaultInvalid => "receipt_vault_invalid",
+            Self::PolicyInvalid => "receipt_policy_invalid",
+        }
+    }
+}
+
+impl std::fmt::Display for CustodyAuditWitnessReadinessError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for CustodyAuditWitnessReadinessError {}
+
+impl CustodyAuditWitnessPolicyReadiness {
+    /// Stable aggregate status used by existing operator JSON contracts.
+    #[must_use]
+    pub const fn status_label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::AdverseEvidence => "adverse",
+            Self::EvidenceUnavailable | Self::ThresholdUnmet => "collecting",
+        }
+    }
+}
+
+impl CustodyAuditWitnessReceiptPolicyEvidence {
+    /// Validates counter invariants and derives the authoritative readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns a privacy-safe static error when counters cannot originate from
+    /// one valid exact-anchor policy evaluation.
+    pub fn readiness(&self) -> Result<CustodyAuditWitnessPolicyReadiness, &'static str> {
+        let classified = self
+            .accepted
+            .checked_add(self.adverse)
+            .ok_or("custody witness policy counters are inconsistent")?;
+        let expected_ready = self.adverse == 0 && self.accepted >= self.minimum_verified;
+        if self.configured == 0
+            || self.minimum_verified == 0
+            || self.minimum_verified > self.configured
+            || self.fresh_verified > self.configured
+            || classified != self.fresh_verified
+            || self.missing != self.configured.saturating_sub(self.fresh_verified)
+            || self.quorum_satisfied != expected_ready
+        {
+            return Err("custody witness policy counters are inconsistent");
+        }
+        if self.adverse > 0 {
+            Ok(CustodyAuditWitnessPolicyReadiness::AdverseEvidence)
+        } else if expected_ready {
+            Ok(CustodyAuditWitnessPolicyReadiness::Ready)
+        } else if self.fresh_verified == 0 {
+            Ok(CustodyAuditWitnessPolicyReadiness::EvidenceUnavailable)
+        } else {
+            Ok(CustodyAuditWitnessPolicyReadiness::ThresholdUnmet)
+        }
+    }
+}
+
+/// One cryptographically audited SQLite snapshot and its typed policy result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustodyAuditWitnessReceiptReadinessSnapshot {
+    /// Complete aggregate vault audit from the same SQLite snapshot.
+    pub vault: CustodyAuditWitnessReceiptVaultAudit,
+    /// Exact-anchor policy evidence reconstructed from that snapshot.
+    pub policy: CustodyAuditWitnessReceiptPolicyEvidence,
+    /// Authoritative typed readiness derived from validated policy counters.
+    pub readiness: CustodyAuditWitnessPolicyReadiness,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3108,6 +3215,121 @@ fn audit_custody_audit_witness_receipt_snapshot(
     Ok((report, receipts))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn evaluate_custody_audit_witness_receipts(
+    receipts: Vec<CustodyAuditWitnessReceiptV1>,
+    producer: &[u8; 32],
+    requested_generation: u64,
+    requested_frame_sha256: &[u8; 32],
+    witness_node_ids: &[[u8; 32]],
+    minimum_verified: usize,
+    now: u64,
+    max_age_secs: u64,
+) -> Result<
+    (
+        CustodyAuditWitnessReceiptPolicyEvidence,
+        CustodyAuditWitnessPolicyReadiness,
+    ),
+    CustodyAuditWitnessReadinessError,
+> {
+    const MAX_POLICY_WITNESSES: usize = 3;
+    if producer == &[0u8; 32]
+        || requested_frame_sha256 == &[0u8; 32]
+        || requested_generation == 0
+        || requested_generation > i64::MAX as u64
+        || witness_node_ids.len() > MAX_POLICY_WITNESSES
+        || minimum_verified == 0
+        || minimum_verified > MAX_POLICY_WITNESSES
+        || now == 0
+        || max_age_secs == 0
+    {
+        return Err(CustodyAuditWitnessReadinessError::PolicyInvalid);
+    }
+
+    let mut evidence = CustodyAuditWitnessReceiptPolicyEvidence {
+        minimum_verified,
+        ..CustodyAuditWitnessReceiptPolicyEvidence::default()
+    };
+    let mut configured = Vec::with_capacity(witness_node_ids.len());
+    for witness in witness_node_ids {
+        if witness == producer {
+            evidence.self_excluded = evidence.self_excluded.saturating_add(1);
+        } else if configured.contains(witness) {
+            evidence.duplicates_ignored = evidence.duplicates_ignored.saturating_add(1);
+        } else {
+            configured.push(*witness);
+        }
+    }
+    evidence.configured = configured.len();
+    // [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Callers outside
+    // config loading must not receive a structurally impossible policy after
+    // self/duplicate exclusion changes the effective pin set.
+    if minimum_verified > evidence.configured {
+        return Err(CustodyAuditWitnessReadinessError::PolicyInvalid);
+    }
+
+    let mut latest = HashMap::<[u8; 32], LatestCustodyAuditWitnessDecision>::new();
+    for receipt in receipts {
+        if receipt.producer_node_id != *producer
+            || receipt.requested_checkpoint_generation != requested_generation
+            || receipt.requested_frame_sha256 != *requested_frame_sha256
+            || !configured.contains(&receipt.witness_node_id)
+            || !custody_witness_receipt_time_is_admissible(now, receipt.observed_at, max_age_secs)
+        {
+            continue;
+        }
+        let digest = custody_audit_witness_receipt_frame_sha256(&receipt)
+            .map_err(|_| CustodyAuditWitnessReadinessError::PolicyInvalid)?;
+        let sticky_adverse = matches!(
+            receipt.outcome,
+            CUSTODY_AUDIT_WITNESS_STALE_V1 | CUSTODY_AUDIT_WITNESS_CONFLICT_V1
+        );
+        if let Some(current) = latest.get_mut(&receipt.witness_node_id) {
+            current.sticky_adverse |= sticky_adverse;
+            if receipt.observed_at > current.observed_at {
+                current.observed_at = receipt.observed_at;
+                current.accepted = receipt.accepted();
+                current.receipt_digest = digest;
+                current.same_time_ambiguous = false;
+            } else if receipt.observed_at == current.observed_at && digest != current.receipt_digest
+            {
+                // An immediate retry can legitimately replace `advanced`
+                // with `idempotent` in one wall-clock second. Any accepted /
+                // adverse ambiguity remains fail-closed and order-independent.
+                if !(current.accepted && receipt.accepted()) {
+                    current.same_time_ambiguous = true;
+                }
+            }
+        } else {
+            latest.insert(
+                receipt.witness_node_id,
+                LatestCustodyAuditWitnessDecision {
+                    observed_at: receipt.observed_at,
+                    accepted: receipt.accepted(),
+                    receipt_digest: digest,
+                    same_time_ambiguous: false,
+                    sticky_adverse,
+                },
+            );
+        }
+    }
+
+    evidence.fresh_verified = latest.len();
+    for decision in latest.values() {
+        if decision.accepted && !decision.same_time_ambiguous && !decision.sticky_adverse {
+            evidence.accepted = evidence.accepted.saturating_add(1);
+        } else {
+            evidence.adverse = evidence.adverse.saturating_add(1);
+        }
+    }
+    evidence.missing = evidence.configured.saturating_sub(evidence.fresh_verified);
+    evidence.quorum_satisfied = evidence.accepted >= minimum_verified && evidence.adverse == 0;
+    let readiness = evidence
+        .readiness()
+        .map_err(|_| CustodyAuditWitnessReadinessError::PolicyInvalid)?;
+    Ok((evidence, readiness))
+}
+
 // ============================================
 // impl MemoryStorage — Custody Witness Receipt Evidence
 // ============================================
@@ -3294,6 +3516,11 @@ impl MemoryStorage {
     /// The newest receipt per distinct non-self operator pin supplies current
     /// state. Any fresh `stale`/`conflict` receipt remains sticky adverse for
     /// that exact anchor, and same-time accepted/adverse ambiguity fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the canonical receipt vault fails audit or the
+    /// effective witness pin policy is structurally impossible.
     #[allow(clippy::too_many_arguments)]
     pub async fn evaluate_custody_audit_witness_receipt_policy(
         &self,
@@ -3305,116 +3532,72 @@ impl MemoryStorage {
         now: u64,
         max_age_secs: u64,
     ) -> Result<CustodyAuditWitnessReceiptPolicyEvidence, String> {
-        const MAX_POLICY_WITNESSES: usize = 3;
-        if producer == &[0u8; 32]
-            || requested_frame_sha256 == &[0u8; 32]
-            || requested_generation == 0
-            || requested_generation > i64::MAX as u64
-            || witness_node_ids.len() > MAX_POLICY_WITNESSES
-            || minimum_verified == 0
-            || minimum_verified > MAX_POLICY_WITNESSES
-            || now == 0
-            || max_age_secs == 0
-        {
-            return Err("custody witness receipt evaluation policy is invalid".to_string());
-        }
+        Ok(self
+            .audit_custody_audit_witness_receipt_readiness(
+                producer,
+                requested_generation,
+                requested_frame_sha256,
+                witness_node_ids,
+                minimum_verified,
+                now,
+                max_age_secs,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .policy)
+    }
 
-        let mut evidence = CustodyAuditWitnessReceiptPolicyEvidence {
-            minimum_verified,
-            ..CustodyAuditWitnessReceiptPolicyEvidence::default()
-        };
-        let mut configured = Vec::with_capacity(witness_node_ids.len());
-        for witness in witness_node_ids {
-            if witness == producer {
-                evidence.self_excluded = evidence.self_excluded.saturating_add(1);
-            } else if configured.contains(witness) {
-                evidence.duplicates_ignored = evidence.duplicates_ignored.saturating_add(1);
-            } else {
-                configured.push(*witness);
-            }
-        }
-        evidence.configured = configured.len();
-
-        // [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Release the
-        // SQLite mutex after the canonical snapshot is copied. Signature and
-        // policy evaluation are CPU-only and must not extend storage lock time.
-        let receipts = {
+    /// Audits the complete vault and derives exact-anchor readiness from the
+    /// same `SQLite` snapshot.
+    ///
+    /// [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] This is the
+    /// authoritative startup/operator boundary. A command can no longer log
+    /// one vault snapshot while making its decision from a later snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vault is malformed, signatures or redundant
+    /// indexes fail verification, or the effective pin policy is impossible.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn audit_custody_audit_witness_receipt_readiness(
+        &self,
+        producer: &[u8; 32],
+        requested_generation: u64,
+        requested_frame_sha256: &[u8; 32],
+        witness_node_ids: &[[u8; 32]],
+        minimum_verified: usize,
+        now: u64,
+        max_age_secs: u64,
+    ) -> Result<CustodyAuditWitnessReceiptReadinessSnapshot, CustodyAuditWitnessReadinessError>
+    {
+        let (vault, receipts) = {
             let mut conn = self.conn.lock().await;
             let transaction = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
-                .map_err(|error| format!("begin custody witness receipt policy audit: {error}"))?;
-            let (_, receipts) = audit_custody_audit_witness_receipt_snapshot(&transaction)?;
+                .map_err(|_| CustodyAuditWitnessReadinessError::VaultInvalid)?;
+            let snapshot = audit_custody_audit_witness_receipt_snapshot(&transaction)
+                .map_err(|_| CustodyAuditWitnessReadinessError::VaultInvalid)?;
             transaction
                 .commit()
-                .map_err(|error| format!("finish custody witness receipt policy audit: {error}"))?;
+                .map_err(|_| CustodyAuditWitnessReadinessError::VaultInvalid)?;
             drop(conn);
-            receipts
+            snapshot
         };
-
-        let mut latest = HashMap::<[u8; 32], LatestCustodyAuditWitnessDecision>::new();
-        for receipt in receipts {
-            if receipt.producer_node_id != *producer
-                || receipt.requested_checkpoint_generation != requested_generation
-                || receipt.requested_frame_sha256 != *requested_frame_sha256
-                || !configured.contains(&receipt.witness_node_id)
-                || !custody_witness_receipt_time_is_admissible(
-                    now,
-                    receipt.observed_at,
-                    max_age_secs,
-                )
-            {
-                continue;
-            }
-            let digest = custody_audit_witness_receipt_frame_sha256(&receipt)
-                .map_err(|_| "custody witness receipt policy digest failed".to_string())?;
-            let sticky_adverse = matches!(
-                receipt.outcome,
-                CUSTODY_AUDIT_WITNESS_STALE_V1 | CUSTODY_AUDIT_WITNESS_CONFLICT_V1
-            );
-            if let Some(current) = latest.get_mut(&receipt.witness_node_id) {
-                current.sticky_adverse |= sticky_adverse;
-                if receipt.observed_at > current.observed_at {
-                    current.observed_at = receipt.observed_at;
-                    current.accepted = receipt.accepted();
-                    current.receipt_digest = digest;
-                    current.same_time_ambiguous = false;
-                } else if receipt.observed_at == current.observed_at
-                    && digest != current.receipt_digest
-                {
-                    // An immediate retry can legitimately replace `advanced`
-                    // with `idempotent` in the same wall-clock second. Both
-                    // independently prove the exact retained anchor. Any
-                    // accepted/adverse ambiguity at one timestamp still fails
-                    // closed and cannot depend on SQLite row order.
-                    if !(current.accepted && receipt.accepted()) {
-                        current.same_time_ambiguous = true;
-                    }
-                }
-            } else {
-                latest.insert(
-                    receipt.witness_node_id,
-                    LatestCustodyAuditWitnessDecision {
-                        observed_at: receipt.observed_at,
-                        accepted: receipt.accepted(),
-                        receipt_digest: digest,
-                        same_time_ambiguous: false,
-                        sticky_adverse,
-                    },
-                );
-            }
-        }
-
-        evidence.fresh_verified = latest.len();
-        for decision in latest.values() {
-            if decision.accepted && !decision.same_time_ambiguous && !decision.sticky_adverse {
-                evidence.accepted = evidence.accepted.saturating_add(1);
-            } else {
-                evidence.adverse = evidence.adverse.saturating_add(1);
-            }
-        }
-        evidence.missing = evidence.configured.saturating_sub(evidence.fresh_verified);
-        evidence.quorum_satisfied = evidence.accepted >= minimum_verified && evidence.adverse == 0;
-        Ok(evidence)
+        let (policy, readiness) = evaluate_custody_audit_witness_receipts(
+            receipts,
+            producer,
+            requested_generation,
+            requested_frame_sha256,
+            witness_node_ids,
+            minimum_verified,
+            now,
+            max_age_secs,
+        )?;
+        Ok(CustodyAuditWitnessReceiptReadinessSnapshot {
+            vault,
+            policy,
+            readiness,
+        })
     }
 }
 
@@ -9503,8 +9686,8 @@ mod tests {
         drop(storage);
 
         let reopened = MemoryStorage::open(&db_path, None).unwrap();
-        let policy = reopened
-            .evaluate_custody_audit_witness_receipt_policy(
+        let readiness = reopened
+            .audit_custody_audit_witness_receipt_readiness(
                 &producer_id,
                 1,
                 &frame_sha256,
@@ -9515,11 +9698,31 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(readiness.vault.records, 1);
+        assert_eq!(
+            readiness.readiness,
+            CustodyAuditWitnessPolicyReadiness::Ready
+        );
+        let policy = readiness.policy;
         assert_eq!(policy.configured, 1);
         assert_eq!(policy.duplicates_ignored, 1);
         assert_eq!(policy.self_excluded, 1);
         assert_eq!(policy.accepted, 1);
         assert!(policy.quorum_satisfied);
+        assert_eq!(
+            reopened
+                .audit_custody_audit_witness_receipt_readiness(
+                    &producer_id,
+                    1,
+                    &frame_sha256,
+                    &[producer_id],
+                    1,
+                    observed_at.saturating_add(10),
+                    60,
+                )
+                .await,
+            Err(CustodyAuditWitnessReadinessError::PolicyInvalid)
+        );
 
         let conflict_receipt = CustodyAuditWitnessReceiptV1::signed(
             producer_id,
@@ -9543,7 +9746,7 @@ mod tests {
             .await
             .unwrap();
         let impossible_recovery = reopened
-            .evaluate_custody_audit_witness_receipt_policy(
+            .audit_custody_audit_witness_receipt_readiness(
                 &producer_id,
                 1,
                 &frame_sha256,
@@ -9554,9 +9757,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(impossible_recovery.accepted, 0);
-        assert_eq!(impossible_recovery.adverse, 1);
-        assert!(!impossible_recovery.quorum_satisfied);
+        assert_eq!(
+            impossible_recovery.readiness,
+            CustodyAuditWitnessPolicyReadiness::AdverseEvidence
+        );
+        assert_eq!(impossible_recovery.policy.accepted, 0);
+        assert_eq!(impossible_recovery.policy.adverse, 1);
+        assert!(!impossible_recovery.policy.quorum_satisfied);
         {
             let conn = reopened.conn_lock().await;
             conn.execute(

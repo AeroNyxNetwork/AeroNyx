@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Document that startup
+  and operator status derive from one typed, cryptographically audited snapshot.
 - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Document the opt-in,
   network-silent fail-closed startup gate and one-sided receipt freshness.
 - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Document explicit,
@@ -1014,6 +1016,15 @@ of positive clock skew is tolerated for both live and operator-imported
 receipts. Keep node clocks synchronized and collect a new receipt after the
 current immutable custody checkpoint advances. Always validate this rollout
 with `audit-witness-vault --require-ready` before changing the flag to `true`.
+
+<!-- [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] -->
+The audit command, import result, collection result, and strict startup gate now
+share one typed readiness contract. Vault totals and policy readiness are read
+from the same SQLite snapshot; malformed counters, an impossible effective pin
+set, or a mismatch between the aggregate `quorum_satisfied` flag and its signed
+evidence fail closed. Existing JSON field names and `ready` / `collecting` /
+`adverse` labels remain compatible. An internal inconsistency is reported as
+`invalid` and can never satisfy `--require-ready` or process startup.
 
 Re-audit the current checkpoint after restart or before a maintenance window:
 

@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.02.0 - Added a default-off local custody-receipt
-startup gate and one-sided freshness hardening without startup transmission.
+Modification Reason: v1.03.0 - Unified custody vault audit and exact-anchor
+policy into one typed SQLite readiness snapshot.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.02.0 - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Optionally blocks startup unless the exact current custody anchor has enough fresh durable signed receipts and no adverse evidence, without contacting witnesses.
+Last Modified: v1.03.0 - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Makes startup and operator tools consume one cryptographically audited SQLite snapshot and one typed readiness decision.
+Previous: v1.02.0 - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Optionally blocks startup unless the exact current custody anchor has enough fresh durable signed receipts and no adverse evidence, without contacting witnesses.
 Previous: v1.01.0 - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Runs one explicit signed-snapshot-pinned witness round, persists every verified receipt before counting it, and re-audits current-checkpoint readiness without enabling a scheduler.
 Previous: v1.00.0 - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Re-audits the complete local receipt vault against the current custody checkpoint with an optional fail-closed operator readiness exit.
 Previous: v0.99.0 - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Imports operator-carried signed receipts only for the current local checkpoint and preserves their typed admission policy for restart audit.
@@ -135,6 +136,33 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.03 Custody readiness is one atomic typed contract
+
+[CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex]
+
+- Vault integrity totals and exact-anchor policy evidence now come from one
+  SQLite snapshot. Startup can no longer audit one state and make its decision
+  from a later state; operator import, collection, and audit commands use the
+  same primitive.
+- `CustodyAuditWitnessPolicyReadiness` is the only readiness interpretation:
+  `Ready`, `EvidenceUnavailable`, `ThresholdUnmet`, or `AdverseEvidence`.
+  Runtime reason codes and existing CLI status labels are projections of this
+  type, not independent count logic.
+- Counter invariants are verified before readiness is returned: configured
+  pins and threshold must be possible after self/duplicate exclusion, fresh
+  decisions must equal accepted plus adverse, missing must equal configured
+  minus fresh, and the compatibility quorum flag must equal the derived rule.
+- The prior library path could return an impossible aggregate when direct API
+  callers supplied only self pins or duplicate pins with a larger threshold.
+  That path now returns typed `PolicyInvalid` and cannot authorize startup.
+- The SQLite mutex is released immediately after copying the canonical signed
+  snapshot. Signature classification and policy reduction remain CPU-only and
+  do not extend storage lock duration.
+- Public JSON fields and `ready` / `collecting` / `adverse` labels are preserved.
+  A structurally inconsistent synthetic or future result becomes `invalid` and
+  always fails readiness. No node identity, hash, signature, endpoint, message,
+  route, payload, user, address, destination, or social graph is exposed.
 
 ### v1.02 Current custody evidence can become a strict startup invariant
 

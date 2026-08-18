@@ -94,6 +94,8 @@
 //! locally with an optional fail-closed operator health gate
 //! v1.21.0-CustodyWitnessOperatorCollect - Explicitly collect current-anchor
 //! witness receipts from signed snapshot-pinned peers and re-audit durability
+//! v1.22.0-CustodyWitnessAtomicReadiness - Use one typed SQLite snapshot for
+//! vault audit and current-anchor readiness across startup and operator tools
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read};
@@ -2134,16 +2136,12 @@ fn open_relay_custody_witness_storage(
         .map_err(|_| anyhow::anyhow!("unable to open custody witness receipt vault"))
 }
 
-const fn custody_audit_witness_policy_status(
+fn custody_audit_witness_policy_status(
     policy: &CustodyAuditWitnessReceiptPolicyEvidence,
 ) -> &'static str {
-    if policy.adverse > 0 {
-        "adverse"
-    } else if policy.quorum_satisfied {
-        "ready"
-    } else {
-        "collecting"
-    }
+    policy
+        .readiness()
+        .map_or("invalid", |readiness| readiness.status_label())
 }
 
 fn print_relay_custody_audit_witness_vault(
@@ -2378,12 +2376,10 @@ async fn cmd_relay_collect_audit_witnesses(
     .await
     .map_err(|reason| anyhow::anyhow!("custody witness collection failed: {reason}"))?;
     let evaluated_at = unix_timestamp_now()?;
-    let vault = storage
-        .audit_custody_audit_witness_receipt_evidence()
-        .await
-        .map_err(|_| anyhow::anyhow!("custody witness receipt vault audit failed closed"))?;
-    let policy = storage
-        .evaluate_custody_audit_witness_receipt_policy(
+    // [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Report and exit
+    // status must describe the exact same cryptographically audited snapshot.
+    let readiness = storage
+        .audit_custody_audit_witness_receipt_readiness(
             &producer,
             anchor_guard.anchor().checkpoint_generation,
             &anchor_sha256,
@@ -2393,7 +2389,9 @@ async fn cmd_relay_collect_audit_witnesses(
             max_age_seconds,
         )
         .await
-        .map_err(|_| anyhow::anyhow!("custody witness receipt policy audit failed closed"))?;
+        .map_err(|_| anyhow::anyhow!("custody witness readiness audit failed closed"))?;
+    let vault = readiness.vault;
+    let policy = readiness.policy;
     let report = build_relay_custody_audit_witness_collection_report(
         round,
         &snapshot,
@@ -2434,12 +2432,8 @@ async fn cmd_relay_audit_witness_vault(
     } = current;
     let evaluated_at = unix_timestamp_now()?;
     let storage = open_relay_custody_witness_storage(&config, &identity)?;
-    let vault = storage
-        .audit_custody_audit_witness_receipt_evidence()
-        .await
-        .map_err(|_| anyhow::anyhow!("custody witness receipt vault audit failed closed"))?;
-    let policy = storage
-        .evaluate_custody_audit_witness_receipt_policy(
+    let readiness = storage
+        .audit_custody_audit_witness_receipt_readiness(
             &producer,
             anchor_guard.anchor().checkpoint_generation,
             &anchor_sha256,
@@ -2449,7 +2443,9 @@ async fn cmd_relay_audit_witness_vault(
             max_age_seconds,
         )
         .await
-        .map_err(|_| anyhow::anyhow!("custody witness receipt policy audit failed closed"))?;
+        .map_err(|_| anyhow::anyhow!("custody witness readiness audit failed closed"))?;
+    let vault = readiness.vault;
+    let policy = readiness.policy;
     let status = custody_audit_witness_policy_status(&policy);
     let policy_ready = status == "ready";
     let report = RelayCustodyAuditWitnessVaultReport {
@@ -2523,12 +2519,8 @@ async fn cmd_relay_import_audit_witness(
         )
         .await
         .map_err(|_| anyhow::anyhow!("custody witness receipt import failed closed"))?;
-    let vault = storage
-        .audit_custody_audit_witness_receipt_evidence()
-        .await
-        .map_err(|_| anyhow::anyhow!("custody witness receipt vault audit failed closed"))?;
-    let policy = storage
-        .evaluate_custody_audit_witness_receipt_policy(
+    let readiness = storage
+        .audit_custody_audit_witness_receipt_readiness(
             &producer,
             anchor.checkpoint_generation,
             &anchor_sha256,
@@ -2538,7 +2530,9 @@ async fn cmd_relay_import_audit_witness(
             max_age_seconds,
         )
         .await
-        .map_err(|_| anyhow::anyhow!("custody witness receipt policy audit failed closed"))?;
+        .map_err(|_| anyhow::anyhow!("custody witness readiness audit failed closed"))?;
+    let vault = readiness.vault;
+    let policy = readiness.policy;
     let status = custody_audit_witness_policy_status(&policy);
     let report = RelayCustodyAuditWitnessImportReport {
         contract_version: "relay_custody_audit_witness_import.v1",
@@ -4497,33 +4491,60 @@ mod tests {
         // [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Monitoring labels
         // must not depend on count ordering: readiness wins only when the full
         // policy says so, while any unresolved adverse evidence is explicit.
-        let collecting = CustodyAuditWitnessReceiptPolicyEvidence::default();
+        let collecting = CustodyAuditWitnessReceiptPolicyEvidence {
+            configured: 1,
+            missing: 1,
+            minimum_verified: 1,
+            ..CustodyAuditWitnessReceiptPolicyEvidence::default()
+        };
         assert_eq!(
             custody_audit_witness_policy_status(&collecting),
             "collecting"
         );
 
         let adverse = CustodyAuditWitnessReceiptPolicyEvidence {
+            configured: 1,
+            fresh_verified: 1,
             adverse: 1,
+            minimum_verified: 1,
             ..CustodyAuditWitnessReceiptPolicyEvidence::default()
         };
         assert_eq!(custody_audit_witness_policy_status(&adverse), "adverse");
 
         let inconsistent = CustodyAuditWitnessReceiptPolicyEvidence {
-            adverse: 1,
-            quorum_satisfied: true,
+            configured: 1,
+            fresh_verified: 1,
+            accepted: 1,
+            minimum_verified: 1,
             ..CustodyAuditWitnessReceiptPolicyEvidence::default()
         };
         assert_eq!(
             custody_audit_witness_policy_status(&inconsistent),
-            "adverse"
+            "invalid"
         );
 
         let ready = CustodyAuditWitnessReceiptPolicyEvidence {
+            configured: 1,
+            fresh_verified: 1,
+            accepted: 1,
+            minimum_verified: 1,
             quorum_satisfied: true,
             ..CustodyAuditWitnessReceiptPolicyEvidence::default()
         };
         assert_eq!(custody_audit_witness_policy_status(&ready), "ready");
+
+        let threshold = CustodyAuditWitnessReceiptPolicyEvidence {
+            configured: 2,
+            fresh_verified: 1,
+            accepted: 1,
+            missing: 1,
+            minimum_verified: 2,
+            ..CustodyAuditWitnessReceiptPolicyEvidence::default()
+        };
+        assert_eq!(
+            custody_audit_witness_policy_status(&threshold),
+            "collecting"
+        );
     }
 
     #[test]

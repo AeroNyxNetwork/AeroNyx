@@ -376,6 +376,9 @@
 // 141. [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Optionally requires
 //      fresh exact-anchor signed receipts from independent operator pins before
 //      PeerStore bootstrap or listeners, with no startup network transmission.
+// 142. [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Consumes one
+//      typed SQLite snapshot for both vault audit telemetry and startup policy,
+//      preventing CLI/runtime interpretation or snapshot drift.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -434,6 +437,8 @@
 //   - Custody-receipt strict startup is local-only and default-off. It must
 //     hold the maintenance anchor guard, audit the complete durable vault, and
 //     reject future-dated evidence beyond the fixed clock-skew allowance.
+//   - Custody readiness counters are not an open-coded API. Startup and tools
+//     must use the typed atomic snapshot and reject inconsistent aggregates.
 //   - Certificate exchange is post-startup evidence transport only. Never use
 //     an imported historical bundle to satisfy the live startup witness gate.
 //   - Follower certificate synchronization runs only after signed convergence.
@@ -931,8 +936,8 @@ use crate::services::memchain::EmbedEngine;
 use crate::services::memchain::NerEngine;
 use crate::services::memchain::RerankerEngine;
 use crate::services::memchain::{
-    ensure_volumes_config, CustodyAuditWitnessReceiptPolicyEvidence, StoragePool, SystemDb,
-    VectorIndexPool, VolumeRouter,
+    ensure_volumes_config, CustodyAuditWitnessPolicyReadiness, CustodyAuditWitnessReadinessError,
+    StoragePool, SystemDb, VectorIndexPool, VolumeRouter,
 };
 #[allow(deprecated)]
 use crate::services::memchain::{AofWriter, MemPool, MemoryStorage, VectorIndex};
@@ -2467,18 +2472,19 @@ impl std::fmt::Display for CustodyWitnessStartupBlockReason {
 }
 
 const fn custody_witness_startup_decision(
-    evidence: &CustodyAuditWitnessReceiptPolicyEvidence,
+    readiness: CustodyAuditWitnessPolicyReadiness,
 ) -> std::result::Result<(), CustodyWitnessStartupBlockReason> {
-    if evidence.adverse > 0 {
-        return Err(CustodyWitnessStartupBlockReason::AdverseEvidence);
-    }
-    if evidence.quorum_satisfied {
-        return Ok(());
-    }
-    if evidence.fresh_verified == 0 {
-        Err(CustodyWitnessStartupBlockReason::EvidenceUnavailable)
-    } else {
-        Err(CustodyWitnessStartupBlockReason::ThresholdUnmet)
+    match readiness {
+        CustodyAuditWitnessPolicyReadiness::Ready => Ok(()),
+        CustodyAuditWitnessPolicyReadiness::EvidenceUnavailable => {
+            Err(CustodyWitnessStartupBlockReason::EvidenceUnavailable)
+        }
+        CustodyAuditWitnessPolicyReadiness::ThresholdUnmet => {
+            Err(CustodyWitnessStartupBlockReason::ThresholdUnmet)
+        }
+        CustodyAuditWitnessPolicyReadiness::AdverseEvidence => {
+            Err(CustodyWitnessStartupBlockReason::AdverseEvidence)
+        }
     }
 }
 
@@ -4499,14 +4505,10 @@ impl Server {
         .map_err(|_| fail(CustodyWitnessStartupBlockReason::CurrentAnchorUnavailable))?;
         let anchor_sha256 = custody_audit_anchor_frame_sha256(anchor_guard.anchor())
             .map_err(|_| fail(CustodyWitnessStartupBlockReason::CurrentAnchorUnavailable))?;
-        let vault = storage
-            .audit_custody_audit_witness_receipt_evidence()
-            .await
-            .map_err(|_| fail(CustodyWitnessStartupBlockReason::ReceiptVaultInvalid))?;
         let witness_node_ids = self.config.discovery.custody_audit_witness_node_id_bytes();
         let evaluated_at = unix_now_secs();
-        let evidence = storage
-            .evaluate_custody_audit_witness_receipt_policy(
+        let snapshot = storage
+            .audit_custody_audit_witness_receipt_readiness(
                 &self.identity.public_key_bytes(),
                 anchor_guard.anchor().checkpoint_generation,
                 &anchor_sha256,
@@ -4516,8 +4518,17 @@ impl Server {
                 self.config.discovery.custody_audit_witness_max_age_secs,
             )
             .await
-            .map_err(|_| fail(CustodyWitnessStartupBlockReason::ReceiptPolicyInvalid))?;
-        custody_witness_startup_decision(&evidence).map_err(fail)?;
+            .map_err(|error| match error {
+                CustodyAuditWitnessReadinessError::VaultInvalid => {
+                    fail(CustodyWitnessStartupBlockReason::ReceiptVaultInvalid)
+                }
+                CustodyAuditWitnessReadinessError::PolicyInvalid => {
+                    fail(CustodyWitnessStartupBlockReason::ReceiptPolicyInvalid)
+                }
+            })?;
+        custody_witness_startup_decision(snapshot.readiness).map_err(fail)?;
+        let vault = snapshot.vault;
+        let evidence = snapshot.policy;
         info!(
             checkpoint_generation = anchor_guard.anchor().checkpoint_generation,
             vault_records = vault.records,
@@ -14285,6 +14296,8 @@ impl std::fmt::Debug for Server {
 
 #[cfg(test)]
 mod tests {
+    use crate::services::memchain::CustodyAuditWitnessPolicyReadiness;
+
     use super::{
         await_commitment_tip_announcement_or_newer,
         commitment_coordinator_lease_degraded_retry_delay,
@@ -15910,8 +15923,6 @@ mod tests {
 
     #[test]
     fn custody_witness_startup_gate_requires_clean_current_anchor_quorum() {
-        use crate::services::memchain::CustodyAuditWitnessReceiptPolicyEvidence;
-
         // [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Authentic
         // adverse evidence always wins over count, while absence and partial
         // coverage remain distinct privacy-safe operator diagnostics.
@@ -15920,43 +15931,23 @@ mod tests {
             "receipt_vault_invalid"
         );
         assert_eq!(
-            custody_witness_startup_decision(&CustodyAuditWitnessReceiptPolicyEvidence::default()),
+            custody_witness_startup_decision(
+                CustodyAuditWitnessPolicyReadiness::EvidenceUnavailable
+            ),
             Err(CustodyWitnessStartupBlockReason::EvidenceUnavailable)
         );
-        let partial = CustodyAuditWitnessReceiptPolicyEvidence {
-            configured: 2,
-            fresh_verified: 1,
-            accepted: 1,
-            missing: 1,
-            minimum_verified: 2,
-            ..CustodyAuditWitnessReceiptPolicyEvidence::default()
-        };
         assert_eq!(
-            custody_witness_startup_decision(&partial),
+            custody_witness_startup_decision(CustodyAuditWitnessPolicyReadiness::ThresholdUnmet),
             Err(CustodyWitnessStartupBlockReason::ThresholdUnmet)
         );
-        let adverse = CustodyAuditWitnessReceiptPolicyEvidence {
-            configured: 2,
-            fresh_verified: 2,
-            accepted: 1,
-            adverse: 1,
-            minimum_verified: 1,
-            quorum_satisfied: true,
-            ..CustodyAuditWitnessReceiptPolicyEvidence::default()
-        };
         assert_eq!(
-            custody_witness_startup_decision(&adverse),
+            custody_witness_startup_decision(CustodyAuditWitnessPolicyReadiness::AdverseEvidence),
             Err(CustodyWitnessStartupBlockReason::AdverseEvidence)
         );
-        let ready = CustodyAuditWitnessReceiptPolicyEvidence {
-            configured: 2,
-            fresh_verified: 2,
-            accepted: 2,
-            minimum_verified: 2,
-            quorum_satisfied: true,
-            ..CustodyAuditWitnessReceiptPolicyEvidence::default()
-        };
-        assert_eq!(custody_witness_startup_decision(&ready), Ok(()));
+        assert_eq!(
+            custody_witness_startup_decision(CustodyAuditWitnessPolicyReadiness::Ready),
+            Ok(())
+        );
     }
 
     #[test]
