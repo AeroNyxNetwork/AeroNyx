@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Document the default-off
+#   local receipt threshold that can block startup without network I/O.
 # - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Document the
 #   explicit signed-snapshot network collection command and its non-scheduled
 #   transport boundary.
@@ -202,10 +204,10 @@ verified_delivery_witness_required_for_restore = false
 # discovery. List only requester node identities this node explicitly agrees
 # to protect. Empty means the witness endpoint refuses every write.
 verified_delivery_witness_requester_node_ids = []
-# [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Producer-side independent
-# custody witness candidates. Startup evaluates only fresh authenticated
-# EncryptedStorage descriptors with public-safe endpoints and logs aggregate
-# readiness. An explicitly invoked durable round stores canonical signed
+# [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Producer-side independent
+# custody witness candidates. PeerStore startup planning evaluates fresh
+# authenticated EncryptedStorage descriptors with public-safe endpoints and
+# logs aggregate readiness. An explicitly invoked durable round stores signed
 # receipts in a bounded local vault and revalidates them after restart. The
 # host-local import command accepts only a current producer checkpoint and a
 # witness from this pin set; it does not contact the witness over the network.
@@ -222,6 +224,15 @@ custody_audit_witness_node_ids = []
 # Required eligible candidates for the local dry-run plan. Valid range 1-3 and
 # never greater than custody_audit_witness_node_ids.
 custody_audit_witness_min_verified = 1
+# Default false preserves existing deployments. When true, startup regenerates
+# the exact current ChatRelay custody anchor and requires the configured count
+# of fresh accepted receipts already present in the local MemChain vault. It
+# performs no network I/O; missing, expired, conflicting, stale, gap, malformed,
+# or rollback-mismatched evidence stops startup before listeners and gossip.
+custody_audit_witness_startup_required = false
+# Current-anchor receipt freshness window. Valid range 60..=604800 seconds.
+# Positive witness clock skew is always capped separately at 60 seconds.
+custody_audit_witness_max_age_secs = 7200
 # [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] Independent producer pins for
 # POST /api/memchain/peer/custody-audit-anchor-witness. The endpoint stores
 # only producer id, monotonic generation, canonical anchor SHA-256, and time.

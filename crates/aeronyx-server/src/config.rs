@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.24.0-CustodyWitnessStartupGate - Added a default-off, local-only
+//! current-anchor receipt threshold and bounded freshness policy for startup
 //! v0.23.0-CustodyWitnessReceiptVault - Clarified that explicit durable rounds
 //! use producer pins while configuration alone never schedules transmission
 //! v0.22.0-CustodyWitnessPlanner - Added independent producer witness pins and
@@ -107,6 +109,7 @@ const MAX_VERIFIED_DELIVERY_WITNESS_NODE_IDS: usize = 3;
 const MAX_VERIFIED_DELIVERY_WITNESS_REQUESTER_NODE_IDS: usize = 64;
 const MAX_CUSTODY_AUDIT_WITNESS_NODE_IDS: usize = 3;
 const MAX_CUSTODY_AUDIT_WITNESS_REQUESTER_NODE_IDS: usize = 64;
+const MAX_CUSTODY_AUDIT_WITNESS_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_DIRECTORY_CHAIN_SYNC_PEER_NODE_IDS: usize = 16;
 const MAX_DIRECTORY_FULL_NODE_MIRROR_PRODUCERS: usize = 64;
 const MAX_DIRECTORY_GOSSIP_PROOF_MIN_AGE_SECS: u64 = 48 * 60 * 60;
@@ -305,6 +308,16 @@ pub struct DiscoveryConfig {
     /// Minimum independently eligible custody witnesses required by policy.
     #[serde(default = "DiscoveryConfig::default_custody_audit_witness_min_verified")]
     pub custody_audit_witness_min_verified: usize,
+    /// Requires fresh durable receipts for the current custody anchor at startup.
+    ///
+    /// [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] This gate is
+    /// deliberately local-only: it re-audits receipts already stored in the
+    /// node's `MemChain` database and never contacts a witness during startup.
+    #[serde(default)]
+    pub custody_audit_witness_startup_required: bool,
+    /// Maximum age of a signed receipt accepted by the startup policy.
+    #[serde(default = "DiscoveryConfig::default_custody_audit_witness_max_age_secs")]
+    pub custody_audit_witness_max_age_secs: u64,
     /// Producer identities this node explicitly agrees to witness for custody.
     ///
     /// [CUSTODY-WITNESS-NETWORK 2026-08-16 by Codex] These pins are separate
@@ -509,6 +522,12 @@ impl DiscoveryConfig {
     #[must_use]
     pub const fn default_custody_audit_witness_min_verified() -> usize {
         1
+    }
+
+    /// Default freshness window for producer-side custody witness receipts.
+    #[must_use]
+    pub const fn default_custody_audit_witness_max_age_secs() -> u64 {
+        2 * 60 * 60
     }
 
     /// Default outbound gossip interval.
@@ -888,6 +907,9 @@ impl DiscoveryConfig {
         if !self.custody_audit_witness_node_ids.is_empty()
             || self.custody_audit_witness_min_verified
                 != Self::default_custody_audit_witness_min_verified()
+            || self.custody_audit_witness_startup_required
+            || self.custody_audit_witness_max_age_secs
+                != Self::default_custody_audit_witness_max_age_secs()
         {
             if !self.enabled {
                 return Err(ServerError::config_invalid(
@@ -912,6 +934,14 @@ impl DiscoveryConfig {
                 return Err(ServerError::config_invalid(
                     "discovery.custody_audit_witness_min_verified",
                     "must be between one and the number of configured custody witnesses",
+                ));
+            }
+            if !(60..=MAX_CUSTODY_AUDIT_WITNESS_AGE_SECS)
+                .contains(&self.custody_audit_witness_max_age_secs)
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.custody_audit_witness_max_age_secs",
+                    "must be between 60 and 604800 seconds",
                 ));
             }
         }
@@ -1326,6 +1356,29 @@ impl DiscoveryConfig {
             .collect()
     }
 
+    /// Rejects a producer policy that counts this node as its own witness.
+    ///
+    /// [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Static TOML
+    /// validation cannot compare pins with the identity derived from the node
+    /// key. Startup calls this before opening protocol transports or storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when the local node identity is present
+    /// in the producer's independent custody-witness pin set.
+    pub fn validate_runtime_identity(&self, local_node_id: &[u8; 32]) -> Result<()> {
+        if self
+            .custody_audit_witness_node_id_bytes()
+            .contains(local_node_id)
+        {
+            return Err(ServerError::config_invalid(
+                "discovery.custody_audit_witness_node_ids",
+                "must not contain this node's own identity",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_seed_endpoint(endpoint: &str) -> Result<()> {
         let trimmed = endpoint.trim();
         if trimmed.is_empty() {
@@ -1377,6 +1430,8 @@ impl Default for DiscoveryConfig {
             verified_delivery_witness_requester_node_ids: Vec::new(),
             custody_audit_witness_node_ids: Vec::new(),
             custody_audit_witness_min_verified: Self::default_custody_audit_witness_min_verified(),
+            custody_audit_witness_startup_required: false,
+            custody_audit_witness_max_age_secs: Self::default_custody_audit_witness_max_age_secs(),
             custody_audit_witness_requester_node_ids: Vec::new(),
             verified_delivery_witness_min_verified:
                 Self::default_verified_delivery_witness_min_verified(),
@@ -1678,6 +1733,11 @@ mod tests {
         assert_eq!(
             config.discovery.custody_audit_witness_min_verified,
             DiscoveryConfig::default_custody_audit_witness_min_verified()
+        );
+        assert!(!config.discovery.custody_audit_witness_startup_required);
+        assert_eq!(
+            config.discovery.custody_audit_witness_max_age_secs,
+            DiscoveryConfig::default_custody_audit_witness_max_age_secs()
         );
         assert_eq!(
             config.discovery.verified_delivery_witness_min_verified,
@@ -2012,6 +2072,8 @@ custody_audit_witness_node_ids = [
   "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 ]
 custody_audit_witness_min_verified = 2
+custody_audit_witness_startup_required = true
+custody_audit_witness_max_age_secs = 3600
 verified_delivery_witness_min_verified = 2
 verified_delivery_witness_required_for_restore = true
 "#;
@@ -2037,12 +2099,22 @@ verified_delivery_witness_required_for_restore = true
             vec![[0xEE; 32], [0xFF; 32]]
         );
         assert_eq!(config.discovery.custody_audit_witness_min_verified, 2);
+        assert!(config.discovery.custody_audit_witness_startup_required);
+        assert_eq!(config.discovery.custody_audit_witness_max_age_secs, 3600);
         assert_eq!(config.discovery.verified_delivery_witness_min_verified, 2);
         assert!(
             config
                 .discovery
                 .verified_delivery_witness_required_for_restore
         );
+        assert!(config
+            .discovery
+            .validate_runtime_identity(&[0xAB; 32])
+            .is_ok());
+        assert!(config
+            .discovery
+            .validate_runtime_identity(&[0xEE; 32])
+            .is_err());
     }
 
     #[test]
@@ -2167,6 +2239,42 @@ custody_audit_witness_node_ids = [
 custody_audit_witness_min_verified = 2
 "#;
         assert!(ServerConfig::from_str(impossible_custody_quorum).is_err());
+
+        // [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Strict startup
+        // cannot be enabled without pins, and freshness is bounded to the
+        // same seven-day operational ceiling as explicit receipt import.
+        let strict_custody_without_pins = r#"
+[memchain]
+mode = "local"
+
+[memchain.chat_relay]
+enabled = true
+
+[discovery]
+enabled = true
+custody_audit_witness_startup_required = true
+"#;
+        assert!(ServerConfig::from_str(strict_custody_without_pins).is_err());
+
+        for invalid_age in [59, MAX_CUSTODY_AUDIT_WITNESS_AGE_SECS + 1] {
+            let invalid_freshness = format!(
+                r#"
+[memchain]
+mode = "local"
+
+[memchain.chat_relay]
+enabled = true
+
+[discovery]
+enabled = true
+custody_audit_witness_node_ids = [
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+]
+custody_audit_witness_max_age_secs = {invalid_age}
+"#
+            );
+            assert!(ServerConfig::from_str(&invalid_freshness).is_err());
+        }
 
         let custody_without_relay = r#"
 [memchain]

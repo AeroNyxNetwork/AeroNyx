@@ -90,6 +90,9 @@
 //! - [FOLLOWER-POLICY-STARTUP-GATE 2026-08-14 by Codex] Retains one bounded,
 //!   identity-blind diagnostic when typed follower carrier policy construction
 //!   fails before its required runtime task is spawned
+//! - [CUSTODY-WITNESS-TIME-HARDENING 2026-08-18 by Codex] Uses one-sided
+//!   receipt age with a bounded future-clock tolerance so imported future
+//!   timestamps cannot extend startup evidence freshness.
 //! - [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Runs signed local-anchor
 //!   writes through one privacy-safe blocking worker boundary.
 //!
@@ -2746,6 +2749,7 @@ fn insert_trusted_checkpoint_divergence_incident(
 
 const LIVE_CUSTODY_WITNESS_RECEIPT_MAX_DELAY_SECS: u64 = 60;
 const MAX_OPERATOR_CUSTODY_WITNESS_RECEIPT_IMPORT_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const CUSTODY_WITNESS_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 60;
 const CUSTODY_WITNESS_RECEIPT_ADMISSION_LIVE: i64 = 0;
 const CUSTODY_WITNESS_RECEIPT_ADMISSION_OPERATOR_IMPORT: i64 = 1;
 
@@ -2777,6 +2781,23 @@ struct PreparedCustodyAuditWitnessReceipt {
     admission_max_delay_secs: i64,
 }
 
+/// Applies one-sided freshness while tolerating only bounded positive skew.
+///
+/// [CUSTODY-WITNESS-TIME-HARDENING 2026-08-18 by Codex] `abs_diff` made an
+/// operator import window double as a future-clock allowance. Keep the wider
+/// window exclusively for delayed past evidence and cap future observations
+/// independently at the live transport skew budget.
+const fn custody_witness_receipt_time_is_admissible(
+    reference_at: u64,
+    observed_at: u64,
+    max_past_age_secs: u64,
+) -> bool {
+    reference_at > 0
+        && observed_at > 0
+        && observed_at <= reference_at.saturating_add(CUSTODY_WITNESS_RECEIPT_MAX_FUTURE_SKEW_SECS)
+        && reference_at.saturating_sub(observed_at) <= max_past_age_secs
+}
+
 fn prepare_custody_audit_witness_receipt(
     receipt: &CustodyAuditWitnessReceiptV1,
     expected_producer: &[u8; 32],
@@ -2791,7 +2812,11 @@ fn prepare_custody_audit_witness_receipt(
         || expected_generation == 0
         || persisted_at == 0
         || expected_generation > i64::MAX as u64
-        || persisted_at.abs_diff(receipt.observed_at) > admission.max_delay_secs()
+        || !custody_witness_receipt_time_is_admissible(
+            persisted_at,
+            receipt.observed_at,
+            admission.max_delay_secs(),
+        )
         || receipt.witness_node_id == *expected_producer
     {
         return Err("custody witness receipt persistence policy is invalid".to_string());
@@ -3033,9 +3058,11 @@ fn audit_custody_audit_witness_receipt_snapshot(
             row.admission_kind,
             row.admission_max_delay_secs,
         )?;
-        if persisted_at == 0
-            || persisted_at.abs_diff(receipt.observed_at) > admission.max_delay_secs()
-        {
+        if !custody_witness_receipt_time_is_admissible(
+            persisted_at,
+            receipt.observed_at,
+            admission.max_delay_secs(),
+        ) {
             return Err("custody witness receipt persistence time is inconsistent".to_string());
         }
         if exact_32_bytes(&row.producer, "custody witness receipt producer")?
@@ -3308,14 +3335,21 @@ impl MemoryStorage {
         }
         evidence.configured = configured.len();
 
-        let mut conn = self.conn.lock().await;
-        let transaction = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
-            .map_err(|error| format!("begin custody witness receipt policy audit: {error}"))?;
-        let (_, receipts) = audit_custody_audit_witness_receipt_snapshot(&transaction)?;
-        transaction
-            .commit()
-            .map_err(|error| format!("finish custody witness receipt policy audit: {error}"))?;
+        // [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Release the
+        // SQLite mutex after the canonical snapshot is copied. Signature and
+        // policy evaluation are CPU-only and must not extend storage lock time.
+        let receipts = {
+            let mut conn = self.conn.lock().await;
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| format!("begin custody witness receipt policy audit: {error}"))?;
+            let (_, receipts) = audit_custody_audit_witness_receipt_snapshot(&transaction)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("finish custody witness receipt policy audit: {error}"))?;
+            drop(conn);
+            receipts
+        };
 
         let mut latest = HashMap::<[u8; 32], LatestCustodyAuditWitnessDecision>::new();
         for receipt in receipts {
@@ -3323,7 +3357,11 @@ impl MemoryStorage {
                 || receipt.requested_checkpoint_generation != requested_generation
                 || receipt.requested_frame_sha256 != *requested_frame_sha256
                 || !configured.contains(&receipt.witness_node_id)
-                || now.abs_diff(receipt.observed_at) > max_age_secs
+                || !custody_witness_receipt_time_is_admissible(
+                    now,
+                    receipt.observed_at,
+                    max_age_secs,
+                )
             {
                 continue;
             }
@@ -9236,6 +9274,9 @@ mod tests {
         // [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Manual transfer
         // may exceed the live 60-second window, but must retain the real import
         // time, reject clock rollback/future evidence, and remain idempotent.
+        // [CUSTODY-WITNESS-TIME-HARDENING 2026-08-18 by Codex] The manual
+        // import age applies only to past evidence. Positive skew remains
+        // bounded to 60 seconds regardless of the configured import window.
         let producer = IdentityKeyPair::from_bytes(&[0x7d; 32]).unwrap();
         let witness = IdentityKeyPair::from_bytes(&[0x7e; 32]).unwrap();
         let producer_id = producer.public_key_bytes();
@@ -9253,6 +9294,27 @@ mod tests {
         )
         .unwrap();
         let storage = MemoryStorage::open(":memory:", None).unwrap();
+
+        assert!(custody_witness_receipt_time_is_admissible(
+            observed_at,
+            observed_at + CUSTODY_WITNESS_RECEIPT_MAX_FUTURE_SKEW_SECS,
+            300,
+        ));
+        assert!(!custody_witness_receipt_time_is_admissible(
+            observed_at,
+            observed_at + CUSTODY_WITNESS_RECEIPT_MAX_FUTURE_SKEW_SECS + 1,
+            300,
+        ));
+        assert!(custody_witness_receipt_time_is_admissible(
+            observed_at,
+            observed_at - 300,
+            300,
+        ));
+        assert!(!custody_witness_receipt_time_is_admissible(
+            observed_at,
+            observed_at - 301,
+            300,
+        ));
 
         assert!(storage
             .persist_custody_audit_witness_receipt(
@@ -9299,6 +9361,17 @@ mod tests {
                 1,
                 &frame_sha256,
                 observed_at - 301,
+                300,
+            )
+            .await
+            .is_err());
+        assert!(storage
+            .import_custody_audit_witness_receipt(
+                &receipt,
+                &producer_id,
+                1,
+                &frame_sha256,
+                observed_at - CUSTODY_WITNESS_RECEIPT_MAX_FUTURE_SKEW_SECS - 1,
                 300,
             )
             .await

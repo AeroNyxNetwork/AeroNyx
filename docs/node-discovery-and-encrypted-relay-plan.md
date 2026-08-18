@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.00.0 - Added aggregate current-checkpoint witness-vault
-auditing with an explicit readiness exit and no network transmission.
+Modification Reason: v1.02.0 - Added a default-off local custody-receipt
+startup gate and one-sided freshness hardening without startup transmission.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.01.0 - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Runs one explicit signed-snapshot-pinned witness round, persists every verified receipt before counting it, and re-audits current-checkpoint readiness without enabling a scheduler.
+Last Modified: v1.02.0 - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Optionally blocks startup unless the exact current custody anchor has enough fresh durable signed receipts and no adverse evidence, without contacting witnesses.
+Previous: v1.01.0 - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Runs one explicit signed-snapshot-pinned witness round, persists every verified receipt before counting it, and re-audits current-checkpoint readiness without enabling a scheduler.
 Previous: v1.00.0 - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Re-audits the complete local receipt vault against the current custody checkpoint with an optional fail-closed operator readiness exit.
 Previous: v0.99.0 - [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Imports operator-carried signed receipts only for the current local checkpoint and preserves their typed admission policy for restart audit.
 Previous: v0.98.0 - [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] Persists exact portable witness receipts atomically, revalidates every frame after restart, and reconstructs fresh exact-anchor policy without exposing custody contents.
@@ -134,6 +135,35 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.02 Current custody evidence can become a strict startup invariant
+
+[CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex]
+
+- `discovery.custody_audit_witness_startup_required` is default-off. Existing
+  nodes preserve availability until an operator explicitly enables the gate
+  after collecting and auditing compatible independent receipts.
+- Strict evaluation runs after local MemChain and ChatRelay storage open but
+  before PeerStore bootstrap, self-advertisement, any listener, gossip, or
+  background task. It performs no HTTP request and cannot derive authority
+  from permissionless discovery.
+- The node holds the cross-process custody maintenance lock, regenerates the
+  exact current producer-signed anchor, audits every canonical receipt in the
+  bounded vault, and reconstructs policy from distinct configured witness
+  identities. A self witness is rejected before storage or transports open.
+- Startup fails closed for an unavailable current anchor, malformed vault,
+  invalid policy, absent/expired evidence, threshold shortfall, or authentic
+  stale/conflict/gap evidence. Accepted count can never outvote an adverse
+  receipt for the exact current anchor.
+- `custody_audit_witness_max_age_secs` is bounded to 60 seconds through seven
+  days and defaults to two hours. Freshness is one-sided: delayed past evidence
+  may use the configured window, but future observations receive at most 60
+  seconds of clock-skew tolerance. This closes the prior `abs_diff` behavior
+  that could let an imported future timestamp extend apparent readiness.
+- Passing the gate proves only that the configured independent nodes signed
+  the exact opaque custody checkpoint recently. It does not prove message
+  storage, availability, consensus, finality, validator voting, or fork choice,
+  and it reveals no message, user, route, payload, destination, or social graph.
 
 ### v1.01 Witness collection is explicit, pinned, and durable
 

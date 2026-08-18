@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Document the opt-in,
+  network-silent fail-closed startup gate and one-sided receipt freshness.
 - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Document explicit,
   signed-snapshot-pinned network collection with durable receipt re-audit and
   fail-closed command status, without enabling a background scheduler.
@@ -977,6 +979,41 @@ counts. It does not expose witness identities or endpoints. This operator
 command removes manual receipt shuttling when reviewed nodes are online, but it
 does not establish consensus, finality, validator voting, fork choice, or
 automatic startup transmission.
+
+After a reviewed deployment has collected enough current-anchor receipts, an
+operator may make that evidence mandatory for later starts:
+
+```toml
+[discovery]
+custody_audit_witness_node_ids = [
+  "<reviewed-independent-witness-ed25519-node-id-hex>",
+]
+custody_audit_witness_min_verified = 1
+custody_audit_witness_startup_required = true
+custody_audit_witness_max_age_secs = 7200
+```
+
+<!-- [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] -->
+The default remains `false`. Strict startup regenerates the exact current
+ChatRelay custody anchor while holding the cross-process maintenance lock,
+cryptographically audits every durable receipt, and evaluates only distinct
+configured witnesses whose signed receipt matches that exact anchor. It runs
+before PeerStore bootstrap, listeners, self-advertisement, gossip, or runtime
+tasks and performs no network request. Permissionless peers therefore cannot
+become startup authority.
+
+Startup fails closed when the current anchor cannot be produced, the vault is
+malformed, no fresh receipt exists, the configured threshold is unmet, or an
+authentic `stale`, `conflict`, or `gap` decision exists for the current anchor.
+Rolling the host back to an older custody checkpoint also changes the exact
+anchor policy and leaves newer witness receipts unable to authorize it.
+
+Receipt age is one-sided. The configured window accepts delayed past evidence;
+it does not permit a future timestamp to extend readiness. At most 60 seconds
+of positive clock skew is tolerated for both live and operator-imported
+receipts. Keep node clocks synchronized and collect a new receipt after the
+current immutable custody checkpoint advances. Always validate this rollout
+with `audit-witness-vault --require-ready` before changing the flag to `true`.
 
 Re-audit the current checkpoint after restart or before a maintenance window:
 
