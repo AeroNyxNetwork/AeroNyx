@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.06.0 - Added an exact aggregate custody quorum expiry
-horizon and local-only renewal warning before strict readiness is lost.
+Modification Reason: v1.07.0 - Added a process-local edge-triggered custody
+renewal warning and recovery lifecycle without new data or network surfaces.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.06.0 - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Derives the threshold set's exact aggregate lifetime and warns locally before expiry without contacting witnesses or changing authority.
+Last Modified: v1.07.0 - [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Emits one warning per expiring quorum horizon and one recovery event after explicit evidence refresh, without new APIs or heartbeat fields.
+Previous: v1.06.0 - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Derives the threshold set's exact aggregate lifetime and warns locally before expiry without contacting witnesses or changing authority.
 Previous: v1.05.0 - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Reuses exact startup readiness during runtime and triggers controlled process recovery when local durable evidence expires, changes, or fails audit, without contacting witnesses.
 Previous: v1.04.0 - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Copies a bounded immutable receipt snapshot under SQLite and performs read-only cryptographic verification after releasing the connection lock.
 Previous: v1.03.0 - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Makes startup and operator tools consume one cryptographically audited SQLite snapshot and one typed readiness decision.
@@ -139,6 +140,22 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.07 Custody renewal warnings have a bounded local lifecycle
+
+[CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex]
+
+- The runtime uses the aggregate `quorum_valid_through` value as a local
+  incident key. One horizon emits `receipt_renewal_required` once; repeated
+  timer observations remain debug-only instead of flooding the journal.
+- Explicitly refreshed signed receipts may create a newer horizon. If it leaves
+  the warning window, the runtime emits `receipt_renewal_recovered` once. If it
+  remains near expiry, the new horizon opens one new warning.
+- The state machine is process-local. It adds no endpoint, heartbeat field,
+  CMS payload, storage row, witness request, automatic scheduler, trust-policy
+  mutation, consensus claim, or finality claim.
+- Expiry, adverse evidence, threshold loss, vault failure, and current-anchor
+  failure continue through the existing supervised fail-closed shutdown path.
 
 ### v1.06 Custody quorum expiry is exact and locally actionable
 

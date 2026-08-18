@@ -6,6 +6,8 @@
 #   commercial AeroNyx privacy nodes.
 #
 # Modification Reason:
+# - [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Clarify edge-triggered
+#   renewal warning and recovery behavior.
 # - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Clarify local pre-expiry
 #   warnings derived from the exact accepted threshold set.
 # - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Document the separate
@@ -73,6 +75,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.18.0-node-deploy - Documented custody renewal warning lifecycle.
 # v1.17.0-node-deploy - Documented custody quorum expiry warning behavior.
 # v1.16.0-node-deploy - Documented strict runtime custody witness re-auditing.
 # v1.15.0-node-deploy - Documented explicit durable witness collection.
@@ -242,6 +245,8 @@ custody_audit_witness_startup_required = false
 # the existing runtime supervisor to stop the process when readiness is lost.
 # Before expiry it emits aggregate-only `receipt_renewal_required` telemetry;
 # this warning never contacts witnesses or changes the configured trust policy.
+# Each expiry horizon warns once; a later healthy explicit refresh emits one
+# `receipt_renewal_recovered` event. Actual audit failure still stops the node.
 custody_audit_witness_runtime_required = false
 # Current-anchor receipt freshness window. Valid range 60..=604800 seconds.
 # Positive witness clock skew is always capped separately at 60 seconds.

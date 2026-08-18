@@ -386,6 +386,9 @@
 // 144. [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Derives the exact aggregate
 //      lifetime of the accepted receipt threshold and warns locally before the
 //      strict runtime gate reaches its fail-closed boundary.
+// 145. [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Edge-triggers local
+//      renewal warnings, suppresses duplicate warning spam for the same quorum
+//      horizon, and records recovery after explicit evidence refresh.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -566,6 +569,8 @@
 //     installation but the checkpoint table is absent, startup must fail.
 //
 // Last Modified:
+//   [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Added a process-local
+//     renewal warning/recovery state machine without networking or new APIs.
 //   [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Added local-only exact quorum
 //     expiry telemetry and a bounded pre-expiry operator warning window.
 //   [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Added a default-off,
@@ -2521,6 +2526,40 @@ struct CustodyWitnessRenewalStatus {
     valid_for_secs: u64,
     warning_window_secs: u64,
     renewal_recommended: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustodyWitnessRenewalLogAction {
+    Healthy,
+    WarningEntered,
+    WarningSuppressed,
+    Recovered,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CustodyWitnessRenewalLogState {
+    warned_valid_through: Option<u64>,
+}
+
+impl CustodyWitnessRenewalLogState {
+    fn observe(&mut self, renewal: CustodyWitnessRenewalStatus) -> CustodyWitnessRenewalLogAction {
+        // [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] The aggregate expiry
+        // horizon is a stable incident key. Repeated timer observations for
+        // that horizon stay debug-only, while a refreshed horizon may open a
+        // new warning or close the prior one explicitly.
+        if renewal.renewal_recommended {
+            if self.warned_valid_through == Some(renewal.valid_through) {
+                CustodyWitnessRenewalLogAction::WarningSuppressed
+            } else {
+                self.warned_valid_through = Some(renewal.valid_through);
+                CustodyWitnessRenewalLogAction::WarningEntered
+            }
+        } else if self.warned_valid_through.take().is_some() {
+            CustodyWitnessRenewalLogAction::Recovered
+        } else {
+            CustodyWitnessRenewalLogAction::Healthy
+        }
+    }
 }
 
 /// Derives a bounded cadence from the operator's receipt freshness policy.
@@ -4703,6 +4742,7 @@ impl Server {
                 freshness_window_secs = config.discovery.custody_audit_witness_max_age_secs,
                 "[CHAT_RELAY] Runtime custody witness guard started"
             );
+            let mut renewal_log_state = CustodyWitnessRenewalLogState::default();
 
             loop {
                 tokio::select! {
@@ -4739,29 +4779,53 @@ impl Server {
                                     let _ = shutdown_rx.recv().await;
                                     return;
                                 };
-                                if renewal.renewal_recommended {
-                                    warn!(
-                                        reason = "receipt_renewal_required",
-                                        checkpoint_generation = audit.checkpoint_generation,
-                                        quorum_valid_through = renewal.valid_through,
-                                        quorum_valid_for_secs = renewal.valid_for_secs,
-                                        warning_window_secs = renewal.warning_window_secs,
-                                        fresh_verified = evidence.fresh_verified,
-                                        accepted = evidence.accepted,
-                                        minimum_verified = evidence.minimum_verified,
-                                        "[CHAT_RELAY] Custody witness evidence is approaching expiry"
-                                    );
-                                } else {
-                                    debug!(
-                                        checkpoint_generation = audit.checkpoint_generation,
-                                        vault_records = vault.records,
-                                        fresh_verified = evidence.fresh_verified,
-                                        accepted = evidence.accepted,
-                                        minimum_verified = evidence.minimum_verified,
-                                        quorum_valid_through = renewal.valid_through,
-                                        quorum_valid_for_secs = renewal.valid_for_secs,
-                                        "[CHAT_RELAY] Runtime custody witness guard passed"
-                                    );
+                                match renewal_log_state.observe(renewal) {
+                                    CustodyWitnessRenewalLogAction::WarningEntered => {
+                                        warn!(
+                                            reason = "receipt_renewal_required",
+                                            checkpoint_generation = audit.checkpoint_generation,
+                                            quorum_valid_through = renewal.valid_through,
+                                            quorum_valid_for_secs = renewal.valid_for_secs,
+                                            warning_window_secs = renewal.warning_window_secs,
+                                            fresh_verified = evidence.fresh_verified,
+                                            accepted = evidence.accepted,
+                                            minimum_verified = evidence.minimum_verified,
+                                            "[CHAT_RELAY] Custody witness evidence is approaching expiry"
+                                        );
+                                    }
+                                    CustodyWitnessRenewalLogAction::Recovered => {
+                                        info!(
+                                            reason = "receipt_renewal_recovered",
+                                            checkpoint_generation = audit.checkpoint_generation,
+                                            quorum_valid_through = renewal.valid_through,
+                                            quorum_valid_for_secs = renewal.valid_for_secs,
+                                            fresh_verified = evidence.fresh_verified,
+                                            accepted = evidence.accepted,
+                                            minimum_verified = evidence.minimum_verified,
+                                            "[CHAT_RELAY] Custody witness evidence freshness recovered"
+                                        );
+                                    }
+                                    CustodyWitnessRenewalLogAction::WarningSuppressed => {
+                                        debug!(
+                                            reason = "receipt_renewal_pending",
+                                            checkpoint_generation = audit.checkpoint_generation,
+                                            quorum_valid_through = renewal.valid_through,
+                                            quorum_valid_for_secs = renewal.valid_for_secs,
+                                            "[CHAT_RELAY] Custody witness renewal warning already active"
+                                        );
+                                    }
+                                    CustodyWitnessRenewalLogAction::Healthy => {
+                                        debug!(
+                                            checkpoint_generation = audit.checkpoint_generation,
+                                            vault_records = vault.records,
+                                            fresh_verified = evidence.fresh_verified,
+                                            accepted = evidence.accepted,
+                                            minimum_verified = evidence.minimum_verified,
+                                            quorum_valid_through = renewal.valid_through,
+                                            quorum_valid_for_secs = renewal.valid_for_secs,
+                                            "[CHAT_RELAY] Runtime custody witness guard passed"
+                                        );
+                                    }
                                 }
                             }
                             Err(reason) => {
@@ -14563,7 +14627,8 @@ mod tests {
         CommitmentFollowerRoundOutcome, CommitmentSyncTaskLivenessGuard,
         CommitmentTipAnnouncementWaitOutcome, CommitmentWitnessStartupBlockReason,
         CommitmentWitnessStartupDecision, CriticalRuntimeFailure, CustodyWitnessAuditEvidence,
-        CustodyWitnessReadinessBlockReason, DataPlaneReceiveFailureAction,
+        CustodyWitnessReadinessBlockReason, CustodyWitnessRenewalLogAction,
+        CustodyWitnessRenewalLogState, CustodyWitnessRenewalStatus, DataPlaneReceiveFailureAction,
         DirectPeerRelayAckFailure, DirectoryChainStore, DirectoryProofGossipOutcome,
         DirectoryProofGossipPeerState, DirectoryProofGossipResult, DiscoveryGossipExecution,
         DiscoveryGossipFailure, DiscoveryGossipFailureKind, DiscoveryGossipPhase,
@@ -16205,7 +16270,7 @@ mod tests {
     }
 
     #[test]
-    fn custody_witness_runtime_audit_cadence_is_bounded() {
+    fn custody_witness_runtime_cadence_and_renewal_lifecycle_are_bounded() {
         // [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Small
         // freshness windows cannot create a hot loop and large windows cannot
         // defer detection beyond five minutes.
@@ -16243,6 +16308,53 @@ mod tests {
         assert_eq!(warning.valid_for_secs, 100);
         assert_eq!(warning.warning_window_secs, 100);
         assert!(warning.renewal_recommended);
+
+        // [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] One expiry horizon
+        // opens one warning. Explicitly refreshed evidence either opens a new
+        // horizon warning or closes the incident when it is healthy again.
+        let healthy = CustodyWitnessRenewalStatus {
+            valid_through: 1_200,
+            valid_for_secs: 300,
+            warning_window_secs: 100,
+            renewal_recommended: false,
+        };
+        let refreshed_warning = CustodyWitnessRenewalStatus {
+            valid_through: 1_100,
+            valid_for_secs: 80,
+            warning_window_secs: 100,
+            renewal_recommended: true,
+        };
+        let recovered = CustodyWitnessRenewalStatus {
+            valid_through: 2_000,
+            valid_for_secs: 900,
+            warning_window_secs: 100,
+            renewal_recommended: false,
+        };
+        let mut log_state = CustodyWitnessRenewalLogState::default();
+        assert_eq!(
+            log_state.observe(healthy),
+            CustodyWitnessRenewalLogAction::Healthy
+        );
+        assert_eq!(
+            log_state.observe(warning),
+            CustodyWitnessRenewalLogAction::WarningEntered
+        );
+        assert_eq!(
+            log_state.observe(warning),
+            CustodyWitnessRenewalLogAction::WarningSuppressed
+        );
+        assert_eq!(
+            log_state.observe(refreshed_warning),
+            CustodyWitnessRenewalLogAction::WarningEntered
+        );
+        assert_eq!(
+            log_state.observe(recovered),
+            CustodyWitnessRenewalLogAction::Recovered
+        );
+        assert_eq!(
+            log_state.observe(recovered),
+            CustodyWitnessRenewalLogAction::Healthy
+        );
 
         let failure = custody_witness_runtime_failure(
             CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid,

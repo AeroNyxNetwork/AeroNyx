@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Document edge-triggered
+  renewal warnings, duplicate suppression, and explicit recovery events.
 - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Document exact aggregate
   threshold lifetime and local-only pre-expiry renewal warnings.
 - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Document the opt-in,
@@ -149,6 +151,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.60.0-node-deploy - Documented custody renewal warning lifecycle.
 v1.59.0-node-deploy - Documented custody quorum expiry preflight telemetry.
 v1.58.0-node-deploy - Documented strict runtime custody witness re-auditing.
 v1.57.0-node-deploy - Documented one-shot durable witness collection.
@@ -1085,6 +1088,16 @@ window, and `renewal_recommended`. The runtime emits the fixed local warning
 reason `receipt_renewal_required` inside that window. This is advance notice
 only: it sends no anchor, contacts no witness, changes no trust pin, and does
 not postpone the existing fail-closed boundary.
+
+<!-- [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] -->
+The runtime emits `receipt_renewal_required` once per aggregate quorum expiry
+horizon. Later timer checks for that same horizon are debug-only, preventing a
+long warning window from flooding the journal. After an operator explicitly
+imports or collects fresher signed receipts and the quorum leaves the warning
+window, the runtime emits `receipt_renewal_recovered` once. A refreshed quorum
+that is still near expiry opens one new warning for its new horizon. None of
+these transitions schedules collection, changes policy, or delays shutdown
+when the strict audit actually fails.
 
 Re-audit the current checkpoint after restart or before a maintenance window:
 
