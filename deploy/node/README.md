@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Document the bounded
+  row-copy and lock-free cryptographic verification boundary for read audits.
 - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Document that startup
   and operator status derive from one typed, cryptographically audited snapshot.
 - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Document the opt-in,
@@ -1025,6 +1027,17 @@ set, or a mismatch between the aggregate `quorum_satisfied` flag and its signed
 evidence fail closed. Existing JSON field names and `ready` / `collecting` /
 `adverse` labels remain compatible. An internal inconsistency is reported as
 `invalid` and can never satisfy `--require-ready` or process startup.
+
+<!-- [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] -->
+Read-only startup and operator audits copy at most the configured receipt-vault
+capacity from one SQLite transaction. Fixed-size index BLOBs and signed-frame
+lengths are preflighted before any row copy, so a replaced database cannot turn
+the detached snapshot into an unbounded allocation. The transaction then
+commits, releases the connection mutex, and only afterward decodes,
+canonicalizes, hashes, and verifies every signed frame. Receipt insertion still
+performs its before/after vault audits inside the `Immediate` write transaction;
+that stronger lock is required so a malformed pre-state or post-state can never
+be committed.
 
 Re-audit the current checkpoint after restart or before a maintenance window:
 

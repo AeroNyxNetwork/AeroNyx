@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.03.0 - Unified custody vault audit and exact-anchor
-policy into one typed SQLite readiness snapshot.
+Modification Reason: v1.04.0 - Moved read-only custody receipt cryptographic
+verification outside the SQLite connection lock without weakening snapshots.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.03.0 - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Makes startup and operator tools consume one cryptographically audited SQLite snapshot and one typed readiness decision.
+Last Modified: v1.04.0 - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Copies a bounded immutable receipt snapshot under SQLite and performs read-only cryptographic verification after releasing the connection lock.
+Previous: v1.03.0 - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Makes startup and operator tools consume one cryptographically audited SQLite snapshot and one typed readiness decision.
 Previous: v1.02.0 - [CUSTODY-WITNESS-STARTUP-GATE 2026-08-18 by Codex] Optionally blocks startup unless the exact current custody anchor has enough fresh durable signed receipts and no adverse evidence, without contacting witnesses.
 Previous: v1.01.0 - [CUSTODY-WITNESS-OPERATOR-COLLECT 2026-08-18 by Codex] Runs one explicit signed-snapshot-pinned witness round, persists every verified receipt before counting it, and re-audits current-checkpoint readiness without enabling a scheduler.
 Previous: v1.00.0 - [CUSTODY-WITNESS-VAULT-AUDIT 2026-08-17 by Codex] Re-audits the complete local receipt vault against the current custody checkpoint with an optional fail-closed operator readiness exit.
@@ -136,6 +137,28 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.04 Custody vault reads use a bounded two-phase audit
+
+[CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex]
+
+- Startup readiness and operator read audits first copy the complete bounded
+  raw receipt row set from one deferred SQLite transaction. The transaction is
+  committed and the connection mutex released before cryptographic work begins.
+- Decode, canonical re-encode, digest verification, signature verification,
+  redundant-column checks, receipt classification, and policy reduction operate
+  only on those immutable process-owned bytes. A later database mutation cannot
+  change the decision for the already captured snapshot.
+- The existing receipt-vault capacity remains a memory and CPU bound before any
+  rows are copied. The loader also preflights fixed-size index BLOBs and signed
+  frame lengths inside the snapshot, preventing a replaced database from
+  forcing an unbounded allocation. A corrupted count, oversized frame,
+  malformed signature, or inconsistent index still fails closed.
+- Receipt persistence deliberately keeps the full before/after audit inside its
+  `Immediate` write transaction. This is a separate mutation invariant: no
+  malformed pre-state or post-state may be committed merely to shorten a lock.
+- No database schema, public JSON field, CLI flag, startup setting, identity,
+  network frame, or compatibility contract changes in this milestone.
 
 ### v1.03 Custody readiness is one atomic typed contract
 

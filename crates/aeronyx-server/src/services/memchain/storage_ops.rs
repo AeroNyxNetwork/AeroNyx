@@ -95,6 +95,9 @@
 //!   timestamps cannot extend startup evidence freshness.
 //! - [CUSTODY-WITNESS-ATOMIC-READINESS 2026-08-18 by Codex] Derives typed
 //!   exact-anchor readiness and aggregate vault audit from one SQLite snapshot.
+//! - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Copies the bounded
+//!   receipt rows under one SQLite snapshot, then verifies them after releasing
+//!   the connection lock on read-only audit and readiness paths.
 //! - [ANCHOR-WORKER-PRIVACY 2026-07-30 by Codex] Runs signed local-anchor
 //!   writes through one privacy-safe blocking worker boundary.
 //!
@@ -3068,21 +3071,10 @@ fn exact_32_bytes(bytes: &[u8], context: &str) -> Result<[u8; 32], String> {
         .map_err(|_| format!("{context} has invalid length"))
 }
 
-/// Revalidates every retained producer-side custody witness receipt.
-///
-/// [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] The audit treats the
-/// encoded signed frame as authoritative and every SQL column as a redundant
-/// index that must match it exactly. A replaced or partially edited database
-/// therefore cannot manufacture restart readiness from denormalized columns.
-fn audit_custody_audit_witness_receipt_snapshot(
+/// Copies one bounded raw receipt snapshot without doing cryptographic work.
+fn load_custody_audit_witness_receipt_rows(
     connection: &rusqlite::Connection,
-) -> Result<
-    (
-        CustodyAuditWitnessReceiptVaultAudit,
-        Vec<CustodyAuditWitnessReceiptV1>,
-    ),
-    String,
-> {
+) -> Result<Vec<StoredCustodyAuditWitnessReceiptRow>, String> {
     let count_i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM custody_audit_witness_receipt_evidence",
@@ -3095,9 +3087,56 @@ fn audit_custody_audit_witness_receipt_snapshot(
     if count > CUSTODY_WITNESS_RECEIPT_EVIDENCE_CAPACITY {
         return Err("custody witness receipt evidence exceeds its configured capacity".to_string());
     }
+    // [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Row count alone
+    // is not a memory bound when a locally replaced database can contain an
+    // oversized BLOB. Preflight lengths in the same snapshot before Vec reads.
+    let (
+        max_receipt_digest_len,
+        max_producer_len,
+        max_witness_len,
+        max_requested_digest_len,
+        max_retained_digest_len,
+        max_receipt_frame_len,
+    ): (i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT COALESCE(MAX(length(receipt_digest)),0),
+                    COALESCE(MAX(length(producer)),0),
+                    COALESCE(MAX(length(witness)),0),
+                    COALESCE(MAX(length(requested_frame_sha256)),0),
+                    COALESCE(MAX(length(retained_frame_sha256)),0),
+                    COALESCE(MAX(length(receipt_frame)),0)
+             FROM custody_audit_witness_receipt_evidence",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("bound custody witness receipt evidence: {error}"))?;
+    if [
+        max_receipt_digest_len,
+        max_producer_len,
+        max_witness_len,
+        max_requested_digest_len,
+        max_retained_digest_len,
+    ]
+    .into_iter()
+    .any(|length| length > 32)
+    {
+        return Err("custody witness receipt indexed blob violates bounds".to_string());
+    }
+    let max_frame_bytes = i64::try_from(MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES)
+        .map_err(|_| "custody witness receipt frame bound is invalid".to_string())?;
+    if max_receipt_frame_len > max_frame_bytes {
+        return Err("custody witness receipt frame violates bounds".to_string());
+    }
 
-    let mut report = CustodyAuditWitnessReceiptVaultAudit::default();
-    let mut receipts = Vec::with_capacity(count);
     let mut statement = connection
         .prepare(
             "SELECT receipt_digest,producer,witness,requested_generation,
@@ -3128,8 +3167,34 @@ fn audit_custody_audit_witness_receipt_snapshot(
         })
         .map_err(|error| format!("query custody witness receipt audit: {error}"))?;
 
+    let mut snapshot = Vec::with_capacity(count);
     for row in rows {
-        let row = row.map_err(|error| format!("read custody witness receipt row: {error}"))?;
+        snapshot.push(row.map_err(|error| format!("read custody witness receipt row: {error}"))?);
+    }
+    if snapshot.len() != count {
+        return Err("custody witness receipt evidence count changed during audit".to_string());
+    }
+    Ok(snapshot)
+}
+
+/// Revalidates every retained producer-side custody witness receipt.
+///
+/// [CUSTODY-WITNESS-RECEIPT-VAULT 2026-08-16 by Codex] The audit treats the
+/// encoded signed frame as authoritative and every SQL column as a redundant
+/// index that must match it exactly. A replaced or partially edited database
+/// therefore cannot manufacture restart readiness from denormalized columns.
+fn audit_custody_audit_witness_receipt_rows(
+    rows: Vec<StoredCustodyAuditWitnessReceiptRow>,
+) -> Result<
+    (
+        CustodyAuditWitnessReceiptVaultAudit,
+        Vec<CustodyAuditWitnessReceiptV1>,
+    ),
+    String,
+> {
+    let mut report = CustodyAuditWitnessReceiptVaultAudit::default();
+    let mut receipts = Vec::with_capacity(rows.len());
+    for row in rows {
         if row.receipt_frame.is_empty()
             || row.receipt_frame.len() > MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES
         {
@@ -3209,10 +3274,20 @@ fn audit_custody_audit_witness_receipt_snapshot(
         );
         receipts.push(receipt);
     }
-    if receipts.len() != count {
-        return Err("custody witness receipt evidence count changed during audit".to_string());
-    }
     Ok((report, receipts))
+}
+
+/// Performs an in-transaction audit for receipt-vault mutation paths.
+fn audit_custody_audit_witness_receipt_snapshot(
+    connection: &rusqlite::Connection,
+) -> Result<
+    (
+        CustodyAuditWitnessReceiptVaultAudit,
+        Vec<CustodyAuditWitnessReceiptV1>,
+    ),
+    String,
+> {
+    audit_custody_audit_witness_receipt_rows(load_custody_audit_witness_receipt_rows(connection)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3494,19 +3569,32 @@ impl MemoryStorage {
         })
     }
 
-    /// Revalidates all retained producer-side receipt evidence in one SQLite
+    /// Revalidates all retained producer-side receipt evidence in one `SQLite`
     /// snapshot and returns aggregate-only operational state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded row snapshot cannot be read or any
+    /// retained receipt fails canonical, signature, or redundant-index audit.
     pub async fn audit_custody_audit_witness_receipt_evidence(
         &self,
     ) -> Result<CustodyAuditWitnessReceiptVaultAudit, String> {
-        let mut conn = self.conn.lock().await;
-        let transaction = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
-            .map_err(|error| format!("begin custody witness receipt audit: {error}"))?;
-        let (report, _) = audit_custody_audit_witness_receipt_snapshot(&transaction)?;
-        transaction
-            .commit()
-            .map_err(|error| format!("finish custody witness receipt audit: {error}"))?;
+        // [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] The bounded
+        // raw rows are immutable process-owned values after this block. Decode,
+        // canonicalization, digesting, and signature checks do not hold SQLite.
+        let rows = {
+            let mut conn = self.conn.lock().await;
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| format!("begin custody witness receipt audit: {error}"))?;
+            let rows = load_custody_audit_witness_receipt_rows(&transaction)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("finish custody witness receipt audit: {error}"))?;
+            drop(conn);
+            rows
+        };
+        let (report, _) = audit_custody_audit_witness_receipt_rows(rows)?;
         Ok(report)
     }
 
@@ -3570,19 +3658,21 @@ impl MemoryStorage {
         max_age_secs: u64,
     ) -> Result<CustodyAuditWitnessReceiptReadinessSnapshot, CustodyAuditWitnessReadinessError>
     {
-        let (vault, receipts) = {
+        let rows = {
             let mut conn = self.conn.lock().await;
             let transaction = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
                 .map_err(|_| CustodyAuditWitnessReadinessError::VaultInvalid)?;
-            let snapshot = audit_custody_audit_witness_receipt_snapshot(&transaction)
+            let rows = load_custody_audit_witness_receipt_rows(&transaction)
                 .map_err(|_| CustodyAuditWitnessReadinessError::VaultInvalid)?;
             transaction
                 .commit()
                 .map_err(|_| CustodyAuditWitnessReadinessError::VaultInvalid)?;
             drop(conn);
-            snapshot
+            rows
         };
+        let (vault, receipts) = audit_custody_audit_witness_receipt_rows(rows)
+            .map_err(|_| CustodyAuditWitnessReadinessError::VaultInvalid)?;
         let (policy, readiness) = evaluate_custody_audit_witness_receipts(
             receipts,
             producer,
@@ -9764,6 +9854,18 @@ mod tests {
         assert_eq!(impossible_recovery.policy.accepted, 0);
         assert_eq!(impossible_recovery.policy.adverse, 1);
         assert!(!impossible_recovery.policy.quorum_satisfied);
+        // [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Capture the
+        // exact raw snapshot, release SQLite, then prove later database edits
+        // cannot alter the detached bytes being cryptographically audited.
+        let detached_rows = {
+            let mut conn = reopened.conn_lock().await;
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .unwrap();
+            let rows = load_custody_audit_witness_receipt_rows(&transaction).unwrap();
+            transaction.commit().unwrap();
+            rows
+        };
         {
             let conn = reopened.conn_lock().await;
             conn.execute(
@@ -9772,6 +9874,10 @@ mod tests {
             )
             .unwrap();
         }
+        let (detached_audit, detached_receipts) =
+            audit_custody_audit_witness_receipt_rows(detached_rows).unwrap();
+        assert_eq!(detached_audit.records, 2);
+        assert_eq!(detached_receipts.len(), 2);
         assert!(reopened
             .audit_custody_audit_witness_receipt_evidence()
             .await
@@ -9802,6 +9908,36 @@ mod tests {
             .await
             .unwrap_err()
             .contains("persistence time is inconsistent"));
+
+        let oversized_blob = MemoryStorage::open(":memory:", None).unwrap();
+        oversized_blob
+            .persist_custody_audit_witness_receipt(
+                &receipt,
+                &producer_id,
+                1,
+                &frame_sha256,
+                observed_at,
+            )
+            .await
+            .unwrap();
+        {
+            let conn = oversized_blob.conn_lock().await;
+            let oversized_frame_bytes =
+                i64::try_from(MAX_CUSTODY_AUDIT_WITNESS_RECEIPT_FRAME_BYTES).unwrap() + 1;
+            conn.execute_batch("PRAGMA ignore_check_constraints=ON;")
+                .unwrap();
+            conn.execute(
+                "UPDATE custody_audit_witness_receipt_evidence
+                 SET receipt_frame=zeroblob(?1)",
+                params![oversized_frame_bytes],
+            )
+            .unwrap();
+        }
+        assert!(oversized_blob
+            .audit_custody_audit_witness_receipt_evidence()
+            .await
+            .unwrap_err()
+            .contains("frame violates bounds"));
 
         let mut self_receipt = receipt.clone();
         self_receipt.witness_node_id = producer_id;
