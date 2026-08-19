@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Document the
+  hard-bounded concurrent witness round and its durable-before-counting rule.
 - [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Document edge-triggered
   renewal warnings, duplicate suppression, and explicit recovery events.
 - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Document exact aggregate
@@ -151,6 +153,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.61.0-node-deploy - Documented bounded concurrent custody witness collection.
 v1.60.0-node-deploy - Documented custody renewal warning lifecycle.
 v1.59.0-node-deploy - Documented custody quorum expiry preflight telemetry.
 v1.58.0-node-deploy - Documented strict runtime custody witness re-auditing.
@@ -986,6 +989,16 @@ It exits zero only when the configured current-checkpoint threshold is ready;
 transport shortfall and all authentic `stale`, `conflict`, or `gap` evidence
 produce aggregate output followed by non-zero exit. Valid adverse receipts stay
 stored for investigation and cannot be outvoted by accepted receipts.
+
+<!-- [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] -->
+The command contacts each distinct configured witness concurrently, with the
+existing protocol limit of 16 pins as the absolute concurrency ceiling. One
+unavailable witness therefore consumes at most one configured timeout window
+instead of multiplying that window by the number of pins. Duplicate pins and
+the producer's own identity are removed before any request starts. Concurrent
+completion does not relax durability: each verified receipt must be persisted
+before it can increase the aggregate verified or accepted counts, and any
+storage failure still fails the whole command closed.
 
 The JSON contract reports only aggregate snapshot, round, vault, and policy
 counts. It does not expose witness identities or endpoints. This operator

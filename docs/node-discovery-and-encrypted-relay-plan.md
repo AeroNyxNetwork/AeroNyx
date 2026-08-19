@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.07.0 - Added a process-local edge-triggered custody
-renewal warning and recovery lifecycle without new data or network surfaces.
+Modification Reason: v1.08.0 - Made explicit custody witness collection
+concurrent under the existing 16-pin limit without changing trust or data flow.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.07.0 - [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Emits one warning per expiring quorum horizon and one recovery event after explicit evidence refresh, without new APIs or heartbeat fields.
+Last Modified: v1.08.0 - [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Bounds explicit witness collection to one concurrent request per distinct configured pin while retaining durable-before-counting and fail-closed adverse evidence.
+Previous: v1.07.0 - [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Emits one warning per expiring quorum horizon and one recovery event after explicit evidence refresh, without new APIs or heartbeat fields.
 Previous: v1.06.0 - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Derives the threshold set's exact aggregate lifetime and warns locally before expiry without contacting witnesses or changing authority.
 Previous: v1.05.0 - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Reuses exact startup readiness during runtime and triggers controlled process recovery when local durable evidence expires, changes, or fails audit, without contacting witnesses.
 Previous: v1.04.0 - [CUSTODY-WITNESS-TWO-PHASE-AUDIT 2026-08-18 by Codex] Copies a bounded immutable receipt snapshot under SQLite and performs read-only cryptographic verification after releasing the connection lock.
@@ -140,6 +141,26 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.08 Custody witness collection is concurrent but still hard-bounded
+
+[CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex]
+
+- Explicit collection de-duplicates configured witness pins and excludes the
+  producer identity before starting any request.
+- One future runs per remaining exact pin through
+  `buffer_unordered(MAX_PINNED_WITNESSES_PER_ROUND)`. The existing maximum of
+  16 pins is therefore both the policy limit and absolute concurrency ceiling.
+- A slow or unavailable witness consumes one timeout window for the round; it
+  cannot multiply maintenance-lock hold time by the configured witness count.
+- Signature, descriptor, endpoint, request binding, and exact-anchor checks are
+  unchanged. Each valid receipt is durably written before it can increment the
+  verified/accepted aggregate, and any persistence failure fails the round.
+- Authentic stale, conflict, or gap receipts remain retained adverse evidence
+  and continue to make quorum readiness fail closed. Completion order cannot
+  become voting weight, route preference, trust, consensus, or finality.
+- No scheduler, retry loop, API, heartbeat field, witness identity disclosure,
+  endpoint disclosure, or new payload field is introduced.
 
 ### v1.07 Custody renewal warnings have a bounded local lifecycle
 

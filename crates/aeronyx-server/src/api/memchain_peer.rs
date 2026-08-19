@@ -83,6 +83,9 @@
 //!   for cross-host duplicate-writer fencing.
 //! - Default-off external witness transport for signed aggregate-only verified-
 //!   delivery cache anchors, with contiguous generation enforcement.
+//! - [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Explicit custody
+//!   witness collection runs the hard-bounded pin set concurrently so one
+//!   unavailable witness cannot multiply the maintenance-lock hold time.
 //! - [AUTHORITY-HANDOVER-EXCHANGE 2026-08-14 by Codex] Fixed one-proof
 //!   authority-history exchange interleaved with exact-prefix block catch-up.
 //!
@@ -170,6 +173,9 @@
 //!   and audited predecessor; never trust responder identity as authority.
 //!
 //! ## Last Modified
+//! v2.8.65-CustodyWitnessConcurrentRound - Bounded explicit custody witness
+//! transport to one concurrent request per distinct configured pin while
+//! preserving durable-before-counting and adverse-evidence fail-closed rules.
 //! v2.8.64-CustodyWitnessReceiptVault - Added fail-closed producer receipt
 //! persistence and restart-safe exact-anchor policy reconstruction.
 //! v2.8.63-CustodyWitnessTransport - Added explicit pinned witness transport
@@ -2246,6 +2252,7 @@ where
         ..CustodyAuditWitnessRound::default()
     };
     let mut distinct = HashSet::with_capacity(witness_node_ids.len());
+    let mut witnesses = Vec::with_capacity(witness_node_ids.len());
     for witness_node_id in witness_node_ids {
         if witness_node_id == &producer_node_id {
             round.self_excluded = round.self_excluded.saturating_add(1);
@@ -2256,34 +2263,54 @@ where
             continue;
         }
         round.configured = round.configured.saturating_add(1);
-        let receipt = match witness_custody_audit_anchor_with_endpoint_policy(
-            peer_store,
-            identity,
-            client,
-            witness_node_id,
-            anchor,
-            endpoint_allowed,
-        )
-        .await
-        {
-            Ok(receipt) => receipt,
-            Err(_) => {
-                round.failed = round.failed.saturating_add(1);
-                continue;
+        witnesses.push(*witness_node_id);
+    }
+
+    // [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Every future is
+    // tied to one already de-duplicated operator pin, and the stream cannot
+    // exceed the protocol's fixed witness fan-out. Persistence remains inside
+    // the future: a receipt is never returned to the aggregate counter until
+    // its durable write succeeds.
+    let deliveries = futures::stream::iter(witnesses)
+        .map(|witness_node_id| async move {
+            let receipt = match witness_custody_audit_anchor_with_endpoint_policy(
+                peer_store,
+                identity,
+                client,
+                &witness_node_id,
+                anchor,
+                endpoint_allowed,
+            )
+            .await
+            {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    return Ok::<Option<CustodyAuditWitnessReceiptV1>, String>(None);
+                }
+            };
+            if let Some(storage) = receipt_storage {
+                storage
+                    .persist_custody_audit_witness_receipt(
+                        &receipt,
+                        &producer_node_id,
+                        anchor.checkpoint_generation,
+                        &anchor_frame_sha256,
+                        now_secs(),
+                    )
+                    .await
+                    .map_err(|_| "custody_witness_receipt_persist_failed".to_string())?;
             }
+            Ok(Some(receipt))
+        })
+        .buffer_unordered(MAX_PINNED_WITNESSES_PER_ROUND)
+        .collect::<Vec<_>>()
+        .await;
+
+    for delivery in deliveries {
+        let Some(receipt) = delivery? else {
+            round.failed = round.failed.saturating_add(1);
+            continue;
         };
-        if let Some(storage) = receipt_storage {
-            storage
-                .persist_custody_audit_witness_receipt(
-                    &receipt,
-                    &producer_node_id,
-                    anchor.checkpoint_generation,
-                    &anchor_frame_sha256,
-                    now_secs(),
-                )
-                .await
-                .map_err(|_| "custody_witness_receipt_persist_failed".to_string())?;
-        }
         round.verified = round.verified.saturating_add(1);
         match receipt.outcome {
             CUSTODY_AUDIT_WITNESS_ADVANCED_V1 => {
@@ -8762,10 +8789,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custody_witness_transport_is_bounded_and_adverse_evidence_fails_closed() {
+    async fn custody_witness_transport_is_concurrent_bounded_and_adverse_evidence_fails_closed() {
         // [CUSTODY-WITNESS-TRANSPORT 2026-08-16 by Codex] Exercise the exact
         // public wire path while proving duplicate/self pins cannot inflate
         // quorum and a valid adverse receipt cannot be outvoted.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let now = now_secs();
         let producer = IdentityKeyPair::from_bytes(&[0x95; 32]).expect("producer identity");
         let producer_storage = MemoryStorage::open(":memory:", None).unwrap();
@@ -8776,11 +8805,27 @@ mod tests {
         let witness_peers = Arc::new(PeerStore::new());
         admit_peer(&witness_peers, &producer, None, now);
         witness_peers.configure_custody_audit_witness_requesters(&[producer.public_key_bytes()]);
+        let concurrent_gate = Arc::new(AtomicBool::new(false));
+        let concurrent_barrier = Arc::new(tokio::sync::Barrier::new(2));
         let router = build_memchain_peer_router(
             witness_storage,
             Arc::clone(&witness_peers),
             Arc::clone(&witness),
-        );
+        )
+        .layer(axum::middleware::from_fn({
+            let gate = Arc::clone(&concurrent_gate);
+            let barrier = Arc::clone(&concurrent_barrier);
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let gate = Arc::clone(&gate);
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    if gate.load(Ordering::SeqCst) {
+                        barrier.wait().await;
+                    }
+                    next.run(request).await
+                }
+            }
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -8794,7 +8839,21 @@ mod tests {
             second_storage,
             Arc::clone(&second_peers),
             Arc::clone(&second_witness),
-        );
+        )
+        .layer(axum::middleware::from_fn({
+            let gate = Arc::clone(&concurrent_gate);
+            let barrier = Arc::clone(&concurrent_barrier);
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let gate = Arc::clone(&gate);
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    if gate.load(Ordering::SeqCst) {
+                        barrier.wait().await;
+                    }
+                    next.run(request).await
+                }
+            }
+        }));
         let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let second_address = second_listener.local_addr().unwrap();
         let second_server = tokio::spawn(async move {
@@ -8925,6 +8984,33 @@ mod tests {
         assert_eq!(gap_evidence.accepted, 1);
         assert_eq!(gap_evidence.adverse, 1);
         assert!(!gap_evidence.quorum_satisfied);
+
+        // [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Both real
+        // HTTP handlers wait on the same two-party barrier. A sequential round
+        // would time out before either handler could answer; the bounded
+        // concurrent round reaches both and retains both signed receipts.
+        concurrent_gate.store(true, Ordering::SeqCst);
+        let anchor_2 = CustodyAuditAnchorV1::signed(2, 200, 20_000, [0x9D; 32], &producer)
+            .expect("sign concurrent generation two anchor");
+        let concurrent = witness_custody_audit_anchor_round_with_endpoint_policy(
+            &producer_peers,
+            &producer,
+            &client,
+            &[witness_node_id, second_witness_node_id],
+            1,
+            &anchor_2,
+            Some(&producer_storage),
+            &allow_test_endpoint,
+        )
+        .await
+        .expect("complete bounded concurrent custody witness round");
+        assert_eq!(concurrent.configured, 2);
+        assert_eq!(concurrent.verified, 2);
+        assert_eq!(concurrent.accepted, 1);
+        assert_eq!(concurrent.advanced, 1);
+        assert_eq!(concurrent.stale, 1);
+        assert!(concurrent.adverse_evidence);
+        assert!(!concurrent.quorum_satisfied);
 
         let unrelated = IdentityKeyPair::from_bytes(&[0x99; 32]).expect("unrelated identity");
         let unrelated_anchor = CustodyAuditAnchorV1::signed(2, 200, 20_000, [0x9A; 32], &unrelated)
