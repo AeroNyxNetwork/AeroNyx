@@ -403,6 +403,10 @@
 //      monotonic recovery anchor to v3 with an opaque commitment to the exact
 //      routeability/quarantine section, rejecting old or unanchored route
 //      state while preserving independently verified peer descriptors.
+// 150. [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Applies adverse
+//      external recovery-anchor evidence to the complete v3 restart-readiness
+//      bundle before listeners start, retaining descriptors while revoking
+//      route, quarantine, proof, and aggregate delivery recovery.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -593,8 +597,15 @@
 //     v3 may authorize persisted routeability/quarantine after restart. v1/v2
 //     anchors preserve compatibility for their historical evidence sections,
 //     but route readiness must be rebuilt by fresh probes.
+//   - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] The historical
+//     verified_delivery_witness wire/config name remains backward compatible,
+//     but a witnessed v3 anchor covers all committed restart-readiness state.
+//     Any signed adverse result must revoke the complete bundle at startup.
 //
 // Last Modified:
+//   [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Closed the whole-host
+//     rollback gap by applying adverse external witness evidence to route,
+//     quarantine, two/three-hop proof, and delivery readiness before listeners.
 //   [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Bound signed route state
 //     to recovery-anchor v3 and rejected stale, missing, invalid, conflicting,
 //     or legacy-unanchored route evidence without discarding descriptors.
@@ -7907,12 +7918,14 @@ impl Server {
         }
     }
 
-    /// Reconciles the exact local signed delivery-cache anchor with pinned peers.
+    /// Reconciles the exact local signed recovery anchor with pinned peers.
     ///
     /// This is intentionally separate from Memory Chain checkpoint witnesses.
-    /// It protects only aggregate local relay-readiness recovery and never
-    /// carries delivery counts, timestamps, routes, message ids, payloads,
-    /// endpoints, or client metadata.
+    /// [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] The legacy wire name
+    /// remains stable, while anchor v3 commits to route state and both proof
+    /// sections in addition to aggregate delivery. Witness traffic still
+    /// carries only generation plus opaque digest, never delivery counts,
+    /// timestamps, routes, message ids, payloads, endpoints, or client data.
     async fn reconcile_peer_cache_delivery_witnesses(
         identity: &IdentityKeyPair,
         peer_store: &PeerStore,
@@ -7954,7 +7967,7 @@ impl Server {
                     round,
                 );
                 if startup_gate && discovery.verified_delivery_witness_required_for_restore {
-                    peer_store.clear_restored_verified_client_delivery_evidence(
+                    peer_store.clear_restored_peer_cache_readiness_evidence(
                         evaluated_at,
                         "external_witness_unavailable",
                     );
@@ -7976,7 +7989,7 @@ impl Server {
                     round,
                 );
                 if startup_gate {
-                    peer_store.clear_restored_verified_client_delivery_evidence(
+                    peer_store.clear_restored_peer_cache_readiness_evidence(
                         evaluated_at,
                         "external_witness_invalid",
                     );
@@ -8003,7 +8016,7 @@ impl Server {
                     round,
                 );
                 if startup_gate {
-                    peer_store.clear_restored_verified_client_delivery_evidence(
+                    peer_store.clear_restored_peer_cache_readiness_evidence(
                         evaluated_at,
                         "external_witness_invalid",
                     );
@@ -8050,8 +8063,10 @@ impl Server {
         };
         if startup_gate {
             if let Some(reason) = rejection_reason {
-                peer_store
-                    .clear_restored_verified_client_delivery_evidence(unix_now_secs(), reason);
+                peer_store.clear_restored_peer_cache_readiness_evidence(
+                    unix_now_secs(),
+                    reason,
+                );
             }
         }
         if status == "verified" {

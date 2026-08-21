@@ -177,6 +177,9 @@
 //! - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Reports only fixed
 //!   aggregate recovery-anchor decisions for routeability/quarantine and uses
 //!   the same closed vocabulary for local cache-rejection audit evidence
+//! - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Revokes the complete
+//!   anchor-v3 restart-readiness bundle on adverse external witness evidence
+//!   while retaining verified descriptors for bounded fresh probing
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -208,8 +211,12 @@
 //!   never fresh relay proof.
 //! - Recovery-anchor v3 authorizes route-state restore. Older anchors remain
 //!   parseable, but must never authorize routeability or quarantine recovery.
+//! - External witness rejection is applied only during startup, before public
+//!   listeners. Do not reuse that bulk reset as a runtime route-health tool.
 //!
 //! ## Last Modified
+//! v0.86.0-ExternalWitnessRouteGate - Applied adverse external v3 witness
+//! evidence to all restored readiness sections without deleting descriptors
 //! v0.85.0-RouteStateRollbackAnchor - Bound routeability and quarantine to the
 //! monotonic signed v3 recovery anchor with privacy-safe operator status
 //! v0.84.0-RouteQuarantineRecovery - Added signed, expiry-bounded restart
@@ -3641,13 +3648,7 @@ impl PeerStore {
     /// can accept new client receipts. It does not touch descriptors,
     /// routeability evidence, proof history, or ordinary relay counters.
     pub fn clear_restored_verified_client_delivery_evidence(&self, now: u64, reason: &str) {
-        let reason = match reason {
-            "external_witness_unavailable" => "external_witness_unavailable",
-            "external_witness_rollback" => "external_witness_rollback",
-            "external_witness_conflict" => "external_witness_conflict",
-            "external_witness_gap" => "external_witness_gap",
-            _ => "external_witness_invalid",
-        };
+        let reason = Self::external_witness_gate_reason(reason);
         self.counters
             .verified_client_onion_deliveries
             .store(0, Ordering::Release);
@@ -3667,6 +3668,93 @@ impl PeerStore {
             "rejected",
             format!("restored_deliveries=0 reason={reason}"),
         );
+    }
+
+    /// Clears every restart-readiness section covered by the recovery anchor.
+    ///
+    /// [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] This operation is
+    /// startup-only and must run before public listeners or route probes. An
+    /// external witness rollback/conflict means the node cannot distinguish a
+    /// whole-host replay from current state, so route health, quarantine,
+    /// two-hop/three-hop proof history, and aggregate client delivery all fail
+    /// closed together. Independently verified descriptors remain available
+    /// so bounded fresh probes can rebuild readiness without a discovery
+    /// outage. Ordinary process relay counters are intentionally untouched.
+    pub fn clear_restored_peer_cache_readiness_evidence(&self, now: u64, reason: &str) {
+        let reason = Self::external_witness_gate_reason(reason);
+        let route_records_cleared = {
+            let mut route_health = self.route_health.write();
+            let count = route_health.len();
+            route_health.clear();
+            count
+        };
+        let two_hop_events_cleared = {
+            let mut events = self.two_hop_path_proof_events.write();
+            let count = events.len();
+            events.clear();
+            count
+        };
+        let three_hop_events_cleared = {
+            let mut events = self.three_hop_path_proof_events.write();
+            let count = events.len();
+            events.clear();
+            count
+        };
+        self.counters
+            .verified_client_onion_deliveries
+            .store(0, Ordering::Release);
+        self.counters
+            .last_verified_client_onion_delivery_at
+            .store(0, Ordering::Release);
+
+        {
+            let mut status = self.bootstrap_status.write();
+            status.last_routeability_cache_rejected = status
+                .last_routeability_cache_rejected
+                .saturating_add(status.last_routeability_cache_restored);
+            status.last_routeability_cache_status = Some("rejected".to_string());
+            status.last_routeability_cache_restored = 0;
+            status.last_routeability_cache_at = Some(now);
+
+            status.last_two_hop_proof_cache_rejected = status
+                .last_two_hop_proof_cache_rejected
+                .saturating_add(status.last_two_hop_proof_cache_restored);
+            status.last_two_hop_proof_cache_status = Some("rejected".to_string());
+            status.last_two_hop_proof_cache_restored = 0;
+            status.last_two_hop_proof_cache_restored_stability_ready = false;
+            status.last_two_hop_proof_cache_at = Some(now);
+
+            status.last_three_hop_proof_cache_rejected = status
+                .last_three_hop_proof_cache_rejected
+                .saturating_add(status.last_three_hop_proof_cache_restored);
+            status.last_three_hop_proof_cache_status = Some("rejected".to_string());
+            status.last_three_hop_proof_cache_restored = 0;
+            status.last_three_hop_proof_cache_restored_stability_ready = false;
+            status.last_three_hop_proof_cache_at = Some(now);
+
+            status.last_client_delivery_cache_status = Some("rejected".to_string());
+            status.last_client_delivery_cache_restored = 0;
+            status.last_client_delivery_cache_at = Some(now);
+        }
+        self.mark_peer_cache_dirty();
+        self.record_audit_event(
+            now,
+            "peer_cache_external_witness_gate",
+            "rejected",
+            format!(
+                "route_records_cleared={route_records_cleared} two_hop_events_cleared={two_hop_events_cleared} three_hop_events_cleared={three_hop_events_cleared} restored_deliveries=0 reason={reason}"
+            ),
+        );
+    }
+
+    fn external_witness_gate_reason(reason: &str) -> &'static str {
+        match reason {
+            "external_witness_unavailable" => "external_witness_unavailable",
+            "external_witness_rollback" => "external_witness_rollback",
+            "external_witness_conflict" => "external_witness_conflict",
+            "external_witness_gap" => "external_witness_gap",
+            _ => "external_witness_invalid",
+        }
     }
 
     /// Records the independently evaluated proof-cache authentication bucket.
@@ -13233,6 +13321,119 @@ mod tests {
             Some("rejected")
         );
         assert!(store.take_client_delivery_cache_dirty());
+    }
+
+    #[test]
+    fn test_external_witness_route_gate_clears_anchored_readiness_not_descriptors() {
+        // [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Model the state
+        // present immediately after cache import and before public listeners.
+        // A whole-host rollback decision must revoke every readiness section
+        // committed by anchor v3 while retaining signed discovery descriptors.
+        let store = PeerStore::new();
+        let now = 1_700_100_000;
+        let routeable_identity = IdentityKeyPair::generate();
+        let quarantined_identity = IdentityKeyPair::generate();
+        let mut routeable = signed_descriptor_for(&routeable_identity, 1, now + 4_000);
+        routeable.descriptor.public_endpoint = Some("https://routeable.example".to_string());
+        routeable = SignedNodeDescriptor::sign(routeable.descriptor, &routeable_identity).unwrap();
+        let mut quarantined = signed_descriptor_for(&quarantined_identity, 1, now + 4_000);
+        quarantined.descriptor.public_endpoint = Some("https://quarantined.example".to_string());
+        quarantined =
+            SignedNodeDescriptor::sign(quarantined.descriptor, &quarantined_identity).unwrap();
+        let routeable_node_id = routeable.node_id();
+        let quarantined_node_id = quarantined.node_id();
+        store.upsert_verified(routeable, now).unwrap();
+        store.upsert_verified(quarantined, now).unwrap();
+        store.record_route_forward_success(&routeable_node_id, now + 1);
+        for observed_at in [now + 2, now + 3, now + 4] {
+            store.record_route_forward_failure(
+                &quarantined_node_id,
+                observed_at,
+                "request_failed",
+            );
+        }
+        for offset in 5..=7 {
+            store.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                2,
+                2,
+                2,
+                1,
+            );
+            store.record_blind_relay_three_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                3,
+                3,
+                3,
+                2,
+            );
+        }
+        store.record_verified_client_onion_delivery(now + 7);
+        store.record_blind_relay_terminal(now + 7, 0, 32);
+
+        assert!(store.is_routeable_now(&routeable_node_id, now + 8));
+        assert!(store.is_route_quarantined_now(&quarantined_node_id, now + 8));
+        let before = store.status(now + 8);
+        assert_eq!(before.snapshot.valid_peers, 2);
+        assert_eq!(before.two_hop_path_proof_history.attempted, 3);
+        assert_eq!(before.three_hop_path_proof_history.attempted, 3);
+        assert_eq!(
+            before.runtime.blind_relay.verified_client_onion_deliveries,
+            1
+        );
+        assert!(store.take_peer_cache_dirty());
+
+        store.clear_restored_peer_cache_readiness_evidence(
+            now + 9,
+            "external_witness_rollback",
+        );
+        let after = store.status(now + 10);
+        assert_eq!(after.snapshot.valid_peers, 2);
+        assert!(store.get_valid(&routeable_node_id, now + 10).is_some());
+        assert!(store.get_valid(&quarantined_node_id, now + 10).is_some());
+        assert!(!store.is_routeable_now(&routeable_node_id, now + 10));
+        assert!(!store.is_route_quarantined_now(&quarantined_node_id, now + 10));
+        assert_eq!(after.two_hop_path_proof_history.attempted, 0);
+        assert_eq!(after.three_hop_path_proof_history.attempted, 0);
+        assert_eq!(
+            after.runtime.blind_relay.verified_client_onion_deliveries,
+            0
+        );
+        assert_eq!(after.runtime.blind_relay.terminal, 1);
+        assert_eq!(
+            after.bootstrap.last_routeability_cache_status.as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(
+            after.bootstrap.last_two_hop_proof_cache_status.as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(
+            after
+                .bootstrap
+                .last_three_hop_proof_cache_status
+                .as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(
+            after
+                .bootstrap
+                .last_client_delivery_cache_status
+                .as_deref(),
+            Some("rejected")
+        );
+        assert!(after.recent_audit_events.iter().any(|event| {
+            event.action == "peer_cache_external_witness_gate"
+                && event.outcome == "rejected"
+                && event.detail.contains("reason=external_witness_rollback")
+                && !event.detail.contains("routeable.example")
+                && !event.detail.contains("quarantined.example")
+        }));
+        assert!(store.take_peer_cache_dirty());
     }
 
     #[test]

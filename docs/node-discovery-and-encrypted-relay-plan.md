@@ -4,9 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.15.0 - Bound the signed routeability/quarantine
-snapshot to recovery-anchor v3 so a valid older cache cannot silently revive
-stale route state after restart.
+Modification Reason: v1.16.0 - Made adverse external recovery-anchor evidence
+revoke the complete v3 restart-readiness bundle before listeners start.
 
 Main Functionality:
 
@@ -31,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.15.0 - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Commits the exact signed routeability/quarantine section into recovery-anchor v3, rejects stale or unanchored route state while preserving descriptors, and extends configured external-witness protection to the same opaque state.
+Last Modified: v1.16.0 - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Applies signed rollback, conflict, gap, invalid-anchor, and required-unavailable witness outcomes to routeability, quarantine, two-hop/three-hop proof, and delivery recovery as one startup-only fail-closed decision while preserving verified descriptors.
+Previous: v1.15.0 - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Commits the exact signed routeability/quarantine section into recovery-anchor v3, rejects stale or unanchored route state while preserving descriptors, and extends configured external-witness protection to the same opaque state.
 Previous: v1.14.0 - [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Persists active descriptor-bound route quarantine beside positive routeability under one signed cache v2 snapshot, restores it before admission, and retains signed v1 rolling-upgrade compatibility without storing failure details.
 Previous: v1.13.0 - [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Prevents open-text route failures, relay rejections, or quarantine reasons from entering PeerStore reputation and diagnostics while preserving legacy method signatures and valid serialized buckets.
 Previous: v1.12.0 - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Prevents arbitrary transport, endpoint, request, or payload-derived strings from entering relay heartbeat status while preserving the established JSON reason buckets and legacy record APIs.
@@ -149,6 +149,36 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.16 External witnesses close the whole-host route rollback gap
+
+[EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex]
+
+- The existing witness protocol and configuration retain their historical
+  `verified_delivery_witness_*` names for wire and deployment compatibility.
+  With recovery-anchor v3, the witnessed opaque digest now commits to route
+  health/quarantine, two-hop proof, three-hop proof, and aggregate delivery as
+  one restart-readiness bundle.
+- Startup may temporarily import the locally signed sections before contacting
+  pinned witnesses. A signed witness result of rollback, conflict, or gap now
+  atomically clears every restored readiness section before public listeners
+  start. Invalid local anchor does the same; required-but-unavailable witness
+  coverage also fails closed.
+- Clearing readiness does not delete or downgrade independently verified node
+  descriptors. Discovery remains available and bounded direct probes can
+  rebuild current route health and proof windows from live network evidence.
+- The gate clears route health including active quarantine, both in-memory
+  proof windows, and aggregate restored client-delivery readiness. Ordinary
+  process relay counters are not rewritten, and no route, peer, witness,
+  endpoint, digest, payload, message, user, wallet, IP, or social-graph data is
+  exported.
+- This bulk reset is startup-only. Runtime witness persistence still defers the
+  next cache generation and retains the dirty bit for bounded retry; it does
+  not erase fresh live evidence behind active listeners.
+- Tests establish routeable and quarantined signed peers, mature two-hop and
+  three-hop proof histories, delivery readiness, and ordinary relay counters;
+  an external rollback removes only the anchored readiness bundle and leaves
+  both descriptors plus ordinary counters intact.
 
 ### v1.15 Signed route state is protected from cache rollback
 
