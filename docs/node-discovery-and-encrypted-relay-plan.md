@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.09.0 - Added explicit opt-in pre-expiry custody
-witness renewal without changing the default local-only runtime contract.
+Modification Reason: v1.10.0 - Added bounded custody renewal retry backoff and
+made the post-round durable audit authoritative after partial collection error.
 
 Main Functionality:
 
@@ -164,6 +164,25 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
   second skipped-tick cadence while prior evidence remains valid. It never
   extends receipt lifetime. Persisted authentic adverse evidence enters the
   existing typed supervised shutdown path immediately.
+
+### v1.10 Renewal failures cannot create synchronized retry pressure
+
+[CUSTODY-RENEWAL-BACKOFF 2026-08-21 by Codex]
+
+- Strict local custody audits and external witness collection now have
+  independent schedules. Every audit tick still verifies the durable vault and
+  fails closed on expiry, conflict, stale evidence, or generation gap.
+- A failed collection round enters bounded exponential backoff aligned to the
+  audit cadence. A locally derived node-identity +/- one-tick spread prevents a
+  fleet from retrying all exact pins in one synchronized burst; identities and
+  endpoints never enter logs or status payloads.
+- Retry delay is capped at the final timer tick strictly before the old quorum
+  expires. When no safe retry tick remains, the runtime reports
+  `retry_before_expiry=false` and lets the next strict audit stop the process.
+- The post-round atomic vault audit is authoritative even if the collector
+  returns a partial transport or persistence error. Receipts already persisted
+  by completed peer futures can recover the quorum, while authentic adverse
+  evidence still takes the existing supervised fail-closed path immediately.
 - Logs retain aggregate checkpoint/round/policy fields only. No identity,
   endpoint, signature, hash, message, user, route, payload, memory, address,
   destination, DNS, or social-graph metadata is exported.

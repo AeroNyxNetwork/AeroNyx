@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-RENEWAL-BACKOFF 2026-08-21 by Codex] Document bounded,
+  identity-jittered retry scheduling that never delays strict local audits.
 - [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Document the explicit
   opt-in, exact-pin pre-expiry renewal path inside the supervised runtime gate.
 - [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Document the
@@ -1118,10 +1120,22 @@ witnesses and a healthy quorum produces no witness traffic.
 The cross-process maintenance guard remains held from current-anchor creation
 through transport, durable receipt persistence, and final atomic vault audit.
 Receipts count only after storage succeeds. A temporary transport shortfall is
-reported in aggregate and retried on the next skipped-tick cadence while the
-old quorum remains valid; it never extends validity. Any authentic stale,
-conflict, or generation-gap receipt is persisted and immediately follows the
-same supervised fail-closed shutdown path as the local runtime audit.
+reported in aggregate and moves network collection into bounded exponential
+backoff. The retry is aligned to the existing 30-to-300-second audit cadence,
+spread by a locally derived node-identity tick, and capped at the last timer
+tick before the old quorum expires. Strict local audits continue on every tick;
+backoff never extends validity or delays fail-closed shutdown. If no retry tick
+exists before expiry, telemetry says so and the next failed audit stops the
+node. Any authentic stale, conflict, or generation-gap receipt is persisted
+and immediately follows the same supervised fail-closed shutdown path.
+
+The post-round durable audit remains authoritative even when collection
+reports a partial transport or persistence failure. If completed peers already
+refreshed the configured quorum, the runtime adopts that newer state instead
+of retaining a stale warning. If the quorum remains inside the warning window,
+the aggregate `receipt_renewal_collection_failed` or
+`receipt_renewal_quorum_not_refreshed` event includes only retry delay, failure
+streak, and whether another pre-expiry attempt is possible.
 
 Runtime logs contain checkpoint generation and aggregate round/policy counters
 only. They never include witness identities, endpoint strings, signatures,
