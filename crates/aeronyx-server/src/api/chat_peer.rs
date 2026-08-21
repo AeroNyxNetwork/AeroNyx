@@ -60,6 +60,9 @@
 //! - [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Applies the same
 //!   identity-independent parser-front ceiling to blind relay so permissionless
 //!   callers cannot bypass resource protection by rotating node keys
+//! - [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Makes fixed-memory
+//!   previous-hop eviction expiration-aware and preserves active quarantine
+//!   evidence under permissionless identity churn
 //! - [PEER-ACK-PRIVACY 2026-08-15 by Codex] Normalizes successful direct
 //!   relay ACKs so peers cannot probe receiver presence, device count, or
 //!   mailbox/dedup state through legacy compatibility fields
@@ -257,6 +260,8 @@
 //!   never export request, endpoint, identity, or payload-derived text.
 //!
 //! ## Last Modified
+//! v0.52.0-BlindRelayBucketFairness - Evict expired/LRU non-quarantined peer
+//! buckets without letting one active FIFO head retain stale attacker state
 //! v0.51.0-BlindRelayGlobalAdmission - Bound aggregate blind-relay request rate
 //! before JSON parsing so permissionless node-key rotation cannot evade limits
 //! v0.50.0-RelayHealthReasonBoundary - Enforce validated aggregate inbound
@@ -1140,6 +1145,7 @@ impl BlindRelayRouteReplayCache {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlindRelayAbuseDecision {
     Allowed,
+    CapacityLimited,
     RateLimited { quarantine_until: u64 },
     Quarantined { quarantine_until: u64 },
 }
@@ -1157,7 +1163,6 @@ struct BlindRelayPreviousHopBucket {
 #[derive(Debug)]
 struct BlindRelayAbuseGuard {
     buckets: HashMap<[u8; 32], BlindRelayPreviousHopBucket>,
-    order: VecDeque<[u8; 32]>,
     global_rate_limit: PeerRelayRateLimitWindow,
 }
 
@@ -1165,7 +1170,6 @@ impl Default for BlindRelayAbuseGuard {
     fn default() -> Self {
         Self {
             buckets: HashMap::new(),
-            order: VecDeque::new(),
             global_rate_limit: PeerRelayRateLimitWindow::new(Instant::now()),
         }
     }
@@ -1177,8 +1181,9 @@ impl BlindRelayAbuseGuard {
     }
 
     fn observe_request(&mut self, previous_hop: [u8; 32], now: u64) -> BlindRelayAbuseDecision {
-        self.evict_idle(now);
-        let bucket = self.bucket_mut(previous_hop, now);
+        let Some(bucket) = self.bucket_mut(previous_hop, now) else {
+            return BlindRelayAbuseDecision::CapacityLimited;
+        };
         bucket.last_seen_at = now;
 
         if bucket
@@ -1206,7 +1211,7 @@ impl BlindRelayAbuseGuard {
     }
 
     fn record_failure(&mut self, previous_hop: [u8; 32], now: u64) -> Option<u64> {
-        let bucket = self.bucket_mut(previous_hop, now);
+        let bucket = self.bucket_mut(previous_hop, now)?;
         bucket.last_seen_at = now;
         if now.saturating_sub(bucket.failure_window_start)
             > BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS
@@ -1237,48 +1242,70 @@ impl BlindRelayAbuseGuard {
         }
     }
 
-    fn bucket_mut(&mut self, previous_hop: [u8; 32], now: u64) -> &mut BlindRelayPreviousHopBucket {
+    fn bucket_mut(
+        &mut self,
+        previous_hop: [u8; 32],
+        now: u64,
+    ) -> Option<&mut BlindRelayPreviousHopBucket> {
         if !self.buckets.contains_key(&previous_hop) {
-            self.order.push_back(previous_hop);
+            // [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Scan only on
+            // new verified identities. Identity churn is already bounded by
+            // the parser-front global window, so fixed-capacity LRU selection
+            // cannot become unbounded per-request work. Active quarantines are
+            // never removed merely to admit a fresh permissionless identity.
+            self.evict_idle(now);
+            if !self.make_room_for_new_bucket(now, MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS) {
+                return None;
+            }
         }
-        self.evict_over_capacity();
-        self.buckets
-            .entry(previous_hop)
-            .or_insert_with(|| BlindRelayPreviousHopBucket {
-                rate_window_start: now,
-                failure_window_start: now,
-                last_seen_at: now,
-                ..BlindRelayPreviousHopBucket::default()
-            })
+        Some(
+            self.buckets
+                .entry(previous_hop)
+                .or_insert_with(|| BlindRelayPreviousHopBucket {
+                    rate_window_start: now,
+                    failure_window_start: now,
+                    last_seen_at: now,
+                    ..BlindRelayPreviousHopBucket::default()
+                }),
+        )
     }
 
     fn evict_idle(&mut self, now: u64) {
         let retention_secs =
             BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
-        while let Some(previous_hop) = self.order.front().copied() {
-            let Some(bucket) = self.buckets.get(&previous_hop) else {
-                self.order.pop_front();
-                continue;
-            };
+        self.buckets.retain(|_, bucket| {
             let quarantine_active = bucket
                 .quarantine_until
                 .is_some_and(|quarantine_until| now < quarantine_until);
-            if quarantine_active || now.saturating_sub(bucket.last_seen_at) <= retention_secs {
-                break;
-            }
-            self.order.pop_front();
-            self.buckets.remove(&previous_hop);
-        }
+            quarantine_active || now.saturating_sub(bucket.last_seen_at) <= retention_secs
+        });
     }
 
-    fn evict_over_capacity(&mut self) {
-        while self.buckets.len() >= MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS {
-            if let Some(previous_hop) = self.order.pop_front() {
-                self.buckets.remove(&previous_hop);
-            } else {
-                break;
-            }
+    fn make_room_for_new_bucket(&mut self, now: u64, capacity: usize) -> bool {
+        if capacity == 0 {
+            return false;
         }
+        while self.buckets.len() >= capacity {
+            let eviction_candidate = self
+                .buckets
+                .iter()
+                .filter(|(_, bucket)| {
+                    !bucket
+                        .quarantine_until
+                        .is_some_and(|quarantine_until| now < quarantine_until)
+                })
+                .min_by(|(left_id, left), (right_id, right)| {
+                    left.last_seen_at
+                        .cmp(&right.last_seen_at)
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(node_id, _)| *node_id);
+            let Some(eviction_candidate) = eviction_candidate else {
+                return false;
+            };
+            self.buckets.remove(&eviction_candidate);
+        }
+        true
     }
 }
 
@@ -2994,6 +3021,16 @@ fn check_blind_relay_previous_hop_allowed(
 
     match decision {
         BlindRelayAbuseDecision::Allowed => Ok(()),
+        BlindRelayAbuseDecision::CapacityLimited => {
+            // [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Capacity
+            // pressure is aggregate node protection, not evidence that this
+            // authenticated peer misbehaved. Do not mutate peer reputation or
+            // quarantine state while every retained bucket is still protected.
+            state
+                .peer_store
+                .record_blind_relay_rejected(now, "rate_limited");
+            Err(BlindRelayError::RateLimited)
+        }
         BlindRelayAbuseDecision::RateLimited { quarantine_until } => {
             state
                 .peer_store
@@ -6539,6 +6576,87 @@ mod tests {
                 quarantine_until: quarantine_at + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
             }
         );
+    }
+
+    #[test]
+    fn blind_relay_abuse_guard_removes_idle_buckets_behind_active_identity() {
+        let mut guard = BlindRelayAbuseGuard::default();
+        let active = [0x61u8; 32];
+        let stale = [0x62u8; 32];
+        let newcomer = [0x63u8; 32];
+        let started_at = 1_800_000_000;
+        let retention_secs =
+            BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
+        let now = started_at + retention_secs + 2;
+
+        assert_eq!(
+            guard.observe_request(active, started_at),
+            BlindRelayAbuseDecision::Allowed
+        );
+        assert_eq!(
+            guard.observe_request(stale, started_at + 1),
+            BlindRelayAbuseDecision::Allowed
+        );
+        guard.record_success(active, now);
+        assert_eq!(
+            guard.observe_request(newcomer, now),
+            BlindRelayAbuseDecision::Allowed
+        );
+
+        assert!(guard.buckets.contains_key(&active));
+        assert!(guard.buckets.contains_key(&newcomer));
+        assert!(!guard.buckets.contains_key(&stale));
+    }
+
+    #[test]
+    fn blind_relay_abuse_guard_evicts_lru_without_erasing_active_quarantine() {
+        let mut guard = BlindRelayAbuseGuard::default();
+        let quarantined = [0x71u8; 32];
+        let evictable = [0x72u8; 32];
+        let now = 1_800_000_000;
+        guard.buckets.insert(
+            quarantined,
+            BlindRelayPreviousHopBucket {
+                quarantine_until: Some(now + 60),
+                last_seen_at: now - 100,
+                ..BlindRelayPreviousHopBucket::default()
+            },
+        );
+        guard.buckets.insert(
+            evictable,
+            BlindRelayPreviousHopBucket {
+                last_seen_at: now - 10,
+                ..BlindRelayPreviousHopBucket::default()
+            },
+        );
+
+        assert!(guard.make_room_for_new_bucket(now, 2));
+        assert!(guard.buckets.contains_key(&quarantined));
+        assert!(!guard.buckets.contains_key(&evictable));
+    }
+
+    #[test]
+    fn blind_relay_abuse_guard_rejects_new_identity_when_all_buckets_quarantined() {
+        let mut guard = BlindRelayAbuseGuard::default();
+        let now = 1_800_000_000;
+        for index in 0..MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS {
+            let mut node_id = [0u8; 32];
+            node_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            guard.buckets.insert(
+                node_id,
+                BlindRelayPreviousHopBucket {
+                    quarantine_until: Some(now + 60),
+                    last_seen_at: now,
+                    ..BlindRelayPreviousHopBucket::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            guard.observe_request([0xffu8; 32], now),
+            BlindRelayAbuseDecision::CapacityLimited
+        );
+        assert_eq!(guard.buckets.len(), MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS);
     }
 
     #[tokio::test]

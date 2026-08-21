@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.22.0 - Add an identity-independent parser-front blind
-relay ceiling while retaining verified previous-hop fairness as a second layer.
+Modification Reason: v1.23.0 - Make fixed-memory previous-hop abuse buckets
+expiration-aware and preserve active quarantine under permissionless churn.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.22.0 - [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Prevents permissionless node-key rotation from bypassing blind-relay parser and process admission while preserving aggregate-only telemetry and verified previous-hop fairness.
+Last Modified: v1.23.0 - [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Removes stale previous-hop buckets regardless of FIFO position, evicts only the least-recently-used non-quarantined identity under pressure, and never deletes active quarantine to admit a fresh permissionless key.
+Previous: v1.22.0 - [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Prevents permissionless node-key rotation from bypassing blind-relay parser and process admission while preserving aggregate-only telemetry and verified previous-hop fairness.
 Previous: v1.21.0 - [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] Separates optional witness availability from authenticated adverse evidence so rollback, conflict, or generation-gap results always block restored proof continuity and multi-hop admission.
 Previous: v1.20.0 - [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Reuses the shared recovery-anchor contract in local health, startup admission, operator telemetry, and deployment diagnostics; strict witness deployments now fail health while the active generation is unverified.
 Previous: v1.19.0 - [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Reuses the shared recovery-anchor builder in the signed management heartbeat so backend and Nodeboard observe the same exact-generation admission decision as the node APIs.
@@ -155,6 +156,27 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.23 Previous-hop fairness survives fixed-memory identity churn
+
+[BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex]
+
+- The prior FIFO cleanup stopped at the first active bucket. A frequently used
+  early identity could therefore retain expired buckets behind it; once the
+  4096-slot ceiling was reached, insertion-order eviction could delete the
+  active identity and reset its rate/failure history instead.
+- Cleanup now examines all buckets only when a newly verified identity needs a
+  slot. Expired non-quarantined state is removed regardless of insertion order.
+- If the fixed ceiling is still full, the least-recently-used non-quarantined
+  bucket is evicted deterministically. An active quarantine is never removed
+  just to admit a freshly generated permissionless identity.
+- When every retained slot remains quarantined, the fresh identity receives the
+  existing `rate_limited` result. This is aggregate capacity protection and does
+  not alter that peer's reputation or create a new quarantine record.
+- The parser-front global admission added in v1.22 bounds identity-churn scans;
+  no work, queue, or memory dimension can grow with attacker-supplied keys.
+- This milestone changes no API path, JSON field, signed frame, payload handling,
+  configured limit, heartbeat schema, or permissionless discovery rule.
 
 ### v1.22 Blind-relay admission survives permissionless identity rotation
 

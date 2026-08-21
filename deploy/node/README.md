@@ -177,6 +177,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.73.0-node-deploy - Documented fair fixed-memory relay abuse buckets.
 v1.72.0-node-deploy - Documented identity-independent blind-relay admission.
 v1.71.0-node-deploy - Documented fail-closed adverse optional-witness evidence.
 v1.70.0-node-deploy - Documented signed recovery-anchor heartbeat telemetry.
@@ -768,6 +769,14 @@ and verified previous hops retain their separate fairness/quarantine guard,
 but rotating permissionless keys cannot multiply parser capacity. The blind
 relay counter remains aggregate-only and does not identify callers or inspect
 the opaque encrypted relay body.
+
+<!-- [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] -->
+Verified previous-hop fairness remains fixed at 4096 in-memory buckets. Expired
+buckets are removed regardless of insertion order; under capacity pressure the
+least-recently-used non-quarantined bucket is replaced. Active quarantine is
+never erased to admit a newly generated permissionless identity. If every slot
+is still quarantined, the new request receives the existing aggregate
+`rate_limited` response without changing peer reputation.
 
 <!-- [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] -->
 `peer_relay_authenticated_requests_per_minute` adds a bounded fairness ceiling
