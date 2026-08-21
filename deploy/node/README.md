@@ -177,6 +177,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.72.0-node-deploy - Documented identity-independent blind-relay admission.
 v1.71.0-node-deploy - Documented fail-closed adverse optional-witness evidence.
 v1.70.0-node-deploy - Documented signed recovery-anchor heartbeat telemetry.
 v1.69.0-node-deploy - Documented recovery-anchor status and runtime generation gate.
@@ -759,6 +760,14 @@ parsing. It is intentionally node-global because v1 cannot authenticate a
 previous hop and permissionless identities can be rotated. AeroNyx does not
 create rate-limit buckets from user keys, receiver keys, source IPs, endpoints,
 or ciphertext metadata.
+
+<!-- [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] -->
+The same node-global ceiling now protects `/api/chat/peer/blind-relay` before
+JSON parsing. A valid Ed25519 node identity is still required by the handler,
+and verified previous hops retain their separate fairness/quarantine guard,
+but rotating permissionless keys cannot multiply parser capacity. The blind
+relay counter remains aggregate-only and does not identify callers or inspect
+the opaque encrypted relay body.
 
 <!-- [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] -->
 `peer_relay_authenticated_requests_per_minute` adds a bounded fairness ceiling

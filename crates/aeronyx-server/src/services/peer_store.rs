@@ -69,8 +69,9 @@
 //!   are visible as aggregate drop reasons before future multi-hop rollout
 //! - Blind relay replay-drop counters for duplicate route_id frames, without
 //!   exposing route ids, previous hops, next hops, endpoints, or payload data
-//! - Blind relay abuse-guard counters for previous-hop rate limiting and
-//!   short quarantine without exposing peer identities or route metadata
+//! - [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Blind relay
+//!   abuse-guard counters cover aggregate parser-front admission plus verified
+//!   previous-hop fairness and quarantine without identity or route dimensions
 //! - Per-peer health summary for operators, using only signed node metadata,
 //!   gossip/import observation buckets, route-health counters, and relay
 //!   protection buckets without payload or route reconstruction data
@@ -218,6 +219,8 @@
 //!   listeners. Do not reuse that bulk reset as a runtime route-health tool.
 //!
 //! ## Last Modified
+//! v0.88.0-BlindRelayGlobalAdmission - Broadened the existing privacy-safe
+//! rate-limit aggregate to include parser-front identity-rotation protection
 //! v0.87.0-ExternalWitnessGenerationBinding - Bound startup witness decisions
 //! to the exact aggregate generation currently represented by restored state
 //! v0.86.0-ExternalWitnessRouteGate - Applied adverse external v3 witness
@@ -1414,7 +1417,11 @@ pub struct PeerStoreBlindRelayStats {
     /// expanded into route ids, exact timestamps, previous-hop ids, endpoint
     /// URLs, encrypted blobs, receiver identities, or user metadata.
     pub timestamp_rejected: u64,
-    /// Requests rejected by local previous-hop rate limiting.
+    /// Requests rejected by local aggregate or verified previous-hop admission.
+    ///
+    /// [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] This remains one
+    /// process aggregate. It must not gain node, IP, route, endpoint, user,
+    /// receiver, message, or ciphertext-derived dimensions.
     pub rate_limited: u64,
     /// Requests rejected while the previous-hop bucket was quarantined.
     pub quarantined: u64,

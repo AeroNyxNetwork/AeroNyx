@@ -57,6 +57,9 @@
 //! - [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Applies configurable,
 //!   node-global direct-relay admission before JSON parsing without creating
 //!   privacy-sensitive sender, receiver, wallet, or source-address buckets
+//! - [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Applies the same
+//!   identity-independent parser-front ceiling to blind relay so permissionless
+//!   callers cannot bypass resource protection by rotating node keys
 //! - [PEER-ACK-PRIVACY 2026-08-15 by Codex] Normalizes successful direct
 //!   relay ACKs so peers cannot probe receiver presence, device count, or
 //!   mailbox/dedup state through legacy compatibility fields
@@ -125,9 +128,10 @@
 //! - Blind relay keeps a bounded local `route_id` replay cache. The cache is
 //!   in-memory only, stores no payload/peer endpoint/user data, and prevents a
 //!   repeated encrypted route frame from being forwarded twice by this node.
-//! - Blind relay applies previous-hop rate limiting and short quarantine using
-//!   only node-level metadata. This protects commercial nodes from relay abuse
-//!   while preserving the invariant that encrypted blobs are never parsed.
+//! - Blind relay applies one identity-independent parser-front rate ceiling,
+//!   followed by previous-hop rate limiting and short quarantine only after
+//!   signature verification. This protects commercial nodes from identity
+//!   rotation and noisy verified peers without parsing encrypted blobs.
 //! - Blind relay reports privacy-safe previous-hop health buckets to PeerStore
 //!   so nodeboard can show protection status without route ids, endpoints,
 //!   encrypted blobs, or user metadata.
@@ -253,6 +257,8 @@
 //!   never export request, endpoint, identity, or payload-derived text.
 //!
 //! ## Last Modified
+//! v0.51.0-BlindRelayGlobalAdmission - Bound aggregate blind-relay request rate
+//! before JSON parsing so permissionless node-key rotation cannot evade limits
 //! v0.50.0-RelayHealthReasonBoundary - Enforce validated aggregate inbound
 //! failure reasons while preserving legacy heartbeat JSON values
 //! v0.49.0-DirectRelayIdempotentRetry - Return exact bounded custody ACKs for
@@ -830,6 +836,7 @@ impl AuthenticatedPeerRelayReplayCache {
     }
 }
 
+#[derive(Debug)]
 struct PeerRelayRateLimitWindow {
     started_at: Instant,
     admitted: u32,
@@ -1147,13 +1154,28 @@ struct BlindRelayPreviousHopBucket {
     last_seen_at: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BlindRelayAbuseGuard {
     buckets: HashMap<[u8; 32], BlindRelayPreviousHopBucket>,
     order: VecDeque<[u8; 32]>,
+    global_rate_limit: PeerRelayRateLimitWindow,
+}
+
+impl Default for BlindRelayAbuseGuard {
+    fn default() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            order: VecDeque::new(),
+            global_rate_limit: PeerRelayRateLimitWindow::new(Instant::now()),
+        }
+    }
 }
 
 impl BlindRelayAbuseGuard {
+    fn admit_global(&mut self, now: Instant, limit: u32) -> bool {
+        self.global_rate_limit.allow(now, limit)
+    }
+
     fn observe_request(&mut self, previous_hop: [u8; 32], now: u64) -> BlindRelayAbuseDecision {
         self.evict_idle(now);
         let bucket = self.bucket_mut(previous_hop, now);
@@ -1962,6 +1984,28 @@ async fn peer_blind_relay_request_gate(
     request: Request,
     next: Next,
 ) -> Response {
+    // [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Permissionless node
+    // identities are cheap to rotate, so the verified previous-hop bucket
+    // cannot protect parser and process capacity by itself. Count only one
+    // aggregate process window before body parsing; never create source-IP,
+    // user, receiver, route, endpoint, or ciphertext-derived buckets here.
+    let requests_per_minute = state
+        .chat_relay
+        .as_ref()
+        .map(|relay| relay.config().peer_relay_requests_per_minute)
+        .unwrap_or(DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE);
+    let admitted = state
+        .blind_relay_abuse_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .admit_global(Instant::now(), requests_per_minute);
+    if !admitted {
+        state
+            .peer_store
+            .record_blind_relay_rejected(now_secs(), "rate_limited");
+        return rejected_blind_relay_response("rate_limited");
+    }
+
     let Some(_in_flight) = InFlightRequestGuard::try_acquire(
         &state.blind_relay_in_flight,
         MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS,
@@ -1969,22 +2013,26 @@ async fn peer_blind_relay_request_gate(
         state
             .peer_store
             .record_blind_relay_rejected(now_secs(), "backpressure");
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(PeerBlindRelayResponse {
-                accepted: false,
-                terminal: false,
-                forwarded: false,
-                ttl_remaining: 0,
-                reason: Some("backpressure".to_string()),
-                delivery_receipt: None,
-                failure_receipt: None,
-            }),
-        )
-            .into_response();
+        return rejected_blind_relay_response("backpressure");
     };
 
     next.run(request).await
+}
+
+fn rejected_blind_relay_response(reason: &'static str) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(PeerBlindRelayResponse {
+            accepted: false,
+            terminal: false,
+            forwarded: false,
+            ttl_remaining: 0,
+            reason: Some(reason.to_string()),
+            delivery_receipt: None,
+            failure_receipt: None,
+        }),
+    )
+        .into_response()
 }
 
 async fn peer_relay_handler(
@@ -4961,6 +5009,21 @@ mod tests {
         assert_eq!(window.admitted, 1);
     }
 
+    #[test]
+    fn blind_relay_global_rate_limit_uses_exact_monotonic_windows() {
+        let started_at = Instant::now();
+        let mut guard = BlindRelayAbuseGuard {
+            global_rate_limit: PeerRelayRateLimitWindow::new(started_at),
+            ..BlindRelayAbuseGuard::default()
+        };
+
+        assert!(guard.admit_global(started_at, 2));
+        assert!(guard.admit_global(started_at + Duration::from_secs(59), 2));
+        assert!(!guard.admit_global(started_at + Duration::from_secs(59), 2));
+        assert!(guard.admit_global(started_at + Duration::from_secs(60), 2));
+        assert_eq!(guard.global_rate_limit.admitted, 1);
+    }
+
     #[tokio::test]
     async fn peer_relay_rate_limit_rejects_before_duplicate_processing() {
         let (relay, path) = temp_chat_relay_with_peer_rate("chat-peer-rate-limit", 1);
@@ -5012,6 +5075,51 @@ mod tests {
             status.last_inbound_failure_reason.as_deref(),
             Some("rate_limited")
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn blind_relay_global_rate_limit_rejects_before_json_deserialization() {
+        let (relay, path) = temp_chat_relay_with_peer_rate("blind-relay-global-rate-limit", 1);
+        let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
+        let udp = Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap());
+        let peer_store = Arc::new(PeerStore::new());
+        let app = build_chat_peer_router(
+            Some(relay),
+            sessions,
+            udp,
+            Arc::clone(&peer_store),
+            Arc::new(IdentityKeyPair::generate()),
+            Arc::new(reqwest::Client::new()),
+            None,
+        );
+
+        // [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Malformed JSON
+        // proves the second attempt is rejected by middleware before Axum can
+        // parse an identity, route, next hop, or opaque encrypted body.
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat/peer/blind-relay")
+                .header("content-type", "application/json")
+                .body(Body::from("not-json"))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        let second = app.oneshot(request()).await.unwrap();
+
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: PeerBlindRelayResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.reason.as_deref(), Some("rate_limited"));
+        let stats = peer_store.status(now_secs()).runtime.blind_relay;
+        assert_eq!(stats.received, 1);
+        assert_eq!(stats.rejected, 1);
+        assert_eq!(stats.rate_limited, 1);
 
         let _ = std::fs::remove_file(path);
     }

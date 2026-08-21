@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.21.0 - Make authenticated adverse external-witness
-evidence fail closed even when witness availability is configured as optional.
+Modification Reason: v1.22.0 - Add an identity-independent parser-front blind
+relay ceiling while retaining verified previous-hop fairness as a second layer.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.21.0 - [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] Separates optional witness availability from authenticated adverse evidence so rollback, conflict, or generation-gap results always block restored proof continuity and multi-hop admission.
+Last Modified: v1.22.0 - [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Prevents permissionless node-key rotation from bypassing blind-relay parser and process admission while preserving aggregate-only telemetry and verified previous-hop fairness.
+Previous: v1.21.0 - [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] Separates optional witness availability from authenticated adverse evidence so rollback, conflict, or generation-gap results always block restored proof continuity and multi-hop admission.
 Previous: v1.20.0 - [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Reuses the shared recovery-anchor contract in local health, startup admission, operator telemetry, and deployment diagnostics; strict witness deployments now fail health while the active generation is unverified.
 Previous: v1.19.0 - [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Reuses the shared recovery-anchor builder in the signed management heartbeat so backend and Nodeboard observe the same exact-generation admission decision as the node APIs.
 Previous: v1.18.0 - [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Adds one privacy-safe recovery-anchor API aggregate and prevents a prior generation's witness result from authorizing proof continuity between local persistence and exact-generation witnessing.
@@ -154,6 +155,27 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.22 Blind-relay admission survives permissionless identity rotation
+
+[BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex]
+
+- `/api/chat/peer/blind-relay` now consumes the established node-global relay
+  rate window before Axum deserializes the request body. This bounds parser and
+  process work even when an attacker continuously generates new Ed25519 node
+  identities.
+- The limit reuses `peer_relay_requests_per_minute`; no configuration key, API
+  path, JSON field, signed frame, or deployment migration is added.
+- Signature verification still precedes all per-node reputation, fairness, and
+  quarantine mutation. The existing verified previous-hop guard therefore
+  remains a second layer without allowing forged identities to poison peers.
+- The global window stores two aggregate monotonic counters only. It does not
+  create buckets from IP addresses, node keys, users, receivers, routes,
+  endpoints, message IDs, or opaque encrypted bytes.
+- Rejections reuse the stable `rate_limited` response and aggregate health
+  counter so Nodeboard and existing monitoring remain backward compatible.
+- Regression coverage proves exact monotonic-window reset and proves a second
+  blind request is rejected before malformed JSON can enter deserialization.
 
 ### v1.21 Optional availability never weakens adverse witness evidence
 
