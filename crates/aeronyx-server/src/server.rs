@@ -8063,10 +8063,7 @@ impl Server {
         };
         if startup_gate {
             if let Some(reason) = rejection_reason {
-                peer_store.clear_restored_peer_cache_readiness_evidence(
-                    unix_now_secs(),
-                    reason,
-                );
+                peer_store.clear_restored_peer_cache_readiness_evidence(unix_now_secs(), reason);
             }
         }
         if status == "verified" {
@@ -15727,9 +15724,10 @@ mod tests {
         DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints,
         PeerHttpClients, PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
         PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryAnchorState,
-        PeerStoreVerifiedClientDeliveryCacheEvidence, RequiredApiListenerExit, RuntimeTaskRegistry,
-        RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server, SystemdNotifier,
-        TargetBoundPeerRelayFailure, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
+        PeerStoreVerifiedClientDeliveryCacheEvidence,
+        PeerStoreVerifiedClientDeliveryExternalWitnessDecision, RequiredApiListenerExit,
+        RuntimeTaskRegistry, RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server,
+        SystemdNotifier, TargetBoundPeerRelayFailure, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
         BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
         COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DATA_PLANE_RECV_FAILURE_LIMIT,
         DIRECTORY_OPERATOR_HTTP_PROFILE, DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS,
@@ -24615,6 +24613,93 @@ mod tests {
         tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_store_startup_witness_gate_revokes_complete_readiness_bundle() {
+        // [EXTERNAL-WITNESS-STARTUP-REGRESSION 2026-08-21 by Codex] Exercise
+        // the real startup reconciliation entry point rather than only the
+        // PeerStore reset primitive. A required witness with no local anchor
+        // must revoke all recovered readiness before listeners can start.
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let witness = IdentityKeyPair::generate();
+        let mut discovery = server.config.discovery.clone();
+        discovery.verified_delivery_witness_node_ids =
+            vec![hex::encode(witness.public_key_bytes())];
+        discovery.verified_delivery_witness_required_for_restore = true;
+
+        let now = unix_now_secs();
+        let peer_store = PeerStore::new();
+        let descriptor = signed_chat_relay_peer_descriptor(
+            "https://startup-gate.example".to_string(),
+            7,
+            now + 4_000,
+        );
+        let node_id = descriptor.node_id();
+        assert!(peer_store.upsert_verified(descriptor, now).unwrap());
+        peer_store.record_route_forward_success(&node_id, now + 1);
+        for offset in 2..=4 {
+            peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                2,
+                2,
+                2,
+                1,
+            );
+            peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                3,
+                3,
+                3,
+                2,
+            );
+        }
+        peer_store.record_verified_client_onion_delivery(now + 4);
+        peer_store.record_blind_relay_terminal(now + 4, 0, 32);
+        assert!(peer_store.is_routeable_now(&node_id, now + 5));
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let missing_path = std::env::temp_dir().join(format!(
+            "aeronyx-peer-cache-startup-witness-gate-{unique}.json"
+        ));
+        let decision = Server::reconcile_peer_cache_delivery_witnesses(
+            &server.identity,
+            &peer_store,
+            &discovery,
+            &reqwest::Client::new(),
+            &missing_path.to_string_lossy(),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            decision,
+            PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Missing
+        );
+        let status = peer_store.status(now + 6);
+        assert_eq!(status.snapshot.valid_peers, 1);
+        assert!(peer_store.get_valid(&node_id, now + 6).is_some());
+        assert!(!peer_store.is_routeable_now(&node_id, now + 6));
+        assert_eq!(status.two_hop_path_proof_history.attempted, 0);
+        assert_eq!(status.three_hop_path_proof_history.attempted, 0);
+        assert_eq!(
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            0
+        );
+        assert_eq!(status.runtime.blind_relay.terminal, 1);
+        assert!(status.recent_audit_events.iter().any(|event| {
+            event.action == "peer_cache_external_witness_gate"
+                && event.outcome == "rejected"
+                && event.detail.contains("reason=external_witness_unavailable")
+                && !event.detail.contains("startup-gate.example")
+        }));
     }
 
     #[tokio::test]
