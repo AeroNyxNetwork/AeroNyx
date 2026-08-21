@@ -389,6 +389,10 @@
 // 145. [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Edge-triggers local
 //      renewal warnings, suppresses duplicate warning spam for the same quorum
 //      horizon, and records recovery after explicit evidence refresh.
+// 146. [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Optionally renews
+//      an expiring exact-anchor receipt threshold through the already pinned,
+//      bounded, durable witness transport without expanding discovery into
+//      authority or changing the default local-only runtime behavior.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -569,6 +573,8 @@
 //     installation but the checkpoint table is absent, startup must fail.
 //
 // Last Modified:
+//   [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Added explicit opt-in
+//     pre-expiry renewal inside the supervised strict custody runtime task.
 //   [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Added a process-local
 //     renewal warning/recovery state machine without networking or new APIs.
 //   [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Added local-only exact quorum
@@ -916,13 +922,15 @@ use crate::api::memchain_peer::{
     recover_record_commitment_checkpoint_certificate_from_pinned_carriers_with_runtime,
     release_record_commitment_coordinator_lease, request_record_commitment_coordinator_lease,
     sync_follower_record_commitment_checkpoint_certificate_with_carrier_runtime,
-    sync_next_record_coordinator_handover_with_carrier_runtime, witness_verified_delivery_anchor,
+    sync_next_record_coordinator_handover_with_carrier_runtime,
+    witness_custody_audit_anchor_round_durable, witness_verified_delivery_anchor,
     CommitmentAuthorityCarrierCircuitBreaker, CommitmentAuthorityCarrierCursor,
     CommitmentAuthoritySyncSource, CommitmentBlockCarrierCircuitBreaker,
     CommitmentBlockCarrierCursor, CommitmentCertificateCarrierCircuitBreaker,
     CommitmentCertificateCarrierRecoveryDisposition, CommitmentCheckpointRelation,
     CommitmentFollowerCertificateSyncOutcome, CommitmentReconciliationOutcome,
-    CommitmentSyncPageSource, VerifiedDeliveryAnchorWitnessRound, MAX_BLOCKS_PER_RESPONSE_WIRE,
+    CommitmentSyncPageSource, CustodyAuditWitnessRound, VerifiedDeliveryAnchorWitnessRound,
+    MAX_BLOCKS_PER_RESPONSE_WIRE,
 };
 use crate::api::mpi::{build_mpi_router, BaselineSnapshot, Mode, MpiState, SessionEmbeddingCache};
 use crate::api::voice::build_voice_router;
@@ -2517,6 +2525,18 @@ struct CustodyWitnessAuditEvidence {
     snapshot: CustodyAuditWitnessReceiptReadinessSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CustodyWitnessRenewalAttempt {
+    round: CustodyAuditWitnessRound,
+    audit: CustodyWitnessAuditEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustodyWitnessRenewalAttemptError {
+    CollectionFailed,
+    Readiness(CustodyWitnessReadinessBlockReason),
+}
+
 const CUSTODY_WITNESS_RUNTIME_AUDIT_MIN_INTERVAL_SECS: u64 = 30;
 const CUSTODY_WITNESS_RUNTIME_AUDIT_MAX_INTERVAL_SECS: u64 = 300;
 
@@ -2599,29 +2619,31 @@ fn custody_witness_renewal_status(
     })
 }
 
-async fn audit_chat_relay_custody_witness_state(
+const fn custody_witness_auto_renewal_due(
+    enabled: bool,
+    renewal: CustodyWitnessRenewalStatus,
+) -> bool {
+    // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Keep the network
+    // transition explicit and independently testable. A healthy quorum never
+    // creates witness traffic, even when the operator enabled renewal.
+    enabled && renewal.renewal_recommended
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn audit_chat_relay_custody_witness_anchor(
     config: &ServerConfig,
     identity: &IdentityKeyPair,
     storage: &MemoryStorage,
+    checkpoint_generation: u64,
+    anchor_sha256: &[u8; 32],
+    evaluated_at: u64,
 ) -> std::result::Result<CustodyWitnessAuditEvidence, CustodyWitnessReadinessBlockReason> {
-    // [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] The maintenance
-    // guard binds the receipt policy to one immutable current custody anchor.
-    // This helper performs no network I/O and exposes no anchor material.
-    let anchor_guard = ChatRelayService::hold_backup_maintenance_audit_anchor_for_config(
-        &config.memchain.chat_relay,
-        identity,
-    )
-    .map_err(|_| CustodyWitnessReadinessBlockReason::CurrentAnchorUnavailable)?;
-    let checkpoint_generation = anchor_guard.anchor().checkpoint_generation;
-    let anchor_sha256 = custody_audit_anchor_frame_sha256(anchor_guard.anchor())
-        .map_err(|_| CustodyWitnessReadinessBlockReason::CurrentAnchorUnavailable)?;
     let witness_node_ids = config.discovery.custody_audit_witness_node_id_bytes();
-    let evaluated_at = unix_now_secs();
     let snapshot = storage
         .audit_custody_audit_witness_receipt_readiness(
             &identity.public_key_bytes(),
             checkpoint_generation,
-            &anchor_sha256,
+            anchor_sha256,
             &witness_node_ids,
             config.discovery.custody_audit_witness_min_verified,
             evaluated_at,
@@ -2642,6 +2664,89 @@ async fn audit_chat_relay_custody_witness_state(
         evaluated_at,
         snapshot,
     })
+}
+
+async fn audit_chat_relay_custody_witness_state(
+    config: &ServerConfig,
+    identity: &IdentityKeyPair,
+    storage: &MemoryStorage,
+) -> std::result::Result<CustodyWitnessAuditEvidence, CustodyWitnessReadinessBlockReason> {
+    // [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] The maintenance
+    // guard binds the receipt policy to one immutable current custody anchor.
+    // This helper performs no network I/O and exposes no anchor material.
+    let anchor_guard = ChatRelayService::hold_backup_maintenance_audit_anchor_for_config(
+        &config.memchain.chat_relay,
+        identity,
+    )
+    .map_err(|_| CustodyWitnessReadinessBlockReason::CurrentAnchorUnavailable)?;
+    let checkpoint_generation = anchor_guard.anchor().checkpoint_generation;
+    let anchor_sha256 = custody_audit_anchor_frame_sha256(anchor_guard.anchor())
+        .map_err(|_| CustodyWitnessReadinessBlockReason::CurrentAnchorUnavailable)?;
+    let evaluated_at = unix_now_secs();
+    audit_chat_relay_custody_witness_anchor(
+        config,
+        identity,
+        storage,
+        checkpoint_generation,
+        &anchor_sha256,
+        evaluated_at,
+    )
+    .await
+}
+
+async fn renew_chat_relay_custody_witness_state(
+    config: &ServerConfig,
+    identity: &IdentityKeyPair,
+    storage: &MemoryStorage,
+    peer_store: &PeerStore,
+    client: &reqwest::Client,
+) -> std::result::Result<CustodyWitnessRenewalAttempt, CustodyWitnessRenewalAttemptError> {
+    // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Hold the same
+    // cross-process maintenance guard used by the operator command across
+    // network collection, durable receipt writes, and the final atomic audit.
+    // A backup rotation therefore cannot move the anchor mid-renewal.
+    let anchor_guard = ChatRelayService::hold_backup_maintenance_audit_anchor_for_config(
+        &config.memchain.chat_relay,
+        identity,
+    )
+    .map_err(|_| {
+        CustodyWitnessRenewalAttemptError::Readiness(
+            CustodyWitnessReadinessBlockReason::CurrentAnchorUnavailable,
+        )
+    })?;
+    let checkpoint_generation = anchor_guard.anchor().checkpoint_generation;
+    let anchor_sha256 = custody_audit_anchor_frame_sha256(anchor_guard.anchor()).map_err(|_| {
+        CustodyWitnessRenewalAttemptError::Readiness(
+            CustodyWitnessReadinessBlockReason::CurrentAnchorUnavailable,
+        )
+    })?;
+    let witness_node_ids = config.discovery.custody_audit_witness_node_id_bytes();
+    let round = witness_custody_audit_anchor_round_durable(
+        storage,
+        peer_store,
+        identity,
+        client,
+        &witness_node_ids,
+        config.discovery.custody_audit_witness_min_verified,
+        anchor_guard.anchor(),
+    )
+    .await;
+    // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Always audit after
+    // the concurrent round, including a persistence error. Other completed
+    // futures may already have durably retained adverse signed evidence; that
+    // security result must outrank and immediately surface past transport.
+    let audit = audit_chat_relay_custody_witness_anchor(
+        config,
+        identity,
+        storage,
+        checkpoint_generation,
+        &anchor_sha256,
+        unix_now_secs(),
+    )
+    .await
+    .map_err(CustodyWitnessRenewalAttemptError::Readiness)?;
+    let round = round.map_err(|_| CustodyWitnessRenewalAttemptError::CollectionFailed)?;
+    Ok(CustodyWitnessRenewalAttempt { round, audit })
 }
 
 const COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS: u64 = 15;
@@ -3496,27 +3601,6 @@ impl Server {
             self.verify_chat_relay_custody_witness_startup(custody_storage)
                 .await?;
         }
-        if self.config.discovery.custody_audit_witness_runtime_required {
-            let custody_storage = storage.as_ref().cloned().ok_or_else(|| {
-                ServerError::startup_failed(
-                    "Chat Relay custody witness runtime guard: local_storage_unavailable",
-                )
-            })?;
-            let custody_runtime_task = self.spawn_chat_relay_custody_witness_runtime_guard(
-                custody_storage,
-                critical_failure_tx.clone(),
-            );
-            tasks.push((
-                "custody-witness-runtime",
-                Self::supervise_required_runtime_task(
-                    "custody-witness-runtime",
-                    custody_runtime_task,
-                    Arc::clone(&self.shutdown),
-                    critical_failure_tx.clone(),
-                ),
-            ));
-        }
-
         // [BLIND-VAULT-SERVICE 2026-07-23 by Codex] This store is independent
         // from identity-indexed MemChain and receiver-indexed ChatRelay state.
         // Explicit enablement is fail-closed: a configured database error must
@@ -3540,6 +3624,32 @@ impl Server {
         let peer_store = self
             .init_peer_store(chat_relay_runtime_ready, peer_http_clients.control.as_ref())
             .await?;
+        if self.config.discovery.custody_audit_witness_runtime_required {
+            // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Runtime
+            // custody starts only after authenticated PeerStore bootstrap.
+            // This preserves the original local audit gate while giving the
+            // separately enabled renewal path an exact pinned transport view.
+            let custody_storage = storage.as_ref().cloned().ok_or_else(|| {
+                ServerError::startup_failed(
+                    "Chat Relay custody witness runtime guard: local_storage_unavailable",
+                )
+            })?;
+            let custody_runtime_task = self.spawn_chat_relay_custody_witness_runtime_guard(
+                custody_storage,
+                Arc::clone(&peer_store),
+                Arc::clone(&peer_http_clients.control),
+                critical_failure_tx.clone(),
+            );
+            tasks.push((
+                "custody-witness-runtime",
+                Self::supervise_required_runtime_task(
+                    "custody-witness-runtime",
+                    custody_runtime_task,
+                    Arc::clone(&self.shutdown),
+                    critical_failure_tx.clone(),
+                ),
+            ));
+        }
         self.publish_memchain_commitment_descriptor_preflight(
             &peer_store,
             peer_http_clients.control.as_ref(),
@@ -4714,16 +4824,41 @@ impl Server {
         Ok(())
     }
 
+    /// Reports one strict custody failure and preserves its typed reason.
+    async fn stop_for_custody_witness_runtime_failure(
+        critical_failure_tx: &mpsc::Sender<CriticalRuntimeFailure>,
+        shutdown_rx: &mut broadcast::Receiver<()>,
+        reason: CustodyWitnessReadinessBlockReason,
+    ) {
+        // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Runtime audit
+        // and post-renewal audit share one failure edge so neither can race a
+        // specific policy reason with the supervisor's generic task-exit path.
+        let failure = custody_witness_runtime_failure(reason);
+        error!(
+            reason = reason.as_str(),
+            "[CHAT_RELAY] Runtime custody witness guard rejected local state"
+        );
+        if critical_failure_tx.send(failure).await.is_err() {
+            error!(
+                task = "custody-witness-runtime",
+                "[RUNTIME] Main task dropped the critical failure receiver"
+            );
+            return;
+        }
+        let _ = shutdown_rx.recv().await;
+    }
+
     /// Revalidates strict custody evidence throughout the process lifetime.
     ///
-    /// [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] The task starts
-    /// only after the identical startup audit passed. It consumes durable
-    /// local evidence only, skips missed ticks, and reports one fixed failure
-    /// bucket to the existing required-task supervisor before waiting for the
-    /// shared shutdown signal.
+    /// [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] When the independent
+    /// opt-in flag is set, an approaching expiry runs one bounded exact-pin
+    /// durable round before the final local audit. Existing configurations
+    /// retain the v1.05 local-only behavior and create no witness traffic.
     fn spawn_chat_relay_custody_witness_runtime_guard(
         &self,
         storage: Arc<MemoryStorage>,
+        peer_store: Arc<PeerStore>,
+        client: Arc<reqwest::Client>,
         critical_failure_tx: mpsc::Sender<CriticalRuntimeFailure>,
     ) -> JoinHandle<()> {
         let config = self.config.clone();
@@ -4740,6 +4875,7 @@ impl Server {
             info!(
                 interval_secs,
                 freshness_window_secs = config.discovery.custody_audit_witness_max_age_secs,
+                auto_renewal_enabled = config.discovery.custody_audit_witness_auto_renewal_enabled,
                 "[CHAT_RELAY] Runtime custody witness guard started"
             );
             let mut renewal_log_state = CustodyWitnessRenewalLogState::default();
@@ -4748,106 +4884,145 @@ impl Server {
                 tokio::select! {
                     _ = shutdown_rx.recv() => return,
                     _ = timer.tick() => {
-                        match audit_chat_relay_custody_witness_state(
+                        let mut audit = match audit_chat_relay_custody_witness_state(
                             &config,
                             &identity,
                             &storage,
                         )
                         .await
                         {
-                            Ok(audit) => {
-                                let vault = audit.snapshot.vault;
-                                let evidence = audit.snapshot.policy;
-                                let Some(renewal) = custody_witness_renewal_status(
-                                    &audit,
-                                    config.discovery.custody_audit_witness_max_age_secs,
-                                ) else {
-                                    let reason =
-                                        CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid;
-                                    let failure = custody_witness_runtime_failure(reason);
-                                    error!(
-                                        reason = reason.as_str(),
-                                        "[CHAT_RELAY] Runtime custody witness guard rejected local state"
+                            Ok(audit) => audit,
+                            Err(reason) => {
+                                Self::stop_for_custody_witness_runtime_failure(
+                                    &critical_failure_tx,
+                                    &mut shutdown_rx,
+                                    reason,
+                                )
+                                .await;
+                                return;
+                            }
+                        };
+                        let Some(mut renewal) = custody_witness_renewal_status(
+                            &audit,
+                            config.discovery.custody_audit_witness_max_age_secs,
+                        ) else {
+                            Self::stop_for_custody_witness_runtime_failure(
+                                &critical_failure_tx,
+                                &mut shutdown_rx,
+                                CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid,
+                            )
+                            .await;
+                            return;
+                        };
+
+                        if custody_witness_auto_renewal_due(
+                            config.discovery.custody_audit_witness_auto_renewal_enabled,
+                            renewal,
+                        ) {
+                            match renew_chat_relay_custody_witness_state(
+                                &config,
+                                &identity,
+                                &storage,
+                                &peer_store,
+                                &client,
+                            )
+                            .await
+                            {
+                                Ok(attempt) => {
+                                    info!(
+                                        checkpoint_generation = attempt.audit.checkpoint_generation,
+                                        configured = attempt.round.configured,
+                                        verified = attempt.round.verified,
+                                        accepted = attempt.round.accepted,
+                                        failed = attempt.round.failed,
+                                        adverse = attempt.round.adverse_evidence,
+                                        round_quorum_satisfied = attempt.round.quorum_satisfied,
+                                        "[CHAT_RELAY] Custody witness automatic renewal round completed"
                                     );
-                                    if critical_failure_tx.send(failure).await.is_err() {
-                                        error!(
-                                            task = "custody-witness-runtime",
-                                            "[RUNTIME] Main task dropped the critical failure receiver"
-                                        );
+                                    audit = attempt.audit;
+                                    let Some(refreshed) = custody_witness_renewal_status(
+                                        &audit,
+                                        config.discovery.custody_audit_witness_max_age_secs,
+                                    ) else {
+                                        Self::stop_for_custody_witness_runtime_failure(
+                                            &critical_failure_tx,
+                                            &mut shutdown_rx,
+                                            CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid,
+                                        )
+                                        .await;
                                         return;
-                                    }
-                                    let _ = shutdown_rx.recv().await;
+                                    };
+                                    renewal = refreshed;
+                                }
+                                Err(CustodyWitnessRenewalAttemptError::CollectionFailed) => {
+                                    warn!(
+                                        reason = "receipt_renewal_collection_failed",
+                                        checkpoint_generation = audit.checkpoint_generation,
+                                        quorum_valid_through = renewal.valid_through,
+                                        quorum_valid_for_secs = renewal.valid_for_secs,
+                                        "[CHAT_RELAY] Custody witness automatic renewal will retry"
+                                    );
+                                }
+                                Err(CustodyWitnessRenewalAttemptError::Readiness(reason)) => {
+                                    Self::stop_for_custody_witness_runtime_failure(
+                                        &critical_failure_tx,
+                                        &mut shutdown_rx,
+                                        reason,
+                                    )
+                                    .await;
                                     return;
-                                };
-                                match renewal_log_state.observe(renewal) {
-                                    CustodyWitnessRenewalLogAction::WarningEntered => {
-                                        warn!(
-                                            reason = "receipt_renewal_required",
-                                            checkpoint_generation = audit.checkpoint_generation,
-                                            quorum_valid_through = renewal.valid_through,
-                                            quorum_valid_for_secs = renewal.valid_for_secs,
-                                            warning_window_secs = renewal.warning_window_secs,
-                                            fresh_verified = evidence.fresh_verified,
-                                            accepted = evidence.accepted,
-                                            minimum_verified = evidence.minimum_verified,
-                                            "[CHAT_RELAY] Custody witness evidence is approaching expiry"
-                                        );
-                                    }
-                                    CustodyWitnessRenewalLogAction::Recovered => {
-                                        info!(
-                                            reason = "receipt_renewal_recovered",
-                                            checkpoint_generation = audit.checkpoint_generation,
-                                            quorum_valid_through = renewal.valid_through,
-                                            quorum_valid_for_secs = renewal.valid_for_secs,
-                                            fresh_verified = evidence.fresh_verified,
-                                            accepted = evidence.accepted,
-                                            minimum_verified = evidence.minimum_verified,
-                                            "[CHAT_RELAY] Custody witness evidence freshness recovered"
-                                        );
-                                    }
-                                    CustodyWitnessRenewalLogAction::WarningSuppressed => {
-                                        debug!(
-                                            reason = "receipt_renewal_pending",
-                                            checkpoint_generation = audit.checkpoint_generation,
-                                            quorum_valid_through = renewal.valid_through,
-                                            quorum_valid_for_secs = renewal.valid_for_secs,
-                                            "[CHAT_RELAY] Custody witness renewal warning already active"
-                                        );
-                                    }
-                                    CustodyWitnessRenewalLogAction::Healthy => {
-                                        debug!(
-                                            checkpoint_generation = audit.checkpoint_generation,
-                                            vault_records = vault.records,
-                                            fresh_verified = evidence.fresh_verified,
-                                            accepted = evidence.accepted,
-                                            minimum_verified = evidence.minimum_verified,
-                                            quorum_valid_through = renewal.valid_through,
-                                            quorum_valid_for_secs = renewal.valid_for_secs,
-                                            "[CHAT_RELAY] Runtime custody witness guard passed"
-                                        );
-                                    }
                                 }
                             }
-                            Err(reason) => {
-                                let failure = custody_witness_runtime_failure(reason);
-                                error!(
-                                    reason = reason.as_str(),
-                                    "[CHAT_RELAY] Runtime custody witness guard rejected local state"
-                                );
-                                if critical_failure_tx.send(failure).await.is_err() {
-                                    error!(
-                                        task = "custody-witness-runtime",
-                                        "[RUNTIME] Main task dropped the critical failure receiver"
-                                    );
-                                    return;
-                                }
+                        }
 
-                                // Keep the required task alive until the main
-                                // runtime broadcasts the controlled stop. This
-                                // prevents its wrapper from racing the specific
-                                // policy failure with a generic exit failure.
-                                let _ = shutdown_rx.recv().await;
-                                return;
+                        let vault = audit.snapshot.vault;
+                        let evidence = audit.snapshot.policy;
+                        match renewal_log_state.observe(renewal) {
+                            CustodyWitnessRenewalLogAction::WarningEntered => {
+                                warn!(
+                                    reason = "receipt_renewal_required",
+                                    checkpoint_generation = audit.checkpoint_generation,
+                                    quorum_valid_through = renewal.valid_through,
+                                    quorum_valid_for_secs = renewal.valid_for_secs,
+                                    warning_window_secs = renewal.warning_window_secs,
+                                    fresh_verified = evidence.fresh_verified,
+                                    accepted = evidence.accepted,
+                                    minimum_verified = evidence.minimum_verified,
+                                    "[CHAT_RELAY] Custody witness evidence is approaching expiry"
+                                );
+                            }
+                            CustodyWitnessRenewalLogAction::Recovered => {
+                                info!(
+                                    reason = "receipt_renewal_recovered",
+                                    checkpoint_generation = audit.checkpoint_generation,
+                                    quorum_valid_through = renewal.valid_through,
+                                    quorum_valid_for_secs = renewal.valid_for_secs,
+                                    fresh_verified = evidence.fresh_verified,
+                                    accepted = evidence.accepted,
+                                    minimum_verified = evidence.minimum_verified,
+                                    "[CHAT_RELAY] Custody witness evidence freshness recovered"
+                                );
+                            }
+                            CustodyWitnessRenewalLogAction::WarningSuppressed => {
+                                debug!(
+                                    reason = "receipt_renewal_pending",
+                                    checkpoint_generation = audit.checkpoint_generation,
+                                    quorum_valid_through = renewal.valid_through,
+                                    quorum_valid_for_secs = renewal.valid_for_secs,
+                                    "[CHAT_RELAY] Custody witness renewal warning already active"
+                                );
+                            }
+                            CustodyWitnessRenewalLogAction::Healthy => {
+                                debug!(
+                                    checkpoint_generation = audit.checkpoint_generation,
+                                    vault_records = vault.records,
+                                    fresh_verified = evidence.fresh_verified,
+                                    accepted = evidence.accepted,
+                                    minimum_verified = evidence.minimum_verified,
+                                    quorum_valid_through = renewal.valid_through,
+                                    quorum_valid_for_secs = renewal.valid_for_secs,
+                                    "[CHAT_RELAY] Runtime custody witness guard passed"
+                                );
                             }
                         }
                     }
@@ -14617,7 +14792,8 @@ mod tests {
         await_commitment_tip_announcement_or_newer,
         commitment_coordinator_lease_degraded_retry_delay,
         commitment_coordinator_lease_production_valid_for, commitment_follower_success_retry_delay,
-        commitment_witness_startup_decision, custody_witness_readiness_decision,
+        commitment_witness_startup_decision, custody_witness_auto_renewal_due,
+        custody_witness_readiness_decision,
         custody_witness_renewal_status, custody_witness_renewal_warning_window_secs,
         custody_witness_runtime_audit_interval_secs, custody_witness_runtime_failure,
         data_plane_receive_failure_action, memchain_index_rejection_reason,
@@ -16318,6 +16494,11 @@ mod tests {
             warning_window_secs: 100,
             renewal_recommended: false,
         };
+        // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Network renewal
+        // requires both explicit operator enablement and an expiring quorum.
+        assert!(!custody_witness_auto_renewal_due(false, warning));
+        assert!(!custody_witness_auto_renewal_due(true, healthy));
+        assert!(custody_witness_auto_renewal_due(true, warning));
         let refreshed_warning = CustodyWitnessRenewalStatus {
             valid_through: 1_100,
             valid_for_secs: 80,

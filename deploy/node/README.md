@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Document the explicit
+  opt-in, exact-pin pre-expiry renewal path inside the supervised runtime gate.
 - [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Document the
   hard-bounded concurrent witness round and its durable-before-counting rule.
 - [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Document edge-triggered
@@ -1068,6 +1070,9 @@ also require the same exact-anchor evidence throughout the process lifetime:
 [discovery]
 custody_audit_witness_startup_required = true
 custody_audit_witness_runtime_required = true
+# Keep false during the initial rollout. Enable only after every exact pin is
+# independently operated, reachable, and the explicit collection drill passes.
+custody_audit_witness_auto_renewal_enabled = false
 ```
 
 <!-- [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] -->
@@ -1077,13 +1082,13 @@ and typed readiness decision every 30 to 300 seconds; the cadence is one quarter
 of `custody_audit_witness_max_age_secs`, clamped to those bounds. Missed timer
 ticks are skipped rather than replayed in a burst.
 
-The runtime guard never discovers authority, contacts a witness, exports an
-anchor, or automatically collects evidence. If the immutable custody checkpoint
-advances, signed evidence expires, the configured threshold is no longer met,
-adverse evidence applies, or vault/policy integrity fails, the guard sends one
-privacy-safe reason bucket to the existing required-task supervisor. The main
-runtime then performs its normal bounded graceful shutdown and exits non-zero so
-the service manager can recover only after current evidence is present.
+By default the runtime guard never discovers authority, contacts a witness,
+exports an anchor, or automatically collects evidence. If the immutable custody
+checkpoint advances, signed evidence expires, the configured threshold is no
+longer met, adverse evidence applies, or vault/policy integrity fails, the guard
+sends one privacy-safe reason bucket to the existing required-task supervisor.
+The main runtime then performs its normal bounded graceful shutdown and exits
+non-zero so the service manager can recover only after current evidence exists.
 
 Enable this flag only when the witness collection/import workflow is part of the
 node's maintenance procedure. Before a planned checkpoint rotation or restart,
@@ -1092,25 +1097,58 @@ collect and durably import fresh exact-anchor receipts, run
 service-manager restarts cannot manufacture readiness and must not replace that
 operator workflow.
 
+After the explicit workflow has been exercised against every independent pin,
+the node may renew expiring evidence without an operator timer:
+
+```toml
+[discovery]
+custody_audit_witness_startup_required = true
+custody_audit_witness_runtime_required = true
+custody_audit_witness_auto_renewal_enabled = true
+```
+
+<!-- [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] -->
+Automatic renewal is invalid unless both strict local gates are enabled. It
+runs only after authenticated PeerStore bootstrap and only when the existing
+threshold enters the bounded renewal window. One attempt contacts at most the
+three exact configured pins concurrently, with the process-lifetime no-proxy,
+no-redirect, bounded control HTTP client. Permissionless peers cannot become
+witnesses and a healthy quorum produces no witness traffic.
+
+The cross-process maintenance guard remains held from current-anchor creation
+through transport, durable receipt persistence, and final atomic vault audit.
+Receipts count only after storage succeeds. A temporary transport shortfall is
+reported in aggregate and retried on the next skipped-tick cadence while the
+old quorum remains valid; it never extends validity. Any authentic stale,
+conflict, or generation-gap receipt is persisted and immediately follows the
+same supervised fail-closed shutdown path as the local runtime audit.
+
+Runtime logs contain checkpoint generation and aggregate round/policy counters
+only. They never include witness identities, endpoint strings, signatures,
+anchor hashes, messages, users, routes, payloads, memory, destinations, DNS,
+IP addresses, or social-graph metadata. This remains independent evidence for
+an opaque custody checkpoint, not voting, consensus, fork choice, or finality.
+
 <!-- [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] -->
 Every successful atomic audit also derives `quorum_valid_through` from the
 threshold-th newest accepted receipt, rather than from the newest vault row or
 the oldest surplus receipt. Operator JSON reports expose that inclusive Unix
 timestamp, `quorum_valid_for_seconds`, a bounded 60-to-900-second renewal
 window, and `renewal_recommended`. The runtime emits the fixed local warning
-reason `receipt_renewal_required` inside that window. This is advance notice
-only: it sends no anchor, contacts no witness, changes no trust pin, and does
-not postpone the existing fail-closed boundary.
+reason `receipt_renewal_required` inside that window. With automatic renewal
+disabled this is advance notice only. Enabling renewal may contact exact pins,
+but never changes trust policy or postpones the fail-closed boundary.
 
 <!-- [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] -->
 The runtime emits `receipt_renewal_required` once per aggregate quorum expiry
 horizon. Later timer checks for that same horizon are debug-only, preventing a
 long warning window from flooding the journal. After an operator explicitly
-imports or collects fresher signed receipts and the quorum leaves the warning
-window, the runtime emits `receipt_renewal_recovered` once. A refreshed quorum
+imports, explicitly collects, or automatically renews fresher signed receipts
+and the quorum leaves the warning window, the runtime emits
+`receipt_renewal_recovered` once. A refreshed quorum
 that is still near expiry opens one new warning for its new horizon. None of
-these transitions schedules collection, changes policy, or delays shutdown
-when the strict audit actually fails.
+these log-state transitions changes policy or delays shutdown when the strict
+audit actually fails.
 
 Re-audit the current checkpoint after restart or before a maintenance window:
 

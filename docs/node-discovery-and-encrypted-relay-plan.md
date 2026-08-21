@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.08.0 - Made explicit custody witness collection
-concurrent under the existing 16-pin limit without changing trust or data flow.
+Modification Reason: v1.09.0 - Added explicit opt-in pre-expiry custody
+witness renewal without changing the default local-only runtime contract.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.08.0 - [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Bounds explicit witness collection to one concurrent request per distinct configured pin while retaining durable-before-counting and fail-closed adverse evidence.
+Last Modified: v1.09.0 - [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Renews an expiring exact-anchor threshold only when explicitly enabled, using authenticated PeerStore pins, bounded transport, durable-before-counting, and immediate post-round fail-closed audit.
+Previous: v1.08.0 - [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Bounds explicit witness collection to one concurrent request per distinct configured pin while retaining durable-before-counting and fail-closed adverse evidence.
 Previous: v1.07.0 - [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Emits one warning per expiring quorum horizon and one recovery event after explicit evidence refresh, without new APIs or heartbeat fields.
 Previous: v1.06.0 - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Derives the threshold set's exact aggregate lifetime and warns locally before expiry without contacting witnesses or changing authority.
 Previous: v1.05.0 - [CUSTODY-WITNESS-RUNTIME-GUARD 2026-08-18 by Codex] Reuses exact startup readiness during runtime and triggers controlled process recovery when local durable evidence expires, changes, or fails audit, without contacting witnesses.
@@ -142,6 +143,34 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
 
+### v1.09 Strict custody evidence can renew before expiry
+
+[CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex]
+
+- `custody_audit_witness_auto_renewal_enabled` is independently default-off
+  and valid only with both strict startup and runtime gates. Existing nodes
+  preserve their network-silent local audit behavior after upgrade.
+- The supervised runtime task starts only after authenticated PeerStore
+  bootstrap. A renewal attempt occurs only when the current threshold enters
+  its bounded warning window; healthy evidence creates no witness traffic.
+- Each attempt uses the process-lifetime no-proxy, no-redirect control client
+  and the existing maximum of three exact operator pins. Permissionless
+  discovery can provide current signed descriptors but cannot grant witness
+  authority, replace a pin, or increase fan-out.
+- The custody maintenance guard remains held across exact-anchor generation,
+  concurrent network transport, durable receipt writes, and one final atomic
+  readiness audit. A backup rotation cannot change the checkpoint mid-round.
+- Temporary transport shortfall is retried only on the existing 30-to-300
+  second skipped-tick cadence while prior evidence remains valid. It never
+  extends receipt lifetime. Persisted authentic adverse evidence enters the
+  existing typed supervised shutdown path immediately.
+- Logs retain aggregate checkpoint/round/policy fields only. No identity,
+  endpoint, signature, hash, message, user, route, payload, memory, address,
+  destination, DNS, or social-graph metadata is exported.
+- This is bounded independent corroboration for opaque custody continuity. It
+  is not validator voting, leader election, fork choice, consensus, finality,
+  reputation, proof of storage, or settlement.
+
 ### v1.08 Custody witness collection is concurrent but still hard-bounded
 
 [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex]
@@ -150,7 +179,7 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
   producer identity before starting any request.
 - One future runs per remaining exact pin through
   `buffer_unordered(MAX_PINNED_WITNESSES_PER_ROUND)`. The existing maximum of
-  16 pins is therefore both the policy limit and absolute concurrency ceiling.
+  three pins is therefore both the policy limit and absolute concurrency ceiling.
 - A slow or unavailable witness consumes one timeout window for the round; it
   cannot multiply maintenance-lock hold time by the configured witness count.
 - Signature, descriptor, endpoint, request binding, and exact-anchor checks are
@@ -159,8 +188,9 @@ Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 - Authentic stale, conflict, or gap receipts remain retained adverse evidence
   and continue to make quorum readiness fail closed. Completion order cannot
   become voting weight, route preference, trust, consensus, or finality.
-- No scheduler, retry loop, API, heartbeat field, witness identity disclosure,
-  endpoint disclosure, or new payload field is introduced.
+- This v1.08 primitive introduced no scheduler, retry loop, API, heartbeat
+  field, witness identity disclosure, endpoint disclosure, or payload field.
+  The later v1.09 runtime composition is separately opt-in.
 
 ### v1.07 Custody renewal warnings have a bounded local lifecycle
 

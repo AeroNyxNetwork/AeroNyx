@@ -220,8 +220,8 @@ verified_delivery_witness_requester_node_ids = []
 # receipts in a bounded local vault and revalidates them after restart. The
 # host-local import command accepts only a current producer checkpoint and a
 # witness from this pin set; it does not contact the witness over the network.
-# Configuration/startup still sends nothing: no scheduler exists in this
-# release, and an empty list remains fully off. Operators may explicitly run
+# Configuration/startup still sends nothing, and an empty list remains fully
+# off. Operators may explicitly run
 # `relay-custody collect-audit-witnesses --discovery-snapshot <signed-json>`;
 # it filters the snapshot to this exact pin set, verifies every descriptor,
 # persists signed receipts before counting them, and exits non-zero unless the
@@ -248,6 +248,12 @@ custody_audit_witness_startup_required = false
 # Each expiry horizon warns once; a later healthy explicit refresh emits one
 # `receipt_renewal_recovered` event. Actual audit failure still stops the node.
 custody_audit_witness_runtime_required = false
+# [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Default false preserves
+# the local-only runtime contract above. When true, an expiring quorum triggers
+# one bounded concurrent round to these exact pins. Every response is verified
+# and durably stored before counting; signed adverse evidence still stops the
+# strict runtime. Requires both startup_required and runtime_required = true.
+custody_audit_witness_auto_renewal_enabled = false
 # Current-anchor receipt freshness window. Valid range 60..=604800 seconds.
 # Positive witness clock skew is always capped separately at 60 seconds.
 custody_audit_witness_max_age_secs = 7200

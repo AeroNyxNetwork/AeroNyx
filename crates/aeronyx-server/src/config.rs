@@ -53,6 +53,8 @@
 //!   #[cfg(test)] block; unit tests belong in each sub-module's own tests.
 //!
 //! ## Last Modified
+//! v0.26.0-CustodyWitnessAutoRenewal - Added an explicit default-off runtime
+//! renewal policy that requires both strict startup and runtime custody gates.
 //! v0.25.0-CustodyWitnessRuntimeGuard - Added a default-off, local-only
 //! runtime re-audit gate that requires the strict startup gate.
 //! v0.24.0-CustodyWitnessStartupGate - Added a default-off, local-only
@@ -324,6 +326,14 @@ pub struct DiscoveryConfig {
     /// may be enabled only together with the strict startup gate.
     #[serde(default)]
     pub custody_audit_witness_runtime_required: bool,
+    /// Renews current-anchor receipts before the strict runtime gate expires.
+    ///
+    /// [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] This remains
+    /// independently default-off because enabling it transmits an aggregate,
+    /// producer-signed custody anchor to the exact configured witness pins.
+    /// It is valid only when both strict local gates are enabled.
+    #[serde(default)]
+    pub custody_audit_witness_auto_renewal_enabled: bool,
     /// Maximum age of a signed receipt accepted by strict local policy.
     #[serde(default = "DiscoveryConfig::default_custody_audit_witness_max_age_secs")]
     pub custody_audit_witness_max_age_secs: u64,
@@ -918,6 +928,7 @@ impl DiscoveryConfig {
                 != Self::default_custody_audit_witness_min_verified()
             || self.custody_audit_witness_startup_required
             || self.custody_audit_witness_runtime_required
+            || self.custody_audit_witness_auto_renewal_enabled
             || self.custody_audit_witness_max_age_secs
                 != Self::default_custody_audit_witness_max_age_secs()
         {
@@ -960,6 +971,14 @@ impl DiscoveryConfig {
                 return Err(ServerError::config_invalid(
                     "discovery.custody_audit_witness_runtime_required",
                     "requires custody_audit_witness_startup_required = true",
+                ));
+            }
+            if self.custody_audit_witness_auto_renewal_enabled
+                && !self.custody_audit_witness_runtime_required
+            {
+                return Err(ServerError::config_invalid(
+                    "discovery.custody_audit_witness_auto_renewal_enabled",
+                    "requires custody_audit_witness_runtime_required = true",
                 ));
             }
         }
@@ -1450,6 +1469,7 @@ impl Default for DiscoveryConfig {
             custody_audit_witness_min_verified: Self::default_custody_audit_witness_min_verified(),
             custody_audit_witness_startup_required: false,
             custody_audit_witness_runtime_required: false,
+            custody_audit_witness_auto_renewal_enabled: false,
             custody_audit_witness_max_age_secs: Self::default_custody_audit_witness_max_age_secs(),
             custody_audit_witness_requester_node_ids: Vec::new(),
             verified_delivery_witness_min_verified:
@@ -1755,6 +1775,7 @@ mod tests {
         );
         assert!(!config.discovery.custody_audit_witness_startup_required);
         assert!(!config.discovery.custody_audit_witness_runtime_required);
+        assert!(!config.discovery.custody_audit_witness_auto_renewal_enabled);
         assert_eq!(
             config.discovery.custody_audit_witness_max_age_secs,
             DiscoveryConfig::default_custody_audit_witness_max_age_secs()
@@ -2094,6 +2115,7 @@ custody_audit_witness_node_ids = [
 custody_audit_witness_min_verified = 2
 custody_audit_witness_startup_required = true
 custody_audit_witness_runtime_required = true
+custody_audit_witness_auto_renewal_enabled = true
 custody_audit_witness_max_age_secs = 3600
 verified_delivery_witness_min_verified = 2
 verified_delivery_witness_required_for_restore = true
@@ -2122,6 +2144,7 @@ verified_delivery_witness_required_for_restore = true
         assert_eq!(config.discovery.custody_audit_witness_min_verified, 2);
         assert!(config.discovery.custody_audit_witness_startup_required);
         assert!(config.discovery.custody_audit_witness_runtime_required);
+        assert!(config.discovery.custody_audit_witness_auto_renewal_enabled);
         assert_eq!(config.discovery.custody_audit_witness_max_age_secs, 3600);
         assert_eq!(config.discovery.verified_delivery_witness_min_verified, 2);
         assert!(
@@ -2295,6 +2318,26 @@ custody_audit_witness_node_ids = [
 custody_audit_witness_runtime_required = true
 "#;
         assert!(ServerConfig::from_str(runtime_custody_without_startup).is_err());
+
+        // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Automatic
+        // network transmission cannot be enabled behind a weaker local-only
+        // runtime policy, even when a valid witness pin exists.
+        let renewal_without_runtime_guard = r#"
+[memchain]
+mode = "local"
+
+[memchain.chat_relay]
+enabled = true
+
+[discovery]
+enabled = true
+custody_audit_witness_node_ids = [
+  "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+]
+custody_audit_witness_startup_required = true
+custody_audit_witness_auto_renewal_enabled = true
+"#;
+        assert!(ServerConfig::from_str(renewal_without_runtime_guard).is_err());
 
         for invalid_age in [59, MAX_CUSTODY_AUDIT_WITNESS_AGE_SECS + 1] {
             let invalid_freshness = format!(
