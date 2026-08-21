@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Document bounded,
+  CPU-aware previous-hop signature verification and unsigned pre-auth failures.
 - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Document
   wall-clock-independent previous-hop rate, decay, quarantine, and LRU policy.
 - [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Document the local
@@ -179,6 +181,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.75.0-node-deploy - Documented bounded blind-relay signature verification.
 v1.74.0-node-deploy - Documented monotonic previous-hop abuse enforcement.
 v1.73.0-node-deploy - Documented fair fixed-memory relay abuse buckets.
 v1.72.0-node-deploy - Documented identity-independent blind-relay admission.
@@ -789,6 +792,23 @@ peer's quota or keep process-local quarantine alive beyond its configured
 duration. The existing Unix `quarantine_until` value remains a rounded-up
 projection for API and Nodeboard compatibility; it is not derived from payload,
 route, user, receiver, endpoint, or source-address data.
+
+<!-- [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] -->
+Previous-hop Ed25519 verification and exact failure-receipt commitment hashing
+now run outside Tokio's asynchronous workers behind a process-wide semaphore.
+The active capacity is approximately half the host's reported hardware threads,
+with a minimum of one and a hard maximum of eight. Admission uses
+`try_acquire_owned`:
+when every verifier is busy, the request receives the existing retryable
+`429 backpressure` result instead of entering a blocking-task queue.
+
+The permit is owned by the blocking worker until verification returns, even if
+the HTTP request is cancelled. Invalid signatures, invalid previous-hop keys,
+and pre-verification backpressure update aggregate health only; they cannot
+mutate a claimed peer's state and receive no node-signed failure receipt. Once
+authentication succeeds, the established signed failure-receipt contract stays
+unchanged. This adds no configuration key, API route, JSON field, node identity
+bucket, payload inspection, or deployment migration.
 
 <!-- [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] -->
 `peer_relay_authenticated_requests_per_minute` adds a bounded fairness ceiling

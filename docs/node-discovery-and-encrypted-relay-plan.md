@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.24.0 - Make previous-hop abuse enforcement independent
-from host wall-clock correction while preserving existing observability fields.
+Modification Reason: v1.25.0 - Bound blind-relay signature verification and
+request commitment hashing outside asynchronous runtime workers.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.24.0 - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforces previous-hop request, failure-decay, quarantine, idle-retention, and LRU windows with process-local monotonic time while projecting only a compatibility timestamp to PeerStore and Nodeboard.
+Last Modified: v1.25.0 - [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Runs previous-hop authentication and request commitment hashing behind CPU-aware, fail-fast blocking admission; unauthenticated requests receive no node-signed failure receipt and cannot mutate claimed-peer state.
+Previous: v1.24.0 - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforces previous-hop request, failure-decay, quarantine, idle-retention, and LRU windows with process-local monotonic time while projecting only a compatibility timestamp to PeerStore and Nodeboard.
 Previous: v1.23.0 - [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Removes stale previous-hop buckets regardless of FIFO position, evicts only the least-recently-used non-quarantined identity under pressure, and never deletes active quarantine to admit a fresh permissionless key.
 Previous: v1.22.0 - [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Prevents permissionless node-key rotation from bypassing blind-relay parser and process admission while preserving aggregate-only telemetry and verified previous-hop fairness.
 Previous: v1.21.0 - [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] Separates optional witness availability from authenticated adverse evidence so rollback, conflict, or generation-gap results always block restored proof continuity and multi-hop admission.
@@ -157,6 +158,36 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.25 Blind-relay authentication cannot starve the async runtime
+
+[BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex]
+
+- The parser-front rate and HTTP in-flight gates bound request count and memory,
+  but previous-hop Ed25519 verification still executed directly on Tokio worker
+  threads. A burst of syntactically valid, maximum-size invalid envelopes could
+  therefore delay health, discovery, and unrelated relay futures.
+- Verification and exact failure-receipt commitment hashing now execute in
+  `spawn_blocking` behind a process-wide semaphore. Capacity is CPU-aware:
+  approximately half the reported hardware threads, clamped to 1..=8.
+- Admission is fail-fast before `spawn_blocking`; saturation returns the existing
+  retryable `429 backpressure` bucket and never creates an unbounded blocking
+  queue. The owned permit stays inside the worker, so cancelled requests cannot
+  release capacity while abandoned CPU work continues.
+- Only successful authentication creates the private
+  `AuthenticatedPeerBlindRelayRequest` capability. Per-peer fairness,
+  reputation, quarantine, route processing, and signed failure receipts all
+  remain behind that compile-time boundary.
+- Invalid public keys, invalid signatures, verifier saturation, and blocking
+  worker failure affect aggregate health only. They receive no node signature,
+  preventing attacker-selected requests from turning failure handling into a
+  signing oracle.
+- Authenticated protocol failures retain their exact signed failure receipt;
+  existing API paths, JSON fields, status/reason buckets, descriptor features,
+  opaque payload handling, and permissionless discovery remain compatible.
+- Regression tests prove fail-fast admission, successful recovery after permit
+  release, unsigned invalid-signature HTTP responses, and unchanged signed
+  failure receipts for authenticated stale requests.
 
 ### v1.24 Previous-hop policy survives host clock correction
 

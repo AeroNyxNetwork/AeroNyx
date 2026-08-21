@@ -66,6 +66,9 @@
 //! - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforces
 //!   previous-hop rate, decay, quarantine, and LRU windows with process-local
 //!   monotonic time so host clock corrections cannot extend or reset policy
+//! - [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Runs previous-hop
+//!   signature verification and request commitment hashing on a bounded
+//!   blocking pool boundary before any identity attribution or signed failure
 //! - [PEER-ACK-PRIVACY 2026-08-15 by Codex] Normalizes successful direct
 //!   relay ACKs so peers cannot probe receiver presence, device count, or
 //!   mailbox/dedup state through legacy compatibility fields
@@ -265,8 +268,15 @@
 //! - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Inbound relay health
 //!   accepts only the validated reason type. Keep raw store errors local and
 //!   never export request, endpoint, identity, or payload-derived text.
+//! - [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Never queue unbounded
+//!   signature work or sign a failure receipt for an unauthenticated request.
+//!   The owned admission permit must remain inside the blocking worker so task
+//!   cancellation cannot release capacity while verification is still active.
 //!
 //! ## Last Modified
+//! v0.54.0-BlindRelayVerifyAdmission - Isolate signature verification and
+//! request commitment hashing behind bounded CPU admission; unsigned rejection
+//! is mandatory until previous-hop authentication succeeds
 //! v0.53.0-BlindRelayMonotonicAbuseClock - Enforce previous-hop rate, decay,
 //! quarantine, and LRU windows independently from host wall-clock corrections
 //! v0.52.0-BlindRelayBucketFairness - Evict expired/LRU non-quarantined peer
@@ -349,7 +359,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{atomic::AtomicUsize, Arc, Mutex},
+    sync::{atomic::AtomicUsize, Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -380,7 +390,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::time::sleep;
+use tokio::{sync::Semaphore, time::sleep};
 use tracing::{debug, warn};
 
 use crate::api::{
@@ -474,6 +484,17 @@ const HTTP_TOO_EARLY_STATUS_CODE: u16 = 425;
 /// possible fanout. This is local backpressure only; callers should retry with
 /// jitter at the transport/client layer.
 const MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS: usize = 64;
+
+/// Hard ceiling for concurrent previous-hop signature verification workers.
+///
+/// [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] The runtime derives a
+/// smaller CPU-aware value from this cap. Keeping it below the HTTP in-flight
+/// ceiling prevents large, invalid but syntactically valid envelopes from
+/// occupying Tokio workers or creating an unbounded blocking-task backlog.
+const MAX_BLIND_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT: usize = 8;
+
+/// Process-wide admission for CPU-bound blind-relay authentication.
+static BLIND_RELAY_SIGNATURE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Maximum attempts for a single next-hop blind relay POST.
 ///
@@ -1761,6 +1782,18 @@ pub struct PeerBlindRelayRequest {
     pub onward_descriptor_hint: Option<SignedNodeDescriptor>,
 }
 
+/// A blind-relay request whose claimed previous hop has authenticated the
+/// exact envelope and whose failure-receipt commitment is already computed.
+///
+/// [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] This type is deliberately
+/// private and cannot be deserialized from the wire. Construct it only through
+/// `authenticate_peer_blind_relay_request_with_admission`; that boundary keeps
+/// unauthenticated work out of per-peer state and out of the node signing path.
+struct AuthenticatedPeerBlindRelayRequest {
+    request: PeerBlindRelayRequest,
+    failure_request_commitment: [u8; 32],
+}
+
 /// Node-to-node blind relay response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerBlindRelayResponse {
@@ -1827,6 +1860,9 @@ enum ChatPeerRelayError {
 
 #[derive(Debug, thiserror::Error)]
 enum BlindRelayError {
+    #[error("blind relay verification capacity exhausted")]
+    Backpressure,
+
     #[error("invalid previous hop public key")]
     InvalidPreviousHop,
 
@@ -1904,7 +1940,9 @@ impl BlindRelayError {
             Self::OnionTerminalCapacityExhausted | Self::RouteInFlight | Self::ReplayCapacity => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-            Self::RateLimited | Self::Quarantined => StatusCode::TOO_MANY_REQUESTS,
+            Self::Backpressure | Self::RateLimited | Self::Quarantined => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             Self::NoRoute | Self::InvalidEndpoint => StatusCode::BAD_GATEWAY,
             Self::ForwardFailed => StatusCode::BAD_GATEWAY,
         }
@@ -1912,6 +1950,7 @@ impl BlindRelayError {
 
     fn reason_bucket(&self) -> &'static str {
         match self {
+            Self::Backpressure => "backpressure",
             Self::InvalidPreviousHop => "invalid_previous_hop",
             Self::InvalidSignature => "invalid_signature",
             Self::EnvelopeTooLarge => "envelope_too_large",
@@ -2317,35 +2356,70 @@ async fn peer_blind_relay_handler(
     Json(request): Json<PeerBlindRelayRequest>,
 ) -> impl IntoResponse {
     let failure_route_id = request.envelope.route_id;
-    let failure_request_commitment =
-        BlindRelayFailureReceipt::request_commitment(&request.envelope);
     let node_identity = Arc::clone(&state.node_identity);
-    match process_peer_blind_relay(state, request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+    let authenticated = match authenticate_peer_blind_relay_request(request).await {
+        Ok(authenticated) => authenticated,
         Err(error) => {
-            let reason = error.reason_bucket();
-            let failure_receipt = BlindRelayFailureReceipt::failed(
+            // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] The claimed
+            // previous hop has no attribution authority before verification.
+            // Record only aggregate health and never sign an oracle response.
+            state
+                .peer_store
+                .record_blind_relay_rejected(now_secs(), error.reason_bucket());
+            return blind_relay_failure_response(
+                error,
                 failure_route_id,
-                failure_request_commitment,
-                reason,
-                now_secs(),
+                None,
                 node_identity.as_ref(),
             );
-            (
-                error.status_code(),
-                Json(PeerBlindRelayResponse {
-                    accepted: false,
-                    terminal: false,
-                    forwarded: false,
-                    ttl_remaining: 0,
-                    reason: Some(reason.to_string()),
-                    delivery_receipt: None,
-                    failure_receipt: Some(failure_receipt),
-                }),
-            )
-                .into_response()
         }
+    };
+    let failure_request_commitment = authenticated.failure_request_commitment;
+    match process_authenticated_peer_blind_relay(state, authenticated).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => blind_relay_failure_response(
+            error,
+            failure_route_id,
+            Some(failure_request_commitment),
+            node_identity.as_ref(),
+        ),
     }
+}
+
+/// Builds the stable blind-relay failure shape and signs it only when the
+/// caller supplies a commitment produced by the authenticated request type.
+///
+/// [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] `None` is a security
+/// boundary, not legacy absence: pre-authentication failures must stay unsigned.
+fn blind_relay_failure_response(
+    error: BlindRelayError,
+    route_id: [u8; 16],
+    authenticated_request_commitment: Option<[u8; 32]>,
+    node_identity: &IdentityKeyPair,
+) -> Response {
+    let reason = error.reason_bucket();
+    let failure_receipt = authenticated_request_commitment.map(|request_commitment| {
+        BlindRelayFailureReceipt::failed(
+            route_id,
+            request_commitment,
+            reason,
+            now_secs(),
+            node_identity,
+        )
+    });
+    (
+        error.status_code(),
+        Json(PeerBlindRelayResponse {
+            accepted: false,
+            terminal: false,
+            forwarded: false,
+            ttl_remaining: 0,
+            reason: Some(reason.to_string()),
+            delivery_receipt: None,
+            failure_receipt,
+        }),
+    )
+        .into_response()
 }
 
 async fn process_peer_relay(
@@ -2427,26 +2501,90 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn blind_relay_signature_admission() -> Arc<Semaphore> {
+    Arc::clone(BLIND_RELAY_SIGNATURE_ADMISSION.get_or_init(|| {
+        // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Reserve roughly
+        // half the reported hardware parallelism for the rest of the node.
+        // The hard cap keeps large hosts from accepting an excessive blocking
+        // burst, while a one-core node still retains one verification worker.
+        let hardware_threads = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1);
+        let capacity = (hardware_threads.saturating_add(1) / 2)
+            .max(1)
+            .min(MAX_BLIND_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT);
+        Arc::new(Semaphore::new(capacity))
+    }))
+}
+
+async fn authenticate_peer_blind_relay_request(
+    request: PeerBlindRelayRequest,
+) -> Result<AuthenticatedPeerBlindRelayRequest, BlindRelayError> {
+    authenticate_peer_blind_relay_request_with_admission(blind_relay_signature_admission(), request)
+        .await
+}
+
+async fn authenticate_peer_blind_relay_request_with_admission(
+    admission: Arc<Semaphore>,
+    request: PeerBlindRelayRequest,
+) -> Result<AuthenticatedPeerBlindRelayRequest, BlindRelayError> {
+    // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Acquire before
+    // `spawn_blocking`, then move the owned permit into the worker. This makes
+    // saturation fail immediately without queue growth and prevents a
+    // cancelled HTTP future from releasing capacity before CPU work stops.
+    let permit = admission
+        .try_acquire_owned()
+        .map_err(|_| BlindRelayError::Backpressure)?;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        authenticate_blind_relay_envelope(&request.envelope, &request.previous_hop_node_id)?;
+        let failure_request_commitment =
+            BlindRelayFailureReceipt::request_commitment(&request.envelope);
+        Ok(AuthenticatedPeerBlindRelayRequest {
+            request,
+            failure_request_commitment,
+        })
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            // Join failures are local runtime faults. Never expose a panic or
+            // scheduler detail through the privacy protocol response.
+            warn!("[CHAT_PEER] Blind relay verification worker failed closed");
+            Err(BlindRelayError::Backpressure)
+        }
+    }
+}
+
+#[cfg(test)]
 async fn process_peer_blind_relay(
     state: ChatPeerState,
     request: PeerBlindRelayRequest,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    let authenticated = authenticate_peer_blind_relay_request(request)
+        .await
+        .map_err(|error| {
+            state
+                .peer_store
+                .record_blind_relay_rejected(now_secs(), error.reason_bucket());
+            error
+        })?;
+    process_authenticated_peer_blind_relay(state, authenticated).await
+}
+
+async fn process_authenticated_peer_blind_relay(
+    state: ChatPeerState,
+    authenticated: AuthenticatedPeerBlindRelayRequest,
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Reaching route state
+    // requires possession of the private authenticated request capability.
     let now = now_secs();
     let route_started_at = Instant::now();
+    let request = authenticated.request;
     let previous_hop_node_id = request.previous_hop_node_id;
     let onward_descriptor_hint = request.onward_descriptor_hint;
     let envelope = request.envelope;
-
-    // [PREVIOUS-HOP-ATTRIBUTION 2026-08-15 by Codex] The claimed node id is
-    // attacker-controlled until this exact envelope verifies against it. Do
-    // not let unauthenticated traffic consume or poison another node's rate,
-    // reputation, or quarantine bucket.
-    authenticate_blind_relay_envelope(&envelope, &previous_hop_node_id).map_err(|error| {
-        state
-            .peer_store
-            .record_blind_relay_rejected(now, error.reason_bucket());
-        error
-    })?;
 
     check_blind_relay_previous_hop_allowed(&state, previous_hop_node_id, now)?;
 
@@ -4580,6 +4718,14 @@ mod tests {
             BlindRelayError::ReplayCapacity.reason_bucket(),
             "replay_capacity"
         );
+        assert_eq!(
+            BlindRelayError::Backpressure.status_code(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            BlindRelayError::Backpressure.reason_bucket(),
+            "backpressure"
+        );
         let failure_ack = |reason: &str| PeerBlindRelayResponse {
             accepted: false,
             terminal: false,
@@ -4633,6 +4779,51 @@ mod tests {
             non_retryable_downstream_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS).is_none()
         );
         assert!(non_retryable_downstream_status_error(reqwest::StatusCode::BAD_GATEWAY).is_none());
+    }
+
+    #[tokio::test]
+    async fn blind_relay_signature_admission_rejects_without_queueing() {
+        // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] A saturated
+        // verifier must reject before spawning more blocking work. Once the
+        // permit is released, the same authenticated request remains valid.
+        let admission = Arc::new(Semaphore::new(1));
+        let held_permit = Arc::clone(&admission)
+            .try_acquire_owned()
+            .expect("reserve the only verification permit");
+        let previous_hop = IdentityKeyPair::generate();
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x3du8; 16],
+            next_hop: IdentityKeyPair::generate().public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: b"opaque bounded verification test".to_vec(),
+            timestamp: now_secs(),
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+        let request = PeerBlindRelayRequest {
+            envelope,
+            previous_hop_node_id: previous_hop.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+
+        let rejected = authenticate_peer_blind_relay_request_with_admission(
+            Arc::clone(&admission),
+            request.clone(),
+        )
+        .await;
+        assert!(matches!(rejected, Err(BlindRelayError::Backpressure)));
+
+        drop(held_permit);
+        let authenticated =
+            authenticate_peer_blind_relay_request_with_admission(admission, request.clone())
+                .await
+                .expect("released verifier must accept valid signed work");
+        assert_eq!(authenticated.request.envelope.route_id, [0x3du8; 16]);
+        assert_eq!(
+            authenticated.failure_request_commitment,
+            BlindRelayFailureReceipt::request_commitment(&request.envelope)
+        );
     }
 
     #[tokio::test]
@@ -5408,6 +5599,58 @@ mod tests {
             validate_downstream_failure_receipt(&parsed, &request, &node_id, now_secs(), true),
             Ok(true)
         );
+    }
+
+    #[tokio::test]
+    async fn blind_relay_handler_never_signs_unauthenticated_failure() {
+        // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] An attacker may
+        // choose both the ciphertext and claimed node id. Invalid work gets a
+        // coarse retry/error bucket, but no node-authored receipt oracle.
+        let claimed_previous_hop = IdentityKeyPair::generate();
+        let attacker = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let request = PeerBlindRelayRequest {
+            envelope: BlindRelayEnvelope {
+                route_id: [0x4au8; 16],
+                next_hop: node_identity.public_key_bytes(),
+                ttl: 2,
+                encrypted_blob: b"opaque unauthenticated failure".to_vec(),
+                timestamp: now_secs(),
+                signature: [0u8; 64],
+            }
+            .sign_with(&attacker),
+            previous_hop_node_id: claimed_previous_hop.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let app = build_chat_peer_router(
+            None,
+            Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            Arc::new(PeerStore::new()),
+            node_identity,
+            Arc::new(reqwest::Client::new()),
+            None,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/blind-relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: PeerBlindRelayResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.reason.as_deref(), Some("invalid_signature"));
+        assert!(parsed.failure_receipt.is_none());
     }
 
     #[tokio::test]
