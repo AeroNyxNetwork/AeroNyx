@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Document
+  wall-clock-independent previous-hop rate, decay, quarantine, and LRU policy.
 - [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Document the local
   startup/operator admission rule and deployment healthcheck projection.
 - [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Document the signed
@@ -177,6 +179,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.74.0-node-deploy - Documented monotonic previous-hop abuse enforcement.
 v1.73.0-node-deploy - Documented fair fixed-memory relay abuse buckets.
 v1.72.0-node-deploy - Documented identity-independent blind-relay admission.
 v1.71.0-node-deploy - Documented fail-closed adverse optional-witness evidence.
@@ -777,6 +780,15 @@ least-recently-used non-quarantined bucket is replaced. Active quarantine is
 never erased to admit a newly generated permissionless identity. If every slot
 is still quarantined, the new request receives the existing aggregate
 `rate_limited` response without changing peer reputation.
+
+<!-- [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] -->
+Previous-hop request windows, failure-score decay, active quarantine, idle
+retention, and LRU order now use process-local monotonic time. NTP corrections,
+manual clock changes, and host wall-clock rollback therefore cannot reset a
+peer's quota or keep process-local quarantine alive beyond its configured
+duration. The existing Unix `quarantine_until` value remains a rounded-up
+projection for API and Nodeboard compatibility; it is not derived from payload,
+route, user, receiver, endpoint, or source-address data.
 
 <!-- [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] -->
 `peer_relay_authenticated_requests_per_minute` adds a bounded fairness ceiling

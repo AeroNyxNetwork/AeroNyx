@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.23.0 - Make fixed-memory previous-hop abuse buckets
-expiration-aware and preserve active quarantine under permissionless churn.
+Modification Reason: v1.24.0 - Make previous-hop abuse enforcement independent
+from host wall-clock correction while preserving existing observability fields.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.23.0 - [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Removes stale previous-hop buckets regardless of FIFO position, evicts only the least-recently-used non-quarantined identity under pressure, and never deletes active quarantine to admit a fresh permissionless key.
+Last Modified: v1.24.0 - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforces previous-hop request, failure-decay, quarantine, idle-retention, and LRU windows with process-local monotonic time while projecting only a compatibility timestamp to PeerStore and Nodeboard.
+Previous: v1.23.0 - [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Removes stale previous-hop buckets regardless of FIFO position, evicts only the least-recently-used non-quarantined identity under pressure, and never deletes active quarantine to admit a fresh permissionless key.
 Previous: v1.22.0 - [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Prevents permissionless node-key rotation from bypassing blind-relay parser and process admission while preserving aggregate-only telemetry and verified previous-hop fairness.
 Previous: v1.21.0 - [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] Separates optional witness availability from authenticated adverse evidence so rollback, conflict, or generation-gap results always block restored proof continuity and multi-hop admission.
 Previous: v1.20.0 - [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Reuses the shared recovery-anchor contract in local health, startup admission, operator telemetry, and deployment diagnostics; strict witness deployments now fail health while the active generation is unverified.
@@ -156,6 +157,30 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.24 Previous-hop policy survives host clock correction
+
+[BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex]
+
+- The verified previous-hop guard previously used Unix seconds for request
+  windows, failure decay, quarantine lifetime, idle retention, and LRU order.
+  A backward host-clock correction could freeze those windows; a forward jump
+  could clear them prematurely. The exact 60-second boundary also remained in
+  the old window for one extra whole-clock second.
+- All process-local enforcement now uses `std::time::Instant`. The shared rate
+  window resets at the exact configured boundary; failure decay and quarantine
+  expiry follow elapsed duration rather than civil time.
+- LRU and idle eviction use the same monotonic observation source, so clock
+  rollback cannot make stale identities look newer than active peers.
+- The established Unix `quarantine_until` contract is preserved as a rounded-up
+  projection from the active monotonic deadline. It remains privacy-safe
+  operator telemetry and does not expose a node key, endpoint, route, user,
+  receiver, source address, or encrypted payload.
+- Regression coverage fixes the exact rate-window edge, simulates a one-hour
+  wall-clock rollback while monotonic time advances, and retains the existing
+  failure-threshold, stale-bucket, LRU, and all-quarantined capacity proofs.
+- No API path, JSON field, status code, configuration key, signed frame,
+  discovery rule, payload handling, or deployment migration changes.
 
 ### v1.23 Previous-hop fairness survives fixed-memory identity churn
 

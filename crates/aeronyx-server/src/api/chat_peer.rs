@@ -63,6 +63,9 @@
 //! - [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Makes fixed-memory
 //!   previous-hop eviction expiration-aware and preserves active quarantine
 //!   evidence under permissionless identity churn
+//! - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforces
+//!   previous-hop rate, decay, quarantine, and LRU windows with process-local
+//!   monotonic time so host clock corrections cannot extend or reset policy
 //! - [PEER-ACK-PRIVACY 2026-08-15 by Codex] Normalizes successful direct
 //!   relay ACKs so peers cannot probe receiver presence, device count, or
 //!   mailbox/dedup state through legacy compatibility fields
@@ -135,6 +138,10 @@
 //!   followed by previous-hop rate limiting and short quarantine only after
 //!   signature verification. This protects commercial nodes from identity
 //!   rotation and noisy verified peers without parsing encrypted blobs.
+//! - Blind-relay abuse enforcement uses process-local monotonic deadlines.
+//!   Unix timestamps are observability projections only and must never become
+//!   the authority for inbound request admission, failure decay, process-local
+//!   quarantine lifetime, or LRU.
 //! - Blind relay reports privacy-safe previous-hop health buckets to PeerStore
 //!   so nodeboard can show protection status without route ids, endpoints,
 //!   encrypted blobs, or user metadata.
@@ -260,6 +267,8 @@
 //!   never export request, endpoint, identity, or payload-derived text.
 //!
 //! ## Last Modified
+//! v0.53.0-BlindRelayMonotonicAbuseClock - Enforce previous-hop rate, decay,
+//! quarantine, and LRU windows independently from host wall-clock corrections
 //! v0.52.0-BlindRelayBucketFairness - Evict expired/LRU non-quarantined peer
 //! buckets without letting one active FIFO head retain stale attacker state
 //! v0.51.0-BlindRelayGlobalAdmission - Bound aggregate blind-relay request rate
@@ -897,7 +906,11 @@ impl PeerRelayRateLimitWindow {
     }
 
     fn allow(&mut self, now: Instant, limit: u32) -> bool {
-        if now.saturating_duration_since(self.started_at) >= Duration::from_secs(60) {
+        self.allow_for(now, limit, Duration::from_secs(60))
+    }
+
+    fn allow_for(&mut self, now: Instant, limit: u32, window: Duration) -> bool {
+        if now.saturating_duration_since(self.started_at) >= window {
             self.started_at = now;
             self.admitted = 0;
         }
@@ -1150,14 +1163,25 @@ enum BlindRelayAbuseDecision {
     Quarantined { quarantine_until: u64 },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BlindRelayPreviousHopBucket {
-    rate_window_start: u64,
-    rate_count: u32,
-    failure_window_start: u64,
+    rate_window: PeerRelayRateLimitWindow,
+    failure_window_started_at: Instant,
     failure_score: u32,
-    quarantine_until: Option<u64>,
-    last_seen_at: u64,
+    quarantine_until: Option<Instant>,
+    last_seen_at: Instant,
+}
+
+impl BlindRelayPreviousHopBucket {
+    fn new(now: Instant) -> Self {
+        Self {
+            rate_window: PeerRelayRateLimitWindow::new(now),
+            failure_window_started_at: now,
+            failure_score: 0,
+            quarantine_until: None,
+            last_seen_at: now,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1180,63 +1204,105 @@ impl BlindRelayAbuseGuard {
         self.global_rate_limit.allow(now, limit)
     }
 
-    fn observe_request(&mut self, previous_hop: [u8; 32], now: u64) -> BlindRelayAbuseDecision {
-        let Some(bucket) = self.bucket_mut(previous_hop, now) else {
+    fn observe_request(
+        &mut self,
+        previous_hop: [u8; 32],
+        observed_at_epoch: u64,
+    ) -> BlindRelayAbuseDecision {
+        self.observe_request_at(previous_hop, observed_at_epoch, Instant::now())
+    }
+
+    fn observe_request_at(
+        &mut self,
+        previous_hop: [u8; 32],
+        observed_at_epoch: u64,
+        observed_at: Instant,
+    ) -> BlindRelayAbuseDecision {
+        let Some(bucket) = self.bucket_mut(previous_hop, observed_at) else {
             return BlindRelayAbuseDecision::CapacityLimited;
         };
-        bucket.last_seen_at = now;
+        bucket.last_seen_at = observed_at;
 
-        if bucket
+        if let Some(quarantine_until) = bucket
             .quarantine_until
-            .is_some_and(|quarantine_until| now < quarantine_until)
+            .filter(|quarantine_until| observed_at < *quarantine_until)
         {
             return BlindRelayAbuseDecision::Quarantined {
-                quarantine_until: bucket.quarantine_until.unwrap_or(now),
+                quarantine_until: project_monotonic_deadline_to_epoch(
+                    observed_at_epoch,
+                    observed_at,
+                    quarantine_until,
+                ),
             };
         }
-        if now.saturating_sub(bucket.rate_window_start) > BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS
-        {
-            bucket.rate_window_start = now;
-            bucket.rate_count = 0;
-        }
+        bucket.quarantine_until = None;
 
-        bucket.rate_count = bucket.rate_count.saturating_add(1);
-        if bucket.rate_count > BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
-            let quarantine_until = now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
-            bucket.quarantine_until = Some(quarantine_until);
-            return BlindRelayAbuseDecision::RateLimited { quarantine_until };
+        if !bucket.rate_window.allow_for(
+            observed_at,
+            BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT,
+            Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS),
+        ) {
+            let quarantine_deadline = observed_at
+                .checked_add(Duration::from_secs(
+                    BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS,
+                ))
+                .unwrap_or(observed_at);
+            bucket.quarantine_until = Some(quarantine_deadline);
+            return BlindRelayAbuseDecision::RateLimited {
+                quarantine_until: observed_at_epoch
+                    .saturating_add(BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS),
+            };
         }
 
         BlindRelayAbuseDecision::Allowed
     }
 
-    fn record_failure(&mut self, previous_hop: [u8; 32], now: u64) -> Option<u64> {
-        let bucket = self.bucket_mut(previous_hop, now)?;
-        bucket.last_seen_at = now;
-        if now.saturating_sub(bucket.failure_window_start)
-            > BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS
+    fn record_failure(&mut self, previous_hop: [u8; 32], observed_at_epoch: u64) -> Option<u64> {
+        self.record_failure_at(previous_hop, observed_at_epoch, Instant::now())
+    }
+
+    fn record_failure_at(
+        &mut self,
+        previous_hop: [u8; 32],
+        observed_at_epoch: u64,
+        observed_at: Instant,
+    ) -> Option<u64> {
+        let bucket = self.bucket_mut(previous_hop, observed_at)?;
+        bucket.last_seen_at = observed_at;
+        if observed_at.saturating_duration_since(bucket.failure_window_started_at)
+            >= Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS)
         {
-            bucket.failure_window_start = now;
+            bucket.failure_window_started_at = observed_at;
             bucket.failure_score = 0;
         }
 
         bucket.failure_score = bucket.failure_score.saturating_add(1);
         if bucket.failure_score >= BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD {
-            let quarantine_until = now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
-            bucket.quarantine_until = Some(quarantine_until);
+            let quarantine_deadline = observed_at
+                .checked_add(Duration::from_secs(
+                    BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS,
+                ))
+                .unwrap_or(observed_at);
+            bucket.quarantine_until = Some(quarantine_deadline);
             bucket.failure_score = 0;
-            return Some(quarantine_until);
+            return Some(
+                observed_at_epoch.saturating_add(BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS),
+            );
         }
         None
     }
 
-    fn record_success(&mut self, previous_hop: [u8; 32], now: u64) {
+    fn record_success(&mut self, previous_hop: [u8; 32]) {
+        self.record_success_at(previous_hop, Instant::now());
+    }
+
+    fn record_success_at(&mut self, previous_hop: [u8; 32], observed_at: Instant) {
         if let Some(bucket) = self.buckets.get_mut(&previous_hop) {
-            bucket.last_seen_at = now;
-            if now.saturating_sub(bucket.failure_window_start)
-                > BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS
+            bucket.last_seen_at = observed_at;
+            if observed_at.saturating_duration_since(bucket.failure_window_started_at)
+                >= Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS)
             {
-                bucket.failure_window_start = now;
+                bucket.failure_window_started_at = observed_at;
                 bucket.failure_score = 0;
             }
         }
@@ -1245,7 +1311,7 @@ impl BlindRelayAbuseGuard {
     fn bucket_mut(
         &mut self,
         previous_hop: [u8; 32],
-        now: u64,
+        observed_at: Instant,
     ) -> Option<&mut BlindRelayPreviousHopBucket> {
         if !self.buckets.contains_key(&previous_hop) {
             // [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Scan only on
@@ -1253,35 +1319,32 @@ impl BlindRelayAbuseGuard {
             // the parser-front global window, so fixed-capacity LRU selection
             // cannot become unbounded per-request work. Active quarantines are
             // never removed merely to admit a fresh permissionless identity.
-            self.evict_idle(now);
-            if !self.make_room_for_new_bucket(now, MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS) {
+            self.evict_idle(observed_at);
+            if !self.make_room_for_new_bucket(observed_at, MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS) {
                 return None;
             }
         }
         Some(
             self.buckets
                 .entry(previous_hop)
-                .or_insert_with(|| BlindRelayPreviousHopBucket {
-                    rate_window_start: now,
-                    failure_window_start: now,
-                    last_seen_at: now,
-                    ..BlindRelayPreviousHopBucket::default()
-                }),
+                .or_insert_with(|| BlindRelayPreviousHopBucket::new(observed_at)),
         )
     }
 
-    fn evict_idle(&mut self, now: u64) {
+    fn evict_idle(&mut self, observed_at: Instant) {
         let retention_secs =
             BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
         self.buckets.retain(|_, bucket| {
             let quarantine_active = bucket
                 .quarantine_until
-                .is_some_and(|quarantine_until| now < quarantine_until);
-            quarantine_active || now.saturating_sub(bucket.last_seen_at) <= retention_secs
+                .is_some_and(|quarantine_until| observed_at < quarantine_until);
+            quarantine_active
+                || observed_at.saturating_duration_since(bucket.last_seen_at)
+                    <= Duration::from_secs(retention_secs)
         });
     }
 
-    fn make_room_for_new_bucket(&mut self, now: u64, capacity: usize) -> bool {
+    fn make_room_for_new_bucket(&mut self, observed_at: Instant, capacity: usize) -> bool {
         if capacity == 0 {
             return false;
         }
@@ -1292,7 +1355,7 @@ impl BlindRelayAbuseGuard {
                 .filter(|(_, bucket)| {
                     !bucket
                         .quarantine_until
-                        .is_some_and(|quarantine_until| now < quarantine_until)
+                        .is_some_and(|quarantine_until| observed_at < quarantine_until)
                 })
                 .min_by(|(left_id, left), (right_id, right)| {
                     left.last_seen_at
@@ -1307,6 +1370,22 @@ impl BlindRelayAbuseGuard {
         }
         true
     }
+}
+
+fn project_monotonic_deadline_to_epoch(
+    observed_at_epoch: u64,
+    observed_at: Instant,
+    deadline: Instant,
+) -> u64 {
+    // [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforcement
+    // remains monotonic. This projection exists only for the established
+    // PeerStore/API timestamp contract and rounds up so observability never
+    // reports an active quarantine as expired one second too early.
+    let remaining = deadline.saturating_duration_since(observed_at);
+    let remaining_secs = remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() != 0));
+    observed_at_epoch.saturating_add(remaining_secs)
 }
 
 /// Node-to-node encrypted envelope relay request.
@@ -2424,7 +2503,7 @@ async fn process_peer_blind_relay(
             failure_receipt: None,
         };
         route_lease.complete(now, response.clone());
-        record_blind_relay_previous_hop_success(&state, previous_hop_node_id, now);
+        record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
         state.peer_store.record_blind_relay_terminal(
             now,
             envelope.ttl,
@@ -2532,7 +2611,7 @@ async fn process_peer_blind_relay(
     let _ = state
         .peer_store
         .record_route_forward_success_for_descriptor(&descriptor, observed_at);
-    record_blind_relay_previous_hop_success(&state, previous_hop_node_id, observed_at);
+    record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
     state
         .peer_store
         .record_blind_relay_forwarded(observed_at, ttl_remaining);
@@ -2630,7 +2709,7 @@ async fn process_onion_blind_relay(
                 failure_receipt: None,
             };
             route_lease.complete(accepted_at, response.clone());
-            record_blind_relay_previous_hop_success(&state, previous_hop_node_id, accepted_at);
+            record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
             state.peer_store.record_blind_relay_terminal(
                 accepted_at,
                 envelope.ttl,
@@ -2750,7 +2829,7 @@ async fn process_onion_blind_relay(
             let _ = state
                 .peer_store
                 .record_route_forward_success_for_descriptor(&descriptor, observed_at);
-            record_blind_relay_previous_hop_success(&state, previous_hop_node_id, observed_at);
+            record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
             state
                 .peer_store
                 .record_blind_relay_forwarded(observed_at, ttl_remaining);
@@ -2926,7 +3005,7 @@ async fn process_onion_middle_blind_relay(
     let _ = state
         .peer_store
         .record_route_forward_success_for_descriptor(&descriptor, observed_at);
-    record_blind_relay_previous_hop_success(&state, previous_hop_node_id, observed_at);
+    record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
     state
         .peer_store
         .record_blind_relay_forwarded(observed_at, ttl_remaining);
@@ -3000,7 +3079,7 @@ fn begin_blind_relay_route(
             state
                 .peer_store
                 .record_blind_relay_rejected(now, "duplicate_route");
-            record_blind_relay_previous_hop_success(state, previous_hop, now);
+            record_blind_relay_previous_hop_success(state, previous_hop);
             Ok(BlindRelayRouteStart::Completed(response))
         }
     }
@@ -3101,16 +3180,12 @@ fn reject_blind_relay_previous_hop(
     }
 }
 
-fn record_blind_relay_previous_hop_success(
-    state: &ChatPeerState,
-    previous_hop: [u8; 32],
-    now: u64,
-) {
+fn record_blind_relay_previous_hop_success(state: &ChatPeerState, previous_hop: [u8; 32]) {
     let mut abuse_guard = state
         .blind_relay_abuse_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    abuse_guard.record_success(previous_hop, now);
+    abuse_guard.record_success(previous_hop);
 }
 
 fn blind_relay_reason_counts_toward_quarantine(reason: &str) -> bool {
@@ -6529,26 +6604,88 @@ mod tests {
     fn blind_relay_abuse_guard_rate_limits_previous_hop_without_payload_data() {
         let mut guard = BlindRelayAbuseGuard::default();
         let previous_hop = [0x52u8; 32];
-        let now = 1_800_000_000;
+        let now_epoch = 1_800_000_000;
+        let started_at = Instant::now();
 
         for _ in 0..BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
             assert_eq!(
-                guard.observe_request(previous_hop, now),
+                guard.observe_request_at(previous_hop, now_epoch, started_at),
                 BlindRelayAbuseDecision::Allowed
             );
         }
 
         assert_eq!(
-            guard.observe_request(previous_hop, now),
+            guard.observe_request_at(previous_hop, now_epoch, started_at),
             BlindRelayAbuseDecision::RateLimited {
-                quarantine_until: now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
+                quarantine_until: now_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
             }
         );
         assert_eq!(
-            guard.observe_request(previous_hop, now + 1),
+            guard.observe_request_at(
+                previous_hop,
+                now_epoch + 1,
+                started_at + Duration::from_secs(1),
+            ),
             BlindRelayAbuseDecision::Quarantined {
-                quarantine_until: now + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
+                quarantine_until: now_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
             }
+        );
+    }
+
+    #[test]
+    fn blind_relay_abuse_guard_uses_exact_monotonic_rate_window() {
+        let mut guard = BlindRelayAbuseGuard::default();
+        let previous_hop = [0x54u8; 32];
+        let now_epoch = 1_800_000_000;
+        let started_at = Instant::now();
+
+        for _ in 0..BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
+            assert_eq!(
+                guard.observe_request_at(previous_hop, now_epoch, started_at),
+                BlindRelayAbuseDecision::Allowed
+            );
+        }
+        assert_eq!(
+            guard.observe_request_at(
+                previous_hop,
+                now_epoch + BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS,
+                started_at + Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS),
+            ),
+            BlindRelayAbuseDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn blind_relay_abuse_guard_ignores_wall_clock_rollback() {
+        let mut guard = BlindRelayAbuseGuard::default();
+        let previous_hop = [0x55u8; 32];
+        let started_epoch = 1_800_000_000;
+        let rolled_back_epoch = started_epoch - 3_600;
+        let started_at = Instant::now();
+
+        for _ in 0..BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
+            assert_eq!(
+                guard.observe_request_at(previous_hop, started_epoch, started_at),
+                BlindRelayAbuseDecision::Allowed
+            );
+        }
+        assert_eq!(
+            guard.observe_request_at(
+                previous_hop,
+                rolled_back_epoch,
+                started_at + Duration::from_secs(59),
+            ),
+            BlindRelayAbuseDecision::RateLimited {
+                quarantine_until: rolled_back_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
+            }
+        );
+        assert_eq!(
+            guard.observe_request_at(
+                previous_hop,
+                rolled_back_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS,
+                started_at + Duration::from_secs(59 + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS,),
+            ),
+            BlindRelayAbuseDecision::Allowed
         );
     }
 
@@ -6556,26 +6693,61 @@ mod tests {
     fn blind_relay_abuse_guard_quarantines_repeated_bad_previous_hop() {
         let mut guard = BlindRelayAbuseGuard::default();
         let previous_hop = [0x53u8; 32];
-        let now = 1_800_000_000;
+        let now_epoch = 1_800_000_000;
+        let started_at = Instant::now();
 
         for offset in 0..(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD - 1) {
             assert_eq!(
-                guard.record_failure(previous_hop, now + u64::from(offset)),
+                guard.record_failure_at(
+                    previous_hop,
+                    now_epoch + u64::from(offset),
+                    started_at + Duration::from_secs(u64::from(offset)),
+                ),
                 None
             );
         }
 
-        let quarantine_at = now + u64::from(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD);
+        let quarantine_offset = u64::from(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD);
+        let quarantine_at_epoch = now_epoch + quarantine_offset;
+        let quarantine_at = started_at + Duration::from_secs(quarantine_offset);
         assert_eq!(
-            guard.record_failure(previous_hop, quarantine_at),
-            Some(quarantine_at + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS)
+            guard.record_failure_at(previous_hop, quarantine_at_epoch, quarantine_at),
+            Some(quarantine_at_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS)
         );
         assert_eq!(
-            guard.observe_request(previous_hop, quarantine_at + 1),
+            guard.observe_request_at(
+                previous_hop,
+                quarantine_at_epoch + 1,
+                quarantine_at + Duration::from_secs(1),
+            ),
             BlindRelayAbuseDecision::Quarantined {
-                quarantine_until: quarantine_at + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
+                quarantine_until: quarantine_at_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
             }
         );
+    }
+
+    #[test]
+    fn blind_relay_abuse_guard_decays_failures_at_exact_monotonic_boundary() {
+        let mut guard = BlindRelayAbuseGuard::default();
+        let previous_hop = [0x56u8; 32];
+        let now_epoch = 1_800_000_000;
+        let started_at = Instant::now();
+
+        for _ in 0..(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD - 1) {
+            assert_eq!(
+                guard.record_failure_at(previous_hop, now_epoch, started_at),
+                None
+            );
+        }
+        assert_eq!(
+            guard.record_failure_at(
+                previous_hop,
+                now_epoch + BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS,
+                started_at + Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS),
+            ),
+            None
+        );
+        assert_eq!(guard.buckets[&previous_hop].failure_score, 1);
     }
 
     #[test]
@@ -6584,22 +6756,28 @@ mod tests {
         let active = [0x61u8; 32];
         let stale = [0x62u8; 32];
         let newcomer = [0x63u8; 32];
-        let started_at = 1_800_000_000;
+        let started_at_epoch = 1_800_000_000;
+        let started_at = Instant::now();
         let retention_secs =
             BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
-        let now = started_at + retention_secs + 2;
+        let now_epoch = started_at_epoch + retention_secs + 2;
+        let now = started_at + Duration::from_secs(retention_secs + 2);
 
         assert_eq!(
-            guard.observe_request(active, started_at),
+            guard.observe_request_at(active, started_at_epoch, started_at),
             BlindRelayAbuseDecision::Allowed
         );
         assert_eq!(
-            guard.observe_request(stale, started_at + 1),
+            guard.observe_request_at(
+                stale,
+                started_at_epoch + 1,
+                started_at + Duration::from_secs(1),
+            ),
             BlindRelayAbuseDecision::Allowed
         );
-        guard.record_success(active, now);
+        guard.record_success_at(active, now);
         assert_eq!(
-            guard.observe_request(newcomer, now),
+            guard.observe_request_at(newcomer, now_epoch, now),
             BlindRelayAbuseDecision::Allowed
         );
 
@@ -6613,21 +6791,14 @@ mod tests {
         let mut guard = BlindRelayAbuseGuard::default();
         let quarantined = [0x71u8; 32];
         let evictable = [0x72u8; 32];
-        let now = 1_800_000_000;
-        guard.buckets.insert(
-            quarantined,
-            BlindRelayPreviousHopBucket {
-                quarantine_until: Some(now + 60),
-                last_seen_at: now - 100,
-                ..BlindRelayPreviousHopBucket::default()
-            },
-        );
+        let now = Instant::now();
+        let mut quarantined_bucket =
+            BlindRelayPreviousHopBucket::new(now - Duration::from_secs(100));
+        quarantined_bucket.quarantine_until = Some(now + Duration::from_secs(60));
+        guard.buckets.insert(quarantined, quarantined_bucket);
         guard.buckets.insert(
             evictable,
-            BlindRelayPreviousHopBucket {
-                last_seen_at: now - 10,
-                ..BlindRelayPreviousHopBucket::default()
-            },
+            BlindRelayPreviousHopBucket::new(now - Duration::from_secs(10)),
         );
 
         assert!(guard.make_room_for_new_bucket(now, 2));
@@ -6638,22 +6809,18 @@ mod tests {
     #[test]
     fn blind_relay_abuse_guard_rejects_new_identity_when_all_buckets_quarantined() {
         let mut guard = BlindRelayAbuseGuard::default();
-        let now = 1_800_000_000;
+        let now_epoch = 1_800_000_000;
+        let now = Instant::now();
         for index in 0..MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS {
             let mut node_id = [0u8; 32];
             node_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            guard.buckets.insert(
-                node_id,
-                BlindRelayPreviousHopBucket {
-                    quarantine_until: Some(now + 60),
-                    last_seen_at: now,
-                    ..BlindRelayPreviousHopBucket::default()
-                },
-            );
+            let mut bucket = BlindRelayPreviousHopBucket::new(now);
+            bucket.quarantine_until = Some(now + Duration::from_secs(60));
+            guard.buckets.insert(node_id, bucket);
         }
 
         assert_eq!(
-            guard.observe_request([0xffu8; 32], now),
+            guard.observe_request_at([0xffu8; 32], now_epoch, now),
             BlindRelayAbuseDecision::CapacityLimited
         );
         assert_eq!(guard.buckets.len(), MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS);
