@@ -410,6 +410,9 @@
 // 151. [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Requires the
 //      local recovery cache and witnessed anchor to represent the exact same
 //      generation, closing the interrupted cache-before-anchor write window.
+// 152. [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Projects the shared
+//      exact-generation recovery-anchor status into the signed management
+//      heartbeat through one bounded, testable aggregate builder.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -961,8 +964,8 @@ use crate::api::directory_replica_sync::{
 };
 use crate::api::discovery::{
     blind_relay_runtime_status_value, build_discovery_router_with_local_entry,
-    discovery_readiness_status_value, DiscoveryApiPolicy, DiscoveryLocalCapabilityStatus,
-    GossipResponse,
+    discovery_readiness_status_value, recovery_anchor_status_value, DiscoveryApiPolicy,
+    DiscoveryLocalCapabilityStatus, GossipResponse,
 };
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
@@ -1026,10 +1029,10 @@ use crate::services::memchain::{
 };
 use crate::services::peer_store::{
     PeerStoreDirectoryProofGossipRound, PeerStoreRouteQuarantineCacheEvidence,
-    PeerStoreRouteabilityCacheEvidence, PeerStoreStatus, PeerStoreTwoHopPathProofEvent,
-    PeerStoreVerifiedClientDeliveryCacheEvidence, PeerStoreVerifiedDeliveryWitnessRound,
-    AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT, AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT,
-    ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION,
+    PeerStoreRouteabilityCacheEvidence, PeerStoreSignedPeerRecordsStatus, PeerStoreStatus,
+    PeerStoreTwoHopPathProofEvent, PeerStoreVerifiedClientDeliveryCacheEvidence,
+    PeerStoreVerifiedDeliveryWitnessRound, AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT,
+    AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT, ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION,
     ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES,
     ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION, ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION,
     THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
@@ -1299,6 +1302,38 @@ fn peer_store_heartbeat_status_value(status: &PeerStoreStatus) -> serde_json::Va
         "route_governance": &status.route_governance,
         "peer_quorum": &status.peer_quorum,
         "network_story": &status.network_story,
+    })
+}
+
+/// Builds the bounded discovery object carried by the signed management heartbeat.
+///
+/// [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Keep all derived readiness
+/// in shared API helpers so the local status endpoint and backend heartbeat
+/// cannot disagree about external-witness generation alignment. The signed
+/// peer-record batch is intentionally passed in after its own bounded export;
+/// this function must not add local audit rows, route candidates, witness
+/// identities/endpoints, anchor material, or user traffic.
+fn discovery_heartbeat_status_value(
+    generated_at: u64,
+    status: &PeerStoreStatus,
+    local_capabilities: &DiscoveryLocalCapabilityStatus,
+    signed_peer_records: PeerStoreSignedPeerRecordsStatus,
+) -> serde_json::Value {
+    serde_json::json!({
+        "generated_at": generated_at,
+        "peer_store": peer_store_heartbeat_status_value(status),
+        "route_governance": &status.route_governance,
+        "blind_relay_runtime": blind_relay_runtime_status_value(
+            generated_at,
+            status,
+            local_capabilities,
+        ),
+        "recovery_anchor": recovery_anchor_status_value(status),
+        "signed_peer_records": signed_peer_records,
+        "local_capabilities": local_capabilities,
+        "discovery_readiness": discovery_readiness_status_value(status, local_capabilities),
+        "source": "rust_peer_store",
+        "privacy_boundary": "aggregate node discovery, blind relay, and recovery-anchor state plus bounded signed node-level discovery descriptors for central verification; no client IPs, destinations, DNS contents, packet payloads, chat plaintext, voucher secrets, private keys, or wallet-level traffic"
     })
 }
 
@@ -7279,12 +7314,6 @@ impl Server {
                     &config,
                     discovery_chat_relay_runtime_ready,
                 );
-                let discovery_readiness =
-                    discovery_readiness_status_value(&status, &local_capabilities);
-                let route_governance = serde_json::json!(&status.route_governance);
-                let blind_relay_runtime =
-                    blind_relay_runtime_status_value(now, &status, &local_capabilities);
-                let peer_store_status = peer_store_heartbeat_status_value(&status);
                 let signed_peer_records = peer_store.export_signed_peer_records_for_heartbeat(
                     now,
                     Some(
@@ -7294,17 +7323,12 @@ impl Server {
                             .min(HEARTBEAT_SIGNED_PEER_RECORD_LIMIT),
                     ),
                 );
-                Some(serde_json::json!({
-                    "generated_at": now,
-                    "peer_store": peer_store_status,
-                    "route_governance": route_governance,
-                    "blind_relay_runtime": blind_relay_runtime,
-                    "signed_peer_records": signed_peer_records,
-                    "local_capabilities": local_capabilities,
-                    "discovery_readiness": discovery_readiness,
-                    "source": "rust_peer_store",
-                    "privacy_boundary": "aggregate node discovery counters plus signed node-level discovery descriptors for central verification; no client IPs, destinations, DNS contents, packet payloads, chat plaintext, voucher secrets, private keys, or wallet-level traffic"
-                }))
+                Some(discovery_heartbeat_status_value(
+                    now,
+                    &status,
+                    &local_capabilities,
+                    signed_peer_records,
+                ))
             })
         }));
 
@@ -15747,7 +15771,8 @@ mod tests {
         custody_witness_readiness_decision, custody_witness_renewal_status,
         custody_witness_renewal_warning_window_secs, custody_witness_runtime_audit_interval_secs,
         custody_witness_runtime_failure, data_plane_receive_failure_action,
-        memchain_index_rejection_reason, peer_store_heartbeat_status_value, prefix_to_netmask,
+        discovery_heartbeat_status_value, memchain_index_rejection_reason,
+        peer_store_heartbeat_status_value, prefix_to_netmask,
         required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
         take_pre_ready_runtime_failure, unix_now_secs, CommitmentCoordinatorLeaseRound,
         CommitmentFollowerRoundOutcome, CommitmentSyncTaskLivenessGuard,
@@ -15831,7 +15856,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixDatagram;
 
-    use crate::api::discovery::GossipResponse;
+    use crate::api::discovery::{DiscoveryLocalCapabilityStatus, GossipResponse};
     use crate::config::{DiscoveryConfig, ServerConfig};
 
     #[test]
@@ -15884,6 +15909,7 @@ mod tests {
         ));
     }
     use crate::services::memchain::MemoryStorage;
+    use crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound;
     use crate::services::{
         ChatRelayService, DirectoryReplicaGossipAnnouncement, DirectoryReplicaStore,
         DirectoryReplicaSyncRuntime, PeerStore, PeerStoreImportReport, SessionManager,
@@ -19506,6 +19532,72 @@ mod tests {
 
         let serialized = serde_json::to_vec(&projection).unwrap();
         assert!(serialized.len() < 32 * 1024);
+    }
+
+    #[test]
+    fn discovery_heartbeat_reports_generation_bound_recovery_anchor() {
+        let now = 1_700_000_020;
+        let peer_store = PeerStore::new();
+        peer_store.record_routeability_cache_rollback_protection(now, 2, "anchored");
+        peer_store.record_two_hop_proof_cache_persisted(now, 3, true);
+        peer_store.record_three_hop_proof_cache_persisted(now, 3, true);
+        peer_store.record_client_delivery_cache_persisted(now, 2, 2);
+        peer_store.record_client_delivery_witness_round(
+            now,
+            1,
+            true,
+            1,
+            PeerStoreVerifiedDeliveryWitnessRound {
+                configured: 1,
+                attempted: 1,
+                verified: 1,
+                idempotent: 1,
+                ..Default::default()
+            },
+        );
+
+        let status = peer_store.status(now);
+        let local_capabilities = DiscoveryLocalCapabilityStatus::default();
+        let signed_peer_records = peer_store.export_signed_peer_records_for_heartbeat(now, Some(8));
+        let heartbeat = discovery_heartbeat_status_value(
+            now,
+            &status,
+            &local_capabilities,
+            signed_peer_records,
+        );
+        let recovery_anchor = &heartbeat["recovery_anchor"];
+
+        assert_eq!(recovery_anchor["contract_version"], "recovery_anchor.v1");
+        assert_eq!(recovery_anchor["status"], "blocked");
+        assert_eq!(recovery_anchor["ready_for_restore"], false);
+        assert_eq!(recovery_anchor["cache_generation"], 2);
+        assert_eq!(recovery_anchor["local_anchor"]["ready"], true);
+        assert_eq!(recovery_anchor["external_witness"]["status"], "verified");
+        assert_eq!(
+            recovery_anchor["external_witness"]["generation_aligned"],
+            false
+        );
+        assert_eq!(recovery_anchor["external_witness"]["ready"], false);
+
+        let serialized_anchor = serde_json::to_string(recovery_anchor).unwrap();
+        for forbidden in [
+            "https://",
+            "\"anchor_digest\"",
+            "\"signature\"",
+            "\"endpoint\"",
+            "\"peer_id\"",
+            "\"route_id\"",
+            "\"message_id\"",
+            "\"client_ip\"",
+            "\"payload_b64\"",
+        ] {
+            assert!(
+                !serialized_anchor.contains(forbidden),
+                "recovery anchor leaked forbidden field: {forbidden}"
+            );
+        }
+        let serialized_heartbeat = serde_json::to_vec(&heartbeat).unwrap();
+        assert!(serialized_heartbeat.len() < 64 * 1024);
     }
 
     #[test]

@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Document the signed
+  management-heartbeat projection for exact-generation recovery readiness.
 - [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Document the additive public
   aggregate and exact-generation runtime admission gate.
 - [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Document exact
@@ -173,6 +175,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.70.0-node-deploy - Documented signed recovery-anchor heartbeat telemetry.
 v1.69.0-node-deploy - Documented recovery-anchor status and runtime generation gate.
 v1.68.0-node-deploy - Documented exact-generation external witness binding.
 v1.67.0-node-deploy - Documented whole-host rollback fail-closed route gating.
@@ -1277,6 +1280,20 @@ node remains fail closed until the post-write witness round verifies that exact
 generation. This closes the small runtime interval between atomic local
 persistence and external witness completion without changing configuration or
 peer wire frames.
+
+<!-- [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] -->
+The signed management heartbeat now carries the same `recovery_anchor.v1`
+object under its existing discovery status payload. Backend and Nodeboard can
+therefore distinguish `ready`, `attention`, `blocked`, and `idle` recovery
+state without reconstructing policy from raw PeerStore fields. The projection
+is built by the same Rust helper as the local discovery endpoints, preventing
+generation-alignment rules from drifting between operator and central views.
+
+This is an additive heartbeat field. Existing consumers may ignore it, and no
+registration, configuration, database, or wire migration is required. The
+heartbeat remains bounded and includes no anchor digest/signature, witness
+identity/endpoint, selected route, message, client, payload, secret, or
+wallet-level traffic.
 
 <!-- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] -->
 The existing signed management heartbeat now includes the additive object

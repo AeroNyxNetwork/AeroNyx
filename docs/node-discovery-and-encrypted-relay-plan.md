@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.18.0 - Expose aggregate recovery-anchor health and
-require exact-generation witness alignment during runtime persistence.
+Modification Reason: v1.19.0 - Project exact-generation recovery-anchor health
+through the existing signed management heartbeat.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.18.0 - [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Adds one privacy-safe recovery-anchor API aggregate and prevents a prior generation's witness result from authorizing proof continuity between local persistence and exact-generation witnessing.
+Last Modified: v1.19.0 - [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Reuses the shared recovery-anchor builder in the signed management heartbeat so backend and Nodeboard observe the same exact-generation admission decision as the node APIs.
+Previous: v1.18.0 - [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Adds one privacy-safe recovery-anchor API aggregate and prevents a prior generation's witness result from authorizing proof continuity between local persistence and exact-generation witnessing.
 Previous: v1.17.0 - [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Prevents a valid older recovery anchor from authorizing readiness restored from a newer signed cache after an interrupted cache-before-anchor durability update.
 Previous: v1.16.0 - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Applies signed rollback, conflict, gap, invalid-anchor, and required-unavailable witness outcomes to routeability, quarantine, two-hop/three-hop proof, and delivery recovery as one startup-only fail-closed decision while preserving verified descriptors.
 Previous: v1.15.0 - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Commits the exact signed routeability/quarantine section into recovery-anchor v3, rejects stale or unanchored route state while preserving descriptors, and extends configured external-witness protection to the same opaque state.
@@ -151,6 +152,26 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.19 Recovery-anchor health reaches the signed management plane
+
+[RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex]
+
+- The existing management heartbeat discovery object now includes the same
+  `recovery_anchor.v1` aggregate returned by `/api/discovery/status` and
+  `/api/discovery/summary`.
+- One pure Rust projection builder owns the heartbeat shape. It reuses the
+  shared discovery readiness, blind-relay runtime, route-governance, and
+  recovery-anchor helpers rather than reimplementing policy inline.
+- Backend and Nodeboard can distinguish `ready`, `attention`, `blocked`, and
+  `idle`, inspect exact-generation alignment, and show one safe next action
+  without parsing audit text or inferring state from legacy proof fields.
+- The field is additive and remains below the existing heartbeat safety budget.
+  Existing consumers, registration flows, configurations, signed descriptor
+  frames, and witness frames require no migration.
+- Tests cover a locally anchored generation two with a still-verified
+  generation-one witness, proving the heartbeat reports `blocked`, remains
+  below 64 KiB, and omits anchor material and identity-bearing route data.
 
 ### v1.18 Recovery-anchor status and runtime generation admission
 
