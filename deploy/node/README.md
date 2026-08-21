@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Document the aggregate,
+  process-lifetime Chat Relay heartbeat contract for custody renewal health.
 - [CUSTODY-RENEWAL-BACKOFF 2026-08-21 by Codex] Document bounded,
   identity-jittered retry scheduling that never delays strict local audits.
 - [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Document the explicit
@@ -157,6 +159,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.62.0-node-deploy - Documented custody renewal runtime heartbeat telemetry.
 v1.61.0-node-deploy - Documented bounded concurrent custody witness collection.
 v1.60.0-node-deploy - Documented custody renewal warning lifecycle.
 v1.59.0-node-deploy - Documented custody quorum expiry preflight telemetry.
@@ -1142,6 +1145,29 @@ only. They never include witness identities, endpoint strings, signatures,
 anchor hashes, messages, users, routes, payloads, memory, destinations, DNS,
 IP addresses, or social-graph metadata. This remains independent evidence for
 an opaque custody checkpoint, not voting, consensus, fork choice, or finality.
+
+<!-- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] -->
+The existing signed management heartbeat now includes the additive object
+`system_stats.chat_relay_status.custody_witness`. Its `status` is one of
+`disabled`, `monitoring`, `healthy`, `renewal_due`, `backing_off`, `exhausted`,
+or `failed_closed`. The remaining fields are node-wide process counters, Unix
+timestamps, audit/freshness intervals, aggregate quorum lifetime, checkpoint
+generation, retry delay, consecutive failures, and fixed reason buckets.
+Strict runtime mode seeds the snapshot from its successful startup audit before
+listeners start, so a freshly admitted node does not wait for the first timer
+tick before reporting the already-verified quorum state.
+
+These counters reset on process restart and are operational evidence only. The
+durable signed receipt vault and a fresh atomic audit remain authoritative.
+Telemetry is updated from the post-round durable audit before a renewal is
+reported as successful, including the case where collection returned a partial
+error after enough peer futures had already persisted valid receipts.
+
+The heartbeat never publishes witness identities or membership, endpoints,
+signatures, anchors or hashes, receipts, request IDs, messages, routes, users,
+wallets, payloads, ciphertext, IP addresses, destinations, DNS, or social-graph
+metadata. Reading or losing telemetry cannot influence trust, routing,
+readiness, renewal, fail-closed shutdown, consensus, or finality.
 
 <!-- [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] -->
 Every successful atomic audit also derives `quorum_valid_through` from the

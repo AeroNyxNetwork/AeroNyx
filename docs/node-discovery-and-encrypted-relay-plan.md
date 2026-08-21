@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.10.0 - Added bounded custody renewal retry backoff and
-made the post-round durable audit authoritative after partial collection error.
+Modification Reason: v1.11.0 - Added privacy-safe custody renewal runtime
+telemetry to the existing signed Chat Relay management heartbeat.
 
 Main Functionality:
 
@@ -30,7 +30,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.09.0 - [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Renews an expiring exact-anchor threshold only when explicitly enabled, using authenticated PeerStore pins, bounded transport, durable-before-counting, and immediate post-round fail-closed audit.
+Last Modified: v1.11.0 - [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Reports process-lifetime custody audit, renewal, backoff, recovery, and fail-closed health through the existing aggregate Chat Relay heartbeat without exposing witness or custody evidence.
+Previous: v1.10.0 - [CUSTODY-RENEWAL-BACKOFF 2026-08-21 by Codex] Bounds external renewal retries by expiry while strict local audits continue independently.
+Previous: v1.09.0 - [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Renews an expiring exact-anchor threshold only when explicitly enabled, using authenticated PeerStore pins, bounded transport, durable-before-counting, and immediate post-round fail-closed audit.
 Previous: v1.08.0 - [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Bounds explicit witness collection to one concurrent request per distinct configured pin while retaining durable-before-counting and fail-closed adverse evidence.
 Previous: v1.07.0 - [CUSTODY-RENEWAL-LIFECYCLE 2026-08-18 by Codex] Emits one warning per expiring quorum horizon and one recovery event after explicit evidence refresh, without new APIs or heartbeat fields.
 Previous: v1.06.0 - [CUSTODY-QUORUM-EXPIRY 2026-08-18 by Codex] Derives the threshold set's exact aggregate lifetime and warns locally before expiry without contacting witnesses or changing authority.
@@ -142,6 +144,34 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.11 Custody renewal health is observable without exposing witnesses
+
+[CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex]
+
+- The signed management heartbeat now adds
+  `system_stats.chat_relay_status.custody_witness`. This is an additive field;
+  existing Chat Relay counters and older management consumers remain valid.
+- `status` is one fixed lifecycle value: `disabled`, `monitoring`, `healthy`,
+  `renewal_due`, `backing_off`, `exhausted`, or `failed_closed`. Operators can
+  distinguish a healthy quorum, a pending renewal, a bounded retry delay, and
+  a strict security stop without parsing logs. Strict runtime mode seeds this
+  state from its successful startup audit before listeners begin; `monitoring`
+  is reserved for a runtime that has not yet produced auditable state.
+- The snapshot contains only node-wide process counters, Unix timestamps,
+  freshness/audit intervals, the aggregate quorum horizon, checkpoint
+  generation, retry delay, failure streak, and fixed failure reason buckets.
+  Counters intentionally reset when the node process restarts; durable
+  authority remains the signed receipt vault and its fresh atomic audit.
+- A successful or partially successful collection is reported only after the
+  post-round durable audit. That audit supplies the authoritative checkpoint
+  generation and quorum horizon, so telemetry cannot claim recovery from a
+  pre-round snapshot.
+- The field never contains witness identity or membership, endpoint, signature,
+  anchor/hash, receipt, request id, message id, route, user, wallet, payload,
+  ciphertext, address, destination, DNS, or social-graph information. It has no
+  effect on trust pins, routing, retries, readiness, shutdown, consensus, or
+  finality; protocol decisions remain independent of the telemetry mutex.
 
 ### v1.09 Strict custody evidence can renew before expiry
 

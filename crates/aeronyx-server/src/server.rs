@@ -573,6 +573,8 @@
 //     installation but the checkpoint table is absent, startup must fail.
 //
 // Last Modified:
+//   [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Added one privacy-safe,
+//     process-lifetime custody runtime snapshot to Chat Relay heartbeat status.
 //   [CUSTODY-RENEWAL-BACKOFF 2026-08-21 by Codex] Separated strict local
 //     audits from identity-jittered witness retry backoff and retained the
 //     post-round durable audit even when collection reports partial failure.
@@ -835,7 +837,7 @@ use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
@@ -2578,6 +2580,262 @@ struct CustodyWitnessRenewalRetryState {
     exhausted_for_horizon: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CustodyWitnessRuntimePhase {
+    Disabled,
+    #[default]
+    Monitoring,
+    Healthy,
+    RenewalDue,
+    BackingOff,
+    Exhausted,
+    FailedClosed,
+}
+
+impl CustodyWitnessRuntimePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Monitoring => "monitoring",
+            Self::Healthy => "healthy",
+            Self::RenewalDue => "renewal_due",
+            Self::BackingOff => "backing_off",
+            Self::Exhausted => "exhausted",
+            Self::FailedClosed => "failed_closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct CustodyWitnessRuntimeSnapshot {
+    runtime_required: bool,
+    auto_renewal_enabled: bool,
+    status: &'static str,
+    audit_interval_seconds: u64,
+    freshness_window_seconds: u64,
+    audits_total: u64,
+    renewal_attempts_total: u64,
+    renewal_successes_total: u64,
+    renewal_failures_total: u64,
+    partial_collection_successes_total: u64,
+    backoff_skips_total: u64,
+    exhausted_skips_total: u64,
+    fail_closed_total: u64,
+    consecutive_failures: u32,
+    retry_after_seconds: Option<u64>,
+    retry_before_expiry: Option<bool>,
+    quorum_valid_through: Option<u64>,
+    quorum_valid_for_seconds: Option<u64>,
+    last_checkpoint_generation: Option<u64>,
+    last_audit_at: Option<u64>,
+    last_attempt_at: Option<u64>,
+    last_success_at: Option<u64>,
+    last_failure_at: Option<u64>,
+    last_failure_reason: Option<&'static str>,
+    last_fail_closed_at: Option<u64>,
+    last_fail_closed_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Default)]
+struct CustodyWitnessRuntimeState {
+    phase: CustodyWitnessRuntimePhase,
+    audits_total: u64,
+    renewal_attempts_total: u64,
+    renewal_successes_total: u64,
+    renewal_failures_total: u64,
+    partial_collection_successes_total: u64,
+    backoff_skips_total: u64,
+    exhausted_skips_total: u64,
+    fail_closed_total: u64,
+    consecutive_failures: u32,
+    retry_after_seconds: Option<u64>,
+    retry_before_expiry: Option<bool>,
+    quorum_valid_through: Option<u64>,
+    quorum_valid_for_seconds: Option<u64>,
+    last_checkpoint_generation: Option<u64>,
+    last_audit_at: Option<u64>,
+    last_attempt_at: Option<u64>,
+    last_success_at: Option<u64>,
+    last_failure_at: Option<u64>,
+    last_failure_reason: Option<&'static str>,
+    last_fail_closed_at: Option<u64>,
+    last_fail_closed_reason: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct CustodyWitnessRuntimeTelemetry {
+    runtime_required: bool,
+    auto_renewal_enabled: bool,
+    audit_interval_seconds: u64,
+    freshness_window_seconds: u64,
+    state: Mutex<CustodyWitnessRuntimeState>,
+}
+
+impl CustodyWitnessRuntimeTelemetry {
+    fn new(runtime_required: bool, auto_renewal_enabled: bool, max_age_secs: u64) -> Self {
+        let mut state = CustodyWitnessRuntimeState::default();
+        if !runtime_required {
+            state.phase = CustodyWitnessRuntimePhase::Disabled;
+        }
+        Self {
+            runtime_required,
+            auto_renewal_enabled,
+            audit_interval_seconds: custody_witness_runtime_audit_interval_secs(max_age_secs),
+            freshness_window_seconds: max_age_secs,
+            state: Mutex::new(state),
+        }
+    }
+
+    fn with_state(&self, update: impl FnOnce(&mut CustodyWitnessRuntimeState)) {
+        // [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Telemetry must never
+        // become a second availability dependency. Recover a poisoned lock and
+        // retain the last aggregate state; no protocol decision reads it back.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut state);
+    }
+
+    fn snapshot(&self) -> CustodyWitnessRuntimeSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        CustodyWitnessRuntimeSnapshot {
+            runtime_required: self.runtime_required,
+            auto_renewal_enabled: self.auto_renewal_enabled,
+            status: state.phase.as_str(),
+            audit_interval_seconds: self.audit_interval_seconds,
+            freshness_window_seconds: self.freshness_window_seconds,
+            audits_total: state.audits_total,
+            renewal_attempts_total: state.renewal_attempts_total,
+            renewal_successes_total: state.renewal_successes_total,
+            renewal_failures_total: state.renewal_failures_total,
+            partial_collection_successes_total: state.partial_collection_successes_total,
+            backoff_skips_total: state.backoff_skips_total,
+            exhausted_skips_total: state.exhausted_skips_total,
+            fail_closed_total: state.fail_closed_total,
+            consecutive_failures: state.consecutive_failures,
+            retry_after_seconds: state.retry_after_seconds,
+            retry_before_expiry: state.retry_before_expiry,
+            quorum_valid_through: state.quorum_valid_through,
+            quorum_valid_for_seconds: state.quorum_valid_for_seconds,
+            last_checkpoint_generation: state.last_checkpoint_generation,
+            last_audit_at: state.last_audit_at,
+            last_attempt_at: state.last_attempt_at,
+            last_success_at: state.last_success_at,
+            last_failure_at: state.last_failure_at,
+            last_failure_reason: state.last_failure_reason,
+            last_fail_closed_at: state.last_fail_closed_at,
+            last_fail_closed_reason: state.last_fail_closed_reason,
+        }
+    }
+
+    fn record_audit(
+        &self,
+        checkpoint_generation: u64,
+        evaluated_at: u64,
+        renewal: CustodyWitnessRenewalStatus,
+    ) {
+        self.with_state(|state| {
+            state.audits_total = state.audits_total.saturating_add(1);
+            state.last_checkpoint_generation = Some(checkpoint_generation);
+            state.last_audit_at = Some(evaluated_at);
+            state.quorum_valid_through = Some(renewal.valid_through);
+            state.quorum_valid_for_seconds = Some(renewal.valid_for_secs);
+            if renewal.renewal_recommended {
+                state.phase = CustodyWitnessRuntimePhase::RenewalDue;
+            } else {
+                state.phase = CustodyWitnessRuntimePhase::Healthy;
+                state.consecutive_failures = 0;
+                state.retry_after_seconds = None;
+                state.retry_before_expiry = None;
+            }
+        });
+    }
+
+    fn record_attempt(&self, attempted_at: u64) {
+        self.with_state(|state| {
+            state.phase = CustodyWitnessRuntimePhase::RenewalDue;
+            state.renewal_attempts_total = state.renewal_attempts_total.saturating_add(1);
+            state.last_attempt_at = Some(attempted_at);
+        });
+    }
+
+    fn record_backoff_skip(&self, retry_in_secs: u64, consecutive_failures: u32) {
+        self.with_state(|state| {
+            state.phase = CustodyWitnessRuntimePhase::BackingOff;
+            state.backoff_skips_total = state.backoff_skips_total.saturating_add(1);
+            state.consecutive_failures = consecutive_failures;
+            state.retry_after_seconds = Some(retry_in_secs);
+            state.retry_before_expiry = Some(true);
+        });
+    }
+
+    fn record_exhausted_skip(&self, consecutive_failures: u32) {
+        self.with_state(|state| {
+            state.phase = CustodyWitnessRuntimePhase::Exhausted;
+            state.exhausted_skips_total = state.exhausted_skips_total.saturating_add(1);
+            state.consecutive_failures = consecutive_failures;
+            state.retry_after_seconds = None;
+            state.retry_before_expiry = Some(false);
+        });
+    }
+
+    fn record_failure(
+        &self,
+        failed_at: u64,
+        reason: &'static str,
+        schedule: CustodyWitnessRenewalRetrySchedule,
+    ) {
+        self.with_state(|state| {
+            state.phase = if schedule.retry_before_expiry {
+                CustodyWitnessRuntimePhase::BackingOff
+            } else {
+                CustodyWitnessRuntimePhase::Exhausted
+            };
+            state.renewal_failures_total = state.renewal_failures_total.saturating_add(1);
+            state.consecutive_failures = schedule.consecutive_failures;
+            state.retry_after_seconds = schedule.retry_before_expiry.then_some(schedule.delay_secs);
+            state.retry_before_expiry = Some(schedule.retry_before_expiry);
+            state.last_failure_at = Some(failed_at);
+            state.last_failure_reason = Some(reason);
+        });
+    }
+
+    fn record_success(
+        &self,
+        succeeded_at: u64,
+        renewal: CustodyWitnessRenewalStatus,
+        partial_collection: bool,
+    ) {
+        self.with_state(|state| {
+            state.phase = CustodyWitnessRuntimePhase::Healthy;
+            state.renewal_successes_total = state.renewal_successes_total.saturating_add(1);
+            if partial_collection {
+                state.partial_collection_successes_total =
+                    state.partial_collection_successes_total.saturating_add(1);
+            }
+            state.consecutive_failures = 0;
+            state.retry_after_seconds = None;
+            state.retry_before_expiry = None;
+            state.quorum_valid_through = Some(renewal.valid_through);
+            state.quorum_valid_for_seconds = Some(renewal.valid_for_secs);
+            state.last_success_at = Some(succeeded_at);
+        });
+    }
+
+    fn record_fail_closed(&self, failed_at: u64, reason: CustodyWitnessReadinessBlockReason) {
+        self.with_state(|state| {
+            state.phase = CustodyWitnessRuntimePhase::FailedClosed;
+            state.fail_closed_total = state.fail_closed_total.saturating_add(1);
+            state.last_fail_closed_at = Some(failed_at);
+            state.last_fail_closed_reason = Some(reason.as_str());
+        });
+    }
+}
+
 impl CustodyWitnessRenewalRetryState {
     fn action(
         &mut self,
@@ -3642,6 +3900,7 @@ pub struct Server {
     config_path: Option<PathBuf>,
     shutdown: Arc<AtomicBool>,
     shutdown_tx: broadcast::Sender<()>,
+    custody_witness_runtime: Arc<CustodyWitnessRuntimeTelemetry>,
 }
 
 impl Server {
@@ -3651,12 +3910,18 @@ impl Server {
         config_path: Option<PathBuf>,
     ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
+        let custody_witness_runtime = Arc::new(CustodyWitnessRuntimeTelemetry::new(
+            config.discovery.custody_audit_witness_runtime_required,
+            config.discovery.custody_audit_witness_auto_renewal_enabled,
+            config.discovery.custody_audit_witness_max_age_secs,
+        ));
         Self {
             config,
             identity,
             config_path,
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
+            custody_witness_runtime,
         }
     }
 
@@ -4954,6 +5219,21 @@ impl Server {
             self.config.discovery.custody_audit_witness_max_age_secs,
         )
         .ok_or_else(|| fail(CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid))?;
+        if self
+            .config
+            .discovery
+            .custody_audit_witness_runtime_required
+        {
+            // [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Strict runtime
+            // mode has already completed a valid audit before listeners start.
+            // Seed the process snapshot so heartbeat does not report a false
+            // monitoring gap until the first periodic tick.
+            self.custody_witness_runtime.record_audit(
+                audit.checkpoint_generation,
+                audit.evaluated_at,
+                renewal,
+            );
+        }
         info!(
             checkpoint_generation = audit.checkpoint_generation,
             vault_records = vault.records,
@@ -4976,11 +5256,13 @@ impl Server {
     async fn stop_for_custody_witness_runtime_failure(
         critical_failure_tx: &mpsc::Sender<CriticalRuntimeFailure>,
         shutdown_rx: &mut broadcast::Receiver<()>,
+        telemetry: &CustodyWitnessRuntimeTelemetry,
         reason: CustodyWitnessReadinessBlockReason,
     ) {
         // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Runtime audit
         // and post-renewal audit share one failure edge so neither can race a
         // specific policy reason with the supervisor's generic task-exit path.
+        telemetry.record_fail_closed(unix_now_secs(), reason);
         let failure = custody_witness_runtime_failure(reason);
         error!(
             reason = reason.as_str(),
@@ -5011,6 +5293,7 @@ impl Server {
     ) -> JoinHandle<()> {
         let config = self.config.clone();
         let identity = self.identity.clone();
+        let telemetry = Arc::clone(&self.custody_witness_runtime);
         let interval_secs = custody_witness_runtime_audit_interval_secs(
             config.discovery.custody_audit_witness_max_age_secs,
         );
@@ -5045,6 +5328,7 @@ impl Server {
                                 Self::stop_for_custody_witness_runtime_failure(
                                     &critical_failure_tx,
                                     &mut shutdown_rx,
+                                    &telemetry,
                                     reason,
                                 )
                                 .await;
@@ -5058,11 +5342,17 @@ impl Server {
                             Self::stop_for_custody_witness_runtime_failure(
                                 &critical_failure_tx,
                                 &mut shutdown_rx,
+                                &telemetry,
                                 CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid,
                             )
                             .await;
                             return;
                         };
+                        telemetry.record_audit(
+                            audit.checkpoint_generation,
+                            audit.evaluated_at,
+                            renewal,
+                        );
 
                         if custody_witness_auto_renewal_due(
                             config.discovery.custody_audit_witness_auto_renewal_enabled,
@@ -5073,6 +5363,10 @@ impl Server {
                                     retry_in_secs,
                                     consecutive_failures,
                                 } => {
+                                    telemetry.record_backoff_skip(
+                                        retry_in_secs,
+                                        consecutive_failures,
+                                    );
                                     debug!(
                                         reason = "receipt_renewal_backoff",
                                         checkpoint_generation = audit.checkpoint_generation,
@@ -5086,6 +5380,7 @@ impl Server {
                                 CustodyWitnessRenewalRetryAction::Exhausted {
                                     consecutive_failures,
                                 } => {
+                                    telemetry.record_exhausted_skip(consecutive_failures);
                                     debug!(
                                         reason = "receipt_renewal_retry_exhausted",
                                         checkpoint_generation = audit.checkpoint_generation,
@@ -5096,6 +5391,7 @@ impl Server {
                                     );
                                 }
                                 CustodyWitnessRenewalRetryAction::Attempt => {
+                                    telemetry.record_attempt(unix_now_secs());
                                     match renew_chat_relay_custody_witness_state(
                                         &config,
                                         &identity,
@@ -5114,18 +5410,32 @@ impl Server {
                                                 Self::stop_for_custody_witness_runtime_failure(
                                                     &critical_failure_tx,
                                                     &mut shutdown_rx,
+                                                    &telemetry,
                                                     CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid,
                                                 )
                                                 .await;
                                                 return;
                                             };
                                             renewal = refreshed;
+                                            // [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex]
+                                            // The post-round durable audit is authoritative for
+                                            // both the checkpoint generation and quorum horizon.
+                                            telemetry.record_audit(
+                                                audit.checkpoint_generation,
+                                                audit.evaluated_at,
+                                                renewal,
+                                            );
                                             if renewal.renewal_recommended {
                                                 let schedule = renewal_retry_state.record_failure(
                                                     renewal,
                                                     interval_secs,
                                                     &identity.public_key_bytes(),
                                                     Instant::now(),
+                                                );
+                                                telemetry.record_failure(
+                                                    unix_now_secs(),
+                                                    "quorum_not_refreshed",
+                                                    schedule,
                                                 );
                                                 warn!(
                                                     reason = "receipt_renewal_quorum_not_refreshed",
@@ -5145,6 +5455,11 @@ impl Server {
                                                 );
                                             } else {
                                                 renewal_retry_state.record_success(renewal);
+                                                telemetry.record_success(
+                                                    unix_now_secs(),
+                                                    renewal,
+                                                    false,
+                                                );
                                                 info!(
                                                     checkpoint_generation = audit.checkpoint_generation,
                                                     configured = attempt.round.configured,
@@ -5173,18 +5488,32 @@ impl Server {
                                                 Self::stop_for_custody_witness_runtime_failure(
                                                     &critical_failure_tx,
                                                     &mut shutdown_rx,
+                                                    &telemetry,
                                                     CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid,
                                                 )
                                                 .await;
                                                 return;
                                             };
                                             renewal = refreshed;
+                                            // [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex]
+                                            // A partially failed collection may still have
+                                            // persisted enough receipts to advance the quorum.
+                                            telemetry.record_audit(
+                                                audit.checkpoint_generation,
+                                                audit.evaluated_at,
+                                                renewal,
+                                            );
                                             if renewal.renewal_recommended {
                                                 let schedule = renewal_retry_state.record_failure(
                                                     renewal,
                                                     interval_secs,
                                                     &identity.public_key_bytes(),
                                                     Instant::now(),
+                                                );
+                                                telemetry.record_failure(
+                                                    unix_now_secs(),
+                                                    "collection_failed",
+                                                    schedule,
                                                 );
                                                 warn!(
                                                     reason = "receipt_renewal_collection_failed",
@@ -5198,6 +5527,11 @@ impl Server {
                                                 );
                                             } else {
                                                 renewal_retry_state.record_success(renewal);
+                                                telemetry.record_success(
+                                                    unix_now_secs(),
+                                                    renewal,
+                                                    true,
+                                                );
                                                 warn!(
                                                     reason = "receipt_renewal_collection_partial",
                                                     checkpoint_generation = audit.checkpoint_generation,
@@ -5211,6 +5545,7 @@ impl Server {
                                             Self::stop_for_custody_witness_runtime_failure(
                                                 &critical_failure_tx,
                                                 &mut shutdown_rx,
+                                                &telemetry,
                                                 reason,
                                             )
                                             .await;
@@ -6764,8 +7099,10 @@ impl Server {
 
         if let Some(relay) = chat_relay.as_ref() {
             let chat_relay_status: Arc<ChatRelayService> = Arc::clone(relay);
+            let custody_witness_runtime = Arc::clone(&self.custody_witness_runtime);
             heartbeat = heartbeat.with_chat_relay_status(Box::new(move || {
                 let relay = Arc::clone(&chat_relay_status);
+                let custody_witness_runtime = Arc::clone(&custody_witness_runtime);
                 Box::pin(async move {
                     let now = unix_now_secs();
                     let storage_usage = relay.storage_usage().ok();
@@ -6773,6 +7110,10 @@ impl Server {
                     Some(serde_json::json!({
                         "generated_at": now,
                         "peer_relay": relay.peer_status(),
+                        // [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex]
+                        // This process-lifetime snapshot exposes only fixed
+                        // reasons, timestamps and node-wide aggregate counts.
+                        "custody_witness": custody_witness_runtime.snapshot(),
                         "maintenance": relay.maintenance_status(),
                         "storage_usage": storage_usage,
                         "storage_capacity": {
@@ -6782,12 +7123,14 @@ impl Server {
                             "max_pending_blob_bytes_total": config.max_pending_blob_bytes_total
                         },
                         "source": "rust_chat_relay_service",
-                        "privacy_boundary": "aggregate encrypted chat relay counters and node-wide storage capacity only; no message ids, wallet ids, sender/receiver keys, blob ids, session ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
+                        "privacy_boundary": "aggregate encrypted chat relay counters, custody witness runtime health, fixed reason buckets, timestamps, and node-wide storage capacity only; no message ids, wallet ids, sender/receiver keys, witness identities, witness endpoints, signatures, anchors, blob ids, session ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
                     }))
                 })
             }));
         } else if !chat_relay_enabled {
+            let custody_witness_runtime = Arc::clone(&self.custody_witness_runtime);
             heartbeat = heartbeat.with_chat_relay_status(Box::new(move || {
+                let custody_witness_runtime = Arc::clone(&custody_witness_runtime);
                 Box::pin(async move {
                     let now = unix_now_secs();
                     Some(serde_json::json!({
@@ -6796,11 +7139,12 @@ impl Server {
                         // Reuse the typed schema so disabled heartbeats cannot
                         // silently omit newly added aggregate health fields.
                         "peer_relay": ChatRelayPeerStatus::new(false),
+                        "custody_witness": custody_witness_runtime.snapshot(),
                         "maintenance": null,
                         "storage_usage": null,
                         "storage_capacity": null,
                         "source": "rust_chat_relay_disabled_config",
-                        "privacy_boundary": "aggregate encrypted chat relay counters and node-wide storage capacity only; no message ids, wallet ids, sender/receiver keys, blob ids, session ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
+                        "privacy_boundary": "aggregate encrypted chat relay counters, custody witness runtime health, fixed reason buckets, timestamps, and node-wide storage capacity only; no message ids, wallet ids, sender/receiver keys, witness identities, witness endpoints, signatures, anchors, blob ids, session ids, client IPs, destinations, DNS contents, packet payloads, chat plaintext, ciphertext, private keys, voucher secrets, or per-user traffic"
                     }))
                 })
             }));
@@ -15039,11 +15383,10 @@ mod tests {
         commitment_coordinator_lease_degraded_retry_delay,
         commitment_coordinator_lease_production_valid_for, commitment_follower_success_retry_delay,
         commitment_witness_startup_decision, custody_witness_auto_renewal_due,
-        custody_witness_readiness_decision,
-        custody_witness_renewal_status, custody_witness_renewal_warning_window_secs,
-        custody_witness_runtime_audit_interval_secs, custody_witness_runtime_failure,
-        data_plane_receive_failure_action, memchain_index_rejection_reason,
-        peer_store_heartbeat_status_value, prefix_to_netmask,
+        custody_witness_readiness_decision, custody_witness_renewal_status,
+        custody_witness_renewal_warning_window_secs, custody_witness_runtime_audit_interval_secs,
+        custody_witness_runtime_failure, data_plane_receive_failure_action,
+        memchain_index_rejection_reason, peer_store_heartbeat_status_value, prefix_to_netmask,
         required_runtime_supervisor_channel_closed, retry_required_data_plane_receive,
         take_pre_ready_runtime_failure, unix_now_secs, CommitmentCoordinatorLeaseRound,
         CommitmentFollowerRoundOutcome, CommitmentSyncTaskLivenessGuard,
@@ -15051,7 +15394,8 @@ mod tests {
         CommitmentWitnessStartupDecision, CriticalRuntimeFailure, CustodyWitnessAuditEvidence,
         CustodyWitnessReadinessBlockReason, CustodyWitnessRenewalLogAction,
         CustodyWitnessRenewalLogState, CustodyWitnessRenewalRetryAction,
-        CustodyWitnessRenewalRetryState, CustodyWitnessRenewalStatus, DataPlaneReceiveFailureAction,
+        CustodyWitnessRenewalRetrySchedule, CustodyWitnessRenewalRetryState,
+        CustodyWitnessRenewalStatus, CustodyWitnessRuntimeTelemetry, DataPlaneReceiveFailureAction,
         DirectPeerRelayAckFailure, DirectoryChainStore, DirectoryProofGossipOutcome,
         DirectoryProofGossipPeerState, DirectoryProofGossipResult, DiscoveryGossipExecution,
         DiscoveryGossipFailure, DiscoveryGossipFailureKind, DiscoveryGossipPhase,
@@ -16862,6 +17206,114 @@ mod tests {
         assert_eq!(state.consecutive_failures, 0);
         assert_eq!(state.retry_not_before, None);
         assert!(!state.exhausted_for_horizon);
+    }
+
+    #[test]
+    fn custody_witness_runtime_telemetry_is_aggregate_and_process_local() {
+        // [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] The management
+        // contract exposes one node-wide process snapshot, never a witness,
+        // route, user, receipt, signature, anchor or encrypted object.
+        let telemetry = CustodyWitnessRuntimeTelemetry::new(true, true, 7_200);
+        let initial = telemetry.snapshot();
+        assert_eq!(initial.status, "monitoring");
+        assert_eq!(initial.audit_interval_seconds, 300);
+        assert_eq!(initial.freshness_window_seconds, 7_200);
+        assert_eq!(initial.audits_total, 0);
+
+        let renewal_due = CustodyWitnessRenewalStatus {
+            valid_through: 10_000,
+            valid_for_secs: 900,
+            warning_window_secs: 900,
+            renewal_recommended: true,
+        };
+        telemetry.record_audit(7, 9_100, renewal_due);
+        telemetry.record_attempt(9_101);
+        telemetry.record_failure(
+            9_102,
+            "collection_failed",
+            CustodyWitnessRenewalRetrySchedule {
+                delay_secs: 300,
+                consecutive_failures: 1,
+                retry_before_expiry: true,
+            },
+        );
+        telemetry.record_backoff_skip(120, 1);
+        let backing_off = telemetry.snapshot();
+        assert_eq!(backing_off.status, "backing_off");
+        assert_eq!(backing_off.audits_total, 1);
+        assert_eq!(backing_off.renewal_attempts_total, 1);
+        assert_eq!(backing_off.renewal_failures_total, 1);
+        assert_eq!(backing_off.backoff_skips_total, 1);
+        assert_eq!(backing_off.retry_after_seconds, Some(120));
+        assert_eq!(backing_off.last_checkpoint_generation, Some(7));
+        assert_eq!(backing_off.last_failure_reason, Some("collection_failed"));
+
+        telemetry.record_failure(
+            9_103,
+            "quorum_not_refreshed",
+            CustodyWitnessRenewalRetrySchedule {
+                delay_secs: 300,
+                consecutive_failures: 2,
+                retry_before_expiry: false,
+            },
+        );
+        telemetry.record_exhausted_skip(2);
+        let exhausted = telemetry.snapshot();
+        assert_eq!(exhausted.status, "exhausted");
+        assert_eq!(exhausted.exhausted_skips_total, 1);
+        assert_eq!(exhausted.retry_before_expiry, Some(false));
+        assert_eq!(exhausted.retry_after_seconds, None);
+
+        let healthy = CustodyWitnessRenewalStatus {
+            valid_through: 20_000,
+            valid_for_secs: 10_000,
+            warning_window_secs: 900,
+            renewal_recommended: false,
+        };
+        telemetry.record_audit(8, 10_000, healthy);
+        telemetry.record_success(10_001, healthy, true);
+        let recovered = telemetry.snapshot();
+        assert_eq!(recovered.status, "healthy");
+        assert_eq!(recovered.renewal_successes_total, 1);
+        assert_eq!(recovered.partial_collection_successes_total, 1);
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert_eq!(recovered.retry_after_seconds, None);
+        assert_eq!(recovered.last_checkpoint_generation, Some(8));
+        assert_eq!(recovered.quorum_valid_through, Some(20_000));
+
+        telemetry.record_fail_closed(
+            10_002,
+            CustodyWitnessReadinessBlockReason::ReceiptPolicyInvalid,
+        );
+        let failed_closed = telemetry.snapshot();
+        assert_eq!(failed_closed.status, "failed_closed");
+        assert_eq!(failed_closed.fail_closed_total, 1);
+        assert_eq!(
+            failed_closed.last_fail_closed_reason,
+            Some("receipt_policy_invalid")
+        );
+
+        let encoded = serde_json::to_string(&failed_closed).unwrap();
+        for forbidden in [
+            "node_id",
+            "endpoint",
+            "signature",
+            "anchor",
+            "message_id",
+            "wallet",
+            "payload",
+            "ciphertext",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "telemetry leaked forbidden field: {forbidden}"
+            );
+        }
+
+        let disabled = CustodyWitnessRuntimeTelemetry::new(false, false, 7_200).snapshot();
+        assert_eq!(disabled.status, "disabled");
+        assert!(!disabled.runtime_required);
+        assert!(!disabled.auto_renewal_enabled);
     }
 
     #[test]
