@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.12.0 - Enforced a typed, allowlisted privacy boundary
-for every heartbeat-visible encrypted relay failure reason.
+Modification Reason: v1.13.0 - Extended the closed reason boundary into
+PeerStore route reputation, rejection counters, and quarantine diagnostics.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.12.0 - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Prevents arbitrary transport, endpoint, request, or payload-derived strings from entering relay heartbeat status while preserving the established JSON reason buckets and legacy record APIs.
+Last Modified: v1.13.0 - [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Prevents open-text route failures, relay rejections, or quarantine reasons from entering PeerStore reputation and diagnostics while preserving legacy method signatures and valid serialized buckets.
+Previous: v1.12.0 - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Prevents arbitrary transport, endpoint, request, or payload-derived strings from entering relay heartbeat status while preserving the established JSON reason buckets and legacy record APIs.
 Previous: v1.11.0 - [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Reports process-lifetime custody audit, renewal, backoff, recovery, and fail-closed health through the existing aggregate Chat Relay heartbeat without exposing witness or custody evidence.
 Previous: v1.10.0 - [CUSTODY-RENEWAL-BACKOFF 2026-08-21 by Codex] Bounds external renewal retries by expiry while strict local audits continue independently.
 Previous: v1.09.0 - [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Renews an expiring exact-anchor threshold only when explicitly enabled, using authenticated PeerStore pins, bounded transport, durable-before-counting, and immediate post-round fail-closed audit.
@@ -145,6 +146,31 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.13 Peer reputation accepts only reviewed reason buckets
+
+[PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex]
+
+- Route failures can affect health ranking, consecutive-failure quarantine,
+  nodeboard peer diagnostics, and process-local audit events. PeerStore now
+  admits every such reason through a private typed value before mutating those
+  surfaces; callers cannot persist arbitrary error text directly.
+- Blind-relay rejection counters, previous-hop protection diagnostics, and
+  quarantine events use separate closed vocabularies. The distinction keeps a
+  valid route-transport reason from silently becoming a quarantine policy code.
+- Existing public recorder signatures remain source-compatible for rolling
+  upgrades. Known reason strings retain their exact values; unknown strings,
+  malformed HTTP status buckets, uppercase variants, and values with appended
+  identifiers or endpoint details become the aggregate `unknown` bucket.
+- HTTP families accept only three decimal digits in the 100-599 range. ACK and
+  transport families accept only reviewed phase/suffix combinations generated
+  by bounded response decoding and the node's local request classifier.
+- Sanitization does not weaken route protection: a failed operation still
+  increments failure counters and can reach the existing quarantine threshold.
+  It only prevents unreviewed text from becoming durable reputation metadata or
+  an observability exfiltration path.
+- Regression tests cover valid HTTP, ACK, receipt, and transport buckets as well
+  as malformed status codes and strings containing private route details.
 
 ### v1.12 Relay health reasons are a closed privacy boundary
 

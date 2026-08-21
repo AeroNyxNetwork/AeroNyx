@@ -168,6 +168,9 @@
 //! - [CLIENT-DELIVERY-ATOMIC-ROUTE-EVIDENCE 2026-08-11 by Codex] Commits both
 //!   hop capabilities, both route successes, and the aggregate real-delivery
 //!   counter only while one coherent signed two-hop snapshot remains current
+//! - [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Admits route failures,
+//!   blind-relay rejections, and quarantine events through closed reason
+//!   vocabularies before they can affect reputation or public diagnostics
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -199,6 +202,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.83.0-PeerHealthReasonBoundary - Replaced open-text route-health and
+//! relay-protection diagnostics with compatibility-preserving reason admission
 //! v0.82.0-CustodyWitnessAdmission - Isolated custody requester pins from
 //! permissionless discovery and verified-delivery witness authority
 //! v0.81.0-SignedProtocolFeatures - Bound negotiated response contracts into
@@ -1795,6 +1800,191 @@ struct PeerRouteHealth {
     quarantine_until: Option<u64>,
     last_quarantine_at: Option<u64>,
     last_quarantine_reason: Option<String>,
+}
+
+/// A reason admitted into node reputation, aggregate counters, or audit state.
+///
+/// [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Public compatibility
+/// recorders still accept strings, but open text ends here. Keeping this value
+/// private prevents future mutation code from accidentally persisting endpoint
+/// values, peer-controlled response text, route identifiers, or payload-derived
+/// details. Unknown and malformed buckets collapse to one stable value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrivacySafePeerHealthReason(String);
+
+impl PrivacySafePeerHealthReason {
+    const UNKNOWN: &'static str = "unknown";
+
+    fn route_failure(reason: &str) -> Self {
+        Self::admit(reason, is_route_failure_reason)
+    }
+
+    fn blind_relay_rejection(reason: &str) -> Self {
+        Self::admit(reason, is_blind_relay_rejection_reason)
+    }
+
+    fn peer_relay_rejection(reason: &str) -> Self {
+        Self::admit(reason, is_peer_relay_rejection_reason)
+    }
+
+    fn quarantine(reason: &str) -> Self {
+        Self::admit(reason, is_quarantine_reason)
+    }
+
+    fn admit(reason: &str, predicate: fn(&str) -> bool) -> Self {
+        if predicate(reason) {
+            Self(reason.to_string())
+        } else {
+            Self(Self::UNKNOWN.to_string())
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+fn is_http_status_reason(reason: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| {
+        let Some(status) = reason.strip_prefix(prefix) else {
+            return false;
+        };
+        status.len() == 3
+            && status.bytes().all(|byte| byte.is_ascii_digit())
+            && status
+                .parse::<u16>()
+                .is_ok_and(|status| (100..=599).contains(&status))
+    })
+}
+
+fn is_bounded_response_reason(reason: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "ack_",
+        "onion_ack_",
+        "onion_delivery_ack_",
+        "peer_relay_ack_",
+    ];
+    const SUFFIXES: &[&str] = &[
+        "response_too_large",
+        "response_body_read_failed",
+        "response_json_decode_failed",
+    ];
+
+    PREFIXES.iter().any(|prefix| {
+        reason
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| SUFFIXES.contains(&suffix))
+    })
+}
+
+fn is_reqwest_failure_reason(reason: &str) -> bool {
+    const PHASES: &[&str] = &[
+        "blind_relay_probe",
+        "two_hop_onion_delivery_probe",
+        "two_hop_blind_relay_probe",
+        "three_hop_onion_delivery_probe",
+        "blind_relay_request",
+        "onion_delivery_request",
+        "peer_relay_request",
+    ];
+    const SUFFIXES: &[&str] = &[
+        "timeout",
+        "connect",
+        "http_status",
+        "decode",
+        "body",
+        "request",
+        "unknown",
+    ];
+
+    PHASES.iter().any(|phase| {
+        let Some(suffix) = reason
+            .strip_prefix(phase)
+            .and_then(|suffix| suffix.strip_prefix('_'))
+        else {
+            return false;
+        };
+        SUFFIXES.contains(&suffix) || is_http_status_reason(suffix, &["http_"])
+    })
+}
+
+fn is_route_failure_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "missing_endpoint"
+            | "invalid_endpoint"
+            | "ack_rejected"
+            | "onion_ack_rejected"
+            | "delivery_receipt_invalid"
+            | "delivery_receipt_rejected"
+            | "failure_receipt_downgrade"
+            | "failure_receipt_invalid"
+            | "forward_failed"
+            | "request_failed"
+            | "invalid_previous_hop"
+            | "invalid_signature"
+            | "envelope_too_large"
+            | "ttl_exhausted"
+            | "timestamp_expired"
+            | "timestamp_in_future"
+            | "rate_limited"
+            | "quarantined"
+            | "route_in_flight"
+            | "replay_capacity"
+            | "route_loop"
+            | "no_route"
+            | "onion_peel_failed"
+            | "onion_terminal_payload_rejected"
+            | "onion_terminal_capacity_exhausted"
+            | "downstream_rejected"
+            | "peer_relay_target_auth_encode_failed"
+            | "peer_relay_auth_encode_failed"
+            | "peer_relay_ack_rejected"
+            | "peer_relay_receipt_request_missing"
+            | "peer_relay_receipt_missing"
+            | "peer_relay_receipt_version_invalid"
+            | "peer_relay_receipt_binding_invalid"
+            | "peer_relay_receipt_signature_invalid"
+    ) || is_http_status_reason(
+        reason,
+        &[
+            "http_",
+            "onion_http_",
+            "onion_delivery_http_",
+            "peer_relay_http_",
+        ],
+    ) || is_bounded_response_reason(reason)
+        || is_reqwest_failure_reason(reason)
+}
+
+fn is_blind_relay_rejection_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "backpressure"
+            | "self_loop"
+            | "duplicate_route"
+            | "onion_inner_not_layer"
+            | "onion_terminal_delivery_failed"
+            | "relay_unavailable"
+            | "envelope_serialization_failed"
+            | "pending_capacity_exhausted"
+            | "store_pending_failed"
+    ) || is_route_failure_reason(reason)
+}
+
+fn is_peer_relay_rejection_reason(reason: &str) -> bool {
+    matches!(reason, "duplicate_route") || is_blind_relay_rejection_reason(reason)
+}
+
+fn is_quarantine_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "rate_limit" | "failure_threshold" | "still_quarantined"
+    )
 }
 
 /// Process-local proof that one signed route surface carried a valid,
@@ -5057,7 +5247,8 @@ impl PeerStore {
 
     /// Records a blind relay rejection with a stable privacy-safe reason.
     pub fn record_blind_relay_rejected(&self, now: u64, reason: impl AsRef<str>) {
-        let reason = reason.as_ref();
+        let reason = PrivacySafePeerHealthReason::blind_relay_rejection(reason.as_ref());
+        let reason = reason.as_str();
         self.counters
             .blind_relay_received
             .fetch_add(1, Ordering::Relaxed);
@@ -5150,6 +5341,8 @@ impl PeerStore {
     /// `failure_threshold`; callers must not pass node ids, route ids, endpoint
     /// values, encrypted blobs, wallet ids, or payload-derived details.
     pub fn record_blind_relay_quarantine_started(&self, now: u64, detail: impl Into<String>) {
+        let detail = detail.into();
+        let detail = PrivacySafePeerHealthReason::quarantine(&detail).into_inner();
         self.counters
             .blind_relay_quarantine_started
             .fetch_add(1, Ordering::Relaxed);
@@ -5254,6 +5447,7 @@ impl PeerStore {
         reason: impl Into<String>,
     ) -> bool {
         let reason = reason.into();
+        let reason = PrivacySafePeerHealthReason::route_failure(&reason);
         let node_id = descriptor.node_id();
         let result = self.with_current_verified_route_surface(
             descriptor,
@@ -5301,7 +5495,13 @@ impl PeerStore {
         let _ = self.record_route_forward_failure_for_descriptor(&descriptor, now, reason);
     }
 
-    fn record_route_forward_failure_for_node(&self, node_id: &[u8; 32], now: u64, reason: &str) {
+    fn record_route_forward_failure_for_node(
+        &self,
+        node_id: &[u8; 32],
+        now: u64,
+        reason: &PrivacySafePeerHealthReason,
+    ) {
+        let reason = reason.as_str();
         let mut route_health = self.route_health.write();
         let health = route_health.entry(*node_id).or_default();
         health.failure_count = health.failure_count.saturating_add(1);
@@ -5358,6 +5558,7 @@ impl PeerStore {
         reason: impl Into<String>,
     ) {
         let reason = reason.into();
+        let reason = PrivacySafePeerHealthReason::peer_relay_rejection(&reason).into_inner();
         let mut relay_health = self.relay_protection_health.write();
         let health = relay_health.entry(*node_id).or_default();
         health.rejection_count = health.rejection_count.saturating_add(1);
@@ -5388,6 +5589,7 @@ impl PeerStore {
         reason: impl Into<String>,
     ) {
         let reason = reason.into();
+        let reason = PrivacySafePeerHealthReason::quarantine(&reason).into_inner();
         let mut relay_health = self.relay_protection_health.write();
         let health = relay_health.entry(*node_id).or_default();
         health.quarantine_count = health.quarantine_count.saturating_add(1);
@@ -10278,6 +10480,139 @@ mod tests {
             ));
         }
         assert!(store.is_route_quarantined_now(&node_id, now + 33));
+    }
+
+    #[test]
+    fn test_route_failure_reason_admission_preserves_known_buckets_and_redacts_open_text() {
+        let now = 1_700_000_100;
+        let identity = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&identity, 1, now + 4_000);
+        descriptor.descriptor.public_endpoint = Some("https://route.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &identity).unwrap();
+        let node_id = descriptor.node_id();
+
+        let store = PeerStore::new();
+        store.upsert_verified(descriptor.clone(), now).unwrap();
+
+        assert!(store.record_route_forward_failure_for_descriptor(
+            &descriptor,
+            now + 1,
+            "peer_relay_http_502",
+        ));
+        assert_eq!(
+            store
+                .route_health
+                .read()
+                .get(&node_id)
+                .and_then(|health| health.last_failure_reason.as_deref()),
+            Some("peer_relay_http_502")
+        );
+
+        // [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] A malformed
+        // status or appended peer-controlled detail must never enter route
+        // reputation diagnostics, even through the legacy string API.
+        assert!(store.record_route_forward_failure_for_descriptor(
+            &descriptor,
+            now + 2,
+            "peer_relay_http_600 receiver=private",
+        ));
+        assert_eq!(
+            store
+                .route_health
+                .read()
+                .get(&node_id)
+                .and_then(|health| health.last_failure_reason.as_deref()),
+            Some(PrivacySafePeerHealthReason::UNKNOWN)
+        );
+        assert!(store.recent_audit_events().iter().all(|event| {
+            !event.detail.contains("receiver=private")
+                && !event.detail.contains("peer_relay_http_600")
+        }));
+    }
+
+    #[test]
+    fn test_peer_health_reason_vocabularies_are_closed_and_protocol_complete() {
+        for reason in [
+            "http_100",
+            "http_599",
+            "onion_delivery_http_425",
+            "peer_relay_http_502",
+            "ack_response_too_large",
+            "onion_ack_response_json_decode_failed",
+            "peer_relay_ack_response_body_read_failed",
+            "blind_relay_probe_timeout",
+            "two_hop_onion_delivery_probe_connect",
+            "three_hop_onion_delivery_probe_http_503",
+            "onion_delivery_request_decode",
+            "peer_relay_request_unknown",
+            "peer_relay_receipt_signature_invalid",
+        ] {
+            assert!(is_route_failure_reason(reason), "rejected {reason}");
+        }
+
+        for reason in [
+            "http_099",
+            "http_600",
+            "http_502_private",
+            "peer_relay_http_502 endpoint=private",
+            "ack_peer_body",
+            "unknown_phase_timeout",
+            "peer_relay_request_private_detail",
+            "PEER_RELAY_HTTP_502",
+            "",
+        ] {
+            assert!(!is_route_failure_reason(reason), "admitted {reason}");
+        }
+
+        assert!(is_blind_relay_rejection_reason("backpressure"));
+        assert!(is_blind_relay_rejection_reason(
+            "onion_terminal_delivery_failed"
+        ));
+        assert!(is_peer_relay_rejection_reason("duplicate_route"));
+        assert!(is_quarantine_reason("failure_threshold"));
+        assert!(!is_quarantine_reason("failure_threshold peer=private"));
+    }
+
+    #[test]
+    fn test_relay_protection_reason_admission_redacts_unknown_details() {
+        let store = PeerStore::new();
+        let now = 1_700_000_100;
+        let node_id = [23u8; 32];
+
+        store.record_blind_relay_rejected(now, "invalid_signature route=private");
+        store.record_blind_relay_quarantine_started(now + 1, "operator=private");
+        store.record_peer_relay_rejection(&node_id, now + 2, "receiver=private");
+        store.record_peer_relay_quarantine_started(
+            &node_id,
+            now + 3,
+            now + 303,
+            "endpoint=private",
+        );
+
+        let protection = store.relay_protection_health.read();
+        let health = protection.get(&node_id).expect("peer protection health");
+        assert_eq!(
+            health.last_rejection_reason.as_deref(),
+            Some(PrivacySafePeerHealthReason::UNKNOWN)
+        );
+        assert_eq!(
+            health.last_quarantine_reason.as_deref(),
+            Some(PrivacySafePeerHealthReason::UNKNOWN)
+        );
+        drop(protection);
+
+        let audit = store.recent_audit_events();
+        assert!(audit.iter().all(|event| {
+            !event.detail.contains("route=private")
+                && !event.detail.contains("operator=private")
+                && !event.detail.contains("receiver=private")
+                && !event.detail.contains("endpoint=private")
+        }));
+        assert!(audit.iter().any(|event| {
+            event.action == "blind_relay_forward"
+                && event.outcome == "rejected"
+                && event.detail == PrivacySafePeerHealthReason::UNKNOWN
+        }));
     }
 
     #[test]

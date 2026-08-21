@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Document closed reason
+  admission for route reputation, relay rejection, and quarantine diagnostics.
 - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Document the typed,
   compatibility-preserving allowlist for heartbeat-visible relay failures.
 - [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Document the aggregate,
@@ -161,6 +163,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.64.0-node-deploy - Documented PeerStore reputation reason admission.
 v1.63.0-node-deploy - Documented typed relay health reason privacy boundary.
 v1.62.0-node-deploy - Documented custody renewal runtime heartbeat telemetry.
 v1.61.0-node-deploy - Documented bounded concurrent custody witness collection.
@@ -1163,6 +1166,21 @@ or `last_inbound_failure_reason`, including through the legacy compatibility
 recording methods. Operators should treat `unknown` as a code/version mismatch
 or a newly introduced bucket that must be reviewed and explicitly registered,
 not as permission to expose the original error text.
+
+<!-- [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] -->
+The same privacy boundary now applies before PeerStore mutates route reputation,
+blind-relay rejection counters, previous-hop protection state, or quarantine
+diagnostics. Existing recorder method signatures remain compatible, and known
+reason strings keep their current API representation. An unknown value,
+malformed HTTP status, uppercase variant, or reason with appended endpoint,
+route, request, receiver, or payload detail is reduced to `unknown`.
+
+This sanitization does not forgive a failed route. Failure counters and the
+existing consecutive-failure quarantine policy still advance. It prevents only
+unreviewed text from entering peer health, nodeboard status, and the bounded
+process audit trail. Operators who observe `unknown` should align node versions
+or register a newly reviewed coarse bucket; they must never copy the raw error
+into telemetry as a workaround.
 
 <!-- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] -->
 The existing signed management heartbeat now includes the additive object
