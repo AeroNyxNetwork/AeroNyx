@@ -177,6 +177,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.71.0-node-deploy - Documented fail-closed adverse optional-witness evidence.
 v1.70.0-node-deploy - Documented signed recovery-anchor heartbeat telemetry.
 v1.69.0-node-deploy - Documented recovery-anchor status and runtime generation gate.
 v1.68.0-node-deploy - Documented exact-generation external witness binding.
@@ -1307,6 +1308,16 @@ When `verified_delivery_witness_required_for_restore = true`, a missing,
 rejected, or older-generation witness is a critical startup health failure.
 Optional witness deployments remain operational, but incomplete or adverse
 local anchor state produces a warning until signed recovery state is ready.
+
+<!-- [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] -->
+Optional witness **availability** is advisory; authenticated witness evidence
+is not. A signed `rollback_detected`, `conflict`, or `gap` result always marks
+`recovery_anchor.v1` blocked and removes the proof window from restart
+continuity and multi-hop admission, even when
+`verified_delivery_witness_required_for_restore = false`. An unavailable or
+partial optional witness round remains non-blocking. Operators and monitoring
+should use the additive `external_witness.adverse_evidence` boolean to
+distinguish these cases instead of inferring policy from transport failures.
 
 `deploy/node/healthcheck.sh --json` copies only the bounded status, generation,
 fixed protection buckets, aggregate witness counts, and next action into

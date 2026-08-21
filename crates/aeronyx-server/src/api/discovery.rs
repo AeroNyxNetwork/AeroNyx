@@ -1069,6 +1069,35 @@ fn recovery_anchor_protection_ready(protection: Option<&str>) -> bool {
     matches!(protection, Some("anchored" | "cache_ahead"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalWitnessRecoveryAdmission {
+    ready: bool,
+    adverse_evidence: bool,
+    generation_aligned: bool,
+}
+
+fn external_witness_recovery_admission(
+    status: &str,
+    required: bool,
+    cache_generation: u64,
+    witness_generation: u64,
+) -> ExternalWitnessRecoveryAdmission {
+    // [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] Optional witnessing
+    // makes transport availability advisory; it never makes authenticated
+    // rollback, conflict, or generation-gap evidence advisory. Keep this one
+    // decision shared by recovery health and path-proof admission so an
+    // operator surface cannot fail closed while the data plane stays eligible.
+    let adverse_evidence = matches!(status, "rollback_detected" | "conflict" | "gap");
+    let generation_aligned = cache_generation != 0 && witness_generation == cache_generation;
+    let ready = !adverse_evidence && (!required || (status == "verified" && generation_aligned));
+
+    ExternalWitnessRecoveryAdmission {
+        ready,
+        adverse_evidence,
+        generation_aligned,
+    }
+}
+
 /// Builds an aggregate view of the local recovery anchor and its witnesses.
 ///
 /// [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] This contract deliberately
@@ -1086,10 +1115,12 @@ pub fn recovery_anchor_status_value(status: &PeerStoreStatus) -> serde_json::Val
         .as_deref()
         .unwrap_or("not_observed");
     let witness_required = bootstrap.last_client_delivery_witness_required;
-    let witness_generation_aligned =
-        cache_generation != 0 && witness_generation == cache_generation;
-    let external_witness_ready =
-        !witness_required || (witness_status == "verified" && witness_generation_aligned);
+    let witness_admission = external_witness_recovery_admission(
+        witness_status,
+        witness_required,
+        cache_generation,
+        witness_generation,
+    );
     let routeability_protection = bootstrap
         .last_routeability_cache_rollback_protection
         .as_deref()
@@ -1115,7 +1146,7 @@ pub fn recovery_anchor_status_value(status: &PeerStoreStatus) -> serde_json::Val
         ]
         .into_iter()
         .all(recovery_anchor_protection_ready);
-    let ready_for_restore = local_anchor_ready && external_witness_ready;
+    let ready_for_restore = local_anchor_ready && witness_admission.ready;
     let adverse_local_evidence = [
         routeability_protection,
         two_hop_protection,
@@ -1129,13 +1160,11 @@ pub fn recovery_anchor_status_value(status: &PeerStoreStatus) -> serde_json::Val
             "anchor_invalid" | "anchor_conflict" | "rollback_detected"
         )
     });
-    let adverse_witness_evidence =
-        matches!(witness_status, "rollback_detected" | "conflict" | "gap");
     let status_bucket = if cache_generation == 0 {
         "idle"
     } else if ready_for_restore {
         "ready"
-    } else if adverse_local_evidence || adverse_witness_evidence || witness_required {
+    } else if adverse_local_evidence || witness_admission.adverse_evidence || witness_required {
         "blocked"
     } else {
         "attention"
@@ -1143,7 +1172,10 @@ pub fn recovery_anchor_status_value(status: &PeerStoreStatus) -> serde_json::Val
     let next_action = match status_bucket {
         "idle" => "persist the first signed peer-cache recovery generation",
         "ready" => "continue bounded persistence and exact-generation witnessing",
-        "blocked" if witness_required && !witness_generation_aligned => {
+        "blocked" if witness_admission.adverse_evidence => {
+            "reject restored readiness and inspect the authenticated witness failure bucket"
+        }
+        "blocked" if witness_required && !witness_admission.generation_aligned => {
             "obtain the required witness quorum for the current cache generation"
         }
         "blocked" => "inspect aggregate rollback or witness failure buckets before restore",
@@ -1165,9 +1197,10 @@ pub fn recovery_anchor_status_value(status: &PeerStoreStatus) -> serde_json::Val
         "external_witness": {
             "status": witness_status,
             "required": witness_required,
-            "ready": external_witness_ready,
+            "ready": witness_admission.ready,
+            "adverse_evidence": witness_admission.adverse_evidence,
             "generation": witness_generation,
-            "generation_aligned": witness_generation_aligned,
+            "generation_aligned": witness_admission.generation_aligned,
             "minimum_verified": bootstrap.last_client_delivery_witness_minimum_verified,
             "configured": bootstrap.last_client_delivery_witness_configured,
             "attempted": bootstrap.last_client_delivery_witness_attempted,
@@ -1213,12 +1246,12 @@ fn path_proof_restart_continuity(
     // local cache generation before the post-write witness round completes.
     // Never let the prior generation's `verified` bucket authorize this short
     // interval or any later state restored from a mismatched generation.
-    let external_witness_generation_ready = status.bootstrap.last_client_delivery_cache_generation
-        != 0
-        && status.bootstrap.last_client_delivery_witness_generation
-            == status.bootstrap.last_client_delivery_cache_generation;
-    let external_witness_ready = !external_witness_required
-        || (external_witness == "verified" && external_witness_generation_ready);
+    let external_witness_admission = external_witness_recovery_admission(
+        &external_witness,
+        external_witness_required,
+        status.bootstrap.last_client_delivery_cache_generation,
+        status.bootstrap.last_client_delivery_witness_generation,
+    );
     let restore_evidence_fresh = restored_at
         .map(|at| at <= generated_at && generated_at.saturating_sub(at) <= stale_after_seconds)
         .unwrap_or(false);
@@ -1231,11 +1264,11 @@ fn path_proof_restart_continuity(
     // startup gate, the existing opaque external witness quorum.
     let authenticated_restore_ready = authentication == "verified"
         && rollback_protection_ready
-        && external_witness_ready
+        && external_witness_admission.ready
         && restored_stability_ready
         && restore_evidence_fresh;
     let signed_persistence_ready = rollback_protection_ready
-        && external_witness_ready
+        && external_witness_admission.ready
         && persisted_stability_ready
         && persistence_evidence_fresh;
     let peer_recovery_configured = status.peer_quorum.restart_recovery_configured;
@@ -1250,7 +1283,7 @@ fn path_proof_restart_continuity(
         }
         (false, false) if authentication == "legacy_descriptor_only" => "legacy_cache",
         (false, false) if !rollback_protection_ready => "rollback_protection_not_ready",
-        (false, false) if !external_witness_ready => "external_witness_not_ready",
+        (false, false) if !external_witness_admission.ready => "external_witness_not_ready",
         _ => "not_ready",
     };
 
@@ -6163,6 +6196,105 @@ mod tests {
             Some(true)
         );
         assert!(two_hop_proof_restart_continuity(&aligned_status).ready);
+    }
+
+    #[test]
+    fn test_optional_external_witness_adverse_evidence_blocks_recovery() {
+        let store = PeerStore::new();
+        let now = now_secs();
+        store.record_routeability_cache_rollback_protection(now, 1, "anchored");
+        store.record_two_hop_proof_cache_persisted(now, 3, true);
+        store.record_three_hop_proof_cache_persisted(now, 3, true);
+        store.record_client_delivery_cache_persisted(now, 0, 1);
+
+        // [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] An optional
+        // witness may be unavailable without becoming an availability
+        // dependency. Once a valid witness reports rollback, conflict, or a
+        // generation gap, however, both recovery and relay admission must
+        // reject the anchored state even though strict quorum was not enabled.
+        store.record_client_delivery_witness_round(
+            now + 1,
+            1,
+            false,
+            1,
+            crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound {
+                configured: 1,
+                attempted: 1,
+                failed: 1,
+                ..Default::default()
+            },
+        );
+        let unavailable_status = store.status(now + 1);
+        let unavailable_anchor = recovery_anchor_status_value(&unavailable_status);
+        assert_eq!(unavailable_anchor["status"].as_str(), Some("ready"));
+        assert_eq!(
+            unavailable_anchor["external_witness"]["required"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            unavailable_anchor["external_witness"]["ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            unavailable_anchor["external_witness"]["adverse_evidence"].as_bool(),
+            Some(false)
+        );
+        assert!(two_hop_proof_restart_continuity(&unavailable_status).ready);
+
+        let adverse_rounds = [
+            (
+                "rollback_detected",
+                crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound {
+                    configured: 1,
+                    attempted: 1,
+                    verified: 1,
+                    stale: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "conflict",
+                crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound {
+                    configured: 1,
+                    attempted: 1,
+                    verified: 1,
+                    conflicts: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "gap",
+                crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound {
+                    configured: 1,
+                    attempted: 1,
+                    verified: 1,
+                    gaps: 1,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (offset, (expected_status, round)) in adverse_rounds.into_iter().enumerate() {
+            let observed_at = now + offset as u64 + 2;
+            store.record_client_delivery_witness_round(observed_at, 1, false, 1, round);
+            let status = store.status(observed_at);
+            let anchor = recovery_anchor_status_value(&status);
+
+            assert_eq!(
+                anchor["external_witness"]["status"].as_str(),
+                Some(expected_status)
+            );
+            assert_eq!(anchor["status"].as_str(), Some("blocked"));
+            assert_eq!(anchor["ready_for_restore"].as_bool(), Some(false));
+            assert_eq!(
+                anchor["external_witness"]["adverse_evidence"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(anchor["external_witness"]["ready"].as_bool(), Some(false));
+            let continuity = two_hop_proof_restart_continuity(&status);
+            assert!(!continuity.ready);
+            assert_eq!(continuity.source, "external_witness_not_ready");
+        }
     }
 
     #[tokio::test]

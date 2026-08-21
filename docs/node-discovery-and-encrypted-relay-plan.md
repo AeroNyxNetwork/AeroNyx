@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.20.0 - Enforce exact-generation recovery readiness in
-local health, startup self-check, operator status, and deployment diagnostics.
+Modification Reason: v1.21.0 - Make authenticated adverse external-witness
+evidence fail closed even when witness availability is configured as optional.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.20.0 - [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Reuses the shared recovery-anchor contract in local health, startup admission, operator telemetry, and deployment diagnostics; strict witness deployments now fail health while the active generation is unverified.
+Last Modified: v1.21.0 - [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] Separates optional witness availability from authenticated adverse evidence so rollback, conflict, or generation-gap results always block restored proof continuity and multi-hop admission.
+Previous: v1.20.0 - [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Reuses the shared recovery-anchor contract in local health, startup admission, operator telemetry, and deployment diagnostics; strict witness deployments now fail health while the active generation is unverified.
 Previous: v1.19.0 - [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Reuses the shared recovery-anchor builder in the signed management heartbeat so backend and Nodeboard observe the same exact-generation admission decision as the node APIs.
 Previous: v1.18.0 - [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Adds one privacy-safe recovery-anchor API aggregate and prevents a prior generation's witness result from authorizing proof continuity between local persistence and exact-generation witnessing.
 Previous: v1.17.0 - [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Prevents a valid older recovery anchor from authorizing readiness restored from a newer signed cache after an interrupted cache-before-anchor durability update.
@@ -153,6 +154,27 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.21 Optional availability never weakens adverse witness evidence
+
+[EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex]
+
+- Optional external witnessing means an unavailable witness transport does not
+  become a runtime availability dependency. It does not make authenticated
+  rollback, same-generation conflict, or generation-gap evidence advisory.
+- One typed admission helper now owns witness readiness for recovery status and
+  two-hop/three-hop proof continuity. A health surface therefore cannot report
+  a blocked recovery anchor while multi-hop selection remains eligible.
+- `recovery_anchor.v1.external_witness.adverse_evidence` is an additive boolean
+  that lets Nodeboard and runbooks distinguish cryptographic rejection from a
+  merely unavailable optional witness without parsing free-form text.
+- Any adverse witness bucket sets recovery status to `blocked`, rejects
+  `ready_for_restore`, and prevents restored or newly persisted proof windows
+  from satisfying restart continuity. Independently verified descriptors and
+  fresh bounded probes remain available; client traffic and payload contents
+  are not inspected or exported.
+- Regression coverage proves optional-unavailable remains operational while
+  signed rollback, conflict, and gap outcomes all fail closed.
 
 ### v1.20 Recovery-anchor readiness is enforced across local operations
 

@@ -966,14 +966,21 @@ anchor_ready = bool(recovery_anchor.get("ready_for_restore"))
 external_witness = recovery_anchor.get("external_witness") or {}
 witness_required = bool(external_witness.get("required"))
 witness_aligned = bool(external_witness.get("generation_aligned"))
-print("info\tdiscovery recovery anchor status=%s ready=%s witness_required=%s generation_aligned=%s" % (
+witness_adverse = bool(external_witness.get("adverse_evidence"))
+print("info\tdiscovery recovery anchor status=%s ready=%s witness_required=%s generation_aligned=%s adverse_evidence=%s" % (
     anchor_status,
     str(anchor_ready).lower(),
     str(witness_required).lower(),
     str(witness_aligned).lower(),
+    str(witness_adverse).lower(),
 ))
 if witness_required and not anchor_ready:
     print("fail\tdiscovery recovery anchor lacks the required exact-generation witness")
+elif witness_adverse:
+    # [EXTERNAL-WITNESS-ADVERSE-GATE 2026-08-21 by Codex] Optional transport
+    # availability is advisory, but authenticated rollback/conflict/gap
+    # evidence must remain visible as a distinct operator warning.
+    print("warn\tdiscovery recovery anchor rejected authenticated adverse witness evidence")
 elif anchor_status in ("blocked", "attention"):
     print("warn\tdiscovery recovery anchor needs operator attention")
 elif anchor_status == "ready":
@@ -1109,6 +1116,7 @@ def discovery_readiness_payload(discovery_path, local_health):
                 "status": external_witness.get("status"),
                 "required": external_witness.get("required"),
                 "ready": external_witness.get("ready"),
+                "adverse_evidence": external_witness.get("adverse_evidence"),
                 "generation": external_witness.get("generation"),
                 "generation_aligned": external_witness.get("generation_aligned"),
                 "minimum_verified": external_witness.get("minimum_verified"),
