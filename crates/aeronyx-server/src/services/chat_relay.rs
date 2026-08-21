@@ -1,9 +1,13 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.7.0-CustodyWitnessReceiptImport
+// Version: 3.8.0-RelayHealthReasonBoundary
 //
 // Modification Reason:
+//   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
+//   allowlisted relay-health failure reasons so arbitrary runtime strings can
+//   never cross into heartbeat-visible status. Legacy public record methods
+//   remain source-compatible and sanitize unknown input to `unknown`.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -84,6 +88,7 @@
 //   - Verified custody backup: WAL-aware, private, no-overwrite recovery image
 //   - Idempotent custody backup: restart-safe command replay without raw IDs
 //   - Custody backup retention: bounded, verified, serialized local audit
+//   - Relay health reason boundary: typed ingress with compatibility sanitizer
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -191,10 +196,15 @@
 //     checkpoint may be compressed into one opaque digest and signed by the
 //     node identity for external retention. No private MAC or audit path crosses
 //     that boundary, and interrupted rotations cannot be exported.
+//   - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Heartbeat-visible
+//     relay failure reasons must enter through the typed allowlist below.
+//     Unknown, typoed, URL-bearing, identifier-bearing, or payload-derived
+//     strings are reduced to `unknown`; never widen this into a pass-through.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.8.0-RelayHealthReasonBoundary — Typed privacy-safe failure allowlist
 //   v3.7.0-CustodyAuditAnchor — Portable node-signed checkpoint commitment
 //   v3.6.0-CustodyAuditRotation — Crash-safe segmented maintenance audit
 //   v3.5.0-CustodyAuditVerify — Bounded public maintenance-chain verification
@@ -1173,6 +1183,138 @@ impl DirectPeerRelayCircuitCheckpointRow {
 enum OutboundRouteClass {
     AuthenticatedOnion,
     DirectPeer,
+}
+
+/// Validated outbound relay-health reason accepted by heartbeat telemetry.
+///
+/// The field is private by design: callers cannot construct this value from a
+/// raw error, endpoint, request identifier, or payload. `from_bucket` retains
+/// the established operational vocabulary and collapses everything else to a
+/// single aggregate `unknown` bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatRelayOutboundFailureReason(String);
+
+impl ChatRelayOutboundFailureReason {
+    /// Sanitizes one internal diagnostic bucket for aggregate health export.
+    pub(crate) fn from_bucket(reason: &str) -> Self {
+        // [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Keep this list
+        // closed. Dynamic HTTP buckets are accepted only when their suffix is
+        // a valid three-digit status; all peer-controlled text is discarded.
+        let safe = matches!(
+            reason,
+            "peer_http_client_unavailable"
+                | "no_receipt_capable_terminal"
+                | "no_network_diverse_receipt_path"
+                | "no_receipt_capable_middle"
+                | "onion_terminal_selection_changed"
+                | "onion_terminal_diversity_exhausted"
+                | "onion_middle_candidate_unavailable"
+                | "onion_middle_endpoint_missing"
+                | "onion_middle_endpoint_invalid"
+                | "onion_request_build_failed"
+                | "onion_delivery_receipt_rejected"
+                | "onion_delivery_route_surface_changed"
+                | "onion_delivery_ack_response_too_large"
+                | "onion_delivery_ack_response_body_read_failed"
+                | "onion_delivery_ack_response_json_decode_failed"
+                | "onion_delivery_request_timeout"
+                | "onion_delivery_request_connect"
+                | "onion_delivery_request_http_status"
+                | "onion_delivery_request_decode"
+                | "onion_delivery_request_body"
+                | "onion_delivery_request_request"
+                | "onion_delivery_request_unknown"
+                | "peer_relay_circuit_open"
+                | "peer_relay_half_open_probe_unavailable"
+                | "peer_relay_target_auth_encode_failed"
+                | "peer_relay_auth_encode_failed"
+                | "peer_relay_request_timeout"
+                | "peer_relay_request_connect"
+                | "peer_relay_request_http_status"
+                | "peer_relay_request_decode"
+                | "peer_relay_request_body"
+                | "peer_relay_request_request"
+                | "peer_relay_request_unknown"
+                | "peer_relay_ack_response_too_large"
+                | "peer_relay_ack_response_body_read_failed"
+                | "peer_relay_ack_response_json_decode_failed"
+                | "peer_relay_ack_rejected"
+                | "peer_relay_receipt_request_missing"
+                | "peer_relay_receipt_missing"
+                | "peer_relay_receipt_version_invalid"
+                | "peer_relay_receipt_binding_invalid"
+                | "peer_relay_receipt_signature_invalid"
+                | "peer_relay_receipt_timestamp_in_future"
+                | "peer_relay_receipt_timestamp_expired"
+        ) || relay_http_status_bucket(reason, "onion_delivery_http_")
+            || relay_http_status_bucket(reason, "onion_delivery_request_http_")
+            || relay_http_status_bucket(reason, "peer_relay_http_")
+            || relay_http_status_bucket(reason, "peer_relay_request_http_");
+
+        Self(if safe { reason } else { "unknown" }.to_string())
+    }
+
+    fn into_bucket(self) -> String {
+        self.0
+    }
+}
+
+/// Validated inbound relay-health reason accepted by heartbeat telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChatRelayInboundFailureReason(String);
+
+impl ChatRelayInboundFailureReason {
+    /// Sanitizes one inbound rejection bucket for aggregate health export.
+    pub(crate) fn from_bucket(reason: &str) -> Self {
+        // [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Inbound reasons
+        // are intentionally fixed; request content and parser details never
+        // become health labels even when an upstream caller makes a mistake.
+        let safe = matches!(
+            reason,
+            "rate_limited"
+                | "backpressure"
+                | "peer_auth_invalid"
+                | "peer_target_mismatch"
+                | "peer_auth_retry_in_flight"
+                | "peer_auth_retry_cache_saturated"
+                | "peer_auth_rate_limited"
+                | "relay_unavailable"
+                | "invalid_signature"
+                | "envelope_too_large"
+                | "envelope_serialization_failed"
+                | "timestamp_expired"
+                | "timestamp_in_future"
+                | "pending_capacity_exhausted"
+                | "store_pending_failed"
+                | "sqlite_error"
+                | "serialization_error"
+                | "corrupt_stored_data"
+                | "timestamp_out_of_range"
+                | "message_id_conflict"
+                | "queue_sequence_exhausted"
+                | "message_too_large"
+                | "mailbox_full"
+                | "pending_message_count_quota"
+                | "pending_message_byte_quota"
+        );
+
+        Self(if safe { reason } else { "unknown" }.to_string())
+    }
+
+    fn into_bucket(self) -> String {
+        self.0
+    }
+}
+
+fn relay_http_status_bucket(reason: &str, prefix: &str) -> bool {
+    let Some(status) = reason.strip_prefix(prefix) else {
+        return false;
+    };
+    status.len() == 3
+        && status.bytes().all(|byte| byte.is_ascii_digit())
+        && status
+            .parse::<u16>()
+            .is_ok_and(|status| (100..=599).contains(&status))
 }
 
 /// Aggregate commit-durability evidence for encrypted relay custody.
@@ -6998,12 +7140,31 @@ impl ChatRelayService {
     /// The failure reason must be a stable bucket such as
     /// `peer_relay_request_timeout` or `peer_relay_http_503`; do not pass peer
     /// URLs, message IDs, wallet IDs, client IPs, or payload-derived data.
+    /// Unrecognized legacy input is intentionally reported as `unknown`.
     pub fn record_peer_relay_outbound(
         &self,
         now: u64,
         attempted: usize,
         accepted: usize,
         failure_reason: Option<String>,
+    ) {
+        self.record_peer_relay_outbound_typed(
+            now,
+            attempted,
+            accepted,
+            failure_reason
+                .as_deref()
+                .map(ChatRelayOutboundFailureReason::from_bucket),
+        );
+    }
+
+    /// Records direct relay health through the compiler-checked reason type.
+    pub(crate) fn record_peer_relay_outbound_typed(
+        &self,
+        now: u64,
+        attempted: usize,
+        accepted: usize,
+        failure_reason: Option<ChatRelayOutboundFailureReason>,
     ) {
         self.record_outbound_round(
             now,
@@ -7137,6 +7298,24 @@ impl ChatRelayService {
         accepted: usize,
         failure_reason: Option<String>,
     ) {
+        self.record_authenticated_onion_outbound_typed(
+            now,
+            attempted,
+            accepted,
+            failure_reason
+                .as_deref()
+                .map(ChatRelayOutboundFailureReason::from_bucket),
+        );
+    }
+
+    /// Records authenticated onion health through the validated reason type.
+    pub(crate) fn record_authenticated_onion_outbound_typed(
+        &self,
+        now: u64,
+        attempted: usize,
+        accepted: usize,
+        failure_reason: Option<ChatRelayOutboundFailureReason>,
+    ) {
         self.record_outbound_round(
             now,
             attempted,
@@ -7151,7 +7330,7 @@ impl ChatRelayService {
         now: u64,
         attempted: usize,
         accepted: usize,
-        failure_reason: Option<String>,
+        failure_reason: Option<ChatRelayOutboundFailureReason>,
         route_class: OutboundRouteClass,
     ) {
         let failed = attempted.saturating_sub(accepted);
@@ -7167,7 +7346,11 @@ impl ChatRelayService {
             "failed"
         };
         let failure_reason = if failed > 0 || (attempted == 0 && status_bucket == "failed") {
-            Some(failure_reason.unwrap_or_else(|| "unknown".to_string()))
+            Some(
+                failure_reason
+                    .map(ChatRelayOutboundFailureReason::into_bucket)
+                    .unwrap_or_else(|| "unknown".to_string()),
+            )
         } else {
             None
         };
@@ -7248,11 +7431,26 @@ impl ChatRelayService {
     }
 
     /// Records a rejected inbound peer relay request with a stable reason bucket.
+    ///
+    /// This compatibility entry point sanitizes unrecognized text to `unknown`.
     pub fn record_peer_relay_inbound_rejected(&self, now: u64, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.record_peer_relay_inbound_rejected_typed(
+            now,
+            ChatRelayInboundFailureReason::from_bucket(&reason),
+        );
+    }
+
+    /// Records an inbound rejection through the validated reason type.
+    pub(crate) fn record_peer_relay_inbound_rejected_typed(
+        &self,
+        now: u64,
+        reason: ChatRelayInboundFailureReason,
+    ) {
         let mut status = self.peer_status.write();
         status.inbound_rejected_total = status.inbound_rejected_total.saturating_add(1);
         status.last_inbound_status = Some("rejected".to_string());
-        status.last_inbound_failure_reason = Some(reason.into());
+        status.last_inbound_failure_reason = Some(reason.into_bucket());
         status.last_inbound_at = Some(now);
     }
 
@@ -9619,6 +9817,62 @@ mod tests {
             Some("healthy")
         );
         assert_eq!(status.authenticated_onion_outbound.rounds, 0);
+    }
+
+    #[test]
+    fn relay_health_reason_boundary_preserves_buckets_and_redacts_raw_input() {
+        let svc = make_service();
+
+        // [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] The legacy API
+        // remains callable during rolling upgrades, but neither a URL nor an
+        // invalid status suffix may become heartbeat-visible text.
+        svc.record_peer_relay_outbound(
+            1_800_000_031,
+            1,
+            0,
+            Some("https://peer.example/secret?message_id=42".to_string()),
+        );
+        assert_eq!(
+            svc.peer_status().last_outbound_failure_reason.as_deref(),
+            Some("unknown")
+        );
+
+        svc.record_peer_relay_outbound(
+            1_800_000_032,
+            1,
+            0,
+            Some("peer_relay_http_503".to_string()),
+        );
+        assert_eq!(
+            svc.peer_status().last_outbound_failure_reason.as_deref(),
+            Some("peer_relay_http_503")
+        );
+
+        svc.record_peer_relay_outbound(
+            1_800_000_033,
+            1,
+            0,
+            Some("peer_relay_http_999".to_string()),
+        );
+        assert_eq!(
+            svc.peer_status().last_outbound_failure_reason.as_deref(),
+            Some("unknown")
+        );
+
+        svc.record_peer_relay_inbound_rejected(
+            1_800_000_034,
+            "invalid_signature receiver=private-key-material",
+        );
+        assert_eq!(
+            svc.peer_status().last_inbound_failure_reason.as_deref(),
+            Some("unknown")
+        );
+
+        svc.record_peer_relay_inbound_rejected(1_800_000_035, "invalid_signature");
+        assert_eq!(
+            svc.peer_status().last_inbound_failure_reason.as_deref(),
+            Some("invalid_signature")
+        );
     }
 
     #[test]

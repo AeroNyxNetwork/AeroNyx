@@ -78,6 +78,9 @@
 //! - [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Retains a bounded,
 //!   short-lived exact custody ACK by opaque request commitment so an ACK-loss
 //!   retry cannot consume quota or repeat durable/live delivery
+//! - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Converts parser-front,
+//!   authentication, validation, and durable-store rejection diagnostics into
+//!   a validated aggregate reason before relay health can export it
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -245,8 +248,13 @@
 //!   generation queue independently bounded; stale owners must never mutate a
 //!   newer generation, and retries must bypass authenticated quota only after
 //!   exact request authentication succeeds.
+//! - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Inbound relay health
+//!   accepts only the validated reason type. Keep raw store errors local and
+//!   never export request, endpoint, identity, or payload-derived text.
 //!
 //! ## Last Modified
+//! v0.50.0-RelayHealthReasonBoundary - Enforce validated aggregate inbound
+//! failure reasons while preserving legacy heartbeat JSON values
 //! v0.49.0-DirectRelayIdempotentRetry - Return exact bounded custody ACKs for
 //! authenticated same-request retries without repeating relay side effects
 //! v0.48.0-DirectRelayTargetBindingV3 - Bind authenticated direct relay work to
@@ -362,7 +370,7 @@ use crate::api::{
 use crate::config_chat_relay::{
     DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE, DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE,
 };
-use crate::services::chat_relay::ChatRelayError;
+use crate::services::chat_relay::{ChatRelayError, ChatRelayInboundFailureReason};
 use crate::services::peer_store::PeerStore;
 use crate::services::{
     BlindVaultPutFailureClass, BlindVaultServiceError, ChatRelayService, Session, SessionManager,
@@ -567,9 +575,9 @@ impl PeerRelayRequestGate {
             .allow(now, self.requests_per_minute)
     }
 
-    fn record_rejected(&self, reason: &'static str) {
+    fn record_rejected(&self, reason: ChatRelayInboundFailureReason) {
         if let Some(relay) = self.chat_relay.as_ref() {
-            relay.record_peer_relay_inbound_rejected(now_secs(), reason);
+            relay.record_peer_relay_inbound_rejected_typed(now_secs(), reason);
         }
     }
 
@@ -1904,14 +1912,14 @@ async fn peer_relay_request_gate(
     // state: the legacy wire contract cannot authenticate a previous-hop node,
     // and sender/receiver/IP buckets would create misleading identity state.
     if !gate.admit(Instant::now()) {
-        gate.record_rejected("rate_limited");
+        gate.record_rejected(ChatRelayInboundFailureReason::from_bucket("rate_limited"));
         return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
     }
 
     let Some(_in_flight) =
         InFlightRequestGuard::try_acquire(&gate.in_flight, MAX_IN_FLIGHT_PEER_CHAT_REQUESTS)
     else {
-        gate.record_rejected("backpressure");
+        gate.record_rejected(ChatRelayInboundFailureReason::from_bucket("backpressure"));
         return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
     };
 
@@ -1996,7 +2004,10 @@ async fn peer_relay_v2_handler(
     // affect only aggregate health and cannot poison another node's identity.
     let Some(request_commitment) = request.verified_request_commitment() else {
         if let Some(relay) = state.chat_relay.as_ref() {
-            relay.record_peer_relay_inbound_rejected(now_secs(), "peer_auth_invalid");
+            relay.record_peer_relay_inbound_rejected_typed(
+                now_secs(),
+                ChatRelayInboundFailureReason::from_bucket("peer_auth_invalid"),
+            );
         }
         return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
     };
@@ -2023,14 +2034,20 @@ async fn peer_relay_v3_handler(
     let local_node_id = state.node_identity.public_key_bytes();
     if request.target_node_id != local_node_id {
         if let Some(relay) = state.chat_relay.as_ref() {
-            relay.record_peer_relay_inbound_rejected(now_secs(), "peer_target_mismatch");
+            relay.record_peer_relay_inbound_rejected_typed(
+                now_secs(),
+                ChatRelayInboundFailureReason::from_bucket("peer_target_mismatch"),
+            );
         }
         return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
     }
     let Some(request_commitment) = request.verified_request_commitment_for_target(&local_node_id)
     else {
         if let Some(relay) = state.chat_relay.as_ref() {
-            relay.record_peer_relay_inbound_rejected(now_secs(), "peer_auth_invalid");
+            relay.record_peer_relay_inbound_rejected_typed(
+                now_secs(),
+                ChatRelayInboundFailureReason::from_bucket("peer_auth_invalid"),
+            );
         }
         return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
     };
@@ -2069,19 +2086,25 @@ async fn authenticated_peer_relay_response(
             return (StatusCode::OK, Json(response)).into_response();
         }
         AuthenticatedPeerRelayReplayStart::InFlight => {
-            gate.record_rejected("peer_auth_retry_in_flight");
+            gate.record_rejected(ChatRelayInboundFailureReason::from_bucket(
+                "peer_auth_retry_in_flight",
+            ));
             let status =
                 StatusCode::from_u16(HTTP_TOO_EARLY_STATUS_CODE).unwrap_or(StatusCode::CONFLICT);
             return rejected_peer_relay_response(status);
         }
         AuthenticatedPeerRelayReplayStart::Saturated => {
-            gate.record_rejected("peer_auth_retry_cache_saturated");
+            gate.record_rejected(ChatRelayInboundFailureReason::from_bucket(
+                "peer_auth_retry_cache_saturated",
+            ));
             return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
         }
     };
 
     if !gate.admit_authenticated(previous_hop_node_id, Instant::now()) {
-        gate.record_rejected("peer_auth_rate_limited");
+        gate.record_rejected(ChatRelayInboundFailureReason::from_bucket(
+            "peer_auth_rate_limited",
+        ));
         return rejected_peer_relay_response(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -2178,7 +2201,10 @@ async fn process_peer_relay(
     let now = now_secs();
     if let Err(error) = validate_peer_envelope(&envelope, now) {
         if let Some(relay) = state.chat_relay.as_ref() {
-            relay.record_peer_relay_inbound_rejected(now, error.reason_bucket());
+            relay.record_peer_relay_inbound_rejected_typed(
+                now,
+                ChatRelayInboundFailureReason::from_bucket(error.reason_bucket()),
+            );
         }
         return Err(error);
     }
@@ -2196,7 +2222,13 @@ async fn process_peer_relay(
     relay.store_pending(&envelope).map_err(|error| {
         let reason = error.reason_bucket();
         warn!(reason, "[CHAT_PEER] Failed to durably accept peer envelope");
-        relay.record_peer_relay_inbound_rejected(now, reason);
+        // [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Preserve the
+        // storage diagnostic in the local warning while exporting only a
+        // validated aggregate bucket to node health.
+        relay.record_peer_relay_inbound_rejected_typed(
+            now,
+            ChatRelayInboundFailureReason::from_bucket(reason),
+        );
         map_pending_store_error(&error)
     })?;
 

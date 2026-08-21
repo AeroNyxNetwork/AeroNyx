@@ -393,6 +393,9 @@
 //      an expiring exact-anchor receipt threshold through the already pinned,
 //      bounded, durable witness transport without expanding discovery into
 //      authority or changing the default local-only runtime behavior.
+// 147. [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Converts direct and
+//      authenticated-onion relay diagnostics into validated aggregate reason
+//      values before heartbeat state can observe them.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -571,8 +574,14 @@
 //   - [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] The anonymous schema
 //     marker is part of relay startup integrity. If it proves prior checkpoint
 //     installation but the checkpoint table is absent, startup must fail.
+//   - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Route-local
+//     diagnostics and logs may use reviewed stable buckets, but heartbeat must
+//     receive the validated reason type. Never pass through a raw reqwest
+//     error, endpoint, response body, request id, message id, or payload text.
 //
 // Last Modified:
+//   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added a typed,
+//     allowlisted export boundary for direct and authenticated-onion failures.
 //   [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Added one privacy-safe,
 //     process-lifetime custody runtime snapshot to Chat Relay heartbeat status.
 //   [CUSTODY-RENEWAL-BACKOFF 2026-08-21 by Codex] Separated strict local
@@ -959,8 +968,8 @@ use crate::management::{
 };
 use crate::miner::ReflectionMiner;
 use crate::services::chat_relay::{
-    derive_node_secret, ChatRelayPeerStatus, ChatRelayService, ExpiredNotification,
-    MAX_CHAT_ACK_MESSAGE_IDS,
+    derive_node_secret, ChatRelayOutboundFailureReason, ChatRelayPeerStatus, ChatRelayService,
+    ExpiredNotification, MAX_CHAT_ACK_MESSAGE_IDS,
 };
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
@@ -12057,11 +12066,13 @@ impl Server {
         // otherwise a real routing failure is indistinguishable from idle.
         let Some(client) = client else {
             if let Some(relay) = relay {
-                relay.record_authenticated_onion_outbound(
+                relay.record_authenticated_onion_outbound_typed(
                     now,
                     0,
                     0,
-                    Some("peer_http_client_unavailable".to_string()),
+                    Some(ChatRelayOutboundFailureReason::from_bucket(
+                        "peer_http_client_unavailable",
+                    )),
                 );
             }
             return AuthenticatedChatOnionRelayOutcome::default();
@@ -12078,11 +12089,13 @@ impl Server {
                 "[CHAT_RELAY] Authenticated onion path is not currently ready"
             );
             if let Some(relay) = relay {
-                relay.record_authenticated_onion_outbound(
+                relay.record_authenticated_onion_outbound_typed(
                     now,
                     0,
                     0,
-                    Some(path_readiness.reason.to_string()),
+                    Some(ChatRelayOutboundFailureReason::from_bucket(
+                        path_readiness.reason,
+                    )),
                 );
             }
             return AuthenticatedChatOnionRelayOutcome::default();
@@ -12099,11 +12112,13 @@ impl Server {
             // change between readiness and selection. Record only a stable
             // aggregate bucket, never the missing descriptor or endpoint.
             if let Some(relay) = relay {
-                relay.record_authenticated_onion_outbound(
+                relay.record_authenticated_onion_outbound_typed(
                     now,
                     0,
                     0,
-                    Some("onion_terminal_selection_changed".to_string()),
+                    Some(ChatRelayOutboundFailureReason::from_bucket(
+                        "onion_terminal_selection_changed",
+                    )),
                 );
             }
             return AuthenticatedChatOnionRelayOutcome::default();
@@ -12276,11 +12291,16 @@ impl Server {
             // [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] Keep verified
             // onion evidence independent from the compatibility direct-relay
             // fallback that may run immediately after this function returns.
-            relay.record_authenticated_onion_outbound(
+            // [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] PeerStore
+            // keeps its internal route diagnostic, while heartbeat receives
+            // only the closed aggregate reason vocabulary.
+            relay.record_authenticated_onion_outbound_typed(
                 now,
                 attempted,
                 accepted,
-                last_failure_reason,
+                last_failure_reason
+                    .as_deref()
+                    .map(ChatRelayOutboundFailureReason::from_bucket),
             );
         }
         let outcome = AuthenticatedChatOnionRelayOutcome {
@@ -12441,11 +12461,13 @@ impl Server {
         let now = unix_now_secs();
         let Some(client) = client else {
             if let Some(relay) = relay {
-                relay.record_peer_relay_outbound(
+                relay.record_peer_relay_outbound_typed(
                     now,
                     0,
                     0,
-                    Some("peer_http_client_unavailable".to_string()),
+                    Some(ChatRelayOutboundFailureReason::from_bucket(
+                        "peer_http_client_unavailable",
+                    )),
                 );
             }
             return 0;
@@ -12476,11 +12498,13 @@ impl Server {
         if has_target_bound_candidate {
             if let Some(relay) = relay {
                 let Some(permit) = relay.begin_direct_peer_delivery(now) else {
-                    relay.record_peer_relay_outbound(
+                    relay.record_peer_relay_outbound_typed(
                         now,
                         0,
                         0,
-                        Some("peer_relay_circuit_open".to_string()),
+                        Some(ChatRelayOutboundFailureReason::from_bucket(
+                            "peer_relay_circuit_open",
+                        )),
                     );
                     return 0;
                 };
@@ -12716,7 +12740,16 @@ impl Server {
         }
 
         if let Some(relay) = relay {
-            relay.record_peer_relay_outbound(now, attempted, accepted, last_failure_reason);
+            // [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Never send
+            // raw transport or peer-returned text into heartbeat telemetry.
+            relay.record_peer_relay_outbound_typed(
+                now,
+                attempted,
+                accepted,
+                last_failure_reason
+                    .as_deref()
+                    .map(ChatRelayOutboundFailureReason::from_bucket),
+            );
         }
 
         if attempted > 0 {

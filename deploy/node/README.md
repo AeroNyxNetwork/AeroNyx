@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Document the typed,
+  compatibility-preserving allowlist for heartbeat-visible relay failures.
 - [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Document the aggregate,
   process-lifetime Chat Relay heartbeat contract for custody renewal health.
 - [CUSTODY-RENEWAL-BACKOFF 2026-08-21 by Codex] Document bounded,
@@ -159,6 +161,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.63.0-node-deploy - Documented typed relay health reason privacy boundary.
 v1.62.0-node-deploy - Documented custody renewal runtime heartbeat telemetry.
 v1.61.0-node-deploy - Documented bounded concurrent custody witness collection.
 v1.60.0-node-deploy - Documented custody renewal warning lifecycle.
@@ -1145,6 +1148,21 @@ only. They never include witness identities, endpoint strings, signatures,
 anchor hashes, messages, users, routes, payloads, memory, destinations, DNS,
 IP addresses, or social-graph metadata. This remains independent evidence for
 an opaque custody checkpoint, not voting, consensus, fork choice, or finality.
+
+<!-- [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] -->
+Relay failure fields in the signed management heartbeat use a closed,
+privacy-safe vocabulary. Recognized direct, authenticated-onion, admission,
+transport, HTTP, ACK, receipt, and durable-store buckets retain their existing
+JSON strings so current nodeboard and backend consumers do not need a contract
+migration. Valid HTTP buckets accept only a three-digit 100-599 status.
+
+Any unregistered value is reported as `unknown`. A raw transport error, peer
+response, URL, endpoint, request/message identifier, wallet, payload, or
+ciphertext can therefore never be copied into `last_outbound_failure_reason`
+or `last_inbound_failure_reason`, including through the legacy compatibility
+recording methods. Operators should treat `unknown` as a code/version mismatch
+or a newly introduced bucket that must be reviewed and explicitly registered,
+not as permission to expose the original error text.
 
 <!-- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] -->
 The existing signed management heartbeat now includes the additive object

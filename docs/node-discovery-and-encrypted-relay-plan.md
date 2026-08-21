@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.11.0 - Added privacy-safe custody renewal runtime
-telemetry to the existing signed Chat Relay management heartbeat.
+Modification Reason: v1.12.0 - Enforced a typed, allowlisted privacy boundary
+for every heartbeat-visible encrypted relay failure reason.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.11.0 - [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Reports process-lifetime custody audit, renewal, backoff, recovery, and fail-closed health through the existing aggregate Chat Relay heartbeat without exposing witness or custody evidence.
+Last Modified: v1.12.0 - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Prevents arbitrary transport, endpoint, request, or payload-derived strings from entering relay heartbeat status while preserving the established JSON reason buckets and legacy record APIs.
+Previous: v1.11.0 - [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Reports process-lifetime custody audit, renewal, backoff, recovery, and fail-closed health through the existing aggregate Chat Relay heartbeat without exposing witness or custody evidence.
 Previous: v1.10.0 - [CUSTODY-RENEWAL-BACKOFF 2026-08-21 by Codex] Bounds external renewal retries by expiry while strict local audits continue independently.
 Previous: v1.09.0 - [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Renews an expiring exact-anchor threshold only when explicitly enabled, using authenticated PeerStore pins, bounded transport, durable-before-counting, and immediate post-round fail-closed audit.
 Previous: v1.08.0 - [CUSTODY-WITNESS-CONCURRENT-ROUND 2026-08-19 by Codex] Bounds explicit witness collection to one concurrent request per distinct configured pin while retaining durable-before-counting and fail-closed adverse evidence.
@@ -144,6 +145,28 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.12 Relay health reasons are a closed privacy boundary
+
+[RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex]
+
+- Rust node relay telemetry no longer accepts an unchecked runtime string at
+  its internal heartbeat-writing boundary. Direct relay, authenticated onion,
+  admission, authentication, durable-store, transport, HTTP, ACK, and receipt
+  failures are converted into validated aggregate reason values first.
+- Existing public recording methods remain source-compatible for rolling
+  upgrades and external integrations. Their input is passed through the same
+  allowlist; an unregistered value becomes `unknown` instead of being copied
+  into `last_outbound_failure_reason` or `last_inbound_failure_reason`.
+- Existing reason strings such as `peer_relay_http_503`,
+  `peer_relay_request_timeout`, `onion_delivery_receipt_rejected`, and
+  `invalid_signature` keep their exact serialized representation. Valid HTTP
+  buckets require a three-digit status in the 100-599 range.
+- PeerStore may retain a separate stable local route diagnostic for routing
+  policy, but heartbeat export cannot contain a peer URL, raw error, response
+  body, message/request identifier, wallet, endpoint, payload, or ciphertext.
+- Regression tests prove known buckets remain compatible and deliberately
+  URL-bearing or identifier-bearing input is reduced to `unknown`.
 
 ### v1.11 Custody renewal health is observable without exposing witnesses
 
