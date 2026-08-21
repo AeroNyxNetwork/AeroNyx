@@ -180,6 +180,9 @@
 //! - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Revokes the complete
 //!   anchor-v3 restart-readiness bundle on adverse external witness evidence
 //!   while retaining verified descriptors for bounded fresh probing
+//! - [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Exposes the
+//!   aggregate restored cache generation so startup witnessing cannot protect
+//!   a different local anchor generation after an interrupted atomic update
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -215,6 +218,8 @@
 //!   listeners. Do not reuse that bulk reset as a runtime route-health tool.
 //!
 //! ## Last Modified
+//! v0.87.0-ExternalWitnessGenerationBinding - Bound startup witness decisions
+//! to the exact aggregate generation currently represented by restored state
 //! v0.86.0-ExternalWitnessRouteGate - Applied adverse external v3 witness
 //! evidence to all restored readiness sections without deleting descriptors
 //! v0.85.0-RouteStateRollbackAnchor - Bound routeability and quarantine to the
@@ -3566,6 +3571,20 @@ impl PeerStore {
             outcome,
             format!("generation={generation} protection={protection}"),
         );
+    }
+
+    /// Returns the aggregate generation represented by current recovered state.
+    ///
+    /// [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] The value is
+    /// deliberately detached from cache paths, signatures, digests, peers,
+    /// routes, messages, and clients. Startup orchestration uses it only to
+    /// prove that the local anchor sent to external witnesses protects the
+    /// exact cache generation whose readiness evidence is currently loaded.
+    #[must_use]
+    pub fn peer_cache_recovery_generation(&self) -> u64 {
+        self.bootstrap_status
+            .read()
+            .last_client_delivery_cache_generation
     }
 
     /// Records one bounded external delivery-cache witness round.

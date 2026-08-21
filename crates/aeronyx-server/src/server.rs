@@ -407,6 +407,9 @@
 //      external recovery-anchor evidence to the complete v3 restart-readiness
 //      bundle before listeners start, retaining descriptors while revoking
 //      route, quarantine, proof, and aggregate delivery recovery.
+// 151. [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Requires the
+//      local recovery cache and witnessed anchor to represent the exact same
+//      generation, closing the interrupted cache-before-anchor write window.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -603,6 +606,9 @@
 //     Any signed adverse result must revoke the complete bundle at startup.
 //
 // Last Modified:
+//   [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Prevented a
+//     valid older anchor from authorizing restored state from a newer cache
+//     generation after an interrupted two-file durability update.
 //   [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Closed the whole-host
 //     rollback gap by applying adverse external witness evidence to route,
 //     quarantine, two/three-hop proof, and delivery readiness before listeners.
@@ -7999,6 +8005,39 @@ impl Server {
                 );
             }
         };
+
+        // [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Cache and
+        // anchor are independently replaced durable files. A crash can land
+        // after the new signed cache rename but before its matching anchor
+        // rename. Never ask witnesses to approve the older anchor and then
+        // apply that decision to readiness restored from the newer cache.
+        let recovered_generation = peer_store.peer_cache_recovery_generation();
+        if startup_gate
+            && recovered_generation != 0
+            && recovered_generation != anchor.cache_generation
+        {
+            let round = PeerStoreVerifiedDeliveryWitnessRound {
+                configured: witness_node_ids.len() as u64,
+                failed: witness_node_ids.len() as u64,
+                ..PeerStoreVerifiedDeliveryWitnessRound::default()
+            };
+            peer_store.record_client_delivery_witness_round(
+                evaluated_at,
+                recovered_generation,
+                discovery.verified_delivery_witness_required_for_restore,
+                discovery.verified_delivery_witness_min_verified,
+                round,
+            );
+            if discovery.verified_delivery_witness_required_for_restore {
+                peer_store.clear_restored_peer_cache_readiness_evidence(
+                    evaluated_at,
+                    "external_witness_unavailable",
+                );
+            }
+            return PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Unprotected(
+                "unavailable",
+            );
+        }
 
         let digest = match anchor.witness_digest() {
             Ok(digest) => digest,
@@ -24700,6 +24739,121 @@ mod tests {
                 && event.detail.contains("reason=external_witness_unavailable")
                 && !event.detail.contains("startup-gate.example")
         }));
+    }
+
+    #[tokio::test]
+    async fn peer_store_startup_witness_gate_rejects_cache_ahead_of_anchor() {
+        // [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Model a
+        // crash between the signed cache rename and matching anchor rename.
+        // The older valid anchor must not authorize newer restored readiness,
+        // and no network request should be attempted for the wrong generation.
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let now = unix_now_secs();
+        let peer_store = PeerStore::new();
+        let descriptor = signed_chat_relay_peer_descriptor(
+            "https://cache-ahead.example".to_string(),
+            8,
+            now + 4_000,
+        );
+        let node_id = descriptor.node_id();
+        assert!(peer_store.upsert_verified(descriptor, now).unwrap());
+        peer_store.record_route_forward_success(&node_id, now + 1);
+        for offset in 2..=4 {
+            peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                2,
+                2,
+                2,
+                1,
+            );
+            peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                now + offset,
+                true,
+                "onion_terminal_delivered",
+                3,
+                3,
+                3,
+                2,
+            );
+        }
+        peer_store.record_verified_client_onion_delivery(now + 4);
+        peer_store.record_blind_relay_terminal(now + 4, 0, 32);
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aeronyx-peer-cache-generation-binding-{unique}.json"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        Server::persist_peer_store_cache_once(
+            &server.identity,
+            &peer_store,
+            &path_str,
+            now + 5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(peer_store.peer_cache_recovery_generation(), 1);
+
+        // The new cache generation became durable, but the old generation-one
+        // anchor is still on disk because the process crashed before replace.
+        peer_store.record_client_delivery_cache_persisted(now + 6, 1, 2);
+        assert_eq!(peer_store.peer_cache_recovery_generation(), 2);
+
+        let witness = IdentityKeyPair::generate();
+        let mut discovery = server.config.discovery.clone();
+        discovery.verified_delivery_witness_node_ids =
+            vec![hex::encode(witness.public_key_bytes())];
+        discovery.verified_delivery_witness_required_for_restore = true;
+        let decision = Server::reconcile_peer_cache_delivery_witnesses(
+            &server.identity,
+            &peer_store,
+            &discovery,
+            &reqwest::Client::new(),
+            &path_str,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            decision,
+            PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Unprotected("unavailable")
+        );
+        let status = peer_store.status(now + 7);
+        assert_eq!(status.snapshot.valid_peers, 1);
+        assert!(peer_store.get_valid(&node_id, now + 7).is_some());
+        assert!(!peer_store.is_routeable_now(&node_id, now + 7));
+        assert_eq!(status.two_hop_path_proof_history.attempted, 0);
+        assert_eq!(status.three_hop_path_proof_history.attempted, 0);
+        assert_eq!(
+            status.runtime.blind_relay.verified_client_onion_deliveries,
+            0
+        );
+        assert_eq!(status.runtime.blind_relay.terminal, 1);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_client_delivery_witness_status
+                .as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(
+            status.bootstrap.last_client_delivery_witness_generation,
+            2
+        );
+        assert_eq!(status.bootstrap.last_client_delivery_witness_attempted, 0);
+        assert_eq!(status.bootstrap.last_client_delivery_witness_failed, 1);
+
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path_str)).await;
+        let _ = tokio::fs::remove_file(
+            Server::peer_cache_client_delivery_anchor_path(&path_str),
+        )
+        .await;
     }
 
     #[tokio::test]

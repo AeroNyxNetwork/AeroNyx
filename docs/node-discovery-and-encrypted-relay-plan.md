@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.16.0 - Made adverse external recovery-anchor evidence
-revoke the complete v3 restart-readiness bundle before listeners start.
+Modification Reason: v1.17.0 - Bound startup external witnessing to the exact
+cache generation currently represented by restored readiness state.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.16.0 - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Applies signed rollback, conflict, gap, invalid-anchor, and required-unavailable witness outcomes to routeability, quarantine, two-hop/three-hop proof, and delivery recovery as one startup-only fail-closed decision while preserving verified descriptors.
+Last Modified: v1.17.0 - [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Prevents a valid older recovery anchor from authorizing readiness restored from a newer signed cache after an interrupted cache-before-anchor durability update.
+Previous: v1.16.0 - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Applies signed rollback, conflict, gap, invalid-anchor, and required-unavailable witness outcomes to routeability, quarantine, two-hop/three-hop proof, and delivery recovery as one startup-only fail-closed decision while preserving verified descriptors.
 Previous: v1.15.0 - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Commits the exact signed routeability/quarantine section into recovery-anchor v3, rejects stale or unanchored route state while preserving descriptors, and extends configured external-witness protection to the same opaque state.
 Previous: v1.14.0 - [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Persists active descriptor-bound route quarantine beside positive routeability under one signed cache v2 snapshot, restores it before admission, and retains signed v1 rolling-upgrade compatibility without storing failure details.
 Previous: v1.13.0 - [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Prevents open-text route failures, relay rejections, or quarantine reasons from entering PeerStore reputation and diagnostics while preserving legacy method signatures and valid serialized buckets.
@@ -149,6 +150,34 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.17 External witnesses are bound to the exact recovered generation
+
+[EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex]
+
+- The signed peer cache and its monotonic recovery anchor are two independently
+  replaced durable files. A process or host failure can occur after the newer
+  cache rename and before the matching anchor rename, leaving a valid cache one
+  generation ahead of a valid older anchor.
+- Startup reconciliation now compares the aggregate generation represented by
+  restored state with the local anchor generation before any witness request.
+  An older anchor cannot be sent to witnesses and then reused as authorization
+  for a newer route, quarantine, two-hop, three-hop, or delivery section.
+- A generation mismatch records a stable aggregate `unavailable` witness
+  decision without contacting the network. When external witness protection is
+  required, the complete restored readiness bundle fails closed before public
+  listeners start; independently verified descriptors remain available for
+  fresh bounded probing.
+- Optional witness deployments remain backward compatible: mismatched state is
+  reported as unprotected, while local signed-cache policy continues to decide
+  whether live probes must rebuild readiness. Existing wire frames and all
+  `verified_delivery_witness_*` configuration keys remain unchanged.
+- The recovery-generation accessor exposes only one integer. It never exposes
+  cache paths, anchor digests, signatures, node identities, endpoints, routes,
+  messages, payloads, clients, wallets, IP addresses, or social relationships.
+- A crash-window regression test creates generation one, models generation two
+  becoming durable while the generation-one anchor remains, and proves that no
+  witness transport occurs and strict restored readiness is revoked.
 
 ### v1.16 External witnesses close the whole-host route rollback gap
 

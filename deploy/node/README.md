@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Document exact
+  cache/anchor generation binding during startup external witness checks.
 - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Document startup-wide
   readiness revocation when pinned witnesses reject recovery-anchor v3.
 - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Document recovery-anchor
@@ -169,6 +171,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.68.0-node-deploy - Documented exact-generation external witness binding.
 v1.67.0-node-deploy - Documented whole-host rollback fail-closed route gating.
 v1.66.0-node-deploy - Documented route-state rollback protection in recovery-anchor v3.
 v1.65.0-node-deploy - Documented restart-safe active route quarantine.
@@ -1245,6 +1248,16 @@ The deployed configuration keys and peer wire frames intentionally retain the
 `verified_delivery_witness_*` prefix for rolling compatibility. Operators must
 interpret those settings as recovery-anchor witness policy on v3 nodes, not as
 protection for one delivery counter. No new migration command is required.
+
+<!-- [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] -->
+Startup witness approval is valid only when the local signed cache and recovery
+anchor carry the same generation. If a crash lands after a newer cache rename
+but before its matching anchor rename, the node reports the witness state as
+`unavailable` without sending the older anchor. With
+`verified_delivery_witness_required_for_restore = true`, all restored route and
+proof readiness is discarded before listeners start, while verified peer
+descriptors remain available for fresh probes. This behavior is automatic and
+does not require an operator repair command or configuration migration.
 
 <!-- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] -->
 The existing signed management heartbeat now includes the additive object
