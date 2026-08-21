@@ -4,8 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.14.0 - Made active route quarantine survive a clean
-node restart through one signed, privacy-safe peer-cache v2 contract.
+Modification Reason: v1.15.0 - Bound the signed routeability/quarantine
+snapshot to recovery-anchor v3 so a valid older cache cannot silently revive
+stale route state after restart.
 
 Main Functionality:
 
@@ -30,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.14.0 - [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Persists active descriptor-bound route quarantine beside positive routeability under one signed cache v2 snapshot, restores it before admission, and retains signed v1 rolling-upgrade compatibility without storing failure details.
+Last Modified: v1.15.0 - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Commits the exact signed routeability/quarantine section into recovery-anchor v3, rejects stale or unanchored route state while preserving descriptors, and extends configured external-witness protection to the same opaque state.
+Previous: v1.14.0 - [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Persists active descriptor-bound route quarantine beside positive routeability under one signed cache v2 snapshot, restores it before admission, and retains signed v1 rolling-upgrade compatibility without storing failure details.
 Previous: v1.13.0 - [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Prevents open-text route failures, relay rejections, or quarantine reasons from entering PeerStore reputation and diagnostics while preserving legacy method signatures and valid serialized buckets.
 Previous: v1.12.0 - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Prevents arbitrary transport, endpoint, request, or payload-derived strings from entering relay heartbeat status while preserving the established JSON reason buckets and legacy record APIs.
 Previous: v1.11.0 - [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Reports process-lifetime custody audit, renewal, backoff, recovery, and fail-closed health through the existing aggregate Chat Relay heartbeat without exposing witness or custody evidence.
@@ -147,6 +149,37 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.15 Signed route state is protected from cache rollback
+
+[ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex]
+
+- Recovery-anchor v3 commits to an opaque SHA-256 digest of the exact signed
+  routeability and active-quarantine section. The digest binds the section's
+  canonical signing bytes, node signer, and Ed25519 signature; it contains no
+  endpoint, route, failure reason, request/message id, payload, user, wallet,
+  IP address, or social-graph field.
+- At startup, a valid route-state signature is necessary but no longer
+  sufficient. The cache generation and route-state digest must also match the
+  monotonic v3 anchor. Older generation, same-generation conflict, missing or
+  invalid anchor, and legacy-unanchored state fail closed and are rebuilt only
+  through fresh bounded route probes.
+- Signed peer descriptors remain independently recoverable. This keeps node
+  discovery available after an anchor problem while preventing stale health or
+  quarantine evidence from changing routing decisions.
+- Existing v1 and v2 anchors remain parseable for rolling upgrades. v1 keeps
+  its historical aggregate-delivery contract; v2 keeps its two-hop/three-hop
+  proof commitments. Neither version may authorize route-state recovery.
+- The normal cache-ahead crash window remains accepted: when the newly signed
+  cache was durably renamed but the matching anchor rename had not completed,
+  the newer cache can restore and repair the anchor on the next persistence.
+- A host-local anchor detects rollback of the cache file alone. A snapshot that
+  rolls back both cache and anchor requires the existing explicitly configured
+  external recovery-anchor witnesses; because their opaque digest covers the
+  full v3 anchor, route state is protected without revealing its contents.
+- Tests cover v1/v2/v3 signing compatibility, normal quarantine restart,
+  missing/invalid anchors, cache-ahead recovery, and replay of an older valid
+  signed cache while the latest anchor remains present.
 
 ### v1.14 Route quarantine remains effective across node restart
 

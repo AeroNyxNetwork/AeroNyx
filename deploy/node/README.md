@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Document recovery-anchor
+  v3 rollback protection for signed routeability and active quarantine state.
 - [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Document signed peer-cache
   v2 recovery for active route quarantine and v1 rolling-upgrade compatibility.
 - [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Document closed reason
@@ -165,6 +167,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.66.0-node-deploy - Documented route-state rollback protection in recovery-anchor v3.
 v1.65.0-node-deploy - Documented restart-safe active route quarantine.
 v1.64.0-node-deploy - Documented PeerStore reputation reason admission.
 v1.63.0-node-deploy - Documented typed relay health reason privacy boundary.
@@ -1204,6 +1207,27 @@ Quarantine entry and verified recovery trigger the same debounced atomic cache
 flush used by other security-relevant peer evidence. Operators do not need a
 new command or configuration flag; the periodic write and graceful-shutdown
 flush remain fallback durability paths.
+
+<!-- [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] -->
+Recovery-anchor v3 also commits to an opaque digest of the exact signed
+routeability/quarantine section. During startup, a valid cache signature alone
+cannot authorize route state: its generation and digest must agree with the
+monotonic anchor. Older, conflicting, missing, invalid, or v1/v2-unanchored
+route state is rejected, while independently verified peer descriptors remain
+available and bounded startup probes rebuild readiness.
+
+No operator migration command is required. The next successful cache write
+creates v3. Existing v1/v2 anchors remain readable for their historical
+delivery/proof contracts, but route state from those generations is deliberately
+re-probed. `last_routeability_cache_rollback_protection` reports only a fixed
+aggregate bucket such as `anchored`, `cache_ahead`, `legacy_unanchored`,
+`anchor_missing`, `anchor_invalid`, `anchor_conflict`, or `rollback_detected`.
+
+The local anchor detects replacement of the cache file alone. Detecting a
+whole-host snapshot rollback that replaces both files requires the existing
+operator-pinned external delivery-anchor witnesses. Their opaque witness digest
+now covers v3 route state without exposing routes, endpoints, failure reasons,
+payloads, messages, users, wallets, IP addresses, or social relationships.
 
 <!-- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] -->
 The existing signed management heartbeat now includes the additive object

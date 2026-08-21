@@ -399,6 +399,10 @@
 // 148. [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Signs active,
 //      descriptor-bound route quarantine into peer-cache v2 and restores it
 //      before route admission so restart cannot revive a recently failed peer.
+// 149. [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Extends the signed
+//      monotonic recovery anchor to v3 with an opaque commitment to the exact
+//      routeability/quarantine section, rejecting old or unanchored route
+//      state while preserving independently verified peer descriptors.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -585,8 +589,15 @@
 //     routeability and active quarantine under one node signature. Keep v1
 //     readable for rolling upgrades, but never infer missing quarantine state
 //     from a v1 cache or persist failure reasons, endpoints, routes, or payloads.
+//   - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Only recovery-anchor
+//     v3 may authorize persisted routeability/quarantine after restart. v1/v2
+//     anchors preserve compatibility for their historical evidence sections,
+//     but route readiness must be rebuilt by fresh probes.
 //
 // Last Modified:
+//   [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Bound signed route state
+//     to recovery-anchor v3 and rejected stale, missing, invalid, conflicting,
+//     or legacy-unanchored route evidence without discarding descriptors.
 //   [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Added signed active-route
 //     quarantine recovery and prompt persistence for security-state changes.
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added a typed,
@@ -1154,7 +1165,8 @@ const VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION: u16 = 1;
 const VERIFIED_CLIENT_DELIVERY_ANCHOR_MAX_BYTES: usize = 4 * 1024;
 const VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT: &str =
     "peer_store_verified_client_delivery_anchor.v1";
-const VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT: &str = "peer_store_recovery_anchor.v2";
+const VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT: &str = "peer_store_recovery_anchor.v2";
+const VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT: &str = "peer_store_recovery_anchor.v3";
 /// Direct startup probes are bounded independently of untrusted peer count.
 const BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES: usize = 3;
 
@@ -1944,6 +1956,41 @@ impl PeerStoreCacheDocument {
         .map_err(|error| format!("routeability evidence signing bytes: {error}"))
     }
 
+    /// Returns an opaque digest of the exact independently signed route-state
+    /// section, including active quarantine in cache schema v2.
+    ///
+    /// [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] The local monotonic
+    /// anchor commits to this digest, never to decoded endpoints or failure
+    /// details. Binding signer and signature prevents an unsigned replacement
+    /// from sharing the same anchor state even if its payload bytes match.
+    fn route_state_digest(&self) -> std::result::Result<String, String> {
+        let signer_hex = self
+            .routeability_evidence_signer_node_id
+            .as_deref()
+            .ok_or_else(|| "route state signer missing".to_string())?;
+        let signature_hex = self
+            .routeability_evidence_signature_ed25519
+            .as_deref()
+            .ok_or_else(|| "route state signature missing".to_string())?;
+        let mut signer = [0u8; 32];
+        hex::decode_to_slice(signer_hex, &mut signer)
+            .map_err(|_| "route state signer encoding invalid".to_string())?;
+        let mut signature = [0u8; 64];
+        hex::decode_to_slice(signature_hex, &mut signature)
+            .map_err(|_| "route state signature encoding invalid".to_string())?;
+        let signing_bytes = self.routeability_evidence_signing_bytes()?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx-PeerCache-RouteStateDigest-v1");
+        let signing_bytes_len = u64::try_from(signing_bytes.len())
+            .map_err(|_| "route state signing bytes length invalid".to_string())?;
+        hasher.update(signing_bytes_len.to_be_bytes());
+        hasher.update(signing_bytes);
+        hasher.update(signer);
+        hasher.update(signature);
+        Ok(hex::encode(hasher.finalize()))
+    }
+
     fn verify_two_hop_path_proof_signature(
         &self,
         identity: &IdentityKeyPair,
@@ -2109,6 +2156,9 @@ struct PeerStoreVerifiedClientDeliveryAnchor {
     cache_generation: u64,
     cache_generated_at: u64,
     evidence: Option<PeerStoreVerifiedClientDeliveryCacheEvidence>,
+    /// Opaque digest of signed routeability plus active quarantine state.
+    #[serde(default)]
+    route_state_digest: Option<String>,
     /// Opaque digest of the independently signed two-hop proof section.
     #[serde(default)]
     two_hop_path_proof_digest: Option<String>,
@@ -2126,6 +2176,11 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
             cache_generation: document.verified_client_delivery_generation,
             cache_generated_at: document.descriptor_snapshot.generated_at,
             evidence: document.verified_client_delivery_evidence,
+            route_state_digest: Some(
+                document
+                    .route_state_digest()
+                    .map_err(ServerError::internal)?,
+            ),
             two_hop_path_proof_digest: Some(
                 document
                     .two_hop_path_proof_digest()
@@ -2161,6 +2216,7 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
         if !matches!(
             anchor.contract_version.as_str(),
             VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT
+                | VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
                 | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
         ) {
             return Err("verified client delivery anchor contract unsupported".to_string());
@@ -2168,7 +2224,11 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
         if anchor.cache_generation == 0 {
             return Err("verified client delivery anchor generation invalid".to_string());
         }
-        if anchor.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT {
+        if matches!(
+            anchor.contract_version.as_str(),
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
+                | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
+        ) {
             for digest in [
                 anchor.two_hop_path_proof_digest.as_deref(),
                 anchor.three_hop_path_proof_digest.as_deref(),
@@ -2179,6 +2239,32 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
                 hex::decode_to_slice(digest, &mut decoded)
                     .map_err(|_| "recovery anchor proof digest encoding invalid".to_string())?;
             }
+        }
+        match anchor.contract_version.as_str() {
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT => {
+                if anchor.route_state_digest.is_some()
+                    || anchor.two_hop_path_proof_digest.is_some()
+                    || anchor.three_hop_path_proof_digest.is_some()
+                {
+                    return Err("legacy recovery anchor contains unsupported digest".to_string());
+                }
+            }
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT => {
+                if anchor.route_state_digest.is_some() {
+                    return Err("v2 recovery anchor contains route-state digest".to_string());
+                }
+            }
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT => {
+                let digest = anchor
+                    .route_state_digest
+                    .as_deref()
+                    .ok_or_else(|| "recovery anchor route-state digest missing".to_string())?;
+                let mut decoded = [0u8; 32];
+                hex::decode_to_slice(digest, &mut decoded).map_err(|_| {
+                    "recovery anchor route-state digest encoding invalid".to_string()
+                })?;
+            }
+            _ => unreachable!("anchor contract checked above"),
         }
         Ok(anchor)
     }
@@ -2192,12 +2278,22 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
                 self.cache_generated_at,
                 self.evidence,
             )),
-            VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT => bincode::serialize(&(
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT => bincode::serialize(&(
                 "aeronyx-peer-cache-recovery-anchor-v2",
                 self.contract_version.as_str(),
                 self.cache_generation,
                 self.cache_generated_at,
                 self.evidence,
+                self.two_hop_path_proof_digest.as_deref(),
+                self.three_hop_path_proof_digest.as_deref(),
+            )),
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT => bincode::serialize(&(
+                "aeronyx-peer-cache-recovery-anchor-v3",
+                self.contract_version.as_str(),
+                self.cache_generation,
+                self.cache_generated_at,
+                self.evidence,
+                self.route_state_digest.as_deref(),
                 self.two_hop_path_proof_digest.as_deref(),
                 self.three_hop_path_proof_digest.as_deref(),
             )),
@@ -2229,7 +2325,11 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
     }
 
     fn matches_two_hop_path_proof_section(&self, document: &PeerStoreCacheDocument) -> bool {
-        self.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
+        matches!(
+            self.contract_version.as_str(),
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
+                | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
+        )
             && self.cache_generation == document.verified_client_delivery_generation
             && self.cache_generated_at == document.descriptor_snapshot.generated_at
             && document.two_hop_path_proof_digest().is_ok_and(|digest| {
@@ -2238,11 +2338,24 @@ impl PeerStoreVerifiedClientDeliveryAnchor {
     }
 
     fn matches_three_hop_path_proof_section(&self, document: &PeerStoreCacheDocument) -> bool {
-        self.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
+        matches!(
+            self.contract_version.as_str(),
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT
+                | VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
+        )
             && self.cache_generation == document.verified_client_delivery_generation
             && self.cache_generated_at == document.descriptor_snapshot.generated_at
             && document.three_hop_path_proof_digest().is_ok_and(|digest| {
                 self.three_hop_path_proof_digest.as_deref() == Some(digest.as_str())
+            })
+    }
+
+    fn matches_route_state_section(&self, document: &PeerStoreCacheDocument) -> bool {
+        self.contract_version == VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT
+            && self.cache_generation == document.verified_client_delivery_generation
+            && self.cache_generated_at == document.descriptor_snapshot.generated_at
+            && document.route_state_digest().is_ok_and(|digest| {
+                self.route_state_digest.as_deref() == Some(digest.as_str())
             })
     }
 
@@ -2348,6 +2461,29 @@ impl PeerStoreVerifiedClientDeliveryAnchorState {
         self.path_proof_protection_for(document, |anchor, document| {
             anchor.matches_three_hop_path_proof_section(document)
         })
+    }
+
+    /// Evaluates the signed routeability/quarantine snapshot against the
+    /// monotonic local generation without exposing its digest.
+    fn route_state_protection_for(&self, document: &PeerStoreCacheDocument) -> &'static str {
+        match self {
+            Self::NotChecked => "not_checked",
+            Self::Missing => "anchor_missing",
+            Self::Invalid => "anchor_invalid",
+            Self::Verified(anchor) => {
+                if document.verified_client_delivery_generation < anchor.cache_generation {
+                    "rollback_detected"
+                } else if document.verified_client_delivery_generation > anchor.cache_generation {
+                    "cache_ahead"
+                } else if anchor.contract_version != VERIFIED_CLIENT_DELIVERY_ANCHOR_CONTRACT {
+                    "legacy_unanchored"
+                } else if anchor.matches_route_state_section(document) {
+                    "anchored"
+                } else {
+                    "anchor_conflict"
+                }
+            }
+        }
     }
 
     /// Evaluates rollback protection independently from aggregate delivery
@@ -13050,6 +13186,11 @@ impl Server {
                     "success",
                     format!("persisted={}", report.route_domain_certificates),
                 );
+                peer_store.record_routeability_cache_rollback_protection(
+                    now,
+                    report.client_delivery_generation,
+                    "anchored",
+                );
                 peer_store.record_two_hop_proof_cache_persisted(
                     now,
                     report.two_hop_events,
@@ -13364,6 +13505,16 @@ impl Server {
                     } else {
                         "not_checked"
                     };
+                // [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] The same
+                // monotonic generation now protects the independently signed
+                // routeability/quarantine section. Authentication and rollback
+                // remain separate decisions so diagnostics stay precise.
+                let routeability_rollback_protection = if routeability_authentication == "verified"
+                {
+                    client_delivery_anchor.route_state_protection_for(&document)
+                } else {
+                    "not_checked"
+                };
                 // [PATH-PROOF-ROLLBACK-ANCHOR 2026-08-02 by Codex] The same
                 // monotonic recovery anchor commits to opaque digests of both
                 // proof sections. This remains an independent failure domain:
@@ -13384,6 +13535,7 @@ impl Server {
                     Some(document.routeability_evidence),
                     route_quarantine_evidence,
                     routeability_authentication,
+                    routeability_rollback_protection,
                     route_domain_certificates,
                     Some(document.two_hop_path_proof_events),
                     two_hop_proof_authentication,
@@ -13405,6 +13557,7 @@ impl Server {
                         None,
                         None,
                         "not_applicable",
+                        "not_applicable",
                         None,
                         None,
                         "not_applicable",
@@ -13425,6 +13578,7 @@ impl Server {
             routeability_evidence,
             route_quarantine_evidence,
             routeability_authentication,
+            routeability_rollback_protection,
             route_domain_certificates,
             two_hop_proof_events,
             two_hop_proof_authentication,
@@ -13451,6 +13605,11 @@ impl Server {
         };
 
         if is_peer_cache {
+            peer_store.record_routeability_cache_rollback_protection(
+                now,
+                client_delivery_generation,
+                routeability_rollback_protection,
+            );
             peer_store.record_two_hop_proof_cache_authentication(now, two_hop_proof_authentication);
             peer_store
                 .record_three_hop_proof_cache_authentication(now, three_hop_proof_authentication);
@@ -13496,26 +13655,32 @@ impl Server {
             .unwrap_or(0);
         let route_report = match (
             routeability_authentication,
+            routeability_rollback_protection,
             routeability_evidence.as_deref(),
         ) {
-            ("signature_invalid", Some(records)) => {
+            ("signature_invalid", _, Some(records)) => {
                 Some(peer_store.reject_routeability_cache_evidence(
                     records.len(),
                     now,
                     "signature_invalid",
                 ))
             }
-            ("identity_unavailable", Some(records)) => {
+            ("identity_unavailable", _, Some(records)) => {
                 Some(peer_store.reject_routeability_cache_evidence(
                     records.len(),
                     now,
                     "identity_unavailable",
                 ))
             }
-            (_, Some(records)) => {
+            (_, protection, Some(records))
+                if !matches!(protection, "anchored" | "cache_ahead" | "not_checked") =>
+            {
+                Some(peer_store.reject_routeability_cache_evidence(records.len(), now, protection))
+            }
+            (_, _, Some(records)) => {
                 Some(peer_store.restore_routeability_cache_evidence(records, now))
             }
-            (_, None) => None,
+            (_, _, None) => None,
         };
         // [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Cache v2 signs
         // positive routeability and active quarantine as one policy snapshot.
@@ -13523,26 +13688,36 @@ impl Server {
         // cache has no quarantine section and remains source-compatible.
         let route_quarantine_report = match (
             routeability_authentication,
+            routeability_rollback_protection,
             route_quarantine_evidence.as_deref(),
         ) {
-            ("signature_invalid", Some(records)) => {
+            ("signature_invalid", _, Some(records)) => {
                 Some(peer_store.reject_route_quarantine_cache_evidence(
                     records.len(),
                     now,
                     "signature_invalid",
                 ))
             }
-            ("identity_unavailable", Some(records)) => {
+            ("identity_unavailable", _, Some(records)) => {
                 Some(peer_store.reject_route_quarantine_cache_evidence(
                     records.len(),
                     now,
                     "identity_unavailable",
                 ))
             }
-            (_, Some(records)) => {
+            (_, protection, Some(records))
+                if !matches!(protection, "anchored" | "cache_ahead" | "not_checked") =>
+            {
+                Some(peer_store.reject_route_quarantine_cache_evidence(
+                    records.len(),
+                    now,
+                    protection,
+                ))
+            }
+            (_, _, Some(records)) => {
                 Some(peer_store.restore_route_quarantine_cache_evidence(records, now))
             }
-            (_, None) => None,
+            (_, _, None) => None,
         };
         let route_restored = route_report.map(|value| value.restored).unwrap_or(0);
         let route_rejected = route_report.map(|value| value.rejected).unwrap_or(0);
@@ -13555,6 +13730,10 @@ impl Server {
         let route_authentication_rejected = matches!(
             routeability_authentication,
             "signature_invalid" | "identity_unavailable"
+        );
+        let route_rollback_rejected = !matches!(
+            routeability_rollback_protection,
+            "anchored" | "cache_ahead" | "not_checked" | "not_applicable"
         );
         // Routeability must be restored first: proof history is accepted only
         // when the current signed descriptors still form a complete distinct
@@ -13741,6 +13920,7 @@ impl Server {
                 || route_rejected > 0
                 || route_quarantine_rejected > 0
                 || route_authentication_rejected
+                || route_rollback_rejected
                 || route_domain_certificates_rejected > 0
                 || proof_rejected > 0
                 || proof_authentication_rejected
@@ -13757,13 +13937,14 @@ impl Server {
                 "success"
             },
             format!(
-                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} route_quarantine_restored={} route_quarantine_rejected={} route_domain_certificates_restored={} route_domain_certificates_unchanged={} route_domain_certificates_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} two_hop_proof_rollback_protection={} three_hop_proof_authentication={} three_hop_proof_restored={} three_hop_proof_rejected={} three_hop_proof_rollback_protection={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
+                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_rollback_protection={} routeability_restored={} routeability_rejected={} route_quarantine_restored={} route_quarantine_rejected={} route_domain_certificates_restored={} route_domain_certificates_unchanged={} route_domain_certificates_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} two_hop_proof_rollback_protection={} three_hop_proof_authentication={} three_hop_proof_restored={} three_hop_proof_rejected={} three_hop_proof_rollback_protection={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
                 report.total,
                 report.inserted,
                 report.unchanged,
                 report.stale,
                 report.rejected,
                 routeability_authentication,
+                routeability_rollback_protection,
                 route_restored,
                 route_rejected,
                 route_quarantine_restored,
@@ -13795,6 +13976,7 @@ impl Server {
             stale = report.stale,
             rejected = report.rejected,
             routeability_authentication,
+            routeability_rollback_protection,
             routeability_restored = route_restored,
             routeability_rejected = route_rejected,
             route_quarantine_restored,
@@ -15529,18 +15711,20 @@ mod tests {
         DiscoveryGossipFailure, DiscoveryGossipFailureKind, DiscoveryGossipPhase,
         DiscoveryGossipRoundAccumulator, DiscoveryPeerGossipReport, DiscoveryPeerIdentityHints,
         PeerHttpClients, PeerStoreCacheDocument, PeerStoreCachePersistOutcome,
-        PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryCacheEvidence,
-        RequiredApiListenerExit, RuntimeTaskRegistry, RuntimeTaskShutdownOutcome,
-        RuntimeTaskShutdownReport, Server, SystemdNotifier, TargetBoundPeerRelayFailure,
-        BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS,
-        BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES, COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS,
-        DATA_PLANE_RECV_FAILURE_LIMIT, DIRECTORY_OPERATOR_HTTP_PROFILE,
-        DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
-        DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, HTTP_TOO_EARLY_STATUS_CODE,
-        MEMCHAIN_SYNC_HTTP_PROFILE, ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION,
+        PeerStoreVerifiedClientDeliveryAnchor, PeerStoreVerifiedClientDeliveryAnchorState,
+        PeerStoreVerifiedClientDeliveryCacheEvidence, RequiredApiListenerExit, RuntimeTaskRegistry,
+        RuntimeTaskShutdownOutcome, RuntimeTaskShutdownReport, Server, SystemdNotifier,
+        TargetBoundPeerRelayFailure, BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
+        BLIND_RELAY_PROBE_MIN_COOLDOWN_SECS, BLIND_RELAY_STARTUP_WARMUP_MAX_CANDIDATES,
+        COORDINATOR_LEASE_PRODUCTION_SAFETY_SECS, DATA_PLANE_RECV_FAILURE_LIMIT,
+        DIRECTORY_OPERATOR_HTTP_PROFILE, DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS,
+        DIRECTORY_SYNC_HTTP_PROFILE, DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS,
+        HTTP_TOO_EARLY_STATUS_CODE, MEMCHAIN_SYNC_HTTP_PROFILE,
+        ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION,
         ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION,
         ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION, THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
         TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT,
+        VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT,
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
     };
@@ -22320,6 +22504,7 @@ mod tests {
         let anchor = PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(&anchor_bytes).unwrap();
         assert!(anchor.verify(&server.identity).is_ok());
         assert!(anchor.matches_document(&document));
+        assert!(anchor.matches_route_state_section(&document));
         assert!(anchor.matches_two_hop_path_proof_section(&document));
         assert!(anchor.matches_three_hop_path_proof_section(&document));
         let witness_digest = anchor.witness_digest().unwrap();
@@ -22333,6 +22518,7 @@ mod tests {
         let mut legacy_anchor = anchor.clone();
         legacy_anchor.contract_version =
             VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT.to_string();
+        legacy_anchor.route_state_digest = None;
         legacy_anchor.two_hop_path_proof_digest = None;
         legacy_anchor.three_hop_path_proof_digest = None;
         legacy_anchor.signature_ed25519 = hex::encode(
@@ -22345,8 +22531,36 @@ mod tests {
         )
         .unwrap();
         assert!(parsed_legacy.verify(&server.identity).is_ok());
+        assert!(!parsed_legacy.matches_route_state_section(&document));
         assert!(!parsed_legacy.matches_two_hop_path_proof_section(&document));
         assert!(!parsed_legacy.matches_three_hop_path_proof_section(&document));
+
+        // [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] v2 anchors keep
+        // their exact proof-signing contract during rolling upgrades, but they
+        // predate route-state commitment and therefore cannot authorize route
+        // or quarantine recovery.
+        let mut previous_anchor = anchor.clone();
+        previous_anchor.contract_version =
+            VERIFIED_CLIENT_DELIVERY_ANCHOR_PREVIOUS_CONTRACT.to_string();
+        previous_anchor.route_state_digest = None;
+        previous_anchor.signature_ed25519 = hex::encode(
+            server
+                .identity
+                .sign(&previous_anchor.signing_bytes().unwrap()),
+        );
+        let parsed_previous = PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(
+            &previous_anchor.to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        assert!(parsed_previous.verify(&server.identity).is_ok());
+        assert!(!parsed_previous.matches_route_state_section(&document));
+        assert!(parsed_previous.matches_two_hop_path_proof_section(&document));
+        assert!(parsed_previous.matches_three_hop_path_proof_section(&document));
+        assert_eq!(
+            PeerStoreVerifiedClientDeliveryAnchorState::Verified(parsed_previous)
+                .route_state_protection_for(&document),
+            "legacy_unanchored"
+        );
         let serialized_anchor = String::from_utf8(anchor_bytes).unwrap();
         for forbidden in [
             "route_id",
@@ -22431,17 +22645,17 @@ mod tests {
             .is_err());
 
         let restored = PeerStore::new();
-        assert!(Server::import_bootstrap_snapshot_bytes(
-            &restored,
-            "cache",
-            &path_str,
-            &bytes,
-            now + 6,
-            Some(&server.identity),
-        ));
+        server.load_peer_cache(&restored, &path_str, now + 6).await;
         assert!(restored.is_route_quarantined_now(&node_id, now + 6));
         assert!(!restored.is_routeable_now(&node_id, now + 6));
         let status = restored.status(now + 6);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_routeability_cache_rollback_protection
+                .as_deref(),
+            Some("anchored")
+        );
         assert!(status
             .bootstrap
             .last_cache_load_detail
@@ -22451,6 +22665,87 @@ mod tests {
         let _ = tokio::fs::remove_file(path).await;
         let _ =
             tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str)).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_rejects_older_signed_route_state_generation() {
+        // [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Keep the newest
+        // monotonic anchor while replaying an older, otherwise valid cache.
+        // Descriptors remain recoverable, but stale route health must not.
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_041_000;
+        let peer_identity = IdentityKeyPair::generate();
+        let descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            "https://rollback-peer.example".to_string(),
+            11,
+            now + 4_000,
+            &[],
+            &peer_identity,
+        );
+        let node_id = descriptor.node_id();
+        let original = Arc::new(PeerStore::new());
+        assert!(original.upsert_verified(descriptor.clone(), now).unwrap());
+        original.record_route_forward_success_for_descriptor(&descriptor, now + 1);
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aeronyx-peer-cache-route-state-rollback-{unique}.json"
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        Server::save_peer_store_cache_snapshot(&server.identity, &original, &path_str, now + 2)
+            .await
+            .unwrap();
+        let older_cache = tokio::fs::read(&path).await.unwrap();
+        let older_document = PeerStoreCacheDocument::from_json_bytes(&older_cache).unwrap();
+        assert_eq!(older_document.verified_client_delivery_generation, 1);
+        assert_eq!(older_document.routeability_evidence.len(), 1);
+
+        for observed_at in [now + 3, now + 4, now + 5] {
+            assert!(original.record_route_forward_failure_for_descriptor(
+                &descriptor,
+                observed_at,
+                "request_failed",
+            ));
+        }
+        assert!(original.is_route_quarantined_now(&node_id, now + 5));
+        Server::save_peer_store_cache_snapshot(&server.identity, &original, &path_str, now + 6)
+            .await
+            .unwrap();
+        let anchor_path = Server::peer_cache_client_delivery_anchor_path(&path_str);
+        let newest_anchor_bytes = tokio::fs::read(&anchor_path).await.unwrap();
+        let newest_anchor =
+            PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(&newest_anchor_bytes).unwrap();
+        assert_eq!(newest_anchor.cache_generation, 2);
+        assert!(newest_anchor.verify(&server.identity).is_ok());
+
+        tokio::fs::write(&path, &older_cache).await.unwrap();
+        let restored = PeerStore::new();
+        server.load_peer_cache(&restored, &path_str, now + 7).await;
+
+        assert!(restored.get_valid(&node_id, now + 7).is_some());
+        assert!(!restored.is_routeable_now(&node_id, now + 7));
+        assert!(!restored.is_route_quarantined_now(&node_id, now + 7));
+        let status = restored.status(now + 7);
+        assert_eq!(
+            status
+                .bootstrap
+                .last_routeability_cache_rollback_protection
+                .as_deref(),
+            Some("rollback_detected")
+        );
+        assert_eq!(
+            status.bootstrap.last_routeability_cache_status.as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(status.bootstrap.last_routeability_cache_restored, 0);
+        assert_eq!(status.bootstrap.last_routeability_cache_rejected, 1);
+
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(Server::peer_cache_backup_path(&path_str)).await;
+        let _ = tokio::fs::remove_file(anchor_path).await;
     }
 
     #[tokio::test]
@@ -23046,6 +23341,22 @@ mod tests {
             .await;
         let missing_anchor_status = missing_anchor_store.status(now + 8);
         assert_eq!(missing_anchor_status.snapshot.valid_peers, 3);
+        assert!(!missing_anchor_store.is_routeable_now(&middle.node_id(), now + 8));
+        assert!(!missing_anchor_store.is_routeable_now(&terminal.node_id(), now + 8));
+        assert_eq!(
+            missing_anchor_status
+                .bootstrap
+                .last_routeability_cache_rollback_protection
+                .as_deref(),
+            Some("anchor_missing")
+        );
+        assert_eq!(
+            missing_anchor_status
+                .bootstrap
+                .last_routeability_cache_status
+                .as_deref(),
+            Some("rejected")
+        );
         assert_eq!(
             missing_anchor_status
                 .runtime
@@ -23086,9 +23397,10 @@ mod tests {
             0
         );
 
-        // A present but unauthentic anchor is not equivalent to the valid
-        // crash window. Preserve independent peer and route recovery while
-        // failing the aggregate delivery evidence closed.
+        // [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] A present but
+        // unauthentic anchor is not equivalent to the valid crash window.
+        // Preserve signed peer descriptors, but fail route state, proofs, and
+        // aggregate delivery evidence closed until probes rebuild readiness.
         let mut invalid_anchor =
             PeerStoreVerifiedClientDeliveryAnchor::from_json_bytes(&anchor_bytes).unwrap();
         invalid_anchor.signature_ed25519 = "00".repeat(64);
@@ -23101,8 +23413,22 @@ mod tests {
             .await;
         let invalid_anchor_status = invalid_anchor_store.status(now + 9);
         assert_eq!(invalid_anchor_status.snapshot.valid_peers, 3);
-        assert!(invalid_anchor_store.is_routeable_now(&middle.node_id(), now + 9));
-        assert!(invalid_anchor_store.is_routeable_now(&terminal.node_id(), now + 9));
+        assert!(!invalid_anchor_store.is_routeable_now(&middle.node_id(), now + 9));
+        assert!(!invalid_anchor_store.is_routeable_now(&terminal.node_id(), now + 9));
+        assert_eq!(
+            invalid_anchor_status
+                .bootstrap
+                .last_routeability_cache_rollback_protection
+                .as_deref(),
+            Some("anchor_invalid")
+        );
+        assert_eq!(
+            invalid_anchor_status
+                .bootstrap
+                .last_routeability_cache_status
+                .as_deref(),
+            Some("rejected")
+        );
         assert_eq!(
             invalid_anchor_status
                 .runtime
@@ -23347,9 +23673,10 @@ mod tests {
             2
         );
 
-        // Replacing only the cache with an older, still-valid signed copy must
-        // not revive its aggregate delivery evidence. Other independently
-        // verified cache sections remain usable.
+        // [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Replacing only the
+        // cache with an older, still-valid signed copy must not revive route
+        // health or aggregate delivery evidence. Signed descriptors remain
+        // usable and fresh probes can rebuild route readiness.
         tokio::fs::write(&path, &older_signed_cache).await.unwrap();
         let restored_store = PeerStore::new();
         server
@@ -23357,8 +23684,19 @@ mod tests {
             .await;
         let status = restored_store.status(now + 6);
         assert_eq!(status.snapshot.valid_peers, 2);
-        assert!(restored_store.is_routeable_now(&middle.node_id(), now + 6));
-        assert!(restored_store.is_routeable_now(&terminal.node_id(), now + 6));
+        assert!(!restored_store.is_routeable_now(&middle.node_id(), now + 6));
+        assert!(!restored_store.is_routeable_now(&terminal.node_id(), now + 6));
+        assert_eq!(
+            status
+                .bootstrap
+                .last_routeability_cache_rollback_protection
+                .as_deref(),
+            Some("rollback_detected")
+        );
+        assert_eq!(
+            status.bootstrap.last_routeability_cache_status.as_deref(),
+            Some("rejected")
+        );
         assert_eq!(
             status.runtime.blind_relay.verified_client_onion_deliveries,
             0

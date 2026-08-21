@@ -174,6 +174,9 @@
 //! - [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Persists only active,
 //!   signed-route-bound quarantine windows in the host-local signed peer cache
 //!   so a process restart cannot revive a currently isolated route
+//! - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Reports only fixed
+//!   aggregate recovery-anchor decisions for routeability/quarantine and uses
+//!   the same closed vocabulary for local cache-rejection audit evidence
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -203,8 +206,12 @@
 //! - Path-proof readiness must use only events at or before the current node
 //!   time. Future-dated retained evidence is an aggregate clock-health signal,
 //!   never fresh relay proof.
+//! - Recovery-anchor v3 authorizes route-state restore. Older anchors remain
+//!   parseable, but must never authorize routeability or quarantine recovery.
 //!
 //! ## Last Modified
+//! v0.85.0-RouteStateRollbackAnchor - Bound routeability and quarantine to the
+//! monotonic signed v3 recovery anchor with privacy-safe operator status
 //! v0.84.0-RouteQuarantineRecovery - Added signed, expiry-bounded restart
 //! recovery for active route quarantine without retaining failure details
 //! v0.83.0-PeerHealthReasonBoundary - Replaced open-text route-health and
@@ -927,6 +934,12 @@ pub struct PeerStoreBootstrapStatus {
     /// Timestamp of the last routeability cache restore attempt.
     #[serde(default)]
     pub last_routeability_cache_at: Option<u64>,
+    /// Local recovery-anchor result for routeability plus active quarantine.
+    ///
+    /// Stable buckets match the other signed recovery sections. No digest,
+    /// peer identity, endpoint, route, or failure detail is exported.
+    #[serde(default)]
+    pub last_routeability_cache_rollback_protection: Option<String>,
     /// Signed two-hop proof cache restore status: restored, partial, empty, or rejected.
     #[serde(default)]
     pub last_two_hop_proof_cache_status: Option<String>,
@@ -1192,6 +1205,7 @@ impl Default for PeerStoreBootstrapStatus {
             last_routeability_cache_restored: 0,
             last_routeability_cache_rejected: 0,
             last_routeability_cache_at: None,
+            last_routeability_cache_rollback_protection: None,
             last_two_hop_proof_cache_status: None,
             last_two_hop_proof_cache_authentication: None,
             last_two_hop_proof_cache_restored: 0,
@@ -3422,6 +3436,44 @@ impl PeerStore {
         );
     }
 
+    /// Records the local recovery-anchor decision for the signed route-state
+    /// section without retaining or exporting its digest.
+    ///
+    /// [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] This additive status
+    /// mirrors existing proof/delivery protection buckets for node operators.
+    pub fn record_routeability_cache_rollback_protection(
+        &self,
+        now: u64,
+        generation: u64,
+        protection: &str,
+    ) {
+        let protection = Self::recovery_anchor_protection_bucket(protection);
+        self.bootstrap_status
+            .write()
+            .last_routeability_cache_rollback_protection = Some(protection.to_string());
+        let outcome = match protection {
+            "anchored" => "accepted",
+            "cache_ahead" | "legacy_unanchored" | "not_checked" => "warning",
+            _ => "rejected",
+        };
+        self.record_audit_event(
+            now,
+            "routeability_cache_rollback_protection",
+            outcome,
+            format!("generation={generation} protection={protection}"),
+        );
+    }
+
+    fn recovery_anchor_protection_bucket(protection: &str) -> &str {
+        match protection {
+            "anchored" | "cache_ahead" | "legacy_unanchored" | "anchor_missing"
+            | "anchor_invalid" | "anchor_conflict" | "rollback_detected" | "not_checked" => {
+                protection
+            }
+            _ => "unknown",
+        }
+    }
+
     fn record_path_proof_cache_rollback_protection(
         &self,
         kind: PathProofCacheKind,
@@ -3429,13 +3481,7 @@ impl PeerStore {
         generation: u64,
         protection: &str,
     ) {
-        let protection = match protection {
-            "anchored" | "cache_ahead" | "legacy_unanchored" | "anchor_missing"
-            | "anchor_invalid" | "anchor_conflict" | "rollback_detected" | "not_checked" => {
-                protection
-            }
-            _ => "unknown",
-        };
+        let protection = Self::recovery_anchor_protection_bucket(protection);
         {
             let mut status = self.bootstrap_status.write();
             match kind {
@@ -3496,13 +3542,7 @@ impl PeerStore {
         generation: u64,
         protection: &str,
     ) {
-        let protection = match protection {
-            "anchored" | "cache_ahead" | "legacy_unanchored" | "anchor_missing"
-            | "anchor_invalid" | "anchor_conflict" | "rollback_detected" | "not_checked" => {
-                protection
-            }
-            _ => "unknown",
-        };
+        let protection = Self::recovery_anchor_protection_bucket(protection);
         {
             let mut status = self.bootstrap_status.write();
             status.last_client_delivery_cache_generation = generation;
@@ -7233,10 +7273,7 @@ impl PeerStore {
         now: u64,
         reason: &str,
     ) -> PeerStoreRouteQuarantineCacheRestoreReport {
-        let reason_bucket = match reason {
-            "identity_unavailable" => "identity_unavailable",
-            _ => "signature_invalid",
-        };
+        let reason_bucket = Self::route_cache_rejection_reason_bucket(reason);
         self.record_audit_event(
             now,
             "route_quarantine_cache_restore",
@@ -7393,10 +7430,7 @@ impl PeerStore {
         now: u64,
         reason: &str,
     ) -> PeerStoreRouteabilityCacheRestoreReport {
-        let reason_bucket = match reason {
-            "identity_unavailable" => "identity_unavailable",
-            _ => "signature_invalid",
-        };
+        let reason_bucket = Self::route_cache_rejection_reason_bucket(reason);
         {
             let mut status = self.bootstrap_status.write();
             status.last_routeability_cache_status = Some("rejected".to_string());
@@ -7419,6 +7453,25 @@ impl PeerStore {
             total,
             restored: 0,
             rejected: total,
+        }
+    }
+
+    /// Admits only fixed cache authentication/rollback reasons into local
+    /// audit telemetry.
+    ///
+    /// [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Anchor decisions are
+    /// coarse policy buckets. Never attach cache paths, digests, signatures,
+    /// peer identities, routes, endpoints, or parser errors to these values.
+    fn route_cache_rejection_reason_bucket(reason: &str) -> &str {
+        match reason {
+            "identity_unavailable"
+            | "signature_invalid"
+            | "legacy_unanchored"
+            | "anchor_missing"
+            | "anchor_invalid"
+            | "anchor_conflict"
+            | "rollback_detected" => reason,
+            _ => "unknown",
         }
     }
 
