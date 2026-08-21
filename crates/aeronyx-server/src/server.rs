@@ -396,6 +396,9 @@
 // 147. [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Converts direct and
 //      authenticated-onion relay diagnostics into validated aggregate reason
 //      values before heartbeat state can observe them.
+// 148. [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Signs active,
+//      descriptor-bound route quarantine into peer-cache v2 and restores it
+//      before route admission so restart cannot revive a recently failed peer.
 //
 // ⚠️ Important Notes for Next Developer:
 //   - traffic_tracker is Arc-shared between packet_handler (writes) and
@@ -578,8 +581,14 @@
 //     diagnostics and logs may use reviewed stable buckets, but heartbeat must
 //     receive the validated reason type. Never pass through a raw reqwest
 //     error, endpoint, response body, request id, message id, or payload text.
+//   - [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Cache v2 binds positive
+//     routeability and active quarantine under one node signature. Keep v1
+//     readable for rolling upgrades, but never infer missing quarantine state
+//     from a v1 cache or persist failure reasons, endpoints, routes, or payloads.
 //
 // Last Modified:
+//   [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Added signed active-route
+//     quarantine recovery and prompt persistence for security-state changes.
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added a typed,
 //     allowlisted export boundary for direct and authenticated-onion failures.
 //   [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] Added one privacy-safe,
@@ -988,11 +997,13 @@ use crate::services::memchain::{
     LlmRouter, RecordCommitmentCertificateBackfillDisposition, TaskWorker,
 };
 use crate::services::peer_store::{
-    PeerStoreDirectoryProofGossipRound, PeerStoreRouteabilityCacheEvidence, PeerStoreStatus,
-    PeerStoreTwoHopPathProofEvent, PeerStoreVerifiedClientDeliveryCacheEvidence,
-    PeerStoreVerifiedDeliveryWitnessRound, AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT,
-    AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
-    ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES, ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION,
+    PeerStoreDirectoryProofGossipRound, PeerStoreRouteQuarantineCacheEvidence,
+    PeerStoreRouteabilityCacheEvidence, PeerStoreStatus, PeerStoreTwoHopPathProofEvent,
+    PeerStoreVerifiedClientDeliveryCacheEvidence, PeerStoreVerifiedDeliveryWitnessRound,
+    AUTHENTICATED_CHAT_MIDDLE_CANDIDATE_LIMIT, AUTHENTICATED_CHAT_TERMINAL_FANOUT_LIMIT,
+    ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION,
+    ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, ROUTE_DOMAIN_CERTIFICATE_CACHE_MAX_ENTRIES,
+    ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION, ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION,
     THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
     VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
 };
@@ -1643,6 +1654,10 @@ struct PeerStoreCacheDocument {
     #[serde(default)]
     routeability_evidence: Vec<PeerStoreRouteabilityCacheEvidence>,
     #[serde(default)]
+    route_quarantine_schema_version: u16,
+    #[serde(default)]
+    route_quarantine_evidence: Vec<PeerStoreRouteQuarantineCacheEvidence>,
+    #[serde(default)]
     routeability_evidence_signer_node_id: Option<String>,
     #[serde(default)]
     routeability_evidence_signature_ed25519: Option<String>,
@@ -1712,6 +1727,7 @@ impl PeerStoreCacheDocument {
     fn new(
         descriptor_snapshot: NodeBootstrapSnapshot,
         routeability_evidence: Vec<PeerStoreRouteabilityCacheEvidence>,
+        route_quarantine_evidence: Vec<PeerStoreRouteQuarantineCacheEvidence>,
         two_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
         three_hop_path_proof_events: Vec<PeerStoreTwoHopPathProofEvent>,
         route_domain_certificates: Vec<RouteDomainAttestationCertificateV1>,
@@ -1723,6 +1739,8 @@ impl PeerStoreCacheDocument {
             descriptor_snapshot,
             routeability_evidence_schema_version: ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
             routeability_evidence,
+            route_quarantine_schema_version: ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION,
+            route_quarantine_evidence,
             routeability_evidence_signer_node_id: None,
             routeability_evidence_signature_ed25519: None,
             two_hop_path_proof_schema_version: TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
@@ -1789,12 +1807,31 @@ impl PeerStoreCacheDocument {
             .map_err(|error| format!("peer cache descriptor snapshot: {error}"))?;
         let evidence_version_valid = (document.routeability_evidence.is_empty()
             && document.routeability_evidence_schema_version == 0)
-            || document.routeability_evidence_schema_version
-                == ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION;
+            || matches!(
+                document.routeability_evidence_schema_version,
+                ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION
+                    | ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION
+            );
         if !evidence_version_valid {
             return Err(format!(
                 "unsupported routeability evidence schema version: {}",
                 document.routeability_evidence_schema_version
+            ));
+        }
+        let quarantine_version_valid = match document.routeability_evidence_schema_version {
+            ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION => {
+                document.route_quarantine_schema_version
+                    == ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION
+            }
+            _ => {
+                document.route_quarantine_schema_version == 0
+                    && document.route_quarantine_evidence.is_empty()
+            }
+        };
+        if !quarantine_version_valid {
+            return Err(format!(
+                "unsupported route quarantine cache schema version: {}",
+                document.route_quarantine_schema_version
             ));
         }
         // [ROUTE-DOMAIN-CERTIFICATE-RECOVERY 2026-08-03 by Codex] Keep the
@@ -1886,12 +1923,24 @@ impl PeerStoreCacheDocument {
     }
 
     fn routeability_evidence_signing_bytes(&self) -> std::result::Result<Vec<u8>, String> {
-        bincode::serialize(&(
-            "aeronyx-peer-cache-routeability-v1",
-            self.descriptor_snapshot.generated_at,
-            self.routeability_evidence_schema_version,
-            &self.routeability_evidence,
-        ))
+        let encoded = match self.routeability_evidence_schema_version {
+            ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION => bincode::serialize(&(
+                "aeronyx-peer-cache-routeability-v1",
+                self.descriptor_snapshot.generated_at,
+                self.routeability_evidence_schema_version,
+                &self.routeability_evidence,
+            )),
+            ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION => bincode::serialize(&(
+                "aeronyx-peer-cache-routeability-v2",
+                self.descriptor_snapshot.generated_at,
+                self.routeability_evidence_schema_version,
+                &self.routeability_evidence,
+                self.route_quarantine_schema_version,
+                &self.route_quarantine_evidence,
+            )),
+            version => return Err(format!("unsupported routeability evidence schema: {version}")),
+        };
+        encoded
         .map_err(|error| format!("routeability evidence signing bytes: {error}"))
     }
 
@@ -7924,7 +7973,7 @@ impl Server {
                     "skipped",
                     format!("external_delivery_witness={status}"),
                 );
-                peer_store.mark_client_delivery_cache_dirty();
+                peer_store.mark_peer_cache_dirty();
                 return Ok(PeerStoreCachePersistOutcome::Deferred);
             }
         } else {
@@ -7944,7 +7993,7 @@ impl Server {
             // task claims the dirty bit immediately before exporting. A failed
             // atomic write did not acknowledge that evidence, so retain it for
             // a later bounded retry instead of waiting for another receipt.
-            peer_store.mark_client_delivery_cache_dirty();
+            peer_store.mark_peer_cache_dirty();
             return Err(error);
         }
         if witnesses_configured {
@@ -7958,7 +8007,7 @@ impl Server {
             )
             .await;
             if decision != PeerStoreVerifiedClientDeliveryExternalWitnessDecision::Protected {
-                peer_store.mark_client_delivery_cache_dirty();
+                peer_store.mark_peer_cache_dirty();
                 return Ok(PeerStoreCachePersistOutcome::Deferred);
             }
         }
@@ -8391,7 +8440,7 @@ impl Server {
                     // outranks a simultaneously-ready retry or periodic tick.
                     biased;
                     _ = rx.recv() => {
-                        peer_store.take_client_delivery_cache_dirty();
+                        peer_store.take_peer_cache_dirty();
                         let _ = persist_snapshot(
                             Arc::clone(&identity),
                             Arc::clone(&peer_store),
@@ -8405,7 +8454,7 @@ impl Server {
                     }
                     _ = timer.tick() => {
                         if shutdown.load(Ordering::SeqCst) {
-                            peer_store.take_client_delivery_cache_dirty();
+                            peer_store.take_peer_cache_dirty();
                             persist_snapshot(
                                 Arc::clone(&identity),
                                 Arc::clone(&peer_store),
@@ -8422,7 +8471,7 @@ impl Server {
                         {
                             continue;
                         }
-                        peer_store.take_client_delivery_cache_dirty();
+                        peer_store.take_peer_cache_dirty();
                         let stable = persist_snapshot(
                             Arc::clone(&identity),
                             Arc::clone(&peer_store),
@@ -8438,18 +8487,18 @@ impl Server {
                             &mut retry_not_before,
                         );
                     }
-                    _ = peer_store.wait_for_client_delivery_cache_dirty(), if retry_not_before.is_none() => {
+                    _ = peer_store.wait_for_peer_cache_dirty(), if retry_not_before.is_none() => {
                         tokio::time::sleep(Duration::from_millis(
                             CLIENT_DELIVERY_CACHE_FLUSH_DEBOUNCE_MILLIS,
                         )).await;
-                        if peer_store.take_client_delivery_cache_dirty() {
+                        if peer_store.take_peer_cache_dirty() {
                             let stable = persist_snapshot(
                                 Arc::clone(&identity),
                                 Arc::clone(&peer_store),
                                 Arc::clone(&discovery),
                                 Arc::clone(&control_http_client),
                                 path.clone(),
-                                "client_delivery",
+                                "peer_evidence",
                             ).await;
                             update_retry(
                                 stable,
@@ -8462,7 +8511,7 @@ impl Server {
                         retry_not_before.unwrap_or_else(tokio::time::Instant::now)
                     ), if retry_not_before.is_some() => {
                         retry_not_before = None;
-                        if peer_store.take_client_delivery_cache_dirty() {
+                        if peer_store.take_peer_cache_dirty() {
                             let stable = persist_snapshot(
                                 Arc::clone(&identity),
                                 Arc::clone(&peer_store),
@@ -12807,6 +12856,7 @@ impl Server {
 
         let descriptor_snapshot = peer_store.export_peer_cache_snapshot(now);
         let routeability_evidence = peer_store.export_routeability_cache_evidence(now);
+        let route_quarantine_evidence = peer_store.export_route_quarantine_cache_evidence(now);
         let two_hop_path_proof_events = peer_store.export_two_hop_path_proof_cache_events(now);
         let two_hop_path_proof_event_count = two_hop_path_proof_events.len();
         let two_hop_path_proof_stability_ready = peer_store
@@ -12835,6 +12885,7 @@ impl Server {
         let document = PeerStoreCacheDocument::new(
             descriptor_snapshot,
             routeability_evidence,
+            route_quarantine_evidence,
             two_hop_path_proof_events,
             three_hop_path_proof_events,
             route_domain_certificates,
@@ -13325,9 +13376,13 @@ impl Server {
                 let route_domain_certificates = (document.route_domain_certificate_schema_version
                     != 0)
                     .then_some(document.route_domain_certificates);
+                let route_quarantine_evidence = (document.routeability_evidence_schema_version
+                    == ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION)
+                    .then_some(document.route_quarantine_evidence);
                 (
                     document.descriptor_snapshot,
                     Some(document.routeability_evidence),
+                    route_quarantine_evidence,
                     routeability_authentication,
                     route_domain_certificates,
                     Some(document.two_hop_path_proof_events),
@@ -13348,6 +13403,7 @@ impl Server {
                     (
                         snapshot,
                         None,
+                        None,
                         "not_applicable",
                         None,
                         None,
@@ -13367,6 +13423,7 @@ impl Server {
         let (
             snapshot,
             routeability_evidence,
+            route_quarantine_evidence,
             routeability_authentication,
             route_domain_certificates,
             two_hop_proof_events,
@@ -13460,8 +13517,41 @@ impl Server {
             }
             (_, None) => None,
         };
+        // [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Cache v2 signs
+        // positive routeability and active quarantine as one policy snapshot.
+        // Authentication failure rejects both sections; an older signed v1
+        // cache has no quarantine section and remains source-compatible.
+        let route_quarantine_report = match (
+            routeability_authentication,
+            route_quarantine_evidence.as_deref(),
+        ) {
+            ("signature_invalid", Some(records)) => {
+                Some(peer_store.reject_route_quarantine_cache_evidence(
+                    records.len(),
+                    now,
+                    "signature_invalid",
+                ))
+            }
+            ("identity_unavailable", Some(records)) => {
+                Some(peer_store.reject_route_quarantine_cache_evidence(
+                    records.len(),
+                    now,
+                    "identity_unavailable",
+                ))
+            }
+            (_, Some(records)) => {
+                Some(peer_store.restore_route_quarantine_cache_evidence(records, now))
+            }
+            (_, None) => None,
+        };
         let route_restored = route_report.map(|value| value.restored).unwrap_or(0);
         let route_rejected = route_report.map(|value| value.rejected).unwrap_or(0);
+        let route_quarantine_restored = route_quarantine_report
+            .map(|value| value.restored)
+            .unwrap_or(0);
+        let route_quarantine_rejected = route_quarantine_report
+            .map(|value| value.rejected)
+            .unwrap_or(0);
         let route_authentication_rejected = matches!(
             routeability_authentication,
             "signature_invalid" | "identity_unavailable"
@@ -13649,6 +13739,7 @@ impl Server {
             source_kind,
             if report.rejected > 0
                 || route_rejected > 0
+                || route_quarantine_rejected > 0
                 || route_authentication_rejected
                 || route_domain_certificates_rejected > 0
                 || proof_rejected > 0
@@ -13666,7 +13757,7 @@ impl Server {
                 "success"
             },
             format!(
-                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} route_domain_certificates_restored={} route_domain_certificates_unchanged={} route_domain_certificates_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} two_hop_proof_rollback_protection={} three_hop_proof_authentication={} three_hop_proof_restored={} three_hop_proof_rejected={} three_hop_proof_rollback_protection={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
+                "total={} inserted={} unchanged={} stale={} rejected={} routeability_authentication={} routeability_restored={} routeability_rejected={} route_quarantine_restored={} route_quarantine_rejected={} route_domain_certificates_restored={} route_domain_certificates_unchanged={} route_domain_certificates_rejected={} two_hop_proof_authentication={} two_hop_proof_restored={} two_hop_proof_rejected={} two_hop_proof_rollback_protection={} three_hop_proof_authentication={} three_hop_proof_restored={} three_hop_proof_rejected={} three_hop_proof_rollback_protection={} client_delivery_authentication={} client_delivery_generation={} client_delivery_rollback_protection={} client_delivery_restored={} client_delivery_rejected={}",
                 report.total,
                 report.inserted,
                 report.unchanged,
@@ -13675,6 +13766,8 @@ impl Server {
                 routeability_authentication,
                 route_restored,
                 route_rejected,
+                route_quarantine_restored,
+                route_quarantine_rejected,
                 route_domain_certificates_restored,
                 route_domain_certificates_unchanged,
                 route_domain_certificates_rejected,
@@ -13704,6 +13797,8 @@ impl Server {
             routeability_authentication,
             routeability_restored = route_restored,
             routeability_rejected = route_rejected,
+            route_quarantine_restored,
+            route_quarantine_rejected,
             route_domain_certificates_restored,
             route_domain_certificates_unchanged,
             route_domain_certificates_rejected,
@@ -15442,8 +15537,9 @@ mod tests {
         DATA_PLANE_RECV_FAILURE_LIMIT, DIRECTORY_OPERATOR_HTTP_PROFILE,
         DIRECTORY_SYNC_CONNECT_TIMEOUT_SECS, DIRECTORY_SYNC_HTTP_PROFILE,
         DIRECTORY_SYNC_HTTP_REQUEST_TIMEOUT_SECS, HTTP_TOO_EARLY_STATUS_CODE,
-        MEMCHAIN_SYNC_HTTP_PROFILE, ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION,
-        ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION, THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
+        MEMCHAIN_SYNC_HTTP_PROFILE, ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION,
+        ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION, ROUTE_DOMAIN_CERTIFICATE_CACHE_SCHEMA_VERSION,
+        ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION, THREE_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION,
         TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION, VERIFIED_CLIENT_DELIVERY_ANCHOR_LEGACY_CONTRACT,
         VERIFIED_CLIENT_DELIVERY_CACHE_LEGACY_SCHEMA_VERSION,
         VERIFIED_CLIENT_DELIVERY_CACHE_SCHEMA_VERSION,
@@ -22160,6 +22256,11 @@ mod tests {
         );
         assert!(document.routeability_evidence.is_empty());
         assert_eq!(
+            document.route_quarantine_schema_version,
+            ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION
+        );
+        assert!(document.route_quarantine_evidence.is_empty());
+        assert_eq!(
             document.two_hop_path_proof_schema_version,
             TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION
         );
@@ -22191,6 +22292,27 @@ mod tests {
             .is_ok());
         assert!(document
             .verify_verified_client_delivery_signature(&server.identity)
+            .is_ok());
+
+        // [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] A rolling-upgrade
+        // node must continue validating the exact v1 signing domain. v1 has no
+        // quarantine section and therefore cannot claim restored quarantine.
+        let mut legacy_document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
+        legacy_document.routeability_evidence_schema_version =
+            ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION;
+        legacy_document.route_quarantine_schema_version = 0;
+        legacy_document.route_quarantine_evidence.clear();
+        legacy_document.routeability_evidence_signature_ed25519 = Some(hex::encode(
+            server.identity.sign(
+                &legacy_document
+                    .routeability_evidence_signing_bytes()
+                    .unwrap(),
+            ),
+        ));
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy_document).unwrap();
+        let parsed_legacy = PeerStoreCacheDocument::from_json_bytes(&legacy_bytes).unwrap();
+        assert!(parsed_legacy
+            .verify_routeability_evidence_signature(&server.identity)
             .is_ok());
 
         let anchor_path = Server::peer_cache_client_delivery_anchor_path(&path_str);
@@ -22241,6 +22363,94 @@ mod tests {
 
         let _ = tokio::fs::remove_file(path).await;
         let _ = tokio::fs::remove_file(anchor_path).await;
+    }
+
+    #[tokio::test]
+    async fn peer_store_cache_keeps_active_route_quarantine_across_restart() {
+        // [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Exercise the real
+        // signed cache document and startup importer. A peer that was healthy
+        // before three consecutive failures must remain excluded after restart.
+        let server = Server::new(ServerConfig::default(), IdentityKeyPair::generate(), None);
+        let now: u64 = 1_800_040_000;
+        let peer_identity = IdentityKeyPair::generate();
+        let descriptor = signed_chat_relay_peer_descriptor_for_identity(
+            "https://quarantined-peer.example".to_string(),
+            7,
+            now + 4_000,
+            &[],
+            &peer_identity,
+        );
+        let node_id = descriptor.node_id();
+        let original = Arc::new(PeerStore::new());
+        assert!(original.upsert_verified(descriptor.clone(), now).unwrap());
+        original.record_route_forward_success_for_descriptor(&descriptor, now + 1);
+        for observed_at in [now + 2, now + 3, now + 4] {
+            assert!(original.record_route_forward_failure_for_descriptor(
+                &descriptor,
+                observed_at,
+                "request_failed",
+            ));
+        }
+        assert!(original.is_route_quarantined_now(&node_id, now + 4));
+        assert!(!original.is_routeable_now(&node_id, now + 4));
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("aeronyx-peer-cache-route-quarantine-{unique}.json"));
+        let path_str = path.to_string_lossy().to_string();
+        Server::save_peer_store_cache_snapshot(&server.identity, &original, &path_str, now + 5)
+            .await
+            .unwrap();
+
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let document = PeerStoreCacheDocument::from_json_bytes(&bytes).unwrap();
+        assert_eq!(document.routeability_evidence_schema_version, 2);
+        assert!(document.routeability_evidence.is_empty());
+        assert_eq!(document.route_quarantine_evidence.len(), 1);
+        assert!(document
+            .verify_routeability_evidence_signature(&server.identity)
+            .is_ok());
+        let quarantine_json = serde_json::to_string(&document.route_quarantine_evidence).unwrap();
+        for forbidden in [
+            "quarantined-peer.example",
+            "request_failed",
+            "last_failure_reason",
+            "payload",
+            "route_id",
+        ] {
+            assert!(!quarantine_json.contains(forbidden));
+        }
+
+        let mut tampered = document;
+        tampered.route_quarantine_evidence.clear();
+        assert!(tampered
+            .verify_routeability_evidence_signature(&server.identity)
+            .is_err());
+
+        let restored = PeerStore::new();
+        assert!(Server::import_bootstrap_snapshot_bytes(
+            &restored,
+            "cache",
+            &path_str,
+            &bytes,
+            now + 6,
+            Some(&server.identity),
+        ));
+        assert!(restored.is_route_quarantined_now(&node_id, now + 6));
+        assert!(!restored.is_routeable_now(&node_id, now + 6));
+        let status = restored.status(now + 6);
+        assert!(status
+            .bootstrap
+            .last_cache_load_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("route_quarantine_restored=1")));
+
+        let _ = tokio::fs::remove_file(path).await;
+        let _ =
+            tokio::fs::remove_file(Server::peer_cache_client_delivery_anchor_path(&path_str)).await;
     }
 
     #[tokio::test]

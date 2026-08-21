@@ -171,6 +171,9 @@
 //! - [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Admits route failures,
 //!   blind-relay rejections, and quarantine events through closed reason
 //!   vocabularies before they can affect reputation or public diagnostics
+//! - [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Persists only active,
+//!   signed-route-bound quarantine windows in the host-local signed peer cache
+//!   so a process restart cannot revive a currently isolated route
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/discovery.rs: descriptor and capability types
@@ -202,6 +205,8 @@
 //!   never fresh relay proof.
 //!
 //! ## Last Modified
+//! v0.84.0-RouteQuarantineRecovery - Added signed, expiry-bounded restart
+//! recovery for active route quarantine without retaining failure details
 //! v0.83.0-PeerHealthReasonBoundary - Replaced open-text route-health and
 //! relay-protection diagnostics with compatibility-preserving reason admission
 //! v0.82.0-CustodyWitnessAdmission - Isolated custody requester pins from
@@ -334,7 +339,14 @@ const PEER_ROUTE_LAST_SEEN_STALE_SECS: u64 = 1_800;
 const PEER_ROUTE_RECENT_FAILURE_SECS: u64 = 600;
 const PEER_ROUTEABILITY_STALE_AFTER_SECS: u64 = 1_800;
 /// Local peer-cache routeability evidence schema understood by this node.
-pub const ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION: u16 = 1;
+///
+/// Version 2 signs active route-quarantine evidence together with successful
+/// routeability evidence. Readers continue accepting signed version 1 caches.
+pub const ROUTEABILITY_CACHE_EVIDENCE_SCHEMA_VERSION: u16 = 2;
+/// Previous routeability-only cache schema accepted during rolling upgrades.
+pub const ROUTEABILITY_CACHE_EVIDENCE_LEGACY_SCHEMA_VERSION: u16 = 1;
+/// Active route-quarantine section schema coupled to routeability cache v2.
+pub const ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION: u16 = 1;
 /// Local peer-cache two-hop proof history schema understood by this node.
 pub const TWO_HOP_PATH_PROOF_CACHE_SCHEMA_VERSION: u16 = 1;
 /// Local peer-cache three-hop proof history schema understood by this node.
@@ -2038,6 +2050,37 @@ pub struct PeerStoreRouteabilityCacheRestoreReport {
     pub rejected: usize,
 }
 
+/// Minimal active route quarantine retained in the signed host-local cache.
+///
+/// [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] The record intentionally
+/// excludes failure reasons, counters, endpoint values, routes, payloads, and
+/// user metadata. Its only authority is to preserve an already active local
+/// isolation window across a short process restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRouteQuarantineCacheEvidence {
+    /// Full node id encoded as lowercase hex for local descriptor binding.
+    pub node_id_hex: String,
+    /// Descriptor sequence current when the quarantine evidence was exported.
+    pub descriptor_sequence: u64,
+    /// SHA-256 of the stable signed route surface currently under isolation.
+    pub route_surface_fingerprint_sha256: String,
+    /// Unix timestamp when this local quarantine window began.
+    pub quarantined_at: u64,
+    /// Unix timestamp when this local quarantine window expires.
+    pub quarantine_until: u64,
+}
+
+/// Aggregate result of restoring active route-quarantine cache evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStoreRouteQuarantineCacheRestoreReport {
+    /// Number of records supplied, including bounded overflow.
+    pub total: usize,
+    /// Number of fresh records restored into local route health.
+    pub restored: usize,
+    /// Number rejected by bounds, time, descriptor, or route-surface checks.
+    pub rejected: usize,
+}
+
 /// Aggregate result of restoring signed, privacy-safe two-hop proof history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerStoreTwoHopProofCacheRestoreReport {
@@ -2778,8 +2821,8 @@ pub struct PeerStore {
     two_hop_path_proof_events: RwLock<VecDeque<PeerStoreTwoHopPathProofEvent>>,
     three_hop_path_proof_events: RwLock<VecDeque<PeerStoreTwoHopPathProofEvent>>,
     bootstrap_status: RwLock<PeerStoreBootstrapStatus>,
-    client_delivery_cache_dirty: AtomicBool,
-    client_delivery_cache_notify: Notify,
+    peer_cache_dirty: AtomicBool,
+    peer_cache_notify: Notify,
 }
 
 impl PeerStore {
@@ -2807,8 +2850,8 @@ impl PeerStore {
                 MAX_TWO_HOP_PATH_PROOF_EVENTS,
             )),
             bootstrap_status: RwLock::new(PeerStoreBootstrapStatus::default()),
-            client_delivery_cache_dirty: AtomicBool::new(false),
-            client_delivery_cache_notify: Notify::new(),
+            peer_cache_dirty: AtomicBool::new(false),
+            peer_cache_notify: Notify::new(),
         }
     }
 
@@ -3577,7 +3620,7 @@ impl PeerStore {
             status.last_client_delivery_cache_restored = 0;
             status.last_client_delivery_cache_at = Some(now);
         }
-        self.mark_client_delivery_cache_dirty();
+        self.mark_peer_cache_dirty();
         self.record_audit_event(
             now,
             "client_delivery_cache_external_witness_gate",
@@ -4846,9 +4889,7 @@ impl PeerStore {
         self.counters
             .last_verified_client_onion_delivery_at
             .store(now, Ordering::Relaxed);
-        self.client_delivery_cache_dirty
-            .store(true, Ordering::Release);
-        self.client_delivery_cache_notify.notify_one();
+        self.mark_peer_cache_dirty();
     }
 
     /// Runs one evidence transition while a complete signed route is current.
@@ -4928,7 +4969,7 @@ impl PeerStore {
         now: u64,
         publish: impl FnOnce() -> R,
     ) -> Result<(Vec<[u8; 32]>, R), &'static str> {
-        self.with_current_verified_route_path(route, now, |expected_surfaces| {
+        let result = self.with_current_verified_route_path(route, now, |expected_surfaces| {
             let mut route_health = self.route_health.write();
             for (node_id, fingerprint) in expected_surfaces {
                 let health = route_health.entry(*node_id).or_default();
@@ -4953,7 +4994,15 @@ impl PeerStore {
             // Publish last: readers may observe an older conservative state,
             // never a success marker without its supporting route evidence.
             publish()
-        })
+        });
+        if result.is_ok() {
+            // [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] A verified path
+            // both creates positive routeability evidence and can clear a
+            // restored quarantine. Persist that transition promptly instead
+            // of waiting for the periodic cache interval.
+            self.mark_peer_cache_dirty();
+        }
+        result
     }
 
     /// Records a legacy two-hop control-plane ACK without upgrading it to
@@ -5014,6 +5063,10 @@ impl PeerStore {
                 return false;
             }
         };
+        // [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] The compatibility
+        // control probe can clear only the directly observed middle. Its
+        // route-health transition still needs the generic peer-cache flush.
+        self.mark_peer_cache_dirty();
         self.record_audit_event(
             now,
             "blind_relay_route_health",
@@ -5218,31 +5271,44 @@ impl PeerStore {
         );
     }
 
-    /// Waits until verified client-delivery evidence needs a durable cache
-    /// refresh. Tokio `Notify` coalesces bursts into bounded wakeups.
-    pub async fn wait_for_client_delivery_cache_dirty(&self) {
-        self.client_delivery_cache_notify.notified().await;
+    /// Waits until security-relevant peer evidence needs a durable refresh.
+    /// Tokio `Notify` coalesces route and delivery bursts into bounded wakeups.
+    pub async fn wait_for_peer_cache_dirty(&self) {
+        self.peer_cache_notify.notified().await;
     }
 
-    /// Atomically claims the pending aggregate delivery evidence update.
+    /// Atomically claims the pending peer-cache evidence update.
     ///
     /// The persistence task calls this immediately before exporting a cache
-    /// snapshot. A new receipt arriving during the write sets the flag again
-    /// and schedules a follow-up flush, so abrupt cancellation cannot silently
-    /// clear evidence that was not part of the snapshot.
-    pub fn take_client_delivery_cache_dirty(&self) -> bool {
-        self.client_delivery_cache_dirty
-            .swap(false, Ordering::AcqRel)
+    /// snapshot. A new evidence transition during the write sets the flag
+    /// again and schedules a follow-up flush, so abrupt cancellation cannot
+    /// silently clear evidence that was not part of the snapshot.
+    pub fn take_peer_cache_dirty(&self) -> bool {
+        self.peer_cache_dirty.swap(false, Ordering::AcqRel)
     }
 
-    /// Re-arms aggregate delivery-cache persistence after a deferred write.
+    /// Re-arms peer-cache persistence after a deferred write.
     ///
     /// This preserves coalescing semantics: repeated calls set one dirty bit
     /// and one notification permit, without allocating an unbounded queue.
+    pub fn mark_peer_cache_dirty(&self) {
+        self.peer_cache_dirty.store(true, Ordering::Release);
+        self.peer_cache_notify.notify_one();
+    }
+
+    /// Backward-compatible aggregate-delivery cache waiter.
+    pub async fn wait_for_client_delivery_cache_dirty(&self) {
+        self.wait_for_peer_cache_dirty().await;
+    }
+
+    /// Backward-compatible aggregate-delivery dirty-bit claim.
+    pub fn take_client_delivery_cache_dirty(&self) -> bool {
+        self.take_peer_cache_dirty()
+    }
+
+    /// Backward-compatible aggregate-delivery dirty marker.
     pub fn mark_client_delivery_cache_dirty(&self) {
-        self.client_delivery_cache_dirty
-            .store(true, Ordering::Release);
-        self.client_delivery_cache_notify.notify_one();
+        self.mark_peer_cache_dirty();
     }
 
     /// Records a blind relay rejection with a stable privacy-safe reason.
@@ -5372,24 +5438,31 @@ impl PeerStore {
             |observed_node_id, route_fingerprint| {
                 let mut route_health = self.route_health.write();
                 let health = route_health.entry(observed_node_id).or_default();
+                let cleared_quarantine = health.quarantine_until.take().is_some();
                 health.success_count = health.success_count.saturating_add(1);
                 health.consecutive_failures = 0;
                 health.last_success_at = Some(now);
                 health.last_success_route_fingerprint_sha256 = Some(route_fingerprint);
-                health.quarantine_until = None;
+                cleared_quarantine
             },
         );
-        if let Err(reason) = result {
-            self.record_audit_event(
-                now,
-                "blind_relay_route_health",
-                "rejected",
-                format!(
-                    "node_prefix={} result=ignored reason={reason}",
-                    hex::encode(&node_id[..4])
-                ),
-            );
-            return false;
+        let cleared_quarantine = match result {
+            Ok(cleared_quarantine) => cleared_quarantine,
+            Err(reason) => {
+                self.record_audit_event(
+                    now,
+                    "blind_relay_route_health",
+                    "rejected",
+                    format!(
+                        "node_prefix={} result=ignored reason={reason}",
+                        hex::encode(&node_id[..4])
+                    ),
+                );
+                return false;
+            }
+        };
+        if cleared_quarantine {
+            self.mark_peer_cache_dirty();
         }
 
         self.record_audit_event(
@@ -5541,6 +5614,7 @@ impl PeerStore {
                     PEER_ROUTE_FAILURE_QUARANTINE_SECS
                 ),
             );
+            self.mark_peer_cache_dirty();
         }
     }
 
@@ -6977,6 +7051,206 @@ impl PeerStore {
             ),
         );
         evidence
+    }
+
+    /// Exports active, route-surface-bound quarantine windows for restart.
+    ///
+    /// [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Only an unexpired
+    /// quarantine created by the fixed local route policy is eligible. Failure
+    /// counts and reasons are deliberately omitted; the enclosing cache v2
+    /// signature prevents this section from being removed while retaining old
+    /// success evidence.
+    #[must_use]
+    pub fn export_route_quarantine_cache_evidence(
+        &self,
+        generated_at: u64,
+    ) -> Vec<PeerStoreRouteQuarantineCacheEvidence> {
+        let peers = self.peers.read();
+        let route_health = self.route_health.read();
+        let mut evidence = Vec::new();
+
+        for (node_id, descriptor) in peers.iter() {
+            if evidence.len() >= PEER_ROUTEABILITY_CACHE_MAX_ENTRIES {
+                break;
+            }
+            if descriptor.verify_at(generated_at).is_err() {
+                continue;
+            }
+            let Some(health) = route_health.get(node_id) else {
+                continue;
+            };
+            let (Some(quarantined_at), Some(quarantine_until)) =
+                (health.last_quarantine_at, health.quarantine_until)
+            else {
+                continue;
+            };
+            if quarantined_at > generated_at
+                || quarantine_until <= generated_at
+                || quarantine_until <= quarantined_at
+                || quarantine_until.saturating_sub(quarantined_at)
+                    > PEER_ROUTE_FAILURE_QUARANTINE_SECS
+            {
+                continue;
+            }
+            let Some(route_surface_fingerprint_sha256) =
+                Self::descriptor_routeability_surface_fingerprint(descriptor)
+            else {
+                continue;
+            };
+            evidence.push(PeerStoreRouteQuarantineCacheEvidence {
+                node_id_hex: hex::encode(node_id),
+                descriptor_sequence: descriptor.sequence(),
+                route_surface_fingerprint_sha256,
+                quarantined_at,
+                quarantine_until,
+            });
+        }
+        drop(route_health);
+        drop(peers);
+
+        evidence.sort_by(|left, right| left.node_id_hex.cmp(&right.node_id_hex));
+        self.record_audit_event(
+            generated_at,
+            "route_quarantine_cache_export",
+            "accepted",
+            format!(
+                "schema_version={} exported={} max_duration_seconds={}",
+                ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION,
+                evidence.len(),
+                PEER_ROUTE_FAILURE_QUARANTINE_SECS
+            ),
+        );
+        evidence
+    }
+
+    /// Restores fresh active route quarantine after descriptors are verified.
+    ///
+    /// Every record is rebound to the current signed route surface. A newer
+    /// sequence is accepted only when endpoint, capabilities, discovery policy,
+    /// and KEM remain unchanged. Expired, future-dated, oversized, malformed,
+    /// or rotated records fail closed per item.
+    pub fn restore_route_quarantine_cache_evidence(
+        &self,
+        records: &[PeerStoreRouteQuarantineCacheEvidence],
+        now: u64,
+    ) -> PeerStoreRouteQuarantineCacheRestoreReport {
+        let mut restored = 0usize;
+        let mut rejected = records
+            .len()
+            .saturating_sub(PEER_ROUTEABILITY_CACHE_MAX_ENTRIES);
+
+        for record in records.iter().take(PEER_ROUTEABILITY_CACHE_MAX_ENTRIES) {
+            let mut node_id = [0u8; 32];
+            if hex::decode_to_slice(&record.node_id_hex, &mut node_id).is_err()
+                || record.quarantined_at > now
+                || record.quarantine_until <= now
+                || record.quarantine_until <= record.quarantined_at
+                || record
+                    .quarantine_until
+                    .saturating_sub(record.quarantined_at)
+                    > PEER_ROUTE_FAILURE_QUARANTINE_SECS
+            {
+                rejected = rejected.saturating_add(1);
+                continue;
+            }
+
+            let descriptor = self.peers.read().get(&node_id).cloned();
+            let Some(descriptor) = descriptor else {
+                rejected = rejected.saturating_add(1);
+                continue;
+            };
+            let route_surface_fingerprint =
+                Self::descriptor_routeability_surface_fingerprint(&descriptor);
+            if descriptor.verify_at(now).is_err()
+                || descriptor.sequence() < record.descriptor_sequence
+                || route_surface_fingerprint.as_deref()
+                    != Some(record.route_surface_fingerprint_sha256.as_str())
+            {
+                rejected = rejected.saturating_add(1);
+                continue;
+            }
+
+            let mut route_health = self.route_health.write();
+            let health = route_health.entry(node_id).or_default();
+            health.failure_count = health
+                .failure_count
+                .max(PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD);
+            health.consecutive_failures = health
+                .consecutive_failures
+                .max(PEER_ROUTE_FAILURE_QUARANTINE_THRESHOLD);
+            health.last_failure_at = Some(
+                health
+                    .last_failure_at
+                    .unwrap_or_default()
+                    .max(record.quarantined_at),
+            );
+            health.last_failure_reason = Some("restart_restored_quarantine".to_string());
+            health.quarantine_count = health.quarantine_count.max(1);
+            health.quarantine_until = Some(
+                health
+                    .quarantine_until
+                    .unwrap_or_default()
+                    .max(record.quarantine_until),
+            );
+            health.last_quarantine_at = Some(
+                health
+                    .last_quarantine_at
+                    .unwrap_or_default()
+                    .max(record.quarantined_at),
+            );
+            health.last_quarantine_reason = Some("consecutive_route_failures".to_string());
+            restored = restored.saturating_add(1);
+        }
+
+        let report = PeerStoreRouteQuarantineCacheRestoreReport {
+            total: records.len(),
+            restored,
+            rejected,
+        };
+        self.record_audit_event(
+            now,
+            "route_quarantine_cache_restore",
+            if restored > 0 || records.is_empty() {
+                "accepted"
+            } else {
+                "rejected"
+            },
+            format!(
+                "schema_version={} total={} restored={} rejected={}",
+                ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION,
+                records.len(),
+                restored,
+                rejected
+            ),
+        );
+        report
+    }
+
+    /// Rejects an unauthenticated route-quarantine section without restoring it.
+    pub fn reject_route_quarantine_cache_evidence(
+        &self,
+        total: usize,
+        now: u64,
+        reason: &str,
+    ) -> PeerStoreRouteQuarantineCacheRestoreReport {
+        let reason_bucket = match reason {
+            "identity_unavailable" => "identity_unavailable",
+            _ => "signature_invalid",
+        };
+        self.record_audit_event(
+            now,
+            "route_quarantine_cache_restore",
+            "rejected",
+            format!(
+                "schema_version={} total={} restored=0 rejected={} reason={reason_bucket}",
+                ROUTE_QUARANTINE_CACHE_SCHEMA_VERSION, total, total
+            ),
+        );
+        PeerStoreRouteQuarantineCacheRestoreReport {
+            total,
+            restored: 0,
+            rejected: total,
+        }
     }
 
     /// Restores fresh descriptor-bound routeability evidence from local cache.
@@ -9994,6 +10268,132 @@ mod tests {
     }
 
     #[test]
+    fn test_route_quarantine_cache_survives_restart_without_failure_details() {
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 7, now + 4_000);
+        descriptor.descriptor.public_endpoint = Some("https://quarantine.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+
+        let original = PeerStore::new();
+        original.upsert_verified(descriptor.clone(), now).unwrap();
+        original.record_route_forward_success(&node_id, now + 1);
+        for observed_at in [now + 2, now + 3, now + 4] {
+            assert!(original.record_route_forward_failure_for_descriptor(
+                &descriptor,
+                observed_at,
+                "request_failed",
+            ));
+        }
+        assert!(original.is_route_quarantined_now(&node_id, now + 4));
+        assert!(original.take_peer_cache_dirty());
+
+        let evidence = original.export_route_quarantine_cache_evidence(now + 5);
+        assert_eq!(evidence.len(), 1);
+        let rendered = serde_json::to_string(&evidence).unwrap();
+        assert!(!rendered.contains("quarantine.example"));
+        assert!(!rendered.contains("request_failed"));
+
+        let mut refreshed_body = descriptor.descriptor.clone();
+        refreshed_body.sequence = 8;
+        refreshed_body.issued_at = now + 6;
+        refreshed_body.expires_at = now + 4_006;
+        let refreshed = SignedNodeDescriptor::sign(refreshed_body, &peer_kp).unwrap();
+        let restored = PeerStore::new();
+        restored.upsert_verified(refreshed, now + 6).unwrap();
+        let report = restored.restore_route_quarantine_cache_evidence(&evidence, now + 6);
+
+        assert_eq!(
+            report,
+            PeerStoreRouteQuarantineCacheRestoreReport {
+                total: 1,
+                restored: 1,
+                rejected: 0,
+            }
+        );
+        assert!(restored.is_route_quarantined_now(&node_id, now + 6));
+        assert!(!restored.is_routeable_now(&node_id, now + 6));
+        let row = restored
+            .status(now + 6)
+            .peer_health_summary
+            .peers
+            .into_iter()
+            .find(|row| row.node_id_prefix == hex::encode(&node_id[..4]))
+            .expect("restored peer health row");
+        assert_eq!(row.route_health, "quarantined");
+        assert_eq!(
+            row.last_route_failure_reason.as_deref(),
+            Some("restart_restored_quarantine")
+        );
+    }
+
+    #[test]
+    fn test_route_quarantine_cache_rejects_rotation_expiry_and_oversized_window() {
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 1, now + 4_000);
+        descriptor.descriptor.public_endpoint = Some("https://route-a.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+
+        let source = PeerStore::new();
+        source.upsert_verified(descriptor.clone(), now).unwrap();
+        for observed_at in [now + 1, now + 2, now + 3] {
+            source.record_route_forward_failure(&node_id, observed_at, "request_failed");
+        }
+        let valid = source
+            .export_route_quarantine_cache_evidence(now + 4)
+            .remove(0);
+
+        let mut rotated_body = descriptor.descriptor;
+        rotated_body.sequence = 2;
+        rotated_body.issued_at = now + 5;
+        rotated_body.expires_at = now + 4_005;
+        rotated_body.public_endpoint = Some("https://route-b.example".to_string());
+        let rotated = SignedNodeDescriptor::sign(rotated_body, &peer_kp).unwrap();
+        let restored = PeerStore::new();
+        restored.upsert_verified(rotated, now + 5).unwrap();
+
+        let mut expired = valid.clone();
+        expired.quarantine_until = now + 5;
+        let mut oversized = valid.clone();
+        oversized.quarantine_until =
+            oversized.quarantined_at + PEER_ROUTE_FAILURE_QUARANTINE_SECS + 1;
+        let report =
+            restored.restore_route_quarantine_cache_evidence(&[valid, expired, oversized], now + 5);
+
+        assert_eq!(report.total, 3);
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.rejected, 3);
+        assert!(!restored.is_route_quarantined_now(&node_id, now + 5));
+    }
+
+    #[test]
+    fn test_route_success_clears_quarantine_and_requests_cache_refresh() {
+        let now = 1_700_000_100;
+        let peer_kp = IdentityKeyPair::generate();
+        let mut descriptor = signed_descriptor_for(&peer_kp, 1, now + 4_000);
+        descriptor.descriptor.public_endpoint = Some("https://recovery.example".to_string());
+        descriptor = SignedNodeDescriptor::sign(descriptor.descriptor, &peer_kp).unwrap();
+        let node_id = descriptor.node_id();
+        let store = PeerStore::new();
+        store.upsert_verified(descriptor, now).unwrap();
+
+        for observed_at in [now + 1, now + 2, now + 3] {
+            store.record_route_forward_failure(&node_id, observed_at, "request_failed");
+        }
+        assert!(store.take_peer_cache_dirty());
+        store.record_route_forward_success(&node_id, now + 4);
+
+        assert!(store.take_peer_cache_dirty());
+        assert!(!store.is_route_quarantined_now(&node_id, now + 4));
+        assert!(store
+            .export_route_quarantine_cache_evidence(now + 4)
+            .is_empty());
+    }
+
+    #[test]
     fn test_routeability_cache_accepts_legacy_exact_descriptor_evidence() {
         let now = 1_700_000_100;
         let peer_kp = IdentityKeyPair::generate();
@@ -10330,6 +10730,7 @@ mod tests {
         for node_id in [first_node_id, second_node_id, terminal_node_id] {
             assert!(!store.is_routeable_now(&node_id, now + 21));
         }
+        assert!(!store.take_peer_cache_dirty());
 
         assert!(store.record_verified_three_hop_probe_delivery(
             &first,
@@ -10355,6 +10756,7 @@ mod tests {
         for node_id in [first_node_id, second_node_id, terminal_node_id] {
             assert!(store.is_routeable_now(&node_id, now + 22));
         }
+        assert!(store.take_peer_cache_dirty());
     }
 
     #[test]
@@ -10401,6 +10803,7 @@ mod tests {
             0
         );
         assert!(!store.is_routeable_now(&middle_node_id, now + 21));
+        assert!(!store.take_peer_cache_dirty());
 
         assert!(store.record_verified_two_hop_control_probe(
             &middle,
@@ -10424,6 +10827,7 @@ mod tests {
         );
         assert!(store.is_routeable_now(&middle_node_id, now + 22));
         assert!(!store.is_routeable_now(&terminal_node_id, now + 22));
+        assert!(store.take_peer_cache_dirty());
     }
 
     #[test]

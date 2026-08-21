@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Document signed peer-cache
+  v2 recovery for active route quarantine and v1 rolling-upgrade compatibility.
 - [PEER-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Document closed reason
   admission for route reputation, relay rejection, and quarantine diagnostics.
 - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Document the typed,
@@ -163,6 +165,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.65.0-node-deploy - Documented restart-safe active route quarantine.
 v1.64.0-node-deploy - Documented PeerStore reputation reason admission.
 v1.63.0-node-deploy - Documented typed relay health reason privacy boundary.
 v1.62.0-node-deploy - Documented custody renewal runtime heartbeat telemetry.
@@ -1181,6 +1184,26 @@ unreviewed text from entering peer health, nodeboard status, and the bounded
 process audit trail. Operators who observe `unknown` should align node versions
 or register a newly reviewed coarse bucket; they must never copy the raw error
 into telemetry as a workaround.
+
+<!-- [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] -->
+Active consecutive-failure quarantine is part of the signed local peer cache
+starting with routeability schema v2. Restarting or upgrading a node during the
+fixed quarantine window no longer revives a peer merely because an older route
+success was still fresh. The startup importer verifies the cache signature and
+rebinds each quarantine item to the current signed descriptor route surface
+before route admission.
+
+The persisted section contains no failure reason, endpoint, route, request or
+message id, payload, ciphertext, user, wallet, destination, DNS, IP address, or
+social-graph information. It contains only the peer identity, descriptor
+sequence, route-surface fingerprint, and bounded quarantine timestamps. Cache
+v1 remains accepted during rolling upgrades but has no quarantine section and
+must never be treated as proof that a peer is currently quarantined.
+
+Quarantine entry and verified recovery trigger the same debounced atomic cache
+flush used by other security-relevant peer evidence. Operators do not need a
+new command or configuration flag; the periodic write and graceful-shutdown
+flush remain fallback durability paths.
 
 <!-- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] -->
 The existing signed management heartbeat now includes the additive object
