@@ -76,6 +76,10 @@
 //! [CHAT-RELAY-DURABILITY-STATUS 2026-08-16 by Codex] The same typed snapshot
 //! carries verified aggregate custody durability. A missing relay runtime stays
 //! `unknown`; health must never infer FULL durability from configuration alone.
+//! [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Local health and startup
+//! self-check now consume the shared recovery-anchor projection. A deployment
+//! that explicitly requires an exact-generation external witness cannot report
+//! startup readiness while that witness is absent or generation-mismatched.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -89,6 +93,7 @@ use serde_json::Value;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
+use crate::api::discovery::recovery_anchor_status_value;
 use crate::config::ServerConfig;
 use crate::handlers::packet::{PacketHandler, PacketRuntimeStatus};
 use crate::isolated_child_command;
@@ -773,9 +778,11 @@ async fn collect_vpn_health_response(state: VpnHealthState) -> VpnHealthResponse
 fn collect_discovery_status_value(peer_store: &PeerStore) -> Value {
     let now = unix_now_secs();
     let status = peer_store.status(now);
+    let recovery_anchor = recovery_anchor_status_value(&status);
     serde_json::json!({
         "generated_at": now,
         "peer_store": status,
+        "recovery_anchor": recovery_anchor,
         "source": "rust_peer_store",
         "privacy_boundary": concat!(
             "aggregate node discovery counters only; no client IPs, ",
@@ -971,6 +978,24 @@ fn collect_startup_self_check(
         &["peer_store", "stability", "restart_recovery_configured"],
     )
     .unwrap_or(false);
+    let recovery_anchor_status =
+        discovery_str(discovery_status, &["recovery_anchor", "status"]).unwrap_or("not_reported");
+    let recovery_anchor_ready =
+        discovery_bool(discovery_status, &["recovery_anchor", "ready_for_restore"])
+            .unwrap_or(false);
+    let recovery_witness_required = config
+        .discovery
+        .verified_delivery_witness_required_for_restore
+        || discovery_bool(
+            discovery_status,
+            &["recovery_anchor", "external_witness", "required"],
+        )
+        .unwrap_or(false);
+    let recovery_witness_generation_aligned = discovery_bool(
+        discovery_status,
+        &["recovery_anchor", "external_witness", "generation_aligned"],
+    )
+    .unwrap_or(false);
 
     checks.push(startup_item(
         "peer_store_restart_recovery",
@@ -1012,6 +1037,39 @@ fn collect_startup_self_check(
         "warning",
         format!("peer_store_stability={stability_health}"),
         "Wait for live gossip recovery or refresh the peer cache/bootstrap snapshot before enabling multi-hop routing.".to_string(),
+    ));
+
+    // [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Preserve optional
+    // witness deployments while refusing to call a strict deployment ready
+    // until the external witness covers the exact active cache generation.
+    // Optional deployments still surface adverse/incomplete anchor state as a
+    // warning instead of silently treating it as healthy.
+    let recovery_anchor_ok = !discovery_enabled
+        || if recovery_witness_required {
+            recovery_anchor_ready
+        } else {
+            recovery_anchor_status == "ready"
+        };
+    checks.push(startup_item(
+        "peer_store_recovery_anchor",
+        recovery_anchor_ok,
+        if discovery_enabled && recovery_witness_required {
+            "critical"
+        } else {
+            "warning"
+        },
+        format!(
+            "recovery_anchor_status={} ready_for_restore={} witness_required={} witness_generation_aligned={}",
+            recovery_anchor_status,
+            recovery_anchor_ready,
+            recovery_witness_required,
+            recovery_witness_generation_aligned
+        ),
+        if recovery_witness_required {
+            "Obtain the configured external witness quorum for the current peer-cache generation before relying on restored routing state.".to_string()
+        } else {
+            "Persist and verify the local signed peer-cache recovery anchor before relying on restored routing state.".to_string()
+        },
     ));
 
     let failed_checks = checks
@@ -3382,6 +3440,76 @@ mod tests {
         assert!(status
             .recommended_action
             .contains("discovery.peer_cache_path"));
+    }
+
+    #[test]
+    fn local_discovery_health_includes_shared_recovery_anchor_contract() {
+        let status = collect_discovery_status_value(&PeerStore::new());
+
+        assert_eq!(
+            status["recovery_anchor"]["contract_version"],
+            "recovery_anchor.v1"
+        );
+        assert_eq!(status["recovery_anchor"]["status"], "idle");
+        assert_eq!(status["recovery_anchor"]["ready_for_restore"], false);
+        let rendered = serde_json::to_string(&status).expect("serialize discovery health");
+        for forbidden in ["anchor_digest", "signature_hex", "witness_endpoint"] {
+            assert!(!rendered.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn startup_self_check_blocks_required_mismatched_recovery_witness() {
+        let mut config = ServerConfig::default();
+        config.discovery.enabled = true;
+        config.discovery.peer_cache_path = Some("/var/lib/aeronyx/peers.json".to_string());
+        config
+            .discovery
+            .verified_delivery_witness_required_for_restore = true;
+
+        let discovery_status = serde_json::json!({
+            "peer_store": {
+                "bootstrap": {
+                    "peer_cache_configured": true,
+                    "gossip_enabled": false,
+                    "seed_endpoints_configured": 0
+                },
+                "stability": {
+                    "health": "healthy",
+                    "restart_recovery_configured": true
+                }
+            },
+            "recovery_anchor": {
+                "status": "blocked",
+                "ready_for_restore": false,
+                "external_witness": {
+                    "required": true,
+                    "generation_aligned": false
+                }
+            }
+        });
+
+        let status = collect_startup_self_check(
+            &config,
+            &healthy_runtime_checks(),
+            &healthy_service_manager(),
+            &healthy_transport(),
+            &healthy_capacity(),
+            &discovery_status,
+        );
+
+        assert_eq!(status.status, "failed");
+        assert!(status
+            .blocking_checks
+            .contains(&"peer_store_recovery_anchor"));
+        let recovery_check = status
+            .checks
+            .iter()
+            .find(|check| check.name == "peer_store_recovery_anchor")
+            .expect("recovery anchor self-check");
+        assert!(!recovery_check.ok);
+        assert_eq!(recovery_check.severity, "critical");
+        assert!(recovery_check.detail.contains("generation_aligned=false"));
     }
 
     #[test]

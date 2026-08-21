@@ -7,6 +7,9 @@
 #   nodes after install, upgrade, or incident response.
 #
 # Modification Reason:
+# - [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Surface the shared
+#   recovery-anchor contract and fail deployment health when a required
+#   external witness does not cover the active peer-cache generation.
 # - [COMMIT-PINNED-SOURCE 2026-07-29 by Codex] Distinguish the runtime
 #   repository HEAD from the Git commit embedded in the running Rust binary,
 #   and expose privacy-safe commit-pinned upgrade provenance.
@@ -80,6 +83,7 @@
 #   a binary workspace; dependency changes must be code-reviewed.
 #
 # Last Modified:
+# v1.25.0-node-deploy - Added exact-generation recovery-anchor diagnostics.
 # v1.24.0-node-deploy - Added commit-pinned source and binary provenance.
 # v1.23.0-node-deploy - Added Type=notify/NotifyAccess readiness diagnostics
 #                       and aligned TimeoutStartSec with audited node startup.
@@ -905,6 +909,7 @@ check_discovery_endpoint() {
         case "${status}" in
             pass) pass "${message}" ;;
             warn) warn "${message}" ;;
+            fail) fail "${message}" ;;
             info) [ "${JSON_ONLY}" -eq 1 ] || printf '[INFO] %s\n' "${message}" ;;
         esac
     done <<EOF
@@ -916,6 +921,7 @@ data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 local = data.get("local_capabilities") or {}
 peer_store = data.get("peer_store") or {}
 quorum = peer_store.get("peer_quorum") or {}
+recovery_anchor = data.get("recovery_anchor") or {}
 
 local_status = local.get("status")
 configured = bool(local.get("chat_relay_configured"))
@@ -951,6 +957,27 @@ if status == "attention":
     print("warn\tdiscovery peer quorum needs operator attention")
 elif status == "route_ready":
     print("pass\tdiscovery peer quorum route-ready")
+
+# [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Strict witness policy is
+# an admission boundary, not an informational metric. Keep optional operation
+# backward-compatible while making a required generation mismatch fail health.
+anchor_status = recovery_anchor.get("status")
+anchor_ready = bool(recovery_anchor.get("ready_for_restore"))
+external_witness = recovery_anchor.get("external_witness") or {}
+witness_required = bool(external_witness.get("required"))
+witness_aligned = bool(external_witness.get("generation_aligned"))
+print("info\tdiscovery recovery anchor status=%s ready=%s witness_required=%s generation_aligned=%s" % (
+    anchor_status,
+    str(anchor_ready).lower(),
+    str(witness_required).lower(),
+    str(witness_aligned).lower(),
+))
+if witness_required and not anchor_ready:
+    print("fail\tdiscovery recovery anchor lacks the required exact-generation witness")
+elif anchor_status in ("blocked", "attention"):
+    print("warn\tdiscovery recovery anchor needs operator attention")
+elif anchor_status == "ready":
+    print("pass\tdiscovery recovery anchor is ready")
 PY
 )
 EOF
@@ -1024,6 +1051,9 @@ def discovery_readiness_payload(discovery_path, local_health):
     local = discovery_status.get("local_capabilities") or {}
     quorum = peer_store.get("peer_quorum") or {}
     network_story = peer_store.get("network_story") or {}
+    recovery_anchor = discovery_status.get("recovery_anchor") or vpn_discovery.get("recovery_anchor") or {}
+    local_anchor = recovery_anchor.get("local_anchor") or {}
+    external_witness = recovery_anchor.get("external_witness") or {}
 
     blockers = local.get("advertisement_blockers")
     if not isinstance(blockers, list):
@@ -1062,6 +1092,34 @@ def discovery_readiness_payload(discovery_path, local_health):
             "chat_two_hop_onion_ready": network_story.get("chat_two_hop_onion_ready"),
             "routeable_chat_relays": network_story.get("routeable_chat_relays"),
             "routeable_onion_middle_hops": network_story.get("routeable_onion_middle_hops"),
+        },
+        "recovery_anchor": {
+            "contract_version": recovery_anchor.get("contract_version"),
+            "status": recovery_anchor.get("status"),
+            "ready_for_restore": recovery_anchor.get("ready_for_restore"),
+            "cache_generation": recovery_anchor.get("cache_generation"),
+            "local_anchor": {
+                "ready": local_anchor.get("ready"),
+                "routeability": local_anchor.get("routeability"),
+                "two_hop_proof": local_anchor.get("two_hop_proof"),
+                "three_hop_proof": local_anchor.get("three_hop_proof"),
+                "aggregate_delivery": local_anchor.get("aggregate_delivery"),
+            },
+            "external_witness": {
+                "status": external_witness.get("status"),
+                "required": external_witness.get("required"),
+                "ready": external_witness.get("ready"),
+                "generation": external_witness.get("generation"),
+                "generation_aligned": external_witness.get("generation_aligned"),
+                "minimum_verified": external_witness.get("minimum_verified"),
+                "configured": external_witness.get("configured"),
+                "attempted": external_witness.get("attempted"),
+                "verified": external_witness.get("verified"),
+                "accepted": external_witness.get("accepted"),
+                "adverse": external_witness.get("adverse"),
+                "failed": external_witness.get("failed"),
+            },
+            "next_action": recovery_anchor.get("next_action"),
         },
         "privacy_boundary": (
             "aggregate discovery readiness only; no full node ids, endpoint URLs, "

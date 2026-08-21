@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.19.0 - Project exact-generation recovery-anchor health
-through the existing signed management heartbeat.
+Modification Reason: v1.20.0 - Enforce exact-generation recovery readiness in
+local health, startup self-check, operator status, and deployment diagnostics.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.19.0 - [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Reuses the shared recovery-anchor builder in the signed management heartbeat so backend and Nodeboard observe the same exact-generation admission decision as the node APIs.
+Last Modified: v1.20.0 - [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Reuses the shared recovery-anchor contract in local health, startup admission, operator telemetry, and deployment diagnostics; strict witness deployments now fail health while the active generation is unverified.
+Previous: v1.19.0 - [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Reuses the shared recovery-anchor builder in the signed management heartbeat so backend and Nodeboard observe the same exact-generation admission decision as the node APIs.
 Previous: v1.18.0 - [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Adds one privacy-safe recovery-anchor API aggregate and prevents a prior generation's witness result from authorizing proof continuity between local persistence and exact-generation witnessing.
 Previous: v1.17.0 - [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Prevents a valid older recovery anchor from authorizing readiness restored from a newer signed cache after an interrupted cache-before-anchor durability update.
 Previous: v1.16.0 - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Applies signed rollback, conflict, gap, invalid-anchor, and required-unavailable witness outcomes to routeability, quarantine, two-hop/three-hop proof, and delivery recovery as one startup-only fail-closed decision while preserving verified descriptors.
@@ -152,6 +153,28 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.20 Recovery-anchor readiness is enforced across local operations
+
+[RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex]
+
+- `/api/vpn/health` and `/api/node/operator/status` now include the same
+  `recovery_anchor.v1` projection as discovery endpoints and the signed
+  management heartbeat. Operator surfaces no longer reconstruct witness policy
+  from legacy cache counters.
+- Startup self-check treats a required external witness as a critical admission
+  boundary. The node is not reported ready while the active cache generation
+  lacks an exact-generation witness quorum.
+- Optional witness deployments remain compatible. Incomplete or adverse local
+  anchor state is reported as a warning rather than silently presented as
+  healthy; strict mode alone turns unavailable witness coverage into a hard
+  health failure.
+- `deploy/node/healthcheck.sh` emits the bounded recovery aggregate in JSON and
+  applies the same strict failure rule in terminal diagnostics. It allow-lists
+  fields instead of forwarding future recovery payloads wholesale.
+- Tests prove the local API uses the shared contract and strict generation
+  mismatch appears as the `peer_store_recovery_anchor` blocking check without
+  exposing anchor material, witness identities, endpoints, routes, or messages.
 
 ### v1.19 Recovery-anchor health reaches the signed management plane
 

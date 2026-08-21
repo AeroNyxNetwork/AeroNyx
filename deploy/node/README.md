@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] Document the local
+  startup/operator admission rule and deployment healthcheck projection.
 - [RECOVERY-ANCHOR-HEARTBEAT 2026-08-21 by Codex] Document the signed
   management-heartbeat projection for exact-generation recovery readiness.
 - [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Document the additive public
@@ -1294,6 +1296,23 @@ registration, configuration, database, or wire migration is required. The
 heartbeat remains bounded and includes no anchor digest/signature, witness
 identity/endpoint, selected route, message, client, payload, secret, or
 wallet-level traffic.
+
+<!-- [RECOVERY-ANCHOR-LOCAL-HEALTH 2026-08-21 by Codex] -->
+The same `recovery_anchor.v1` object is now present under `discovery_status` in
+`/api/vpn/health` and consequently in `/api/node/operator/status`. The startup
+self-check includes `peer_store_recovery_anchor`, so operators and Nodeboard
+receive the same admission result as the discovery API and signed heartbeat.
+
+When `verified_delivery_witness_required_for_restore = true`, a missing,
+rejected, or older-generation witness is a critical startup health failure.
+Optional witness deployments remain operational, but incomplete or adverse
+local anchor state produces a warning until signed recovery state is ready.
+
+`deploy/node/healthcheck.sh --json` copies only the bounded status, generation,
+fixed protection buckets, aggregate witness counts, and next action into
+`discovery_readiness.recovery_anchor`. Its terminal mode applies the same strict
+failure rule. It does not expose anchor digests/signatures, cache paths, witness
+identities/endpoints, peer ids, routes, messages, clients, or payload data.
 
 <!-- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] -->
 The existing signed management heartbeat now includes the additive object
