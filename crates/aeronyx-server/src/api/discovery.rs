@@ -21,6 +21,9 @@
 //!   foundation summary for app, website, backend aggregation, and AI runbooks,
 //!   including aggregate route-governance readiness and non-authoritative
 //!   transport feature negotiation without route metadata
+//! - [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Publishes one privacy-safe
+//!   recovery-anchor aggregate and requires an external witness to protect the
+//!   exact cache generation before restart continuity can become ready.
 //! - `GET /api/discovery/public-card`: returns the smallest product-facing
 //!   protocol health card for website, Nodeboard first-level views, and apps
 //! - [ONION-CANDIDATE-PROOF 2026-07-31 by Codex] Returns each onion candidate's
@@ -135,8 +138,13 @@
 //! - [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Purpose parsing and specialized
 //!   terminal capability semantics live in `aeronyx-core`. This server owns
 //!   only live admission policy and must not fork the shared wire contract.
+//! - External witness status is generation-bound. A `verified` result from an
+//!   older cache generation must never authorize current proof continuity,
+//!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.49.0-RecoveryAnchorStatus - Added exact-generation recovery observability
+//! and closed the post-persistence stale-witness readiness window
 //! v0.48.0-PurposeBoundReceiptNegotiation - Advertise v2 receipt semantics
 //! separately from legacy multi-hop receipt framing
 //! v0.47.0-CoreRoutePurposeContract - Consumed the shared onion purpose
@@ -814,6 +822,13 @@ pub struct DiscoveryStatusResponse {
     /// destinations, Memory Chain plaintext, private keys, wallet-level
     /// traffic, or social graph metadata.
     blind_relay_runtime: serde_json::Value,
+    /// Aggregate recovery-anchor and external-witness readiness.
+    ///
+    /// [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] This exposes only local
+    /// generation numbers, status buckets, and bounded counts. It must never
+    /// contain anchor digests, signatures, witness identities/endpoints,
+    /// routes, peers, clients, messages, or payload metadata.
+    recovery_anchor: serde_json::Value,
 }
 
 /// Compact public-safe discovery summary.
@@ -861,6 +876,8 @@ pub struct DiscoverySummaryResponse {
     three_hop_path_proof: serde_json::Value,
     /// Aggregate permissionless relay-pool admission gate without route data.
     onion_relay_admission: serde_json::Value,
+    /// Aggregate exact-generation recovery protection without secret material.
+    recovery_anchor: serde_json::Value,
     /// Actionable next step for operators and AI runbooks.
     next_action: String,
     /// Explicit invariant for downstream UI and AI-agent consumers.
@@ -1048,6 +1065,126 @@ struct PathProofRestartContinuity {
     persisted: u64,
 }
 
+fn recovery_anchor_protection_ready(protection: Option<&str>) -> bool {
+    matches!(protection, Some("anchored" | "cache_ahead"))
+}
+
+/// Builds an aggregate view of the local recovery anchor and its witnesses.
+///
+/// [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] This contract deliberately
+/// excludes anchor digests, signatures, file paths, witness identities and
+/// endpoints, peer identifiers, routes, messages, clients, and payload data.
+/// A witness is ready only when it verified the exact cache generation now
+/// represented by the restored or newly persisted local state.
+#[must_use]
+pub fn recovery_anchor_status_value(status: &PeerStoreStatus) -> serde_json::Value {
+    let bootstrap = &status.bootstrap;
+    let cache_generation = bootstrap.last_client_delivery_cache_generation;
+    let witness_generation = bootstrap.last_client_delivery_witness_generation;
+    let witness_status = bootstrap
+        .last_client_delivery_witness_status
+        .as_deref()
+        .unwrap_or("not_observed");
+    let witness_required = bootstrap.last_client_delivery_witness_required;
+    let witness_generation_aligned =
+        cache_generation != 0 && witness_generation == cache_generation;
+    let external_witness_ready =
+        !witness_required || (witness_status == "verified" && witness_generation_aligned);
+    let routeability_protection = bootstrap
+        .last_routeability_cache_rollback_protection
+        .as_deref()
+        .unwrap_or("not_observed");
+    let two_hop_protection = bootstrap
+        .last_two_hop_proof_cache_rollback_protection
+        .as_deref()
+        .unwrap_or("not_observed");
+    let three_hop_protection = bootstrap
+        .last_three_hop_proof_cache_rollback_protection
+        .as_deref()
+        .unwrap_or("not_observed");
+    let delivery_protection = bootstrap
+        .last_client_delivery_cache_rollback_protection
+        .as_deref()
+        .unwrap_or("not_observed");
+    let local_anchor_ready = cache_generation != 0
+        && [
+            Some(routeability_protection),
+            Some(two_hop_protection),
+            Some(three_hop_protection),
+            Some(delivery_protection),
+        ]
+        .into_iter()
+        .all(recovery_anchor_protection_ready);
+    let ready_for_restore = local_anchor_ready && external_witness_ready;
+    let adverse_local_evidence = [
+        routeability_protection,
+        two_hop_protection,
+        three_hop_protection,
+        delivery_protection,
+    ]
+    .into_iter()
+    .any(|protection| {
+        matches!(
+            protection,
+            "anchor_invalid" | "anchor_conflict" | "rollback_detected"
+        )
+    });
+    let adverse_witness_evidence =
+        matches!(witness_status, "rollback_detected" | "conflict" | "gap");
+    let status_bucket = if cache_generation == 0 {
+        "idle"
+    } else if ready_for_restore {
+        "ready"
+    } else if adverse_local_evidence || adverse_witness_evidence || witness_required {
+        "blocked"
+    } else {
+        "attention"
+    };
+    let next_action = match status_bucket {
+        "idle" => "persist the first signed peer-cache recovery generation",
+        "ready" => "continue bounded persistence and exact-generation witnessing",
+        "blocked" if witness_required && !witness_generation_aligned => {
+            "obtain the required witness quorum for the current cache generation"
+        }
+        "blocked" => "inspect aggregate rollback or witness failure buckets before restore",
+        _ => "complete local recovery-anchor protection before relying on restored readiness",
+    };
+
+    serde_json::json!({
+        "contract_version": "recovery_anchor.v1",
+        "status": status_bucket,
+        "ready_for_restore": ready_for_restore,
+        "cache_generation": cache_generation,
+        "local_anchor": {
+            "ready": local_anchor_ready,
+            "routeability": routeability_protection,
+            "two_hop_proof": two_hop_protection,
+            "three_hop_proof": three_hop_protection,
+            "aggregate_delivery": delivery_protection,
+        },
+        "external_witness": {
+            "status": witness_status,
+            "required": witness_required,
+            "ready": external_witness_ready,
+            "generation": witness_generation,
+            "generation_aligned": witness_generation_aligned,
+            "minimum_verified": bootstrap.last_client_delivery_witness_minimum_verified,
+            "configured": bootstrap.last_client_delivery_witness_configured,
+            "attempted": bootstrap.last_client_delivery_witness_attempted,
+            "verified": bootstrap.last_client_delivery_witness_verified,
+            "accepted": bootstrap.last_client_delivery_witness_advanced
+                .saturating_add(bootstrap.last_client_delivery_witness_idempotent),
+            "adverse": bootstrap.last_client_delivery_witness_stale
+                .saturating_add(bootstrap.last_client_delivery_witness_conflicts)
+                .saturating_add(bootstrap.last_client_delivery_witness_gaps),
+            "failed": bootstrap.last_client_delivery_witness_failed,
+        },
+        "rollback_boundary": "signed_sections_plus_monotonic_local_anchor_with_optional_exact_generation_external_witness",
+        "next_action": next_action,
+        "privacy_boundary": "aggregate recovery control state only; no anchor digests, signatures, file paths, witness identities or endpoints, peer ids, routes, messages, clients, or payload metadata",
+    })
+}
+
 fn path_proof_restart_continuity(
     status: &PeerStoreStatus,
     generated_at: u64,
@@ -1072,7 +1209,16 @@ fn path_proof_restart_continuity(
     let external_witness_required = status.bootstrap.last_client_delivery_witness_required;
     let rollback_protection_ready =
         matches!(rollback_protection.as_str(), "anchored" | "cache_ahead");
-    let external_witness_ready = !external_witness_required || external_witness == "verified";
+    // [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Persistence updates the
+    // local cache generation before the post-write witness round completes.
+    // Never let the prior generation's `verified` bucket authorize this short
+    // interval or any later state restored from a mismatched generation.
+    let external_witness_generation_ready = status.bootstrap.last_client_delivery_cache_generation
+        != 0
+        && status.bootstrap.last_client_delivery_witness_generation
+            == status.bootstrap.last_client_delivery_cache_generation;
+    let external_witness_ready = !external_witness_required
+        || (external_witness == "verified" && external_witness_generation_ready);
     let restore_evidence_fresh = restored_at
         .map(|at| at <= generated_at && generated_at.saturating_sub(at) <= stale_after_seconds)
         .unwrap_or(false);
@@ -1749,6 +1895,7 @@ pub fn discovery_summary_response(
     let onion_relay_admission = onion_relay_admission_status_value(status, local_capabilities);
     let blind_relay_runtime =
         blind_relay_runtime_status_value(generated_at, status, local_capabilities);
+    let recovery_anchor = recovery_anchor_status_value(status);
     let peer_quorum = &status.peer_quorum;
     let network_story = &status.network_story;
     let blind_relay_quality = &status.blind_relay_quality;
@@ -2099,6 +2246,7 @@ pub fn discovery_summary_response(
             "privacy_boundary": &three_hop_history.privacy_boundary,
         }),
         onion_relay_admission,
+        recovery_anchor,
         next_action,
         privacy_invariant: "blind_nodes_route_only_opaque_ciphertext_and_aggregate_control_status",
         privacy_boundary: "aggregate discovery summary only; no signed descriptors, full node ids, endpoint URLs, route ids, encrypted payloads, receiver identities, client public IPs, DNS contents, destinations, Memory Chain plaintext, voucher secrets, private keys, wallet-level traffic, or social graph metadata",
@@ -3540,6 +3688,7 @@ async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<Discover
     let discovery_readiness = discovery_readiness_status_value(&peer_store, &local_capabilities);
     let blind_relay_runtime =
         blind_relay_runtime_status_value(now, &peer_store, &local_capabilities);
+    let recovery_anchor = recovery_anchor_status_value(&peer_store);
     Json(DiscoveryStatusResponse {
         generated_at: now,
         peer_store,
@@ -3559,6 +3708,7 @@ async fn status_handler(State(state): State<DiscoveryApiState>) -> Json<Discover
         local_capabilities,
         discovery_readiness,
         blind_relay_runtime,
+        recovery_anchor,
     })
 }
 
@@ -5522,6 +5672,11 @@ mod tests {
         assert!(!serialized.contains("encrypted_blob"));
         assert!(!serialized.contains("payload_b64"));
         assert!(!serialized.contains("client_ip"));
+        assert_eq!(
+            parsed["recovery_anchor"]["contract_version"].as_str(),
+            Some("recovery_anchor.v1")
+        );
+        assert_eq!(parsed["recovery_anchor"]["status"].as_str(), Some("idle"));
     }
 
     #[tokio::test]
@@ -5598,6 +5753,10 @@ mod tests {
         assert_eq!(
             parsed["protocol_features"]["onion_route_purposes"],
             serde_json::json!(["message_relay", "blind_vault_put"])
+        );
+        assert_eq!(
+            parsed["recovery_anchor"]["contract_version"].as_str(),
+            Some("recovery_anchor.v1")
         );
         assert_eq!(parsed["local_capability"]["status"].as_str(), Some("ready"));
         assert_eq!(
@@ -5854,6 +6013,9 @@ mod tests {
 
         store.record_cache_save_status(now + 8, "success", "snapshot_persisted");
         store.record_two_hop_proof_cache_persisted(now + 8, 3, true);
+        // [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Production persistence
+        // records the aggregate generation in the same successful cache round.
+        store.record_client_delivery_cache_persisted(now + 8, 0, 1);
         let after_persist = store.status(now + 8);
         let after_admission =
             onion_relay_admission_status_value(&after_persist, &local_capabilities);
@@ -5931,6 +6093,76 @@ mod tests {
             witness_verified["proof_cache_external_witness"].as_str(),
             Some("verified")
         );
+    }
+
+    #[test]
+    fn test_recovery_anchor_status_requires_exact_witness_generation() {
+        let store = PeerStore::new();
+        let now = now_secs();
+        store.record_routeability_cache_rollback_protection(now, 2, "anchored");
+        store.record_two_hop_proof_cache_persisted(now, 3, true);
+        store.record_three_hop_proof_cache_persisted(now, 3, true);
+        store.record_client_delivery_cache_persisted(now, 2, 2);
+        store.record_client_delivery_witness_round(
+            now,
+            1,
+            true,
+            1,
+            crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound {
+                configured: 1,
+                attempted: 1,
+                verified: 1,
+                idempotent: 1,
+                ..Default::default()
+            },
+        );
+
+        let mismatched_status = store.status(now + 1);
+        let mismatched_anchor = recovery_anchor_status_value(&mismatched_status);
+        assert_eq!(mismatched_anchor["status"].as_str(), Some("blocked"));
+        assert_eq!(
+            mismatched_anchor["local_anchor"]["ready"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            mismatched_anchor["external_witness"]["status"].as_str(),
+            Some("verified")
+        );
+        assert_eq!(
+            mismatched_anchor["external_witness"]["generation_aligned"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            mismatched_anchor["external_witness"]["ready"].as_bool(),
+            Some(false)
+        );
+        assert!(!two_hop_proof_restart_continuity(&mismatched_status).ready);
+
+        store.record_client_delivery_witness_round(
+            now + 2,
+            2,
+            true,
+            1,
+            crate::services::peer_store::PeerStoreVerifiedDeliveryWitnessRound {
+                configured: 1,
+                attempted: 1,
+                verified: 1,
+                idempotent: 1,
+                ..Default::default()
+            },
+        );
+        let aligned_status = store.status(now + 2);
+        let aligned_anchor = recovery_anchor_status_value(&aligned_status);
+        assert_eq!(aligned_anchor["status"].as_str(), Some("ready"));
+        assert_eq!(
+            aligned_anchor["external_witness"]["generation_aligned"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            aligned_anchor["external_witness"]["ready"].as_bool(),
+            Some(true)
+        );
+        assert!(two_hop_proof_restart_continuity(&aligned_status).ready);
     }
 
     #[tokio::test]

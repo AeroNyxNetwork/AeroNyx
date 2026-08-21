@@ -9,6 +9,8 @@ Creation Reason:
   deployment scripts.
 
 Modification Reason:
+- [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Document the additive public
+  aggregate and exact-generation runtime admission gate.
 - [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Document exact
   cache/anchor generation binding during startup external witness checks.
 - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Document startup-wide
@@ -171,6 +173,7 @@ Important Note for Next Developer:
   deployment package, not production node targets.
 
 Last Modified:
+v1.69.0-node-deploy - Documented recovery-anchor status and runtime generation gate.
 v1.68.0-node-deploy - Documented exact-generation external witness binding.
 v1.67.0-node-deploy - Documented whole-host rollback fail-closed route gating.
 v1.66.0-node-deploy - Documented route-state rollback protection in recovery-anchor v3.
@@ -1258,6 +1261,22 @@ but before its matching anchor rename, the node reports the witness state as
 proof readiness is discarded before listeners start, while verified peer
 descriptors remain available for fresh probes. This behavior is automatic and
 does not require an operator repair command or configuration migration.
+
+<!-- [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] -->
+`/api/discovery/status` and `/api/discovery/summary` now include an additive
+`recovery_anchor` object. It reports the local cache generation, fixed
+protection buckets for routeability, two-hop proof, three-hop proof, and
+aggregate delivery, plus bounded external-witness counts and a
+`generation_aligned` decision. It never reports anchor digests, signatures,
+file paths, witness identities/endpoints, selected routes, peer identities,
+messages, clients, or payload metadata.
+
+When witnesses are required, a previously `verified` result stops authorizing
+proof continuity as soon as a newer local cache generation is persisted. The
+node remains fail closed until the post-write witness round verifies that exact
+generation. This closes the small runtime interval between atomic local
+persistence and external witness completion without changing configuration or
+peer wire frames.
 
 <!-- [CUSTODY-RENEWAL-TELEMETRY 2026-08-21 by Codex] -->
 The existing signed management heartbeat now includes the additive object

@@ -4,8 +4,8 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.17.0 - Bound startup external witnessing to the exact
-cache generation currently represented by restored readiness state.
+Modification Reason: v1.18.0 - Expose aggregate recovery-anchor health and
+require exact-generation witness alignment during runtime persistence.
 
 Main Functionality:
 
@@ -30,7 +30,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.17.0 - [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Prevents a valid older recovery anchor from authorizing readiness restored from a newer signed cache after an interrupted cache-before-anchor durability update.
+Last Modified: v1.18.0 - [RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex] Adds one privacy-safe recovery-anchor API aggregate and prevents a prior generation's witness result from authorizing proof continuity between local persistence and exact-generation witnessing.
+Previous: v1.17.0 - [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Prevents a valid older recovery anchor from authorizing readiness restored from a newer signed cache after an interrupted cache-before-anchor durability update.
 Previous: v1.16.0 - [EXTERNAL-WITNESS-ROUTE-GATE 2026-08-21 by Codex] Applies signed rollback, conflict, gap, invalid-anchor, and required-unavailable witness outcomes to routeability, quarantine, two-hop/three-hop proof, and delivery recovery as one startup-only fail-closed decision while preserving verified descriptors.
 Previous: v1.15.0 - [ROUTE-STATE-ROLLBACK-ANCHOR 2026-08-21 by Codex] Commits the exact signed routeability/quarantine section into recovery-anchor v3, rejects stale or unanchored route state while preserving descriptors, and extends configured external-witness protection to the same opaque state.
 Previous: v1.14.0 - [ROUTE-QUARANTINE-RECOVERY 2026-08-21 by Codex] Persists active descriptor-bound route quarantine beside positive routeability under one signed cache v2 snapshot, restores it before admission, and retains signed v1 rolling-upgrade compatibility without storing failure details.
@@ -150,6 +151,30 @@ Previous: v0.2.0 - Added Blind Node Invariant for relay and Memory Chain coordin
 Previous: v0.1.0 - Initial node discovery and encrypted relay architecture plan.
 
 ## 1. Background
+
+### v1.18 Recovery-anchor status and runtime generation admission
+
+[RECOVERY-ANCHOR-STATUS 2026-08-21 by Codex]
+
+- `/api/discovery/status` and `/api/discovery/summary` expose the same additive
+  `recovery_anchor.v1` aggregate for operators, Nodeboard, backend aggregation,
+  and AI runbooks. The legacy proof fields remain unchanged.
+- The aggregate reports only local monotonic generations, fixed protection and
+  witness buckets, bounded counts, `generation_aligned`, `ready_for_restore`,
+  and one stable next action. It excludes anchor digests, signatures, paths,
+  witness identities/endpoints, node identities, routes, messages, clients,
+  and payload metadata.
+- Runtime cache persistence updates the local generation before its post-write
+  witness round completes. Proof continuity now fails closed during that short
+  interval: an older `verified` witness bucket is insufficient unless its
+  generation exactly equals the current cache generation.
+- An optional witness deployment still treats external availability as
+  advisory. A required deployment becomes `blocked` until the exact current
+  generation reaches the configured valid-response threshold; signed peer
+  descriptors remain available and the wire/config contracts do not change.
+- Regression coverage proves a locally anchored generation two is blocked by a
+  valid generation-one witness, then becomes ready only after generation two is
+  independently witnessed.
 
 ### v1.17 External witnesses are bound to the exact recovered generation
 
