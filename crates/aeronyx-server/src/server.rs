@@ -15973,7 +15973,7 @@ mod tests {
     };
     use aeronyx_core::protocol::memchain::{
         ChatRelayVerifiedSubmitRequestV1, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
-        CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+        CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1, CHAT_VERIFIED_SUBMIT_REJECTED_V1,
     };
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
@@ -19017,7 +19017,6 @@ mod tests {
             None,
         )
         .await;
-        relay_server.abort();
 
         assert!(outcome.delivered());
         assert!(outcome.fully_replicated());
@@ -19043,6 +19042,57 @@ mod tests {
             quality.evidence_mode,
             "verified_client_onion_delivery_receipt"
         );
+
+        // [CHAT-VERIFIED-SUBMIT-LIVE-HANDLER 2026-08-23 by Codex] Reuse the
+        // same real two-hop endpoint through the product-facing handler. The
+        // returned response must combine terminal-verifiable delivery with
+        // durable entry custody and remain independently bound to this request.
+        let verified_directory = tempfile::tempdir().expect("verified submit live directory");
+        let verified_relay = test_chat_relay_service(
+            &verified_directory
+                .path()
+                .join("verified-submit-live.sqlite3"),
+            [0x45; 32],
+        );
+        let verified_relay_option = Some(Arc::clone(&verified_relay));
+        let verified_request = ChatRelayVerifiedSubmitRequestV1::signed(
+            [0x44; 16],
+            envelope.clone(),
+            unix_now_secs(),
+            &chat_sender,
+        )
+        .expect("sign live verified submit request");
+        let verified_session = Arc::new(crate::services::Session::new(
+            aeronyx_common::types::SessionId::generate(),
+            chat_sender.public_key(),
+            aeronyx_core::crypto::SessionKey::from_bytes([0x46; 32]),
+            Ipv4Addr::new(100, 64, 0, 46),
+            "127.0.0.1:1046".parse().unwrap(),
+        ));
+        let verified_response = Server::handle_verified_chat_submit(
+            verified_request.clone(),
+            &verified_session,
+            &verified_relay_option,
+            &store,
+            &source.public_key_bytes(),
+            &source,
+            Some(&reqwest::Client::new()),
+        )
+        .await;
+        assert_eq!(
+            verified_response.result,
+            CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1
+        );
+        verified_response
+            .verify_terminal_receipt_for_request(&verified_request, &terminal_node_id)
+            .expect("live handler response remains independently verifiable");
+        let verified_status = verified_relay.peer_status().verified_submit;
+        assert_eq!(verified_status.total, 1);
+        assert_eq!(verified_status.onion_and_entry_total, 1);
+        assert_eq!(verified_status.unknown_result_total, 0);
+
+        relay_server.abort();
+        let _ = relay_server.await;
     }
 
     #[tokio::test]

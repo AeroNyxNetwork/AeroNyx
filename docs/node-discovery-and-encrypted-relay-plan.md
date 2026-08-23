@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.36.0 - Added a real server-handler regression covering
-durable entry custody, no-route retry, authenticated-session rejection, exact
-response correlation, and aggregate-only telemetry.
+Modification Reason: v1.37.0 - Extended the real two-hop relay integration to
+the product-facing verified-submit handler, including terminal proof, entry
+custody, request correlation, and aggregate telemetry.
 
 Main Functionality:
 
@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.36.0 - [CHAT-VERIFIED-SUBMIT-HANDLER-CORRELATION 2026-08-23 by Codex] Verifies the real server handler returns request-bound entry-retry after durable custody and request-bound rejection for an unrelated authenticated session, with aggregate-only result telemetry.
+Last Modified: v1.37.0 - [CHAT-VERIFIED-SUBMIT-LIVE-HANDLER 2026-08-23 by Codex] Extends the real two-hop HTTP relay test through `handle_verified_chat_submit()`, proving terminal-signed delivery, durable entry custody, exact request correlation, independent client verification, and aggregate-only telemetry in one success path.
+Previous: v1.36.0 - [CHAT-VERIFIED-SUBMIT-HANDLER-CORRELATION 2026-08-23 by Codex] Verifies the real server handler returns request-bound entry-retry after durable custody and request-bound rejection for an unrelated authenticated session, with aggregate-only result telemetry.
 Previous: v1.35.0 - [CHAT-VERIFIED-SUBMIT-RESPONSE-CORRELATION 2026-08-23 by Codex] Adds `validate_for_request()` so every result state binds shape, request id, and message id before changing client or agent state; terminal success then performs the existing independent receipt proof.
 Previous: v1.34.0 - [CHAT-VERIFIED-SUBMIT-REQUEST-BINDING 2026-08-23 by Codex] Adds `verify_terminal_receipt_for_request()` so clients and agents bind terminal evidence to the exact random request id and submitted envelope during concurrent retries.
 Previous: v1.33.0 - [CHAT-SESSION-SENDER-BINDING 2026-08-23 by Codex] Moves authenticated transport identity matching to `ChatEnvelope::sender_matches_authenticated_identity()` so legacy relay, verified submit, SDK simulations, and future client-tunnel entry points share one pre-routing replay boundary.
@@ -3252,6 +3253,9 @@ Verification:
 - Real handler coverage for durable entry custody, no-route retry, unrelated
   authenticated-session rejection, exact response correlation, and
   aggregate-only result telemetry.
+- Real two-hop handler coverage for terminal-signed delivery plus entry
+  custody, followed by independent request-, payload-, purpose-, and
+  terminal-identity verification of the returned receipt.
 - Route-id retry stability and path-binding tests.
 - Exact terminal receipt signature, purpose, terminal identity, and payload
   commitment verification tests.
