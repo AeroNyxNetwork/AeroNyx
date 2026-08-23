@@ -607,8 +607,15 @@
 //     verified_delivery_witness wire/config name remains backward compatible,
 //     but a witnessed v3 anchor covers all committed restart-readiness state.
 //     Any signed adverse result must revoke the complete bundle at startup.
+//   - [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Authenticate
+//     before entering the private single-flight lane. Hold its guard through
+//     cache lookup, onion delivery, entry custody, and response insertion so
+//     concurrent exact retries cannot create contradictory delivery results.
 //
 // Last Modified:
+//   [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Replayed the first
+//     request-bound response for exact retries and rejected request-id reuse
+//     with another envelope before any route or durable-state mutation.
 //   [EXTERNAL-WITNESS-GENERATION-BINDING 2026-08-21 by Codex] Prevented a
 //     valid older anchor from authorizing restored state from a newer cache
 //     generation after an interrupted two-file durability update.
@@ -1010,7 +1017,7 @@ use crate::management::{
 use crate::miner::ReflectionMiner;
 use crate::services::chat_relay::{
     derive_node_secret, ChatRelayOutboundFailureReason, ChatRelayPeerStatus, ChatRelayService,
-    ExpiredNotification, MAX_CHAT_ACK_MESSAGE_IDS,
+    ExpiredNotification, VerifiedSubmitCacheLookup, MAX_CHAT_ACK_MESSAGE_IDS,
 };
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
@@ -14482,6 +14489,29 @@ impl Server {
             return rejected();
         };
 
+        // [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] The
+        // sender/request-id private key is single-flight across one fixed lock
+        // lane. Exact retries replay the first response without repeating
+        // onion relay or entry custody. Reuse for another envelope fails
+        // closed before route, wallet-route, or durable-state mutation.
+        let _single_flight = relay.lock_verified_submit(&request).await;
+        match relay.verified_submit_cache_lookup(&request) {
+            VerifiedSubmitCacheLookup::Exact(response) => {
+                relay.record_verified_submit_replay(unix_now_secs(), response.result);
+                return response;
+            }
+            VerifiedSubmitCacheLookup::Conflict => {
+                let response = rejected();
+                relay.record_verified_submit_conflict(unix_now_secs(), response.result);
+                warn!(
+                    reason = "verified_submit_request_conflict",
+                    "[CHAT_RELAY] Verified submit rejected"
+                );
+                return response;
+            }
+            VerifiedSubmitCacheLookup::Miss => {}
+        }
+
         relay.wallet_routes.announce(
             &request.envelope.sender,
             session.id.clone(),
@@ -14530,6 +14560,7 @@ impl Server {
         // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] The relay
         // status records only the closed result bucket, never identifiers.
         relay.record_verified_submit_result(unix_now_secs(), response.result);
+        relay.remember_verified_submit_response(&request, &response);
         response
     }
 
@@ -18892,6 +18923,44 @@ mod tests {
             .validate_for_request(&request)
             .expect("entry retry response must correlate");
 
+        let replay_response = Server::handle_verified_chat_submit(
+            request.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(replay_response, retry_response);
+
+        let mut conflicting_envelope = request.envelope.clone();
+        conflicting_envelope.message_id = [0x78; 16];
+        conflicting_envelope.nonce = [0x79; 24];
+        conflicting_envelope.signature = sender.sign(&conflicting_envelope.sign_data());
+        let conflicting_request = ChatRelayVerifiedSubmitRequestV1::signed(
+            request.request_id,
+            conflicting_envelope,
+            now,
+            &sender,
+        )
+        .expect("sign conflicting verified submit request");
+        let conflict_response = Server::handle_verified_chat_submit(
+            conflicting_request.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(conflict_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        conflict_response
+            .validate_for_request(&conflicting_request)
+            .expect("conflict response must correlate without leaking prior response");
+
         let unrelated_session = Arc::new(crate::services::Session::new(
             aeronyx_common::types::SessionId::generate(),
             unrelated.public_key(),
@@ -18916,10 +18985,12 @@ mod tests {
             .expect("rejected response must correlate");
 
         let status = relay.peer_status().verified_submit;
-        assert_eq!(status.total, 2);
-        assert_eq!(status.entry_retry_total, 1);
-        assert_eq!(status.rejected_total, 1);
+        assert_eq!(status.total, 4);
+        assert_eq!(status.entry_retry_total, 2);
+        assert_eq!(status.rejected_total, 2);
         assert_eq!(status.unknown_result_total, 0);
+        assert_eq!(status.replayed_total, 1);
+        assert_eq!(status.request_conflict_total, 1);
         assert_eq!(status.last_result.as_deref(), Some("rejected"));
     }
 
@@ -18948,12 +19019,16 @@ mod tests {
         let terminal_payload = encoded_envelope.clone();
 
         let terminal_receipt_identity = terminal_identity.clone();
+        let relay_requests = Arc::new(AtomicUsize::new(0));
+        let relay_requests_for_handler = Arc::clone(&relay_requests);
         let relay = Router::new().route(
             "/api/chat/peer/blind-relay",
             post(move |Json(request): Json<PeerBlindRelayRequest>| {
                 let terminal_receipt_identity = terminal_receipt_identity.clone();
                 let terminal_payload = terminal_payload.clone();
+                let relay_requests = Arc::clone(&relay_requests_for_handler);
                 async move {
+                    relay_requests.fetch_add(1, AtomicOrdering::Relaxed);
                     Json(PeerBlindRelayResponse {
                         accepted: true,
                         terminal: false,
@@ -19069,27 +19144,58 @@ mod tests {
             Ipv4Addr::new(100, 64, 0, 46),
             "127.0.0.1:1046".parse().unwrap(),
         ));
-        let verified_response = Server::handle_verified_chat_submit(
-            verified_request.clone(),
-            &verified_session,
-            &verified_relay_option,
-            &store,
-            &source.public_key_bytes(),
-            &source,
-            Some(&reqwest::Client::new()),
-        )
-        .await;
+        let source_node_id = source.public_key_bytes();
+        let first_client = reqwest::Client::new();
+        let concurrent_client = reqwest::Client::new();
+        let (verified_response, concurrent_response) = tokio::join!(
+            Server::handle_verified_chat_submit(
+                verified_request.clone(),
+                &verified_session,
+                &verified_relay_option,
+                &store,
+                &source_node_id,
+                &source,
+                Some(&first_client),
+            ),
+            Server::handle_verified_chat_submit(
+                verified_request.clone(),
+                &verified_session,
+                &verified_relay_option,
+                &store,
+                &source_node_id,
+                &source,
+                Some(&concurrent_client),
+            )
+        );
         assert_eq!(
             verified_response.result,
             CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1
         );
+        assert_eq!(concurrent_response, verified_response);
         verified_response
             .verify_terminal_receipt_for_request(&verified_request, &terminal_node_id)
             .expect("live handler response remains independently verifiable");
+        assert_eq!(relay_requests.load(AtomicOrdering::Relaxed), 2);
+
+        let replay_response = Server::handle_verified_chat_submit(
+            verified_request.clone(),
+            &verified_session,
+            &verified_relay_option,
+            &store,
+            &source_node_id,
+            &source,
+            Some(&reqwest::Client::new()),
+        )
+        .await;
+        assert_eq!(replay_response, verified_response);
+        assert_eq!(relay_requests.load(AtomicOrdering::Relaxed), 2);
+
         let verified_status = verified_relay.peer_status().verified_submit;
-        assert_eq!(verified_status.total, 1);
-        assert_eq!(verified_status.onion_and_entry_total, 1);
+        assert_eq!(verified_status.total, 3);
+        assert_eq!(verified_status.onion_and_entry_total, 3);
         assert_eq!(verified_status.unknown_result_total, 0);
+        assert_eq!(verified_status.replayed_total, 2);
+        assert_eq!(verified_status.request_conflict_total, 0);
 
         relay_server.abort();
         let _ = relay_server.await;

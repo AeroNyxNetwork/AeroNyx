@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.10.0-VerifiedSubmitResultLabels
+// Version: 3.11.0-VerifiedSubmitIdempotency
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -15,6 +15,9 @@
 //   [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] Reused the core
 //   protocol helper for verified-submit status labels so every consumer shares
 //   one closed vocabulary.
+//   [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Added a bounded,
+//   node-secret-indexed response cache and fixed-lane single-flight guard so
+//   retries return the first verified result without repeating onion custody.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -98,6 +101,7 @@
 //   - Relay health reason boundary: typed ingress with compatibility sanitizer
 //   - Verified submit telemetry: four closed aggregate result counters
 //   - Verified submit result labels: core-owned canonical status vocabulary
+//   - Verified submit idempotency: bounded exact-response replay and conflict guard
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -112,7 +116,8 @@
 //     4. Set and verify WAL + FULL pragmas
 //     5. init_schema() creates tables if missing
 //     6. Initialise MessageDedup (online-path LRU)
-//     7. Initialise WalletRouteCache (in-memory, empty on startup)
+//     7. Initialise bounded verified-submit response cache and lock lanes
+//     8. Initialise WalletRouteCache (in-memory, empty on startup)
 //
 // ⚠️ Important Notes for Next Developer:
 //   - wallet_routes is Arc<WalletRouteCache> so server.rs can hold a separate
@@ -216,10 +221,14 @@
 //   - [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] Status labels
 //     must continue to come from aeronyx-core protocol helpers; do not fork a
 //     dashboard-only vocabulary in the relay implementation.
+//   - [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Keep cache keys
+//     node-secret HMACs and the cache process-local. Never export sender keys,
+//     request ids, response receipts, or envelope commitments through health.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.11.0-VerifiedSubmitIdempotency — Bounded single-flight response replay
 //   v3.10.0-VerifiedSubmitResultLabels — Core-owned verified-submit labels
 //   v3.9.0-VerifiedSubmitTelemetry — Aggregate verified-submit result counters
 //   v3.8.0-RelayHealthReasonBoundary — Typed privacy-safe failure allowlist
@@ -257,7 +266,7 @@
 //   v1.3.1-Maintenance — Removed stale imports; behavior unchanged
 // ============================================================================
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -287,7 +296,8 @@ use aeronyx_core::protocol::chat::{
     decode_envelope, encode_envelope, ChatEnvelope, CustodyAuditAnchorV1,
 };
 use aeronyx_core::protocol::memchain::{
-    chat_verified_submit_result_label, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+    chat_verified_submit_result_label, ChatRelayVerifiedSubmitRequestV1,
+    ChatRelayVerifiedSubmitResponseV1, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
     CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1, CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1,
     CHAT_VERIFIED_SUBMIT_REJECTED_V1,
 };
@@ -328,6 +338,8 @@ const CHAT_PULL_CURSOR_V2_VERSION: u8 = 1;
 const CHAT_PULL_CURSOR_V2_NONCE_BYTES: usize = 24;
 const CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES: usize = 16;
 const CHAT_PULL_CURSOR_V2_TAG_BYTES: usize = 16;
+/// Fixed lock striping for concurrent verified-submit single-flight handling.
+const VERIFIED_SUBMIT_SINGLE_FLIGHT_LANES: usize = 64;
 const CHAT_PULL_CURSOR_V2_BYTES: usize = 1
     + CHAT_PULL_CURSOR_V2_NONCE_BYTES
     + CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES
@@ -480,6 +492,10 @@ pub struct ChatRelayVerifiedSubmitStatus {
     pub rejected_total: u64,
     /// Defensive counter for impossible result codes from a future mismatch.
     pub unknown_result_total: u64,
+    /// Exact retries served from the bounded process-local response cache.
+    pub replayed_total: u64,
+    /// Authenticated sender/request-id reuse with a different envelope.
+    pub request_conflict_total: u64,
     /// Last closed result bucket observed.
     pub last_result: Option<String>,
     /// Timestamp of the last observed verified-submit result.
@@ -509,6 +525,16 @@ impl ChatRelayVerifiedSubmitStatus {
         let bucket = chat_verified_submit_result_label(result).unwrap_or("unknown");
         self.last_result = Some(bucket.to_string());
         self.last_at = Some(now);
+    }
+
+    fn record_replay(&mut self, now: u64, result: u8) {
+        self.replayed_total = self.replayed_total.saturating_add(1);
+        self.record(now, result);
+    }
+
+    fn record_conflict(&mut self, now: u64, result: u8) {
+        self.request_conflict_total = self.request_conflict_total.saturating_add(1);
+        self.record(now, result);
     }
 }
 
@@ -2335,6 +2361,87 @@ impl MessageDedup {
 }
 
 // ============================================
+// Verified-submit idempotency
+// ============================================
+
+/// Result of looking up one authenticated verified-submit request.
+pub(crate) enum VerifiedSubmitCacheLookup {
+    /// No prior completed request exists under this private cache key.
+    Miss,
+    /// The exact request completed previously; return this response verbatim.
+    Exact(ChatRelayVerifiedSubmitResponseV1),
+    /// The same sender/request id was reused with a different envelope.
+    Conflict,
+}
+
+#[derive(Clone)]
+struct VerifiedSubmitCacheEntry {
+    envelope_commitment: [u8; 32],
+    response: ChatRelayVerifiedSubmitResponseV1,
+}
+
+/// Fixed-capacity process-local cache for completed verified submissions.
+///
+/// [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Keys are
+/// domain-separated node-secret HMACs over sender plus request id. Raw routing
+/// metadata never becomes a cache key, log field, heartbeat field, or durable
+/// row. A fixed number of async lock lanes serializes the same private key
+/// while allowing unrelated submissions to proceed concurrently.
+struct VerifiedSubmitResponseCache {
+    entries: HashMap<[u8; 32], VerifiedSubmitCacheEntry>,
+    insertion_order: VecDeque<[u8; 32]>,
+    capacity: usize,
+}
+
+impl VerifiedSubmitResponseCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            insertion_order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn lookup(
+        &self,
+        cache_key: &[u8; 32],
+        envelope_commitment: &[u8; 32],
+    ) -> VerifiedSubmitCacheLookup {
+        let Some(entry) = self.entries.get(cache_key) else {
+            return VerifiedSubmitCacheLookup::Miss;
+        };
+        if &entry.envelope_commitment != envelope_commitment {
+            return VerifiedSubmitCacheLookup::Conflict;
+        }
+        VerifiedSubmitCacheLookup::Exact(entry.response.clone())
+    }
+
+    fn insert(
+        &mut self,
+        cache_key: [u8; 32],
+        envelope_commitment: [u8; 32],
+        response: ChatRelayVerifiedSubmitResponseV1,
+    ) {
+        if self.entries.contains_key(&cache_key) {
+            return;
+        }
+        if self.entries.len() >= self.capacity {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.insertion_order.push_back(cache_key);
+        self.entries.insert(
+            cache_key,
+            VerifiedSubmitCacheEntry {
+                envelope_commitment,
+                response,
+            },
+        );
+    }
+}
+
+// ============================================
 // ChatRelayService
 // ============================================
 
@@ -2351,6 +2458,8 @@ pub struct ChatRelayService {
     /// Stable node-local AEAD key for opaque v2 pull cursors.
     pull_cursor_key: [u8; 32],
     dedup: MessageDedup,
+    verified_submit_cache: Mutex<VerifiedSubmitResponseCache>,
+    verified_submit_lanes: Box<[tokio::sync::Mutex<()>]>,
     peer_status: RwLock<ChatRelayPeerStatus>,
     direct_peer_retry_slo: Mutex<DirectPeerRetrySloWindow>,
     direct_peer_relay_circuit: Mutex<DirectPeerRelayCircuit>,
@@ -5039,6 +5148,10 @@ impl ChatRelayService {
             node_secret,
             pull_cursor_key,
             dedup: MessageDedup::new(dedup_capacity),
+            verified_submit_cache: Mutex::new(VerifiedSubmitResponseCache::new(dedup_capacity)),
+            verified_submit_lanes: (0..VERIFIED_SUBMIT_SINGLE_FLIGHT_LANES)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
             peer_status: RwLock::new(peer_status),
             direct_peer_retry_slo: Mutex::new(DirectPeerRetrySloWindow::default()),
             direct_peer_relay_circuit: Mutex::new(DirectPeerRelayCircuit::default()),
@@ -5796,6 +5909,60 @@ impl ChatRelayService {
     /// online path (duplicate detection for live sessions).
     pub fn is_online_duplicate(&self, message_id: &[u8; 16]) -> bool {
         self.dedup.check_and_insert(message_id)
+    }
+
+    fn verified_submit_cache_key(&self, request: &ChatRelayVerifiedSubmitRequestV1) -> [u8; 32] {
+        let mut mac =
+            HmacSha256::new_from_slice(&self.node_secret).expect("HMAC accepts any key length");
+        mac.update(b"AeroNyx-VerifiedSubmit-ResponseCache-v1");
+        mac.update(&request.envelope.sender);
+        mac.update(&request.request_id);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Serializes requests sharing one private sender/request-id cache key.
+    ///
+    /// Unrelated submissions remain concurrent across fixed lock lanes. The
+    /// caller must hold the returned guard through lookup, relay/custody, and
+    /// response insertion so duplicate requests cannot both become leaders.
+    pub(crate) async fn lock_verified_submit(
+        &self,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        let cache_key = self.verified_submit_cache_key(request);
+        let lane_seed = u64::from_le_bytes(
+            cache_key[..8]
+                .try_into()
+                .expect("verified submit cache key has eight prefix bytes"),
+        );
+        let lane =
+            usize::try_from(lane_seed).unwrap_or(usize::MAX) % self.verified_submit_lanes.len();
+        self.verified_submit_lanes[lane].lock().await
+    }
+
+    /// Looks up a completed response after request authentication.
+    pub(crate) fn verified_submit_cache_lookup(
+        &self,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+    ) -> VerifiedSubmitCacheLookup {
+        let cache_key = self.verified_submit_cache_key(request);
+        self.verified_submit_cache
+            .lock()
+            .lookup(&cache_key, &request.envelope_commitment())
+    }
+
+    /// Retains one completed response for exact retry replay.
+    pub(crate) fn remember_verified_submit_response(
+        &self,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+        response: &ChatRelayVerifiedSubmitResponseV1,
+    ) {
+        let cache_key = self.verified_submit_cache_key(request);
+        self.verified_submit_cache.lock().insert(
+            cache_key,
+            request.envelope_commitment(),
+            response.clone(),
+        );
     }
 
     // ============================================
@@ -7490,10 +7657,23 @@ impl ChatRelayService {
         // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] This is a
         // single node-wide counter update. Do not attach request, message,
         // route, endpoint, wallet, receipt, or payload dimensions here.
+        self.peer_status.write().verified_submit.record(now, result);
+    }
+
+    /// Records one exact retry served without repeating route or custody work.
+    pub(crate) fn record_verified_submit_replay(&self, now: u64, result: u8) {
         self.peer_status
             .write()
             .verified_submit
-            .record(now, result);
+            .record_replay(now, result);
+    }
+
+    /// Records fail-closed reuse of a request id for a different envelope.
+    pub(crate) fn record_verified_submit_conflict(&self, now: u64, result: u8) {
+        self.peer_status
+            .write()
+            .verified_submit
+            .record_conflict(now, result);
     }
 
     /// Records an accepted inbound peer relay request.
@@ -10013,16 +10193,54 @@ mod tests {
         svc.record_verified_submit_result(1_800_000_062, CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1);
         svc.record_verified_submit_result(1_800_000_063, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1);
         svc.record_verified_submit_result(1_800_000_064, u8::MAX);
+        svc.record_verified_submit_replay(1_800_000_065, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1);
+        svc.record_verified_submit_conflict(1_800_000_066, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
 
         let status = svc.peer_status().verified_submit;
-        assert_eq!(status.total, 5);
-        assert_eq!(status.rejected_total, 1);
+        assert_eq!(status.total, 7);
+        assert_eq!(status.rejected_total, 2);
         assert_eq!(status.entry_retry_total, 1);
         assert_eq!(status.onion_only_total, 1);
-        assert_eq!(status.onion_and_entry_total, 1);
+        assert_eq!(status.onion_and_entry_total, 2);
         assert_eq!(status.unknown_result_total, 1);
-        assert_eq!(status.last_result.as_deref(), Some("unknown"));
-        assert_eq!(status.last_at, Some(1_800_000_064));
+        assert_eq!(status.replayed_total, 1);
+        assert_eq!(status.request_conflict_total, 1);
+        assert_eq!(status.last_result.as_deref(), Some("rejected"));
+        assert_eq!(status.last_at, Some(1_800_000_066));
+    }
+
+    #[test]
+    fn verified_submit_response_cache_is_bounded_and_conflict_safe() {
+        let mut cache = VerifiedSubmitResponseCache::new(1);
+        let first_key = [0xA1; 32];
+        let first_commitment = [0xA2; 32];
+        let first_response = ChatRelayVerifiedSubmitResponseV1::rejected([0xA3; 16], [0xA4; 16]);
+        cache.insert(first_key, first_commitment, first_response.clone());
+        assert!(matches!(
+            cache.lookup(&first_key, &[0xA5; 32]),
+            VerifiedSubmitCacheLookup::Conflict
+        ));
+        let VerifiedSubmitCacheLookup::Exact(cached) = cache.lookup(&first_key, &first_commitment)
+        else {
+            panic!("exact verified submit response must remain replayable");
+        };
+        assert_eq!(cached, first_response);
+
+        let second_key = [0xB1; 32];
+        let second_commitment = [0xB2; 32];
+        cache.insert(
+            second_key,
+            second_commitment,
+            ChatRelayVerifiedSubmitResponseV1::rejected([0xB3; 16], [0xB4; 16]),
+        );
+        assert!(matches!(
+            cache.lookup(&first_key, &first_commitment),
+            VerifiedSubmitCacheLookup::Miss
+        ));
+        assert!(matches!(
+            cache.lookup(&second_key, &second_commitment),
+            VerifiedSubmitCacheLookup::Exact(_)
+        ));
     }
 
     #[test]
