@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.9.0-VerifiedSubmitTelemetry
+// Version: 3.10.0-VerifiedSubmitResultLabels
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -12,6 +12,9 @@
 //   verified-submit result counters so nodeboard can distinguish terminal
 //   proof success, entry custody fallback, and rejection without exposing
 //   message, wallet, route, receipt, endpoint, or payload metadata.
+//   [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] Reused the core
+//   protocol helper for verified-submit status labels so every consumer shares
+//   one closed vocabulary.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -94,6 +97,7 @@
 //   - Custody backup retention: bounded, verified, serialized local audit
 //   - Relay health reason boundary: typed ingress with compatibility sanitizer
 //   - Verified submit telemetry: four closed aggregate result counters
+//   - Verified submit result labels: core-owned canonical status vocabulary
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -209,10 +213,14 @@
 //     telemetry is an aggregate delivery-mode counter only. Never add message
 //     ids, request ids, receipts, routes, wallet keys, endpoints, payload
 //     commitments, or per-user dimensions.
+//   - [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] Status labels
+//     must continue to come from aeronyx-core protocol helpers; do not fork a
+//     dashboard-only vocabulary in the relay implementation.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.10.0-VerifiedSubmitResultLabels — Core-owned verified-submit labels
 //   v3.9.0-VerifiedSubmitTelemetry — Aggregate verified-submit result counters
 //   v3.8.0-RelayHealthReasonBoundary — Typed privacy-safe failure allowlist
 //   v3.7.0-CustodyAuditAnchor — Portable node-signed checkpoint commitment
@@ -279,8 +287,9 @@ use aeronyx_core::protocol::chat::{
     decode_envelope, encode_envelope, ChatEnvelope, CustodyAuditAnchorV1,
 };
 use aeronyx_core::protocol::memchain::{
-    CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
-    CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1, CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+    chat_verified_submit_result_label, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+    CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1, CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1,
+    CHAT_VERIFIED_SUBMIT_REJECTED_V1,
 };
 
 use crate::config::ChatRelayConfig;
@@ -480,28 +489,24 @@ pub struct ChatRelayVerifiedSubmitStatus {
 impl ChatRelayVerifiedSubmitStatus {
     fn record(&mut self, now: u64, result: u8) {
         self.total = self.total.saturating_add(1);
-        let bucket = match result {
+        match result {
             CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1 => {
                 self.onion_and_entry_total = self.onion_and_entry_total.saturating_add(1);
-                "onion_and_entry"
             }
             CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1 => {
                 self.onion_only_total = self.onion_only_total.saturating_add(1);
-                "onion_only"
             }
             CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1 => {
                 self.entry_retry_total = self.entry_retry_total.saturating_add(1);
-                "entry_retry"
             }
             CHAT_VERIFIED_SUBMIT_REJECTED_V1 => {
                 self.rejected_total = self.rejected_total.saturating_add(1);
-                "rejected"
             }
             _ => {
                 self.unknown_result_total = self.unknown_result_total.saturating_add(1);
-                "unknown"
             }
         };
+        let bucket = chat_verified_submit_result_label(result).unwrap_or("unknown");
         self.last_result = Some(bucket.to_string());
         self.last_at = Some(now);
     }

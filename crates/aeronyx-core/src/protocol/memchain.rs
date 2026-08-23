@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.17-VerifiedChatSubmit
+// Version: 2.8.18-VerifiedSubmitResultLabels
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -35,6 +35,9 @@
 //   discriminants and wire bytes remain unchanged.
 //   v2.8.17-VerifiedChatSubmit — Appended an opt-in authenticated client frame
 //   that requires terminal-signed onion delivery evidence plus its response.
+//   v2.8.18-VerifiedSubmitResultLabels — Centralized privacy-safe labels for
+//   the fixed verified-submit result vocabulary. Existing wire bytes remain
+//   unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -76,6 +79,7 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.18-VerifiedSubmitResultLabels — Added helper labels for result codes
 //   v2.8.17-VerifiedChatSubmit — Appended variants 38-39 without changing any
 //                        existing discriminant or legacy ChatRelay behavior
 //   v2.8.16-CustodyAuditWitnessNetwork — Appended variants 36-37 and canonical
@@ -169,6 +173,23 @@ pub const CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1: u8 = 1;
 pub const CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1: u8 = 2;
 /// Neither verified terminal delivery nor entry-node custody succeeded.
 pub const CHAT_VERIFIED_SUBMIT_REJECTED_V1: u8 = 3;
+
+/// Privacy-safe label for the fixed verified-submit result vocabulary.
+///
+/// [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] This helper is the
+/// canonical mapping used by health telemetry, SDKs, and dashboards. It maps
+/// only closed result codes and never accepts or returns route, receipt,
+/// message, endpoint, wallet, or payload metadata.
+#[must_use]
+pub fn chat_verified_submit_result_label(result: u8) -> Option<&'static str> {
+    match result {
+        CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1 => Some("onion_and_entry"),
+        CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1 => Some("onion_only"),
+        CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1 => Some("entry_retry"),
+        CHAT_VERIFIED_SUBMIT_REJECTED_V1 => Some("rejected"),
+        _ => None,
+    }
+}
 
 /// Opt-in client request for a terminal-verifiable onion chat delivery.
 ///
@@ -2275,6 +2296,30 @@ mod tests {
             }),
         };
         assert!(response.validate_shape().is_err());
+    }
+
+    #[test]
+    fn verified_chat_submit_result_labels_are_closed_and_stable() {
+        // [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] Keep the
+        // status vocabulary stable for nodeboard and SDK consumers while the
+        // wire discriminants remain numeric.
+        assert_eq!(
+            chat_verified_submit_result_label(CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1),
+            Some("onion_and_entry")
+        );
+        assert_eq!(
+            chat_verified_submit_result_label(CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1),
+            Some("onion_only")
+        );
+        assert_eq!(
+            chat_verified_submit_result_label(CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1),
+            Some("entry_retry")
+        );
+        assert_eq!(
+            chat_verified_submit_result_label(CHAT_VERIFIED_SUBMIT_REJECTED_V1),
+            Some("rejected")
+        );
+        assert_eq!(chat_verified_submit_result_label(u8::MAX), None);
     }
 
     #[test]

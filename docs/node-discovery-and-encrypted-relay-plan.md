@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.27.0 - [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Adds aggregate-only `peer_relay.verified_submit` counters for the closed verified-submit result vocabulary; no message ids, request ids, routes, receipts, endpoints, wallet keys, or payload commitments are exported.
+Last Modified: v1.28.0 - [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] Centralizes verified-submit result labels in `aeronyx-core::protocol::memchain::chat_verified_submit_result_label()` so relay health, nodeboard, SDKs, and docs share one closed vocabulary.
+Previous: v1.27.0 - [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Adds aggregate-only `peer_relay.verified_submit` counters for the closed verified-submit result vocabulary; no message ids, request ids, routes, receipts, endpoints, wallet keys, or payload commitments are exported.
 Previous: v1.25.0 - [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Runs previous-hop authentication and request commitment hashing behind CPU-aware, fail-fast blocking admission; unauthenticated requests receive no node-signed failure receipt and cannot mutate claimed-peer state.
 Previous: v1.24.0 - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforces previous-hop request, failure-decay, quarantine, idle-retention, and LRU windows with process-local monotonic time while projecting only a compatibility timestamp to PeerStore and Nodeboard.
 Previous: v1.23.0 - [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Removes stale previous-hop buckets regardless of FIFO position, evicts only the least-recently-used non-quarantined identity under pressure, and never deletes active quarantine to admit a fresh permissionless key.
@@ -3179,6 +3180,11 @@ Implemented:
   aggregate four-result counter set. This field is process-local telemetry and
   never exports message ids, request ids, routes, receipts, endpoints, wallet
   keys, or payload commitments.
+- [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] The public labels
+  for those numeric result codes are centralized in
+  `chat_verified_submit_result_label()`: `onion_and_entry`, `onion_only`,
+  `entry_retry`, and `rejected`. Unknown future codes must remain `unknown`
+  in telemetry until the protocol vocabulary is deliberately extended.
 - Receipt verification must bind the opaque envelope, message-relay purpose,
   and a terminal identity independently verified from the signed node
   directory. A receipt's embedded identity is never its own trust root.
