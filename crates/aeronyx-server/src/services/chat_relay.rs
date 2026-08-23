@@ -1,13 +1,17 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.8.0-RelayHealthReasonBoundary
+// Version: 3.9.0-VerifiedSubmitTelemetry
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
 //   allowlisted relay-health failure reasons so arbitrary runtime strings can
 //   never cross into heartbeat-visible status. Legacy public record methods
 //   remain source-compatible and sanitize unknown input to `unknown`.
+//   [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Added aggregate-only
+//   verified-submit result counters so nodeboard can distinguish terminal
+//   proof success, entry custody fallback, and rejection without exposing
+//   message, wallet, route, receipt, endpoint, or payload metadata.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -89,6 +93,7 @@
 //   - Idempotent custody backup: restart-safe command replay without raw IDs
 //   - Custody backup retention: bounded, verified, serialized local audit
 //   - Relay health reason boundary: typed ingress with compatibility sanitizer
+//   - Verified submit telemetry: four closed aggregate result counters
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -200,10 +205,15 @@
 //     relay failure reasons must enter through the typed allowlist below.
 //     Unknown, typoed, URL-bearing, identifier-bearing, or payload-derived
 //     strings are reduced to `unknown`; never widen this into a pass-through.
+//   - [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Verified-submit
+//     telemetry is an aggregate delivery-mode counter only. Never add message
+//     ids, request ids, receipts, routes, wallet keys, endpoints, payload
+//     commitments, or per-user dimensions.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.9.0-VerifiedSubmitTelemetry — Aggregate verified-submit result counters
 //   v3.8.0-RelayHealthReasonBoundary — Typed privacy-safe failure allowlist
 //   v3.7.0-CustodyAuditAnchor — Portable node-signed checkpoint commitment
 //   v3.6.0-CustodyAuditRotation — Crash-safe segmented maintenance audit
@@ -267,6 +277,10 @@ use tracing::{debug, info, warn};
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::chat::{
     decode_envelope, encode_envelope, ChatEnvelope, CustodyAuditAnchorV1,
+};
+use aeronyx_core::protocol::memchain::{
+    CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
+    CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1, CHAT_VERIFIED_SUBMIT_REJECTED_V1,
 };
 
 use crate::config::ChatRelayConfig;
@@ -434,6 +448,63 @@ pub struct ChatRelayOutboundRouteStatus {
     pub last_success_at: Option<u64>,
     /// Timestamp of the latest route-class round.
     pub last_at: Option<u64>,
+}
+
+/// Aggregate-only status for explicit client verified-onion submissions.
+///
+/// [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] The result vocabulary
+/// mirrors the protocol constants but intentionally omits request ids, message
+/// ids, routes, terminal receipts, peer identities, wallet keys, and payload
+/// commitments. It is safe for heartbeat and nodeboard.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatRelayVerifiedSubmitStatus {
+    /// Total verified-submit requests observed by this relay runtime.
+    pub total: u64,
+    /// Requests with both terminal onion proof and entry custody.
+    pub onion_and_entry_total: u64,
+    /// Requests with terminal onion proof but failed entry custody.
+    pub onion_only_total: u64,
+    /// Requests stored by entry custody while onion delivery needs retry.
+    pub entry_retry_total: u64,
+    /// Requests rejected or lacking any acceptable custody evidence.
+    pub rejected_total: u64,
+    /// Defensive counter for impossible result codes from a future mismatch.
+    pub unknown_result_total: u64,
+    /// Last closed result bucket observed.
+    pub last_result: Option<String>,
+    /// Timestamp of the last observed verified-submit result.
+    pub last_at: Option<u64>,
+}
+
+impl ChatRelayVerifiedSubmitStatus {
+    fn record(&mut self, now: u64, result: u8) {
+        self.total = self.total.saturating_add(1);
+        let bucket = match result {
+            CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1 => {
+                self.onion_and_entry_total = self.onion_and_entry_total.saturating_add(1);
+                "onion_and_entry"
+            }
+            CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1 => {
+                self.onion_only_total = self.onion_only_total.saturating_add(1);
+                "onion_only"
+            }
+            CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1 => {
+                self.entry_retry_total = self.entry_retry_total.saturating_add(1);
+                "entry_retry"
+            }
+            CHAT_VERIFIED_SUBMIT_REJECTED_V1 => {
+                self.rejected_total = self.rejected_total.saturating_add(1);
+                "rejected"
+            }
+            _ => {
+                self.unknown_result_total = self.unknown_result_total.saturating_add(1);
+                "unknown"
+            }
+        };
+        self.last_result = Some(bucket.to_string());
+        self.last_at = Some(now);
+    }
 }
 
 /// Fixed-window target-bound direct relay delivery SLO.
@@ -1398,6 +1469,9 @@ pub struct ChatRelayPeerStatus {
     /// Aggregate target-bound direct relay retry reliability.
     #[serde(default)]
     pub direct_peer_retry: ChatRelayDirectPeerRetryStatus,
+    /// Explicit verified-onion client submit outcomes.
+    #[serde(default)]
+    pub verified_submit: ChatRelayVerifiedSubmitStatus,
     /// Total inbound peer relay envelopes accepted for local processing.
     pub inbound_accepted_total: u64,
     /// Total inbound duplicate envelopes ignored idempotently.
@@ -1442,6 +1516,7 @@ impl ChatRelayPeerStatus {
             authenticated_onion_outbound: ChatRelayOutboundRouteStatus::default(),
             direct_peer_outbound: ChatRelayOutboundRouteStatus::default(),
             direct_peer_retry: ChatRelayDirectPeerRetryStatus::default(),
+            verified_submit: ChatRelayVerifiedSubmitStatus::default(),
             inbound_accepted_total: 0,
             inbound_duplicate_total: 0,
             inbound_delivered_online_total: 0,
@@ -7405,6 +7480,17 @@ impl ChatRelayService {
         }
     }
 
+    /// Records the closed aggregate result of one explicit verified submit.
+    pub(crate) fn record_verified_submit_result(&self, now: u64, result: u8) {
+        // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] This is a
+        // single node-wide counter update. Do not attach request, message,
+        // route, endpoint, wallet, receipt, or payload dimensions here.
+        self.peer_status
+            .write()
+            .verified_submit
+            .record(now, result);
+    }
+
     /// Records an accepted inbound peer relay request.
     pub fn record_peer_relay_inbound_accepted(
         &self,
@@ -9914,6 +10000,27 @@ mod tests {
     }
 
     #[test]
+    fn verified_submit_health_tracks_closed_result_vocabulary() {
+        let svc = make_service();
+
+        svc.record_verified_submit_result(1_800_000_060, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        svc.record_verified_submit_result(1_800_000_061, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1);
+        svc.record_verified_submit_result(1_800_000_062, CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1);
+        svc.record_verified_submit_result(1_800_000_063, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1);
+        svc.record_verified_submit_result(1_800_000_064, u8::MAX);
+
+        let status = svc.peer_status().verified_submit;
+        assert_eq!(status.total, 5);
+        assert_eq!(status.rejected_total, 1);
+        assert_eq!(status.entry_retry_total, 1);
+        assert_eq!(status.onion_only_total, 1);
+        assert_eq!(status.onion_and_entry_total, 1);
+        assert_eq!(status.unknown_result_total, 1);
+        assert_eq!(status.last_result.as_deref(), Some("unknown"));
+        assert_eq!(status.last_at, Some(1_800_000_064));
+    }
+
+    #[test]
     fn peer_health_deserializes_pre_route_class_snapshot() {
         let svc = make_service();
         svc.record_peer_relay_outbound(1_800_000_050, 1, 1, None);
@@ -9923,6 +10030,7 @@ mod tests {
         object.remove("authenticated_onion_outbound");
         object.remove("direct_peer_outbound");
         object.remove("direct_peer_retry");
+        object.remove("verified_submit");
 
         // [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] Additive health
         // fields must not invalidate status cached or forwarded by an older
@@ -9940,6 +10048,10 @@ mod tests {
         assert_eq!(
             decoded.direct_peer_retry,
             ChatRelayDirectPeerRetryStatus::default()
+        );
+        assert_eq!(
+            decoded.verified_submit,
+            ChatRelayVerifiedSubmitStatus::default()
         );
     }
 

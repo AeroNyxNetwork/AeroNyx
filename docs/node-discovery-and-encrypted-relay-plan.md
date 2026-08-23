@@ -31,7 +31,7 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.26.0 - [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] Adds an opt-in, sender-signed verified-onion submit frame and a closed response carrying the exact terminal receipt; the legacy `ChatRelay` wire index and default central-relay behavior remain unchanged.
+Last Modified: v1.27.0 - [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Adds aggregate-only `peer_relay.verified_submit` counters for the closed verified-submit result vocabulary; no message ids, request ids, routes, receipts, endpoints, wallet keys, or payload commitments are exported.
 Previous: v1.25.0 - [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Runs previous-hop authentication and request commitment hashing behind CPU-aware, fail-fast blocking admission; unauthenticated requests receive no node-signed failure receipt and cannot mutate claimed-peer state.
 Previous: v1.24.0 - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforces previous-hop request, failure-decay, quarantine, idle-retention, and LRU windows with process-local monotonic time while projecting only a compatibility timestamp to PeerStore and Nodeboard.
 Previous: v1.23.0 - [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Removes stale previous-hop buckets regardless of FIFO position, evicts only the least-recently-used non-quarantined identity under pressure, and never deletes active quarantine to admit a fresh permissionless key.
@@ -3175,6 +3175,10 @@ Implemented:
 - Client-visible results use a closed four-state vocabulary: verified onion
   plus entry custody, verified onion only, entry custody with onion retry
   required, or rejected.
+- Node heartbeat and nodeboard can read `peer_relay.verified_submit` for the
+  aggregate four-result counter set. This field is process-local telemetry and
+  never exports message ids, request ids, routes, receipts, endpoints, wallet
+  keys, or payload commitments.
 - Receipt verification must bind the opaque envelope, message-relay purpose,
   and a terminal identity independently verified from the signed node
   directory. A receipt's embedded identity is never its own trust root.

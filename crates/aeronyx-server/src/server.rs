@@ -14523,6 +14523,14 @@ impl Server {
                 &session.client_public_key.to_bytes(),
             )
         {
+            if let Some(relay) = chat_relay.as_ref() {
+                // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Count
+                // rejected explicit submissions only as an aggregate result.
+                relay.record_verified_submit_result(
+                    unix_now_secs(),
+                    CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+                );
+            }
             warn!(
                 reason = "verified_submit_authentication_failed",
                 "[CHAT_RELAY] Verified submit rejected"
@@ -14580,6 +14588,9 @@ impl Server {
             verified_onion && onion_delivered,
             entry_custody,
         );
+        // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] The relay
+        // status records only the closed result bucket, never identifiers.
+        relay.record_verified_submit_result(unix_now_secs(), result);
 
         ChatRelayVerifiedSubmitResponseV1 {
             request_id: request.request_id,
@@ -23031,7 +23042,7 @@ mod tests {
         let node_id = descriptor.node_id();
         let original = Arc::new(PeerStore::new());
         assert!(original.upsert_verified(descriptor.clone(), now).unwrap());
-        original.record_route_forward_success_for_descriptor(&descriptor, now + 1);
+        assert!(original.record_route_forward_success_for_descriptor(&descriptor, now + 1));
         for observed_at in [now + 2, now + 3, now + 4] {
             assert!(original.record_route_forward_failure_for_descriptor(
                 &descriptor,
@@ -23119,7 +23130,7 @@ mod tests {
         let node_id = descriptor.node_id();
         let original = Arc::new(PeerStore::new());
         assert!(original.upsert_verified(descriptor.clone(), now).unwrap());
-        original.record_route_forward_success_for_descriptor(&descriptor, now + 1);
+        assert!(original.record_route_forward_success_for_descriptor(&descriptor, now + 1));
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -24957,11 +24968,15 @@ mod tests {
             .await
             .unwrap();
         let path = non_directory_parent.join("peer-cache.json");
+        // [PEER-CACHE-TEST-HTTP-CLIENT 2026-08-23 by Codex] Keep isolated
+        // cache tests off macOS system proxy discovery; DynamicStore is not
+        // available in every CI/sandbox session.
+        let http_client = test_peer_http_client();
         let result = Server::persist_peer_store_cache_with_delivery_witnesses(
             &server.identity,
             &peer_store,
             &server.config.discovery,
-            &reqwest::Client::new(),
+            http_client.as_ref(),
             &path.to_string_lossy(),
             1_800_040_000,
             false,
@@ -25015,11 +25030,14 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aeronyx-peer-cache-deferred-{unique}.json"));
         let path_str = path.to_string_lossy().to_string();
 
+        // [PEER-CACHE-TEST-HTTP-CLIENT 2026-08-23 by Codex] The test expects
+        // an unavailable witness result, not host proxy initialization failure.
+        let http_client = test_peer_http_client();
         let outcome = Server::persist_peer_store_cache_with_delivery_witnesses(
             &server.identity,
             &peer_store,
             &discovery,
-            &reqwest::Client::new(),
+            http_client.as_ref(),
             &path_str,
             1_800_040_100,
             false,
@@ -25090,11 +25108,14 @@ mod tests {
         let missing_path = std::env::temp_dir().join(format!(
             "aeronyx-peer-cache-startup-witness-gate-{unique}.json"
         ));
+        // [PEER-CACHE-TEST-HTTP-CLIENT 2026-08-23 by Codex] Reuse the
+        // proxy-free test client so startup-gate assertions stay deterministic.
+        let http_client = test_peer_http_client();
         let decision = Server::reconcile_peer_cache_delivery_witnesses(
             &server.identity,
             &peer_store,
             &discovery,
-            &reqwest::Client::new(),
+            http_client.as_ref(),
             &missing_path.to_string_lossy(),
             true,
         )
@@ -25191,11 +25212,14 @@ mod tests {
         discovery.verified_delivery_witness_node_ids =
             vec![hex::encode(witness.public_key_bytes())];
         discovery.verified_delivery_witness_required_for_restore = true;
+        // [PEER-CACHE-TEST-HTTP-CLIENT 2026-08-23 by Codex] Avoid leaking
+        // platform proxy configuration into cache-ahead recovery tests.
+        let http_client = test_peer_http_client();
         let decision = Server::reconcile_peer_cache_delivery_witnesses(
             &server.identity,
             &peer_store,
             &discovery,
-            &reqwest::Client::new(),
+            http_client.as_ref(),
             &path_str,
             true,
         )
