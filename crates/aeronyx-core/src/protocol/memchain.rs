@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.16-CustodyAuditWitnessNetwork
+// Version: 2.8.17-VerifiedChatSubmit
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -33,6 +33,8 @@
 //   v2.8.16-CustodyAuditWitnessNetwork — Appended fixed-size signed request and
 //   response frames for independent custody-audit anchor witnesses. Existing
 //   discriminants and wire bytes remain unchanged.
+//   v2.8.17-VerifiedChatSubmit — Appended an opt-in authenticated client frame
+//   that requires terminal-signed onion delivery evidence plus its response.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -63,6 +65,8 @@
 //     tunnels
 //   - SessionCloseV1 (35) is a client-tunnel control frame. It must match both
 //     the outer encrypted session ID and its handshake Ed25519 identity.
+//   - ChatRelayVerifiedSubmitV1 (38) is opt-in. Legacy ChatRelay (11) remains
+//     unchanged and must never be silently upgraded to stronger semantics.
 //   - Commitment blocks contain opaque record IDs only; sealed memory payload
 //     replication requires a separate owner-authorised protocol
 //   - serde_bytes64 is defined in chat.rs; the [u8;64] signature fields here
@@ -72,6 +76,8 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.17-VerifiedChatSubmit — Appended variants 38-39 without changing any
+//                        existing discriminant or legacy ChatRelay behavior
 //   v2.8.16-CustodyAuditWitnessNetwork — Appended variants 36-37 and canonical
 //                        exact-anchor/receipt request bindings
 //   v2.8.15-AuthenticatedSessionClose — Appended variant 35 for bounded,
@@ -100,16 +106,23 @@
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 
+use crate::crypto::IdentityKeyPair;
+use crate::error::CoreError;
 #[allow(deprecated)]
 use crate::ledger::Fact;
 use crate::ledger::{
     BlockHeader, MemoryRecord, RecordCommitmentBlockV1, RecordCommitmentHeaderV1,
     RecordCoordinatorHandoverV1,
 };
+use crate::protocol::auth::{
+    signed_message_digest, verify_signed_message, AuthError, DOMAIN_CHAT_VERIFIED_SUBMIT_V1,
+};
 use crate::protocol::chat::{
-    ChatEnvelope, CustodyAuditAnchorV1, CustodyAuditWitnessReceiptV1,
+    encode_envelope, BlindRelayDeliveryReceipt, ChatEnvelope, CustodyAuditAnchorV1,
+    CustodyAuditWitnessReceiptV1,
 };
 use crate::protocol::codec::{decode_bincode_bounded, encode_bincode_bounded, TrailingBytesPolicy};
+use crate::protocol::onion::OnionRoutePurpose;
 
 // ============================================
 // Deserialisation size limits
@@ -147,6 +160,190 @@ pub const MIN_COORDINATOR_LEASE_TTL_SECS_V1: u32 = 60;
 /// Short leases bound failover delay and the exposure window after a lost
 /// renewal. Coordinators renew well before this deadline.
 pub const MAX_COORDINATOR_LEASE_TTL_SECS_V1: u32 = 300;
+
+/// Verified onion delivery and durable entry-node custody both succeeded.
+pub const CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1: u8 = 0;
+/// A terminal signed durable custody, but entry-node persistence failed.
+pub const CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1: u8 = 1;
+/// Entry-node custody succeeded while no verified onion route completed.
+pub const CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1: u8 = 2;
+/// Neither verified terminal delivery nor entry-node custody succeeded.
+pub const CHAT_VERIFIED_SUBMIT_REJECTED_V1: u8 = 3;
+
+/// Opt-in client request for a terminal-verifiable onion chat delivery.
+///
+/// [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] The request is authenticated
+/// independently from the encrypted VPN session. Its signature binds the
+/// random request id, exact signed envelope commitment, and freshness window.
+/// It carries no route, endpoint, terminal, or plaintext metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatRelayVerifiedSubmitRequestV1 {
+    /// Random client-generated id used for response binding and retry stability.
+    pub request_id: [u8; 16],
+    /// Exact sender-signed E2E envelope to deliver and durably retain.
+    pub envelope: ChatEnvelope,
+    /// Unix epoch seconds covered by the request signature.
+    pub request_timestamp: u64,
+    /// Sender signature over request id, envelope commitment, and timestamp.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl ChatRelayVerifiedSubmitRequestV1 {
+    /// Constructs a sender-signed request over one already-signed envelope.
+    pub fn signed(
+        request_id: [u8; 16],
+        envelope: ChatEnvelope,
+        request_timestamp: u64,
+        sender: &IdentityKeyPair,
+    ) -> Result<Self, CoreError> {
+        if envelope.sender != sender.public_key_bytes() {
+            return Err(CoreError::malformed(
+                "verified chat submit: envelope sender mismatch",
+            ));
+        }
+        envelope.verify_signature()?;
+        let mut request = Self {
+            request_id,
+            envelope,
+            request_timestamp,
+            signature: [0u8; 64],
+        };
+        request.signature = sender.sign(&request.signing_digest());
+        Ok(request)
+    }
+
+    /// Fixed-size commitment to every signed envelope byte.
+    #[must_use]
+    pub fn envelope_commitment(&self) -> [u8; 32] {
+        let sign_data = self.envelope.sign_data();
+        signed_message_digest(
+            "AeroNyx-ChatEnvelopeCommitment-v1",
+            &[sign_data.as_slice(), self.envelope.signature.as_ref()],
+        )
+    }
+
+    /// Canonical request digest signed by the authenticated sender.
+    #[must_use]
+    pub fn signing_digest(&self) -> [u8; 32] {
+        let envelope_commitment = self.envelope_commitment();
+        let request_timestamp = self.request_timestamp.to_le_bytes();
+        signed_message_digest(
+            DOMAIN_CHAT_VERIFIED_SUBMIT_V1,
+            &[
+                self.request_id.as_ref(),
+                envelope_commitment.as_ref(),
+                request_timestamp.as_ref(),
+            ],
+        )
+    }
+
+    /// Verifies request freshness, sender signature, and envelope signature.
+    pub fn verify_authentication(&self) -> Result<(), AuthError> {
+        self.envelope
+            .verify_signature()
+            .map_err(|_| AuthError::SignatureMismatch)?;
+        let envelope_commitment = self.envelope_commitment();
+        let request_timestamp = self.request_timestamp.to_le_bytes();
+        verify_signed_message(
+            DOMAIN_CHAT_VERIFIED_SUBMIT_V1,
+            &[
+                self.request_id.as_ref(),
+                envelope_commitment.as_ref(),
+                request_timestamp.as_ref(),
+            ],
+            &self.envelope.sender,
+            &self.signature,
+            self.request_timestamp,
+        )
+    }
+}
+
+/// Client-visible result for one explicit verified-onion submission.
+///
+/// The encrypted session authenticates the entry-node response. When present,
+/// `terminal_receipt` independently proves that a terminal node durably
+/// accepted the exact opaque `ChatEnvelope` bytes for message relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRelayVerifiedSubmitResponseV1 {
+    /// Exact client request id copied from the authenticated request.
+    pub request_id: [u8; 16],
+    /// Message id copied from the exact submitted envelope.
+    pub message_id: [u8; 16],
+    /// Fixed result code from the `CHAT_VERIFIED_SUBMIT_*_V1` constants.
+    pub result: u8,
+    /// Terminal-signed exact payload receipt for verified result codes only.
+    pub terminal_receipt: Option<BlindRelayDeliveryReceipt>,
+}
+
+impl ChatRelayVerifiedSubmitResponseV1 {
+    /// Validates the closed result vocabulary and receipt-presence invariant.
+    pub fn validate_shape(&self) -> Result<(), CoreError> {
+        if self.result > CHAT_VERIFIED_SUBMIT_REJECTED_V1 {
+            return Err(CoreError::malformed(
+                "verified chat submit: unknown result code",
+            ));
+        }
+        if self.verified_onion_delivery() != self.terminal_receipt.is_some() {
+            return Err(CoreError::malformed(
+                "verified chat submit: receipt/result mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns whether the entry node durably retained the envelope.
+    #[must_use]
+    pub fn entry_custody_accepted(&self) -> bool {
+        matches!(
+            self.result,
+            CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1 | CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1
+        )
+    }
+
+    /// Returns whether the result claims terminal-verifiable onion delivery.
+    #[must_use]
+    pub fn verified_onion_delivery(&self) -> bool {
+        matches!(
+            self.result,
+            CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1 | CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1
+        )
+    }
+
+    /// Verifies response shape, expected terminal identity, and exact payload.
+    ///
+    /// `expected_terminal_node_id` must come from the caller's independently
+    /// verified signed node directory. Never trust the identity embedded in
+    /// the receipt as its own trust root.
+    pub fn verify_terminal_receipt(
+        &self,
+        envelope: &ChatEnvelope,
+        expected_terminal_node_id: &[u8; 32],
+    ) -> Result<(), CoreError> {
+        self.validate_shape()?;
+        if !self.verified_onion_delivery() {
+            return Err(CoreError::malformed(
+                "verified chat submit: response has no onion delivery",
+            ));
+        }
+        if self.message_id != envelope.message_id {
+            return Err(CoreError::malformed(
+                "verified chat submit: response message mismatch",
+            ));
+        }
+        let receipt = self.terminal_receipt.as_ref().ok_or_else(|| {
+            CoreError::malformed("verified chat submit: terminal receipt missing")
+        })?;
+        let payload = encode_envelope(envelope)
+            .map_err(|_| CoreError::malformed("verified chat submit: envelope encoding failed"))?;
+        receipt.verify_expected_for_purpose(
+            &receipt.route_id,
+            &payload,
+            OnionRoutePurpose::MessageRelay,
+            expected_terminal_node_id,
+        )
+    }
+}
 
 /// Witness atomically advanced from an older generation to this request.
 pub const VERIFIED_DELIVERY_WITNESS_ADVANCED_V1: u8 = 0;
@@ -269,6 +466,8 @@ pub struct RecordCheckpointCertificateMemberV1 {
 /// | 35    | SessionCloseV1       | v2.8.15-AuthenticatedSessionClose |
 /// | 36    | CustodyAuditAnchorWitnessRequestV1 | v2.8.16-CustodyWitnessNetwork |
 /// | 37    | CustodyAuditAnchorWitnessResponseV1| v2.8.16-CustodyWitnessNetwork |
+/// | 38    | ChatRelayVerifiedSubmitV1 | v2.8.17-VerifiedChatSubmit |
+/// | 39    | ChatRelayVerifiedSubmitResponseV1 | v2.8.17-VerifiedChatSubmit |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(deprecated)]
 pub enum MemChainMessage {
@@ -894,6 +1093,13 @@ pub enum MemChainMessage {
         #[serde(with = "serde_bytes64")]
         signature: [u8; 64],
     },
+
+    // ── v2.8.17: opt-in verified client onion delivery (38-39) ─────────
+    /// [index 38] Requests terminal-verifiable onion delivery.
+    ChatRelayVerifiedSubmitV1(ChatRelayVerifiedSubmitRequestV1),
+
+    /// [index 39] Returns entry custody and exact terminal receipt evidence.
+    ChatRelayVerifiedSubmitResponseV1(ChatRelayVerifiedSubmitResponseV1),
 }
 
 fn deserialize_chat_pull_cursor_v2<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -1936,6 +2142,139 @@ mod tests {
             37,
             "CustodyAuditAnchorWitnessResponseV1 must be discriminant 37"
         );
+
+        // [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] New opt-in client frames
+        // append after every deployed control frame. Legacy ChatRelay remains
+        // index 11 and receives no response unless the client selects v1 here.
+        let mut envelope = ChatEnvelope {
+            message_id: [0xD1; 16],
+            sender: identity.public_key_bytes(),
+            receiver: [0xD2; 32],
+            timestamp: 1_700_000_012,
+            ciphertext: vec![0xD3; 32],
+            nonce: [0xD4; 24],
+            content_type: ChatContentType::Text,
+            signature: [0u8; 64],
+        };
+        envelope.signature = identity.sign(&envelope.sign_data());
+        let b = bincode::serialize(&MemChainMessage::ChatRelayVerifiedSubmitV1(
+            ChatRelayVerifiedSubmitRequestV1 {
+                request_id: [0xD5; 16],
+                envelope: envelope.clone(),
+                request_timestamp: 1_700_000_013,
+                signature: [0xD6; 64],
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            38,
+            "ChatRelayVerifiedSubmitV1 must be discriminant 38"
+        );
+
+        let b = bincode::serialize(&MemChainMessage::ChatRelayVerifiedSubmitResponseV1(
+            ChatRelayVerifiedSubmitResponseV1 {
+                request_id: [0xD5; 16],
+                message_id: envelope.message_id,
+                result: CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+                terminal_receipt: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            disc(&b),
+            39,
+            "ChatRelayVerifiedSubmitResponseV1 must be discriminant 39"
+        );
+    }
+
+    #[test]
+    fn verified_chat_submit_binds_exact_envelope_and_verifies_terminal_receipt() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let sender = IdentityKeyPair::generate();
+        let terminal = IdentityKeyPair::generate();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        let mut envelope = ChatEnvelope {
+            message_id: [0xE1; 16],
+            sender: sender.public_key_bytes(),
+            receiver: [0xE2; 32],
+            timestamp: now,
+            ciphertext: vec![0xE3; 48],
+            nonce: [0xE4; 24],
+            content_type: ChatContentType::Text,
+            signature: [0u8; 64],
+        };
+        envelope.signature = sender.sign(&envelope.sign_data());
+        let request =
+            ChatRelayVerifiedSubmitRequestV1::signed([0xE5; 16], envelope.clone(), now, &sender)
+                .expect("sign verified submit");
+        request
+            .verify_authentication()
+            .expect("verify exact submit request");
+
+        let encoded = encode_memchain(&MemChainMessage::ChatRelayVerifiedSubmitV1(request.clone()))
+            .expect("encode verified submit");
+        let decoded = decode_memchain(&encoded[1..]).expect("decode verified submit");
+        let MemChainMessage::ChatRelayVerifiedSubmitV1(decoded_request) = decoded else {
+            panic!("expected verified submit request");
+        };
+        decoded_request
+            .verify_authentication()
+            .expect("verify decoded request");
+
+        let payload = encode_envelope(&envelope).expect("encode terminal payload");
+        let receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
+            [0xE6; 16],
+            &payload,
+            OnionRoutePurpose::MessageRelay,
+            now,
+            &terminal,
+        );
+        let response = ChatRelayVerifiedSubmitResponseV1 {
+            request_id: request.request_id,
+            message_id: envelope.message_id,
+            result: CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
+            terminal_receipt: Some(receipt),
+        };
+        response
+            .verify_terminal_receipt(&envelope, &terminal.public_key_bytes())
+            .expect("verify terminal receipt");
+
+        let mut substituted = envelope.clone();
+        substituted.ciphertext[0] ^= 0x01;
+        assert!(response
+            .verify_terminal_receipt(&substituted, &terminal.public_key_bytes())
+            .is_err());
+        assert!(response
+            .verify_terminal_receipt(&envelope, &[0xA7; 32])
+            .is_err());
+
+        let mut forged_request = request;
+        forged_request.request_id[0] ^= 0x01;
+        assert!(forged_request.verify_authentication().is_err());
+    }
+
+    #[test]
+    fn verified_chat_submit_rejects_receipt_result_mismatch() {
+        let response = ChatRelayVerifiedSubmitResponseV1 {
+            request_id: [0xF1; 16],
+            message_id: [0xF2; 16],
+            result: CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+            terminal_receipt: Some(BlindRelayDeliveryReceipt {
+                version: 2,
+                route_id: [0xF3; 16],
+                payload_commitment: [0xF4; 32],
+                terminal_node_id: [0xF5; 32],
+                delivered_at: 1,
+                disposition: 1,
+                signature: [0xF6; 64],
+            }),
+        };
+        assert!(response.validate_shape().is_err());
     }
 
     #[test]

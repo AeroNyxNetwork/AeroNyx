@@ -928,7 +928,10 @@ use aeronyx_core::protocol::codec::{
 };
 use aeronyx_core::protocol::discovery::RouteDomainAttestationCertificateV1;
 use aeronyx_core::protocol::memchain::{
-    encode_memchain, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,
+    encode_memchain, ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
+    MemChainMessage, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+    CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1, CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1,
+    CHAT_VERIFIED_SUBMIT_REJECTED_V1, MAX_CHAT_PULL_CURSOR_V2_BYTES,
 };
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
@@ -1218,10 +1221,13 @@ struct TwoHopBlindRelayProbeOutcome {
 ///
 /// Never add selected hops, route ids, message ids, sender/receiver keys,
 /// endpoints, payload commitments, ciphertext, or client metadata here.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AuthenticatedChatOnionRelayOutcome {
     attempted_paths: usize,
     verified_receipts: usize,
+    /// First exact terminal receipt retained only for the requesting client.
+    /// Never persist or export it through aggregate node health.
+    first_terminal_receipt: Option<BlindRelayDeliveryReceipt>,
 }
 
 /// Whether an onion-route failure can safely affect first-hop reputation.
@@ -1240,12 +1246,12 @@ enum OnionRouteFailureAttribution {
 
 impl AuthenticatedChatOnionRelayOutcome {
     #[must_use]
-    fn delivered(self) -> bool {
+    fn delivered(&self) -> bool {
         self.verified_receipts > 0
     }
 
     #[must_use]
-    fn fully_replicated(self) -> bool {
+    fn fully_replicated(&self) -> bool {
         self.attempted_paths > 0 && self.attempted_paths == self.verified_receipts
     }
 
@@ -1258,7 +1264,7 @@ impl AuthenticatedChatOnionRelayOutcome {
     /// safely enter the compatibility path; otherwise local pending storage
     /// preserves retry availability without immediate correlation expansion.
     #[must_use]
-    fn compatibility_direct_fallback_allowed(self) -> bool {
+    fn compatibility_direct_fallback_allowed(&self) -> bool {
         self.attempted_paths == 0
     }
 }
@@ -12199,6 +12205,48 @@ impl Server {
         route_id
     }
 
+    /// Derives one retry-stable route id for an explicit client submission.
+    ///
+    /// The digest includes both selected relay identities so independent
+    /// replica paths never share a replay key. Only the 16-byte result crosses
+    /// the relay boundary; request ids and complete path topology are not
+    /// logged or persisted by the source.
+    fn verified_chat_submit_route_id(
+        request_id: &[u8; 16],
+        self_node_id: &[u8; 32],
+        middle_node_id: &[u8; 32],
+        terminal_node_id: &[u8; 32],
+    ) -> [u8; 16] {
+        // [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] Keep this derivation
+        // domain-separated from probes and legacy random route ids. The path
+        // identities make one request id safe across independent replicas.
+        let mut hasher = Sha256::new();
+        hasher.update(b"AeroNyx-ChatVerifiedSubmit-Route-v1");
+        hasher.update(request_id);
+        hasher.update(self_node_id);
+        hasher.update(middle_node_id);
+        hasher.update(terminal_node_id);
+        let digest = hasher.finalize();
+        let mut route_id = [0u8; 16];
+        route_id.copy_from_slice(&digest[..16]);
+        route_id
+    }
+
+    /// Maps independently verified terminal and entry custody outcomes onto
+    /// the closed client-visible result vocabulary.
+    #[must_use]
+    fn verified_chat_submit_result(verified_onion: bool, entry_custody: bool) -> u8 {
+        // [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] Centralising this table
+        // keeps response construction and tests aligned as the retry policy
+        // evolves, without turning transport errors into protocol strings.
+        match (verified_onion, entry_custody) {
+            (true, true) => CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
+            (true, false) => CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1,
+            (false, true) => CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+            (false, false) => CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+        }
+    }
+
     fn blind_relay_three_hop_probe_route_id(
         now: u64,
         self_node_id: &[u8; 32],
@@ -12319,6 +12367,7 @@ impl Server {
         identity: &IdentityKeyPair,
         self_node_id: &[u8; 32],
         envelope: &ChatEnvelope,
+        client_request_id: Option<&[u8; 16]>,
     ) -> AuthenticatedChatOnionRelayOutcome {
         let now = unix_now_secs();
         // [RELAY-SELECTION-DIAGNOSTICS 2026-08-15 by Codex] Every pre-attempt
@@ -12386,6 +12435,7 @@ impl Server {
 
         let mut attempted = 0usize;
         let mut accepted = 0usize;
+        let mut first_terminal_receipt = None;
         let mut last_failure_reason = None;
         let mut used_hop_node_ids = Vec::new();
         let mut used_hops = Vec::new();
@@ -12427,8 +12477,23 @@ impl Server {
                 continue;
             };
 
-            let mut route_id = [0u8; 16];
-            rand::thread_rng().fill_bytes(&mut route_id);
+            let route_id = if let Some(request_id) = client_request_id {
+                // [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] An explicit
+                // client request gets a deterministic route id per selected
+                // route. Retrying the same signed request therefore reaches
+                // the blind-relay replay cache instead of multiplying custody
+                // work, while different hop surfaces remain unlinkable.
+                Self::verified_chat_submit_route_id(
+                    request_id,
+                    self_node_id,
+                    &middle_node_id,
+                    &terminal_node_id,
+                )
+            } else {
+                let mut route_id = [0u8; 16];
+                rand::thread_rng().fill_bytes(&mut route_id);
+                route_id
+            };
             let Some((request, payload_commitment)) = Self::build_two_hop_onion_request(
                 identity,
                 self_node_id,
@@ -12489,6 +12554,9 @@ impl Server {
                                 observed_at,
                             ) {
                                 accepted = accepted.saturating_add(1);
+                                if first_terminal_receipt.is_none() {
+                                    first_terminal_receipt = ack.delivery_receipt;
+                                }
                             } else {
                                 last_failure_reason =
                                     Some("onion_delivery_route_surface_changed".to_string());
@@ -12566,6 +12634,7 @@ impl Server {
         let outcome = AuthenticatedChatOnionRelayOutcome {
             attempted_paths: attempted,
             verified_receipts: accepted,
+            first_terminal_receipt,
         };
         if outcome.attempted_paths > 0 {
             debug!(
@@ -14425,6 +14494,108 @@ impl Server {
         &envelope.sender == authenticated_session_key
     }
 
+    /// Handles one opt-in client request that requires terminal-verifiable
+    /// onion delivery without changing legacy `ChatRelay` availability.
+    ///
+    /// [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] The response carries the
+    /// terminal's exact signed receipt only to the authenticated source
+    /// session. Aggregate health retains counters, never receipt bytes, route
+    /// ids, terminal identities, message ids, or payload commitments.
+    async fn handle_verified_chat_submit(
+        request: ChatRelayVerifiedSubmitRequestV1,
+        session: &Arc<crate::services::Session>,
+        chat_relay: &Option<Arc<ChatRelayService>>,
+        peer_store: &PeerStore,
+        self_node_id: &[u8; 32],
+        node_identity: &IdentityKeyPair,
+        chat_peer_client: Option<&reqwest::Client>,
+    ) -> ChatRelayVerifiedSubmitResponseV1 {
+        let rejected = || ChatRelayVerifiedSubmitResponseV1 {
+            request_id: request.request_id,
+            message_id: request.envelope.message_id,
+            result: CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+            terminal_receipt: None,
+        };
+
+        if request.verify_authentication().is_err()
+            || !Self::chat_sender_matches_authenticated_session(
+                &request.envelope,
+                &session.client_public_key.to_bytes(),
+            )
+        {
+            warn!(
+                reason = "verified_submit_authentication_failed",
+                "[CHAT_RELAY] Verified submit rejected"
+            );
+            return rejected();
+        }
+
+        let Some(relay) = chat_relay.as_ref() else {
+            warn!(
+                reason = "relay_unavailable",
+                "[CHAT_RELAY] Verified submit rejected"
+            );
+            return rejected();
+        };
+
+        relay.wallet_routes.announce(
+            &request.envelope.sender,
+            session.id.clone(),
+            session.client_endpoint,
+        );
+        let onion_outcome = Self::relay_authenticated_chat_over_onion_paths(
+            chat_peer_client,
+            Some(relay.as_ref()),
+            peer_store,
+            node_identity,
+            self_node_id,
+            &request.envelope,
+            Some(&request.request_id),
+        )
+        .await;
+        let onion_delivered = onion_outcome.delivered();
+        let terminal_receipt = onion_outcome.first_terminal_receipt;
+        let verified_onion = terminal_receipt.is_some();
+        if onion_delivered != verified_onion {
+            // This is an internal invariant failure, not a remote route fault.
+            // Fail closed rather than claim terminal evidence without bytes
+            // the client can independently verify.
+            error!(
+                reason = "verified_submit_receipt_invariant_failed",
+                "[CHAT_RELAY] Verified submit evidence rejected"
+            );
+        }
+
+        let entry_custody = match relay.store_pending(&request.envelope) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    reason = error.reason_bucket(),
+                    "[CHAT_RELAY] Verified submit entry custody failed"
+                );
+                false
+            }
+        };
+        let result = Self::verified_chat_submit_result(
+            verified_onion && onion_delivered,
+            entry_custody,
+        );
+
+        ChatRelayVerifiedSubmitResponseV1 {
+            request_id: request.request_id,
+            message_id: request.envelope.message_id,
+            result,
+            terminal_receipt: if matches!(
+                result,
+                CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1 | CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1
+            ) {
+                terminal_receipt
+            } else {
+                None
+            },
+        }
+    }
+
     // ============================================
     // MemChain Message Handler
     // ============================================
@@ -14676,6 +14847,7 @@ impl Server {
                             node_identity,
                             self_node_id,
                             &envelope,
+                            None,
                         )
                         .await;
                         if !onion_outcome.delivered()
@@ -14712,6 +14884,7 @@ impl Server {
                         node_identity,
                         self_node_id,
                         &envelope,
+                        None,
                     )
                     .await;
                     if !onion_outcome.delivered()
@@ -14735,6 +14908,39 @@ impl Server {
                         debug!("[CHAT_RELAY] Stored for offline delivery");
                     }
                 }
+            }
+            MemChainMessage::ChatRelayVerifiedSubmitV1(request) => {
+                let response = Self::handle_verified_chat_submit(
+                    request,
+                    session,
+                    chat_relay,
+                    peer_store.as_ref(),
+                    self_node_id,
+                    node_identity,
+                    chat_peer_client,
+                )
+                .await;
+                if !Self::send_to_session(
+                    &MemChainMessage::ChatRelayVerifiedSubmitResponseV1(response),
+                    session,
+                    udp,
+                    crypto,
+                )
+                .await
+                {
+                    warn!(
+                        reason = "verified_submit_response_write_failed",
+                        "[CHAT_RELAY] Verified submit response failed"
+                    );
+                }
+            }
+            MemChainMessage::ChatRelayVerifiedSubmitResponseV1(_) => {
+                // Server-to-client only. Accepting it from a client would let
+                // arbitrary sessions manufacture local delivery UI state.
+                warn!(
+                    reason = "client_sent_server_response",
+                    "[CHAT_RELAY] Verified submit response rejected"
+                );
             }
             MemChainMessage::ChatPull {
                 wallet,
@@ -17948,6 +18154,7 @@ mod tests {
         let partial = super::AuthenticatedChatOnionRelayOutcome {
             attempted_paths: 2,
             verified_receipts: 1,
+            first_terminal_receipt: None,
         };
         assert!(partial.delivered());
         assert!(!partial.fully_replicated());
@@ -17955,6 +18162,7 @@ mod tests {
         let failed = super::AuthenticatedChatOnionRelayOutcome {
             attempted_paths: 2,
             verified_receipts: 0,
+            first_terminal_receipt: None,
         };
         assert!(!failed.delivered());
         assert!(!failed.fully_replicated());
@@ -17965,6 +18173,71 @@ mod tests {
         // the envelope to no peer at all.
         let preflight_only = super::AuthenticatedChatOnionRelayOutcome::default();
         assert!(preflight_only.compatibility_direct_fallback_allowed());
+    }
+
+    #[test]
+    fn verified_chat_submit_result_table_is_closed() {
+        // [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] All four evidence
+        // combinations have one stable wire result. This prevents future
+        // transport branches from inventing open-text client states.
+        assert_eq!(
+            Server::verified_chat_submit_result(true, true),
+            super::CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1
+        );
+        assert_eq!(
+            Server::verified_chat_submit_result(true, false),
+            super::CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1
+        );
+        assert_eq!(
+            Server::verified_chat_submit_result(false, true),
+            super::CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1
+        );
+        assert_eq!(
+            Server::verified_chat_submit_result(false, false),
+            super::CHAT_VERIFIED_SUBMIT_REJECTED_V1
+        );
+    }
+
+    #[test]
+    fn verified_chat_submit_route_id_is_retry_stable_and_path_bound() {
+        let request_id = [0x91; 16];
+        let source = [0x92; 32];
+        let middle = [0x93; 32];
+        let terminal = [0x94; 32];
+        let route_id = Server::verified_chat_submit_route_id(
+            &request_id,
+            &source,
+            &middle,
+            &terminal,
+        );
+
+        assert_eq!(
+            route_id,
+            Server::verified_chat_submit_route_id(
+                &request_id,
+                &source,
+                &middle,
+                &terminal,
+            )
+        );
+        assert_ne!(
+            route_id,
+            Server::verified_chat_submit_route_id(
+                &request_id,
+                &source,
+                &[0x95; 32],
+                &terminal,
+            )
+        );
+        assert_ne!(
+            route_id,
+            Server::verified_chat_submit_route_id(
+                &[0x96; 16],
+                &source,
+                &middle,
+                &terminal,
+            )
+        );
     }
 
     #[test]
@@ -18691,6 +18964,7 @@ mod tests {
             &source,
             &source.public_key_bytes(),
             &signed_test_chat_envelope(unix_now_secs()),
+            None,
         )
         .await;
 
@@ -18812,6 +19086,7 @@ mod tests {
             &source,
             &source.public_key_bytes(),
             &envelope,
+            None,
         )
         .await;
         relay_server.abort();
@@ -18820,6 +19095,18 @@ mod tests {
         assert!(outcome.fully_replicated());
         assert_eq!(outcome.attempted_paths, 1);
         assert_eq!(outcome.verified_receipts, 1);
+        let terminal_receipt = outcome
+            .first_terminal_receipt
+            .as_ref()
+            .expect("verified relay returns exact terminal receipt");
+        terminal_receipt
+            .verify_expected_for_purpose(
+                &terminal_receipt.route_id,
+                &encoded_envelope,
+                OnionRoutePurpose::MessageRelay,
+                &terminal_node_id,
+            )
+            .expect("returned receipt remains independently verifiable");
         let quality = store.status(unix_now_secs()).blind_relay_quality;
         assert!(quality.real_relay_ready);
         assert_eq!(quality.verified_client_onion_deliveries, 1);
@@ -18898,6 +19185,7 @@ mod tests {
             &source,
             &source.public_key_bytes(),
             &signed_test_chat_envelope(now),
+            None,
         )
         .await;
         relay_server.abort();
@@ -19025,6 +19313,7 @@ mod tests {
             &source,
             &source.public_key_bytes(),
             &envelope,
+            None,
         )
         .await;
         relay_server.abort();
@@ -19100,6 +19389,7 @@ mod tests {
             &source,
             &source.public_key_bytes(),
             &envelope,
+            None,
         )
         .await;
 

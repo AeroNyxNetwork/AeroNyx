@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/auth.rs
 // ============================================================================
-// Version: 1.5.0-SessionClose
+// Version: 1.6.0-VerifiedChatSubmit
 //
 // Modification Reason:
 //   New file. Centralises per-message wallet signature verification so that
@@ -15,6 +15,8 @@
 //   mailbox pagination without changing the deployed v1 signature contract.
 //   v1.5.0-SessionClose — Added a unique domain for an authenticated graceful
 //   UDP tunnel close request; existing domains and signatures are unchanged.
+//   v1.6.0-VerifiedChatSubmit — Added one domain for explicit verified-onion
+//   chat submission and exposed the canonical fixed-size signing digest helper.
 //
 // Main Functionality:
 //   - verify_signed_message(): canonical Ed25519 verification with:
@@ -50,6 +52,8 @@
 //     accidental leakage of internal crypto error detail to callers.
 //
 // Last Modified:
+//   v1.6.0-VerifiedChatSubmit — Added DOMAIN_CHAT_VERIFIED_SUBMIT_V1 and
+//                              signed_message_digest()
 //   v1.5.0-SessionClose — Added DOMAIN_SESSION_CLOSE_V1
 //   v1.4.0-ChatPullV2 — Added DOMAIN_CHAT_PULL_V2
 //   v1.3.0-Sovereign — Initial implementation
@@ -87,6 +91,13 @@ pub const DOMAIN_WALLET_PRESENCE: &str = "AeroNyx-WalletPresence-v1";
 /// [SESSION-TERMINATION 2026-08-15 by Codex] This must never be reused by a
 /// message that does not close the exact encrypted transport session.
 pub const DOMAIN_SESSION_CLOSE_V1: &str = "AeroNyx-SessionClose-v1";
+
+/// Domain separator for an explicit verified-onion chat submission.
+///
+/// [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] This intent is stronger than a
+/// legacy `ChatRelay`: the sender asks the entry node to return an exact
+/// terminal-signed receipt and forbids silent direct-relay substitution.
+pub const DOMAIN_CHAT_VERIFIED_SUBMIT_V1: &str = "AeroNyx-ChatVerifiedSubmit-v1";
 
 // ============================================
 // Timestamp window
@@ -126,6 +137,21 @@ pub enum AuthError {
     /// The signature does not match the signed data.
     #[error("Signature does not match signed data")]
     SignatureMismatch,
+}
+
+/// Computes the canonical fixed-size digest used by signed protocol frames.
+///
+/// [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] Constructors and verifiers must
+/// share this implementation. Duplicating the domain/slice hash in clients or
+/// operator tools previously made new signed frame types easy to drift.
+#[must_use]
+pub fn signed_message_digest(domain: &str, payload_slices: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    for slice in payload_slices {
+        hasher.update(slice);
+    }
+    hasher.finalize().into()
 }
 
 // ============================================
@@ -186,12 +212,7 @@ pub fn verify_signed_message(
     // Hashing rather than raw concatenation:
     // - Produces a fixed 32-byte input for Ed25519 verify
     // - Eliminates length-extension ambiguity between adjacent variable-length fields
-    let mut hasher = Sha256::new();
-    hasher.update(domain.as_bytes());
-    for slice in payload_slices {
-        hasher.update(slice);
-    }
-    let digest: [u8; 32] = hasher.finalize().into();
+    let digest = signed_message_digest(domain, payload_slices);
 
     // ── 3. Ed25519 verification ───────────────────────────────────────
     let pk =

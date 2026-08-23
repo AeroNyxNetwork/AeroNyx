@@ -4,8 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.25.0 - Bound blind-relay signature verification and
-request commitment hashing outside asynchronous runtime workers.
+Modification Reason: v1.26.0 - Added an opt-in authenticated client submit
+contract that returns exact terminal-signed onion delivery evidence while
+preserving the deployed central-relay compatibility path.
 
 Main Functionality:
 
@@ -30,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.25.0 - [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Runs previous-hop authentication and request commitment hashing behind CPU-aware, fail-fast blocking admission; unauthenticated requests receive no node-signed failure receipt and cannot mutate claimed-peer state.
+Last Modified: v1.26.0 - [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] Adds an opt-in, sender-signed verified-onion submit frame and a closed response carrying the exact terminal receipt; the legacy `ChatRelay` wire index and default central-relay behavior remain unchanged.
+Previous: v1.25.0 - [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Runs previous-hop authentication and request commitment hashing behind CPU-aware, fail-fast blocking admission; unauthenticated requests receive no node-signed failure receipt and cannot mutate claimed-peer state.
 Previous: v1.24.0 - [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforces previous-hop request, failure-decay, quarantine, idle-retention, and LRU windows with process-local monotonic time while projecting only a compatibility timestamp to PeerStore and Nodeboard.
 Previous: v1.23.0 - [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Removes stale previous-hop buckets regardless of FIFO position, evicts only the least-recently-used non-quarantined identity under pressure, and never deletes active quarantine to admit a fresh permissionless key.
 Previous: v1.22.0 - [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Prevents permissionless node-key rotation from bypassing blind-relay parser and process admission while preserving aggregate-only telemetry and verified previous-hop fairness.
@@ -3151,33 +3153,67 @@ Verification:
 
 ### Phase 5 - Encrypted Envelope Relay
 
-Status: Planned.
+Status: Implemented for blind E2E chat relay, receipt-capable two-hop delivery,
+bounded store-and-forward custody, and opt-in client-verifiable submission.
+Generic agent envelopes remain a future extension of the same blind boundary.
 
-Goals:
+Implemented:
 
-- Add encrypted envelope protocol type.
-- Add dedup and TTL enforcement.
-- Add bounded pending queue.
-- Add relay forwarder.
-- Integrate with chat relay or agent relay path.
+- `ChatEnvelope` carries sender-signed opaque ciphertext; relay nodes never
+  parse message content.
+- The existing `ChatRelay` frame keeps wire discriminant 11 and remains the
+  backward-compatible default path.
+- `ChatRelayVerifiedSubmitV1` and its response append discriminants 38 and 39.
+  No deployed enum index was renumbered.
+- The request signature binds a random request id, the exact signed-envelope
+  commitment, and a 60-second freshness window. The authenticated VPN session
+  must belong to the envelope sender before routing or custody can start.
+- A retry-stable, path-bound route id reaches the blind-relay replay cache
+  without reusing one route key across independent middle/terminal surfaces.
+- A successful onion result returns the exact terminal-signed delivery receipt
+  to the requesting encrypted session. Aggregate health retains counters only.
+- Client-visible results use a closed four-state vocabulary: verified onion
+  plus entry custody, verified onion only, entry custody with onion retry
+  required, or rejected.
+- Receipt verification must bind the opaque envelope, message-relay purpose,
+  and a terminal identity independently verified from the signed node
+  directory. A receipt's embedded identity is never its own trust root.
+- Entry-node durable custody remains available when no verified onion route is
+  currently ready; an attempted route never silently widens into direct relay.
 
-Files likely changed:
+Primary implementation files:
 
 ```text
-crates/aeronyx-core/src/protocol/envelope.rs
-crates/aeronyx-server/src/services/relay/envelope_queue.rs
-crates/aeronyx-server/src/services/relay/forwarder.rs
-crates/aeronyx-server/src/api/relay.rs
+crates/aeronyx-core/src/protocol/auth.rs
+crates/aeronyx-core/src/protocol/chat.rs
+crates/aeronyx-core/src/protocol/memchain.rs
+crates/aeronyx-core/src/protocol/onion.rs
 crates/aeronyx-server/src/services/chat_relay.rs
+crates/aeronyx-server/src/services/peer_store.rs
+crates/aeronyx-server/src/api/chat_peer.rs
+crates/aeronyx-server/src/server.rs
 ```
 
 Verification:
 
-- Envelope serialization tests.
-- TTL/drop tests.
-- Dedup tests.
-- Store-and-forward queue limit tests.
-- No plaintext payload logging.
+- Stable bincode-discriminant and request round-trip tests.
+- Request freshness, sender signature, session ownership, and envelope
+  substitution rejection tests.
+- Route-id retry stability and path-binding tests.
+- Exact terminal receipt signature, purpose, terminal identity, and payload
+  commitment verification tests.
+- Two-hop integration tests proving the receipt returned by the live relay
+  path remains independently verifiable.
+- Existing TTL, replay, dedup, bounded queue, and no-plaintext logging tests.
+
+Client integration rule:
+
+- Current clients do not change behavior automatically. A future client or
+  agent explicitly sends frame 38 only after loading and verifying signed
+  receipt-capable onion candidates. It verifies frame 39 against the exact
+  submitted envelope and the selected terminal's verified node identity.
+- Central relay remains the default product path. Verified onion submission is
+  an explicit user/agent policy choice and must not silently replace it.
 
 ### Phase 6 - Directory Chain
 
