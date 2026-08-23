@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.24-VerifiedSubmitRequestBinding
+// Version: 2.8.25-VerifiedSubmitResponseCorrelation
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -54,6 +54,9 @@
 //   v2.8.24-VerifiedSubmitRequestBinding — Added response verification against
 //   the exact client request id and envelope. Existing wire bytes remain
 //   unchanged.
+//   v2.8.25-VerifiedSubmitResponseCorrelation — Added request correlation for
+//   every result state and centralized terminal receipt verification internals.
+//   Existing wire bytes remain unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -95,6 +98,7 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.25-VerifiedSubmitResponseCorrelation — Added all-result correlation
 //   v2.8.24-VerifiedSubmitRequestBinding — Added exact-request response verifier
 //   v2.8.23-ChatSessionSenderBinding — Reused core envelope identity binding
 //   v2.8.22-VerifiedSubmitRejectedResponse — Added rejected response builder
@@ -441,6 +445,31 @@ impl ChatRelayVerifiedSubmitResponseV1 {
         )
     }
 
+    /// Validates response shape and correlation with one exact client request.
+    ///
+    /// [CHAT-VERIFIED-SUBMIT-RESPONSE-CORRELATION 2026-08-23 by Codex] Every
+    /// result, including entry custody, retry, and rejection, must bind both
+    /// request id and message id before it can update client or agent state.
+    /// This keeps concurrent retries from consuming one another's response even
+    /// when no terminal receipt exists to provide an additional payload proof.
+    pub fn validate_for_request(
+        &self,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+    ) -> Result<(), CoreError> {
+        self.validate_shape()?;
+        if self.request_id != request.request_id {
+            return Err(CoreError::malformed(
+                "verified chat submit: response request mismatch",
+            ));
+        }
+        if self.message_id != request.envelope.message_id {
+            return Err(CoreError::malformed(
+                "verified chat submit: response message mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     /// Verifies response shape, expected terminal identity, and exact payload.
     ///
     /// `expected_terminal_node_id` must come from the caller's independently
@@ -452,6 +481,14 @@ impl ChatRelayVerifiedSubmitResponseV1 {
         expected_terminal_node_id: &[u8; 32],
     ) -> Result<(), CoreError> {
         self.validate_shape()?;
+        self.verify_terminal_receipt_payload(envelope, expected_terminal_node_id)
+    }
+
+    fn verify_terminal_receipt_payload(
+        &self,
+        envelope: &ChatEnvelope,
+        expected_terminal_node_id: &[u8; 32],
+    ) -> Result<(), CoreError> {
         if !self.verified_onion_delivery() {
             return Err(CoreError::malformed(
                 "verified chat submit: response has no onion delivery",
@@ -488,12 +525,8 @@ impl ChatRelayVerifiedSubmitResponseV1 {
         request: &ChatRelayVerifiedSubmitRequestV1,
         expected_terminal_node_id: &[u8; 32],
     ) -> Result<(), CoreError> {
-        if self.request_id != request.request_id {
-            return Err(CoreError::malformed(
-                "verified chat submit: response request mismatch",
-            ));
-        }
-        self.verify_terminal_receipt(&request.envelope, expected_terminal_node_id)
+        self.validate_for_request(request)?;
+        self.verify_terminal_receipt_payload(&request.envelope, expected_terminal_node_id)
     }
 }
 
@@ -2398,12 +2431,31 @@ mod tests {
         response
             .verify_terminal_receipt_for_request(&request, &terminal.public_key_bytes())
             .expect("verify response against exact request");
+        response
+            .validate_for_request(&request)
+            .expect("correlate delivered response");
+
+        let entry_retry = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            request.envelope.message_id,
+            false,
+            true,
+            None,
+        );
+        entry_retry
+            .validate_for_request(&request)
+            .expect("correlate non-onion response");
 
         let mut mismatched_request = request.clone();
         mismatched_request.request_id[0] ^= 0x01;
+        assert!(response.validate_for_request(&mismatched_request).is_err());
         assert!(response
             .verify_terminal_receipt_for_request(&mismatched_request, &terminal.public_key_bytes(),)
             .is_err());
+
+        let mut mismatched_message = response.clone();
+        mismatched_message.message_id[0] ^= 0x01;
+        assert!(mismatched_message.validate_for_request(&request).is_err());
 
         let mut substituted = envelope.clone();
         substituted.ciphertext[0] ^= 0x01;

@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.34.0 - Added exact-request response verification so
-concurrent retries cannot accidentally accept a terminal receipt response for
-another in-flight request carrying the same encrypted envelope.
+Modification Reason: v1.35.0 - Added exact-request response correlation for
+all verified-submit result states, including entry custody, retry, rejection,
+and terminal-verifiable onion delivery.
 
 Main Functionality:
 
@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.34.0 - [CHAT-VERIFIED-SUBMIT-REQUEST-BINDING 2026-08-23 by Codex] Adds `verify_terminal_receipt_for_request()` so clients and agents bind terminal evidence to the exact random request id and submitted envelope during concurrent retries.
+Last Modified: v1.35.0 - [CHAT-VERIFIED-SUBMIT-RESPONSE-CORRELATION 2026-08-23 by Codex] Adds `validate_for_request()` so every result state binds shape, request id, and message id before changing client or agent state; terminal success then performs the existing independent receipt proof.
+Previous: v1.34.0 - [CHAT-VERIFIED-SUBMIT-REQUEST-BINDING 2026-08-23 by Codex] Adds `verify_terminal_receipt_for_request()` so clients and agents bind terminal evidence to the exact random request id and submitted envelope during concurrent retries.
 Previous: v1.33.0 - [CHAT-SESSION-SENDER-BINDING 2026-08-23 by Codex] Moves authenticated transport identity matching to `ChatEnvelope::sender_matches_authenticated_identity()` so legacy relay, verified submit, SDK simulations, and future client-tunnel entry points share one pre-routing replay boundary.
 Previous: v1.32.0 - [CHAT-VERIFIED-SUBMIT-REJECTED-RESPONSE 2026-08-23 by Codex] Adds the core-owned `ChatRelayVerifiedSubmitResponseV1::rejected()` builder so denied explicit submissions always fail closed with the same no-receipt response shape.
 Previous: v1.31.0 - [CHAT-VERIFIED-SUBMIT-ROUTE-ID 2026-08-23 by Codex] Moves retry-stable verified-submit route id derivation into `aeronyx-core::protocol::memchain::chat_verified_submit_route_id()` so source nodes, SDKs, and future relay implementations share one path-bound replay key contract.
@@ -3222,6 +3223,10 @@ Implemented:
   `verify_terminal_receipt_for_request()`. It checks the exact random request
   id before applying the existing envelope, purpose, and terminal-signature
   proof, preventing concurrent retries from consuming one another's response.
+- [CHAT-VERIFIED-SUBMIT-RESPONSE-CORRELATION 2026-08-23 by Codex] Every result
+  must first pass `validate_for_request()`, including entry-custody retry and
+  rejected responses that carry no receipt. Verified onion delivery then adds
+  terminal identity, purpose, signature, and exact-payload verification.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
