@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.18-VerifiedSubmitResultLabels
+// Version: 2.8.19-VerifiedSubmitOutcomeMapping
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -38,6 +38,9 @@
 //   v2.8.18-VerifiedSubmitResultLabels — Centralized privacy-safe labels for
 //   the fixed verified-submit result vocabulary. Existing wire bytes remain
 //   unchanged.
+//   v2.8.19-VerifiedSubmitOutcomeMapping — Centralized the boolean evidence
+//   to result-code table used by verified chat submit responses. Existing wire
+//   bytes remain unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -79,6 +82,7 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.19-VerifiedSubmitOutcomeMapping — Added core-owned outcome mapping
 //   v2.8.18-VerifiedSubmitResultLabels — Added helper labels for result codes
 //   v2.8.17-VerifiedChatSubmit — Appended variants 38-39 without changing any
 //                        existing discriminant or legacy ChatRelay behavior
@@ -188,6 +192,23 @@ pub fn chat_verified_submit_result_label(result: u8) -> Option<&'static str> {
         CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1 => Some("entry_retry"),
         CHAT_VERIFIED_SUBMIT_REJECTED_V1 => Some("rejected"),
         _ => None,
+    }
+}
+
+/// Maps independent terminal proof and entry custody evidence into one result code.
+///
+/// [CHAT-VERIFIED-SUBMIT-OUTCOME-MAPPING 2026-08-23 by Codex] Keep this table
+/// in the protocol crate so server implementations, SDKs, and future
+/// compatibility shims cannot drift into different client-visible semantics.
+/// The two booleans are already aggregate evidence; no route, endpoint,
+/// receipt, wallet, payload, or message metadata enters this mapping.
+#[must_use]
+pub fn chat_verified_submit_result_for_outcomes(verified_onion: bool, entry_custody: bool) -> u8 {
+    match (verified_onion, entry_custody) {
+        (true, true) => CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
+        (true, false) => CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1,
+        (false, true) => CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+        (false, false) => CHAT_VERIFIED_SUBMIT_REJECTED_V1,
     }
 }
 
@@ -2320,6 +2341,29 @@ mod tests {
             Some("rejected")
         );
         assert_eq!(chat_verified_submit_result_label(u8::MAX), None);
+    }
+
+    #[test]
+    fn verified_chat_submit_outcome_mapping_is_closed_and_stable() {
+        // [CHAT-VERIFIED-SUBMIT-OUTCOME-MAPPING 2026-08-23 by Codex] All four
+        // independent evidence combinations have one stable wire result. This
+        // keeps relay implementations from inventing open-text client states.
+        assert_eq!(
+            chat_verified_submit_result_for_outcomes(true, true),
+            CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1
+        );
+        assert_eq!(
+            chat_verified_submit_result_for_outcomes(true, false),
+            CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1
+        );
+        assert_eq!(
+            chat_verified_submit_result_for_outcomes(false, true),
+            CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1
+        );
+        assert_eq!(
+            chat_verified_submit_result_for_outcomes(false, false),
+            CHAT_VERIFIED_SUBMIT_REJECTED_V1
+        );
     }
 
     #[test]

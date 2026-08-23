@@ -928,9 +928,8 @@ use aeronyx_core::protocol::codec::{
 };
 use aeronyx_core::protocol::discovery::RouteDomainAttestationCertificateV1;
 use aeronyx_core::protocol::memchain::{
-    encode_memchain, ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
-    MemChainMessage, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
-    CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1, CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1,
+    chat_verified_submit_result_for_outcomes, encode_memchain,
+    ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1, MemChainMessage,
     CHAT_VERIFIED_SUBMIT_REJECTED_V1, MAX_CHAT_PULL_CURSOR_V2_BYTES,
 };
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
@@ -12232,21 +12231,6 @@ impl Server {
         route_id
     }
 
-    /// Maps independently verified terminal and entry custody outcomes onto
-    /// the closed client-visible result vocabulary.
-    #[must_use]
-    fn verified_chat_submit_result(verified_onion: bool, entry_custody: bool) -> u8 {
-        // [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] Centralising this table
-        // keeps response construction and tests aligned as the retry policy
-        // evolves, without turning transport errors into protocol strings.
-        match (verified_onion, entry_custody) {
-            (true, true) => CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
-            (true, false) => CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1,
-            (false, true) => CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
-            (false, false) => CHAT_VERIFIED_SUBMIT_REJECTED_V1,
-        }
-    }
-
     fn blind_relay_three_hop_probe_route_id(
         now: u64,
         self_node_id: &[u8; 32],
@@ -14584,7 +14568,7 @@ impl Server {
                 false
             }
         };
-        let result = Self::verified_chat_submit_result(
+        let result = chat_verified_submit_result_for_outcomes(
             verified_onion && onion_delivered,
             entry_custody,
         );
@@ -14592,19 +14576,16 @@ impl Server {
         // status records only the closed result bucket, never identifiers.
         relay.record_verified_submit_result(unix_now_secs(), result);
 
-        ChatRelayVerifiedSubmitResponseV1 {
+        let mut response = ChatRelayVerifiedSubmitResponseV1 {
             request_id: request.request_id,
             message_id: request.envelope.message_id,
             result,
-            terminal_receipt: if matches!(
-                result,
-                CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1 | CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1
-            ) {
-                terminal_receipt
-            } else {
-                None
-            },
+            terminal_receipt,
+        };
+        if !response.verified_onion_delivery() {
+            response.terminal_receipt = None;
         }
+        response
     }
 
     // ============================================
@@ -18184,29 +18165,6 @@ mod tests {
         // the envelope to no peer at all.
         let preflight_only = super::AuthenticatedChatOnionRelayOutcome::default();
         assert!(preflight_only.compatibility_direct_fallback_allowed());
-    }
-
-    #[test]
-    fn verified_chat_submit_result_table_is_closed() {
-        // [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] All four evidence
-        // combinations have one stable wire result. This prevents future
-        // transport branches from inventing open-text client states.
-        assert_eq!(
-            Server::verified_chat_submit_result(true, true),
-            super::CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1
-        );
-        assert_eq!(
-            Server::verified_chat_submit_result(true, false),
-            super::CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1
-        );
-        assert_eq!(
-            Server::verified_chat_submit_result(false, true),
-            super::CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1
-        );
-        assert_eq!(
-            Server::verified_chat_submit_result(false, false),
-            super::CHAT_VERIFIED_SUBMIT_REJECTED_V1
-        );
     }
 
     #[test]
