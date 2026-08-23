@@ -928,8 +928,9 @@ use aeronyx_core::protocol::codec::{
 };
 use aeronyx_core::protocol::discovery::RouteDomainAttestationCertificateV1;
 use aeronyx_core::protocol::memchain::{
-    encode_memchain, ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
-    MemChainMessage, CHAT_VERIFIED_SUBMIT_REJECTED_V1, MAX_CHAT_PULL_CURSOR_V2_BYTES,
+    chat_verified_submit_route_id, encode_memchain, ChatRelayVerifiedSubmitRequestV1,
+    ChatRelayVerifiedSubmitResponseV1, MemChainMessage, CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+    MAX_CHAT_PULL_CURSOR_V2_BYTES,
 };
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
@@ -12203,33 +12204,6 @@ impl Server {
         route_id
     }
 
-    /// Derives one retry-stable route id for an explicit client submission.
-    ///
-    /// The digest includes both selected relay identities so independent
-    /// replica paths never share a replay key. Only the 16-byte result crosses
-    /// the relay boundary; request ids and complete path topology are not
-    /// logged or persisted by the source.
-    fn verified_chat_submit_route_id(
-        request_id: &[u8; 16],
-        self_node_id: &[u8; 32],
-        middle_node_id: &[u8; 32],
-        terminal_node_id: &[u8; 32],
-    ) -> [u8; 16] {
-        // [CHAT-VERIFIED-SUBMIT 2026-08-22 by Codex] Keep this derivation
-        // domain-separated from probes and legacy random route ids. The path
-        // identities make one request id safe across independent replicas.
-        let mut hasher = Sha256::new();
-        hasher.update(b"AeroNyx-ChatVerifiedSubmit-Route-v1");
-        hasher.update(request_id);
-        hasher.update(self_node_id);
-        hasher.update(middle_node_id);
-        hasher.update(terminal_node_id);
-        let digest = hasher.finalize();
-        let mut route_id = [0u8; 16];
-        route_id.copy_from_slice(&digest[..16]);
-        route_id
-    }
-
     fn blind_relay_three_hop_probe_route_id(
         now: u64,
         self_node_id: &[u8; 32],
@@ -12466,7 +12440,7 @@ impl Server {
                 // route. Retrying the same signed request therefore reaches
                 // the blind-relay replay cache instead of multiplying custody
                 // work, while different hop surfaces remain unlinkable.
-                Self::verified_chat_submit_route_id(
+                chat_verified_submit_route_id(
                     request_id,
                     self_node_id,
                     &middle_node_id,
@@ -18157,48 +18131,6 @@ mod tests {
         // the envelope to no peer at all.
         let preflight_only = super::AuthenticatedChatOnionRelayOutcome::default();
         assert!(preflight_only.compatibility_direct_fallback_allowed());
-    }
-
-    #[test]
-    fn verified_chat_submit_route_id_is_retry_stable_and_path_bound() {
-        let request_id = [0x91; 16];
-        let source = [0x92; 32];
-        let middle = [0x93; 32];
-        let terminal = [0x94; 32];
-        let route_id = Server::verified_chat_submit_route_id(
-            &request_id,
-            &source,
-            &middle,
-            &terminal,
-        );
-
-        assert_eq!(
-            route_id,
-            Server::verified_chat_submit_route_id(
-                &request_id,
-                &source,
-                &middle,
-                &terminal,
-            )
-        );
-        assert_ne!(
-            route_id,
-            Server::verified_chat_submit_route_id(
-                &request_id,
-                &source,
-                &[0x95; 32],
-                &terminal,
-            )
-        );
-        assert_ne!(
-            route_id,
-            Server::verified_chat_submit_route_id(
-                &[0x96; 16],
-                &source,
-                &middle,
-                &terminal,
-            )
-        );
     }
 
     #[test]

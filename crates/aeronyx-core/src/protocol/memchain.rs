@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.20-VerifiedSubmitResponseEvidence
+// Version: 2.8.21-VerifiedSubmitRouteId
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -44,6 +44,8 @@
 //   v2.8.20-VerifiedSubmitResponseEvidence — Added a response constructor
 //   that derives result code and receipt retention from closed evidence inputs.
 //   Existing wire bytes remain unchanged.
+//   v2.8.21-VerifiedSubmitRouteId — Centralized retry-stable verified submit
+//   route id derivation. Existing wire bytes remain unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -85,6 +87,7 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.21-VerifiedSubmitRouteId — Added core-owned route id derivation
 //   v2.8.20-VerifiedSubmitResponseEvidence — Added fail-closed response builder
 //   v2.8.19-VerifiedSubmitOutcomeMapping — Added core-owned outcome mapping
 //   v2.8.18-VerifiedSubmitResultLabels — Added helper labels for result codes
@@ -117,6 +120,7 @@
 // ============================================================================
 
 use serde::{de, Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::crypto::IdentityKeyPair;
 use crate::error::CoreError;
@@ -214,6 +218,32 @@ pub fn chat_verified_submit_result_for_outcomes(verified_onion: bool, entry_cust
         (false, true) => CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
         (false, false) => CHAT_VERIFIED_SUBMIT_REJECTED_V1,
     }
+}
+
+/// Derives one retry-stable route id for an explicit verified submit path.
+///
+/// [CHAT-VERIFIED-SUBMIT-ROUTE-ID 2026-08-23 by Codex] This derivation is
+/// domain-separated from probes and random legacy relay route ids. The selected
+/// source, middle, and terminal identities are included so the same client
+/// request id cannot replay across independent path surfaces, while only the
+/// resulting 16-byte route id needs to cross the relay boundary.
+#[must_use]
+pub fn chat_verified_submit_route_id(
+    request_id: &[u8; 16],
+    source_node_id: &[u8; 32],
+    middle_node_id: &[u8; 32],
+    terminal_node_id: &[u8; 32],
+) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"AeroNyx-ChatVerifiedSubmit-Route-v1");
+    hasher.update(request_id);
+    hasher.update(source_node_id);
+    hasher.update(middle_node_id);
+    hasher.update(terminal_node_id);
+    let digest = hasher.finalize();
+    let mut route_id = [0u8; 16];
+    route_id.copy_from_slice(&digest[..16]);
+    route_id
 }
 
 /// Opt-in client request for a terminal-verifiable onion chat delivery.
@@ -2453,6 +2483,31 @@ mod tests {
         inconsistent
             .validate_shape()
             .expect("valid fail-closed shape");
+    }
+
+    #[test]
+    fn verified_chat_submit_route_id_is_retry_stable_and_path_bound() {
+        let request_id = [0x91; 16];
+        let source = [0x92; 32];
+        let middle = [0x93; 32];
+        let terminal = [0x94; 32];
+        let route_id = chat_verified_submit_route_id(&request_id, &source, &middle, &terminal);
+
+        // [CHAT-VERIFIED-SUBMIT-ROUTE-ID 2026-08-23 by Codex] Reusing the
+        // exact signed request and path must hit the same blind-relay replay
+        // key, while path or request changes must not collide.
+        assert_eq!(
+            route_id,
+            chat_verified_submit_route_id(&request_id, &source, &middle, &terminal)
+        );
+        assert_ne!(
+            route_id,
+            chat_verified_submit_route_id(&request_id, &source, &[0x95; 32], &terminal)
+        );
+        assert_ne!(
+            route_id,
+            chat_verified_submit_route_id(&[0x96; 16], &source, &middle, &terminal)
+        );
     }
 
     #[test]
