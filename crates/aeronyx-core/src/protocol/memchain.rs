@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.21-VerifiedSubmitRouteId
+// Version: 2.8.22-VerifiedSubmitRejectedResponse
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -46,6 +46,8 @@
 //   Existing wire bytes remain unchanged.
 //   v2.8.21-VerifiedSubmitRouteId — Centralized retry-stable verified submit
 //   route id derivation. Existing wire bytes remain unchanged.
+//   v2.8.22-VerifiedSubmitRejectedResponse — Added a canonical rejected
+//   response constructor. Existing wire bytes remain unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -87,6 +89,7 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.22-VerifiedSubmitRejectedResponse — Added rejected response builder
 //   v2.8.21-VerifiedSubmitRouteId — Added core-owned route id derivation
 //   v2.8.20-VerifiedSubmitResponseEvidence — Added fail-closed response builder
 //   v2.8.19-VerifiedSubmitOutcomeMapping — Added core-owned outcome mapping
@@ -353,6 +356,22 @@ pub struct ChatRelayVerifiedSubmitResponseV1 {
 }
 
 impl ChatRelayVerifiedSubmitResponseV1 {
+    /// Builds the canonical fail-closed response for rejected submissions.
+    ///
+    /// [CHAT-VERIFIED-SUBMIT-REJECTED-RESPONSE 2026-08-23 by Codex] Keep this
+    /// shape in the protocol crate so entry relays, SDK simulations, and future
+    /// decentralized submit surfaces never drift on the rejected result code or
+    /// accidentally attach terminal receipt bytes to a failed request.
+    #[must_use]
+    pub fn rejected(request_id: [u8; 16], message_id: [u8; 16]) -> Self {
+        Self {
+            request_id,
+            message_id,
+            result: CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+            terminal_receipt: None,
+        }
+    }
+
     /// Builds a response from independently observed delivery evidence.
     ///
     /// [CHAT-VERIFIED-SUBMIT-RESPONSE-EVIDENCE 2026-08-23 by Codex] A terminal
@@ -2457,11 +2476,7 @@ mod tests {
         // If a caller claims onion delivery without receipt bytes, clients must
         // receive only entry-custody retry semantics.
         let missing_receipt = ChatRelayVerifiedSubmitResponseV1::from_evidence(
-            [0x67; 16],
-            [0x68; 16],
-            true,
-            true,
-            None,
+            [0x67; 16], [0x68; 16], true, true, None,
         );
         assert_eq!(missing_receipt.result, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1);
         assert!(missing_receipt.terminal_receipt.is_none());
@@ -2483,6 +2498,13 @@ mod tests {
         inconsistent
             .validate_shape()
             .expect("valid fail-closed shape");
+
+        let rejected = ChatRelayVerifiedSubmitResponseV1::rejected([0x6B; 16], [0x6C; 16]);
+        assert_eq!(rejected.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        assert!(rejected.terminal_receipt.is_none());
+        rejected
+            .validate_shape()
+            .expect("valid rejected response shape");
     }
 
     #[test]

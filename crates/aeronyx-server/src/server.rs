@@ -929,8 +929,7 @@ use aeronyx_core::protocol::codec::{
 use aeronyx_core::protocol::discovery::RouteDomainAttestationCertificateV1;
 use aeronyx_core::protocol::memchain::{
     chat_verified_submit_route_id, encode_memchain, ChatRelayVerifiedSubmitRequestV1,
-    ChatRelayVerifiedSubmitResponseV1, MemChainMessage, CHAT_VERIFIED_SUBMIT_REJECTED_V1,
-    MAX_CHAT_PULL_CURSOR_V2_BYTES,
+    ChatRelayVerifiedSubmitResponseV1, MemChainMessage, MAX_CHAT_PULL_CURSOR_V2_BYTES,
 };
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
@@ -14467,11 +14466,11 @@ impl Server {
         node_identity: &IdentityKeyPair,
         chat_peer_client: Option<&reqwest::Client>,
     ) -> ChatRelayVerifiedSubmitResponseV1 {
-        let rejected = || ChatRelayVerifiedSubmitResponseV1 {
-            request_id: request.request_id,
-            message_id: request.envelope.message_id,
-            result: CHAT_VERIFIED_SUBMIT_REJECTED_V1,
-            terminal_receipt: None,
+        let rejected = || {
+            ChatRelayVerifiedSubmitResponseV1::rejected(
+                request.request_id,
+                request.envelope.message_id,
+            )
         };
 
         if request.verify_authentication().is_err()
@@ -14480,19 +14479,17 @@ impl Server {
                 &session.client_public_key.to_bytes(),
             )
         {
+            let response = rejected();
             if let Some(relay) = chat_relay.as_ref() {
                 // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Count
                 // rejected explicit submissions only as an aggregate result.
-                relay.record_verified_submit_result(
-                    unix_now_secs(),
-                    CHAT_VERIFIED_SUBMIT_REJECTED_V1,
-                );
+                relay.record_verified_submit_result(unix_now_secs(), response.result);
             }
             warn!(
                 reason = "verified_submit_authentication_failed",
                 "[CHAT_RELAY] Verified submit rejected"
             );
-            return rejected();
+            return response;
         }
 
         let Some(relay) = chat_relay.as_ref() else {

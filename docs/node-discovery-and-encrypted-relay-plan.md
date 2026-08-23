@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.31.0 - [CHAT-VERIFIED-SUBMIT-ROUTE-ID 2026-08-23 by Codex] Moves retry-stable verified-submit route id derivation into `aeronyx-core::protocol::memchain::chat_verified_submit_route_id()` so source nodes, SDKs, and future relay implementations share one path-bound replay key contract.
+Last Modified: v1.32.0 - [CHAT-VERIFIED-SUBMIT-REJECTED-RESPONSE 2026-08-23 by Codex] Adds the core-owned `ChatRelayVerifiedSubmitResponseV1::rejected()` builder so denied explicit submissions always fail closed with the same no-receipt response shape.
+Previous: v1.31.0 - [CHAT-VERIFIED-SUBMIT-ROUTE-ID 2026-08-23 by Codex] Moves retry-stable verified-submit route id derivation into `aeronyx-core::protocol::memchain::chat_verified_submit_route_id()` so source nodes, SDKs, and future relay implementations share one path-bound replay key contract.
 Previous: v1.30.0 - [CHAT-VERIFIED-SUBMIT-RESPONSE-EVIDENCE 2026-08-23 by Codex] Adds the core-owned `ChatRelayVerifiedSubmitResponseV1::from_evidence()` builder so server implementations derive result code and terminal-receipt retention through one fail-closed protocol boundary.
 Previous: v1.29.0 - [CHAT-VERIFIED-SUBMIT-OUTCOME-MAPPING 2026-08-23 by Codex] Moves the verified-submit evidence-to-result table into `aeronyx-core::protocol::memchain::chat_verified_submit_result_for_outcomes()` so servers and SDKs share the same closed protocol semantics.
 Previous: v1.28.0 - [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] Centralizes verified-submit result labels in `aeronyx-core::protocol::memchain::chat_verified_submit_result_label()` so relay health, nodeboard, SDKs, and docs share one closed vocabulary.
@@ -3202,6 +3203,10 @@ Implemented:
   `chat_verified_submit_route_id()`, binding request id, source node, middle
   node, and terminal node. Server implementations should not maintain a
   private derivation string.
+- [CHAT-VERIFIED-SUBMIT-REJECTED-RESPONSE 2026-08-23 by Codex] Authentication
+  failures and policy denials should use
+  `ChatRelayVerifiedSubmitResponseV1::rejected()` so no rejected path can attach
+  terminal receipt bytes or drift from the closed rejected result code.
 - Receipt verification must bind the opaque envelope, message-relay purpose,
   and a terminal identity independently verified from the signed node
   directory. A receipt's embedded identity is never its own trust root.
