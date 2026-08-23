@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.23-ChatSessionSenderBinding
+// Version: 2.8.24-VerifiedSubmitRequestBinding
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -51,6 +51,9 @@
 //   v2.8.23-ChatSessionSenderBinding — Reused the core-owned envelope sender
 //   binding contract during verified-submit construction. Existing wire bytes
 //   remain unchanged.
+//   v2.8.24-VerifiedSubmitRequestBinding — Added response verification against
+//   the exact client request id and envelope. Existing wire bytes remain
+//   unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -92,6 +95,7 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.24-VerifiedSubmitRequestBinding — Added exact-request response verifier
 //   v2.8.23-ChatSessionSenderBinding — Reused core envelope identity binding
 //   v2.8.22-VerifiedSubmitRejectedResponse — Added rejected response builder
 //   v2.8.21-VerifiedSubmitRouteId — Added core-owned route id derivation
@@ -469,6 +473,27 @@ impl ChatRelayVerifiedSubmitResponseV1 {
             OnionRoutePurpose::MessageRelay,
             expected_terminal_node_id,
         )
+    }
+
+    /// Verifies terminal delivery against the exact client submission request.
+    ///
+    /// [CHAT-VERIFIED-SUBMIT-REQUEST-BINDING 2026-08-23 by Codex] Concurrent
+    /// retries may carry the same signed envelope under distinct random request
+    /// ids. SDKs and agents should use this method so an authenticated but stale
+    /// response cannot satisfy another in-flight request merely because both
+    /// refer to the same message. The existing envelope-only verifier remains
+    /// available for backward compatibility and offline receipt inspection.
+    pub fn verify_terminal_receipt_for_request(
+        &self,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+        expected_terminal_node_id: &[u8; 32],
+    ) -> Result<(), CoreError> {
+        if self.request_id != request.request_id {
+            return Err(CoreError::malformed(
+                "verified chat submit: response request mismatch",
+            ));
+        }
+        self.verify_terminal_receipt(&request.envelope, expected_terminal_node_id)
     }
 }
 
@@ -2370,6 +2395,15 @@ mod tests {
         response
             .verify_terminal_receipt(&envelope, &terminal.public_key_bytes())
             .expect("verify terminal receipt");
+        response
+            .verify_terminal_receipt_for_request(&request, &terminal.public_key_bytes())
+            .expect("verify response against exact request");
+
+        let mut mismatched_request = request.clone();
+        mismatched_request.request_id[0] ^= 0x01;
+        assert!(response
+            .verify_terminal_receipt_for_request(&mismatched_request, &terminal.public_key_bytes(),)
+            .is_err());
 
         let mut substituted = envelope.clone();
         substituted.ciphertext[0] ^= 0x01;

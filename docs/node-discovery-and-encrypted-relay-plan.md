@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.33.0 - Centralized the client-session sender binding
-in the core chat protocol so legacy relay and opt-in verified submit enforce
-the same pre-routing identity boundary.
+Modification Reason: v1.34.0 - Added exact-request response verification so
+concurrent retries cannot accidentally accept a terminal receipt response for
+another in-flight request carrying the same encrypted envelope.
 
 Main Functionality:
 
@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.33.0 - [CHAT-SESSION-SENDER-BINDING 2026-08-23 by Codex] Moves authenticated transport identity matching to `ChatEnvelope::sender_matches_authenticated_identity()` so legacy relay, verified submit, SDK simulations, and future client-tunnel entry points share one pre-routing replay boundary.
+Last Modified: v1.34.0 - [CHAT-VERIFIED-SUBMIT-REQUEST-BINDING 2026-08-23 by Codex] Adds `verify_terminal_receipt_for_request()` so clients and agents bind terminal evidence to the exact random request id and submitted envelope during concurrent retries.
+Previous: v1.33.0 - [CHAT-SESSION-SENDER-BINDING 2026-08-23 by Codex] Moves authenticated transport identity matching to `ChatEnvelope::sender_matches_authenticated_identity()` so legacy relay, verified submit, SDK simulations, and future client-tunnel entry points share one pre-routing replay boundary.
 Previous: v1.32.0 - [CHAT-VERIFIED-SUBMIT-REJECTED-RESPONSE 2026-08-23 by Codex] Adds the core-owned `ChatRelayVerifiedSubmitResponseV1::rejected()` builder so denied explicit submissions always fail closed with the same no-receipt response shape.
 Previous: v1.31.0 - [CHAT-VERIFIED-SUBMIT-ROUTE-ID 2026-08-23 by Codex] Moves retry-stable verified-submit route id derivation into `aeronyx-core::protocol::memchain::chat_verified_submit_route_id()` so source nodes, SDKs, and future relay implementations share one path-bound replay key contract.
 Previous: v1.30.0 - [CHAT-VERIFIED-SUBMIT-RESPONSE-EVIDENCE 2026-08-23 by Codex] Adds the core-owned `ChatRelayVerifiedSubmitResponseV1::from_evidence()` builder so server implementations derive result code and terminal-receipt retention through one fail-closed protocol boundary.
@@ -3216,6 +3217,11 @@ Implemented:
 - Receipt verification must bind the opaque envelope, message-relay purpose,
   and a terminal identity independently verified from the signed node
   directory. A receipt's embedded identity is never its own trust root.
+- [CHAT-VERIFIED-SUBMIT-REQUEST-BINDING 2026-08-23 by Codex] Online clients,
+  agents, and SDKs should verify responses with
+  `verify_terminal_receipt_for_request()`. It checks the exact random request
+  id before applying the existing envelope, purpose, and terminal-signature
+  proof, preventing concurrent retries from consuming one another's response.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
