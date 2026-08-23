@@ -15971,6 +15971,10 @@ mod tests {
         DirectoryDescriptorInclusionProofV1, RouteDomainAttestationCertificateV1,
         RouteDomainAttestationV1,
     };
+    use aeronyx_core::protocol::memchain::{
+        ChatRelayVerifiedSubmitRequestV1, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+        CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+    };
     use aeronyx_core::protocol::onion::is_onion_blob;
     use aeronyx_core::protocol::{
         NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor, NodeDiscoveryMessage,
@@ -18831,6 +18835,92 @@ mod tests {
             Some("no_receipt_capable_terminal")
         );
         assert_eq!(status.direct_peer_outbound.rounds, 0);
+    }
+
+    #[tokio::test]
+    async fn verified_submit_correlates_entry_retry_and_session_rejection() {
+        // [CHAT-VERIFIED-SUBMIT-HANDLER-CORRELATION 2026-08-23 by Codex]
+        // Exercise the real client handler, durable entry custody, authenticated
+        // session binding, and aggregate telemetry without requiring a live
+        // peer. Both non-onion outcomes must remain safe to correlate with the
+        // exact request and must never attach terminal receipt bytes.
+        let directory = tempfile::tempdir().expect("verified submit handler directory");
+        let relay = test_chat_relay_service(
+            &directory.path().join("verified-submit.sqlite3"),
+            [0x71; 32],
+        );
+        let relay_option = Some(Arc::clone(&relay));
+        let sender = IdentityKeyPair::generate();
+        let unrelated = IdentityKeyPair::generate();
+        let source_node = IdentityKeyPair::generate();
+        let now = unix_now_secs();
+        let mut envelope = ChatEnvelope {
+            message_id: [0x72; 16],
+            sender: sender.public_key_bytes(),
+            receiver: [0x73; 32],
+            timestamp: now,
+            ciphertext: b"opaque verified submit payload".to_vec(),
+            nonce: [0x74; 24],
+            content_type: ChatContentType::Text,
+            signature: [0u8; 64],
+        };
+        envelope.signature = sender.sign(&envelope.sign_data());
+        let request = ChatRelayVerifiedSubmitRequestV1::signed([0x75; 16], envelope, now, &sender)
+            .expect("sign verified submit request");
+        let session = Arc::new(crate::services::Session::new(
+            aeronyx_common::types::SessionId::generate(),
+            sender.public_key(),
+            aeronyx_core::crypto::SessionKey::from_bytes([0x76; 32]),
+            Ipv4Addr::new(100, 64, 0, 76),
+            "127.0.0.1:1076".parse().unwrap(),
+        ));
+        let store = PeerStore::new();
+
+        let retry_response = Server::handle_verified_chat_submit(
+            request.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(retry_response.result, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1);
+        assert!(retry_response.terminal_receipt.is_none());
+        retry_response
+            .validate_for_request(&request)
+            .expect("entry retry response must correlate");
+
+        let unrelated_session = Arc::new(crate::services::Session::new(
+            aeronyx_common::types::SessionId::generate(),
+            unrelated.public_key(),
+            aeronyx_core::crypto::SessionKey::from_bytes([0x77; 32]),
+            Ipv4Addr::new(100, 64, 0, 77),
+            "127.0.0.1:1077".parse().unwrap(),
+        ));
+        let rejected_response = Server::handle_verified_chat_submit(
+            request.clone(),
+            &unrelated_session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(rejected_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        assert!(rejected_response.terminal_receipt.is_none());
+        rejected_response
+            .validate_for_request(&request)
+            .expect("rejected response must correlate");
+
+        let status = relay.peer_status().verified_submit;
+        assert_eq!(status.total, 2);
+        assert_eq!(status.entry_retry_total, 1);
+        assert_eq!(status.rejected_total, 1);
+        assert_eq!(status.unknown_result_total, 0);
+        assert_eq!(status.last_result.as_deref(), Some("rejected"));
     }
 
     #[tokio::test]
