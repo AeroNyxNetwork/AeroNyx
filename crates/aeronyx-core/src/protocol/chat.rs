@@ -16,6 +16,7 @@
 //! - `MediaPointer`: Encrypted file reference (lives inside ChatEnvelope.ciphertext)
 //! - `sign_envelope_data()`: Canonical byte sequence for Ed25519 signing
 //! - `verify_envelope()`: Convenience wrapper for signature verification
+//! - `ChatEnvelope::sender_matches_authenticated_identity()`: Transport identity binding
 //! - `encode_envelope()` / `decode_envelope()`: bincode helpers
 //!
 //! ## E2E Encryption (Flutter client reference)
@@ -55,6 +56,10 @@
 //! - blob_id in MediaPointer is computed by the NODE (HMAC-SHA256 derived),
 //!   returned to the client after POST /api/chat/blob, then embedded here.
 //! - file_key is independent of the chat E2E shared_secret — double-layer protection.
+//! - [CHAT-SESSION-SENDER-BINDING 2026-08-23 by Codex] Signature validity and
+//!   authenticated transport ownership are separate checks. Client-tunnel
+//!   handlers must bind `sender` to the handshake identity before dedupe,
+//!   route mutation, custody, or peer fan-out.
 //!
 //! - `BlindRelayEnvelope`: node-to-node opaque forwarding frame for future
 //!   controlled multi-hop/onion routing. Nodes see route_id/next_hop/ttl and
@@ -86,6 +91,8 @@
 //!   disclosure explicit; it still contains no user- or message-level data.
 //!
 //! ## Last Modified
+//! v1.10.0-ChatSessionSenderBinding - Centralized authenticated transport
+//! identity binding on `ChatEnvelope` without changing wire bytes
 //! v1.9.0-CustodyAnchorMetadataAccuracy - Correct the documented aggregate
 //! metadata visible to an external custody witness
 //! v1.8.0-CustodyWitnessNetwork - Added canonical anchor/receipt frame digests
@@ -336,6 +343,18 @@ impl ChatEnvelope {
         let pk = IdentityPublicKey::from_bytes(&self.sender)?;
         // verify expects (&[u8], &[u8; 64]) — sign_data() returns Vec<u8>, signature is [u8; 64]
         pk.verify(&self.sign_data(), &self.signature)
+    }
+
+    /// Returns whether the envelope sender is the authenticated transport identity.
+    ///
+    /// [CHAT-SESSION-SENDER-BINDING 2026-08-23 by Codex] A valid signature
+    /// proves that `sender` authorized these exact envelope bytes. It does not
+    /// prove that the current VPN session belongs to that sender. Client-facing
+    /// relay handlers must call this after signature verification and before
+    /// dedupe, route mutation, durable custody, or peer fan-out.
+    #[must_use]
+    pub fn sender_matches_authenticated_identity(&self, authenticated_identity: &[u8; 32]) -> bool {
+        &self.sender == authenticated_identity
     }
 
     /// Returns a compact hex prefix of `message_id` for log output.
@@ -1598,6 +1617,20 @@ mod tests {
             env.verify_signature().is_ok(),
             "Valid signature must verify"
         );
+    }
+
+    #[test]
+    fn test_envelope_sender_binding_is_independent_from_signature() {
+        // [CHAT-SESSION-SENDER-BINDING 2026-08-23 by Codex] A captured valid
+        // envelope must not authorize an unrelated authenticated session to
+        // claim the sender route or initiate relay work.
+        let sender = IdentityKeyPair::generate();
+        let unrelated_session = IdentityKeyPair::generate();
+        let env = make_signed_envelope(&sender);
+
+        assert!(env.verify_signature().is_ok());
+        assert!(env.sender_matches_authenticated_identity(&sender.public_key_bytes()));
+        assert!(!env.sender_matches_authenticated_identity(&unrelated_session.public_key_bytes()));
     }
 
     #[test]

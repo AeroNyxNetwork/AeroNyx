@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.22-VerifiedSubmitRejectedResponse
+// Version: 2.8.23-ChatSessionSenderBinding
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -48,6 +48,9 @@
 //   route id derivation. Existing wire bytes remain unchanged.
 //   v2.8.22-VerifiedSubmitRejectedResponse — Added a canonical rejected
 //   response constructor. Existing wire bytes remain unchanged.
+//   v2.8.23-ChatSessionSenderBinding — Reused the core-owned envelope sender
+//   binding contract during verified-submit construction. Existing wire bytes
+//   remain unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -89,6 +92,7 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.23-ChatSessionSenderBinding — Reused core envelope identity binding
 //   v2.8.22-VerifiedSubmitRejectedResponse — Added rejected response builder
 //   v2.8.21-VerifiedSubmitRouteId — Added core-owned route id derivation
 //   v2.8.20-VerifiedSubmitResponseEvidence — Added fail-closed response builder
@@ -276,7 +280,7 @@ impl ChatRelayVerifiedSubmitRequestV1 {
         request_timestamp: u64,
         sender: &IdentityKeyPair,
     ) -> Result<Self, CoreError> {
-        if envelope.sender != sender.public_key_bytes() {
+        if !envelope.sender_matches_authenticated_identity(&sender.public_key_bytes()) {
             return Err(CoreError::malformed(
                 "verified chat submit: envelope sender mismatch",
             ));

@@ -14433,23 +14433,6 @@ impl Server {
         traffic_tracker.remove_wallet(&termination.wallet_hex);
     }
 
-    /// Returns whether one client-tunnel chat sender is bound to the
-    /// authenticated VPN session identity.
-    ///
-    /// [CHAT-SESSION-SENDER-BINDING 2026-08-15 by Codex] A valid envelope
-    /// signature proves that `sender` authorized the envelope; it does not
-    /// prove that the current transport session belongs to that sender. Keep
-    /// this check ahead of dedupe and every route mutation so replaying another
-    /// user's signed ciphertext cannot claim their wallet route or trigger
-    /// peer fan-out from an unrelated authenticated session.
-    #[must_use]
-    fn chat_sender_matches_authenticated_session(
-        envelope: &ChatEnvelope,
-        authenticated_session_key: &[u8; 32],
-    ) -> bool {
-        &envelope.sender == authenticated_session_key
-    }
-
     /// Handles one opt-in client request that requires terminal-verifiable
     /// onion delivery without changing legacy `ChatRelay` availability.
     ///
@@ -14474,10 +14457,9 @@ impl Server {
         };
 
         if request.verify_authentication().is_err()
-            || !Self::chat_sender_matches_authenticated_session(
-                &request.envelope,
-                &session.client_public_key.to_bytes(),
-            )
+            || !request
+                .envelope
+                .sender_matches_authenticated_identity(&session.client_public_key.to_bytes())
         {
             let response = rejected();
             if let Some(relay) = chat_relay.as_ref() {
@@ -14740,10 +14722,7 @@ impl Server {
                     return;
                 }
                 let authenticated_sender = session.client_public_key.to_bytes();
-                if !Self::chat_sender_matches_authenticated_session(
-                    &envelope,
-                    &authenticated_sender,
-                ) {
+                if !envelope.sender_matches_authenticated_identity(&authenticated_sender) {
                     warn!(
                         reason = "session_sender_mismatch",
                         "[CHAT_RELAY] Envelope dropped"
@@ -18066,37 +18045,6 @@ mod tests {
         };
         envelope.signature = sender.sign(&envelope.sign_data());
         envelope
-    }
-
-    #[test]
-    fn chat_sender_must_match_authenticated_session_identity() {
-        // [CHAT-SESSION-SENDER-BINDING 2026-08-15 by Codex] Signature
-        // validity and transport-session ownership are independent proofs. A
-        // captured valid envelope must not authorize another VPN session to
-        // claim the sender's return route or start peer relay fan-out.
-        let sender = IdentityKeyPair::generate();
-        let unrelated_session = IdentityKeyPair::generate();
-        let mut envelope = ChatEnvelope {
-            message_id: [0x31; 16],
-            sender: sender.public_key_bytes(),
-            receiver: [0x32; 32],
-            timestamp: 1_700_000_000,
-            ciphertext: b"opaque signed ciphertext".to_vec(),
-            nonce: [0x33; 24],
-            content_type: ChatContentType::Text,
-            signature: [0; 64],
-        };
-        envelope.signature = sender.sign(&envelope.sign_data());
-
-        assert!(envelope.verify_signature().is_ok());
-        assert!(Server::chat_sender_matches_authenticated_session(
-            &envelope,
-            &sender.public_key_bytes(),
-        ));
-        assert!(!Server::chat_sender_matches_authenticated_session(
-            &envelope,
-            &unrelated_session.public_key_bytes(),
-        ));
     }
 
     #[test]
