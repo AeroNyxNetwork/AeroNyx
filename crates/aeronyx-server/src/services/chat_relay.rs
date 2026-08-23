@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.11.0-VerifiedSubmitIdempotency
+// Version: 3.12.0-DurableVerifiedSubmitIdempotency
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -18,6 +18,10 @@
 //   [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Added a bounded,
 //   node-secret-indexed response cache and fixed-lane single-flight guard so
 //   retries return the first verified result without repeating onion custody.
+//   [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Persisted only
+//   HMAC-derived request/envelope fingerprints plus an AEAD-sealed response so
+//   exact retries remain idempotent across a clean or crash restart without
+//   storing raw request ids, message ids, sender keys, routes, or receipts.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -101,7 +105,7 @@
 //   - Relay health reason boundary: typed ingress with compatibility sanitizer
 //   - Verified submit telemetry: four closed aggregate result counters
 //   - Verified submit result labels: core-owned canonical status vocabulary
-//   - Verified submit idempotency: bounded exact-response replay and conflict guard
+//   - Verified submit idempotency: bounded restart-safe replay and conflict guard
 //
 // Dependencies:
 //   - aeronyx-core/src/protocol/chat.rs: ChatEnvelope, encode_envelope, decode_envelope
@@ -116,7 +120,8 @@
 //     4. Set and verify WAL + FULL pragmas
 //     5. init_schema() creates tables if missing
 //     6. Initialise MessageDedup (online-path LRU)
-//     7. Initialise bounded verified-submit response cache and lock lanes
+//     7. Initialise bounded verified-submit response cache and lock lanes; exact
+//        misses consult the private durable cache before routing
 //     8. Initialise WalletRouteCache (in-memory, empty on startup)
 //
 // ⚠️ Important Notes for Next Developer:
@@ -221,13 +226,16 @@
 //   - [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] Status labels
 //     must continue to come from aeronyx-core protocol helpers; do not fork a
 //     dashboard-only vocabulary in the relay implementation.
-//   - [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Keep cache keys
-//     node-secret HMACs and the cache process-local. Never export sender keys,
-//     request ids, response receipts, or envelope commitments through health.
+//   - [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Keep request
+//     and envelope keys as domain-separated node-secret HMACs. Durable response
+//     bytes must remain AEAD-sealed and bound to both fingerprints. Never store
+//     or export sender keys, request ids, message ids, response receipts, routes,
+//     or envelope commitments as plaintext metadata.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.12.0-DurableVerifiedSubmitIdempotency — Restart-safe private response replay
 //   v3.11.0-VerifiedSubmitIdempotency — Bounded single-flight response replay
 //   v3.10.0-VerifiedSubmitResultLabels — Core-owned verified-submit labels
 //   v3.9.0-VerifiedSubmitTelemetry — Aggregate verified-submit result counters
@@ -292,6 +300,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use aeronyx_core::crypto::IdentityKeyPair;
+use aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS;
 use aeronyx_core::protocol::chat::{
     decode_envelope, encode_envelope, ChatEnvelope, CustodyAuditAnchorV1,
 };
@@ -325,6 +334,8 @@ const CLEANUP_MESSAGE_BATCH_SIZE: usize = 1024;
 const CLEANUP_BLOB_BATCH_SIZE: usize = 128;
 /// Maximum delivered/stale notification rows deleted by one transaction.
 const CLEANUP_NOTIFICATION_BATCH_SIZE: usize = 1024;
+/// Maximum expired private verified-submit rows removed per transaction.
+const CLEANUP_VERIFIED_SUBMIT_RESPONSE_BATCH_SIZE: usize = 1024;
 /// Maximum privacy-minimised quarantine events removed by one transaction.
 const CLEANUP_QUARANTINE_EVENT_BATCH_SIZE: usize = 1024;
 /// Maximum cleanup transactions executed by one scheduled maintenance run.
@@ -340,6 +351,18 @@ const CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES: usize = 16;
 const CHAT_PULL_CURSOR_V2_TAG_BYTES: usize = 16;
 /// Fixed lock striping for concurrent verified-submit single-flight handling.
 const VERIFIED_SUBMIT_SINGLE_FLIGHT_LANES: usize = 64;
+/// Durable verified-submit row format guarded by `relay_schema_features`.
+const VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION: i64 = 1;
+const VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE: &str = "verified_submit_response_cache";
+/// A future-dated request may remain authentic for two timestamp windows.
+const VERIFIED_SUBMIT_RESPONSE_TTL_SECS: u64 = TIMESTAMP_WINDOW_SECS * 2 + 1;
+const VERIFIED_SUBMIT_RESPONSE_NONCE_BYTES: usize = 24;
+const VERIFIED_SUBMIT_RESPONSE_TAG_BYTES: usize = 16;
+/// Current bincode response is fixed-size apart from one fixed-size receipt.
+const MAX_VERIFIED_SUBMIT_RESPONSE_BYTES: usize = 512;
+const VERIFIED_SUBMIT_RESPONSE_HKDF_SALT: &[u8] = b"AeroNyx-VerifiedSubmit-ResponseCache-v1-key";
+const VERIFIED_SUBMIT_RESPONSE_HKDF_INFO: &[u8] = b"XChaCha20-Poly1305";
+const VERIFIED_SUBMIT_RESPONSE_AAD_DOMAIN: &[u8] = b"AeroNyx-VerifiedSubmit-ResponseCache-v1";
 const CHAT_PULL_CURSOR_V2_BYTES: usize = 1
     + CHAT_PULL_CURSOR_V2_NONCE_BYTES
     + CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES
@@ -1607,6 +1630,10 @@ pub enum ChatRelayError {
     #[error("Unable to protect opaque pull cursor")]
     PullCursorEncryptionFailed,
 
+    /// The node could not protect or recover one private verified-submit row.
+    #[error("Unable to protect verified submit response")]
+    VerifiedSubmitProtectionFailed,
+
     /// The durable monotonic queue sequence reached SQLite INTEGER capacity.
     #[error("Durable relay queue sequence exhausted")]
     QueueSequenceExhausted,
@@ -1712,6 +1739,7 @@ impl ChatRelayError {
             Self::MessageIdConflict => "message_id_conflict",
             Self::InvalidPullCursor => "invalid_pull_cursor",
             Self::PullCursorEncryptionFailed => "pull_cursor_encryption_failed",
+            Self::VerifiedSubmitProtectionFailed => "verified_submit_protection_failed",
             Self::QueueSequenceExhausted => "queue_sequence_exhausted",
             Self::MessageTooLarge { .. } => "message_too_large",
             Self::MailboxFull { .. } => "mailbox_full",
@@ -1896,6 +1924,7 @@ struct CleanupBatchOutcome {
     removed_notifications: usize,
     quarantined_pending_messages: usize,
     removed_quarantine_events: usize,
+    removed_verified_submit_responses: usize,
     retained_quarantine_events: usize,
     has_more: bool,
 }
@@ -1907,6 +1936,7 @@ struct CleanupRunSummary {
     removed_notifications: usize,
     quarantined_pending_messages: usize,
     removed_quarantine_events: usize,
+    removed_verified_submit_responses: usize,
     retained_quarantine_events: usize,
     successful_batches: usize,
     backlog_deferred: bool,
@@ -1925,6 +1955,9 @@ impl CleanupRunSummary {
         self.removed_quarantine_events = self
             .removed_quarantine_events
             .saturating_add(batch.removed_quarantine_events);
+        self.removed_verified_submit_responses = self
+            .removed_verified_submit_responses
+            .saturating_add(batch.removed_verified_submit_responses);
         self.retained_quarantine_events = batch.retained_quarantine_events;
         self.successful_batches = self.successful_batches.saturating_add(1);
     }
@@ -1935,6 +1968,7 @@ impl CleanupRunSummary {
             || self.removed_notifications > 0
             || self.quarantined_pending_messages > 0
             || self.removed_quarantine_events > 0
+            || self.removed_verified_submit_responses > 0
     }
 }
 
@@ -2376,7 +2410,7 @@ pub(crate) enum VerifiedSubmitCacheLookup {
 
 #[derive(Clone)]
 struct VerifiedSubmitCacheEntry {
-    envelope_commitment: [u8; 32],
+    envelope_fingerprint: [u8; 32],
     response: ChatRelayVerifiedSubmitResponseV1,
 }
 
@@ -2405,12 +2439,12 @@ impl VerifiedSubmitResponseCache {
     fn lookup(
         &self,
         cache_key: &[u8; 32],
-        envelope_commitment: &[u8; 32],
+        envelope_fingerprint: &[u8; 32],
     ) -> VerifiedSubmitCacheLookup {
         let Some(entry) = self.entries.get(cache_key) else {
             return VerifiedSubmitCacheLookup::Miss;
         };
-        if &entry.envelope_commitment != envelope_commitment {
+        if &entry.envelope_fingerprint != envelope_fingerprint {
             return VerifiedSubmitCacheLookup::Conflict;
         }
         VerifiedSubmitCacheLookup::Exact(entry.response.clone())
@@ -2419,7 +2453,7 @@ impl VerifiedSubmitResponseCache {
     fn insert(
         &mut self,
         cache_key: [u8; 32],
-        envelope_commitment: [u8; 32],
+        envelope_fingerprint: [u8; 32],
         response: ChatRelayVerifiedSubmitResponseV1,
     ) {
         if self.entries.contains_key(&cache_key) {
@@ -2434,7 +2468,7 @@ impl VerifiedSubmitResponseCache {
         self.entries.insert(
             cache_key,
             VerifiedSubmitCacheEntry {
-                envelope_commitment,
+                envelope_fingerprint,
                 response,
             },
         );
@@ -2457,6 +2491,8 @@ pub struct ChatRelayService {
     node_secret: [u8; 32],
     /// Stable node-local AEAD key for opaque v2 pull cursors.
     pull_cursor_key: [u8; 32],
+    /// Stable node-local AEAD key for durable verified-submit responses.
+    verified_submit_response_key: [u8; 32],
     dedup: MessageDedup,
     verified_submit_cache: Mutex<VerifiedSubmitResponseCache>,
     verified_submit_lanes: Box<[tokio::sync::Mutex<()>]>,
@@ -5044,6 +5080,37 @@ impl ChatRelayService {
             });
         }
 
+        let verified_submit_version = conn
+            .query_row(
+                "SELECT schema_version
+                 FROM relay_schema_features
+                 WHERE feature = ?1",
+                params![VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if verified_submit_version != Some(VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION) {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "sqlite_backup_verified_submit_schema_sentinel",
+            });
+        }
+        let invalid_verified_submit_rows = conn.query_row(
+            "SELECT COUNT(*) FROM relay_verified_submit_responses
+             WHERE LENGTH(cache_key) != 32
+                OR LENGTH(envelope_fingerprint) != 32
+                OR LENGTH(response_nonce) != 24
+                OR LENGTH(response_ciphertext) <= 16
+                OR LENGTH(response_ciphertext) > 528
+                OR completed_at < 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if invalid_verified_submit_rows != 0 {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "sqlite_backup_verified_submit_rows",
+            });
+        }
+
         let _ = Self::read_direct_peer_relay_circuit_checkpoint(conn, now_secs())?;
 
         let stored_usage = Self::read_storage_usage(conn)?;
@@ -5139,6 +5206,7 @@ impl ChatRelayService {
         let dedup_capacity = config.dedup_lru_capacity;
         let relay_enabled = config.enabled;
         let pull_cursor_key = Self::derive_pull_cursor_key(&node_secret)?;
+        let verified_submit_response_key = Self::derive_verified_submit_response_key(&node_secret)?;
         let mut peer_status = ChatRelayPeerStatus::new(relay_enabled);
         peer_status.custody_durability =
             ChatRelayCustodyDurabilityStatus::verified_full(synchronous_level);
@@ -5147,6 +5215,7 @@ impl ChatRelayService {
             conn: Mutex::new(conn),
             node_secret,
             pull_cursor_key,
+            verified_submit_response_key,
             dedup: MessageDedup::new(dedup_capacity),
             verified_submit_cache: Mutex::new(VerifiedSubmitResponseCache::new(dedup_capacity)),
             verified_submit_lanes: (0..VERIFIED_SUBMIT_SINGLE_FLIGHT_LANES)
@@ -5181,6 +5250,11 @@ impl ChatRelayService {
         Self::init_quarantine_schema(&conn)?;
         Self::init_usage_schema(&conn)?;
         Self::init_direct_peer_circuit_checkpoint_schema(&mut conn, now_secs())?;
+        Self::init_verified_submit_response_schema(
+            &mut conn,
+            now_secs(),
+            self.config.dedup_lru_capacity,
+        )?;
         Self::reconcile_storage_usage(&conn)?;
         let retained_quarantine_events =
             conn.query_row("SELECT COUNT(*) FROM relay_quarantine_events", [], |row| {
@@ -5302,6 +5376,117 @@ impl ChatRelayService {
                 field: "direct_peer_circuit_checkpoint_installation_marker",
             });
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn init_verified_submit_response_schema(
+        conn: &mut Connection,
+        now: u64,
+        capacity: usize,
+    ) -> ChatRelayResult<()> {
+        // [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] The table
+        // contains only two node-secret HMACs, an AEAD nonce/ciphertext, and a
+        // retention timestamp. Raw request/message ids, wallet keys, routes,
+        // receipts, payload commitments, and endpoints must never become SQL
+        // columns. The feature marker makes post-install table loss fail closed.
+        let table_existed = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'relay_verified_submit_responses'
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS relay_verified_submit_responses (
+                cache_key            BLOB    PRIMARY KEY CHECK(LENGTH(cache_key) = 32),
+                envelope_fingerprint BLOB    NOT NULL CHECK(LENGTH(envelope_fingerprint) = 32),
+                response_nonce       BLOB    NOT NULL CHECK(LENGTH(response_nonce) = 24),
+                response_ciphertext  BLOB    NOT NULL CHECK(
+                    LENGTH(response_ciphertext) > 16
+                    AND LENGTH(response_ciphertext) <= 528
+                ),
+                completed_at         INTEGER NOT NULL CHECK(completed_at >= 0)
+            );
+            CREATE INDEX IF NOT EXISTS idx_verified_submit_response_retention
+                ON relay_verified_submit_responses(completed_at);
+            ",
+        )?;
+        let installed_version = tx
+            .query_row(
+                "SELECT schema_version FROM relay_schema_features WHERE feature = ?1",
+                params![VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if installed_version
+            .is_some_and(|version| version != VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION)
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_installation_version",
+            });
+        }
+        if !table_existed && installed_version.is_some() {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_table",
+            });
+        }
+        let invalid_rows = tx.query_row(
+            "SELECT COUNT(*) FROM relay_verified_submit_responses
+             WHERE LENGTH(cache_key) != 32
+                OR LENGTH(envelope_fingerprint) != 32
+                OR LENGTH(response_nonce) != 24
+                OR LENGTH(response_ciphertext) <= 16
+                OR LENGTH(response_ciphertext) > 528
+                OR completed_at < 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if invalid_rows != 0 {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_row_shape",
+            });
+        }
+        if installed_version.is_none()
+            && tx.execute(
+                "INSERT INTO relay_schema_features (feature, schema_version, installed_at)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
+                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
+                    sqlite_integer(now, "verified_submit_response_schema_installed_at")?
+                ],
+            )? != 1
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_installation_marker",
+            });
+        }
+
+        let cutoff = sqlite_integer(
+            now.saturating_sub(VERIFIED_SUBMIT_RESPONSE_TTL_SECS),
+            "verified_submit_response_startup_cutoff",
+        )?;
+        tx.execute(
+            "DELETE FROM relay_verified_submit_responses WHERE completed_at < ?1",
+            params![cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM relay_verified_submit_responses
+             WHERE rowid IN (
+                 SELECT rowid FROM relay_verified_submit_responses
+                 ORDER BY completed_at DESC, rowid DESC
+                 LIMIT -1 OFFSET ?1
+             )",
+            params![sqlite_integer(
+                u64::try_from(capacity.max(1)).unwrap_or(u64::MAX),
+                "verified_submit_response_capacity"
+            )?],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -5791,6 +5976,106 @@ impl ChatRelayService {
         Ok(key)
     }
 
+    fn derive_verified_submit_response_key(node_secret: &[u8; 32]) -> ChatRelayResult<[u8; 32]> {
+        let hkdf = hkdf::Hkdf::<Sha256>::new(Some(VERIFIED_SUBMIT_RESPONSE_HKDF_SALT), node_secret);
+        let mut key = [0_u8; 32];
+        hkdf.expand(VERIFIED_SUBMIT_RESPONSE_HKDF_INFO, &mut key)
+            .map_err(|_| ChatRelayError::VerifiedSubmitProtectionFailed)?;
+        Ok(key)
+    }
+
+    fn verified_submit_response_aad(
+        cache_key: &[u8; 32],
+        envelope_fingerprint: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(
+            VERIFIED_SUBMIT_RESPONSE_AAD_DOMAIN.len()
+                + cache_key.len()
+                + envelope_fingerprint.len(),
+        );
+        aad.extend_from_slice(VERIFIED_SUBMIT_RESPONSE_AAD_DOMAIN);
+        aad.extend_from_slice(cache_key);
+        aad.extend_from_slice(envelope_fingerprint);
+        aad
+    }
+
+    fn protect_verified_submit_response(
+        &self,
+        cache_key: &[u8; 32],
+        envelope_fingerprint: &[u8; 32],
+        response: &ChatRelayVerifiedSubmitResponseV1,
+    ) -> ChatRelayResult<([u8; VERIFIED_SUBMIT_RESPONSE_NONCE_BYTES], Vec<u8>)> {
+        response
+            .validate_shape()
+            .map_err(|_| ChatRelayError::VerifiedSubmitProtectionFailed)?;
+        let plaintext = bincode::serialize(response)?;
+        if plaintext.len() > MAX_VERIFIED_SUBMIT_RESPONSE_BYTES {
+            return Err(ChatRelayError::VerifiedSubmitProtectionFailed);
+        }
+        let mut nonce = [0_u8; VERIFIED_SUBMIT_RESPONSE_NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.verified_submit_response_key));
+        let aad = Self::verified_submit_response_aad(cache_key, envelope_fingerprint);
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| ChatRelayError::VerifiedSubmitProtectionFailed)?;
+        if ciphertext.len()
+            > MAX_VERIFIED_SUBMIT_RESPONSE_BYTES + VERIFIED_SUBMIT_RESPONSE_TAG_BYTES
+        {
+            return Err(ChatRelayError::VerifiedSubmitProtectionFailed);
+        }
+        Ok((nonce, ciphertext))
+    }
+
+    fn recover_verified_submit_response(
+        &self,
+        cache_key: &[u8; 32],
+        envelope_fingerprint: &[u8; 32],
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> ChatRelayResult<ChatRelayVerifiedSubmitResponseV1> {
+        if nonce.len() != VERIFIED_SUBMIT_RESPONSE_NONCE_BYTES
+            || ciphertext.len() <= VERIFIED_SUBMIT_RESPONSE_TAG_BYTES
+            || ciphertext.len()
+                > MAX_VERIFIED_SUBMIT_RESPONSE_BYTES + VERIFIED_SUBMIT_RESPONSE_TAG_BYTES
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_ciphertext_shape",
+            });
+        }
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.verified_submit_response_key));
+        let aad = Self::verified_submit_response_aad(cache_key, envelope_fingerprint);
+        let plaintext = cipher
+            .decrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_authentication",
+            })?;
+        if plaintext.len() > MAX_VERIFIED_SUBMIT_RESPONSE_BYTES {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_plaintext_size",
+            });
+        }
+        let response: ChatRelayVerifiedSubmitResponseV1 = bincode::deserialize(&plaintext)?;
+        response
+            .validate_shape()
+            .map_err(|_| ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_shape",
+            })?;
+        Ok(response)
+    }
+
     fn pull_cursor_v2_aad(receiver: &[u8; 32], after_timestamp: u64) -> Vec<u8> {
         let mut aad = Vec::with_capacity(
             CHAT_PULL_CURSOR_V2_AAD_DOMAIN.len() + receiver.len() + std::mem::size_of::<u64>(),
@@ -5920,6 +6205,17 @@ impl ChatRelayService {
         mac.finalize().into_bytes().into()
     }
 
+    fn verified_submit_envelope_fingerprint(
+        &self,
+        request: &ChatRelayVerifiedSubmitRequestV1,
+    ) -> [u8; 32] {
+        let mut mac =
+            HmacSha256::new_from_slice(&self.node_secret).expect("HMAC accepts any key length");
+        mac.update(b"AeroNyx-VerifiedSubmit-EnvelopeFingerprint-v1");
+        mac.update(&request.envelope_commitment());
+        mac.finalize().into_bytes().into()
+    }
+
     /// Serializes requests sharing one private sender/request-id cache key.
     ///
     /// Unrelated submissions remain concurrent across fixed lock lanes. The
@@ -5944,25 +6240,151 @@ impl ChatRelayService {
     pub(crate) fn verified_submit_cache_lookup(
         &self,
         request: &ChatRelayVerifiedSubmitRequestV1,
-    ) -> VerifiedSubmitCacheLookup {
+    ) -> ChatRelayResult<VerifiedSubmitCacheLookup> {
         let cache_key = self.verified_submit_cache_key(request);
+        let envelope_fingerprint = self.verified_submit_envelope_fingerprint(request);
+        let memory_lookup = self
+            .verified_submit_cache
+            .lock()
+            .lookup(&cache_key, &envelope_fingerprint);
+        if !matches!(memory_lookup, VerifiedSubmitCacheLookup::Miss) {
+            return Ok(memory_lookup);
+        }
+
+        let now = sqlite_integer(now_secs(), "verified_submit_response_lookup_time")?;
+        let durable_row = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT envelope_fingerprint, response_nonce,
+                        response_ciphertext, completed_at
+                 FROM relay_verified_submit_responses
+                 WHERE cache_key = ?1",
+                params![cache_key.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        };
+        let Some((stored_fingerprint, nonce, ciphertext, completed_at)) = durable_row else {
+            return Ok(VerifiedSubmitCacheLookup::Miss);
+        };
+        if completed_at < 0
+            || now.saturating_sub(completed_at)
+                > i64::try_from(VERIFIED_SUBMIT_RESPONSE_TTL_SECS).unwrap_or(i64::MAX)
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "DELETE FROM relay_verified_submit_responses
+                 WHERE cache_key = ?1 AND completed_at = ?2",
+                params![cache_key.as_slice(), completed_at],
+            )?;
+            return Ok(VerifiedSubmitCacheLookup::Miss);
+        }
+        let stored_fingerprint: [u8; 32] =
+            stored_fingerprint
+                .try_into()
+                .map_err(|_| ChatRelayError::CorruptStoredData {
+                    field: "verified_submit_response_envelope_fingerprint",
+                })?;
+        if stored_fingerprint != envelope_fingerprint {
+            return Ok(VerifiedSubmitCacheLookup::Conflict);
+        }
+        let response = self.recover_verified_submit_response(
+            &cache_key,
+            &envelope_fingerprint,
+            &nonce,
+            &ciphertext,
+        )?;
+        response
+            .validate_for_request(request)
+            .map_err(|_| ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_request_binding",
+            })?;
         self.verified_submit_cache
             .lock()
-            .lookup(&cache_key, &request.envelope_commitment())
+            .insert(cache_key, envelope_fingerprint, response.clone());
+        Ok(VerifiedSubmitCacheLookup::Exact(response))
     }
 
-    /// Retains one completed response for exact retry replay.
+    /// Retains one completed response for exact retry replay across restarts.
     pub(crate) fn remember_verified_submit_response(
         &self,
         request: &ChatRelayVerifiedSubmitRequestV1,
         response: &ChatRelayVerifiedSubmitResponseV1,
-    ) {
+    ) -> ChatRelayResult<()> {
         let cache_key = self.verified_submit_cache_key(request);
-        self.verified_submit_cache.lock().insert(
-            cache_key,
-            request.envelope_commitment(),
-            response.clone(),
-        );
+        let envelope_fingerprint = self.verified_submit_envelope_fingerprint(request);
+        response
+            .validate_for_request(request)
+            .map_err(|_| ChatRelayError::VerifiedSubmitProtectionFailed)?;
+        let (nonce, ciphertext) =
+            self.protect_verified_submit_response(&cache_key, &envelope_fingerprint, response)?;
+        let completed_at = sqlite_integer(now_secs(), "verified_submit_response_completed_at")?;
+        let cutoff = completed_at
+            .saturating_sub(i64::try_from(VERIFIED_SUBMIT_RESPONSE_TTL_SECS).unwrap_or(i64::MAX));
+        let capacity = sqlite_integer(
+            u64::try_from(self.config.dedup_lru_capacity.max(1)).unwrap_or(u64::MAX),
+            "verified_submit_response_capacity",
+        )?;
+        let durable_result: ChatRelayResult<()> = (|| {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM relay_verified_submit_responses WHERE completed_at < ?1",
+                params![cutoff],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO relay_verified_submit_responses (
+                    cache_key, envelope_fingerprint, response_nonce,
+                    response_ciphertext, completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    cache_key.as_slice(),
+                    envelope_fingerprint.as_slice(),
+                    nonce.as_slice(),
+                    ciphertext,
+                    completed_at,
+                ],
+            )?;
+            let stored_fingerprint = tx.query_row(
+                "SELECT envelope_fingerprint
+                 FROM relay_verified_submit_responses
+                 WHERE cache_key = ?1",
+                params![cache_key.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            if stored_fingerprint.as_slice() != envelope_fingerprint.as_slice() {
+                return Err(ChatRelayError::CorruptStoredData {
+                    field: "verified_submit_response_insert_conflict",
+                });
+            }
+            tx.execute(
+                "DELETE FROM relay_verified_submit_responses
+                 WHERE rowid IN (
+                     SELECT rowid FROM relay_verified_submit_responses
+                     ORDER BY completed_at DESC, rowid DESC
+                     LIMIT -1 OFFSET ?1
+                 )",
+                params![capacity],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+
+        // Preserve same-process retry safety even if the durable write fails.
+        // The caller receives the storage error and records only its fixed
+        // reason bucket; no request-derived values enter logs or health.
+        self.verified_submit_cache
+            .lock()
+            .insert(cache_key, envelope_fingerprint, response.clone());
+        durable_result?;
+        Ok(())
     }
 
     // ============================================
@@ -7056,13 +7478,21 @@ impl ChatRelayService {
             i64::try_from(self.config.expired_notification_ttl_secs).unwrap_or(i64::MAX);
         let cutoff = now.saturating_sub(ttl);
         let notif_cutoff = now.saturating_sub(notif_ttl);
+        let verified_submit_cutoff = now
+            .saturating_sub(i64::try_from(VERIFIED_SUBMIT_RESPONSE_TTL_SECS).unwrap_or(i64::MAX));
 
         let mut summary = CleanupRunSummary::default();
         let mut failure = None;
         for batch_index in 0..max_batches {
             let batch_result = {
                 let mut conn = self.conn.lock();
-                Self::run_cleanup_transaction(&mut conn, now, cutoff, notif_cutoff)
+                Self::run_cleanup_transaction(
+                    &mut conn,
+                    now,
+                    cutoff,
+                    notif_cutoff,
+                    verified_submit_cutoff,
+                )
             };
             match batch_result {
                 Ok(batch) => {
@@ -7089,6 +7519,7 @@ impl ChatRelayService {
                 removed_notifications = summary.removed_notifications,
                 quarantined_pending_messages = summary.quarantined_pending_messages,
                 removed_quarantine_events = summary.removed_quarantine_events,
+                removed_verified_submit_responses = summary.removed_verified_submit_responses,
                 retained_quarantine_events = summary.retained_quarantine_events,
                 committed_batches = summary.successful_batches,
                 backlog_deferred = summary.backlog_deferred,
@@ -7116,10 +7547,13 @@ impl ChatRelayService {
         now: i64,
         cutoff: i64,
         notif_cutoff: i64,
+        verified_submit_cutoff: i64,
     ) -> ChatRelayResult<CleanupBatchOutcome> {
         let message_limit = i64::try_from(CLEANUP_MESSAGE_BATCH_SIZE).unwrap_or(i64::MAX);
         let blob_limit = i64::try_from(CLEANUP_BLOB_BATCH_SIZE).unwrap_or(i64::MAX);
         let notification_limit = i64::try_from(CLEANUP_NOTIFICATION_BATCH_SIZE).unwrap_or(i64::MAX);
+        let verified_submit_limit =
+            i64::try_from(CLEANUP_VERIFIED_SUBMIT_RESPONSE_BATCH_SIZE).unwrap_or(i64::MAX);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let transaction_result: ChatRelayResult<CleanupBatchOutcome> = (|| {
@@ -7133,8 +7567,14 @@ impl ChatRelayService {
             let removed_notifications =
                 Self::delete_stale_notification_batch(&tx, notif_cutoff, notification_limit)?;
             let removed_quarantine_events = Self::trim_quarantine_events(&tx, notif_cutoff)?;
+            let removed_verified_submit_responses = Self::delete_stale_verified_submit_batch(
+                &tx,
+                verified_submit_cutoff,
+                verified_submit_limit,
+            )?;
             let retained_quarantine_events = Self::quarantine_event_count(&tx)?;
-            let has_more = Self::cleanup_backlog_exists(&tx, cutoff, notif_cutoff)?;
+            let has_more =
+                Self::cleanup_backlog_exists(&tx, cutoff, notif_cutoff, verified_submit_cutoff)?;
 
             Ok(CleanupBatchOutcome {
                 expired_messages: expired_message_count,
@@ -7142,6 +7582,7 @@ impl ChatRelayService {
                 removed_notifications,
                 quarantined_pending_messages,
                 removed_quarantine_events,
+                removed_verified_submit_responses,
                 retained_quarantine_events,
                 has_more,
             })
@@ -7334,10 +7775,31 @@ impl ChatRelayService {
         )?)
     }
 
+    fn delete_stale_verified_submit_batch(
+        tx: &Transaction<'_>,
+        cutoff: i64,
+        limit: i64,
+    ) -> ChatRelayResult<usize> {
+        // [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Retention
+        // exceeds the maximum authentication window, then removes only a
+        // bounded batch. No identifier or response material is inspected.
+        Ok(tx.execute(
+            "DELETE FROM relay_verified_submit_responses
+             WHERE rowid IN (
+                 SELECT rowid FROM relay_verified_submit_responses
+                 WHERE completed_at < ?1
+                 ORDER BY completed_at ASC, rowid ASC
+                 LIMIT ?2
+             )",
+            params![cutoff, limit],
+        )?)
+    }
+
     fn cleanup_backlog_exists(
         tx: &Transaction<'_>,
         cutoff: i64,
         notif_cutoff: i64,
+        verified_submit_cutoff: i64,
     ) -> ChatRelayResult<bool> {
         let message_has_more = tx.query_row(
             "SELECT EXISTS(
@@ -7374,7 +7836,20 @@ impl ChatRelayService {
             |row| row.get::<_, i64>(0),
         )? != 0;
 
-        Ok(message_has_more || blob_has_more || notification_has_more || quarantine_has_more)
+        let verified_submit_has_more = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM relay_verified_submit_responses
+                 WHERE completed_at < ?1
+             )",
+            params![verified_submit_cutoff],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+
+        Ok(message_has_more
+            || blob_has_more
+            || notification_has_more
+            || quarantine_has_more
+            || verified_submit_has_more)
     }
 
     // ============================================
@@ -8368,6 +8843,13 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ))
+    }
+
+    fn remove_test_database(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", path.display())));
+        }
     }
 
     fn remove_test_db(path: &Path) {
@@ -10213,34 +10695,218 @@ mod tests {
     fn verified_submit_response_cache_is_bounded_and_conflict_safe() {
         let mut cache = VerifiedSubmitResponseCache::new(1);
         let first_key = [0xA1; 32];
-        let first_commitment = [0xA2; 32];
+        let first_fingerprint = [0xA2; 32];
         let first_response = ChatRelayVerifiedSubmitResponseV1::rejected([0xA3; 16], [0xA4; 16]);
-        cache.insert(first_key, first_commitment, first_response.clone());
+        cache.insert(first_key, first_fingerprint, first_response.clone());
         assert!(matches!(
             cache.lookup(&first_key, &[0xA5; 32]),
             VerifiedSubmitCacheLookup::Conflict
         ));
-        let VerifiedSubmitCacheLookup::Exact(cached) = cache.lookup(&first_key, &first_commitment)
+        let VerifiedSubmitCacheLookup::Exact(cached) = cache.lookup(&first_key, &first_fingerprint)
         else {
             panic!("exact verified submit response must remain replayable");
         };
         assert_eq!(cached, first_response);
 
         let second_key = [0xB1; 32];
-        let second_commitment = [0xB2; 32];
+        let second_fingerprint = [0xB2; 32];
         cache.insert(
             second_key,
-            second_commitment,
+            second_fingerprint,
             ChatRelayVerifiedSubmitResponseV1::rejected([0xB3; 16], [0xB4; 16]),
         );
         assert!(matches!(
-            cache.lookup(&first_key, &first_commitment),
+            cache.lookup(&first_key, &first_fingerprint),
             VerifiedSubmitCacheLookup::Miss
         ));
         assert!(matches!(
-            cache.lookup(&second_key, &second_commitment),
+            cache.lookup(&second_key, &second_fingerprint),
             VerifiedSubmitCacheLookup::Exact(_)
         ));
+    }
+
+    #[test]
+    fn verified_submit_response_replays_privately_across_restart() {
+        // [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Exercise
+        // the real SQLite boundary. The durable row exposes only fixed-size
+        // HMACs and sealed response bytes, while exact replay and envelope
+        // conflict survive process-local cache loss.
+        let db_path = unique_test_db_path("verified-submit-restart");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0xC1; 32];
+        let sender = IdentityKeyPair::generate();
+        let envelope = make_envelope(&sender, [0xC2; 32]);
+        let request = ChatRelayVerifiedSubmitRequestV1::signed(
+            [0xC3; 16],
+            envelope.clone(),
+            now_secs(),
+            &sender,
+        )
+        .expect("sign verified submit request");
+        let response = ChatRelayVerifiedSubmitResponseV1::rejected(
+            request.request_id,
+            request.envelope.message_id,
+        );
+
+        {
+            let service = ChatRelayService::new(config.clone(), secret)
+                .expect("create durable verified submit relay");
+            service
+                .remember_verified_submit_response(&request, &response)
+                .expect("persist verified submit response");
+            let conn = service.conn.lock();
+            let (cache_key, envelope_fingerprint, nonce, ciphertext) = conn
+                .query_row(
+                    "SELECT cache_key, envelope_fingerprint, response_nonce,
+                            response_ciphertext
+                     FROM relay_verified_submit_responses",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                        ))
+                    },
+                )
+                .expect("read private durable replay row");
+            assert_eq!(cache_key.len(), 32);
+            assert_eq!(envelope_fingerprint.len(), 32);
+            assert_eq!(nonce.len(), VERIFIED_SUBMIT_RESPONSE_NONCE_BYTES);
+            for sensitive in [
+                request.request_id.as_slice(),
+                request.envelope.message_id.as_slice(),
+                request.envelope.sender.as_slice(),
+            ] {
+                assert!(
+                    !ciphertext
+                        .windows(sensitive.len())
+                        .any(|window| window == sensitive),
+                    "sealed durable response must not expose request metadata"
+                );
+            }
+        }
+
+        let restarted =
+            ChatRelayService::new(config, secret).expect("restart durable verified submit relay");
+        let replayed = restarted
+            .verified_submit_cache_lookup(&request)
+            .expect("recover durable verified submit response");
+        let VerifiedSubmitCacheLookup::Exact(replayed) = replayed else {
+            panic!("exact verified submit must replay after restart");
+        };
+        assert_eq!(replayed, response);
+
+        let conflicting_envelope = make_envelope(&sender, [0xC4; 32]);
+        let conflicting_request = ChatRelayVerifiedSubmitRequestV1::signed(
+            request.request_id,
+            conflicting_envelope,
+            now_secs(),
+            &sender,
+        )
+        .expect("sign conflicting verified submit request");
+        assert!(matches!(
+            restarted
+                .verified_submit_cache_lookup(&conflicting_request)
+                .expect("classify durable request conflict"),
+            VerifiedSubmitCacheLookup::Conflict
+        ));
+
+        drop(restarted);
+        remove_test_database(&db_path);
+    }
+
+    #[test]
+    fn verified_submit_response_retention_is_bounded_and_ttl_cleaned() {
+        let db_path = unique_test_db_path("verified-submit-retention");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        config.dedup_lru_capacity = 1;
+        let secret = [0xD1; 32];
+        let sender = IdentityKeyPair::generate();
+        let service = ChatRelayService::new(config.clone(), secret)
+            .expect("create bounded verified submit relay");
+
+        for request_id in [[0xD2; 16], [0xD3; 16]] {
+            let envelope = make_envelope(&sender, [0xD4; 32]);
+            let request =
+                ChatRelayVerifiedSubmitRequestV1::signed(request_id, envelope, now_secs(), &sender)
+                    .expect("sign bounded verified submit request");
+            let response = ChatRelayVerifiedSubmitResponseV1::rejected(
+                request.request_id,
+                request.envelope.message_id,
+            );
+            service
+                .remember_verified_submit_response(&request, &response)
+                .expect("persist bounded verified submit response");
+        }
+        assert_eq!(
+            service
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_verified_submit_responses",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count bounded durable replay rows"),
+            1
+        );
+        service
+            .conn
+            .lock()
+            .execute(
+                "UPDATE relay_verified_submit_responses SET completed_at = 0",
+                [],
+            )
+            .expect("age durable replay row");
+        let (summary, failure) = service.run_cleanup_at(
+            i64::try_from(VERIFIED_SUBMIT_RESPONSE_TTL_SECS + 2).unwrap(),
+            1,
+        );
+        assert!(failure.is_none());
+        assert_eq!(summary.removed_verified_submit_responses, 1);
+        assert_eq!(
+            service
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM relay_verified_submit_responses",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count cleaned durable replay rows"),
+            0
+        );
+
+        drop(service);
+        remove_test_database(&db_path);
+    }
+
+    #[test]
+    fn verified_submit_response_missing_installed_table_fails_closed() {
+        let db_path = unique_test_db_path("verified-submit-missing-table");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0xE1; 32];
+        drop(
+            ChatRelayService::new(config.clone(), secret)
+                .expect("install durable verified submit schema"),
+        );
+        Connection::open(&db_path)
+            .expect("open durable verified submit database")
+            .execute("DROP TABLE relay_verified_submit_responses", [])
+            .expect("remove installed durable verified submit table");
+
+        assert!(matches!(
+            ChatRelayService::new(config, secret),
+            Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_response_table"
+            })
+        ));
+        remove_test_database(&db_path);
     }
 
     #[test]

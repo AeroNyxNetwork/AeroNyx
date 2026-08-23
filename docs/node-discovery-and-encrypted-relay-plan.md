@@ -4,9 +4,10 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.38.0 - Added bounded, private verified-submit
-single-flight and response replay so exact retries remain idempotent while
-request-id reuse for another envelope fails closed.
+Modification Reason: v1.39.0 - Made verified-submit response replay durable,
+private, retention-bounded, and fail-closed across node restarts without
+persisting request ids, message ids, sender identities, routes, or receipts in
+plaintext.
 
 Main Functionality:
 
@@ -31,7 +32,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.38.0 - [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Adds node-secret-indexed fixed-capacity response replay plus fixed-lane single-flight admission so sequential and concurrent exact retries return the first request-bound response without repeating onion delivery or entry custody; conflicting envelope reuse fails closed.
+Last Modified: v1.39.0 - [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Persists the first request-bound verified-submit response as node-keyed opaque indexes plus AEAD ciphertext, replays it after restart without repeating onion delivery or custody, bounds retention by the authenticated retry horizon and configured capacity, and treats missing or malformed installed protection state as a fail-closed storage fault.
+Previous: v1.38.0 - [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Adds node-secret-indexed fixed-capacity response replay plus fixed-lane single-flight admission so sequential and concurrent exact retries return the first request-bound response without repeating onion delivery or entry custody; conflicting envelope reuse fails closed.
 Previous: v1.37.0 - [CHAT-VERIFIED-SUBMIT-LIVE-HANDLER 2026-08-23 by Codex] Extends the real two-hop HTTP relay test through `handle_verified_chat_submit()`, proving terminal-signed delivery, durable entry custody, exact request correlation, independent client verification, and aggregate-only telemetry in one success path.
 Previous: v1.36.0 - [CHAT-VERIFIED-SUBMIT-HANDLER-CORRELATION 2026-08-23 by Codex] Verifies the real server handler returns request-bound entry-retry after durable custody and request-bound rejection for an unrelated authenticated session, with aggregate-only result telemetry.
 Previous: v1.35.0 - [CHAT-VERIFIED-SUBMIT-RESPONSE-CORRELATION 2026-08-23 by Codex] Adds `validate_for_request()` so every result state binds shape, request id, and message id before changing client or agent state; terminal success then performs the existing independent receipt proof.
@@ -3236,6 +3238,25 @@ Implemented:
   exact retries replay the first response, while a changed envelope under the
   same authenticated key is rejected before routing or durable mutation.
   Health exposes only aggregate `replayed_total` and `request_conflict_total`.
+- [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] The first validated
+  response is also retained transactionally in the existing Chat Relay SQLite
+  boundary. SQL stores only node-secret HMAC cache keys, an HMAC envelope
+  fingerprint, an XChaCha20-Poly1305 nonce and ciphertext, and completion time;
+  request ids, message ids, sender identities, routes, terminal receipts, and
+  payload commitments are never plaintext columns. Exact retries therefore
+  return the original request-bound response after restart without repeating
+  onion forwarding or entry custody.
+- The durable replay window is 121 seconds, covering the complete accepted
+  timestamp-skew and replay horizon, and row count is capped by the existing
+  relay dedupe capacity. Startup and bounded maintenance prune stale/excess
+  rows; verified backups validate the schema marker and every retained row.
+  If an installed table disappears, a row is malformed, or authenticated
+  response recovery fails, lookup rejects before new routing or custody.
+- A persistence error observed only after delivery or custody does not rewrite
+  that truthful result into a rejection: the node retains the same-process
+  replay entry and emits a fixed, privacy-safe internal failure bucket. This
+  avoids instructing a client to repeat already-observed side effects while
+  preserving fail-closed behavior on the next restart.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
@@ -3263,6 +3284,9 @@ Verification:
 - Real two-hop handler coverage for terminal-signed delivery plus entry
   custody, followed by independent request-, payload-, purpose-, and
   terminal-identity verification of the returned receipt.
+- Durable verified-submit coverage for encrypted restart replay, request
+  conflict rejection, TTL and capacity cleanup, installed-schema disappearance,
+  and verified-backup restore integrity.
 - Exact sequential retry coverage proving response equality and no additional
   HTTP onion request, plus fail-closed request-id/envelope conflict coverage.
 - Route-id retry stability and path-binding tests.

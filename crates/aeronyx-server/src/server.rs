@@ -14496,11 +14496,11 @@ impl Server {
         // closed before route, wallet-route, or durable-state mutation.
         let _single_flight = relay.lock_verified_submit(&request).await;
         match relay.verified_submit_cache_lookup(&request) {
-            VerifiedSubmitCacheLookup::Exact(response) => {
+            Ok(VerifiedSubmitCacheLookup::Exact(response)) => {
                 relay.record_verified_submit_replay(unix_now_secs(), response.result);
                 return response;
             }
-            VerifiedSubmitCacheLookup::Conflict => {
+            Ok(VerifiedSubmitCacheLookup::Conflict) => {
                 let response = rejected();
                 relay.record_verified_submit_conflict(unix_now_secs(), response.result);
                 warn!(
@@ -14509,7 +14509,16 @@ impl Server {
                 );
                 return response;
             }
-            VerifiedSubmitCacheLookup::Miss => {}
+            Ok(VerifiedSubmitCacheLookup::Miss) => {}
+            Err(error) => {
+                let response = rejected();
+                relay.record_verified_submit_result(unix_now_secs(), response.result);
+                warn!(
+                    reason = error.reason_bucket(),
+                    "[CHAT_RELAY] Verified submit durable replay check failed"
+                );
+                return response;
+            }
         }
 
         relay.wallet_routes.announce(
@@ -14560,7 +14569,16 @@ impl Server {
         // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] The relay
         // status records only the closed result bucket, never identifiers.
         relay.record_verified_submit_result(unix_now_secs(), response.result);
-        relay.remember_verified_submit_response(&request, &response);
+        if let Err(error) = relay.remember_verified_submit_response(&request, &response) {
+            // [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex]
+            // Delivery/custody has already completed, so changing the result
+            // would misreport evidence and encourage another submission. Keep
+            // same-process replay active and expose only the fixed error bucket.
+            warn!(
+                reason = error.reason_bucket(),
+                "[CHAT_RELAY] Verified submit durable replay persistence failed"
+            );
+        }
         response
     }
 
