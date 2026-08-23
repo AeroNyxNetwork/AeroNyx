@@ -31,7 +31,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.29.0 - [CHAT-VERIFIED-SUBMIT-OUTCOME-MAPPING 2026-08-23 by Codex] Moves the verified-submit evidence-to-result table into `aeronyx-core::protocol::memchain::chat_verified_submit_result_for_outcomes()` so servers and SDKs share the same closed protocol semantics.
+Last Modified: v1.30.0 - [CHAT-VERIFIED-SUBMIT-RESPONSE-EVIDENCE 2026-08-23 by Codex] Adds the core-owned `ChatRelayVerifiedSubmitResponseV1::from_evidence()` builder so server implementations derive result code and terminal-receipt retention through one fail-closed protocol boundary.
+Previous: v1.29.0 - [CHAT-VERIFIED-SUBMIT-OUTCOME-MAPPING 2026-08-23 by Codex] Moves the verified-submit evidence-to-result table into `aeronyx-core::protocol::memchain::chat_verified_submit_result_for_outcomes()` so servers and SDKs share the same closed protocol semantics.
 Previous: v1.28.0 - [CHAT-VERIFIED-SUBMIT-RESULT-LABELS 2026-08-23 by Codex] Centralizes verified-submit result labels in `aeronyx-core::protocol::memchain::chat_verified_submit_result_label()` so relay health, nodeboard, SDKs, and docs share one closed vocabulary.
 Previous: v1.27.0 - [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] Adds aggregate-only `peer_relay.verified_submit` counters for the closed verified-submit result vocabulary; no message ids, request ids, routes, receipts, endpoints, wallet keys, or payload commitments are exported.
 Previous: v1.25.0 - [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Runs previous-hop authentication and request commitment hashing behind CPU-aware, fail-fast blocking admission; unauthenticated requests receive no node-signed failure receipt and cannot mutate claimed-peer state.
@@ -3190,6 +3191,11 @@ Implemented:
   independently verified terminal proof plus entry custody evidence to result
   code is centralized in `chat_verified_submit_result_for_outcomes()`. Server
   implementations should not maintain a private result table.
+- [CHAT-VERIFIED-SUBMIT-RESPONSE-EVIDENCE 2026-08-23 by Codex] Server
+  implementations should build responses through
+  `ChatRelayVerifiedSubmitResponseV1::from_evidence()`. A terminal receipt is
+  retained only when verified onion delivery is also observed; inconsistent
+  evidence fails closed to the appropriate non-onion result.
 - Receipt verification must bind the opaque envelope, message-relay purpose,
   and a terminal identity independently verified from the signed node
   directory. A receipt's embedded identity is never its own trust root.

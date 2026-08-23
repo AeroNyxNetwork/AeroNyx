@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-core/src/protocol/memchain.rs
 // ============================================================================
-// Version: 2.8.19-VerifiedSubmitOutcomeMapping
+// Version: 2.8.20-VerifiedSubmitResponseEvidence
 //
 // Modification Reason:
 //   v1.3.0-Sovereign — Breaking protocol upgrade. Wallet identity is no longer
@@ -41,6 +41,9 @@
 //   v2.8.19-VerifiedSubmitOutcomeMapping — Centralized the boolean evidence
 //   to result-code table used by verified chat submit responses. Existing wire
 //   bytes remain unchanged.
+//   v2.8.20-VerifiedSubmitResponseEvidence — Added a response constructor
+//   that derives result code and receipt retention from closed evidence inputs.
+//   Existing wire bytes remain unchanged.
 //
 // Main Functionality:
 //   Defines all application-layer messages that travel inside the existing
@@ -82,6 +85,7 @@
 //     the shared codec so ignored legacy trailing bytes cannot bypass the cap.
 //
 // Last Modified:
+//   v2.8.20-VerifiedSubmitResponseEvidence — Added fail-closed response builder
 //   v2.8.19-VerifiedSubmitOutcomeMapping — Added core-owned outcome mapping
 //   v2.8.18-VerifiedSubmitResultLabels — Added helper labels for result codes
 //   v2.8.17-VerifiedChatSubmit — Appended variants 38-39 without changing any
@@ -319,6 +323,34 @@ pub struct ChatRelayVerifiedSubmitResponseV1 {
 }
 
 impl ChatRelayVerifiedSubmitResponseV1 {
+    /// Builds a response from independently observed delivery evidence.
+    ///
+    /// [CHAT-VERIFIED-SUBMIT-RESPONSE-EVIDENCE 2026-08-23 by Codex] A terminal
+    /// receipt is retained only when the caller simultaneously observed a
+    /// verified onion delivery and provided receipt bytes. Any mismatch fails
+    /// closed to the non-onion result for the entry-custody state.
+    #[must_use]
+    pub fn from_evidence(
+        request_id: [u8; 16],
+        message_id: [u8; 16],
+        verified_onion: bool,
+        entry_custody: bool,
+        terminal_receipt: Option<BlindRelayDeliveryReceipt>,
+    ) -> Self {
+        let terminal_receipt = if verified_onion {
+            terminal_receipt
+        } else {
+            None
+        };
+        let verified_onion = terminal_receipt.is_some();
+        Self {
+            request_id,
+            message_id,
+            result: chat_verified_submit_result_for_outcomes(verified_onion, entry_custody),
+            terminal_receipt,
+        }
+    }
+
     /// Validates the closed result vocabulary and receipt-presence invariant.
     pub fn validate_shape(&self) -> Result<(), CoreError> {
         if self.result > CHAT_VERIFIED_SUBMIT_REJECTED_V1 {
@@ -2364,6 +2396,63 @@ mod tests {
             chat_verified_submit_result_for_outcomes(false, false),
             CHAT_VERIFIED_SUBMIT_REJECTED_V1
         );
+    }
+
+    #[test]
+    fn verified_chat_submit_response_builder_is_fail_closed() {
+        let receipt = BlindRelayDeliveryReceipt {
+            version: 2,
+            route_id: [0x61; 16],
+            payload_commitment: [0x62; 32],
+            terminal_node_id: [0x63; 32],
+            delivered_at: 1_800_001_001,
+            disposition: 1,
+            signature: [0x64; 64],
+        };
+
+        // [CHAT-VERIFIED-SUBMIT-RESPONSE-EVIDENCE 2026-08-23 by Codex] When
+        // terminal evidence is internally consistent, the response keeps the
+        // receipt and stays shape-valid.
+        let delivered = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            [0x65; 16],
+            [0x66; 16],
+            true,
+            true,
+            Some(receipt.clone()),
+        );
+        assert_eq!(delivered.result, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1);
+        assert!(delivered.terminal_receipt.is_some());
+        delivered.validate_shape().expect("valid delivered shape");
+
+        // If a caller claims onion delivery without receipt bytes, clients must
+        // receive only entry-custody retry semantics.
+        let missing_receipt = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            [0x67; 16],
+            [0x68; 16],
+            true,
+            true,
+            None,
+        );
+        assert_eq!(missing_receipt.result, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1);
+        assert!(missing_receipt.terminal_receipt.is_none());
+        missing_receipt
+            .validate_shape()
+            .expect("valid missing receipt shape");
+
+        // If a caller did not observe verified delivery, any stray receipt is
+        // discarded before the response reaches the client.
+        let inconsistent = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            [0x69; 16],
+            [0x6A; 16],
+            false,
+            false,
+            Some(receipt),
+        );
+        assert_eq!(inconsistent.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        assert!(inconsistent.terminal_receipt.is_none());
+        inconsistent
+            .validate_shape()
+            .expect("valid fail-closed shape");
     }
 
     #[test]

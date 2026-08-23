@@ -928,9 +928,8 @@ use aeronyx_core::protocol::codec::{
 };
 use aeronyx_core::protocol::discovery::RouteDomainAttestationCertificateV1;
 use aeronyx_core::protocol::memchain::{
-    chat_verified_submit_result_for_outcomes, encode_memchain,
-    ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1, MemChainMessage,
-    CHAT_VERIFIED_SUBMIT_REJECTED_V1, MAX_CHAT_PULL_CURSOR_V2_BYTES,
+    encode_memchain, ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
+    MemChainMessage, CHAT_VERIFIED_SUBMIT_REJECTED_V1, MAX_CHAT_PULL_CURSOR_V2_BYTES,
 };
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
@@ -14568,23 +14567,16 @@ impl Server {
                 false
             }
         };
-        let result = chat_verified_submit_result_for_outcomes(
+        let response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            request.envelope.message_id,
             verified_onion && onion_delivered,
             entry_custody,
+            terminal_receipt,
         );
         // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] The relay
         // status records only the closed result bucket, never identifiers.
-        relay.record_verified_submit_result(unix_now_secs(), result);
-
-        let mut response = ChatRelayVerifiedSubmitResponseV1 {
-            request_id: request.request_id,
-            message_id: request.envelope.message_id,
-            result,
-            terminal_receipt,
-        };
-        if !response.verified_onion_delivery() {
-            response.terminal_receipt = None;
-        }
+        relay.record_verified_submit_result(unix_now_secs(), response.result);
         response
     }
 
