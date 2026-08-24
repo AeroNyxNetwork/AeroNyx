@@ -1062,8 +1062,7 @@ impl BlindRelayRouteLease {
         response: PeerBlindRelayResponse,
     ) -> Result<(), BlindRelayError> {
         if let Some(relay) = self.durable_relay.as_ref() {
-            let encoded = bincode::serialize(&response)
-                .map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
+            let encoded = encode_durable_blind_relay_response(&response)?;
             relay
                 .remember_blind_relay_route_response(
                     &self.route_id,
@@ -1908,6 +1907,122 @@ pub struct PeerBlindRelayResponse {
     /// it never identifies or assigns blame to a deeper onion participant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_receipt: Option<BlindRelayFailureReceipt>,
+}
+
+const DURABLE_BLIND_RELAY_RESPONSE_MAGIC: &[u8; 5] = b"ANBR\x01";
+const DURABLE_BLIND_RELAY_RESPONSE_VERSION: u8 = 1;
+
+/// Private, versioned representation of one restart-durable route ACK.
+///
+/// [DURABLE-BLIND-RELAY-RESPONSE-CODEC 2026-08-25 by Codex] The public JSON
+/// response omits absent receipt fields for rolling compatibility. Reusing that
+/// Serde shape with bincode truncated trailing fields and made a successfully
+/// sealed ACK unreadable after the first delivery. This storage-only frame has
+/// no conditional fields and is prefixed independently from the public wire.
+#[derive(Debug, Serialize, Deserialize)]
+struct DurableBlindRelayResponseV1 {
+    version: u8,
+    accepted: bool,
+    terminal: bool,
+    forwarded: bool,
+    ttl_remaining: u8,
+    reason: Option<String>,
+    delivery_receipt: Option<BlindRelayDeliveryReceipt>,
+    failure_receipt: Option<BlindRelayFailureReceipt>,
+}
+
+impl From<&PeerBlindRelayResponse> for DurableBlindRelayResponseV1 {
+    fn from(response: &PeerBlindRelayResponse) -> Self {
+        Self {
+            version: DURABLE_BLIND_RELAY_RESPONSE_VERSION,
+            accepted: response.accepted,
+            terminal: response.terminal,
+            forwarded: response.forwarded,
+            ttl_remaining: response.ttl_remaining,
+            reason: response.reason.clone(),
+            delivery_receipt: response.delivery_receipt.clone(),
+            failure_receipt: response.failure_receipt.clone(),
+        }
+    }
+}
+
+impl From<DurableBlindRelayResponseV1> for PeerBlindRelayResponse {
+    fn from(response: DurableBlindRelayResponseV1) -> Self {
+        Self {
+            accepted: response.accepted,
+            terminal: response.terminal,
+            forwarded: response.forwarded,
+            ttl_remaining: response.ttl_remaining,
+            reason: response.reason,
+            delivery_receipt: response.delivery_receipt,
+            failure_receipt: response.failure_receipt,
+        }
+    }
+}
+
+fn encode_durable_blind_relay_response(
+    response: &PeerBlindRelayResponse,
+) -> Result<Vec<u8>, BlindRelayError> {
+    let frame = DurableBlindRelayResponseV1::from(response);
+    let body =
+        bincode::serialize(&frame).map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
+    let mut encoded = Vec::with_capacity(DURABLE_BLIND_RELAY_RESPONSE_MAGIC.len() + body.len());
+    encoded.extend_from_slice(DURABLE_BLIND_RELAY_RESPONSE_MAGIC);
+    encoded.extend_from_slice(&body);
+    Ok(encoded)
+}
+
+fn decode_durable_blind_relay_response(
+    encoded: &[u8],
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    if let Some(body) = encoded.strip_prefix(DURABLE_BLIND_RELAY_RESPONSE_MAGIC) {
+        let frame: DurableBlindRelayResponseV1 =
+            bincode::deserialize(body).map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
+        if frame.version != DURABLE_BLIND_RELAY_RESPONSE_VERSION {
+            return Err(BlindRelayError::ReplayProtectionUnavailable);
+        }
+        return Ok(frame.into());
+    }
+
+    // [DURABLE-BLIND-RELAY-RESPONSE-CODEC 2026-08-25 by Codex] Read ACKs
+    // sealed before v1 without rewriting them. The old public response omitted
+    // absent trailing fields, so only the two successful shapes that could
+    // enter this table are accepted: a delivery receipt or no receipts.
+    type LegacyWithDelivery = (
+        bool,
+        bool,
+        bool,
+        u8,
+        Option<String>,
+        Option<BlindRelayDeliveryReceipt>,
+    );
+    if let Ok((accepted, terminal, forwarded, ttl_remaining, reason, delivery_receipt)) =
+        bincode::deserialize::<LegacyWithDelivery>(encoded)
+    {
+        return Ok(PeerBlindRelayResponse {
+            accepted,
+            terminal,
+            forwarded,
+            ttl_remaining,
+            reason,
+            delivery_receipt,
+            failure_receipt: None,
+        });
+    }
+
+    type LegacyWithoutReceipts = (bool, bool, bool, u8, Option<String>);
+    let (accepted, terminal, forwarded, ttl_remaining, reason) =
+        bincode::deserialize::<LegacyWithoutReceipts>(encoded)
+            .map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
+    Ok(PeerBlindRelayResponse {
+        accepted,
+        terminal,
+        forwarded,
+        ttl_remaining,
+        reason,
+        delivery_receipt: None,
+        failure_receipt: None,
+    })
 }
 
 /// Internal result of one accepted next-hop relay round.
@@ -3444,7 +3559,7 @@ fn begin_blind_relay_route(
                         .record_blind_relay_rejected(now, "replay_response_expired");
                     return Err(BlindRelayError::ReplayResponseExpired);
                 }
-                let response: PeerBlindRelayResponse = bincode::deserialize(&response)
+                let response = decode_durable_blind_relay_response(&response)
                     .map_err(|_| record_blind_relay_replay_protection_failure(state, now))?;
                 validate_stored_blind_relay_response(&response)
                     .map_err(|_| record_blind_relay_replay_protection_failure(state, now))?;
@@ -4522,6 +4637,64 @@ mod tests {
                 now,
             ),
             Err("terminal_receipt_signer_mismatch")
+        );
+    }
+
+    #[test]
+    fn durable_blind_relay_response_codec_round_trips_and_reads_legacy_rows() {
+        // [DURABLE-BLIND-RELAY-RESPONSE-CODEC 2026-08-25 by Codex] Protect
+        // both the new storage-only frame and already-sealed public-Serde rows.
+        // The latter intentionally reproduce the trailing-field truncation
+        // that made direct bincode deserialization fail with UnexpectedEof.
+        let terminal = IdentityKeyPair::generate();
+        let response_with_receipt = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 1,
+            reason: Some("onion_terminal_delivered".to_string()),
+            delivery_receipt: Some(BlindRelayDeliveryReceipt::accepted(
+                [0xD8; 16],
+                [0xD9; 32],
+                1_800_000_100,
+                &terminal,
+            )),
+            failure_receipt: None,
+        };
+        let encoded = encode_durable_blind_relay_response(&response_with_receipt)
+            .expect("encode versioned durable response");
+        assert!(encoded.starts_with(DURABLE_BLIND_RELAY_RESPONSE_MAGIC));
+        assert_eq!(
+            decode_durable_blind_relay_response(&encoded)
+                .expect("decode versioned durable response"),
+            response_with_receipt
+        );
+
+        let legacy_with_receipt = bincode::serialize(&response_with_receipt)
+            .expect("encode legacy response with receipt");
+        assert_eq!(
+            decode_durable_blind_relay_response(&legacy_with_receipt)
+                .expect("decode legacy response with receipt"),
+            response_with_receipt
+        );
+
+        let legacy_without_receipts = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 2,
+            reason: Some("terminal_next_hop".to_string()),
+            delivery_receipt: None,
+            failure_receipt: None,
+        };
+        let legacy_without_receipts = bincode::serialize(&legacy_without_receipts)
+            .expect("encode legacy response without receipts");
+        assert_eq!(
+            decode_durable_blind_relay_response(&legacy_without_receipts)
+                .expect("decode legacy response without receipts")
+                .reason
+                .as_deref(),
+            Some("terminal_next_hop")
         );
     }
 
@@ -6405,6 +6578,242 @@ mod tests {
 
         drop(recovered_relay);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn onion_middle_armed_claim_recovers_through_terminal_durable_replay() {
+        use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+        // [MIDDLE-HOP-ARMED-RECOVERY 2026-08-25 by Codex] Exercise the real
+        // HTTP boundary on both sides of a crashed middle hop. The terminal
+        // has already accepted durable custody, but the middle has not sealed
+        // its upstream ACK. Restart recovery must reconstruct byte-identical
+        // downstream work, receive the terminal's durable replay, and avoid a
+        // second pending message.
+        let source = IdentityKeyPair::generate();
+        let middle_identity = Arc::new(IdentityKeyPair::generate());
+        let terminal_identity = Arc::new(IdentityKeyPair::generate());
+        let now = now_secs();
+        let delivered_envelope = signed_envelope_at(now);
+        let receiver = delivered_envelope.receiver;
+        let terminal_payload =
+            encode_envelope(&delivered_envelope).expect("encode terminal message payload");
+
+        let (terminal_relay, terminal_path) = temp_chat_relay("onion-terminal-replay-target");
+        let terminal_peer_store = Arc::new(PeerStore::new());
+        let terminal_app = build_chat_peer_router(
+            Some(Arc::clone(&terminal_relay)),
+            Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            Arc::clone(&terminal_peer_store),
+            Arc::clone(&terminal_identity),
+            Arc::new(reqwest::Client::new()),
+            None,
+        );
+        let terminal_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let terminal_endpoint = format!("http://{}", terminal_listener.local_addr().unwrap());
+        let terminal_server = tokio::spawn(async move {
+            axum::serve(terminal_listener, terminal_app).await.unwrap();
+        });
+
+        let terminal_descriptor = signed_chat_relay_peer_descriptor_for(
+            terminal_identity.as_ref(),
+            terminal_endpoint.clone(),
+            now,
+            now + 300,
+        );
+        let middle_peer_store = Arc::new(PeerStore::new());
+        middle_peer_store
+            .upsert_verified_from_source(terminal_descriptor.clone(), now, "gossip_snapshot")
+            .expect("install terminal descriptor at middle hop");
+
+        let (old_middle_relay, middle_path) = temp_chat_relay("onion-middle-armed-recovery");
+        let old_middle_state = ChatPeerState {
+            chat_relay: Some(Arc::clone(&old_middle_relay)),
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&middle_peer_store),
+            node_identity: Arc::clone(&middle_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let route_id = [0x69; 16];
+        let request = PeerBlindRelayRequest {
+            envelope: build_onion_envelope(
+                &[
+                    OnionHop {
+                        node_id: middle_identity.public_key_bytes(),
+                        kem_pub: crate::services::onion_keys::current_public_key(),
+                    },
+                    OnionHop {
+                        node_id: terminal_identity.public_key_bytes(),
+                        kem_pub: crate::services::onion_keys::current_public_key(),
+                    },
+                ],
+                &terminal_payload,
+                route_id,
+                4,
+                now,
+                &source,
+            )
+            .expect("build recoverable two-hop onion"),
+            previous_hop_node_id: source.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let request_commitment = blind_relay_authenticated_request_commitment(&request)
+            .expect("commit recoverable middle-hop request");
+        assert_eq!(
+            old_middle_relay
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("reserve pre-crash middle route"),
+            BlindRelayRouteAdmission::Reserved
+        );
+        old_middle_relay
+            .arm_blind_relay_route_effect(&route_id, &request_commitment, now)
+            .expect("arm pre-crash middle route");
+
+        let peel = try_open_onion_layer(
+            &request.envelope.encrypted_blob,
+            &crate::services::onion_keys::peel_secrets(now),
+        )
+        .expect("peel pre-crash middle layer");
+        assert_eq!(peel.next_hop, Some(terminal_identity.public_key_bytes()));
+        let forwarded_envelope = build_forwarded_onion_envelope(
+            &request.envelope,
+            terminal_identity.public_key_bytes(),
+            peel.inner,
+            middle_identity.as_ref(),
+        );
+        let terminal_url = blind_peer_relay_url(&terminal_endpoint)
+            .expect("construct canonical terminal relay URL");
+        let first_forwarded_request = PeerBlindRelayRequest {
+            envelope: forwarded_envelope,
+            previous_hop_node_id: middle_identity.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let first_terminal_ack = forward_blind_relay_with_retry(
+            &old_middle_state,
+            &terminal_url,
+            &terminal_descriptor,
+            first_forwarded_request.clone(),
+            now,
+        )
+        .await
+        .expect("terminal accepts custody before middle crash");
+        assert!(first_terminal_ack.response.terminal);
+        assert!(first_terminal_ack.response.delivery_receipt.is_some());
+        let terminal_request_commitment =
+            blind_relay_authenticated_request_commitment(&first_forwarded_request)
+                .expect("commit terminal replay request");
+        let sealed_terminal_response = match terminal_relay
+            .reserve_blind_relay_route(&route_id, &terminal_request_commitment)
+            .expect("read terminal sealed route")
+        {
+            BlindRelayRouteAdmission::Completed { response, .. } => response,
+            admission => panic!("terminal route was not sealed: {admission:?}"),
+        };
+        let sealed_terminal_response =
+            decode_durable_blind_relay_response(&sealed_terminal_response)
+                .expect("decode terminal sealed response");
+        validate_stored_blind_relay_response(&sealed_terminal_response)
+            .expect("validate terminal sealed response");
+        assert_eq!(sealed_terminal_response, first_terminal_ack.response);
+
+        drop(old_middle_state);
+        drop(old_middle_relay);
+        let aged_at = now
+            .saturating_sub(crate::services::chat_relay::BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS + 1);
+        Connection::open(&middle_path)
+            .expect("open crashed middle database")
+            .execute(
+                "UPDATE relay_blind_route_reservations
+                 SET reserved_at = ?1, owner_acquired_at = ?1",
+                [i64::try_from(aged_at).expect("fit middle lease timestamp")],
+            )
+            .expect("age crashed middle owner lease");
+
+        let recovered_middle_relay = Arc::new(
+            ChatRelayService::new(
+                test_chat_config(middle_path.to_string_lossy().into_owned()),
+                [7u8; 32],
+            )
+            .expect("restart middle relay for armed reconciliation"),
+        );
+        let recovered_middle_state = ChatPeerState {
+            chat_relay: Some(Arc::clone(&recovered_middle_relay)),
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&middle_peer_store),
+            node_identity: Arc::clone(&middle_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let recovered_peel = try_open_onion_layer(
+            &request.envelope.encrypted_blob,
+            &crate::services::onion_keys::peel_secrets(now),
+        )
+        .expect("peel recovered middle layer");
+        let recovered_forwarded_request = PeerBlindRelayRequest {
+            envelope: build_forwarded_onion_envelope(
+                &request.envelope,
+                terminal_identity.public_key_bytes(),
+                recovered_peel.inner,
+                middle_identity.as_ref(),
+            ),
+            previous_hop_node_id: middle_identity.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        assert_eq!(
+            serde_json::to_vec(&recovered_forwarded_request)
+                .expect("encode recovered downstream request"),
+            serde_json::to_vec(&first_forwarded_request)
+                .expect("encode original downstream request"),
+            "middle restart changed authenticated downstream request bytes"
+        );
+        let recovered = process_peer_blind_relay(recovered_middle_state, request)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "recover middle route through terminal durable replay: {error:?}; middle={:?}; terminal={:?}; terminal_events={:?}",
+                    middle_peer_store.status(now + 1).runtime.blind_relay,
+                    terminal_peer_store.status(now + 1).runtime.blind_relay,
+                    terminal_peer_store.recent_audit_events(),
+                )
+            });
+        assert!(recovered.accepted);
+        assert!(recovered.forwarded);
+        assert!(!recovered.terminal);
+        assert_eq!(recovered.reason.as_deref(), Some("onion_forwarded"));
+        assert_eq!(
+            recovered.delivery_receipt,
+            first_terminal_ack.response.delivery_receipt
+        );
+
+        let (messages, has_more) = terminal_relay
+            .pull_pending(&receiver, 0, &[0; 16], 10)
+            .expect("pull terminal custody after middle recovery");
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, delivered_envelope.message_id);
+        let terminal_stats = terminal_peer_store.status(now + 1).runtime.blind_relay;
+        assert_eq!(terminal_stats.terminal, 1);
+        assert_eq!(terminal_stats.replay_dropped, 1);
+
+        terminal_server.abort();
+        let _ = terminal_server.await;
+        drop(recovered_middle_relay);
+        drop(terminal_relay);
+        let _ = std::fs::remove_file(middle_path);
+        let _ = std::fs::remove_file(terminal_path);
     }
 
     #[tokio::test]

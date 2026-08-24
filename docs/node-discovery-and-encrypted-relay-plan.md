@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.46.0 - Reconcile restart-durable armed blind-relay
-claims through exact idempotent replay, with immutable evidence retention,
-independent process leases, and deterministic onion forwarding.
+Modification Reason: v1.47.0 - Separate the restart-durable ACK codec from its
+public JSON shape and prove armed middle-hop recovery across the real HTTP relay
+boundary without duplicate terminal custody.
 
 Main Functionality:
 
@@ -31,8 +31,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.46.0 - [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Safely takes over an exact armed claim after process grace, repeats only idempotent terminal or downstream work, reconstructs byte-stable onion forwarding, and persists the recovered sealed ACK without duplicating terminal custody.
+Last Modified: v1.47.0 - [MIDDLE-HOP-ARMED-RECOVERY 2026-08-25 by Codex] Gives sealed ACKs an explicit storage-only magic/version codec with legacy-row reads, then proves a crashed middle hop can resend the exact signed downstream onion request, recover the terminal node's durable ACK, and seal upstream success without duplicating custody.
 
+Previous: v1.46.0 - [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Safely takes over an exact armed claim after process grace, repeats only idempotent terminal or downstream work, reconstructs byte-stable onion forwarding, and persists the recovered sealed ACK without duplicating terminal custody.
 Previous: v1.45.0 - [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Persists a random process epoch and explicit effect boundary for each blind-relay claim, safely reclaims only aged unarmed work after restart, and fences the previous process from arming or completing a taken-over route.
 Previous: v1.44.0 - [BLIND-RELAY-BODY-ADMISSION-ORDER 2026-08-24 by Codex] Preserves the fixed 413 contract for declared or exactly-known oversized blind-relay requests before evaluating durable replay availability, without buffering unknown-length streams.
 Previous: v1.43.0 - [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] Requires the node-private durable replay boundary before the public blind-relay HTTP endpoint accepts parser, signature, forwarding, or terminal-storage work; unavailable protection fails closed with a fixed aggregate reason.
