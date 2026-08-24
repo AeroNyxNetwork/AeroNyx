@@ -29,6 +29,8 @@
 //! and the non-destructive audit command contract for private recovery images.
 //! v1.11.0-CustodyBackupPrune — Added the minimum interrupted-backup grace
 //! period used only by explicit host-local dry-run/prune commands.
+//! v1.12.0-CrashSafeVerifiedSubmitAdmission — Documented that the node-wide
+//! deduplication capacity also bounds durable verified-submit replay evidence.
 //!
 //! ## Main Functionality
 //! - `ChatRelayConfig` — all knobs for the zero-knowledge P2P chat relay
@@ -54,8 +56,12 @@
 //! - Node-wide message/blob count and byte ceilings are mandatory when the
 //!   relay is enabled. Keep them at least as large as their per-wallet/single
 //!   item limits so one valid mailbox or object remains usable.
-//! - `dedup_lru_capacity` is node-wide (not per-wallet). ~64 bytes/entry;
-//!   10 000 entries ≈ 640 KB RAM.
+//! - [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex]
+//!   `dedup_lru_capacity` is node-wide (not per-wallet). It bounds both the
+//!   in-memory online-delivery LRU and short-lived durable verified-submit
+//!   responses/reservations. When the durable bound is full, new verified
+//!   submits fail before route or custody side effects; retained evidence is
+//!   never evicted early. Keep operational headroom for the configured TTL.
 //! - `max_message_size`: values > 64 KB emit a warn (UDP fragmentation risk)
 //!   and are hard-rejected above `MAX_MESSAGE_SIZE_HARD_LIMIT` (1 MB).
 //!   `ChatRelayService::store_pending()` enforces the configured ciphertext
@@ -100,6 +106,8 @@
 //!   update `chat_relay.db_path` explicitly in your config file.
 //!
 //! ## Last Modified
+//! v1.12.0-CrashSafeVerifiedSubmitAdmission — Documented the shared volatile
+//! and durable admission capacity boundary for verified submits.
 //! v1.11.0-CustodyBackupPrune — Host-local, confirmation-gated prune policy.
 //! v1.10.0-CustodyBackupRetention — Bounded private backup retention.
 //! v1.9.0-IdempotentCustodyBackup — Restart-safe audited backup replay.
@@ -312,14 +320,20 @@ pub struct ChatRelayConfig {
     #[serde(default = "default_cleanup_interval")]
     pub cleanup_interval_secs: u64,
 
-    /// Capacity of the in-memory LRU deduplication cache for online delivery.
+    /// Node-wide capacity for online-delivery deduplication and durable
+    /// verified-submit replay evidence.
     ///
     /// When a receiver is online, messages are forwarded directly without
     /// hitting SQLite. The LRU cache prevents duplicate delivery if the
     /// sender retransmits before the first ACK arrives.
     ///
-    /// Each entry is ~64 bytes (16-byte message_id + LRU overhead).
-    /// At capacity 10 000: ~640 KB.
+    /// [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] The same
+    /// value bounds short-lived durable response/reservation rows. Saturation
+    /// rejects a new verified submit before any route or custody side effect;
+    /// unexpired replay evidence is not evicted to make room.
+    ///
+    /// In-memory entries are ~64 bytes each (16-byte message_id + LRU
+    /// overhead). At capacity 10 000: ~640 KB, excluding SQLite rows.
     /// Default: 10 000.
     #[serde(default = "default_dedup_lru_capacity")]
     pub dedup_lru_capacity: usize,

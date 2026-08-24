@@ -75,6 +75,7 @@
 # - Existing /etc/aeronyx/server.toml must not be overwritten by install.sh.
 #
 # Last Modified:
+# v1.19.0-node-deploy - Documented crash-safe verified-submit admission bounds.
 # v1.18.0-node-deploy - Documented custody renewal warning lifecycle.
 # v1.17.0-node-deploy - Documented custody quorum expiry warning behavior.
 # v1.16.0-node-deploy - Documented strict runtime custody witness re-auditing.
@@ -414,6 +415,10 @@ max_blobs_per_receiver = 50
 max_pending_blobs_total = 5000
 max_pending_blob_bytes_total = 2147483648
 cleanup_interval_secs = 60
+# [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] This node-wide
+# value also bounds short-lived durable verified-submit responses and pending
+# reservations. When full, the node rejects a new verified submit before any
+# route/custody side effect; it never evicts unexpired replay evidence early.
 dedup_lru_capacity = 10000
 expired_notification_ttl_secs = 604800
 # [PEER-RELAY-ADMISSION 2026-08-15 by Codex] Global parser-front ceiling shared

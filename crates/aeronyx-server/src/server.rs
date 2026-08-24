@@ -1017,7 +1017,8 @@ use crate::management::{
 use crate::miner::ReflectionMiner;
 use crate::services::chat_relay::{
     derive_node_secret, ChatRelayOutboundFailureReason, ChatRelayPeerStatus, ChatRelayService,
-    ExpiredNotification, VerifiedSubmitCacheLookup, MAX_CHAT_ACK_MESSAGE_IDS,
+    ExpiredNotification, VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
+    MAX_CHAT_ACK_MESSAGE_IDS,
 };
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
@@ -14509,6 +14510,18 @@ impl Server {
                 );
                 return response;
             }
+            Ok(VerifiedSubmitCacheLookup::Pending) => {
+                let response = rejected();
+                relay.record_verified_submit_pending_rejection(
+                    unix_now_secs(),
+                    response.result,
+                );
+                warn!(
+                    reason = "verified_submit_request_pending",
+                    "[CHAT_RELAY] Verified submit rejected"
+                );
+                return response;
+            }
             Ok(VerifiedSubmitCacheLookup::Miss) => {}
             Err(error) => {
                 let response = rejected();
@@ -14516,6 +14529,73 @@ impl Server {
                 warn!(
                     reason = error.reason_bucket(),
                     "[CHAT_RELAY] Verified submit durable replay check failed"
+                );
+                return response;
+            }
+        }
+
+        // [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Reserve
+        // bounded durable replay capacity before wallet-route, network, or
+        // custody mutation. Saturation and crash-left pending work reject here;
+        // unexpired evidence is never evicted to make room for new effects.
+        match relay.reserve_verified_submit(&request) {
+            Ok(VerifiedSubmitAdmission::Reserved) => {}
+            Ok(VerifiedSubmitAdmission::Pending) => {
+                let response = rejected();
+                relay.record_verified_submit_pending_rejection(
+                    unix_now_secs(),
+                    response.result,
+                );
+                warn!(
+                    reason = "verified_submit_request_pending",
+                    "[CHAT_RELAY] Verified submit rejected"
+                );
+                return response;
+            }
+            Ok(VerifiedSubmitAdmission::Conflict) => {
+                let response = rejected();
+                relay.record_verified_submit_conflict(unix_now_secs(), response.result);
+                warn!(
+                    reason = "verified_submit_request_conflict",
+                    "[CHAT_RELAY] Verified submit rejected"
+                );
+                return response;
+            }
+            Ok(VerifiedSubmitAdmission::CapacityExhausted) => {
+                let response = rejected();
+                relay.record_verified_submit_capacity_rejection(
+                    unix_now_secs(),
+                    response.result,
+                );
+                warn!(
+                    reason = "verified_submit_replay_capacity",
+                    "[CHAT_RELAY] Verified submit rejected"
+                );
+                return response;
+            }
+            Ok(VerifiedSubmitAdmission::Completed) => {
+                match relay.verified_submit_cache_lookup(&request) {
+                    Ok(VerifiedSubmitCacheLookup::Exact(response)) => {
+                        relay.record_verified_submit_replay(unix_now_secs(), response.result);
+                        return response;
+                    }
+                    Ok(_) | Err(_) => {
+                        let response = rejected();
+                        relay.record_verified_submit_result(unix_now_secs(), response.result);
+                        warn!(
+                            reason = "verified_submit_admission_race",
+                            "[CHAT_RELAY] Verified submit rejected"
+                        );
+                        return response;
+                    }
+                }
+            }
+            Err(error) => {
+                let response = rejected();
+                relay.record_verified_submit_result(unix_now_secs(), response.result);
+                warn!(
+                    reason = error.reason_bucket(),
+                    "[CHAT_RELAY] Verified submit durable admission failed"
                 );
                 return response;
             }
@@ -16009,6 +16089,7 @@ mod tests {
     };
     use crate::config_chat_relay::ChatRelayConfig;
     use crate::error::RuntimeTaskJoinFailureKind;
+    use crate::services::chat_relay::VerifiedSubmitAdmission;
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
@@ -19010,6 +19091,109 @@ mod tests {
         assert_eq!(status.replayed_total, 1);
         assert_eq!(status.request_conflict_total, 1);
         assert_eq!(status.last_result.as_deref(), Some("rejected"));
+    }
+
+    #[tokio::test]
+    async fn verified_submit_pending_and_capacity_reject_before_side_effects() {
+        // [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] A
+        // crash-left exact reservation and a different request at capacity
+        // must both stop before wallet-route mutation, network selection, or
+        // entry custody. This is the live-handler proof of the durable gate.
+        let directory = tempfile::tempdir().expect("verified submit admission directory");
+        let mut relay_config = ChatRelayConfig::default();
+        relay_config.enabled = true;
+        relay_config.dedup_lru_capacity = 1;
+        relay_config.db_path = directory
+            .path()
+            .join("verified-submit-admission.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let relay = Arc::new(
+            ChatRelayService::new(relay_config, [0x81; 32])
+                .expect("initialize verified submit admission relay"),
+        );
+        let relay_option = Some(Arc::clone(&relay));
+        let sender = IdentityKeyPair::generate();
+        let source_node = IdentityKeyPair::generate();
+        let now = unix_now_secs();
+        let make_request = |request_id: [u8; 16], message_id: [u8; 16]| {
+            let mut envelope = ChatEnvelope {
+                message_id,
+                sender: sender.public_key_bytes(),
+                receiver: [0x82; 32],
+                timestamp: now,
+                ciphertext: b"opaque admission payload".to_vec(),
+                nonce: [0x83; 24],
+                content_type: ChatContentType::Text,
+                signature: [0_u8; 64],
+            };
+            envelope.signature = sender.sign(&envelope.sign_data());
+            ChatRelayVerifiedSubmitRequestV1::signed(request_id, envelope, now, &sender)
+                .expect("sign verified submit admission request")
+        };
+        let pending_request = make_request([0x84; 16], [0x85; 16]);
+        assert_eq!(
+            relay
+                .reserve_verified_submit(&pending_request)
+                .expect("seed crash-left pending reservation"),
+            VerifiedSubmitAdmission::Reserved
+        );
+        let session = Arc::new(crate::services::Session::new(
+            aeronyx_common::types::SessionId::generate(),
+            sender.public_key(),
+            aeronyx_core::crypto::SessionKey::from_bytes([0x86; 32]),
+            Ipv4Addr::new(100, 64, 0, 86),
+            "127.0.0.1:1086".parse().unwrap(),
+        ));
+        let store = PeerStore::new();
+
+        let pending_response = Server::handle_verified_chat_submit(
+            pending_request.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(pending_response.result, CHAT_VERIFIED_SUBMIT_REJECTED_V1);
+        pending_response
+            .validate_for_request(&pending_request)
+            .expect("pending rejection remains request-bound");
+
+        let saturated_request = make_request([0x87; 16], [0x88; 16]);
+        let saturated_response = Server::handle_verified_chat_submit(
+            saturated_request.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(
+            saturated_response.result,
+            CHAT_VERIFIED_SUBMIT_REJECTED_V1
+        );
+        saturated_response
+            .validate_for_request(&saturated_request)
+            .expect("capacity rejection remains request-bound");
+
+        assert_eq!(
+            relay
+                .storage_usage()
+                .expect("read admission-gated storage usage")
+                .pending_messages,
+            0
+        );
+        assert!(relay.wallet_routes.lookup(&sender.public_key_bytes()).is_empty());
+        assert_eq!(relay.peer_status().outbound_rounds, 0);
+        let verified_status = relay.peer_status().verified_submit;
+        assert_eq!(verified_status.pending_rejected_total, 1);
+        assert_eq!(verified_status.capacity_rejected_total, 1);
+        assert_eq!(verified_status.rejected_total, 2);
     }
 
     #[tokio::test]

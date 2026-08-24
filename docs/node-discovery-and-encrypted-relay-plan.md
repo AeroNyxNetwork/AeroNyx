@@ -4,10 +4,10 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.39.0 - Made verified-submit response replay durable,
-private, retention-bounded, and fail-closed across node restarts without
-persisting request ids, message ids, sender identities, routes, or receipts in
-plaintext.
+Modification Reason: v1.40.0 - Added crash-safe verified-submit admission so a
+node durably reserves bounded private replay capacity before route or custody
+side effects, never evicts unexpired safety evidence, and fails closed after an
+interrupted submission.
 
 Main Functionality:
 
@@ -32,7 +32,8 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.39.0 - [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Persists the first request-bound verified-submit response as node-keyed opaque indexes plus AEAD ciphertext, replays it after restart without repeating onion delivery or custody, bounds retention by the authenticated retry horizon and configured capacity, and treats missing or malformed installed protection state as a fail-closed storage fault.
+Last Modified: v1.40.0 - [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Atomically upgrades replay schema v1 to v2, reserves a private capacity slot before wallet-route/onion/custody mutation, keeps all unexpired responses and reservations, rejects saturation before side effects, and preserves interrupted reservations across restart so an ambiguous request cannot be blindly repeated.
+Previous: v1.39.0 - [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Persists the first request-bound verified-submit response as node-keyed opaque indexes plus AEAD ciphertext, replays it after restart without repeating onion delivery or custody, bounds retention by the authenticated retry horizon and configured capacity, and treats missing or malformed installed protection state as a fail-closed storage fault.
 Previous: v1.38.0 - [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Adds node-secret-indexed fixed-capacity response replay plus fixed-lane single-flight admission so sequential and concurrent exact retries return the first request-bound response without repeating onion delivery or entry custody; conflicting envelope reuse fails closed.
 Previous: v1.37.0 - [CHAT-VERIFIED-SUBMIT-LIVE-HANDLER 2026-08-23 by Codex] Extends the real two-hop HTTP relay test through `handle_verified_chat_submit()`, proving terminal-signed delivery, durable entry custody, exact request correlation, independent client verification, and aggregate-only telemetry in one success path.
 Previous: v1.36.0 - [CHAT-VERIFIED-SUBMIT-HANDLER-CORRELATION 2026-08-23 by Codex] Verifies the real server handler returns request-bound entry-retry after durable custody and request-bound rejection for an unrelated authenticated session, with aggregate-only result telemetry.
@@ -3257,6 +3258,23 @@ Implemented:
   replay entry and emits a fixed, privacy-safe internal failure bucket. This
   avoids instructing a client to repeat already-observed side effects while
   preserving fail-closed behavior on the next restart.
+- [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Before the entry
+  node announces a wallet route, selects an onion path, contacts another node,
+  or writes custody, it atomically inserts a private reservation containing only
+  the node-secret HMAC cache key, HMAC envelope fingerprint, and reservation
+  time. Completing the request inserts the AEAD-sealed response and removes the
+  matching reservation in one SQLite transaction.
+- Replay schema v1 upgrades atomically to v2. A missing reservation table after
+  v2 installation, malformed row, mismatched completion, or unavailable durable
+  admission rejects before side effects. A reservation left by a crash remains
+  `pending` for the authenticated replay horizon; exact retry receives a
+  request-bound rejection rather than risking duplicate relay or custody.
+- Capacity is now admission, not eviction: unexpired completed responses and
+  reservations are never removed to accept new work. A full node rejects the
+  new request before side effects, while expired rows are pruned in the same
+  committed admission transaction and by bounded maintenance. Aggregate health
+  adds only `pending_rejected_total` and `capacity_rejected_total`; neither has
+  peer, request, message, wallet, route, endpoint, receipt, or payload labels.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
@@ -3287,6 +3305,10 @@ Verification:
 - Durable verified-submit coverage for encrypted restart replay, request
   conflict rejection, TTL and capacity cleanup, installed-schema disappearance,
   and verified-backup restore integrity.
+- Crash-safe admission coverage for v1-to-v2 migration, pending restart recovery,
+  saturation without eviction, admission-time stale cleanup, reservation-table
+  disappearance, pre-side-effect live-handler rejection, and backup retention of
+  an interrupted reservation.
 - Exact sequential retry coverage proving response equality and no additional
   HTTP onion request, plus fail-closed request-id/envelope conflict coverage.
 - Route-id retry stability and path-binding tests.
