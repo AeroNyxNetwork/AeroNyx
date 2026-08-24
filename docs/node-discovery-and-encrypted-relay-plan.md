@@ -31,8 +31,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.43.0 - [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] Requires the node-private durable replay boundary before the public blind-relay HTTP endpoint accepts parser, signature, forwarding, or terminal-storage work; unavailable protection fails closed with a fixed aggregate reason.
+Last Modified: v1.44.0 - [BLIND-RELAY-BODY-ADMISSION-ORDER 2026-08-24 by Codex] Preserves the fixed 413 contract for declared or exactly-known oversized blind-relay requests before evaluating durable replay availability, without buffering unknown-length streams.
 
+Previous: v1.43.0 - [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] Requires the node-private durable replay boundary before the public blind-relay HTTP endpoint accepts parser, signature, forwarding, or terminal-storage work; unavailable protection fails closed with a fixed aggregate reason.
 Previous: v1.42.0 - [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Persists blind-relay reservations and exact ACKs in the node-private Chat Relay database as node-secret HMAC indexes plus AEAD ciphertext, binds them to the complete accepted request, and applies startup, admission-time, and bounded scheduled retention cleanup.
 Previous: v1.41.0 - [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Makes blind-relay replay capacity an admission boundary: after expiry cleanup, saturation rejects only the new route and preserves every unexpired in-flight claim and completed ACK so pressure cannot reopen an already executed route.
 Previous: v1.40.0 - [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Atomically upgrades replay schema v1 to v2, reserves a private capacity slot before wallet-route/onion/custody mutation, keeps all unexpired responses and reservations, rejects saturation before side effects, and preserves interrupted reservations across restart so an ambiguous request cannot be blindly repeated.
@@ -3313,6 +3314,10 @@ Implemented:
   signature work. A node with Chat Relay storage disabled returns a fixed 503
   `replay_protection_unavailable` response and performs no relay side effect;
   it cannot silently degrade to restart-unsafe process-memory replay state.
+- [BLIND-RELAY-BODY-ADMISSION-ORDER 2026-08-24 by Codex] Declared or
+  exactly-known oversized bodies retain the endpoint-wide fixed 413 response
+  before durable-store availability is exposed. Unknown-length streams are
+  never buffered by this preflight and remain bounded by the JSON extractor.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
@@ -3359,6 +3364,9 @@ Verification:
 - Parser-front admission coverage proves a node without durable replay storage
   returns 503 for even an invalid request body before parsing or forwarding,
   while configured nodes retain the existing aggregate backpressure behavior.
+- Shared route coverage proves a known oversized blind-relay body still returns
+  413 without incrementing relay receive or rejection counters when durable
+  replay storage is unavailable.
 - Exact sequential retry coverage proving response equality and no additional
   HTTP onion request, plus fail-closed request-id/envelope conflict coverage.
 - Route-id retry stability and path-binding tests.

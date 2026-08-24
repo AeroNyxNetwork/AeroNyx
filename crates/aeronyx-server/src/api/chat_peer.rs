@@ -291,6 +291,8 @@
 //!   cancellation cannot release capacity while verification is still active.
 //!
 //! ## Last Modified
+//! v0.59.0-BlindRelayBodyAdmissionOrder - Preserve the fixed 413 contract for
+//! known oversized requests before durable replay availability is evaluated
 //! v0.58.0-BlindRelayTestAdmissionIsolation - Keep focused route tests bounded
 //! without racing for the production-global signature verification semaphore
 //! v0.57.0-DurableBlindRelayAdmission - Require the node-private durable replay
@@ -406,6 +408,7 @@ use aeronyx_core::protocol::{
 use aeronyx_transport::traits::Transport;
 use aeronyx_transport::UdpTransport;
 use axum::{
+    body::HttpBody,
     extract::{DefaultBodyLimit, Extension, Request, State},
     http::StatusCode,
     middleware::{self, Next},
@@ -2197,6 +2200,23 @@ async fn peer_blind_relay_request_gate(
     request: Request,
     next: Next,
 ) -> Response {
+    // [BLIND-RELAY-BODY-ADMISSION-ORDER 2026-08-24 by Codex] Reject a declared
+    // or exactly-known oversized body before any service-availability signal.
+    // Unknown-length streams are not read here: the existing DefaultBodyLimit
+    // remains authoritative when the JSON extractor consumes an admitted body.
+    let body_limit = u64::try_from(PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES).unwrap_or(u64::MAX);
+    let declared_length = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let exact_length = request.body().size_hint().exact();
+    if declared_length.is_some_and(|length| length > body_limit)
+        || exact_length.is_some_and(|length| length > body_limit)
+    {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+
     // [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] A public relay must
     // never accept work whose at-most-once evidence disappears on restart.
     // Reject before JSON/body parsing, signature work, route mutation, or any
@@ -5781,6 +5801,7 @@ mod tests {
             .await
             .unwrap();
         let blind_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -5794,9 +5815,28 @@ mod tests {
             )
             .await
             .unwrap();
+        let declared_blind_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/blind-relay")
+                    .header("content-type", "application/json")
+                    .header(
+                        axum::http::header::CONTENT_LENGTH,
+                        (PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES + 1).to_string(),
+                    )
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(peer_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(blind_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            declared_blind_response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
         let blind_stats = peer_store.status(now_secs()).runtime.blind_relay;
         assert_eq!(blind_stats.received, 0, "oversized body reached handler");
         assert_eq!(blind_stats.rejected, 0, "oversized body reached handler");
