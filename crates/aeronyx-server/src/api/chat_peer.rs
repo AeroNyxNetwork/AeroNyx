@@ -51,6 +51,9 @@
 //!   retries from completed delivery replays and retains the exact bounded ACK,
 //!   so a lost response cannot erase a terminal delivery receipt or create a
 //!   false acceptance while the original attempt is still unresolved
+//! - [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Preserves every
+//!   unexpired in-flight claim and completed ACK under capacity pressure;
+//!   saturation rejects only the new route before relay or terminal effects
 //! - [RELAY-ROUTE-RAII 2026-08-11 by Codex] Owns every newly admitted route
 //!   through an RAII lease so cancellation, shutdown, and future early-return
 //!   paths release in-flight replay state unless a durable ACK is committed
@@ -137,6 +140,9 @@
 //! - Blind relay keeps a bounded local `route_id` replay cache. The cache is
 //!   in-memory only, stores no payload/peer endpoint/user data, and prevents a
 //!   repeated encrypted route frame from being forwarded twice by this node.
+//!   [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Capacity is an
+//!   admission bound: after expired entries are removed, a full cache rejects
+//!   the new route and never evicts an unexpired completed ACK or live claim.
 //! - Blind relay applies one identity-independent parser-front rate ceiling,
 //!   followed by previous-hop rate limiting and short quarantine only after
 //!   signature verification. This protects commercial nodes from identity
@@ -274,6 +280,8 @@
 //!   cancellation cannot release capacity while verification is still active.
 //!
 //! ## Last Modified
+//! v0.55.0-BlindRelayNoEvictionAdmission - Reject new routes at replay-cache
+//! saturation without evicting unexpired completed or in-flight evidence
 //! v0.54.0-BlindRelayVerifyAdmission - Isolate signature verification and
 //! request commitment hashing behind bounded CPU admission; unsigned rejection
 //! is mandatory until previous-hop authentication succeeds
@@ -510,8 +518,9 @@ const BLIND_RELAY_RETRY_JITTER_MS: u64 = 35;
 
 /// Maximum route ids retained by one node for blind relay replay suppression.
 ///
-/// The value is deliberately small and local-only: it prevents immediate
-/// replay amplification without becoming a durable route history.
+/// The value is deliberately bounded and local-only: it prevents immediate
+/// replay amplification without becoming a durable route history. Saturation
+/// rejects the new route; unexpired replay evidence is never evicted early.
 const MAX_BLIND_RELAY_SEEN_ROUTES: usize = 8192;
 
 /// Maximum live and stale generations retained by the replay eviction queue.
@@ -1036,6 +1045,14 @@ impl BlindRelayRouteReplayCache {
                 }
             };
         }
+        // [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] A completed
+        // ACK is still the only proof that an ACK-loss retry must not repeat
+        // forwarding or terminal delivery. Treat capacity as admission rather
+        // than deleting valid safety evidence to make room for newer work.
+        if self.seen.len() >= MAX_BLIND_RELAY_SEEN_ROUTES {
+            self.compact_stale_generations_if_needed();
+            return BlindRelayRouteReplayDecision::Saturated;
+        }
 
         let generation = self.allocate_generation();
         self.seen.insert(
@@ -1047,13 +1064,8 @@ impl BlindRelayRouteReplayCache {
             },
         );
         self.order.push_back((route_id, generation));
-        let retained = self.evict_over_capacity(route_id, generation);
         self.compact_stale_generations_if_needed();
-        if retained {
-            BlindRelayRouteReplayDecision::New
-        } else {
-            BlindRelayRouteReplayDecision::Saturated
-        }
+        BlindRelayRouteReplayDecision::New
     }
 
     /// Moves one accepted route's replay horizon to its completion boundary.
@@ -1119,42 +1131,6 @@ impl BlindRelayRouteReplayCache {
             self.order.pop_front();
             self.seen.remove(&route_id);
         }
-    }
-
-    fn evict_over_capacity(&mut self, new_route_id: [u8; 16], new_generation: u64) -> bool {
-        while self.seen.len() > MAX_BLIND_RELAY_SEEN_ROUTES {
-            // [IDEMPOTENT-RELAY-ACK 2026-08-11 by Codex] Never evict an
-            // unresolved route to admit newer work: doing so permits a retry
-            // to execute concurrently and forward the same ciphertext twice.
-            // Completed ACKs are bounded and safe to evict oldest-first.
-            let scan_limit = self.order.len();
-            let mut evicted_completed = false;
-            for _ in 0..scan_limit {
-                let Some((route_id, queued_generation)) = self.order.pop_front() else {
-                    break;
-                };
-                let Some(entry) = self.seen.get(&route_id) else {
-                    continue;
-                };
-                if entry.generation != queued_generation {
-                    continue;
-                }
-                if matches!(entry.state, BlindRelayRouteReplayState::Completed(_)) {
-                    self.seen.remove(&route_id);
-                    evicted_completed = true;
-                    break;
-                }
-                self.order.push_back((route_id, queued_generation));
-            }
-            if !evicted_completed {
-                self.seen.remove(&new_route_id);
-                self.order.retain(|(route_id, generation)| {
-                    *route_id != new_route_id || *generation != new_generation
-                });
-                return false;
-            }
-        }
-        true
     }
 
     fn forget(&mut self, route_id: &[u8; 16]) {
@@ -6667,15 +6643,14 @@ mod tests {
     }
 
     #[test]
-    fn blind_relay_replay_cache_eviction_preserves_in_flight_generations() {
-        // [DURABLE-TERMINAL-REPLAY-WINDOW 2026-08-11 by Codex] A failed route
-        // leaves a stale queue generation after `forget`. Reusing that route id
-        // must not let capacity eviction remove its newer live generation.
-        // [IDEMPOTENT-RELAY-ACK 2026-08-11 by Codex] Capacity pressure evicts
-        // the oldest completed ACK instead of either unresolved route.
+    fn blind_relay_replay_capacity_preserves_completed_and_in_flight_evidence() {
+        // [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] A full cache
+        // must preserve both the exact completed ACK and every unresolved route.
+        // Only the newly presented route is rejected until evidence expires.
         let mut cache = BlindRelayRouteReplayCache::default();
-        let reused_route = [0x91u8; 16];
-        let older_live_route = [0x92u8; 16];
+        let completed_route = [0x91u8; 16];
+        let live_route = [0x92u8; 16];
+        let saturated_route = [0x94u8; 16];
         let now = 1_800_000_000;
         let completed_response = PeerBlindRelayResponse {
             accepted: true,
@@ -6688,41 +6663,42 @@ mod tests {
         };
 
         assert_eq!(
-            cache.observe(reused_route, now),
+            cache.observe(completed_route, now),
             BlindRelayRouteReplayDecision::New
         );
+        cache.complete(&completed_route, now, completed_response.clone());
         assert_eq!(
-            cache.observe(older_live_route, now),
-            BlindRelayRouteReplayDecision::New
-        );
-        cache.forget(&reused_route);
-        assert_eq!(
-            cache.observe(reused_route, now),
+            cache.observe(live_route, now),
             BlindRelayRouteReplayDecision::New
         );
 
-        for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES.saturating_sub(1) {
+        for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES.saturating_sub(2) {
             let mut route_id = [0x93u8; 16];
             route_id[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
             assert_eq!(
                 cache.observe(route_id, now),
                 BlindRelayRouteReplayDecision::New
             );
-            cache.complete(&route_id, now, completed_response.clone());
         }
 
         assert_eq!(
-            cache.observe(reused_route, now),
+            cache.observe(saturated_route, now),
+            BlindRelayRouteReplayDecision::Saturated
+        );
+        assert_eq!(cache.seen.len(), MAX_BLIND_RELAY_SEEN_ROUTES);
+        assert_eq!(
+            cache.observe(completed_route, now),
+            BlindRelayRouteReplayDecision::Completed(completed_response)
+        );
+        assert_eq!(
+            cache.observe(live_route, now),
             BlindRelayRouteReplayDecision::InFlight
         );
         assert_eq!(
-            cache.observe(older_live_route, now),
-            BlindRelayRouteReplayDecision::InFlight
-        );
-        let mut oldest_completed_route = [0x93u8; 16];
-        oldest_completed_route[..8].copy_from_slice(&0u64.to_be_bytes());
-        assert_eq!(
-            cache.observe(oldest_completed_route, now),
+            cache.observe(
+                saturated_route,
+                now + BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS + 1,
+            ),
             BlindRelayRouteReplayDecision::New
         );
     }
@@ -7283,6 +7259,71 @@ mod tests {
             event.action == "blind_relay_forward"
                 && event.outcome == "rejected"
                 && event.detail == "route_in_flight"
+        }));
+    }
+
+    #[tokio::test]
+    async fn blind_relay_capacity_rejects_before_terminal_or_forward_effects() {
+        // [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Exercise the
+        // real authenticated handler with a full replay map. The new route must
+        // fail before terminal accounting, forwarding, or receipt creation.
+        let previous_hop = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let now = now_secs();
+        let mut replay_cache = BlindRelayRouteReplayCache::default();
+        for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES {
+            let mut retained_route = [0x49u8; 16];
+            retained_route[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
+            assert_eq!(
+                replay_cache.observe(retained_route, now),
+                BlindRelayRouteReplayDecision::New
+            );
+        }
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: None,
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(replay_cache)),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let envelope = BlindRelayEnvelope {
+            route_id: [0x4Au8; 16],
+            next_hop: node_identity.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: b"opaque capacity-gated relay candidate".to_vec(),
+            timestamp: now,
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+
+        let error = process_peer_blind_relay(
+            state,
+            PeerBlindRelayRequest {
+                envelope,
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: None,
+                onward_descriptor_hint: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, BlindRelayError::ReplayCapacity));
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
+        assert_eq!(blind_stats.terminal, 0);
+        assert_eq!(blind_stats.forwarded, 0);
+        assert_eq!(blind_stats.rejected, 1);
+        assert!(peer_store.recent_audit_events().iter().any(|event| {
+            event.action == "blind_relay_forward"
+                && event.outcome == "rejected"
+                && event.detail == "replay_capacity"
         }));
     }
 

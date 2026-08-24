@@ -32,7 +32,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.40.0 - [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Atomically upgrades replay schema v1 to v2, reserves a private capacity slot before wallet-route/onion/custody mutation, keeps all unexpired responses and reservations, rejects saturation before side effects, and preserves interrupted reservations across restart so an ambiguous request cannot be blindly repeated.
+Last Modified: v1.41.0 - [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Makes blind-relay replay capacity an admission boundary: after expiry cleanup, saturation rejects only the new route and preserves every unexpired in-flight claim and completed ACK so pressure cannot reopen an already executed route.
+
+Previous: v1.40.0 - [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Atomically upgrades replay schema v1 to v2, reserves a private capacity slot before wallet-route/onion/custody mutation, keeps all unexpired responses and reservations, rejects saturation before side effects, and preserves interrupted reservations across restart so an ambiguous request cannot be blindly repeated.
 Previous: v1.39.0 - [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Persists the first request-bound verified-submit response as node-keyed opaque indexes plus AEAD ciphertext, replays it after restart without repeating onion delivery or custody, bounds retention by the authenticated retry horizon and configured capacity, and treats missing or malformed installed protection state as a fail-closed storage fault.
 Previous: v1.38.0 - [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Adds node-secret-indexed fixed-capacity response replay plus fixed-lane single-flight admission so sequential and concurrent exact retries return the first request-bound response without repeating onion delivery or entry custody; conflicting envelope reuse fails closed.
 Previous: v1.37.0 - [CHAT-VERIFIED-SUBMIT-LIVE-HANDLER 2026-08-23 by Codex] Extends the real two-hop HTTP relay test through `handle_verified_chat_submit()`, proving terminal-signed delivery, durable entry custody, exact request correlation, independent client verification, and aggregate-only telemetry in one success path.
@@ -3249,8 +3251,8 @@ Implemented:
   onion forwarding or entry custody.
 - The durable replay window is 121 seconds, covering the complete accepted
   timestamp-skew and replay horizon, and row count is capped by the existing
-  relay dedupe capacity. Startup and bounded maintenance prune stale/excess
-  rows; verified backups validate the schema marker and every retained row.
+  relay dedupe capacity. Startup and bounded maintenance prune stale rows;
+  verified backups validate the schema marker and every retained row.
   If an installed table disappears, a row is malformed, or authenticated
   response recovery fails, lookup rejects before new routing or custody.
 - A persistence error observed only after delivery or custody does not rewrite
@@ -3275,6 +3277,12 @@ Implemented:
   committed admission transaction and by bounded maintenance. Aggregate health
   adds only `pending_rejected_total` and `capacity_rejected_total`; neither has
   peer, request, message, wallet, route, endpoint, receipt, or payload labels.
+- [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] The node-to-node
+  blind-relay replay cache follows the same safety rule for its 10-minute route
+  horizon. Expired entries are removed first; if capacity remains full, the new
+  route receives the existing aggregate `replay_capacity` rejection before any
+  peel, forward, terminal store, or receipt signature. In-flight claims and
+  completed ACKs remain available for exact replay and are never evicted early.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
@@ -3309,6 +3317,10 @@ Verification:
   saturation without eviction, admission-time stale cleanup, reservation-table
   disappearance, pre-side-effect live-handler rejection, and backup retention of
   an interrupted reservation.
+- Blind-relay no-eviction coverage fills the complete replay map with live and
+  completed evidence, proves the exact ACK remains replayable, proves a new
+  authenticated request stops before terminal/forward effects, and confirms
+  capacity is reusable only after the replay horizon expires.
 - Exact sequential retry coverage proving response equality and no additional
   HTTP onion request, plus fail-closed request-id/envelope conflict coverage.
 - Route-id retry stability and path-binding tests.
