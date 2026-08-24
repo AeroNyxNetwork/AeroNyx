@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.47.0 - Separate the restart-durable ACK codec from its
-public JSON shape and prove armed middle-hop recovery across the real HTTP relay
-boundary without duplicate terminal custody.
+Modification Reason: v1.48.0 - Expose aggregate armed-route recovery outcomes
+through the existing relay health contract without publishing pending volume,
+route identity, peer identity, endpoint, receipt, or ciphertext dimensions.
 
 Main Functionality:
 
@@ -31,8 +31,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.47.0 - [MIDDLE-HOP-ARMED-RECOVERY 2026-08-25 by Codex] Gives sealed ACKs an explicit storage-only magic/version codec with legacy-row reads, then proves a crashed middle hop can resend the exact signed downstream onion request, recover the terminal node's durable ACK, and seal upstream success without duplicating custody.
+Last Modified: v1.48.0 - [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] Reports process-lifetime attempted, completed, and deferred armed-route reconciliation transitions while deliberately omitting current pending volume and every route-, peer-, endpoint-, receipt-, and payload-derived dimension.
 
+Previous: v1.47.0 - [MIDDLE-HOP-ARMED-RECOVERY 2026-08-25 by Codex] Gives sealed ACKs an explicit storage-only magic/version codec with legacy-row reads, then proves a crashed middle hop can resend the exact signed downstream onion request, recover the terminal node's durable ACK, and seal upstream success without duplicating custody.
 Previous: v1.46.0 - [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Safely takes over an exact armed claim after process grace, repeats only idempotent terminal or downstream work, reconstructs byte-stable onion forwarding, and persists the recovered sealed ACK without duplicating terminal custody.
 Previous: v1.45.0 - [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Persists a random process epoch and explicit effect boundary for each blind-relay claim, safely reclaims only aged unarmed work after restart, and fences the previous process from arming or completing a taken-over route.
 Previous: v1.44.0 - [BLIND-RELAY-BODY-ADMISSION-ORDER 2026-08-24 by Codex] Preserves the fixed 413 contract for declared or exactly-known oversized blind-relay requests before evaluating durable replay availability, without buffering unknown-length streams.
@@ -3343,6 +3344,19 @@ Implemented:
   conflicts. Legacy v1 reservations have no trustworthy effect boundary and
   migrate conservatively as armed; v2 preserves its explicit armed/unarmed bit
   while v3 initializes the independent owner lease atomically.
+- [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] The existing Chat Relay
+  health snapshot reports process-lifetime `attempted_total`,
+  `completed_total`, and `deferred_total` recovery transitions plus one coarse
+  last outcome and timestamp. An attempt begins only after the SQLite takeover
+  transaction commits; completion is recorded only after the exact ACK is
+  durably sealed; cancellation or downstream failure records deferred while
+  leaving the armed claim available for another exact retry.
+- Recovery telemetry intentionally has no current-pending gauge, route id,
+  request commitment, peer identity, endpoint, failure reason, receipt,
+  ciphertext, or per-route label. This preserves operator evidence that crash
+  reconciliation is active without turning heartbeat history into a traffic or
+  topology side channel. The additive field has a serde default so rolling
+  upgrades can consume snapshots produced before v1.48.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
@@ -3388,7 +3402,13 @@ Verification:
   commitment, onward-signature substitution rejection, and fail-closed startup
   after an installed replay table or required v2 claim column disappears.
 - Cancellation coverage proves pure onion-peel failures release durable
-  unarmed claims and can be retried, while an armed RAII lease remains pending.
+  unarmed claims and can be retried, while an armed RAII lease remains pending;
+  a recovered armed lease additionally reports one aggregate deferred outcome
+  without exposing route dimensions.
+- Real HTTP middle-hop restart coverage proves one attempted and one completed
+  recovery transition while terminal custody remains exactly once. Legacy
+  health JSON without the additive recovery object still deserializes to the
+  closed zero-value status.
 - Parser-front admission coverage proves a node without durable replay storage
   returns 503 for even an invalid request body before parsing or forwarding,
   while configured nodes retain the existing aggregate backpressure behavior.

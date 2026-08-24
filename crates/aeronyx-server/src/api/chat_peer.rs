@@ -1019,6 +1019,7 @@ struct BlindRelayRouteLease {
     route_id: [u8; 16],
     request_commitment: [u8; 32],
     effect_started: bool,
+    recovered: bool,
     active: bool,
 }
 
@@ -1030,12 +1031,18 @@ impl BlindRelayRouteLease {
         request_commitment: [u8; 32],
         effect_started: bool,
     ) -> Self {
+        // [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] A lease is born
+        // armed only when it owns a restart takeover. Fresh work becomes armed
+        // later through `arm_effect`, so this snapshot distinguishes recovery
+        // without retaining a route or peer identifier in telemetry.
+        let recovered = effect_started;
         Self {
             seen_routes,
             durable_relay,
             route_id,
             request_commitment,
             effect_started,
+            recovered,
             active: true,
         }
     }
@@ -1077,7 +1084,13 @@ impl BlindRelayRouteLease {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         seen_routes.complete(&self.route_id, now, response);
+        drop(seen_routes);
         self.active = false;
+        if self.recovered {
+            if let Some(relay) = self.durable_relay.as_ref() {
+                relay.record_blind_route_recovery_completed(now);
+            }
+        }
         Ok(())
     }
 }
@@ -1095,6 +1108,8 @@ impl Drop for BlindRelayRouteLease {
             if !self.effect_started {
                 let _ = relay
                     .release_unarmed_blind_relay_route(&self.route_id, &self.request_commitment);
+            } else if self.recovered {
+                relay.record_blind_route_recovery_deferred(now_secs());
             }
             return;
         }
@@ -6807,6 +6822,11 @@ mod tests {
         let terminal_stats = terminal_peer_store.status(now + 1).runtime.blind_relay;
         assert_eq!(terminal_stats.terminal, 1);
         assert_eq!(terminal_stats.replay_dropped, 1);
+        let recovery_status = recovered_middle_relay.peer_status().blind_route_recovery;
+        assert_eq!(recovery_status.attempted_total, 1);
+        assert_eq!(recovery_status.completed_total, 1);
+        assert_eq!(recovery_status.deferred_total, 0);
+        assert_eq!(recovery_status.last_outcome.as_deref(), Some("completed"));
 
         terminal_server.abort();
         let _ = terminal_server.await;
@@ -7763,6 +7783,69 @@ mod tests {
                 .observe(route_id, request_commitment, started_at + 6),
             BlindRelayRouteReplayDecision::Completed(response)
         );
+    }
+
+    #[test]
+    fn recovered_blind_route_lease_reports_deferred_without_route_dimensions() {
+        // [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] A cancelled
+        // takeover remains durably armed and emits only one aggregate deferred
+        // transition. No route, request, peer, endpoint, or reason is retained.
+        let (old_relay, path) = temp_chat_relay("blind-route-recovery-deferred");
+        let route_id = [0x49; 16];
+        let request_commitment = [0xA9; 32];
+        let now = now_secs();
+        assert_eq!(
+            old_relay
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("reserve old process route"),
+            BlindRelayRouteAdmission::Reserved
+        );
+        old_relay
+            .arm_blind_relay_route_effect(&route_id, &request_commitment, now)
+            .expect("arm old process route");
+        drop(old_relay);
+
+        let aged_at = now
+            .saturating_sub(crate::services::chat_relay::BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS + 1);
+        Connection::open(&path)
+            .expect("open deferred recovery database")
+            .execute(
+                "UPDATE relay_blind_route_reservations
+                 SET reserved_at = ?1, owner_acquired_at = ?1",
+                [i64::try_from(aged_at).expect("fit deferred lease timestamp")],
+            )
+            .expect("age prior process lease");
+
+        let recovered_relay = Arc::new(
+            ChatRelayService::new(
+                test_chat_config(path.to_string_lossy().into_owned()),
+                [7; 32],
+            )
+            .expect("restart deferred recovery relay"),
+        );
+        assert_eq!(
+            recovered_relay
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("take over armed route"),
+            BlindRelayRouteAdmission::ReservedForRecovery
+        );
+        drop(BlindRelayRouteLease::new(
+            Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            Some(Arc::clone(&recovered_relay)),
+            route_id,
+            request_commitment,
+            true,
+        ));
+
+        let status = recovered_relay.peer_status().blind_route_recovery;
+        assert_eq!(status.attempted_total, 1);
+        assert_eq!(status.completed_total, 0);
+        assert_eq!(status.deferred_total, 1);
+        assert_eq!(status.last_outcome.as_deref(), Some("deferred"));
+        assert!(status.last_event_at.is_some());
+
+        drop(recovered_relay);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -1529,6 +1529,46 @@ impl ChatRelayCustodyDurabilityStatus {
     }
 }
 
+/// Aggregate evidence for restart reconciliation of armed blind routes.
+///
+/// [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] These process-lifetime
+/// counters prove that durable claims are being reconciled without exposing a
+/// current pending count or any route, peer, endpoint, receipt, or ciphertext
+/// dimension that could become a traffic-correlation surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatRelayBlindRouteRecoveryStatus {
+    /// Exact armed claims taken over after the prior process lease expired.
+    pub attempted_total: u64,
+    /// Recovery attempts that durably sealed and replayed the bounded ACK.
+    pub completed_total: u64,
+    /// Recovery attempts left armed for another exact retry.
+    pub deferred_total: u64,
+    /// Last coarse outcome: `attempted`, `completed`, or `deferred`.
+    pub last_outcome: Option<String>,
+    /// Timestamp of the last process-local recovery transition.
+    pub last_event_at: Option<u64>,
+}
+
+impl ChatRelayBlindRouteRecoveryStatus {
+    fn record_attempted(&mut self, now: u64) {
+        self.attempted_total = self.attempted_total.saturating_add(1);
+        self.last_outcome = Some("attempted".to_string());
+        self.last_event_at = Some(now);
+    }
+
+    fn record_completed(&mut self, now: u64) {
+        self.completed_total = self.completed_total.saturating_add(1);
+        self.last_outcome = Some("completed".to_string());
+        self.last_event_at = Some(now);
+    }
+
+    fn record_deferred(&mut self, now: u64) {
+        self.deferred_total = self.deferred_total.saturating_add(1);
+        self.last_outcome = Some("deferred".to_string());
+        self.last_event_at = Some(now);
+    }
+}
+
 /// Privacy-safe node-to-node encrypted chat relay health snapshot.
 ///
 /// This structure intentionally contains only aggregate counters and stable
@@ -1578,6 +1618,9 @@ pub struct ChatRelayPeerStatus {
     /// Explicit verified-onion client submit outcomes.
     #[serde(default)]
     pub verified_submit: ChatRelayVerifiedSubmitStatus,
+    /// Restart reconciliation outcomes for armed blind-route claims.
+    #[serde(default)]
+    pub blind_route_recovery: ChatRelayBlindRouteRecoveryStatus,
     /// Total inbound peer relay envelopes accepted for local processing.
     pub inbound_accepted_total: u64,
     /// Total inbound duplicate envelopes ignored idempotently.
@@ -1623,6 +1666,7 @@ impl ChatRelayPeerStatus {
             direct_peer_outbound: ChatRelayOutboundRouteStatus::default(),
             direct_peer_retry: ChatRelayDirectPeerRetryStatus::default(),
             verified_submit: ChatRelayVerifiedSubmitStatus::default(),
+            blind_route_recovery: ChatRelayBlindRouteRecoveryStatus::default(),
             inbound_accepted_total: 0,
             inbound_duplicate_total: 0,
             inbound_delivered_online_total: 0,
@@ -7231,12 +7275,20 @@ impl ChatRelayService {
                         field: "blind_relay_route_reservation_takeover",
                     });
                 }
-                tx.commit()?;
-                return Ok(if effect_started_at.is_some() {
+                let admission = if effect_started_at.is_some() {
                     BlindRelayRouteAdmission::ReservedForRecovery
                 } else {
                     BlindRelayRouteAdmission::Reserved
-                });
+                };
+                tx.commit()?;
+                drop(conn);
+                if matches!(admission, BlindRelayRouteAdmission::ReservedForRecovery) {
+                    self.peer_status
+                        .write()
+                        .blind_route_recovery
+                        .record_attempted(u64::try_from(reserved_at).unwrap_or(u64::MAX));
+                }
+                return Ok(admission);
             }
             tx.commit()?;
             return Ok(BlindRelayRouteAdmission::Pending);
@@ -9362,6 +9414,22 @@ impl ChatRelayService {
         status.direct_peer_retry.recent_window = recent_window;
         status.direct_peer_retry.circuit = circuit;
         status
+    }
+
+    /// Records a successfully sealed ACK for an armed route takeover.
+    pub(crate) fn record_blind_route_recovery_completed(&self, now: u64) {
+        self.peer_status
+            .write()
+            .blind_route_recovery
+            .record_completed(now);
+    }
+
+    /// Records an armed takeover retained for a later exact retry.
+    pub(crate) fn record_blind_route_recovery_deferred(&self, now: u64) {
+        self.peer_status
+            .write()
+            .blind_route_recovery
+            .record_deferred(now);
     }
 
     /// Returns aggregate TTL cleanup execution evidence.
@@ -13063,6 +13131,7 @@ mod tests {
         object.remove("direct_peer_outbound");
         object.remove("direct_peer_retry");
         object.remove("verified_submit");
+        object.remove("blind_route_recovery");
 
         // [RELAY-ROUTE-CLASS-HEALTH 2026-08-15 by Codex] Additive health
         // fields must not invalidate status cached or forwarded by an older
@@ -13084,6 +13153,10 @@ mod tests {
         assert_eq!(
             decoded.verified_submit,
             ChatRelayVerifiedSubmitStatus::default()
+        );
+        assert_eq!(
+            decoded.blind_route_recovery,
+            ChatRelayBlindRouteRecoveryStatus::default()
         );
     }
 
