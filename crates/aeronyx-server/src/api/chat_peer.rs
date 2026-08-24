@@ -57,6 +57,9 @@
 //! - [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Binds replay admission
 //!   to the complete accepted request and persists only node-secret HMACs
 //!   plus an AEAD-sealed ACK, preserving at-most-once effects across restart
+//! - [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] Fails the public
+//!   blind-relay HTTP gate closed before body parsing when its durable replay
+//!   store is unavailable instead of silently falling back to process memory
 //! - [SIGNED-ONWARD-ENVELOPE 2026-08-24 by Codex] Verifies the previous-hop
 //!   signature on an optional legacy onward envelope before route admission,
 //!   preventing ciphertext substitution before this node re-signs the frame
@@ -288,6 +291,12 @@
 //!   cancellation cannot release capacity while verification is still active.
 //!
 //! ## Last Modified
+//! v0.58.0-BlindRelayTestAdmissionIsolation - Keep focused route tests bounded
+//! without racing for the production-global signature verification semaphore
+//! v0.57.0-DurableBlindRelayAdmission - Require the node-private durable replay
+//! store before accepting public blind-relay parser or forwarding work
+//! v0.56.0-DurableBlindRelayReplay - Persist private route reservations and
+//! sealed exact ACKs across restart, including signed legacy onward envelopes
 //! v0.55.0-BlindRelayNoEvictionAdmission - Reject new routes at replay-cache
 //! saturation without evicting unexpired completed or in-flight evidence
 //! v0.54.0-BlindRelayVerifyAdmission - Isolate signature verification and
@@ -2188,16 +2197,27 @@ async fn peer_blind_relay_request_gate(
     request: Request,
     next: Next,
 ) -> Response {
+    // [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] A public relay must
+    // never accept work whose at-most-once evidence disappears on restart.
+    // Reject before JSON/body parsing, signature work, route mutation, or any
+    // ciphertext side effect. The process-local cache remains only an internal
+    // compatibility primitive for focused unit tests and non-HTTP helpers.
+    let Some(relay) = state.chat_relay.as_ref() else {
+        state
+            .peer_store
+            .record_blind_relay_rejected(now_secs(), "replay_protection_unavailable");
+        return rejected_blind_relay_response_with_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "replay_protection_unavailable",
+        );
+    };
+
     // [BLIND-RELAY-GLOBAL-ADMISSION 2026-08-21 by Codex] Permissionless node
     // identities are cheap to rotate, so the verified previous-hop bucket
     // cannot protect parser and process capacity by itself. Count only one
     // aggregate process window before body parsing; never create source-IP,
     // user, receiver, route, endpoint, or ciphertext-derived buckets here.
-    let requests_per_minute = state
-        .chat_relay
-        .as_ref()
-        .map(|relay| relay.config().peer_relay_requests_per_minute)
-        .unwrap_or(DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE);
+    let requests_per_minute = relay.config().peer_relay_requests_per_minute;
     let admitted = state
         .blind_relay_abuse_guard
         .lock()
@@ -2224,8 +2244,12 @@ async fn peer_blind_relay_request_gate(
 }
 
 fn rejected_blind_relay_response(reason: &'static str) -> Response {
+    rejected_blind_relay_response_with_status(StatusCode::TOO_MANY_REQUESTS, reason)
+}
+
+fn rejected_blind_relay_response_with_status(status: StatusCode, reason: &'static str) -> Response {
     (
-        StatusCode::TOO_MANY_REQUESTS,
+        status,
         Json(PeerBlindRelayResponse {
             accepted: false,
             terminal: false,
@@ -2631,14 +2655,20 @@ async fn process_peer_blind_relay(
     state: ChatPeerState,
     request: PeerBlindRelayRequest,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
-    let authenticated = authenticate_peer_blind_relay_request(request)
-        .await
-        .map_err(|error| {
-            state
-                .peer_store
-                .record_blind_relay_rejected(now_secs(), error.reason_bucket());
-            error
-        })?;
+    // [BLIND-RELAY-TEST-ADMISSION-ISOLATION 2026-08-24 by Codex] Focused
+    // process tests must not race one another for the production-global CPU
+    // semaphore. The dedicated admission tests still exercise that runtime
+    // boundary directly; this helper keeps each unrelated route test bounded
+    // to one verification worker without introducing suite-order flakiness.
+    let authenticated =
+        authenticate_peer_blind_relay_request_with_admission(Arc::new(Semaphore::new(1)), request)
+            .await
+            .map_err(|error| {
+                state
+                    .peer_store
+                    .record_blind_relay_rejected(now_secs(), error.reason_bucket());
+                error
+            })?;
     process_authenticated_peer_blind_relay(state, authenticated).await
 }
 
@@ -5774,6 +5804,7 @@ mod tests {
 
     #[tokio::test]
     async fn blind_relay_endpoint_terminal_accepts_opaque_blob_without_parsing() {
+        let (relay, path) = temp_chat_relay("blind-relay-terminal-http");
         let previous_hop = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
@@ -5793,7 +5824,7 @@ mod tests {
         .sign_with(&previous_hop);
 
         let app = build_chat_peer_router(
-            None,
+            Some(relay),
             sessions,
             udp,
             Arc::clone(&peer_store),
@@ -5839,10 +5870,12 @@ mod tests {
             .recent_audit_events()
             .iter()
             .any(|event| event.action == "blind_relay_terminal"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn blind_relay_handler_signs_exact_failure_response() {
+        let (relay, path) = temp_chat_relay("blind-relay-signed-failure-http");
         let previous_hop = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let node_id = node_identity.public_key_bytes();
@@ -5864,7 +5897,7 @@ mod tests {
             onward_descriptor_hint: None,
         };
         let app = build_chat_peer_router(
-            None,
+            Some(relay),
             sessions,
             udp,
             Arc::new(PeerStore::new()),
@@ -5895,6 +5928,7 @@ mod tests {
             validate_downstream_failure_receipt(&parsed, &request, &node_id, now_secs(), true),
             Ok(true)
         );
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -5902,6 +5936,7 @@ mod tests {
         // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] An attacker may
         // choose both the ciphertext and claimed node id. Invalid work gets a
         // coarse retry/error bucket, but no node-authored receipt oracle.
+        let (relay, path) = temp_chat_relay("blind-relay-unsigned-failure-http");
         let claimed_previous_hop = IdentityKeyPair::generate();
         let attacker = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
@@ -5920,7 +5955,7 @@ mod tests {
             onward_descriptor_hint: None,
         };
         let app = build_chat_peer_router(
-            None,
+            Some(relay),
             Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
             Arc::new(PeerStore::new()),
@@ -5947,6 +5982,7 @@ mod tests {
         let parsed: PeerBlindRelayResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.reason.as_deref(), Some("invalid_signature"));
         assert!(parsed.failure_receipt.is_none());
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -6803,10 +6839,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_request_in_flight_guard_enforces_backpressure_limit() {
+    async fn blind_relay_http_gate_requires_durable_replay_before_body_parse() {
+        // [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] Invalid JSON is
+        // deliberate: a missing replay store must stop the request before the
+        // extractor can parse or allocate for an attacker-controlled envelope.
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
             chat_relay: None,
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::new(IdentityKeyPair::generate()),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let app = Router::new()
+            .route("/api/chat/peer/blind-relay", post(peer_blind_relay_handler))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                peer_blind_relay_request_gate,
+            ))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/chat/peer/blind-relay")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), PEER_ACK_RESPONSE_MAX_BYTES)
+            .await
+            .unwrap();
+        let rejection: PeerBlindRelayResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            rejection.reason.as_deref(),
+            Some("replay_protection_unavailable")
+        );
+        let stats = peer_store.status(now_secs()).runtime.blind_relay;
+        assert_eq!(stats.rejected, 1);
+        assert_eq!(stats.terminal, 0);
+        assert_eq!(stats.forwarded, 0);
+        assert_eq!(
+            rejection.delivery_receipt, None,
+            "unavailable admission must not manufacture delivery evidence"
+        );
+        assert_eq!(
+            rejection.failure_receipt, None,
+            "unavailable admission must not sign failure evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_request_in_flight_guard_enforces_backpressure_limit() {
+        let (relay, path) = temp_chat_relay("blind-relay-backpressure");
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: Some(relay),
             blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
@@ -6844,6 +6942,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -7543,25 +7642,6 @@ mod tests {
         let previous_hop = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let route_id = [0x47u8; 16];
-        let request_commitment = [0xB7u8; 32];
-        let mut replay_cache = BlindRelayRouteReplayCache::default();
-        assert_eq!(
-            replay_cache.observe(route_id, request_commitment, now_secs()),
-            BlindRelayRouteReplayDecision::New
-        );
-        let peer_store = Arc::new(PeerStore::new());
-        let state = ChatPeerState {
-            chat_relay: None,
-            blind_vault: None,
-            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
-            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
-            peer_store: Arc::clone(&peer_store),
-            node_identity: Arc::clone(&node_identity),
-            http_client: Arc::new(reqwest::Client::new()),
-            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(replay_cache)),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
-        };
         let envelope = BlindRelayEnvelope {
             route_id,
             next_hop: node_identity.public_key_bytes(),
@@ -7571,18 +7651,34 @@ mod tests {
             signature: [0u8; 64],
         }
         .sign_with(&previous_hop);
-
-        let error = process_peer_blind_relay(
-            state,
-            PeerBlindRelayRequest {
-                envelope,
-                previous_hop_node_id: previous_hop.public_key_bytes(),
-                onward_envelope: None,
-                onward_descriptor_hint: None,
-            },
-        )
-        .await
-        .unwrap_err();
+        let request = PeerBlindRelayRequest {
+            envelope,
+            previous_hop_node_id: previous_hop.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let request_commitment = blind_relay_authenticated_request_commitment(&request).unwrap();
+        let (relay, path) = temp_chat_relay("blind-relay-in-flight");
+        assert_eq!(
+            relay
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .unwrap(),
+            BlindRelayRouteAdmission::Reserved
+        );
+        let peer_store = Arc::new(PeerStore::new());
+        let state = ChatPeerState {
+            chat_relay: Some(relay),
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+        let error = process_peer_blind_relay(state, request).await.unwrap_err();
 
         assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(matches!(error, BlindRelayError::RouteInFlight));
@@ -7595,6 +7691,7 @@ mod tests {
                 && event.outcome == "rejected"
                 && event.detail == "route_in_flight"
         }));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -7605,7 +7702,21 @@ mod tests {
         let previous_hop = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let now = now_secs();
-        let request_commitment = [0xBAu8; 32];
+        let request = PeerBlindRelayRequest {
+            envelope: BlindRelayEnvelope {
+                route_id: [0x4Au8; 16],
+                next_hop: node_identity.public_key_bytes(),
+                ttl: 2,
+                encrypted_blob: b"opaque capacity-gated relay candidate".to_vec(),
+                timestamp: now,
+                signature: [0u8; 64],
+            }
+            .sign_with(&previous_hop),
+            previous_hop_node_id: previous_hop.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let request_commitment = blind_relay_authenticated_request_commitment(&request).unwrap();
         let mut replay_cache = BlindRelayRouteReplayCache::default();
         for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES {
             let mut retained_route = [0x49u8; 16];
@@ -7628,27 +7739,7 @@ mod tests {
             blind_relay_seen_routes: Arc::new(Mutex::new(replay_cache)),
             blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
         };
-        let envelope = BlindRelayEnvelope {
-            route_id: [0x4Au8; 16],
-            next_hop: node_identity.public_key_bytes(),
-            ttl: 2,
-            encrypted_blob: b"opaque capacity-gated relay candidate".to_vec(),
-            timestamp: now,
-            signature: [0u8; 64],
-        }
-        .sign_with(&previous_hop);
-
-        let error = process_peer_blind_relay(
-            state,
-            PeerBlindRelayRequest {
-                envelope,
-                previous_hop_node_id: previous_hop.public_key_bytes(),
-                onward_envelope: None,
-                onward_descriptor_hint: None,
-            },
-        )
-        .await
-        .unwrap_err();
+        let error = process_peer_blind_relay(state, request).await.unwrap_err();
 
         assert!(matches!(error, BlindRelayError::ReplayCapacity));
         assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
@@ -8597,6 +8688,7 @@ mod tests {
 
     #[tokio::test]
     async fn blind_relay_forward_reports_retry_exhaustion_without_payload_data() {
+        let (relay, path) = temp_chat_relay("blind-relay-retry-exhaustion");
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_for_route = Arc::clone(&attempts);
         let next_hop_app = Router::new().route(
@@ -8630,7 +8722,7 @@ mod tests {
         peer_store.record_route_forward_success(&next_hop_identity.public_key_bytes(), now);
 
         let state = ChatPeerState {
-            chat_relay: None,
+            chat_relay: Some(relay),
             blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
@@ -8684,6 +8776,7 @@ mod tests {
                 && event.outcome == "rejected"
                 && !event.detail.contains("opaque encrypted relay bytes")
         }));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

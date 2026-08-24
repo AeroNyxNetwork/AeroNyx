@@ -31,8 +31,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.42.0 - [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Persists blind-relay reservations and exact ACKs in the node-private Chat Relay database as node-secret HMAC indexes plus AEAD ciphertext, binds them to the complete accepted request, and applies startup, admission-time, and bounded scheduled retention cleanup.
+Last Modified: v1.43.0 - [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] Requires the node-private durable replay boundary before the public blind-relay HTTP endpoint accepts parser, signature, forwarding, or terminal-storage work; unavailable protection fails closed with a fixed aggregate reason.
 
+Previous: v1.42.0 - [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Persists blind-relay reservations and exact ACKs in the node-private Chat Relay database as node-secret HMAC indexes plus AEAD ciphertext, binds them to the complete accepted request, and applies startup, admission-time, and bounded scheduled retention cleanup.
 Previous: v1.41.0 - [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Makes blind-relay replay capacity an admission boundary: after expiry cleanup, saturation rejects only the new route and preserves every unexpired in-flight claim and completed ACK so pressure cannot reopen an already executed route.
 Previous: v1.40.0 - [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Atomically upgrades replay schema v1 to v2, reserves a private capacity slot before wallet-route/onion/custody mutation, keeps all unexpired responses and reservations, rejects saturation before side effects, and preserves interrupted reservations across restart so an ambiguous request cannot be blindly repeated.
 Previous: v1.39.0 - [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Persists the first request-bound verified-submit response as node-keyed opaque indexes plus AEAD ciphertext, replays it after restart without repeating onion delivery or custody, bounds retention by the authenticated retry horizon and configured capacity, and treats missing or malformed installed protection state as a fail-closed storage fault.
@@ -3284,7 +3285,7 @@ Implemented:
   peel, forward, terminal store, or receipt signature. In-flight claims and
   completed ACKs remain available for exact replay and are never evicted early.
 - [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] An advertised relay node
-  reserves the complete authenticated blind-relay request in its existing
+  reserves the complete accepted blind-relay request in its existing
   node-private Chat Relay SQLite boundary before peel, forward, terminal store,
   or receipt signing. A clean or crash restart therefore preserves an ambiguous
   in-flight claim and cannot blindly repeat its external side effect.
@@ -3307,6 +3308,11 @@ Implemented:
 - Startup, each new reservation, and existing bounded maintenance transactions
   remove expired response/reservation rows. The fixed 8,192-row capacity is an
   admission limit, never an eviction policy for unexpired safety evidence.
+- [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] The public blind-relay
+  HTTP gate requires that durable boundary before reading JSON or starting
+  signature work. A node with Chat Relay storage disabled returns a fixed 503
+  `replay_protection_unavailable` response and performs no relay side effect;
+  it cannot silently degrade to restart-unsafe process-memory replay state.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
@@ -3350,6 +3356,9 @@ Verification:
   bounded response/reservation cleanup, complete onward-envelope commitment,
   onward-signature substitution rejection, and fail-closed startup after an
   installed replay table disappears.
+- Parser-front admission coverage proves a node without durable replay storage
+  returns 503 for even an invalid request body before parsing or forwarding,
+  while configured nodes retain the existing aggregate backpressure behavior.
 - Exact sequential retry coverage proving response equality and no additional
   HTTP onion request, plus fail-closed request-id/envelope conflict coverage.
 - Route-id retry stability and path-binding tests.
