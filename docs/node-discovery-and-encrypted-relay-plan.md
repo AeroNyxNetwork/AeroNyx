@@ -4,10 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.40.0 - Added crash-safe verified-submit admission so a
-node durably reserves bounded private replay capacity before route or custody
-side effects, never evicts unexpired safety evidence, and fails closed after an
-interrupted submission.
+Modification Reason: v1.42.0 - Added restart-durable blind-relay replay
+admission so advertised relay nodes reserve before route effects, replay only
+the exact sealed ACK, and never persist raw route or payload metadata.
 
 Main Functionality:
 
@@ -32,8 +31,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.41.0 - [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Makes blind-relay replay capacity an admission boundary: after expiry cleanup, saturation rejects only the new route and preserves every unexpired in-flight claim and completed ACK so pressure cannot reopen an already executed route.
+Last Modified: v1.42.0 - [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Persists blind-relay reservations and exact ACKs in the node-private Chat Relay database as node-secret HMAC indexes plus AEAD ciphertext, binds them to the complete accepted request, and applies startup, admission-time, and bounded scheduled retention cleanup.
 
+Previous: v1.41.0 - [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Makes blind-relay replay capacity an admission boundary: after expiry cleanup, saturation rejects only the new route and preserves every unexpired in-flight claim and completed ACK so pressure cannot reopen an already executed route.
 Previous: v1.40.0 - [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Atomically upgrades replay schema v1 to v2, reserves a private capacity slot before wallet-route/onion/custody mutation, keeps all unexpired responses and reservations, rejects saturation before side effects, and preserves interrupted reservations across restart so an ambiguous request cannot be blindly repeated.
 Previous: v1.39.0 - [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Persists the first request-bound verified-submit response as node-keyed opaque indexes plus AEAD ciphertext, replays it after restart without repeating onion delivery or custody, bounds retention by the authenticated retry horizon and configured capacity, and treats missing or malformed installed protection state as a fail-closed storage fault.
 Previous: v1.38.0 - [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Adds node-secret-indexed fixed-capacity response replay plus fixed-lane single-flight admission so sequential and concurrent exact retries return the first request-bound response without repeating onion delivery or entry custody; conflicting envelope reuse fails closed.
@@ -3252,7 +3252,7 @@ Implemented:
 - The durable replay window is 121 seconds, covering the complete accepted
   timestamp-skew and replay horizon, and row count is capped by the existing
   relay dedupe capacity. Startup and bounded maintenance prune stale rows;
-  verified backups validate the schema marker and every retained row.
+  verified backups validate the schema marker and every retained row shape.
   If an installed table disappears, a row is malformed, or authenticated
   response recovery fails, lookup rejects before new routing or custody.
 - A persistence error observed only after delivery or custody does not rewrite
@@ -3283,6 +3283,30 @@ Implemented:
   route receives the existing aggregate `replay_capacity` rejection before any
   peel, forward, terminal store, or receipt signature. In-flight claims and
   completed ACKs remain available for exact replay and are never evicted early.
+- [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] An advertised relay node
+  reserves the complete authenticated blind-relay request in its existing
+  node-private Chat Relay SQLite boundary before peel, forward, terminal store,
+  or receipt signing. A clean or crash restart therefore preserves an ambiguous
+  in-flight claim and cannot blindly repeat its external side effect.
+- Durable columns contain only a node-secret HMAC of route id, a separate HMAC
+  of the complete request commitment, an XChaCha20-Poly1305 nonce and sealed
+  exact ACK, plus retention timestamps. Raw route ids, previous/next hops,
+  endpoints, descriptors, receipts, encrypted payloads, and user metadata are
+  not persisted as replay columns or emitted in health.
+- Exact completed retries replay the original bounded ACK only while its signed
+  receipt remains fresh. The private route row stays for the complete 10-minute
+  envelope horizon even after ACK freshness expires, preventing stale retries
+  from reopening delivery. Same route id with changed authenticated request
+  material is a fixed `replay_conflict`; malformed or unavailable durable state
+  fails closed as `replay_protection_unavailable`.
+- The optional legacy onward envelope is independently signed by and verified
+  against the immediate previous hop before replay admission or re-signing.
+  Changed onward ciphertext therefore fails authentication instead of being
+  forwarded under this node's identity. New production routing should continue
+  to prefer the self-contained onion-layer format over this compatibility path.
+- Startup, each new reservation, and existing bounded maintenance transactions
+  remove expired response/reservation rows. The fixed 8,192-row capacity is an
+  admission limit, never an eviction policy for unexpired safety evidence.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
@@ -3321,6 +3345,11 @@ Verification:
   completed evidence, proves the exact ACK remains replayable, proves a new
   authenticated request stops before terminal/forward effects, and confirms
   capacity is reusable only after the replay horizon expires.
+- Durable blind-relay coverage proves sealed ACK replay and conflict detection
+  across restart, crash-window reservation recovery, fixed-shape private rows,
+  bounded response/reservation cleanup, complete onward-envelope commitment,
+  onward-signature substitution rejection, and fail-closed startup after an
+  installed replay table disappears.
 - Exact sequential retry coverage proving response equality and no additional
   HTTP onion request, plus fail-closed request-id/envelope conflict coverage.
 - Route-id retry stability and path-binding tests.

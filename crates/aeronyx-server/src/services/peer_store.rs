@@ -1980,6 +1980,11 @@ fn is_route_failure_reason(reason: &str) -> bool {
             | "quarantined"
             | "route_in_flight"
             | "replay_capacity"
+            // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Closed buckets
+            // expose restart/replay protection health without route dimensions.
+            | "replay_conflict"
+            | "replay_response_expired"
+            | "replay_protection_unavailable"
             | "route_loop"
             | "no_route"
             | "onion_peel_failed"
@@ -5523,7 +5528,7 @@ impl PeerStore {
                     .blind_relay_loop_detected
                     .fetch_add(1, Ordering::Relaxed);
             }
-            "duplicate_route" => {
+            "duplicate_route" | "replay_conflict" | "replay_response_expired" => {
                 self.counters
                     .blind_relay_replay_dropped
                     .fetch_add(1, Ordering::Relaxed);

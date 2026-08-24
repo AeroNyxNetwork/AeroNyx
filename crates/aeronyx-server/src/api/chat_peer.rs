@@ -54,6 +54,12 @@
 //! - [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Preserves every
 //!   unexpired in-flight claim and completed ACK under capacity pressure;
 //!   saturation rejects only the new route before relay or terminal effects
+//! - [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Binds replay admission
+//!   to the complete accepted request and persists only node-secret HMACs
+//!   plus an AEAD-sealed ACK, preserving at-most-once effects across restart
+//! - [SIGNED-ONWARD-ENVELOPE 2026-08-24 by Codex] Verifies the previous-hop
+//!   signature on an optional legacy onward envelope before route admission,
+//!   preventing ciphertext substitution before this node re-signs the frame
 //! - [RELAY-ROUTE-RAII 2026-08-11 by Codex] Owns every newly admitted route
 //!   through an RAII lease so cancellation, shutdown, and future early-return
 //!   paths release in-flight replay state unless a durable ACK is committed
@@ -137,12 +143,14 @@
 //! - Blind relay rejects immediate self/previous-hop loops using only node-level
 //!   route metadata, preserving the "blind relay" invariant while preparing
 //!   for future controlled multi-hop/onion routing.
-//! - Blind relay keeps a bounded local `route_id` replay cache. The cache is
-//!   in-memory only, stores no payload/peer endpoint/user data, and prevents a
-//!   repeated encrypted route frame from being forwarded twice by this node.
-//!   [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Capacity is an
-//!   admission bound: after expired entries are removed, a full cache rejects
-//!   the new route and never evicts an unexpired completed ACK or live claim.
+//! - Blind relay keeps a bounded local `route_id` replay cache. Advertised relay
+//!   nodes additionally use the node-private ChatRelay SQLite store so replay
+//!   reservations and exact sealed ACKs survive restart; diagnostic mode without
+//!   ChatRelay remains memory-only. Durable rows contain only node-secret HMACs,
+//!   AEAD ciphertext, and timestamps, never raw route ids, endpoints, peers, or
+//!   payloads. [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Capacity
+//!   is an admission bound: after expired entries are removed, a full cache
+//!   rejects the new route and never evicts an unexpired ACK or live claim.
 //! - Blind relay applies one identity-independent parser-front rate ceiling,
 //!   followed by previous-hop rate limiting and short quarantine only after
 //!   signature verification. This protects commercial nodes from identity
@@ -408,7 +416,11 @@ use crate::api::{
 use crate::config_chat_relay::{
     DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE, DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE,
 };
-use crate::services::chat_relay::{ChatRelayError, ChatRelayInboundFailureReason};
+use crate::services::chat_relay::{
+    BlindRelayRouteAdmission, ChatRelayError, ChatRelayInboundFailureReason,
+    BLIND_RELAY_ROUTE_REPLAY_CAPACITY as MAX_BLIND_RELAY_SEEN_ROUTES,
+    BLIND_RELAY_ROUTE_REPLAY_TTL_SECS as BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS,
+};
 use crate::services::peer_store::PeerStore;
 use crate::services::{
     BlindVaultPutFailureClass, BlindVaultServiceError, ChatRelayService, Session, SessionManager,
@@ -516,18 +528,12 @@ const BLIND_RELAY_RETRY_BASE_MS: u64 = 25;
 /// Extra deterministic jitter window used to avoid retry herds.
 const BLIND_RELAY_RETRY_JITTER_MS: u64 = 35;
 
-/// Maximum route ids retained by one node for blind relay replay suppression.
-///
-/// The value is deliberately bounded and local-only: it prevents immediate
-/// replay amplification without becoming a durable route history. Saturation
-/// rejects the new route; unexpired replay evidence is never evicted early.
-const MAX_BLIND_RELAY_SEEN_ROUTES: usize = 8192;
-
 /// Maximum live and stale generations retained by the replay eviction queue.
 const MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS: usize = MAX_BLIND_RELAY_SEEN_ROUTES * 2;
 
-/// Replay cache horizon for blind relay route ids.
-const BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS: u64 = 10 * 60;
+/// Domain for the complete authenticated blind request, including onward data.
+const BLIND_RELAY_AUTHENTICATED_REQUEST_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx-BlindRelay-AuthenticatedRequest-v1";
 
 /// Per previous-hop accepted relay attempts allowed in the short window.
 const BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT: u32 = 120;
@@ -962,6 +968,7 @@ enum BlindRelayRouteReplayState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlindRelayRouteReplayEntry {
+    request_commitment: [u8; 32],
     observed_at: u64,
     generation: u64,
     state: BlindRelayRouteReplayState,
@@ -972,6 +979,7 @@ enum BlindRelayRouteReplayDecision {
     New,
     InFlight,
     Completed(PeerBlindRelayResponse),
+    Conflict,
     Saturated,
 }
 
@@ -989,32 +997,64 @@ enum BlindRelayRouteStart {
 /// the in-flight marker with the exact bounded ACK before disarming cleanup.
 struct BlindRelayRouteLease {
     seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
+    durable_relay: Option<Arc<ChatRelayService>>,
     route_id: [u8; 16],
+    request_commitment: [u8; 32],
     active: bool,
 }
 
 impl BlindRelayRouteLease {
-    fn new(seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>, route_id: [u8; 16]) -> Self {
+    fn new(
+        seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
+        durable_relay: Option<Arc<ChatRelayService>>,
+        route_id: [u8; 16],
+        request_commitment: [u8; 32],
+    ) -> Self {
         Self {
             seen_routes,
+            durable_relay,
             route_id,
+            request_commitment,
             active: true,
         }
     }
 
-    fn complete(mut self, now: u64, response: PeerBlindRelayResponse) {
+    fn complete(
+        mut self,
+        now: u64,
+        response: PeerBlindRelayResponse,
+    ) -> Result<(), BlindRelayError> {
+        if let Some(relay) = self.durable_relay.as_ref() {
+            let encoded = bincode::serialize(&response)
+                .map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
+            relay
+                .remember_blind_relay_route_response(
+                    &self.route_id,
+                    &self.request_commitment,
+                    &encoded,
+                    now,
+                )
+                .map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
+        }
         let mut seen_routes = self
             .seen_routes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         seen_routes.complete(&self.route_id, now, response);
         self.active = false;
+        Ok(())
     }
 }
 
 impl Drop for BlindRelayRouteLease {
     fn drop(&mut self) {
         if !self.active {
+            return;
+        }
+        // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Preserve durable
+        // ambiguity after cancellation. Deleting this reservation could repeat
+        // a forward/store that completed immediately before future teardown.
+        if self.durable_relay.is_some() {
             return;
         }
         let mut seen_routes = self
@@ -1034,10 +1074,18 @@ struct BlindRelayRouteReplayCache {
 }
 
 impl BlindRelayRouteReplayCache {
-    fn observe(&mut self, route_id: [u8; 16], now: u64) -> BlindRelayRouteReplayDecision {
+    fn observe(
+        &mut self,
+        route_id: [u8; 16],
+        request_commitment: [u8; 32],
+        now: u64,
+    ) -> BlindRelayRouteReplayDecision {
         let now = self.normalize_observation_time(now);
         self.evict_expired(now);
         if let Some(entry) = self.seen.get(&route_id) {
+            if entry.request_commitment != request_commitment {
+                return BlindRelayRouteReplayDecision::Conflict;
+            }
             return match &entry.state {
                 BlindRelayRouteReplayState::InFlight => BlindRelayRouteReplayDecision::InFlight,
                 BlindRelayRouteReplayState::Completed(response) => {
@@ -1058,6 +1106,7 @@ impl BlindRelayRouteReplayCache {
         self.seen.insert(
             route_id,
             BlindRelayRouteReplayEntry {
+                request_commitment,
                 observed_at: now,
                 generation,
                 state: BlindRelayRouteReplayState::InFlight,
@@ -1088,6 +1137,7 @@ impl BlindRelayRouteReplayCache {
         self.seen.insert(
             *route_id,
             BlindRelayRouteReplayEntry {
+                request_commitment: current.request_commitment,
                 observed_at: now,
                 generation,
                 state: BlindRelayRouteReplayState::Completed(response),
@@ -1440,7 +1490,7 @@ impl PeerChatRelayRequestV2 {
             .is_ok()
     }
 
-    /// Returns a commitment to the complete authenticated request.
+    /// Returns a commitment to the complete accepted request.
     pub fn request_commitment(&self) -> Result<[u8; 32], bincode::Error> {
         let signing_data =
             peer_chat_relay_auth_v2_signing_data(&self.previous_hop_node_id, &self.envelope)?;
@@ -1768,6 +1818,24 @@ pub struct PeerBlindRelayRequest {
 struct AuthenticatedPeerBlindRelayRequest {
     request: PeerBlindRelayRequest,
     failure_request_commitment: [u8; 32],
+    /// Commitment to the entire authenticated request, including optional
+    /// onward envelope and signed descriptor hint, for private replay binding.
+    request_commitment: [u8; 32],
+}
+
+fn blind_relay_authenticated_request_commitment(
+    request: &PeerBlindRelayRequest,
+) -> Result<[u8; 32], bincode::Error> {
+    // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Bincode is already the
+    // canonical internal encoding used by this protocol crate. Hashing the
+    // complete request prevents route-id reuse from swapping optional onward
+    // routing material while keeping all durable keys node-secret HMACs.
+    let encoded = bincode::serialize(request)?;
+    let mut hasher = Sha256::new();
+    hasher.update(BLIND_RELAY_AUTHENTICATED_REQUEST_COMMITMENT_DOMAIN);
+    hasher.update((encoded.len() as u64).to_be_bytes());
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
 }
 
 /// Node-to-node blind relay response.
@@ -1869,6 +1937,15 @@ enum BlindRelayError {
     #[error("blind relay replay cache capacity exhausted")]
     ReplayCapacity,
 
+    #[error("blind relay route id conflicts with another authenticated request")]
+    ReplayConflict,
+
+    #[error("blind relay completed response is no longer fresh enough to replay")]
+    ReplayResponseExpired,
+
+    #[error("blind relay durable replay protection unavailable")]
+    ReplayProtectionUnavailable,
+
     #[error("blind relay route loop detected")]
     RouteLoop,
 
@@ -1910,12 +1987,15 @@ impl BlindRelayError {
             | Self::TimestampExpired
             | Self::TimestampInFuture
             | Self::RouteLoop
+            | Self::ReplayConflict
             | Self::OnionPeelFailed
             | Self::OnionTerminalPayloadRejected
             | Self::DownstreamRejected => StatusCode::BAD_REQUEST,
-            Self::OnionTerminalCapacityExhausted | Self::RouteInFlight | Self::ReplayCapacity => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::OnionTerminalCapacityExhausted
+            | Self::RouteInFlight
+            | Self::ReplayCapacity
+            | Self::ReplayProtectionUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ReplayResponseExpired => StatusCode::CONFLICT,
             Self::Backpressure | Self::RateLimited | Self::Quarantined => {
                 StatusCode::TOO_MANY_REQUESTS
             }
@@ -1937,6 +2017,9 @@ impl BlindRelayError {
             Self::Quarantined => "quarantined",
             Self::RouteInFlight => "route_in_flight",
             Self::ReplayCapacity => "replay_capacity",
+            Self::ReplayConflict => "replay_conflict",
+            Self::ReplayResponseExpired => "replay_response_expired",
+            Self::ReplayProtectionUnavailable => "replay_protection_unavailable",
             Self::RouteLoop => "route_loop",
             Self::NoRoute => "no_route",
             Self::InvalidEndpoint => "invalid_endpoint",
@@ -2514,11 +2597,21 @@ async fn authenticate_peer_blind_relay_request_with_admission(
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         authenticate_blind_relay_envelope(&request.envelope, &request.previous_hop_node_id)?;
+        if let Some(onward_envelope) = request.onward_envelope.as_ref() {
+            // [SIGNED-ONWARD-ENVELOPE 2026-08-24 by Codex] The forwarding
+            // sender already re-signs this optional legacy frame. Verify that
+            // exact previous-hop signature before the complete replay
+            // commitment or any route state can trust it.
+            authenticate_blind_relay_envelope(onward_envelope, &request.previous_hop_node_id)?;
+        }
         let failure_request_commitment =
             BlindRelayFailureReceipt::request_commitment(&request.envelope);
+        let request_commitment = blind_relay_authenticated_request_commitment(&request)
+            .map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
         Ok(AuthenticatedPeerBlindRelayRequest {
             request,
             failure_request_commitment,
+            request_commitment,
         })
     })
     .await
@@ -2557,6 +2650,7 @@ async fn process_authenticated_peer_blind_relay(
     // requires possession of the private authenticated request capability.
     let now = now_secs();
     let route_started_at = Instant::now();
+    let request_commitment = authenticated.request_commitment;
     let request = authenticated.request;
     let previous_hop_node_id = request.previous_hop_node_id;
     let onward_descriptor_hint = request.onward_descriptor_hint;
@@ -2585,6 +2679,7 @@ async fn process_authenticated_peer_blind_relay(
                 state,
                 previous_hop_node_id,
                 envelope,
+                request_commitment,
                 now,
                 &route_started_at,
             )
@@ -2597,16 +2692,22 @@ async fn process_authenticated_peer_blind_relay(
                 envelope,
                 onward_envelope,
                 onward_descriptor_hint,
+                request_commitment,
                 now,
                 &route_started_at,
             )
             .await;
         }
-        let route_lease =
-            match begin_blind_relay_route(&state, envelope.route_id, previous_hop_node_id, now)? {
-                BlindRelayRouteStart::Acquired(lease) => lease,
-                BlindRelayRouteStart::Completed(response) => return Ok(response),
-            };
+        let route_lease = match begin_blind_relay_route(
+            &state,
+            envelope.route_id,
+            request_commitment,
+            previous_hop_node_id,
+            now,
+        )? {
+            BlindRelayRouteStart::Acquired(lease) => lease,
+            BlindRelayRouteStart::Completed(response) => return Ok(response),
+        };
         let response = PeerBlindRelayResponse {
             accepted: true,
             terminal: true,
@@ -2616,7 +2717,7 @@ async fn process_authenticated_peer_blind_relay(
             delivery_receipt: None,
             failure_receipt: None,
         };
-        route_lease.complete(now, response.clone());
+        complete_blind_relay_route(&state, route_lease, now, response.clone())?;
         record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
         state.peer_store.record_blind_relay_terminal(
             now,
@@ -2677,11 +2778,16 @@ async fn process_authenticated_peer_blind_relay(
         BlindRelayError::InvalidEndpoint
     })?;
 
-    let route_lease =
-        match begin_blind_relay_route(&state, envelope.route_id, previous_hop_node_id, now)? {
-            BlindRelayRouteStart::Acquired(lease) => lease,
-            BlindRelayRouteStart::Completed(response) => return Ok(response),
-        };
+    let route_lease = match begin_blind_relay_route(
+        &state,
+        envelope.route_id,
+        request_commitment,
+        previous_hop_node_id,
+        now,
+    )? {
+        BlindRelayRouteStart::Acquired(lease) => lease,
+        BlindRelayRouteStart::Completed(response) => return Ok(response),
+    };
 
     let forwarded_envelope = envelope
         .decremented_ttl()
@@ -2721,7 +2827,7 @@ async fn process_authenticated_peer_blind_relay(
         delivery_receipt: None,
         failure_receipt: None,
     };
-    route_lease.complete(observed_at, response.clone());
+    complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
     let _ = state
         .peer_store
         .record_route_forward_success_for_descriptor(&descriptor, observed_at);
@@ -2747,17 +2853,23 @@ async fn process_onion_blind_relay(
     state: ChatPeerState,
     previous_hop_node_id: [u8; 32],
     envelope: BlindRelayEnvelope,
+    request_commitment: [u8; 32],
     now: u64,
     route_started_at: &Instant,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     let self_node_id = state.node_identity.public_key_bytes();
 
     // Per-route replay/dedup, identical to the opaque terminal/forward paths.
-    let route_lease =
-        match begin_blind_relay_route(&state, envelope.route_id, previous_hop_node_id, now)? {
-            BlindRelayRouteStart::Acquired(lease) => lease,
-            BlindRelayRouteStart::Completed(response) => return Ok(response),
-        };
+    let route_lease = match begin_blind_relay_route(
+        &state,
+        envelope.route_id,
+        request_commitment,
+        previous_hop_node_id,
+        now,
+    )? {
+        BlindRelayRouteStart::Acquired(lease) => lease,
+        BlindRelayRouteStart::Completed(response) => return Ok(response),
+    };
 
     // Peel exactly one onion layer with the node's rotating onion key(s): the
     // current key, plus the previous key while it is within the rotation grace
@@ -2822,7 +2934,7 @@ async fn process_onion_blind_relay(
                 delivery_receipt: Some(delivery_receipt),
                 failure_receipt: None,
             };
-            route_lease.complete(accepted_at, response.clone());
+            complete_blind_relay_route(&state, route_lease, accepted_at, response.clone())?;
             record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
             state.peer_store.record_blind_relay_terminal(
                 accepted_at,
@@ -2939,7 +3051,7 @@ async fn process_onion_blind_relay(
                 delivery_receipt: next_hop_ack.delivery_receipt,
                 failure_receipt: None,
             };
-            route_lease.complete(observed_at, response.clone());
+            complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
             let _ = state
                 .peer_store
                 .record_route_forward_success_for_descriptor(&descriptor, observed_at);
@@ -3005,6 +3117,7 @@ async fn process_onion_middle_blind_relay(
     outer_envelope: BlindRelayEnvelope,
     onward_envelope: BlindRelayEnvelope,
     onward_descriptor_hint: Option<SignedNodeDescriptor>,
+    request_commitment: [u8; 32],
     now: u64,
     route_started_at: &Instant,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
@@ -3072,6 +3185,7 @@ async fn process_onion_middle_blind_relay(
     let route_lease = match begin_blind_relay_route(
         &state,
         outer_envelope.route_id,
+        request_commitment,
         previous_hop_node_id,
         now,
     )? {
@@ -3115,7 +3229,7 @@ async fn process_onion_middle_blind_relay(
         delivery_receipt: next_hop_ack.delivery_receipt,
         failure_receipt: None,
     };
-    route_lease.complete(observed_at, response.clone());
+    complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
     let _ = state
         .peer_store
         .record_route_forward_success_for_descriptor(&descriptor, observed_at);
@@ -3157,20 +3271,83 @@ fn resolve_blind_relay_next_hop_descriptor(
 fn begin_blind_relay_route(
     state: &ChatPeerState,
     route_id: [u8; 16],
+    request_commitment: [u8; 32],
     previous_hop: [u8; 32],
     now: u64,
 ) -> Result<BlindRelayRouteStart, BlindRelayError> {
+    if let Some(relay) = state.chat_relay.as_ref() {
+        let admission = relay
+            .reserve_blind_relay_route(&route_id, &request_commitment)
+            .map_err(|_| record_blind_relay_replay_protection_failure(state, now))?;
+        return match admission {
+            BlindRelayRouteAdmission::Reserved => {
+                Ok(BlindRelayRouteStart::Acquired(BlindRelayRouteLease::new(
+                    Arc::clone(&state.blind_relay_seen_routes),
+                    Some(Arc::clone(relay)),
+                    route_id,
+                    request_commitment,
+                )))
+            }
+            BlindRelayRouteAdmission::Pending => {
+                state
+                    .peer_store
+                    .record_blind_relay_rejected(now, "route_in_flight");
+                Err(BlindRelayError::RouteInFlight)
+            }
+            BlindRelayRouteAdmission::Conflict => {
+                reject_blind_relay_previous_hop(state, previous_hop, now, "replay_conflict");
+                Err(BlindRelayError::ReplayConflict)
+            }
+            BlindRelayRouteAdmission::CapacityExhausted => {
+                state
+                    .peer_store
+                    .record_blind_relay_rejected(now, "replay_capacity");
+                Err(BlindRelayError::ReplayCapacity)
+            }
+            BlindRelayRouteAdmission::Completed {
+                response,
+                completed_at,
+            } => {
+                // Signed receipts are online evidence. Do not replay one after
+                // its verifier freshness window, but retain the route row for
+                // the full envelope horizon so stale retries cannot re-execute.
+                if completed_at > now
+                    || now.saturating_sub(completed_at) > BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
+                {
+                    state
+                        .peer_store
+                        .record_blind_relay_rejected(now, "replay_response_expired");
+                    return Err(BlindRelayError::ReplayResponseExpired);
+                }
+                let response: PeerBlindRelayResponse = bincode::deserialize(&response)
+                    .map_err(|_| record_blind_relay_replay_protection_failure(state, now))?;
+                validate_stored_blind_relay_response(&response)
+                    .map_err(|_| record_blind_relay_replay_protection_failure(state, now))?;
+                state
+                    .peer_store
+                    .record_blind_relay_rejected(now, "duplicate_route");
+                record_blind_relay_previous_hop_success(state, previous_hop);
+                Ok(BlindRelayRouteStart::Completed(response))
+            }
+        };
+    }
+
     let mut seen_routes = state
         .blind_relay_seen_routes
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let decision = seen_routes.observe(route_id, now);
+    let decision = seen_routes.observe(route_id, request_commitment, now);
     drop(seen_routes);
 
     match decision {
-        BlindRelayRouteReplayDecision::New => Ok(BlindRelayRouteStart::Acquired(
-            BlindRelayRouteLease::new(Arc::clone(&state.blind_relay_seen_routes), route_id),
-        )),
+        BlindRelayRouteReplayDecision::New => {
+            Ok(BlindRelayRouteStart::Acquired(BlindRelayRouteLease::new(
+                Arc::clone(&state.blind_relay_seen_routes),
+                None,
+                route_id,
+                request_commitment,
+            )))
+        }
         BlindRelayRouteReplayDecision::InFlight => {
             // [IDEMPOTENT-RELAY-ACK 2026-08-11 by Codex] An unresolved first
             // attempt is not proof of acceptance. Return a retryable status and
@@ -3187,6 +3364,10 @@ fn begin_blind_relay_route(
                 .record_blind_relay_rejected(now, "replay_capacity");
             Err(BlindRelayError::ReplayCapacity)
         }
+        BlindRelayRouteReplayDecision::Conflict => {
+            reject_blind_relay_previous_hop(state, previous_hop, now, "replay_conflict");
+            Err(BlindRelayError::ReplayConflict)
+        }
         BlindRelayRouteReplayDecision::Completed(response) => {
             // ACK-loss retries receive the exact bounded success response,
             // including any terminal-signed receipt. No payload is retained.
@@ -3197,6 +3378,53 @@ fn begin_blind_relay_route(
             Ok(BlindRelayRouteStart::Completed(response))
         }
     }
+}
+
+fn complete_blind_relay_route(
+    state: &ChatPeerState,
+    route_lease: BlindRelayRouteLease,
+    now: u64,
+    response: PeerBlindRelayResponse,
+) -> Result<(), BlindRelayError> {
+    // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] One completion boundary
+    // keeps every terminal/forward path on the same durable failure telemetry.
+    // The fixed bucket exposes no route, peer, endpoint, receipt, or payload.
+    route_lease
+        .complete(now, response)
+        .map_err(|_| record_blind_relay_replay_protection_failure(state, now))
+}
+
+fn record_blind_relay_replay_protection_failure(
+    state: &ChatPeerState,
+    now: u64,
+) -> BlindRelayError {
+    state
+        .peer_store
+        .record_blind_relay_rejected(now, "replay_protection_unavailable");
+    BlindRelayError::ReplayProtectionUnavailable
+}
+
+fn validate_stored_blind_relay_response(
+    response: &PeerBlindRelayResponse,
+) -> Result<(), BlindRelayError> {
+    let valid_reason = matches!(
+        response.reason.as_deref(),
+        Some(
+            "terminal_next_hop"
+                | "forwarded"
+                | "onion_terminal_delivered"
+                | "onion_forwarded"
+                | "onion_middle_forwarded"
+        )
+    );
+    if !response.accepted
+        || response.terminal == response.forwarded
+        || response.failure_receipt.is_some()
+        || !valid_reason
+    {
+        return Err(BlindRelayError::ReplayProtectionUnavailable);
+    }
+    Ok(())
 }
 
 fn check_blind_relay_previous_hop_allowed(
@@ -4800,6 +5028,98 @@ mod tests {
             authenticated.failure_request_commitment,
             BlindRelayFailureReceipt::request_commitment(&request.envelope)
         );
+    }
+
+    #[test]
+    fn blind_relay_replay_commitment_binds_optional_onward_envelope() {
+        // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] The route id alone
+        // is not an idempotency key: a substituted onward frame under the same
+        // authenticated outer envelope must become a conflict, never an exact
+        // replay or a second relay side effect.
+        let previous_hop = IdentityKeyPair::generate();
+        let middle = IdentityKeyPair::generate();
+        let terminal = IdentityKeyPair::generate();
+        let outer = BlindRelayEnvelope {
+            route_id: [0x3Eu8; 16],
+            next_hop: middle.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: b"opaque outer layer".to_vec(),
+            timestamp: 1_800_000_000,
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+        let base = PeerBlindRelayRequest {
+            envelope: outer,
+            previous_hop_node_id: previous_hop.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let mut with_onward = base.clone();
+        with_onward.onward_envelope = Some(
+            BlindRelayEnvelope {
+                route_id: [0x3Fu8; 16],
+                next_hop: terminal.public_key_bytes(),
+                ttl: 1,
+                encrypted_blob: b"opaque inner layer".to_vec(),
+                timestamp: 1_800_000_000,
+                signature: [0u8; 64],
+            }
+            .sign_with(&previous_hop),
+        );
+
+        let base_commitment = blind_relay_authenticated_request_commitment(&base)
+            .expect("commit base blind-relay request");
+        assert_eq!(
+            blind_relay_authenticated_request_commitment(&base)
+                .expect("repeat base blind-relay commitment"),
+            base_commitment
+        );
+        assert_ne!(
+            blind_relay_authenticated_request_commitment(&with_onward)
+                .expect("commit blind-relay request with onward envelope"),
+            base_commitment
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_relay_authentication_rejects_substituted_onward_envelope() {
+        // [SIGNED-ONWARD-ENVELOPE 2026-08-24 by Codex] A transport intermediary
+        // cannot alter the optional legacy onward ciphertext and make this node
+        // sign the substituted frame for the terminal hop.
+        let previous_hop = IdentityKeyPair::generate();
+        let middle = IdentityKeyPair::generate();
+        let terminal = IdentityKeyPair::generate();
+        let outer = BlindRelayEnvelope {
+            route_id: [0x40; 16],
+            next_hop: middle.public_key_bytes(),
+            ttl: 2,
+            encrypted_blob: b"opaque outer carrier".to_vec(),
+            timestamp: now_secs(),
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+        let mut onward = BlindRelayEnvelope {
+            route_id: [0x41; 16],
+            next_hop: terminal.public_key_bytes(),
+            ttl: 1,
+            encrypted_blob: b"signed opaque onward frame".to_vec(),
+            timestamp: now_secs(),
+            signature: [0u8; 64],
+        }
+        .sign_with(&previous_hop);
+        onward.encrypted_blob = b"substituted opaque onward frame".to_vec();
+
+        let result = authenticate_peer_blind_relay_request_with_admission(
+            Arc::new(Semaphore::new(1)),
+            PeerBlindRelayRequest {
+                envelope: outer,
+                previous_hop_node_id: previous_hop.public_key_bytes(),
+                onward_envelope: Some(onward),
+                onward_descriptor_hint: None,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(BlindRelayError::InvalidSignature)));
     }
 
     #[tokio::test]
@@ -6581,18 +6901,19 @@ mod tests {
     fn blind_relay_replay_cache_forgets_failed_route_ids() {
         let mut cache = BlindRelayRouteReplayCache::default();
         let route_id = [0x46u8; 16];
+        let request_commitment = [0xA6u8; 32];
 
         assert_eq!(
-            cache.observe(route_id, 1_800_000_000),
+            cache.observe(route_id, request_commitment, 1_800_000_000),
             BlindRelayRouteReplayDecision::New
         );
         assert_eq!(
-            cache.observe(route_id, 1_800_000_001),
+            cache.observe(route_id, request_commitment, 1_800_000_001),
             BlindRelayRouteReplayDecision::InFlight
         );
         cache.forget(&route_id);
         assert_eq!(
-            cache.observe(route_id, 1_800_000_002),
+            cache.observe(route_id, request_commitment, 1_800_000_002),
             BlindRelayRouteReplayDecision::New
         );
     }
@@ -6604,21 +6925,27 @@ mod tests {
         // instead publish the exact bounded response for ACK-loss replay.
         let seen_routes = Arc::new(Mutex::new(BlindRelayRouteReplayCache::default()));
         let route_id = [0x48u8; 16];
+        let request_commitment = [0xA8u8; 32];
         let started_at = 1_800_000_000;
 
         assert_eq!(
-            seen_routes.lock().unwrap().observe(route_id, started_at),
+            seen_routes
+                .lock()
+                .unwrap()
+                .observe(route_id, request_commitment, started_at),
             BlindRelayRouteReplayDecision::New
         );
         drop(BlindRelayRouteLease::new(
             Arc::clone(&seen_routes),
+            None,
             route_id,
+            request_commitment,
         ));
         assert_eq!(
             seen_routes
                 .lock()
                 .unwrap()
-                .observe(route_id, started_at + 1),
+                .observe(route_id, request_commitment, started_at + 1),
             BlindRelayRouteReplayDecision::New
         );
 
@@ -6631,13 +6958,14 @@ mod tests {
             delivery_receipt: None,
             failure_receipt: None,
         };
-        BlindRelayRouteLease::new(Arc::clone(&seen_routes), route_id)
-            .complete(started_at + 2, response.clone());
+        BlindRelayRouteLease::new(Arc::clone(&seen_routes), None, route_id, request_commitment)
+            .complete(started_at + 2, response.clone())
+            .unwrap();
         assert_eq!(
             seen_routes
                 .lock()
                 .unwrap()
-                .observe(route_id, started_at + 3),
+                .observe(route_id, request_commitment, started_at + 3),
             BlindRelayRouteReplayDecision::Completed(response)
         );
     }
@@ -6651,6 +6979,7 @@ mod tests {
         let completed_route = [0x91u8; 16];
         let live_route = [0x92u8; 16];
         let saturated_route = [0x94u8; 16];
+        let request_commitment = [0xB1u8; 32];
         let now = 1_800_000_000;
         let completed_response = PeerBlindRelayResponse {
             accepted: true,
@@ -6663,12 +6992,12 @@ mod tests {
         };
 
         assert_eq!(
-            cache.observe(completed_route, now),
+            cache.observe(completed_route, request_commitment, now),
             BlindRelayRouteReplayDecision::New
         );
         cache.complete(&completed_route, now, completed_response.clone());
         assert_eq!(
-            cache.observe(live_route, now),
+            cache.observe(live_route, request_commitment, now),
             BlindRelayRouteReplayDecision::New
         );
 
@@ -6676,27 +7005,28 @@ mod tests {
             let mut route_id = [0x93u8; 16];
             route_id[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
             assert_eq!(
-                cache.observe(route_id, now),
+                cache.observe(route_id, request_commitment, now),
                 BlindRelayRouteReplayDecision::New
             );
         }
 
         assert_eq!(
-            cache.observe(saturated_route, now),
+            cache.observe(saturated_route, request_commitment, now),
             BlindRelayRouteReplayDecision::Saturated
         );
         assert_eq!(cache.seen.len(), MAX_BLIND_RELAY_SEEN_ROUTES);
         assert_eq!(
-            cache.observe(completed_route, now),
+            cache.observe(completed_route, request_commitment, now),
             BlindRelayRouteReplayDecision::Completed(completed_response)
         );
         assert_eq!(
-            cache.observe(live_route, now),
+            cache.observe(live_route, request_commitment, now),
             BlindRelayRouteReplayDecision::InFlight
         );
         assert_eq!(
             cache.observe(
                 saturated_route,
+                request_commitment,
                 now + BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS + 1,
             ),
             BlindRelayRouteReplayDecision::New
@@ -6707,19 +7037,20 @@ mod tests {
     fn blind_relay_replay_cache_fails_closed_when_all_routes_are_in_flight() {
         let mut cache = BlindRelayRouteReplayCache::default();
         let now = 1_800_000_000;
+        let request_commitment = [0xB2u8; 32];
 
         for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES {
             let mut route_id = [0x97u8; 16];
             route_id[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
             assert_eq!(
-                cache.observe(route_id, now),
+                cache.observe(route_id, request_commitment, now),
                 BlindRelayRouteReplayDecision::New
             );
         }
 
         let saturated_route = [0x98u8; 16];
         assert_eq!(
-            cache.observe(saturated_route, now),
+            cache.observe(saturated_route, request_commitment, now),
             BlindRelayRouteReplayDecision::Saturated
         );
         assert_eq!(cache.seen.len(), MAX_BLIND_RELAY_SEEN_ROUTES);
@@ -6727,12 +7058,12 @@ mod tests {
         let mut first_route = [0x97u8; 16];
         first_route[..8].copy_from_slice(&0u64.to_be_bytes());
         assert_eq!(
-            cache.observe(first_route, now),
+            cache.observe(first_route, request_commitment, now),
             BlindRelayRouteReplayDecision::InFlight
         );
         cache.forget(&first_route);
         assert_eq!(
-            cache.observe(saturated_route, now),
+            cache.observe(saturated_route, request_commitment, now),
             BlindRelayRouteReplayDecision::New
         );
     }
@@ -6748,14 +7079,15 @@ mod tests {
         let live_route = [0x95u8; 16];
         let retried_route = [0x96u8; 16];
         let now = 1_800_000_000;
+        let request_commitment = [0xB3u8; 32];
 
         assert_eq!(
-            cache.observe(live_route, now),
+            cache.observe(live_route, request_commitment, now),
             BlindRelayRouteReplayDecision::New
         );
         for _ in 0..=MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS {
             assert_eq!(
-                cache.observe(retried_route, now),
+                cache.observe(retried_route, request_commitment, now),
                 BlindRelayRouteReplayDecision::New
             );
             cache.forget(&retried_route);
@@ -6763,15 +7095,15 @@ mod tests {
 
         assert!(cache.order.len() <= MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS);
         assert_eq!(
-            cache.observe(live_route, now),
+            cache.observe(live_route, request_commitment, now),
             BlindRelayRouteReplayDecision::InFlight
         );
         assert_eq!(
-            cache.observe(retried_route, now),
+            cache.observe(retried_route, request_commitment, now),
             BlindRelayRouteReplayDecision::New
         );
         assert_eq!(
-            cache.observe(retried_route, now),
+            cache.observe(retried_route, request_commitment, now),
             BlindRelayRouteReplayDecision::InFlight
         );
     }
@@ -6782,6 +7114,7 @@ mod tests {
         let route_id = [0x94u8; 16];
         let started_at = 1_800_000_000;
         let completed_at = started_at + BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS;
+        let request_commitment = [0xB4u8; 32];
         let terminal_identity = IdentityKeyPair::generate();
         let delivery_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
             route_id,
@@ -6802,17 +7135,18 @@ mod tests {
         };
 
         assert_eq!(
-            cache.observe(route_id, started_at),
+            cache.observe(route_id, request_commitment, started_at),
             BlindRelayRouteReplayDecision::New
         );
         cache.complete(&route_id, completed_at, response.clone());
         assert_eq!(
-            cache.observe(route_id, completed_at + 1),
+            cache.observe(route_id, request_commitment, completed_at + 1),
             BlindRelayRouteReplayDecision::Completed(response)
         );
         assert_eq!(
             cache.observe(
                 route_id,
+                request_commitment,
                 completed_at + BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS + 1,
             ),
             BlindRelayRouteReplayDecision::New
@@ -7209,9 +7543,10 @@ mod tests {
         let previous_hop = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let route_id = [0x47u8; 16];
+        let request_commitment = [0xB7u8; 32];
         let mut replay_cache = BlindRelayRouteReplayCache::default();
         assert_eq!(
-            replay_cache.observe(route_id, now_secs()),
+            replay_cache.observe(route_id, request_commitment, now_secs()),
             BlindRelayRouteReplayDecision::New
         );
         let peer_store = Arc::new(PeerStore::new());
@@ -7270,12 +7605,13 @@ mod tests {
         let previous_hop = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let now = now_secs();
+        let request_commitment = [0xBAu8; 32];
         let mut replay_cache = BlindRelayRouteReplayCache::default();
         for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES {
             let mut retained_route = [0x49u8; 16];
             retained_route[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
             assert_eq!(
-                replay_cache.observe(retained_route, now),
+                replay_cache.observe(retained_route, request_commitment, now),
                 BlindRelayRouteReplayDecision::New
             );
         }
