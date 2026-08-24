@@ -291,6 +291,8 @@
 //!   cancellation cannot release capacity while verification is still active.
 //!
 //! ## Last Modified
+//! v0.60.0-RecoverableBlindRelayClaim - Persist a fenced effect boundary so
+//! unarmed restart claims recover while ambiguous side effects stay fail-closed
 //! v0.59.0-BlindRelayBodyAdmissionOrder - Preserve the fixed 413 contract for
 //! known oversized requests before durable replay availability is evaluated
 //! v0.58.0-BlindRelayTestAdmissionIsolation - Keep focused route tests bounded
@@ -1002,16 +1004,18 @@ enum BlindRelayRouteStart {
 
 /// Owns one in-flight route until its durable outcome is published.
 ///
-/// [RELAY-ROUTE-RAII 2026-08-11 by Codex] Axum request futures may be dropped
-/// during shutdown or transport cancellation. Releasing from `Drop` prevents
-/// a cancelled owner from pinning the route in `InFlight` until replay expiry.
-/// Successful paths consume the lease through `complete`, atomically replacing
-/// the in-flight marker with the exact bounded ACK before disarming cleanup.
+/// [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Axum request futures may
+/// be dropped during shutdown or transport cancellation. `Drop` releases only
+/// work that has not crossed an external effect boundary; armed work remains
+/// pending for fail-closed replay safety. Successful paths consume the lease
+/// through `complete`, atomically replacing the in-flight marker with the exact
+/// bounded ACK before disarming cleanup.
 struct BlindRelayRouteLease {
     seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
     durable_relay: Option<Arc<ChatRelayService>>,
     route_id: [u8; 16],
     request_commitment: [u8; 32],
+    effect_started: bool,
     active: bool,
 }
 
@@ -1027,8 +1031,25 @@ impl BlindRelayRouteLease {
             durable_relay,
             route_id,
             request_commitment,
+            effect_started: false,
             active: true,
         }
+    }
+
+    fn arm_effect(&mut self, now: u64) -> Result<(), BlindRelayError> {
+        if !self.active {
+            return Err(BlindRelayError::ReplayProtectionUnavailable);
+        }
+        if self.effect_started {
+            return Ok(());
+        }
+        if let Some(relay) = self.durable_relay.as_ref() {
+            relay
+                .arm_blind_relay_route_effect(&self.route_id, &self.request_commitment, now)
+                .map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
+        }
+        self.effect_started = true;
+        Ok(())
     }
 
     fn complete(
@@ -1063,10 +1084,18 @@ impl Drop for BlindRelayRouteLease {
         if !self.active {
             return;
         }
-        // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Preserve durable
-        // ambiguity after cancellation. Deleting this reservation could repeat
-        // a forward/store that completed immediately before future teardown.
-        if self.durable_relay.is_some() {
+        // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] An armed route is
+        // ambiguous after cancellation and must remain pending. An unarmed
+        // owner has not crossed an external boundary, so release only the
+        // exact process-fenced claim; storage failure safely leaves it pending.
+        if let Some(relay) = self.durable_relay.as_ref() {
+            if !self.effect_started {
+                let _ = relay
+                    .release_unarmed_blind_relay_route(&self.route_id, &self.request_commitment);
+            }
+            return;
+        }
+        if self.effect_started {
             return;
         }
         let mut seen_routes = self
@@ -2828,7 +2857,7 @@ async fn process_authenticated_peer_blind_relay(
         BlindRelayError::InvalidEndpoint
     })?;
 
-    let route_lease = match begin_blind_relay_route(
+    let mut route_lease = match begin_blind_relay_route(
         &state,
         envelope.route_id,
         request_commitment,
@@ -2850,6 +2879,9 @@ async fn process_authenticated_peer_blind_relay(
     let ttl_remaining = forwarded_envelope.ttl;
 
     let forward_started_at = blind_relay_response_observed_at(now, &route_started_at);
+    route_lease
+        .arm_effect(forward_started_at)
+        .map_err(|_| record_blind_relay_replay_protection_failure(&state, forward_started_at))?;
     let observed_at = match forward_blind_relay_with_retry(
         &state,
         &url,
@@ -2910,7 +2942,7 @@ async fn process_onion_blind_relay(
     let self_node_id = state.node_identity.public_key_bytes();
 
     // Per-route replay/dedup, identical to the opaque terminal/forward paths.
-    let route_lease = match begin_blind_relay_route(
+    let mut route_lease = match begin_blind_relay_route(
         &state,
         envelope.route_id,
         request_commitment,
@@ -2944,6 +2976,9 @@ async fn process_onion_blind_relay(
             // peel is insufficient: chat must reach its pending queue, while a
             // Blind Vault Put must pass its signature, lease, quota, TTL,
             // idempotency, and durable SQLite transaction before we sign ACK.
+            route_lease
+                .arm_effect(now)
+                .map_err(|_| record_blind_relay_replay_protection_failure(&state, now))?;
             let route_purpose = match deliver_onion_terminal_payload(&state, &peel.inner, now).await
             {
                 Ok(purpose) => purpose,
@@ -3072,6 +3107,9 @@ async fn process_onion_blind_relay(
             let ttl_remaining = forwarded_envelope.ttl;
 
             let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
+            route_lease.arm_effect(forward_started_at).map_err(|_| {
+                record_blind_relay_replay_protection_failure(&state, forward_started_at)
+            })?;
             let next_hop_forward = match forward_blind_relay_with_retry(
                 &state,
                 &url,
@@ -3232,7 +3270,7 @@ async fn process_onion_middle_blind_relay(
         BlindRelayError::InvalidEndpoint
     })?;
 
-    let route_lease = match begin_blind_relay_route(
+    let mut route_lease = match begin_blind_relay_route(
         &state,
         outer_envelope.route_id,
         request_commitment,
@@ -3250,6 +3288,9 @@ async fn process_onion_middle_blind_relay(
     let ttl_remaining = forwarded_envelope.ttl;
 
     let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
+    route_lease
+        .arm_effect(forward_started_at)
+        .map_err(|_| record_blind_relay_replay_protection_failure(&state, forward_started_at))?;
     let next_hop_forward = match forward_blind_relay_with_retry(
         &state,
         &url,
@@ -6491,8 +6532,9 @@ mod tests {
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let wrong_target = IdentityKeyPair::generate();
         let peer_store = Arc::new(PeerStore::new());
+        let (relay, path) = temp_chat_relay("onion-wrong-node-key-retry");
         let state = ChatPeerState {
-            chat_relay: None,
+            chat_relay: Some(relay),
             blind_vault: None,
             sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
             udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
@@ -6516,21 +6558,29 @@ mod tests {
             build_onion_envelope(&[sealed_for_wrong], &inner, [0x56u8; 16], 4, now, &source)
                 .unwrap();
 
-        let result = process_peer_blind_relay(
-            state,
-            PeerBlindRelayRequest {
-                envelope,
-                previous_hop_node_id: source.public_key_bytes(),
-                onward_envelope: None,
-                onward_descriptor_hint: None,
-            },
-        )
-        .await;
+        // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Peeling is a
+        // pure preflight step. Its failure must release the durable unarmed
+        // claim so an identical retry is classified by payload validation,
+        // never stranded as an in-flight side effect.
+        for _ in 0..2 {
+            let result = process_peer_blind_relay(
+                state.clone(),
+                PeerBlindRelayRequest {
+                    envelope: envelope.clone(),
+                    previous_hop_node_id: source.public_key_bytes(),
+                    onward_envelope: None,
+                    onward_descriptor_hint: None,
+                },
+            )
+            .await;
 
-        assert!(matches!(result, Err(BlindRelayError::OnionPeelFailed)));
+            assert!(matches!(result, Err(BlindRelayError::OnionPeelFailed)));
+        }
         let blind_stats = peer_store.status(now + 1).runtime.blind_relay;
         assert_eq!(blind_stats.terminal, 0);
-        assert_eq!(blind_stats.rejected, 1);
+        assert_eq!(blind_stats.rejected, 2);
+        drop(state);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -7059,9 +7109,9 @@ mod tests {
 
     #[test]
     fn blind_relay_route_lease_releases_cancellation_and_commits_exact_ack() {
-        // [RELAY-ROUTE-RAII 2026-08-11 by Codex] Dropping an async request
-        // owner must release its in-flight claim. A successful owner must
-        // instead publish the exact bounded response for ACK-loss replay.
+        // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Cancellation
+        // releases an unarmed claim, but preserves an armed claim whose effect
+        // may have happened. Completion still publishes the exact bounded ACK.
         let seen_routes = Arc::new(Mutex::new(BlindRelayRouteReplayCache::default()));
         let route_id = [0x48u8; 16];
         let request_commitment = [0xA8u8; 32];
@@ -7088,6 +7138,26 @@ mod tests {
             BlindRelayRouteReplayDecision::New
         );
 
+        let mut armed_lease =
+            BlindRelayRouteLease::new(Arc::clone(&seen_routes), None, route_id, request_commitment);
+        armed_lease.arm_effect(started_at + 2).unwrap();
+        drop(armed_lease);
+        assert_eq!(
+            seen_routes
+                .lock()
+                .unwrap()
+                .observe(route_id, request_commitment, started_at + 3),
+            BlindRelayRouteReplayDecision::InFlight
+        );
+        seen_routes.lock().unwrap().forget(&route_id);
+        assert_eq!(
+            seen_routes
+                .lock()
+                .unwrap()
+                .observe(route_id, request_commitment, started_at + 4),
+            BlindRelayRouteReplayDecision::New
+        );
+
         let response = PeerBlindRelayResponse {
             accepted: true,
             terminal: false,
@@ -7098,13 +7168,13 @@ mod tests {
             failure_receipt: None,
         };
         BlindRelayRouteLease::new(Arc::clone(&seen_routes), None, route_id, request_commitment)
-            .complete(started_at + 2, response.clone())
+            .complete(started_at + 5, response.clone())
             .unwrap();
         assert_eq!(
             seen_routes
                 .lock()
                 .unwrap()
-                .observe(route_id, request_commitment, started_at + 3),
+                .observe(route_id, request_commitment, started_at + 6),
             BlindRelayRouteReplayDecision::Completed(response)
         );
     }

@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.42.0 - Added restart-durable blind-relay replay
-admission so advertised relay nodes reserve before route effects, replay only
-the exact sealed ACK, and never persist raw route or payload metadata.
+Modification Reason: v1.45.0 - Split restart-durable blind-relay claims into
+recoverable pre-effect reservations and fail-closed post-effect reservations,
+with process-epoch fencing across rolling restarts.
 
 Main Functionality:
 
@@ -31,8 +31,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.44.0 - [BLIND-RELAY-BODY-ADMISSION-ORDER 2026-08-24 by Codex] Preserves the fixed 413 contract for declared or exactly-known oversized blind-relay requests before evaluating durable replay availability, without buffering unknown-length streams.
+Last Modified: v1.45.0 - [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Persists a random process epoch and explicit effect boundary for each blind-relay claim, safely reclaims only aged unarmed work after restart, and fences the previous process from arming or completing a taken-over route.
 
+Previous: v1.44.0 - [BLIND-RELAY-BODY-ADMISSION-ORDER 2026-08-24 by Codex] Preserves the fixed 413 contract for declared or exactly-known oversized blind-relay requests before evaluating durable replay availability, without buffering unknown-length streams.
 Previous: v1.43.0 - [DURABLE-BLIND-RELAY-ADMISSION 2026-08-24 by Codex] Requires the node-private durable replay boundary before the public blind-relay HTTP endpoint accepts parser, signature, forwarding, or terminal-storage work; unavailable protection fails closed with a fixed aggregate reason.
 Previous: v1.42.0 - [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Persists blind-relay reservations and exact ACKs in the node-private Chat Relay database as node-secret HMAC indexes plus AEAD ciphertext, binds them to the complete accepted request, and applies startup, admission-time, and bounded scheduled retention cleanup.
 Previous: v1.41.0 - [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] Makes blind-relay replay capacity an admission boundary: after expiry cleanup, saturation rejects only the new route and preserves every unexpired in-flight claim and completed ACK so pressure cannot reopen an already executed route.
@@ -3318,6 +3319,18 @@ Implemented:
   exactly-known oversized bodies retain the endpoint-wide fixed 413 response
   before durable-store availability is exposed. Unknown-length streams are
   never buffered by this preflight and remain bounded by the JSON extractor.
+- [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Each durable reservation
+  records a random process epoch and starts unarmed. Validation and onion peel
+  remain pure preflight work; cancellation before an effect releases only the
+  exact owner-fenced claim. Immediately before terminal persistence or outbound
+  HTTP, the owner atomically arms the claim. Armed claims remain pending for the
+  complete replay horizon because their external result may be ambiguous.
+- A replacement process may reclaim an exact unarmed claim only after a fixed
+  five-second crash grace. The compare-and-swap changes its process epoch, so a
+  still-running old process cannot subsequently arm or complete that route.
+  Same-process duplicates remain pending and changed request commitments remain
+  conflicts. Legacy v1 reservations have no trustworthy effect boundary and
+  therefore migrate conservatively as armed claims.
 - Entry-node durable custody remains available when no verified onion route is
   currently ready; an attempted route never silently widens into direct relay.
 
@@ -3357,10 +3370,13 @@ Verification:
   authenticated request stops before terminal/forward effects, and confirms
   capacity is reusable only after the replay horizon expires.
 - Durable blind-relay coverage proves sealed ACK replay and conflict detection
-  across restart, crash-window reservation recovery, fixed-shape private rows,
-  bounded response/reservation cleanup, complete onward-envelope commitment,
-  onward-signature substitution rejection, and fail-closed startup after an
-  installed replay table disappears.
+  across restart, safe unarmed takeover, old-owner arm/completion fencing,
+  armed crash-window preservation, v1 conservative migration, fixed-shape
+  private rows, bounded response/reservation cleanup, complete onward-envelope
+  commitment, onward-signature substitution rejection, and fail-closed startup
+  after an installed replay table or required v2 claim column disappears.
+- Cancellation coverage proves pure onion-peel failures release durable
+  unarmed claims and can be retried, while an armed RAII lease remains pending.
 - Parser-front admission coverage proves a node without durable replay storage
   returns 503 for even an invalid request body before parsing or forwarding,
   while configured nodes retain the existing aggregate backpressure behavior.

@@ -245,10 +245,15 @@
 //     must own one durable anonymous reservation before any route, wallet-route,
 //     or custody mutation. Never evict an unexpired completed response or
 //     reservation to admit new work; reject saturation before side effects.
+//   - [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Blind-route claims
+//     have an anonymous process epoch and durable effect boundary. Only an
+//     expired, unarmed claim may move to a new process; armed and legacy claims
+//     remain fail-closed for the complete replay horizon.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.14.0-RecoverableBlindRelayClaim — Restart-safe pre-effect claim takeover
 //   v3.13.0-CrashSafeVerifiedSubmitAdmission — Durable pre-side-effect reservation
 //   v3.12.0-DurableVerifiedSubmitIdempotency — Restart-safe private response replay
 //   v3.11.0-VerifiedSubmitIdempotency — Bounded single-flight response replay
@@ -383,8 +388,12 @@ const VERIFIED_SUBMIT_RESPONSE_AAD_DOMAIN: &[u8] = b"AeroNyx-VerifiedSubmit-Resp
 pub(crate) const BLIND_RELAY_ROUTE_REPLAY_CAPACITY: usize = 8192;
 /// Route evidence outlives the signed envelope acceptance window by one second.
 pub(crate) const BLIND_RELAY_ROUTE_REPLAY_TTL_SECS: u64 = 10 * 60;
-const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION: i64 = 1;
+const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION: i64 = 2;
+const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION: i64 = 1;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE: &str = "blind_relay_route_replay";
+const BLIND_RELAY_PROCESS_EPOCH_BYTES: usize = 16;
+/// Maximum wait before another process may reclaim a claim not yet armed.
+const BLIND_RELAY_UNARMED_CLAIM_TTL_SECS: u64 = 5;
 const BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES: usize = 24;
 const BLIND_RELAY_ROUTE_RESPONSE_TAG_BYTES: usize = 16;
 const MAX_BLIND_RELAY_ROUTE_RESPONSE_BYTES: usize = 2048;
@@ -2595,6 +2604,8 @@ pub struct ChatRelayService {
     verified_submit_response_key: [u8; 32],
     /// Stable node-local AEAD key for opaque blind-route response replay.
     blind_relay_route_response_key: [u8; 32],
+    /// Random process epoch used only to fence unarmed durable route claims.
+    blind_relay_process_epoch: [u8; BLIND_RELAY_PROCESS_EPOCH_BYTES],
     dedup: MessageDedup,
     verified_submit_cache: Mutex<VerifiedSubmitResponseCache>,
     verified_submit_lanes: Box<[tokio::sync::Mutex<()>]>,
@@ -5259,7 +5270,13 @@ impl ChatRelayService {
             "SELECT COUNT(*) FROM relay_blind_route_reservations
              WHERE LENGTH(cache_key) != 32
                 OR LENGTH(request_fingerprint) != 32
-                OR reserved_at < 0",
+                OR reserved_at < 0
+                OR owner_epoch IS NULL
+                OR TYPEOF(owner_epoch) != 'blob'
+                OR LENGTH(owner_epoch) != 16
+                OR (effect_started_at IS NOT NULL
+                    AND (TYPEOF(effect_started_at) != 'integer'
+                         OR effect_started_at < reserved_at))",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -5367,6 +5384,8 @@ impl ChatRelayService {
         let verified_submit_response_key = Self::derive_verified_submit_response_key(&node_secret)?;
         let blind_relay_route_response_key =
             Self::derive_blind_relay_route_response_key(&node_secret)?;
+        let mut blind_relay_process_epoch = [0_u8; BLIND_RELAY_PROCESS_EPOCH_BYTES];
+        OsRng.fill_bytes(&mut blind_relay_process_epoch);
         let mut peer_status = ChatRelayPeerStatus::new(relay_enabled);
         peer_status.custody_durability =
             ChatRelayCustodyDurabilityStatus::verified_full(synchronous_level);
@@ -5377,6 +5396,7 @@ impl ChatRelayService {
             pull_cursor_key,
             verified_submit_response_key,
             blind_relay_route_response_key,
+            blind_relay_process_epoch,
             dedup: MessageDedup::new(dedup_capacity),
             verified_submit_cache: Mutex::new(VerifiedSubmitResponseCache::new(dedup_capacity)),
             verified_submit_lanes: (0..VERIFIED_SUBMIT_SINGLE_FLIGHT_LANES)
@@ -5738,7 +5758,11 @@ impl ChatRelayService {
             CREATE TABLE IF NOT EXISTS relay_blind_route_reservations (
                 cache_key           BLOB    PRIMARY KEY CHECK(LENGTH(cache_key) = 32),
                 request_fingerprint BLOB    NOT NULL CHECK(LENGTH(request_fingerprint) = 32),
-                reserved_at         INTEGER NOT NULL CHECK(reserved_at >= 0)
+                reserved_at         INTEGER NOT NULL CHECK(reserved_at >= 0),
+                owner_epoch         BLOB    NOT NULL CHECK(LENGTH(owner_epoch) = 16),
+                effect_started_at   INTEGER CHECK(
+                    effect_started_at IS NULL OR effect_started_at >= reserved_at
+                )
             );
             CREATE INDEX IF NOT EXISTS idx_blind_route_reservation_retention
                 ON relay_blind_route_reservations(reserved_at);
@@ -5751,9 +5775,10 @@ impl ChatRelayService {
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
-        if installed_version
-            .is_some_and(|version| version != BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION)
-        {
+        if installed_version.is_some_and(|version| {
+            version != BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION
+                && version != BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION
+        }) {
             return Err(ChatRelayError::CorruptStoredData {
                 field: "blind_relay_route_replay_installation_version",
             });
@@ -5762,6 +5787,39 @@ impl ChatRelayService {
             return Err(ChatRelayError::CorruptStoredData {
                 field: "blind_relay_route_replay_table",
             });
+        }
+        let owner_epoch_exists = Self::blind_relay_reservation_column_exists(&tx, "owner_epoch")?;
+        let effect_started_at_exists =
+            Self::blind_relay_reservation_column_exists(&tx, "effect_started_at")?;
+        if installed_version == Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION)
+            && (!owner_epoch_exists || !effect_started_at_exists)
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "blind_relay_route_replay_reservation_columns",
+            });
+        }
+        if !owner_epoch_exists {
+            tx.execute_batch(
+                "ALTER TABLE relay_blind_route_reservations
+                 ADD COLUMN owner_epoch BLOB",
+            )?;
+        }
+        if !effect_started_at_exists {
+            tx.execute_batch(
+                "ALTER TABLE relay_blind_route_reservations
+                 ADD COLUMN effect_started_at INTEGER",
+            )?;
+        }
+        if installed_version != Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION) {
+            // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] A v1 row may
+            // have crossed an external side-effect boundary before upgrade.
+            // Mark every legacy claim armed; only v2 claims created with an
+            // explicit process epoch may participate in safe takeover.
+            tx.execute(
+                "UPDATE relay_blind_route_reservations
+                 SET owner_epoch = zeroblob(?1), effect_started_at = reserved_at",
+                params![i64::try_from(BLIND_RELAY_PROCESS_EPOCH_BYTES).unwrap_or(i64::MAX)],
+            )?;
         }
         let invalid_responses = tx.query_row(
             "SELECT COUNT(*) FROM relay_blind_route_responses
@@ -5778,7 +5836,13 @@ impl ChatRelayService {
             "SELECT COUNT(*) FROM relay_blind_route_reservations
              WHERE LENGTH(cache_key) != 32
                 OR LENGTH(request_fingerprint) != 32
-                OR reserved_at < 0",
+                OR reserved_at < 0
+                OR owner_epoch IS NULL
+                OR TYPEOF(owner_epoch) != 'blob'
+                OR LENGTH(owner_epoch) != 16
+                OR (effect_started_at IS NOT NULL
+                    AND (TYPEOF(effect_started_at) != 'integer'
+                         OR effect_started_at < reserved_at))",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -5802,6 +5866,21 @@ impl ChatRelayService {
                 field: "blind_relay_route_replay_installation_marker",
             });
         }
+        if installed_version == Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION)
+            && tx.execute(
+                "UPDATE relay_schema_features SET schema_version = ?1
+                 WHERE feature = ?2 AND schema_version = ?3",
+                params![
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
+                ],
+            )? != 1
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "blind_relay_route_replay_migration_marker",
+            });
+        }
         let cutoff = sqlite_integer(
             now.saturating_sub(BLIND_RELAY_ROUTE_REPLAY_TTL_SECS),
             "blind_relay_route_replay_startup_cutoff",
@@ -5816,6 +5895,20 @@ impl ChatRelayService {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    fn blind_relay_reservation_column_exists(
+        tx: &Transaction<'_>,
+        expected_column: &str,
+    ) -> ChatRelayResult<bool> {
+        let mut stmt = tx.prepare("PRAGMA table_info(relay_blind_route_reservations)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for column in columns {
+            if column? == expected_column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn read_direct_peer_relay_circuit_checkpoint(
@@ -7028,28 +7121,78 @@ impl ChatRelayService {
             });
         }
 
-        let reserved_fingerprint = tx
+        let reservation = tx
             .query_row(
-                "SELECT request_fingerprint FROM relay_blind_route_reservations
+                "SELECT request_fingerprint, reserved_at, owner_epoch,
+                        effect_started_at
+                 FROM relay_blind_route_reservations
                  WHERE cache_key = ?1",
                 params![cache_key.as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
             )
             .optional()?;
-        if let Some(stored_fingerprint) = reserved_fingerprint {
+        if let Some((stored_fingerprint, stored_at, owner_epoch, effect_started_at)) = reservation {
             let stored_fingerprint: [u8; 32] =
                 stored_fingerprint
                     .try_into()
                     .map_err(|_| ChatRelayError::CorruptStoredData {
                         field: "blind_relay_route_reservation_fingerprint",
                     })?;
-            let outcome = if stored_fingerprint == request_fingerprint {
-                BlindRelayRouteAdmission::Pending
-            } else {
-                BlindRelayRouteAdmission::Conflict
-            };
+            if stored_fingerprint != request_fingerprint {
+                tx.commit()?;
+                return Ok(BlindRelayRouteAdmission::Conflict);
+            }
+            let owner_epoch: [u8; BLIND_RELAY_PROCESS_EPOCH_BYTES] = owner_epoch
+                .try_into()
+                .map_err(|_| ChatRelayError::CorruptStoredData {
+                    field: "blind_relay_route_reservation_owner_epoch",
+                })?;
+            if stored_at < 0 || effect_started_at.is_some_and(|started_at| started_at < stored_at) {
+                return Err(ChatRelayError::CorruptStoredData {
+                    field: "blind_relay_route_reservation_state",
+                });
+            }
+            let reclaim_at = stored_at.saturating_add(
+                i64::try_from(BLIND_RELAY_UNARMED_CLAIM_TTL_SECS).unwrap_or(i64::MAX),
+            );
+            if effect_started_at.is_none()
+                && owner_epoch != self.blind_relay_process_epoch
+                && reserved_at >= reclaim_at
+            {
+                if tx.execute(
+                    "UPDATE relay_blind_route_reservations
+                     SET reserved_at = ?1, owner_epoch = ?2
+                     WHERE cache_key = ?3
+                       AND request_fingerprint = ?4
+                       AND reserved_at = ?5
+                       AND owner_epoch = ?6
+                       AND effect_started_at IS NULL",
+                    params![
+                        reserved_at,
+                        self.blind_relay_process_epoch.as_slice(),
+                        cache_key.as_slice(),
+                        request_fingerprint.as_slice(),
+                        stored_at,
+                        owner_epoch.as_slice(),
+                    ],
+                )? != 1
+                {
+                    return Err(ChatRelayError::CorruptStoredData {
+                        field: "blind_relay_route_reservation_takeover",
+                    });
+                }
+                tx.commit()?;
+                return Ok(BlindRelayRouteAdmission::Reserved);
+            }
             tx.commit()?;
-            return Ok(outcome);
+            return Ok(BlindRelayRouteAdmission::Pending);
         }
 
         let retained = tx.query_row(
@@ -7070,12 +7213,14 @@ impl ChatRelayService {
         }
         if tx.execute(
             "INSERT INTO relay_blind_route_reservations (
-                cache_key, request_fingerprint, reserved_at
-             ) VALUES (?1, ?2, ?3)",
+                cache_key, request_fingerprint, reserved_at, owner_epoch,
+                effect_started_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL)",
             params![
                 cache_key.as_slice(),
                 request_fingerprint.as_slice(),
                 reserved_at,
+                self.blind_relay_process_epoch.as_slice(),
             ],
         )? != 1
         {
@@ -7085,6 +7230,62 @@ impl ChatRelayService {
         }
         tx.commit()?;
         Ok(BlindRelayRouteAdmission::Reserved)
+    }
+
+    /// Arms an owned route claim immediately before its first external effect.
+    pub(crate) fn arm_blind_relay_route_effect(
+        &self,
+        route_id: &[u8; 16],
+        request_commitment: &[u8; 32],
+        started_at: u64,
+    ) -> ChatRelayResult<()> {
+        let cache_key = self.blind_relay_route_cache_key(route_id);
+        let request_fingerprint = self.blind_relay_route_fingerprint(request_commitment);
+        let started_at = sqlite_integer(started_at, "blind_relay_route_effect_started_at")?;
+        let conn = self.conn.lock();
+        if conn.execute(
+            "UPDATE relay_blind_route_reservations
+             SET effect_started_at = MAX(?1, reserved_at)
+             WHERE cache_key = ?2
+               AND request_fingerprint = ?3
+               AND owner_epoch = ?4
+               AND effect_started_at IS NULL",
+            params![
+                started_at,
+                cache_key.as_slice(),
+                request_fingerprint.as_slice(),
+                self.blind_relay_process_epoch.as_slice(),
+            ],
+        )? != 1
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "blind_relay_route_effect_admission",
+            });
+        }
+        Ok(())
+    }
+
+    /// Releases only this process's claim when no external effect was armed.
+    pub(crate) fn release_unarmed_blind_relay_route(
+        &self,
+        route_id: &[u8; 16],
+        request_commitment: &[u8; 32],
+    ) -> ChatRelayResult<bool> {
+        let cache_key = self.blind_relay_route_cache_key(route_id);
+        let request_fingerprint = self.blind_relay_route_fingerprint(request_commitment);
+        let conn = self.conn.lock();
+        Ok(conn.execute(
+            "DELETE FROM relay_blind_route_reservations
+             WHERE cache_key = ?1
+               AND request_fingerprint = ?2
+               AND owner_epoch = ?3
+               AND effect_started_at IS NULL",
+            params![
+                cache_key.as_slice(),
+                request_fingerprint.as_slice(),
+                self.blind_relay_process_epoch.as_slice(),
+            ],
+        )? == 1)
     }
 
     /// Atomically replaces one route reservation with its sealed exact ACK.
@@ -7133,8 +7334,14 @@ impl ChatRelayService {
         }
         if tx.execute(
             "DELETE FROM relay_blind_route_reservations
-             WHERE cache_key = ?1 AND request_fingerprint = ?2",
-            params![cache_key.as_slice(), request_fingerprint.as_slice()],
+             WHERE cache_key = ?1
+               AND request_fingerprint = ?2
+               AND owner_epoch = ?3",
+            params![
+                cache_key.as_slice(),
+                request_fingerprint.as_slice(),
+                self.blind_relay_process_epoch.as_slice(),
+            ],
         )? != 1
         {
             return Err(ChatRelayError::CorruptStoredData {
@@ -10333,6 +10540,54 @@ mod tests {
     }
 
     #[test]
+    fn verified_backup_rejects_invalid_blind_route_claim_metadata() {
+        // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Backup
+        // certification enforces the same process-fencing shape as startup;
+        // a malformed owner epoch must not become a trusted recovery image.
+        let directory = tempfile::tempdir().expect("claim metadata backup directory");
+        let source_path = directory.path().join("source.sqlite");
+        let mut config = test_config();
+        config.db_path = source_path.to_string_lossy().into_owned();
+        let source = make_service_with_config(config);
+        source
+            .reserve_blind_relay_route(&[0x91; 16], &[0x92; 32])
+            .expect("reserve blind-route claim before backup corruption");
+        source
+            .conn
+            .lock()
+            .execute(
+                "UPDATE relay_blind_route_reservations
+                 SET owner_epoch = '0000000000000000'",
+                [],
+            )
+            .expect("install malformed claim metadata fixture");
+
+        let error = source
+            .create_verified_backup()
+            .expect_err("malformed claim backup must fail closed");
+        assert!(
+            matches!(
+                error,
+                ChatRelayError::CorruptStoredData {
+                    field: "sqlite_backup_logical_integrity"
+                }
+            ),
+            "unexpected backup rejection: {error:?}"
+        );
+        let backup_directory = source_path.parent().unwrap().join(".aeronyx-relay-backups");
+        assert_eq!(
+            std::fs::read_dir(&backup_directory)
+                .expect("inspect private backup directory")
+                .count(),
+            0,
+            "failed claim certification must remove all partial artifacts"
+        );
+
+        drop(source);
+        remove_test_db(&source_path);
+    }
+
+    #[test]
     fn verified_backup_rejects_in_memory_storage() {
         let error = make_service()
             .create_verified_backup()
@@ -12093,9 +12348,9 @@ mod tests {
 
     #[test]
     fn blind_route_pending_reservation_survives_restart_and_fails_closed() {
-        // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] A crash after
-        // admission has an ambiguous external effect. Preserve that claim
-        // across restart instead of forwarding or storing the ciphertext twice.
+        // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] A crash after
+        // arming has an ambiguous external effect. Preserve that claim across
+        // restart instead of forwarding or storing the ciphertext twice.
         let db_path = unique_test_db_path("blind-route-pending-restart");
         let mut config = test_config();
         config.db_path = db_path.to_string_lossy().into_owned();
@@ -12112,18 +12367,31 @@ mod tests {
                     .expect("persist blind-route reservation"),
                 BlindRelayRouteAdmission::Reserved
             );
-            let (cache_key, fingerprint) = service
+            service
+                .arm_blind_relay_route_effect(&route_id, &request_commitment, now_secs())
+                .expect("arm ambiguous blind-route effect");
+            let (cache_key, fingerprint, owner_epoch, effect_started_at) = service
                 .conn
                 .lock()
                 .query_row(
-                    "SELECT cache_key, request_fingerprint
+                    "SELECT cache_key, request_fingerprint, owner_epoch,
+                            effect_started_at
                      FROM relay_blind_route_reservations",
                     [],
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                        ))
+                    },
                 )
                 .expect("read private blind-route reservation");
             assert_eq!(cache_key.len(), 32);
             assert_eq!(fingerprint.len(), 32);
+            assert_eq!(owner_epoch.len(), BLIND_RELAY_PROCESS_EPOCH_BYTES);
+            assert!(effect_started_at.is_some());
             assert!(!cache_key
                 .windows(route_id.len())
                 .any(|window| window == route_id));
@@ -12167,6 +12435,234 @@ mod tests {
         );
 
         drop(restarted);
+        remove_test_database(&db_path);
+    }
+
+    #[test]
+    fn blind_route_unarmed_claim_is_reclaimed_and_owner_fenced() {
+        // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Rolling restart
+        // can leave the previous process alive briefly. A new process may take
+        // only an aged, unarmed claim; the old epoch can no longer arm or
+        // complete it after the compare-and-swap takeover.
+        let db_path = unique_test_db_path("blind-route-unarmed-takeover");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0xD1; 32];
+        let route_id = [0xD2; 16];
+        let request_commitment = [0xD3; 32];
+        let response = b"owner-fenced response";
+
+        let old_owner =
+            ChatRelayService::new(config.clone(), secret).expect("create old blind-route owner");
+        assert_eq!(
+            old_owner
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("reserve old unarmed claim"),
+            BlindRelayRouteAdmission::Reserved
+        );
+        old_owner
+            .conn
+            .lock()
+            .execute(
+                "UPDATE relay_blind_route_reservations SET reserved_at = ?1",
+                params![sqlite_integer(
+                    now_secs().saturating_sub(BLIND_RELAY_UNARMED_CLAIM_TTL_SECS + 1),
+                    "blind_relay_test_aged_unarmed_claim",
+                )
+                .expect("convert aged unarmed claim timestamp")],
+            )
+            .expect("age unarmed claim beyond takeover grace");
+
+        let new_owner =
+            ChatRelayService::new(config.clone(), secret).expect("create new blind-route owner");
+        assert_eq!(
+            new_owner
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("take over aged unarmed claim"),
+            BlindRelayRouteAdmission::Reserved
+        );
+        assert!(old_owner
+            .arm_blind_relay_route_effect(&route_id, &request_commitment, now_secs())
+            .is_err());
+        assert!(old_owner
+            .remember_blind_relay_route_response(
+                &route_id,
+                &request_commitment,
+                response,
+                now_secs(),
+            )
+            .is_err());
+        new_owner
+            .arm_blind_relay_route_effect(&route_id, &request_commitment, now_secs())
+            .expect("arm claim under new owner epoch");
+        new_owner
+            .remember_blind_relay_route_response(
+                &route_id,
+                &request_commitment,
+                response,
+                now_secs(),
+            )
+            .expect("complete claim under new owner epoch");
+        assert!(matches!(
+            new_owner
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("recover new owner's exact response"),
+            BlindRelayRouteAdmission::Completed { response: stored, .. }
+                if stored == response
+        ));
+
+        drop(new_owner);
+        drop(old_owner);
+        remove_test_database(&db_path);
+    }
+
+    #[test]
+    fn blind_route_release_only_removes_owned_unarmed_claim() {
+        let db_path = unique_test_db_path("blind-route-unarmed-release");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let service =
+            ChatRelayService::new(config, [0xC1; 32]).expect("create blind-route release relay");
+        let route_id = [0xC2; 16];
+        let request_commitment = [0xC3; 32];
+
+        assert_eq!(
+            service
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("reserve releasable claim"),
+            BlindRelayRouteAdmission::Reserved
+        );
+        assert!(service
+            .release_unarmed_blind_relay_route(&route_id, &request_commitment)
+            .expect("release owned unarmed claim"));
+        assert_eq!(
+            service
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("reserve released route again"),
+            BlindRelayRouteAdmission::Reserved
+        );
+        service
+            .arm_blind_relay_route_effect(&route_id, &request_commitment, now_secs())
+            .expect("arm retained claim");
+        assert!(!service
+            .release_unarmed_blind_relay_route(&route_id, &request_commitment)
+            .expect("preserve armed claim"));
+        assert_eq!(
+            service
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("classify retained armed claim"),
+            BlindRelayRouteAdmission::Pending
+        );
+
+        drop(service);
+        remove_test_database(&db_path);
+    }
+
+    #[test]
+    fn blind_route_schema_v1_migrates_claims_as_armed() {
+        // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Version 1 did
+        // not persist an effect boundary. Migration must classify every legacy
+        // claim as ambiguous rather than making it eligible for takeover.
+        let db_path = unique_test_db_path("blind-route-v1-migration");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0xB1; 32];
+        let route_id = [0xB2; 16];
+        let request_commitment = [0xB3; 32];
+
+        {
+            let service = ChatRelayService::new(config.clone(), secret)
+                .expect("install current blind-route schema");
+            assert_eq!(
+                service
+                    .reserve_blind_relay_route(&route_id, &request_commitment)
+                    .expect("seed legacy reservation"),
+                BlindRelayRouteAdmission::Reserved
+            );
+            let conn = service.conn.lock();
+            conn.execute(
+                "UPDATE relay_schema_features SET schema_version = ?1
+                 WHERE feature = ?2",
+                params![
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+                ],
+            )
+            .expect("downgrade blind-route marker to v1");
+            conn.execute(
+                "ALTER TABLE relay_blind_route_reservations
+                 DROP COLUMN effect_started_at",
+                [],
+            )
+            .expect("remove v2 effect marker");
+            conn.execute(
+                "ALTER TABLE relay_blind_route_reservations DROP COLUMN owner_epoch",
+                [],
+            )
+            .expect("remove v2 process epoch");
+        }
+
+        let migrated = ChatRelayService::new(config, secret)
+            .expect("migrate blind-route replay schema v1 to v2");
+        let (version, owner_epoch, reserved_at, effect_started_at) = migrated
+            .conn
+            .lock()
+            .query_row(
+                "SELECT
+                    (SELECT schema_version FROM relay_schema_features
+                     WHERE feature = ?1),
+                    owner_epoch, reserved_at, effect_started_at
+                 FROM relay_blind_route_reservations",
+                params![BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .expect("inspect migrated blind-route claim");
+        assert_eq!(version, BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION);
+        assert_eq!(owner_epoch, vec![0; BLIND_RELAY_PROCESS_EPOCH_BYTES]);
+        assert_eq!(effect_started_at, Some(reserved_at));
+        assert_eq!(
+            migrated
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("preserve legacy ambiguous claim"),
+            BlindRelayRouteAdmission::Pending
+        );
+
+        drop(migrated);
+        remove_test_database(&db_path);
+    }
+
+    #[test]
+    fn blind_route_schema_v2_missing_claim_column_fails_closed() {
+        let db_path = unique_test_db_path("blind-route-v2-missing-column");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0xA1; 32];
+        drop(
+            ChatRelayService::new(config.clone(), secret)
+                .expect("install blind-route replay schema v2"),
+        );
+        Connection::open(&db_path)
+            .expect("open blind-route replay database")
+            .execute(
+                "ALTER TABLE relay_blind_route_reservations
+                 DROP COLUMN effect_started_at",
+                [],
+            )
+            .expect("remove required v2 claim column");
+
+        assert!(matches!(
+            ChatRelayService::new(config, secret),
+            Err(ChatRelayError::CorruptStoredData {
+                field: "blind_relay_route_replay_reservation_columns"
+            })
+        ));
         remove_test_database(&db_path);
     }
 
