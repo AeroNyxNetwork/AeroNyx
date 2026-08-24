@@ -63,6 +63,9 @@
 //! - [SIGNED-ONWARD-ENVELOPE 2026-08-24 by Codex] Verifies the previous-hop
 //!   signature on an optional legacy onward envelope before route admission,
 //!   preventing ciphertext substitution before this node re-signs the frame
+//! - [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Reconciles a crashed
+//!   armed claim by repeating the exact idempotent request; deterministic
+//!   onion forwarding lets the next hop replay its sealed ACK without effects
 //! - [RELAY-ROUTE-RAII 2026-08-11 by Codex] Owns every newly admitted route
 //!   through an RAII lease so cancellation, shutdown, and future early-return
 //!   paths release in-flight replay state unless a durable ACK is committed
@@ -1025,13 +1028,14 @@ impl BlindRelayRouteLease {
         durable_relay: Option<Arc<ChatRelayService>>,
         route_id: [u8; 16],
         request_commitment: [u8; 32],
+        effect_started: bool,
     ) -> Self {
         Self {
             seen_routes,
             durable_relay,
             route_id,
             request_commitment,
-            effect_started: false,
+            effect_started,
             active: true,
         }
     }
@@ -2699,6 +2703,26 @@ async fn authenticate_peer_blind_relay_request_with_admission(
     }
 }
 
+fn build_forwarded_onion_envelope(
+    envelope: &BlindRelayEnvelope,
+    next_hop: [u8; 32],
+    inner: Vec<u8>,
+    node_identity: &IdentityKeyPair,
+) -> BlindRelayEnvelope {
+    // [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Every field derives
+    // from authenticated ingress state. Ed25519 signing is deterministic, so
+    // an exact restart retry generates the same downstream request commitment.
+    BlindRelayEnvelope {
+        route_id: envelope.route_id,
+        next_hop,
+        ttl: envelope.ttl.saturating_sub(1),
+        encrypted_blob: inner,
+        timestamp: envelope.timestamp,
+        signature: [0u8; 64],
+    }
+    .sign_with(node_identity)
+}
+
 #[cfg(test)]
 async fn process_peer_blind_relay(
     state: ChatPeerState,
@@ -3093,17 +3117,17 @@ async fn process_onion_blind_relay(
                 BlindRelayError::InvalidEndpoint
             })?;
 
-            // Fresh envelope carrying the peeled inner layer onward. Re-signed by
-            // this node; next_hop is addressed to the revealed relay.
-            let forwarded_envelope = BlindRelayEnvelope {
-                route_id: envelope.route_id,
+            // [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Preserve the
+            // authenticated ingress timestamp when reconstructing this exact
+            // hop. A restart retry must produce byte-identical signed onward
+            // input so the downstream node can replay its durable ACK without
+            // repeating terminal storage or another network effect.
+            let forwarded_envelope = build_forwarded_onion_envelope(
+                &envelope,
                 next_hop,
-                ttl: envelope.ttl.saturating_sub(1),
-                encrypted_blob: peel.inner,
-                timestamp: now,
-                signature: [0u8; 64],
-            }
-            .sign_with(state.node_identity.as_ref());
+                peel.inner,
+                state.node_identity.as_ref(),
+            );
             let ttl_remaining = forwarded_envelope.ttl;
 
             let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
@@ -3377,6 +3401,16 @@ fn begin_blind_relay_route(
                     Some(Arc::clone(relay)),
                     route_id,
                     request_commitment,
+                    false,
+                )))
+            }
+            BlindRelayRouteAdmission::ReservedForRecovery => {
+                Ok(BlindRelayRouteStart::Acquired(BlindRelayRouteLease::new(
+                    Arc::clone(&state.blind_relay_seen_routes),
+                    Some(Arc::clone(relay)),
+                    route_id,
+                    request_commitment,
+                    true,
                 )))
             }
             BlindRelayRouteAdmission::Pending => {
@@ -3437,6 +3471,7 @@ fn begin_blind_relay_route(
                 None,
                 route_id,
                 request_commitment,
+                false,
             )))
         }
         BlindRelayRouteReplayDecision::InFlight => {
@@ -4266,6 +4301,7 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use axum::response::IntoResponse;
+    use rusqlite::Connection;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
@@ -6242,6 +6278,135 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn onion_forward_reconstruction_is_byte_stable() {
+        // [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] A middle hop that
+        // crashes after sending must reconstruct exactly the same signed frame;
+        // otherwise downstream durable replay sees a conflicting request.
+        let previous_hop = IdentityKeyPair::generate();
+        let middle = IdentityKeyPair::generate();
+        let outer = BlindRelayEnvelope {
+            route_id: [0x61; 16],
+            next_hop: middle.public_key_bytes(),
+            ttl: 4,
+            encrypted_blob: b"opaque outer onion layer".to_vec(),
+            timestamp: 1_800_000_123,
+            signature: [0; 64],
+        }
+        .sign_with(&previous_hop);
+        let next_hop = IdentityKeyPair::generate().public_key_bytes();
+        let inner = b"opaque inner onion layer".to_vec();
+
+        let first = build_forwarded_onion_envelope(&outer, next_hop, inner.clone(), &middle);
+        let after_restart = build_forwarded_onion_envelope(&outer, next_hop, inner, &middle);
+
+        assert_eq!(after_restart, first);
+        assert_eq!(first.timestamp, outer.timestamp);
+        assert_eq!(first.ttl, outer.ttl - 1);
+    }
+
+    #[tokio::test]
+    async fn onion_terminal_armed_claim_recovers_without_duplicate_storage() {
+        use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
+
+        // [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Model a crash after
+        // terminal custody succeeds but before the route ACK is sealed. Exact
+        // retry takes over the armed claim and reuses idempotent store_pending.
+        let source = IdentityKeyPair::generate();
+        let node_identity = Arc::new(IdentityKeyPair::generate());
+        let peer_store = Arc::new(PeerStore::new());
+        let (old_relay, path) = temp_chat_relay("onion-terminal-armed-recovery");
+        let now = now_secs();
+        let delivered_envelope = signed_envelope_at(now);
+        let receiver = delivered_envelope.receiver;
+        let inner = encode_envelope(&delivered_envelope).expect("encode terminal payload");
+        let route_id = [0x62; 16];
+        let request = PeerBlindRelayRequest {
+            envelope: build_onion_envelope(
+                &[OnionHop {
+                    node_id: node_identity.public_key_bytes(),
+                    kem_pub: crate::services::onion_keys::current_public_key(),
+                }],
+                &inner,
+                route_id,
+                4,
+                now,
+                &source,
+            )
+            .expect("build recoverable terminal onion"),
+            previous_hop_node_id: source.public_key_bytes(),
+            onward_envelope: None,
+            onward_descriptor_hint: None,
+        };
+        let request_commitment = blind_relay_authenticated_request_commitment(&request)
+            .expect("commit recoverable request");
+        assert_eq!(
+            old_relay
+                .reserve_blind_relay_route(&route_id, &request_commitment)
+                .expect("reserve pre-crash route"),
+            BlindRelayRouteAdmission::Reserved
+        );
+        old_relay
+            .arm_blind_relay_route_effect(&route_id, &request_commitment, now)
+            .expect("arm pre-crash route");
+        old_relay
+            .store_pending(&delivered_envelope)
+            .expect("complete terminal custody before crash");
+        drop(old_relay);
+
+        let aged_at = now
+            .saturating_sub(crate::services::chat_relay::BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS + 1);
+        Connection::open(&path)
+            .expect("open crashed relay database")
+            .execute(
+                "UPDATE relay_blind_route_reservations
+                 SET reserved_at = ?1, owner_acquired_at = ?1",
+                [i64::try_from(aged_at).expect("fit test timestamp")],
+            )
+            .expect("age crashed owner lease");
+        let recovered_relay = Arc::new(
+            ChatRelayService::new(
+                test_chat_config(path.to_string_lossy().into_owned()),
+                [7u8; 32],
+            )
+            .expect("restart relay for armed reconciliation"),
+        );
+        let state = ChatPeerState {
+            chat_relay: Some(Arc::clone(&recovered_relay)),
+            blind_vault: None,
+            sessions: Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60))),
+            udp: Arc::new(UdpTransport::bind("127.0.0.1:0").await.unwrap()),
+            peer_store: Arc::clone(&peer_store),
+            node_identity: Arc::clone(&node_identity),
+            http_client: Arc::new(reqwest::Client::new()),
+            blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
+            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        };
+
+        let recovered = process_peer_blind_relay(state, request)
+            .await
+            .expect("reconcile armed terminal route");
+        assert!(recovered.terminal);
+        assert_eq!(
+            recovered.reason.as_deref(),
+            Some("onion_terminal_delivered")
+        );
+        let (messages, has_more) = recovered_relay
+            .pull_pending(&receiver, 0, &[0; 16], 10)
+            .expect("pull reconciled terminal custody");
+        assert!(!has_more);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, delivered_envelope.message_id);
+        assert_eq!(
+            encode_envelope(&messages[0].envelope).expect("encode recovered message"),
+            encode_envelope(&delivered_envelope).expect("encode expected message"),
+        );
+
+        drop(recovered_relay);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn onion_terminal_rejects_same_message_id_with_different_ciphertext() {
         use aeronyx_core::protocol::onion::{build_onion_envelope, OnionHop};
@@ -7129,6 +7294,7 @@ mod tests {
             None,
             route_id,
             request_commitment,
+            false,
         ));
         assert_eq!(
             seen_routes
@@ -7138,8 +7304,13 @@ mod tests {
             BlindRelayRouteReplayDecision::New
         );
 
-        let mut armed_lease =
-            BlindRelayRouteLease::new(Arc::clone(&seen_routes), None, route_id, request_commitment);
+        let mut armed_lease = BlindRelayRouteLease::new(
+            Arc::clone(&seen_routes),
+            None,
+            route_id,
+            request_commitment,
+            false,
+        );
         armed_lease.arm_effect(started_at + 2).unwrap();
         drop(armed_lease);
         assert_eq!(
@@ -7167,9 +7338,15 @@ mod tests {
             delivery_receipt: None,
             failure_receipt: None,
         };
-        BlindRelayRouteLease::new(Arc::clone(&seen_routes), None, route_id, request_commitment)
-            .complete(started_at + 5, response.clone())
-            .unwrap();
+        BlindRelayRouteLease::new(
+            Arc::clone(&seen_routes),
+            None,
+            route_id,
+            request_commitment,
+            false,
+        )
+        .complete(started_at + 5, response.clone())
+        .unwrap();
         assert_eq!(
             seen_routes
                 .lock()
