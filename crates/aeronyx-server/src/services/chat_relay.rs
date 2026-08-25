@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.25.0-DurableQuarantineDomain
+// Version: 3.26.0-BoundedCleanupDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -58,6 +58,9 @@
 //   [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex] Extracted atomic
 //   poison-row replacement, de-identified evidence, retention, and backlog
 //   checks behind a typed, composed repository capability.
+//   [CHAT-RELAY-CLEANUP-DOMAIN 2026-08-25 by Codex] Extracted immutable TTL
+//   cutoffs, expired-row validation, typed replay retention, and bounded SQLite
+//   cleanup behind a composed repository capability.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -354,7 +357,7 @@
 //   v1.3.1-Maintenance — Removed stale imports; behavior unchanged
 // ============================================================================
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -379,7 +382,7 @@ use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS;
 #[cfg(test)]
 use aeronyx_core::protocol::chat::encode_envelope;
-use aeronyx_core::protocol::chat::{decode_envelope, ChatEnvelope, CustodyAuditAnchorV1};
+use aeronyx_core::protocol::chat::{ChatEnvelope, CustodyAuditAnchorV1};
 use aeronyx_core::protocol::memchain::{
     chat_verified_submit_result_label, ChatRelayVerifiedSubmitRequestV1,
     ChatRelayVerifiedSubmitResponseV1, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
@@ -396,6 +399,12 @@ use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
 use crate::services::chat_relay_blob_custody::{
     EncryptedBlobCustodyDomain, EncryptedBlobStoreOutcome,
 };
+use crate::services::chat_relay_cleanup::{
+    CleanupBatchOutcome, CleanupRunSummary, RelayCleanupCutoffs, RelayCleanupDomain,
+    CLEANUP_MAX_BATCHES_PER_RUN,
+};
+#[cfg(test)]
+use crate::services::chat_relay_cleanup::CLEANUP_MESSAGE_BATCH_SIZE;
 use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
 #[cfg(test)]
 use crate::services::chat_relay_pending_custody::allocate_queue_sequence;
@@ -408,11 +417,11 @@ use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_C
 use crate::services::chat_relay_pull_cursor::{ChatPullCursorCodec, PullCursorV2};
 use crate::services::chat_relay_quarantine::{
     CorruptDurableRow, DurableQuarantineDomain, QuarantineRowTarget,
-    QUARANTINE_SOURCE_PENDING_MESSAGE,
 };
 #[cfg(test)]
 use crate::services::chat_relay_quarantine::{
     MAX_QUARANTINE_EVENTS, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION,
+    QUARANTINE_SOURCE_PENDING_MESSAGE,
 };
 #[cfg(unix)]
 use crate::services::chat_relay_runtime_fence::ChatRelayRuntimeFence;
@@ -431,21 +440,11 @@ type HmacSha256 = Hmac<Sha256>;
 /// Maximum IDs accepted in one authenticated `ChatAck` frame.
 pub const MAX_CHAT_ACK_MESSAGE_IDS: usize = 100;
 /// Maximum IDs encoded into one `ChatExpired` frame.
-const MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION: usize = 32;
+pub(crate) const MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION: usize = 32;
 /// Maximum notification rows offered during one authenticated pull.
 pub(crate) const MAX_EXPIRED_NOTIFICATIONS_PER_PULL: usize = 16;
 /// Defensive ceiling for one persisted bincode notification payload.
 pub(crate) const MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES: usize = 1024;
-/// Maximum expired message rows processed by one `SQLite` transaction.
-const CLEANUP_MESSAGE_BATCH_SIZE: usize = 1024;
-/// Maximum expired encrypted blobs deleted by one `SQLite` transaction.
-const CLEANUP_BLOB_BATCH_SIZE: usize = 128;
-/// Maximum delivered/stale notification rows deleted by one transaction.
-const CLEANUP_NOTIFICATION_BATCH_SIZE: usize = 1024;
-/// Maximum expired private verified-submit rows removed per transaction.
-const CLEANUP_VERIFIED_SUBMIT_RESPONSE_BATCH_SIZE: usize = 1024;
-/// Maximum cleanup transactions executed by one scheduled maintenance run.
-const CLEANUP_MAX_BATCHES_PER_RUN: usize = 8;
 /// Durable verified-submit row format guarded by `relay_schema_features`.
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION: i64 = 3;
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION: i64 = 2;
@@ -2110,105 +2109,6 @@ pub struct PendingMessagePageV2 {
     pub has_more: bool,
 }
 
-#[derive(Debug)]
-struct ExpiredMessageRow {
-    message_id: [u8; 16],
-    sender: [u8; 32],
-    receiver: [u8; 32],
-}
-
-type ExpiredMessagesBySender = HashMap<[u8; 32], HashMap<[u8; 32], Vec<[u8; 16]>>>;
-#[derive(Debug)]
-struct StoredExpiredMessageRow {
-    rowid: i64,
-    message_id: Vec<u8>,
-    sender: Vec<u8>,
-    receiver: Vec<u8>,
-    timestamp: i64,
-    envelope: Vec<u8>,
-    queue_sequence: Option<i64>,
-}
-
-#[derive(Debug, Default)]
-struct ValidatedExpiredMessageBatch {
-    valid_rows: Vec<ExpiredMessageRow>,
-    corrupt_rows: Vec<CorruptDurableRow>,
-    selected_rowids: Vec<i64>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct CleanupBatchOutcome {
-    expired_messages: usize,
-    expired_blobs: usize,
-    removed_notifications: usize,
-    quarantined_pending_messages: usize,
-    removed_quarantine_events: usize,
-    removed_verified_submit_responses: usize,
-    removed_verified_submit_reservations: usize,
-    removed_blind_route_responses: usize,
-    removed_blind_route_reservations: usize,
-    retained_quarantine_events: usize,
-    has_more: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct CleanupRunSummary {
-    expired_messages: usize,
-    expired_blobs: usize,
-    removed_notifications: usize,
-    quarantined_pending_messages: usize,
-    removed_quarantine_events: usize,
-    removed_verified_submit_responses: usize,
-    removed_verified_submit_reservations: usize,
-    removed_blind_route_responses: usize,
-    removed_blind_route_reservations: usize,
-    retained_quarantine_events: usize,
-    successful_batches: usize,
-    backlog_deferred: bool,
-}
-
-impl CleanupRunSummary {
-    fn absorb(&mut self, batch: CleanupBatchOutcome) {
-        self.expired_messages = self.expired_messages.saturating_add(batch.expired_messages);
-        self.expired_blobs = self.expired_blobs.saturating_add(batch.expired_blobs);
-        self.removed_notifications = self
-            .removed_notifications
-            .saturating_add(batch.removed_notifications);
-        self.quarantined_pending_messages = self
-            .quarantined_pending_messages
-            .saturating_add(batch.quarantined_pending_messages);
-        self.removed_quarantine_events = self
-            .removed_quarantine_events
-            .saturating_add(batch.removed_quarantine_events);
-        self.removed_verified_submit_responses = self
-            .removed_verified_submit_responses
-            .saturating_add(batch.removed_verified_submit_responses);
-        self.removed_verified_submit_reservations = self
-            .removed_verified_submit_reservations
-            .saturating_add(batch.removed_verified_submit_reservations);
-        self.removed_blind_route_responses = self
-            .removed_blind_route_responses
-            .saturating_add(batch.removed_blind_route_responses);
-        self.removed_blind_route_reservations = self
-            .removed_blind_route_reservations
-            .saturating_add(batch.removed_blind_route_reservations);
-        self.retained_quarantine_events = batch.retained_quarantine_events;
-        self.successful_batches = self.successful_batches.saturating_add(1);
-    }
-
-    fn removed_anything(self) -> bool {
-        self.expired_messages > 0
-            || self.expired_blobs > 0
-            || self.removed_notifications > 0
-            || self.quarantined_pending_messages > 0
-            || self.removed_quarantine_events > 0
-            || self.removed_verified_submit_responses > 0
-            || self.removed_verified_submit_reservations > 0
-            || self.removed_blind_route_responses > 0
-            || self.removed_blind_route_reservations > 0
-    }
-}
-
 // ============================================
 // Expired notification row
 // ============================================
@@ -2681,6 +2581,11 @@ pub struct ChatRelayService {
     /// [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex] Pull and cleanup
     /// flows retain telemetry; this domain owns atomic replacement mechanics.
     durable_quarantine: DurableQuarantineDomain,
+    /// Immutable retention policy and bounded durable cleanup capability.
+    ///
+    /// [CHAT-RELAY-CLEANUP-DOMAIN 2026-08-25 by Codex] The service retains
+    /// connection locking, transaction commits, telemetry, and scheduling.
+    cleanup: RelayCleanupDomain,
     /// Private verified-submit replay domain capability.
     ///
     /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
@@ -5500,6 +5405,11 @@ impl ChatRelayService {
         let expired_notification_delivery = ExpiredNotificationDelivery::new();
         let blob_custody = EncryptedBlobCustodyDomain::new(node_secret, &config);
         let durable_quarantine = DurableQuarantineDomain::new(&config);
+        let cleanup = RelayCleanupDomain::new(
+            &config,
+            VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
+            BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
+        );
         let verified_submit_replay = VerifiedSubmitReplay::new(node_secret, dedup_capacity)?;
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
@@ -5519,6 +5429,7 @@ impl ChatRelayService {
             expired_notification_delivery,
             blob_custody,
             durable_quarantine,
+            cleanup,
             verified_submit_replay,
             blind_route_replay,
             replay_process_epoch,
@@ -7842,32 +7753,14 @@ impl ChatRelayService {
         now: i64,
         max_batches: usize,
     ) -> (CleanupRunSummary, Option<ChatRelayError>) {
-        // Configuration validation rejects values above i64::MAX. These
-        // fallbacks keep direct service construction fail-closed as well:
-        // an out-of-range TTL retains data instead of expiring fresh rows.
-        let ttl = i64::try_from(self.config.offline_ttl_secs).unwrap_or(i64::MAX);
-        let notif_ttl =
-            i64::try_from(self.config.expired_notification_ttl_secs).unwrap_or(i64::MAX);
-        let cutoff = now.saturating_sub(ttl);
-        let notif_cutoff = now.saturating_sub(notif_ttl);
-        let verified_submit_cutoff = now
-            .saturating_sub(i64::try_from(VERIFIED_SUBMIT_RESPONSE_TTL_SECS).unwrap_or(i64::MAX));
-        let blind_route_cutoff = now
-            .saturating_sub(i64::try_from(BLIND_RELAY_ROUTE_REPLAY_TTL_SECS).unwrap_or(i64::MAX));
+        let cutoffs = self.cleanup.cutoffs(now);
 
         let mut summary = CleanupRunSummary::default();
         let mut failure = None;
         for batch_index in 0..max_batches {
             let batch_result = {
                 let mut conn = self.conn.lock();
-                self.run_cleanup_transaction(
-                    &mut conn,
-                    now,
-                    cutoff,
-                    notif_cutoff,
-                    verified_submit_cutoff,
-                    blind_route_cutoff,
-                )
+                self.run_cleanup_transaction(&mut conn, now, cutoffs)
             };
             match batch_result {
                 Ok(batch) => {
@@ -7924,85 +7817,12 @@ impl ChatRelayService {
         &self,
         conn: &mut Connection,
         now: i64,
-        cutoff: i64,
-        notif_cutoff: i64,
-        verified_submit_cutoff: i64,
-        blind_route_cutoff: i64,
+        cutoffs: RelayCleanupCutoffs,
     ) -> ChatRelayResult<CleanupBatchOutcome> {
-        let message_limit = i64::try_from(CLEANUP_MESSAGE_BATCH_SIZE).unwrap_or(i64::MAX);
-        let blob_limit = i64::try_from(CLEANUP_BLOB_BATCH_SIZE).unwrap_or(i64::MAX);
-        let notification_limit = i64::try_from(CLEANUP_NOTIFICATION_BATCH_SIZE).unwrap_or(i64::MAX);
-        let verified_submit_limit =
-            i64::try_from(CLEANUP_VERIFIED_SUBMIT_RESPONSE_BATCH_SIZE).unwrap_or(i64::MAX);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        let transaction_result: ChatRelayResult<CleanupBatchOutcome> = (|| {
-            let expired_batch = Self::load_expired_message_batch(&tx, cutoff, message_limit)?;
-            let expired_message_count = expired_batch.valid_rows.len();
-            let quarantined_pending_messages = expired_batch.corrupt_rows.len();
-            Self::queue_expiry_notifications(&tx, now, &expired_batch.valid_rows)?;
-            self.durable_quarantine
-                .record(&tx, now, &expired_batch.corrupt_rows)?;
-            Self::delete_expired_message_batch(&tx, &expired_batch.selected_rowids)?;
-            let expired_blobs = Self::delete_expired_blob_batch(&tx, cutoff, blob_limit)?;
-            let removed_notifications =
-                Self::delete_stale_notification_batch(&tx, notif_cutoff, notification_limit)?;
-            let quarantine_maintenance = self.durable_quarantine.maintain(&tx, now)?;
-            let removed_verified_submit_responses = Self::delete_stale_verified_submit_batch(
-                &tx,
-                "relay_verified_submit_responses",
-                "completed_at",
-                verified_submit_cutoff,
-                verified_submit_limit,
-            )?;
-            let removed_verified_submit_reservations = Self::delete_stale_verified_submit_batch(
-                &tx,
-                "relay_verified_submit_reservations",
-                "reserved_at",
-                verified_submit_cutoff,
-                verified_submit_limit,
-            )?;
-            // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Reuse the
-            // bounded maintenance transaction so idle nodes also honour the
-            // private route-evidence retention policy without a timer-specific
-            // unbounded delete or inspection of HMAC/sealed values.
-            let removed_blind_route_responses = Self::delete_stale_private_replay_batch(
-                &tx,
-                "relay_blind_route_responses",
-                "completed_at",
-                blind_route_cutoff,
-                verified_submit_limit,
-            )?;
-            let removed_blind_route_reservations = Self::delete_stale_private_replay_batch(
-                &tx,
-                "relay_blind_route_reservations",
-                "reserved_at",
-                blind_route_cutoff,
-                verified_submit_limit,
-            )?;
-            let has_more = self.cleanup_backlog_exists(
-                &tx,
-                now,
-                cutoff,
-                notif_cutoff,
-                verified_submit_cutoff,
-                blind_route_cutoff,
-            )?;
-
-            Ok(CleanupBatchOutcome {
-                expired_messages: expired_message_count,
-                expired_blobs,
-                removed_notifications,
-                quarantined_pending_messages,
-                removed_quarantine_events: quarantine_maintenance.removed_events,
-                removed_verified_submit_responses,
-                removed_verified_submit_reservations,
-                removed_blind_route_responses,
-                removed_blind_route_reservations,
-                retained_quarantine_events: quarantine_maintenance.retained_events,
-                has_more,
-            })
-        })();
+        let transaction_result =
+            self.cleanup
+                .run_batch(&tx, &self.durable_quarantine, now, cutoffs);
 
         match transaction_result {
             Ok(counts) => {
@@ -8011,323 +7831,6 @@ impl ChatRelayService {
             }
             Err(error) => Err(error),
         }
-    }
-
-    fn load_expired_message_batch(
-        tx: &Transaction<'_>,
-        cutoff: i64,
-        limit: i64,
-    ) -> ChatRelayResult<ValidatedExpiredMessageBatch> {
-        let mut stmt = tx.prepare(
-            "SELECT rowid, message_id, sender, receiver, timestamp, envelope, queue_sequence
-             FROM pending_messages
-             WHERE status = 0 AND received_at < ?1
-             ORDER BY received_at ASC, message_id ASC
-             LIMIT ?2",
-        )?;
-        let stored_rows: Vec<StoredExpiredMessageRow> = stmt
-            .query_map(params![cutoff, limit], |row| {
-                Ok(StoredExpiredMessageRow {
-                    rowid: row.get(0)?,
-                    message_id: row.get(1)?,
-                    sender: row.get(2)?,
-                    receiver: row.get(3)?,
-                    timestamp: row.get(4)?,
-                    envelope: row.get(5)?,
-                    queue_sequence: row.get(6)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-        drop(stmt);
-
-        let mut batch = ValidatedExpiredMessageBatch {
-            valid_rows: Vec::with_capacity(stored_rows.len()),
-            corrupt_rows: Vec::new(),
-            selected_rowids: Vec::with_capacity(stored_rows.len()),
-        };
-        for row in stored_rows {
-            batch.selected_rowids.push(row.rowid);
-            let encoded_bytes = u64::try_from(row.envelope.len()).unwrap_or(u64::MAX);
-            let corrupt = |reason| CorruptDurableRow {
-                row_key: row.rowid,
-                source_kind: QUARANTINE_SOURCE_PENDING_MESSAGE,
-                reason,
-                encoded_bytes,
-            };
-            let parsed = (|| {
-                let message_id: [u8; 16] = row
-                    .message_id
-                    .try_into()
-                    .map_err(|_| corrupt("expired_message_id"))?;
-                let sender: [u8; 32] = row
-                    .sender
-                    .try_into()
-                    .map_err(|_| corrupt("expired_message_sender"))?;
-                let receiver: [u8; 32] = row
-                    .receiver
-                    .try_into()
-                    .map_err(|_| corrupt("expired_message_receiver"))?;
-                let timestamp = u64::try_from(row.timestamp)
-                    .map_err(|_| corrupt("expired_message_timestamp"))?;
-                let envelope = decode_envelope(&row.envelope)
-                    .map_err(|_| corrupt("expired_message_envelope"))?;
-                if envelope.message_id != message_id {
-                    return Err(corrupt("expired_message_id_mismatch"));
-                }
-                if envelope.sender != sender {
-                    return Err(corrupt("expired_message_sender_mismatch"));
-                }
-                if envelope.receiver != receiver {
-                    return Err(corrupt("expired_message_receiver_mismatch"));
-                }
-                if envelope.timestamp != timestamp {
-                    return Err(corrupt("expired_message_timestamp_mismatch"));
-                }
-                envelope
-                    .verify_signature()
-                    .map_err(|_| corrupt("expired_message_signature"))?;
-                match row.queue_sequence {
-                    Some(sequence) if sequence > 0 => {}
-                    _ => return Err(corrupt("expired_message_queue_sequence")),
-                }
-                Ok::<ExpiredMessageRow, CorruptDurableRow>(ExpiredMessageRow {
-                    message_id,
-                    sender,
-                    receiver,
-                })
-            })();
-            match parsed {
-                Ok(valid) => batch.valid_rows.push(valid),
-                Err(corrupt) => batch.corrupt_rows.push(corrupt),
-            }
-        }
-        Ok(batch)
-    }
-
-    fn queue_expiry_notifications(
-        tx: &Transaction<'_>,
-        now: i64,
-        expired_rows: &[ExpiredMessageRow],
-    ) -> ChatRelayResult<()> {
-        let mut by_sender = ExpiredMessagesBySender::new();
-        for row in expired_rows {
-            by_sender
-                .entry(row.sender)
-                .or_default()
-                .entry(row.receiver)
-                .or_default()
-                .push(row.message_id);
-        }
-
-        for (sender, by_receiver) in &by_sender {
-            for (receiver, ids) in by_receiver {
-                for ids_chunk in ids.chunks(MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION) {
-                    let ids_bytes = bincode::serialize(ids_chunk)?;
-                    if ids_bytes.len() > MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES {
-                        return Err(ChatRelayError::CorruptStoredData {
-                            field: "generated_expired_notification_payload_size",
-                        });
-                    }
-                    tx.execute(
-                        "INSERT INTO expired_notifications
-                         (sender, receiver, message_ids, created_at, pushed)
-                         VALUES (?1, ?2, ?3, ?4, 0)",
-                        params![sender.as_slice(), receiver.as_slice(), ids_bytes, now],
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn delete_expired_message_batch(
-        tx: &Transaction<'_>,
-        selected_rowids: &[i64],
-    ) -> ChatRelayResult<()> {
-        let mut stmt = tx.prepare("DELETE FROM pending_messages WHERE rowid = ?1")?;
-        let mut deleted = 0usize;
-        for rowid in selected_rowids {
-            deleted = deleted.saturating_add(stmt.execute(params![rowid])?);
-        }
-        if deleted != selected_rowids.len() {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "expired_message_cleanup_count",
-            });
-        }
-        Ok(())
-    }
-
-    fn delete_expired_blob_batch(
-        tx: &Transaction<'_>,
-        cutoff: i64,
-        limit: i64,
-    ) -> ChatRelayResult<usize> {
-        Ok(tx.execute(
-            "DELETE FROM pending_blobs
-             WHERE rowid IN (
-                 SELECT rowid FROM pending_blobs
-                 WHERE received_at < ?1
-                 ORDER BY received_at ASC, rowid ASC
-                 LIMIT ?2
-             )",
-            params![cutoff, limit],
-        )?)
-    }
-
-    fn delete_stale_notification_batch(
-        tx: &Transaction<'_>,
-        notif_cutoff: i64,
-        limit: i64,
-    ) -> ChatRelayResult<usize> {
-        Ok(tx.execute(
-            "DELETE FROM expired_notifications
-             WHERE id IN (
-                 SELECT id FROM expired_notifications
-                 WHERE pushed = 1 OR created_at < ?1
-                 ORDER BY id ASC
-                 LIMIT ?2
-             )",
-            params![notif_cutoff, limit],
-        )?)
-    }
-
-    fn delete_stale_verified_submit_batch(
-        tx: &Transaction<'_>,
-        table: &'static str,
-        timestamp_column: &'static str,
-        cutoff: i64,
-        limit: i64,
-    ) -> ChatRelayResult<usize> {
-        // [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex] Retention
-        // exceeds the maximum authentication window, then removes only a
-        // bounded batch. No identifier or response material is inspected.
-        let statement = match (table, timestamp_column) {
-            ("relay_verified_submit_responses", "completed_at") => {
-                "DELETE FROM relay_verified_submit_responses
-                 WHERE rowid IN (
-                     SELECT rowid FROM relay_verified_submit_responses
-                     WHERE completed_at < ?1
-                     ORDER BY completed_at ASC, rowid ASC
-                     LIMIT ?2
-                 )"
-            }
-            ("relay_verified_submit_reservations", "reserved_at") => {
-                "DELETE FROM relay_verified_submit_reservations
-                 WHERE rowid IN (
-                     SELECT rowid FROM relay_verified_submit_reservations
-                     WHERE reserved_at < ?1
-                     ORDER BY reserved_at ASC, rowid ASC
-                     LIMIT ?2
-                 )"
-            }
-            _ => {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "verified_submit_cleanup_table",
-                });
-            }
-        };
-        Ok(tx.execute(statement, params![cutoff, limit])?)
-    }
-
-    fn delete_stale_private_replay_batch(
-        tx: &Transaction<'_>,
-        table: &'static str,
-        timestamp_column: &'static str,
-        cutoff: i64,
-        limit: i64,
-    ) -> ChatRelayResult<usize> {
-        let statement = match (table, timestamp_column) {
-            ("relay_blind_route_responses", "completed_at") => {
-                "DELETE FROM relay_blind_route_responses
-                 WHERE rowid IN (
-                     SELECT rowid FROM relay_blind_route_responses
-                     WHERE completed_at < ?1
-                     ORDER BY completed_at ASC, rowid ASC
-                     LIMIT ?2
-                 )"
-            }
-            ("relay_blind_route_reservations", "reserved_at") => {
-                "DELETE FROM relay_blind_route_reservations
-                 WHERE rowid IN (
-                     SELECT rowid FROM relay_blind_route_reservations
-                     WHERE reserved_at < ?1
-                     ORDER BY reserved_at ASC, rowid ASC
-                     LIMIT ?2
-                 )"
-            }
-            _ => {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "private_replay_cleanup_table",
-                });
-            }
-        };
-        Ok(tx.execute(statement, params![cutoff, limit])?)
-    }
-
-    fn cleanup_backlog_exists(
-        &self,
-        tx: &Transaction<'_>,
-        now: i64,
-        cutoff: i64,
-        notif_cutoff: i64,
-        verified_submit_cutoff: i64,
-        blind_route_cutoff: i64,
-    ) -> ChatRelayResult<bool> {
-        let message_has_more = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pending_messages
-                 WHERE status = 0 AND received_at < ?1
-             )",
-            params![cutoff],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        let blob_has_more = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pending_blobs WHERE received_at < ?1
-             )",
-            params![cutoff],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        let notification_has_more = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM expired_notifications
-                 WHERE pushed = 1 OR created_at < ?1
-             )",
-            params![notif_cutoff],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        let quarantine_has_more = self.durable_quarantine.backlog_exists(tx, now)?;
-
-        let verified_submit_has_more = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM relay_verified_submit_responses
-                 WHERE completed_at < ?1
-             ) OR EXISTS(
-                 SELECT 1 FROM relay_verified_submit_reservations
-                 WHERE reserved_at < ?1
-             )",
-            params![verified_submit_cutoff],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-
-        let blind_route_has_more = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM relay_blind_route_responses
-                 WHERE completed_at < ?1
-             ) OR EXISTS(
-                 SELECT 1 FROM relay_blind_route_reservations
-                 WHERE reserved_at < ?1
-             )",
-            params![blind_route_cutoff],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-
-        Ok(message_has_more
-            || blob_has_more
-            || notification_has_more
-            || quarantine_has_more
-            || verified_submit_has_more
-            || blind_route_has_more)
     }
 
     // ============================================

@@ -31,8 +31,11 @@
 //   encrypted-blob identity, quota, storage, retrieval, and deletion capability.
 //   [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex] Registered the private
 //   typed corrupt-row isolation and de-identified evidence capability.
+//   [CHAT-RELAY-CLEANUP-DOMAIN 2026-08-25 by Codex] Registered the private
+//   bounded retention policy, validation, and persistence capability.
 //
 // Last Modified:
+//   v0.29.0-BoundedCleanupDomain - Registered private cleanup capability
 //   v0.28.0-DurableQuarantineDomain - Registered private quarantine capability
 //   v0.27.0-BlobCustodyDomain - Registered private encrypted-blob capability
 //   v0.26.0-ExpiredDeliveryDomain - Registered private expiry delivery capability
@@ -83,6 +86,7 @@ pub mod blind_vault;
 pub mod chat_relay;
 mod chat_relay_blind_route;
 mod chat_relay_blob_custody;
+mod chat_relay_cleanup;
 mod chat_relay_expired_delivery;
 mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;
