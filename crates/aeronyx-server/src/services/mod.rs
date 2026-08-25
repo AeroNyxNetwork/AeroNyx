@@ -27,8 +27,11 @@
 //   pending-message write, quota, sequence, and acknowledgement capability.
 //   [CHAT-EXPIRED-DELIVERY-DOMAIN 2026-08-25 by Codex] Registered the private
 //   expiry-notification read, validation, pagination, and ACK capability.
+//   [CHAT-BLOB-CUSTODY-DOMAIN 2026-08-25 by Codex] Registered the private
+//   encrypted-blob identity, quota, storage, retrieval, and deletion capability.
 //
 // Last Modified:
+//   v0.27.0-BlobCustodyDomain - Registered private encrypted-blob capability
 //   v0.26.0-ExpiredDeliveryDomain - Registered private expiry delivery capability
 //   v0.25.0-PendingCustodyDomain - Registered private custody write capability
 //   v0.24.0-PendingPullDomain - Registered private pull repository capability
@@ -76,6 +79,7 @@
 pub mod blind_vault;
 pub mod chat_relay;
 mod chat_relay_blind_route;
+mod chat_relay_blob_custody;
 mod chat_relay_expired_delivery;
 mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;

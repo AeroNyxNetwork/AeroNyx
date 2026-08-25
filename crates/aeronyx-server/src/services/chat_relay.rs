@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.23.0-ExpiredDeliveryDomain
+// Version: 3.24.0-BlobCustodyDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -52,6 +52,9 @@
 //   [CHAT-EXPIRED-DELIVERY-DOMAIN 2026-08-25 by Codex] Extracted expiry-control
 //   reads, durable-row validation, pagination, and pushed-state writes behind a
 //   composed repository capability while retaining quarantine and telemetry.
+//   [CHAT-BLOB-CUSTODY-DOMAIN 2026-08-25 by Codex] Extracted opaque encrypted
+//   blob identity, quotas, persistence, retrieval, and sender-bound deletion
+//   behind a composed repository capability.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -296,6 +299,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.24.0-BlobCustodyDomain — Trait-based encrypted-blob custody composition
 //   v3.23.0-ExpiredDeliveryDomain — Trait-based expiry delivery composition
 //   v3.22.0-PendingCustodyDomain — Trait-based custody write composition
 //   v3.21.0-PendingPullDomain — Trait-based pull repository composition
@@ -385,6 +389,9 @@ use crate::services::chat_relay_blind_route::BlindRouteReplay;
 #[cfg(test)]
 use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
     as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
+use crate::services::chat_relay_blob_custody::{
+    EncryptedBlobCustodyDomain, EncryptedBlobStoreOutcome,
+};
 use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
 #[cfg(test)]
 use crate::services::chat_relay_pending_custody::allocate_queue_sequence;
@@ -2666,6 +2673,11 @@ pub struct ChatRelayService {
     /// [CHAT-EXPIRED-DELIVERY-DOMAIN 2026-08-25 by Codex] Quarantine and
     /// telemetry remain service-owned; durable delivery mechanics are composed.
     expired_notification_delivery: ExpiredNotificationDelivery,
+    /// Opaque identity, quota, persistence, retrieval, and deletion capability.
+    ///
+    /// [CHAT-BLOB-CUSTODY-DOMAIN 2026-08-25 by Codex] The service retains API,
+    /// connection locking, and telemetry; the composed domain owns mechanics.
+    blob_custody: EncryptedBlobCustodyDomain,
     /// Private verified-submit replay domain capability.
     ///
     /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
@@ -5483,6 +5495,7 @@ impl ChatRelayService {
         let pending_pull = PendingMessagePullDomain::new();
         let pending_custody = PendingMessageCustodyDomain::new(&config);
         let expired_notification_delivery = ExpiredNotificationDelivery::new();
+        let blob_custody = EncryptedBlobCustodyDomain::new(node_secret, &config);
         let verified_submit_replay = VerifiedSubmitReplay::new(node_secret, dedup_capacity)?;
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
@@ -5500,6 +5513,7 @@ impl ChatRelayService {
             pending_pull,
             pending_custody,
             expired_notification_delivery,
+            blob_custody,
             verified_submit_replay,
             blind_route_replay,
             replay_process_epoch,
@@ -6590,13 +6604,8 @@ impl ChatRelayService {
         receiver: &[u8; 32],
         file_hash: &[u8; 32],
     ) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.node_secret).expect("HMAC accepts any key length");
-        mac.update(sender);
-        mac.update(receiver);
-        mac.update(file_hash);
-        let result = mac.finalize().into_bytes();
-        hex::encode(&result[..16])
+        self.blob_custody
+            .compute_blob_id(sender, receiver, file_hash)
     }
 
     // ============================================
@@ -7740,89 +7749,17 @@ impl ChatRelayService {
         data: &[u8],
         file_hash: &[u8; 32],
     ) -> ChatRelayResult<String> {
-        if data.len() > self.config.max_blob_size {
-            return Err(ChatRelayError::BlobTooLarge {
-                size: data.len(),
-                limit: self.config.max_blob_size,
-            });
-        }
-
-        let blob_id = self.compute_blob_id(sender, receiver, file_hash);
-        let incoming_bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let write =
+            self.blob_custody
+                .prepare_put(sender, receiver, data, file_hash, now_secs())?;
         let mut conn = self.conn.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        // Return the stable content-derived ID before quota checks when the
-        // encrypted object is already present. Retries remain idempotent even
-        // while the blob store is full.
-        let duplicate = tx
-            .query_row(
-                "SELECT 1 FROM pending_blobs WHERE blob_id = ?1",
-                params![&blob_id],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if duplicate {
-            tx.commit()?;
-            return Ok(blob_id);
-        }
-
-        let usage = Self::read_storage_usage(&tx)?;
-        if usage.pending_blobs
-            >= u64::try_from(self.config.max_pending_blobs_total).unwrap_or(u64::MAX)
-        {
-            return Err(ChatRelayError::PendingBlobStoreFull {
-                current: usize::try_from(usage.pending_blobs).unwrap_or(usize::MAX),
-                limit: self.config.max_pending_blobs_total,
-            });
-        }
-        if usage.pending_blob_bytes.saturating_add(incoming_bytes)
-            > self.config.max_pending_blob_bytes_total
-        {
-            return Err(ChatRelayError::PendingBlobBytesExceeded {
-                current: usage.pending_blob_bytes,
-                incoming: incoming_bytes,
-                limit: self.config.max_pending_blob_bytes_total,
-            });
-        }
-
-        let count = tx.query_row(
-            "SELECT COUNT(*) FROM pending_blobs WHERE receiver = ?",
-            params![receiver.as_slice()],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let count = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
-
-        if count >= self.config.max_blobs_per_receiver {
-            return Err(ChatRelayError::BlobQuotaExceeded {
-                current: count,
-                limit: self.config.max_blobs_per_receiver,
-            });
-        }
-
-        let now = now_secs();
-        let received_at = i64::try_from(now).unwrap_or(i64::MAX);
-        let stored_size = i64::try_from(data.len()).unwrap_or(i64::MAX);
-
-        tx.execute(
-            "INSERT OR IGNORE INTO pending_blobs
-             (blob_id, sender, receiver, data, size, received_at, downloaded)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params![
-                &blob_id,
-                sender.as_slice(),
-                receiver.as_slice(),
-                data,
-                stored_size,
-                received_at,
-            ],
-        )?;
-        tx.commit()?;
+        let outcome = self.blob_custody.put(&mut conn, write)?;
         drop(conn);
 
-        info!(size = data.len(), "[CHAT_RELAY] Encrypted blob stored");
-        Ok(blob_id)
+        if let EncryptedBlobStoreOutcome::Stored { size, .. } = &outcome {
+            info!(size = *size, "[CHAT_RELAY] Encrypted blob stored");
+        }
+        Ok(outcome.blob_id().to_owned())
     }
 
     /// Retrieves an opaque encrypted blob by its HMAC-derived identifier.
@@ -7832,32 +7769,10 @@ impl ChatRelayService {
     /// Returns a `SQLite` error or [`ChatRelayError::BlobNotFound`].
     pub fn get_blob(&self, blob_id: &str) -> ChatRelayResult<Vec<u8>> {
         let conn = self.conn.lock();
-
-        let data: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT data FROM pending_blobs WHERE blob_id = ?",
-                params![blob_id],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
-
-        match data {
-            None => {
-                drop(conn);
-                Err(ChatRelayError::BlobNotFound {
-                    blob_id: blob_id.to_string(),
-                })
-            }
-            Some(bytes) => {
-                let _ = conn.execute(
-                    "UPDATE pending_blobs SET downloaded = 1 WHERE blob_id = ?",
-                    params![blob_id],
-                );
-                drop(conn);
-                debug!(size = bytes.len(), "[CHAT_RELAY] Encrypted blob retrieved");
-                Ok(bytes)
-            }
-        }
+        let data = self.blob_custody.get(&conn, blob_id)?;
+        drop(conn);
+        debug!(size = data.len(), "[CHAT_RELAY] Encrypted blob retrieved");
+        Ok(data)
     }
 
     /// Deletes an encrypted blob when requested by its original sender.
@@ -7867,35 +7782,10 @@ impl ChatRelayService {
     /// Returns a `SQLite`, not-found, or authorization error.
     pub fn delete_blob(&self, blob_id: &str, requester: &[u8; 32]) -> ChatRelayResult<()> {
         let conn = self.conn.lock();
-
-        let deleted = conn.execute(
-            "DELETE FROM pending_blobs WHERE blob_id = ?1 AND sender = ?2",
-            params![blob_id, requester.as_slice()],
-        )?;
-
-        if deleted == 1 {
-            drop(conn);
-            info!("[CHAT_RELAY] Encrypted blob deleted by authorized sender");
-            return Ok(());
-        }
-
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM pending_blobs WHERE blob_id = ?",
-                params![blob_id],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
+        self.blob_custody.delete(&conn, blob_id, requester)?;
         drop(conn);
-
-        if exists {
-            Err(ChatRelayError::Unauthorized)
-        } else {
-            Err(ChatRelayError::BlobNotFound {
-                blob_id: blob_id.to_string(),
-            })
-        }
+        info!("[CHAT_RELAY] Encrypted blob deleted by authorized sender");
+        Ok(())
     }
 
     // ============================================
