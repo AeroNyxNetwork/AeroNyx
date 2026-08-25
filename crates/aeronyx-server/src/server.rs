@@ -611,8 +611,15 @@
 //     before entering the private single-flight lane. Hold its guard through
 //     cache lookup, onion delivery, entry custody, and response insertion so
 //     concurrent exact retries cannot create contradictory delivery results.
+//   - [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] A replacement
+//     process may repeat only exact idempotent local entry custody. It must not
+//     re-announce a wallet route, select another onion path, or claim terminal
+//     evidence that was not durably retained before the predecessor stopped.
 //
 // Last Modified:
+//   [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Routed abandoned
+//     verified submissions through owner-fenced custody-only recovery while
+//     preserving the existing fail-closed pending and capacity boundaries.
 //   [CHAT-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-23 by Codex] Replayed the first
 //     request-bound response for exact retries and rejected request-id reuse
 //     with another envelope before any route or durable-state mutation.
@@ -14511,16 +14518,10 @@ impl Server {
                 return response;
             }
             Ok(VerifiedSubmitCacheLookup::Pending) => {
-                let response = rejected();
-                relay.record_verified_submit_pending_rejection(
-                    unix_now_secs(),
-                    response.result,
-                );
-                warn!(
-                    reason = "verified_submit_request_pending",
-                    "[CHAT_RELAY] Verified submit rejected"
-                );
-                return response;
+                // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] The
+                // transactional admission gate below decides whether this is
+                // still live work or exact abandoned custody from an older
+                // process. Lookup alone cannot safely make that distinction.
             }
             Ok(VerifiedSubmitCacheLookup::Miss) => {}
             Err(error) => {
@@ -14538,8 +14539,9 @@ impl Server {
         // bounded durable replay capacity before wallet-route, network, or
         // custody mutation. Saturation and crash-left pending work reject here;
         // unexpired evidence is never evicted to make room for new effects.
-        match relay.reserve_verified_submit(&request) {
-            Ok(VerifiedSubmitAdmission::Reserved) => {}
+        let entry_recovery = match relay.reserve_verified_submit(&request) {
+            Ok(VerifiedSubmitAdmission::Reserved) => false,
+            Ok(VerifiedSubmitAdmission::ReservedForEntryRecovery) => true,
             Ok(VerifiedSubmitAdmission::Pending) => {
                 let response = rejected();
                 relay.record_verified_submit_pending_rejection(
@@ -14599,25 +14601,35 @@ impl Server {
                 );
                 return response;
             }
-        }
+        };
 
-        relay.wallet_routes.announce(
-            &request.envelope.sender,
-            session.id.clone(),
-            session.client_endpoint,
-        );
-        let onion_outcome = Self::relay_authenticated_chat_over_onion_paths(
-            chat_peer_client,
-            Some(relay.as_ref()),
-            peer_store,
-            node_identity,
-            self_node_id,
-            &request.envelope,
-            Some(&request.request_id),
-        )
-        .await;
-        let onion_delivered = onion_outcome.delivered();
-        let terminal_receipt = onion_outcome.first_terminal_receipt;
+        let (onion_delivered, terminal_receipt) = if entry_recovery {
+            // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Recovery
+            // repeats only idempotent local entry custody. Re-announcing a
+            // wallet route or selecting a fresh onion path could duplicate a
+            // pre-crash network effect whose terminal ACK was never retained.
+            (false, None)
+        } else {
+            relay.wallet_routes.announce(
+                &request.envelope.sender,
+                session.id.clone(),
+                session.client_endpoint,
+            );
+            let onion_outcome = Self::relay_authenticated_chat_over_onion_paths(
+                chat_peer_client,
+                Some(relay.as_ref()),
+                peer_store,
+                node_identity,
+                self_node_id,
+                &request.envelope,
+                Some(&request.request_id),
+            )
+            .await;
+            (
+                onion_outcome.delivered(),
+                onion_outcome.first_terminal_receipt,
+            )
+        };
         let verified_onion = terminal_receipt.is_some();
         if onion_delivered != verified_onion {
             // This is an internal invariant failure, not a remote route fault.
@@ -16089,7 +16101,9 @@ mod tests {
     };
     use crate::config_chat_relay::ChatRelayConfig;
     use crate::error::RuntimeTaskJoinFailureKind;
-    use crate::services::chat_relay::VerifiedSubmitAdmission;
+    use crate::services::chat_relay::{
+        VerifiedSubmitAdmission, VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
+    };
     use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
     use aeronyx_core::ledger::{MemoryLayer, MemoryRecord};
     use aeronyx_core::ledger::{RecordCommitmentBlockV1, GENESIS_PREV_HASH};
@@ -19194,6 +19208,129 @@ mod tests {
         assert_eq!(verified_status.pending_rejected_total, 1);
         assert_eq!(verified_status.capacity_rejected_total, 1);
         assert_eq!(verified_status.rejected_total, 2);
+    }
+
+    #[tokio::test]
+    async fn verified_submit_restart_recovers_entry_without_reselecting_onion_path() {
+        // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Exercise the
+        // real handler after a process crash. The replacement process repeats
+        // only idempotent encrypted entry custody and persists an exact retry
+        // response without wallet-route or onion-network side effects.
+        let directory = tempfile::tempdir().expect("verified recovery directory");
+        let db_path = directory.path().join("verified-recovery.sqlite3");
+        let mut relay_config = ChatRelayConfig::default();
+        relay_config.enabled = true;
+        relay_config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0x89; 32];
+        let sender = IdentityKeyPair::generate();
+        let source_node = IdentityKeyPair::generate();
+        let now = unix_now_secs();
+        let mut envelope = ChatEnvelope {
+            message_id: [0x8A; 16],
+            sender: sender.public_key_bytes(),
+            receiver: [0x8B; 32],
+            timestamp: now,
+            ciphertext: b"opaque restart recovery payload".to_vec(),
+            nonce: [0x8C; 24],
+            content_type: ChatContentType::Text,
+            signature: [0_u8; 64],
+        };
+        envelope.signature = sender.sign(&envelope.sign_data());
+        let request = ChatRelayVerifiedSubmitRequestV1::signed(
+            [0x8D; 16],
+            envelope,
+            now,
+            &sender,
+        )
+        .expect("sign restart recovery request");
+
+        {
+            let predecessor = ChatRelayService::new(relay_config.clone(), secret)
+                .expect("initialize predecessor verified-submit relay");
+            assert_eq!(
+                predecessor
+                    .reserve_verified_submit(&request)
+                    .expect("reserve predecessor verified submit"),
+                VerifiedSubmitAdmission::Reserved
+            );
+            predecessor
+                .store_pending(&request.envelope)
+                .expect("persist predecessor entry custody");
+        }
+        let aged_owner = i64::try_from(
+            now.saturating_sub(VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS + 1),
+        )
+        .expect("convert aged verified-submit owner timestamp");
+        rusqlite::Connection::open(&db_path)
+            .expect("open restart recovery database")
+            .execute(
+                "UPDATE relay_verified_submit_reservations
+                 SET reserved_at = ?1, owner_acquired_at = ?1",
+                rusqlite::params![aged_owner],
+            )
+            .expect("age predecessor verified-submit owner lease");
+
+        let relay = Arc::new(
+            ChatRelayService::new(relay_config, secret)
+                .expect("initialize replacement verified-submit relay"),
+        );
+        let relay_option = Some(Arc::clone(&relay));
+        let session = Arc::new(crate::services::Session::new(
+            aeronyx_common::types::SessionId::generate(),
+            sender.public_key(),
+            aeronyx_core::crypto::SessionKey::from_bytes([0x8E; 32]),
+            Ipv4Addr::new(100, 64, 0, 142),
+            "127.0.0.1:1142".parse().unwrap(),
+        ));
+        let store = PeerStore::new();
+
+        let recovered_response = Server::handle_verified_chat_submit(
+            request.clone(),
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(
+            recovered_response.result,
+            CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1
+        );
+        assert!(recovered_response.terminal_receipt.is_none());
+        recovered_response
+            .validate_for_request(&request)
+            .expect("recovered entry response remains request-bound");
+        assert_eq!(
+            relay
+                .storage_usage()
+                .expect("read recovered entry storage")
+                .pending_messages,
+            1
+        );
+        assert_eq!(relay.peer_status().outbound_rounds, 0);
+        assert!(relay.wallet_routes.lookup(&sender.public_key_bytes()).is_empty());
+
+        let replay_response = Server::handle_verified_chat_submit(
+            request,
+            &session,
+            &relay_option,
+            &store,
+            &source_node.public_key_bytes(),
+            &source_node,
+            None,
+        )
+        .await;
+        assert_eq!(replay_response, recovered_response);
+        assert_eq!(
+            relay
+                .storage_usage()
+                .expect("read exact replay storage")
+                .pending_messages,
+            1
+        );
+        assert_eq!(relay.peer_status().verified_submit.replayed_total, 1);
     }
 
     #[tokio::test]

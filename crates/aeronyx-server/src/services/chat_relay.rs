@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.14.0-DurableBlindRelayReplay
+// Version: 3.15.0-VerifiedSubmitEntryRecovery
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -26,6 +26,10 @@
 //   private reservation before route/custody side effects. Unexpired replay
 //   evidence is never evicted to admit new work; saturation and interrupted
 //   submissions fail closed without repeating encrypted delivery.
+//   [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Added process-owner
+//   fencing and lease takeover to verified-submit reservations. A replacement
+//   process may recover exact idempotent entry custody without reselecting an
+//   uncertain onion path or inventing a lost terminal receipt.
 //   [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Reused the node-private
 //   custody database for HMAC-indexed blind-route reservations and AEAD-sealed
 //   ACK replay. Advertised relay nodes now retain their idempotency boundary
@@ -115,6 +119,7 @@
 //   - Verified submit result labels: core-owned canonical status vocabulary
 //   - Verified submit idempotency: bounded restart-safe replay and conflict guard
 //   - Verified submit admission: crash-safe reservation before relay/custody
+//   - Verified submit recovery: owner-fenced, entry-custody-only restart repair
 //   - Blind relay replay: private durable reservation and sealed exact ACK
 //
 // Dependencies:
@@ -245,6 +250,10 @@
 //     must own one durable anonymous reservation before any route, wallet-route,
 //     or custody mutation. Never evict an unexpired completed response or
 //     reservation to admit new work; reject saturation before side effects.
+//   - [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] A foreign-process
+//     reservation may be taken over only after its owner grace and exact CAS.
+//     Recovery may repeat local exact-idempotent custody only; never announce a
+//     wallet route, choose another onion path, or manufacture terminal proof.
 //   - [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Blind-route claims
 //     have an anonymous process epoch and durable effect boundary. Only an
 //     expired, unarmed claim may move to a new process; armed and legacy claims
@@ -253,6 +262,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.15.0-VerifiedSubmitEntryRecovery — Owner-fenced custody-only takeover
 //   v3.14.0-RecoverableBlindRelayClaim — Restart-safe pre-effect claim takeover
 //   v3.13.0-CrashSafeVerifiedSubmitAdmission — Durable pre-side-effect reservation
 //   v3.12.0-DurableVerifiedSubmitIdempotency — Restart-safe private response replay
@@ -372,7 +382,8 @@ const CHAT_PULL_CURSOR_V2_TAG_BYTES: usize = 16;
 /// Fixed lock striping for concurrent verified-submit single-flight handling.
 const VERIFIED_SUBMIT_SINGLE_FLIGHT_LANES: usize = 64;
 /// Durable verified-submit row format guarded by `relay_schema_features`.
-const VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION: i64 = 2;
+const VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION: i64 = 3;
+const VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION: i64 = 2;
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION: i64 = 1;
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE: &str = "verified_submit_response_cache";
 /// A future-dated request may remain authentic for two timestamp windows.
@@ -392,9 +403,15 @@ const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION: i64 = 3;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION: i64 = 2;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION: i64 = 1;
 const BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE: &str = "blind_relay_route_replay";
-const BLIND_RELAY_PROCESS_EPOCH_BYTES: usize = 16;
+/// Shared process-owner token for restart-safe replay reservations.
+const REPLAY_PROCESS_EPOCH_BYTES: usize = 16;
+const REPLAY_OWNER_TAKEOVER_GRACE_SECS: u64 = 5;
+/// Grace period before a replacement process may recover verified entry custody.
+pub(crate) const VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS: u64 =
+    REPLAY_OWNER_TAKEOVER_GRACE_SECS;
 /// Grace period before another process may own and reconcile an exact claim.
-pub(crate) const BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS: u64 = 5;
+pub(crate) const BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS: u64 =
+    REPLAY_OWNER_TAKEOVER_GRACE_SECS;
 const BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES: usize = 24;
 const BLIND_RELAY_ROUTE_RESPONSE_TAG_BYTES: usize = 16;
 const MAX_BLIND_RELAY_ROUTE_RESPONSE_BYTES: usize = 2048;
@@ -2534,6 +2551,9 @@ pub(crate) enum VerifiedSubmitCacheLookup {
 pub(crate) enum VerifiedSubmitAdmission {
     /// This process owns the durable reservation and may perform side effects.
     Reserved,
+    /// A replacement process owns an exact abandoned request. Recovery may
+    /// repeat only idempotent entry custody and must not select an onion path.
+    ReservedForEntryRecovery,
     /// Another process or a prior crashed process owns the exact reservation.
     Pending,
     /// The same sender/request id is reserved for another envelope.
@@ -2652,8 +2672,12 @@ pub struct ChatRelayService {
     verified_submit_response_key: [u8; 32],
     /// Stable node-local AEAD key for opaque blind-route response replay.
     blind_relay_route_response_key: [u8; 32],
-    /// Random process epoch used only to fence unarmed durable route claims.
-    blind_relay_process_epoch: [u8; BLIND_RELAY_PROCESS_EPOCH_BYTES],
+    /// Random process epoch fencing every restart-recoverable replay claim.
+    ///
+    /// [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Verified submit
+    /// and blind-route reservations share ownership mechanics but retain
+    /// independent HMAC namespaces and tables.
+    replay_process_epoch: [u8; REPLAY_PROCESS_EPOCH_BYTES],
     dedup: MessageDedup,
     verified_submit_cache: Mutex<VerifiedSubmitResponseCache>,
     verified_submit_lanes: Box<[tokio::sync::Mutex<()>]>,
@@ -5275,7 +5299,12 @@ impl ChatRelayService {
             "SELECT COUNT(*) FROM relay_verified_submit_reservations
              WHERE LENGTH(cache_key) != 32
                 OR LENGTH(envelope_fingerprint) != 32
-                OR reserved_at < 0",
+                OR reserved_at < 0
+                OR owner_epoch IS NULL
+                OR TYPEOF(owner_epoch) != 'blob'
+                OR LENGTH(owner_epoch) != 16
+                OR TYPEOF(owner_acquired_at) != 'integer'
+                OR owner_acquired_at < reserved_at",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -5434,8 +5463,8 @@ impl ChatRelayService {
         let verified_submit_response_key = Self::derive_verified_submit_response_key(&node_secret)?;
         let blind_relay_route_response_key =
             Self::derive_blind_relay_route_response_key(&node_secret)?;
-        let mut blind_relay_process_epoch = [0_u8; BLIND_RELAY_PROCESS_EPOCH_BYTES];
-        OsRng.fill_bytes(&mut blind_relay_process_epoch);
+        let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
+        OsRng.fill_bytes(&mut replay_process_epoch);
         let mut peer_status = ChatRelayPeerStatus::new(relay_enabled);
         peer_status.custody_durability =
             ChatRelayCustodyDurabilityStatus::verified_full(synchronous_level);
@@ -5446,7 +5475,7 @@ impl ChatRelayService {
             pull_cursor_key,
             verified_submit_response_key,
             blind_relay_route_response_key,
-            blind_relay_process_epoch,
+            replay_process_epoch,
             dedup: MessageDedup::new(dedup_capacity),
             verified_submit_cache: Mutex::new(VerifiedSubmitResponseCache::new(dedup_capacity)),
             verified_submit_lanes: (0..VERIFIED_SUBMIT_SINGLE_FLIGHT_LANES)
@@ -5614,8 +5643,10 @@ impl ChatRelayService {
     ) -> ChatRelayResult<()> {
         // [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Completed
         // responses and unfinished reservations contain only node-secret HMACs,
-        // sealed bytes, and retention timestamps. The v1 -> v2 migration adds
-        // reservations atomically; a later table loss must fail closed.
+        // sealed bytes, retention timestamps, and random process ownership.
+        // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Schema v3
+        // fences abandoned reservations so a replacement process can recover
+        // entry custody without repeating an uncertain onion side effect.
         let response_table_existed = conn.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM sqlite_master
@@ -5653,7 +5684,9 @@ impl ChatRelayService {
             CREATE TABLE IF NOT EXISTS relay_verified_submit_reservations (
                 cache_key            BLOB    PRIMARY KEY CHECK(LENGTH(cache_key) = 32),
                 envelope_fingerprint BLOB    NOT NULL CHECK(LENGTH(envelope_fingerprint) = 32),
-                reserved_at          INTEGER NOT NULL CHECK(reserved_at >= 0)
+                reserved_at          INTEGER NOT NULL CHECK(reserved_at >= 0),
+                owner_epoch         BLOB    NOT NULL CHECK(LENGTH(owner_epoch) = 16),
+                owner_acquired_at   INTEGER NOT NULL CHECK(owner_acquired_at >= reserved_at)
             );
             CREATE INDEX IF NOT EXISTS idx_verified_submit_reservation_retention
                 ON relay_verified_submit_reservations(reserved_at);
@@ -5668,6 +5701,7 @@ impl ChatRelayService {
             .optional()?;
         if installed_version.is_some_and(|version| {
             version != VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION
+                && version != VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION
                 && version != VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION
         }) {
             return Err(ChatRelayError::CorruptStoredData {
@@ -5679,12 +5713,49 @@ impl ChatRelayService {
                 field: "verified_submit_response_table",
             });
         }
-        if installed_version == Some(VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION)
-            && !reservation_table_existed
+        if matches!(
+            installed_version,
+            Some(
+                VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION
+                    | VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION
+            )
+        ) && !reservation_table_existed
         {
             return Err(ChatRelayError::CorruptStoredData {
                 field: "verified_submit_reservation_table",
             });
+        }
+        let owner_epoch_exists =
+            Self::verified_submit_reservation_column_exists(&tx, "owner_epoch")?;
+        let owner_acquired_at_exists =
+            Self::verified_submit_reservation_column_exists(&tx, "owner_acquired_at")?;
+        if installed_version == Some(VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION)
+            && (!owner_epoch_exists || !owner_acquired_at_exists)
+        {
+            return Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_reservation_columns",
+            });
+        }
+        if !owner_epoch_exists {
+            tx.execute_batch(
+                "ALTER TABLE relay_verified_submit_reservations
+                 ADD COLUMN owner_epoch BLOB",
+            )?;
+        }
+        if !owner_acquired_at_exists {
+            tx.execute_batch(
+                "ALTER TABLE relay_verified_submit_reservations
+                 ADD COLUMN owner_acquired_at INTEGER",
+            )?;
+        }
+        if installed_version != Some(VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION) {
+            // A pre-v3 owner is deliberately foreign to this process. Its
+            // immutable reservation age becomes the first takeover lease.
+            tx.execute(
+                "UPDATE relay_verified_submit_reservations
+                 SET owner_epoch = zeroblob(?1), owner_acquired_at = reserved_at",
+                params![i64::try_from(REPLAY_PROCESS_EPOCH_BYTES).unwrap_or(i64::MAX)],
+            )?;
         }
         let invalid_rows = tx.query_row(
             "SELECT COUNT(*) FROM relay_verified_submit_responses
@@ -5706,7 +5777,12 @@ impl ChatRelayService {
             "SELECT COUNT(*) FROM relay_verified_submit_reservations
              WHERE LENGTH(cache_key) != 32
                 OR LENGTH(envelope_fingerprint) != 32
-                OR reserved_at < 0",
+                OR reserved_at < 0
+                OR owner_epoch IS NULL
+                OR TYPEOF(owner_epoch) != 'blob'
+                OR LENGTH(owner_epoch) != 16
+                OR TYPEOF(owner_acquired_at) != 'integer'
+                OR owner_acquired_at < reserved_at",
             [],
             |row| row.get::<_, i64>(0),
         )?;
@@ -5730,16 +5806,22 @@ impl ChatRelayService {
                 field: "verified_submit_response_installation_marker",
             });
         }
-        if installed_version == Some(VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION)
-            && tx.execute(
-                "UPDATE relay_schema_features SET schema_version = ?1
-                 WHERE feature = ?2 AND schema_version = ?3",
-                params![
-                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
-                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
-                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
-                ],
-            )? != 1
+        if matches!(
+            installed_version,
+            Some(
+                VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION
+                    | VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION
+            )
+        ) && tx.execute(
+            "UPDATE relay_schema_features SET schema_version = ?1
+                 WHERE feature = ?2 AND schema_version IN (?3, ?4)",
+            params![
+                VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
+                VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
+                VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
+                VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
+            ],
+        )? != 1
         {
             return Err(ChatRelayError::CorruptStoredData {
                 field: "verified_submit_response_migration_marker",
@@ -5760,6 +5842,20 @@ impl ChatRelayService {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    fn verified_submit_reservation_column_exists(
+        tx: &Transaction<'_>,
+        expected_column: &str,
+    ) -> ChatRelayResult<bool> {
+        let mut stmt = tx.prepare("PRAGMA table_info(relay_verified_submit_reservations)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for column in columns {
+            if column? == expected_column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn init_blind_relay_route_replay_schema(
@@ -5878,7 +5974,7 @@ impl ChatRelayService {
             tx.execute(
                 "UPDATE relay_blind_route_reservations
                  SET owner_epoch = zeroblob(?1), effect_started_at = reserved_at",
-                params![i64::try_from(BLIND_RELAY_PROCESS_EPOCH_BYTES).unwrap_or(i64::MAX)],
+                params![i64::try_from(REPLAY_PROCESS_EPOCH_BYTES).unwrap_or(i64::MAX)],
             )?;
         }
         if installed_version != Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION) {
@@ -6987,23 +7083,80 @@ impl ChatRelayService {
 
         let existing_reservation = tx
             .query_row(
-                "SELECT envelope_fingerprint FROM relay_verified_submit_reservations
+                "SELECT envelope_fingerprint, reserved_at, owner_epoch,
+                        owner_acquired_at
+                 FROM relay_verified_submit_reservations
                  WHERE cache_key = ?1",
                 params![cache_key.as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
             )
             .optional()?;
-        if let Some(stored_fingerprint) = existing_reservation {
+        if let Some((stored_fingerprint, stored_at, owner_epoch, owner_acquired_at)) =
+            existing_reservation
+        {
             let stored_fingerprint: [u8; 32] =
                 stored_fingerprint
                     .try_into()
                     .map_err(|_| ChatRelayError::CorruptStoredData {
                         field: "verified_submit_reservation_envelope_fingerprint",
                     })?;
-            let outcome = if stored_fingerprint == envelope_fingerprint {
-                VerifiedSubmitAdmission::Pending
+            if stored_fingerprint != envelope_fingerprint {
+                tx.commit()?;
+                return Ok(VerifiedSubmitAdmission::Conflict);
+            }
+            let owner_epoch: [u8; REPLAY_PROCESS_EPOCH_BYTES] = owner_epoch
+                .try_into()
+                .map_err(|_| ChatRelayError::CorruptStoredData {
+                    field: "verified_submit_reservation_owner_epoch",
+                })?;
+            if stored_at < 0 || owner_acquired_at < stored_at {
+                return Err(ChatRelayError::CorruptStoredData {
+                    field: "verified_submit_reservation_state",
+                });
+            }
+            let reclaim_at = owner_acquired_at.saturating_add(
+                i64::try_from(VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS)
+                    .unwrap_or(i64::MAX),
+            );
+            let outcome = if owner_epoch != self.replay_process_epoch
+                && reserved_at >= reclaim_at
+            {
+                // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] The
+                // owner CAS fences a still-running predecessor. Recovery owns
+                // only entry custody; it never repeats path selection.
+                if tx.execute(
+                    "UPDATE relay_verified_submit_reservations
+                     SET owner_epoch = ?1, owner_acquired_at = ?2
+                     WHERE cache_key = ?3
+                       AND envelope_fingerprint = ?4
+                       AND reserved_at = ?5
+                       AND owner_epoch = ?6
+                       AND owner_acquired_at = ?7",
+                    params![
+                        self.replay_process_epoch.as_slice(),
+                        reserved_at,
+                        cache_key.as_slice(),
+                        envelope_fingerprint.as_slice(),
+                        stored_at,
+                        owner_epoch.as_slice(),
+                        owner_acquired_at,
+                    ],
+                )? != 1
+                {
+                    return Err(ChatRelayError::CorruptStoredData {
+                        field: "verified_submit_reservation_takeover",
+                    });
+                }
+                VerifiedSubmitAdmission::ReservedForEntryRecovery
             } else {
-                VerifiedSubmitAdmission::Conflict
+                VerifiedSubmitAdmission::Pending
             };
             tx.commit()?;
             return Ok(outcome);
@@ -7027,12 +7180,14 @@ impl ChatRelayService {
         }
         if tx.execute(
             "INSERT INTO relay_verified_submit_reservations (
-                cache_key, envelope_fingerprint, reserved_at
-             ) VALUES (?1, ?2, ?3)",
+                cache_key, envelope_fingerprint, reserved_at,
+                owner_epoch, owner_acquired_at
+             ) VALUES (?1, ?2, ?3, ?4, ?3)",
             params![
                 cache_key.as_slice(),
                 envelope_fingerprint.as_slice(),
                 reserved_at,
+                self.replay_process_epoch.as_slice(),
             ],
         )? != 1
         {
@@ -7088,8 +7243,14 @@ impl ChatRelayService {
             }
             let removed_reservation = tx.execute(
                 "DELETE FROM relay_verified_submit_reservations
-                 WHERE cache_key = ?1 AND envelope_fingerprint = ?2",
-                params![cache_key.as_slice(), envelope_fingerprint.as_slice()],
+                 WHERE cache_key = ?1
+                   AND envelope_fingerprint = ?2
+                   AND owner_epoch = ?3",
+                params![
+                    cache_key.as_slice(),
+                    envelope_fingerprint.as_slice(),
+                    self.replay_process_epoch.as_slice(),
+                ],
             )?;
             if removed_reservation != 1 {
                 return Err(ChatRelayError::CorruptStoredData {
@@ -7235,7 +7396,7 @@ impl ChatRelayService {
                 tx.commit()?;
                 return Ok(BlindRelayRouteAdmission::Conflict);
             }
-            let owner_epoch: [u8; BLIND_RELAY_PROCESS_EPOCH_BYTES] = owner_epoch
+            let owner_epoch: [u8; REPLAY_PROCESS_EPOCH_BYTES] = owner_epoch
                 .try_into()
                 .map_err(|_| ChatRelayError::CorruptStoredData {
                     field: "blind_relay_route_reservation_owner_epoch",
@@ -7251,7 +7412,7 @@ impl ChatRelayService {
             let reclaim_at = owner_acquired_at.saturating_add(
                 i64::try_from(BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS).unwrap_or(i64::MAX),
             );
-            if owner_epoch != self.blind_relay_process_epoch && reserved_at >= reclaim_at {
+            if owner_epoch != self.replay_process_epoch && reserved_at >= reclaim_at {
                 if tx.execute(
                     "UPDATE relay_blind_route_reservations
                      SET owner_epoch = ?1, owner_acquired_at = ?2
@@ -7261,7 +7422,7 @@ impl ChatRelayService {
                        AND owner_epoch = ?6
                        AND owner_acquired_at = ?7",
                     params![
-                        self.blind_relay_process_epoch.as_slice(),
+                        self.replay_process_epoch.as_slice(),
                         reserved_at,
                         cache_key.as_slice(),
                         request_fingerprint.as_slice(),
@@ -7319,7 +7480,7 @@ impl ChatRelayService {
                 cache_key.as_slice(),
                 request_fingerprint.as_slice(),
                 reserved_at,
-                self.blind_relay_process_epoch.as_slice(),
+                self.replay_process_epoch.as_slice(),
             ],
         )? != 1
         {
@@ -7353,7 +7514,7 @@ impl ChatRelayService {
                 started_at,
                 cache_key.as_slice(),
                 request_fingerprint.as_slice(),
-                self.blind_relay_process_epoch.as_slice(),
+                self.replay_process_epoch.as_slice(),
             ],
         )? != 1
         {
@@ -7382,7 +7543,7 @@ impl ChatRelayService {
             params![
                 cache_key.as_slice(),
                 request_fingerprint.as_slice(),
-                self.blind_relay_process_epoch.as_slice(),
+                self.replay_process_epoch.as_slice(),
             ],
         )? == 1)
     }
@@ -7439,7 +7600,7 @@ impl ChatRelayService {
             params![
                 cache_key.as_slice(),
                 request_fingerprint.as_slice(),
-                self.blind_relay_process_epoch.as_slice(),
+                self.replay_process_epoch.as_slice(),
             ],
         )? != 1
         {
@@ -12231,11 +12392,11 @@ mod tests {
     }
 
     #[test]
-    fn verified_submit_pending_reservation_survives_restart_and_fails_closed() {
-        // [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Simulate
-        // a crash after durable admission but before response completion. The
-        // restarted node must not repeat route or custody during the replay
-        // horizon, and the reservation must expose no raw request metadata.
+    fn verified_submit_pending_reservation_recovers_with_owner_fencing() {
+        // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] A replacement
+        // process may recover exact entry custody after a short grace period,
+        // while owner-CAS completion fences the predecessor and private rows
+        // continue to expose no raw request metadata.
         let db_path = unique_test_db_path("verified-submit-pending-restart");
         let mut config = test_config();
         config.db_path = db_path.to_string_lossy().into_owned();
@@ -12249,42 +12410,50 @@ mod tests {
         )
         .expect("sign crash-window verified submit request");
 
-        {
-            let service = ChatRelayService::new(config.clone(), secret)
-                .expect("create crash-window verified submit relay");
-            assert_eq!(
-                service
-                    .reserve_verified_submit(&request)
-                    .expect("persist crash-window reservation"),
-                VerifiedSubmitAdmission::Reserved
-            );
-            let (cache_key, fingerprint) = service
-                .conn
-                .lock()
-                .query_row(
-                    "SELECT cache_key, envelope_fingerprint
-                     FROM relay_verified_submit_reservations",
-                    [],
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-                )
-                .expect("read private reservation row");
-            assert_eq!(cache_key.len(), 32);
-            assert_eq!(fingerprint.len(), 32);
-            for private_value in [
-                request.request_id.as_slice(),
-                request.envelope.message_id.as_slice(),
-                request.envelope.sender.as_slice(),
-            ] {
-                assert!(!cache_key
-                    .windows(private_value.len())
-                    .any(|window| window == private_value));
-                assert!(!fingerprint
-                    .windows(private_value.len())
-                    .any(|window| window == private_value));
-            }
+        let predecessor = ChatRelayService::new(config.clone(), secret)
+            .expect("create crash-window verified submit relay");
+        assert_eq!(
+            predecessor
+                .reserve_verified_submit(&request)
+                .expect("persist crash-window reservation"),
+            VerifiedSubmitAdmission::Reserved
+        );
+        let (cache_key, fingerprint, owner_epoch) = predecessor
+            .conn
+            .lock()
+            .query_row(
+                "SELECT cache_key, envelope_fingerprint, owner_epoch
+                 FROM relay_verified_submit_reservations",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .expect("read private reservation row");
+        assert_eq!(cache_key.len(), 32);
+        assert_eq!(fingerprint.len(), 32);
+        assert_eq!(owner_epoch.len(), REPLAY_PROCESS_EPOCH_BYTES);
+        for private_value in [
+            request.request_id.as_slice(),
+            request.envelope.message_id.as_slice(),
+            request.envelope.sender.as_slice(),
+        ] {
+            assert!(!cache_key
+                .windows(private_value.len())
+                .any(|window| window == private_value));
+            assert!(!fingerprint
+                .windows(private_value.len())
+                .any(|window| window == private_value));
+            assert!(!owner_epoch
+                .windows(private_value.len())
+                .any(|window| window == private_value));
         }
 
-        let restarted = ChatRelayService::new(config, secret)
+        let restarted = ChatRelayService::new(config.clone(), secret)
             .expect("restart crash-window verified submit relay");
         assert!(matches!(
             restarted
@@ -12295,17 +12464,52 @@ mod tests {
         assert_eq!(
             restarted
                 .reserve_verified_submit(&request)
-                .expect("reject duplicate crash-window reservation"),
+                .expect("preserve live predecessor reservation"),
             VerifiedSubmitAdmission::Pending
         );
+        let aged_owner = sqlite_integer(
+            now_secs().saturating_sub(VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS + 1),
+            "verified_submit_test_aged_owner",
+        )
+        .expect("convert aged verified-submit owner timestamp");
         restarted
             .conn
             .lock()
             .execute(
-                "UPDATE relay_verified_submit_reservations SET reserved_at = 0",
-                [],
+                "UPDATE relay_verified_submit_reservations
+                 SET reserved_at = ?1, owner_acquired_at = ?1",
+                params![aged_owner],
             )
-            .expect("age crash-window reservation");
+            .expect("age crash-window owner lease");
+        assert_eq!(
+            restarted
+                .reserve_verified_submit(&request)
+                .expect("take over abandoned entry custody"),
+            VerifiedSubmitAdmission::ReservedForEntryRecovery
+        );
+        let recovered_response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
+            request.request_id,
+            request.envelope.message_id,
+            false,
+            true,
+            None,
+        );
+        assert!(matches!(
+            predecessor.remember_verified_submit_response(&request, &recovered_response),
+            Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_reservation_completion"
+            })
+        ));
+        restarted
+            .remember_verified_submit_response(&request, &recovered_response)
+            .expect("complete recovered entry custody as current owner");
+        assert!(matches!(
+            restarted
+                .verified_submit_cache_lookup(&request)
+                .expect("replay recovered entry response"),
+            VerifiedSubmitCacheLookup::Exact(response) if response == recovered_response
+        ));
+
         let replacement_request = ChatRelayVerifiedSubmitRequestV1::signed(
             [0xE6; 16],
             make_envelope(&sender, [0xE7; 32]),
@@ -12316,20 +12520,15 @@ mod tests {
         assert_eq!(
             restarted
                 .reserve_verified_submit(&replacement_request)
-                .expect("replace expired reservation during admission"),
+                .expect("reserve unrelated replacement request"),
             VerifiedSubmitAdmission::Reserved
         );
-        assert!(matches!(
-            restarted
-                .verified_submit_cache_lookup(&request)
-                .expect("release expired crash-window reservation on admission"),
-            VerifiedSubmitCacheLookup::Miss
-        ));
         restarted
             .conn
             .lock()
             .execute(
-                "UPDATE relay_verified_submit_reservations SET reserved_at = 0",
+                "UPDATE relay_verified_submit_reservations
+                 SET reserved_at = 0, owner_acquired_at = 0",
                 [],
             )
             .expect("age replacement reservation");
@@ -12346,6 +12545,7 @@ mod tests {
             VerifiedSubmitCacheLookup::Miss
         ));
 
+        drop(predecessor);
         drop(restarted);
         remove_test_database(&db_path);
     }
@@ -12506,7 +12706,7 @@ mod tests {
                 .expect("read private blind-route reservation");
             assert_eq!(cache_key.len(), 32);
             assert_eq!(fingerprint.len(), 32);
-            assert_eq!(owner_epoch.len(), BLIND_RELAY_PROCESS_EPOCH_BYTES);
+            assert_eq!(owner_epoch.len(), REPLAY_PROCESS_EPOCH_BYTES);
             assert!(effect_started_at.is_some());
             assert!(!cache_key
                 .windows(route_id.len())
@@ -12869,7 +13069,7 @@ mod tests {
             )
             .expect("inspect migrated blind-route claim");
         assert_eq!(version, BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION);
-        assert_eq!(owner_epoch, vec![0; BLIND_RELAY_PROCESS_EPOCH_BYTES]);
+        assert_eq!(owner_epoch, vec![0; REPLAY_PROCESS_EPOCH_BYTES]);
         assert_eq!(owner_acquired_at, reserved_at);
         assert_eq!(effect_started_at, Some(reserved_at));
         assert_eq!(
@@ -13051,7 +13251,7 @@ mod tests {
         }
 
         let migrated =
-            ChatRelayService::new(config, secret).expect("migrate verified submit schema v1 to v2");
+            ChatRelayService::new(config, secret).expect("migrate verified submit schema v1 to v3");
         let (version, reservations_table) = migrated
             .conn
             .lock()
@@ -13069,6 +13269,149 @@ mod tests {
         assert_eq!(reservations_table, 1);
 
         drop(migrated);
+        remove_test_database(&db_path);
+    }
+
+    #[test]
+    fn verified_submit_schema_v2_migrates_owner_fencing_atomically() {
+        // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Historical v2
+        // reservations become recoverable without exposing raw identifiers or
+        // temporarily installing a marker newer than the table shape.
+        let db_path = unique_test_db_path("verified-submit-v2-migration");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0xE8; 32];
+        let sender = IdentityKeyPair::generate();
+        let request = ChatRelayVerifiedSubmitRequestV1::signed(
+            [0xE9; 16],
+            make_envelope(&sender, [0xEA; 32]),
+            now_secs(),
+            &sender,
+        )
+        .expect("sign migrated verified-submit request");
+        {
+            let service = ChatRelayService::new(config.clone(), secret)
+                .expect("install current verified-submit schema");
+            assert_eq!(
+                service
+                    .reserve_verified_submit(&request)
+                    .expect("reserve row before v2 simulation"),
+                VerifiedSubmitAdmission::Reserved
+            );
+            let conn = service.conn.lock();
+            conn.execute(
+                "UPDATE relay_schema_features SET schema_version = ?1
+                 WHERE feature = ?2",
+                params![
+                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
+                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
+                ],
+            )
+            .expect("set historical verified-submit v2 marker");
+            conn.execute(
+                "ALTER TABLE relay_verified_submit_reservations
+                 RENAME TO relay_verified_submit_reservations_v3",
+                [],
+            )
+            .expect("preserve current reservation rows");
+            conn.execute_batch(
+                "CREATE TABLE relay_verified_submit_reservations (
+                    cache_key BLOB PRIMARY KEY NOT NULL CHECK(length(cache_key) = 32),
+                    envelope_fingerprint BLOB NOT NULL
+                        CHECK(length(envelope_fingerprint) = 32),
+                    reserved_at INTEGER NOT NULL CHECK(reserved_at >= 0)
+                 ) WITHOUT ROWID;
+                 INSERT INTO relay_verified_submit_reservations (
+                    cache_key, envelope_fingerprint, reserved_at
+                 )
+                 SELECT cache_key, envelope_fingerprint, reserved_at
+                 FROM relay_verified_submit_reservations_v3;
+                 DROP TABLE relay_verified_submit_reservations_v3;",
+            )
+            .expect("install historical verified-submit v2 table");
+        }
+
+        let migrated = ChatRelayService::new(config.clone(), secret)
+            .expect("migrate verified-submit schema v2 to v3");
+        let (version, reserved_at, owner_epoch, owner_acquired_at) = migrated
+            .conn
+            .lock()
+            .query_row(
+                "SELECT
+                    (SELECT schema_version FROM relay_schema_features WHERE feature = ?1),
+                    reserved_at, owner_epoch, owner_acquired_at
+                 FROM relay_verified_submit_reservations",
+                params![VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .expect("inspect migrated verified-submit owner fencing");
+        assert_eq!(version, VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION);
+        assert_eq!(owner_epoch, vec![0_u8; REPLAY_PROCESS_EPOCH_BYTES]);
+        assert_eq!(owner_acquired_at, reserved_at);
+
+        let aged_owner = sqlite_integer(
+            now_secs().saturating_sub(VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS + 1),
+            "verified_submit_test_aged_migrated_owner",
+        )
+        .expect("convert migrated verified-submit owner timestamp");
+        migrated
+            .conn
+            .lock()
+            .execute(
+                "UPDATE relay_verified_submit_reservations
+                 SET reserved_at = ?1, owner_acquired_at = ?1",
+                params![aged_owner],
+            )
+            .expect("age migrated verified-submit owner lease");
+        assert_eq!(
+            migrated
+                .reserve_verified_submit(&request)
+                .expect("recover migrated verified-submit reservation"),
+            VerifiedSubmitAdmission::ReservedForEntryRecovery
+        );
+
+        drop(migrated);
+        remove_test_database(&db_path);
+    }
+
+    #[test]
+    fn verified_submit_installed_owner_column_loss_fails_closed() {
+        // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] A current v3
+        // marker with a downgraded table must never silently disable fencing.
+        let db_path = unique_test_db_path("verified-submit-owner-column-loss");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0xEB; 32];
+        drop(
+            ChatRelayService::new(config.clone(), secret)
+                .expect("install verified-submit owner-fencing schema"),
+        );
+        Connection::open(&db_path)
+            .expect("open verified-submit owner-fencing database")
+            .execute_batch(
+                "DROP TABLE relay_verified_submit_reservations;
+                 CREATE TABLE relay_verified_submit_reservations (
+                    cache_key BLOB PRIMARY KEY NOT NULL CHECK(length(cache_key) = 32),
+                    envelope_fingerprint BLOB NOT NULL
+                        CHECK(length(envelope_fingerprint) = 32),
+                    reserved_at INTEGER NOT NULL CHECK(reserved_at >= 0)
+                 ) WITHOUT ROWID;",
+            )
+            .expect("remove current verified-submit owner columns");
+
+        assert!(matches!(
+            ChatRelayService::new(config, secret),
+            Err(ChatRelayError::CorruptStoredData {
+                field: "verified_submit_reservation_columns"
+            })
+        ));
         remove_test_database(&db_path);
     }
 

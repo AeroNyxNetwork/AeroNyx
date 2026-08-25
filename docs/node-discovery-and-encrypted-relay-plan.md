@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.48.0 - Expose aggregate armed-route recovery outcomes
-through the existing relay health contract without publishing pending volume,
-route identity, peer identity, endpoint, receipt, or ciphertext dimensions.
+Modification Reason: v1.49.0 - Recover an exact crash-left verified submission
+through owner-fenced, idempotent entry custody without reselecting an uncertain
+onion path or inventing a terminal receipt that was not durably retained.
 
 Main Functionality:
 
@@ -31,8 +31,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.48.0 - [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] Reports process-lifetime attempted, completed, and deferred armed-route reconciliation transitions while deliberately omitting current pending volume and every route-, peer-, endpoint-, receipt-, and payload-derived dimension.
+Last Modified: v1.49.0 - [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Gives verified-submit reservations process-owner fencing and permits a replacement process to recover only exact idempotent entry custody, preserving truthful retry availability without repeating an unknown onion side effect.
 
+Previous: v1.48.0 - [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] Reports process-lifetime attempted, completed, and deferred armed-route reconciliation transitions while deliberately omitting current pending volume and every route-, peer-, endpoint-, receipt-, and payload-derived dimension.
 Previous: v1.47.0 - [MIDDLE-HOP-ARMED-RECOVERY 2026-08-25 by Codex] Gives sealed ACKs an explicit storage-only magic/version codec with legacy-row reads, then proves a crashed middle hop can resend the exact signed downstream onion request, recover the terminal node's durable ACK, and seal upstream success without duplicating custody.
 Previous: v1.46.0 - [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Safely takes over an exact armed claim after process grace, repeats only idempotent terminal or downstream work, reconstructs byte-stable onion forwarding, and persists the recovered sealed ACK without duplicating terminal custody.
 Previous: v1.45.0 - [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Persists a random process epoch and explicit effect boundary for each blind-relay claim, safely reclaims only aged unarmed work after restart, and fences the previous process from arming or completing a taken-over route.
@@ -3272,11 +3273,25 @@ Implemented:
   the node-secret HMAC cache key, HMAC envelope fingerprint, and reservation
   time. Completing the request inserts the AEAD-sealed response and removes the
   matching reservation in one SQLite transaction.
-- Replay schema v1 upgrades atomically to v2. A missing reservation table after
-  v2 installation, malformed row, mismatched completion, or unavailable durable
-  admission rejects before side effects. A reservation left by a crash remains
-  `pending` for the authenticated replay horizon; exact retry receives a
-  request-bound rejection rather than risking duplicate relay or custody.
+- Replay schema migrations remain atomic. A missing reservation table after v2
+  installation, malformed row, mismatched completion, or unavailable durable
+  admission rejects before side effects. Same-process and still-live foreign
+  owners remain `pending`; they receive a request-bound rejection rather than
+  risking concurrent relay or custody.
+- [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Replay schema v3 adds a
+  random process owner and independent acquisition time to each reservation.
+  An exact foreign-process claim remains pending during a fixed five-second
+  grace, then moves through one transactional compare-and-swap to the
+  replacement process. v1/v2 rows migrate atomically as foreign owners while
+  retaining their original reservation age; a current v3 marker with missing
+  owner columns fails startup rather than silently recreating safety evidence.
+- A recovered explicit submission never announces a wallet route and never
+  selects or sends over another onion path, because the predecessor may already
+  have reached an unknown terminal. It repeats only exact-idempotent local entry
+  custody and returns the existing request-bound `entry_retry` result without a
+  terminal receipt. A predecessor fenced by takeover cannot seal a response.
+  This preserves retry availability without claiming proof the node no longer
+  possesses or creating custody on a second terminal.
 - Capacity is now admission, not eviction: unexpired completed responses and
   reservations are never removed to accept new work. A full node rejects the
   new request before side effects, while expired rows are pruned in the same
@@ -3391,6 +3406,11 @@ Verification:
   saturation without eviction, admission-time stale cleanup, reservation-table
   disappearance, pre-side-effect live-handler rejection, and backup retention of
   an interrupted reservation.
+- Entry-recovery coverage proves v1-to-v3 and v2-to-v3 migration, owner-column
+  loss rejection, grace-gated foreign-owner takeover, predecessor completion
+  fencing, and exact response replay. The real client handler repeats an
+  already-stored encrypted envelope without increasing pending custody, route
+  rounds, or wallet-route state and returns no terminal receipt.
 - Blind-relay no-eviction coverage fills the complete replay map with live and
   completed evidence, proves the exact ACK remains replayable, proves a new
   authenticated request stops before terminal/forward effects, and confirms
