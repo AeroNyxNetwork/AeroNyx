@@ -61,6 +61,9 @@
 //   [CHAT-RELAY-CLEANUP-DOMAIN 2026-08-25 by Codex] Extracted immutable TTL
 //   cutoffs, expired-row validation, typed replay retention, and bounded SQLite
 //   cleanup behind a composed repository capability.
+//   [CHAT-DIRECT-PEER-CIRCUIT-DOMAIN 2026-08-25 by Codex] Extracted the
+//   generation-safe circuit state machine and anonymous durable checkpoint
+//   behind a composed repository capability.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -305,6 +308,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.27.0-DirectPeerCircuitDomain — Trait-based durable circuit composition
 //   v3.25.0-DurableQuarantineDomain — Trait-based quarantine composition
 //   v3.24.0-BlobCustodyDomain — Trait-based encrypted-blob custody composition
 //   v3.23.0-ExpiredDeliveryDomain — Trait-based expiry delivery composition
@@ -403,6 +407,13 @@ use crate::services::chat_relay_cleanup::{
     CleanupBatchOutcome, CleanupRunSummary, RelayCleanupCutoffs, RelayCleanupDomain,
     CLEANUP_MAX_BATCHES_PER_RUN,
 };
+pub(crate) use crate::services::chat_relay_direct_peer_circuit::ChatRelayDirectPeerPermit;
+use crate::services::chat_relay_direct_peer_circuit::{
+    DirectPeerCircuitDomain, SqliteDirectPeerCircuitRepository,
+    DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION, DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS,
+    DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE, DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS,
+    DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES,
+};
 #[cfg(test)]
 use crate::services::chat_relay_cleanup::CLEANUP_MESSAGE_BATCH_SIZE;
 use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
@@ -480,16 +491,6 @@ const DIRECT_PEER_RETRY_SLO_TARGET_BPS: u16 = 9_900;
 const DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES: u64 = 3;
 /// At or below 50% delivery success with enough failures is a failed window.
 const DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS: u16 = 5_000;
-/// Cooldown before one source-blind target-bound relay recovery probe.
-const DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS: u64 = 30;
-/// Maximum time reserved for one half-open delivery before fail-closed reopen.
-const DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS: u64 = 15;
-/// Consecutive half-open delivery successes required to close the circuit.
-const DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES: u8 = 2;
-/// Durable singleton format for source-blind direct relay circuit state.
-const DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION: i64 = 1;
-/// Fixed schema marker proving the durable circuit checkpoint was installed.
-const DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE: &str = "direct_peer_relay_circuit_checkpoint";
 /// Minimum SQLite synchronous level permitted for acknowledged relay custody.
 const CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL: i64 = 2;
 /// Pages copied per online-backup step before SQLite releases its read lock.
@@ -551,8 +552,6 @@ const CHAT_RELAY_BACKUP_AUDIT_TOTAL_MAX_BYTES: u64 =
 const CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_MAX_BYTES: u64 = 4096;
 /// Maximum abandoned checkpoint temporaries cleaned in one locked append.
 const CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_TEMP_MAX_FILES: usize = 64;
-/// Small tolerated wall-clock adjustment before restart recovery fails closed.
-const DIRECT_PEER_RELAY_CIRCUIT_CLOCK_SKEW_SECS: u64 = 5;
 
 // ============================================
 // Peer relay health status
@@ -1039,460 +1038,6 @@ fn ratio_basis_points(numerator: u64, denominator: u64) -> Option<u16> {
     }
     let basis_points = (u128::from(numerator).saturating_mul(10_000)) / u128::from(denominator);
     Some(basis_points.min(10_000) as u16)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectPeerRelayCircuitState {
-    Closed,
-    Open {
-        retry_at: u64,
-    },
-    HalfOpenReady {
-        successful_probes: u8,
-    },
-    HalfOpenInFlight {
-        successful_probes: u8,
-        lease_expires_at: u64,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectPeerRelayPermitKind {
-    Closed,
-    HalfOpen,
-}
-
-/// Process-local admission token for one target-bound direct relay attempt.
-///
-/// [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] The generation prevents a late
-/// outcome from an older request from closing or reopening a newer circuit.
-/// The token deliberately contains no peer, route, endpoint, message, wallet,
-/// commitment, ciphertext, or payload-derived value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ChatRelayDirectPeerPermit {
-    generation: u64,
-    kind: DirectPeerRelayPermitKind,
-}
-
-impl ChatRelayDirectPeerPermit {
-    /// Returns whether this permit is the circuit's single recovery probe.
-    #[must_use]
-    pub(crate) const fn is_half_open(self) -> bool {
-        matches!(self.kind, DirectPeerRelayPermitKind::HalfOpen)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DirectPeerRelayCircuit {
-    state: DirectPeerRelayCircuitState,
-    generation: u64,
-    opened_total: u64,
-    blocked_total: u64,
-    half_open_attempted_total: u64,
-    half_open_succeeded_total: u64,
-    half_open_failed_total: u64,
-    recovered_total: u64,
-    last_transition_at: Option<u64>,
-    restart_protected: bool,
-    checkpoint_loaded_at: Option<u64>,
-    checkpoint_persisted_at: Option<u64>,
-    checkpoint_failures_total: u64,
-    last_checkpoint_failure_at: Option<u64>,
-}
-
-impl Default for DirectPeerRelayCircuit {
-    fn default() -> Self {
-        Self {
-            state: DirectPeerRelayCircuitState::Closed,
-            generation: 0,
-            opened_total: 0,
-            blocked_total: 0,
-            half_open_attempted_total: 0,
-            half_open_succeeded_total: 0,
-            half_open_failed_total: 0,
-            recovered_total: 0,
-            last_transition_at: None,
-            restart_protected: false,
-            checkpoint_loaded_at: None,
-            checkpoint_persisted_at: None,
-            checkpoint_failures_total: 0,
-            last_checkpoint_failure_at: None,
-        }
-    }
-}
-
-impl DirectPeerRelayCircuit {
-    fn checkpoint_state(&self) -> (&'static str, u8, Option<u64>) {
-        match self.state {
-            DirectPeerRelayCircuitState::Closed => ("closed", 0, None),
-            DirectPeerRelayCircuitState::Open { retry_at } => ("open", 0, Some(retry_at)),
-            DirectPeerRelayCircuitState::HalfOpenReady { successful_probes } => {
-                ("half_open_ready", successful_probes, None)
-            }
-            DirectPeerRelayCircuitState::HalfOpenInFlight {
-                successful_probes,
-                lease_expires_at,
-            } => (
-                "half_open_in_flight",
-                successful_probes,
-                Some(lease_expires_at),
-            ),
-        }
-    }
-
-    fn safety_state_changed(&self, previous: &Self) -> bool {
-        self.state != previous.state
-            || self.opened_total != previous.opened_total
-            || self.half_open_attempted_total != previous.half_open_attempted_total
-            || self.half_open_succeeded_total != previous.half_open_succeeded_total
-            || self.half_open_failed_total != previous.half_open_failed_total
-            || self.recovered_total != previous.recovered_total
-            || self.last_transition_at != previous.last_transition_at
-    }
-
-    fn mark_checkpoint_loaded(&mut self, now: u64, persisted_at: Option<u64>) {
-        self.restart_protected = true;
-        self.checkpoint_loaded_at = Some(now);
-        self.checkpoint_persisted_at = persisted_at;
-    }
-
-    fn mark_checkpoint_persisted(&mut self, now: u64) {
-        self.restart_protected = true;
-        self.checkpoint_persisted_at = Some(now);
-    }
-
-    fn fail_closed_after_checkpoint_error(&mut self, now: u64) {
-        // [DURABLE-DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] A runtime SQLite
-        // failure must never leave a newly admitted half-open request usable.
-        self.checkpoint_failures_total = self.checkpoint_failures_total.saturating_add(1);
-        self.last_checkpoint_failure_at = Some(now);
-        self.restart_protected = false;
-        self.open(now);
-    }
-
-    fn accepts_completion(&self, permit: ChatRelayDirectPeerPermit) -> bool {
-        if permit.generation != self.generation {
-            return false;
-        }
-        matches!(
-            (permit.kind, self.state),
-            (
-                DirectPeerRelayPermitKind::Closed,
-                DirectPeerRelayCircuitState::Closed
-            ) | (
-                DirectPeerRelayPermitKind::HalfOpen,
-                DirectPeerRelayCircuitState::HalfOpenInFlight { .. }
-            )
-        )
-    }
-
-    fn begin(&mut self, now: u64) -> Option<ChatRelayDirectPeerPermit> {
-        match self.state {
-            DirectPeerRelayCircuitState::Closed => Some(ChatRelayDirectPeerPermit {
-                generation: self.generation,
-                kind: DirectPeerRelayPermitKind::Closed,
-            }),
-            DirectPeerRelayCircuitState::Open { retry_at } if now < retry_at => {
-                self.blocked_total = self.blocked_total.saturating_add(1);
-                None
-            }
-            DirectPeerRelayCircuitState::Open { .. } => Some(self.begin_half_open(now, 0)),
-            DirectPeerRelayCircuitState::HalfOpenReady { successful_probes } => {
-                Some(self.begin_half_open(now, successful_probes))
-            }
-            DirectPeerRelayCircuitState::HalfOpenInFlight {
-                lease_expires_at, ..
-            } if now < lease_expires_at => {
-                self.blocked_total = self.blocked_total.saturating_add(1);
-                None
-            }
-            DirectPeerRelayCircuitState::HalfOpenInFlight { .. } => {
-                // [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] A dropped future
-                // cannot permanently strand half-open admission. Expiry is a
-                // failed probe and starts a fresh cooldown without a timer.
-                self.half_open_failed_total = self.half_open_failed_total.saturating_add(1);
-                self.open(now);
-                self.blocked_total = self.blocked_total.saturating_add(1);
-                None
-            }
-        }
-    }
-
-    fn begin_half_open(&mut self, now: u64, successful_probes: u8) -> ChatRelayDirectPeerPermit {
-        self.generation = self.generation.wrapping_add(1);
-        self.state = DirectPeerRelayCircuitState::HalfOpenInFlight {
-            successful_probes,
-            lease_expires_at: now.saturating_add(DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS),
-        };
-        self.half_open_attempted_total = self.half_open_attempted_total.saturating_add(1);
-        self.last_transition_at = Some(now);
-        ChatRelayDirectPeerPermit {
-            generation: self.generation,
-            kind: DirectPeerRelayPermitKind::HalfOpen,
-        }
-    }
-
-    fn cancel(&mut self, now: u64, permit: ChatRelayDirectPeerPermit) {
-        if permit.kind != DirectPeerRelayPermitKind::HalfOpen
-            || permit.generation != self.generation
-        {
-            return;
-        }
-        let DirectPeerRelayCircuitState::HalfOpenInFlight {
-            successful_probes, ..
-        } = self.state
-        else {
-            return;
-        };
-        self.generation = self.generation.wrapping_add(1);
-        self.state = DirectPeerRelayCircuitState::HalfOpenReady { successful_probes };
-        self.last_transition_at = Some(now);
-    }
-
-    fn complete(
-        &mut self,
-        now: u64,
-        permit: ChatRelayDirectPeerPermit,
-        delivery_succeeded: bool,
-        slo_failed: bool,
-    ) -> bool {
-        if !self.accepts_completion(permit) {
-            return false;
-        }
-        match (permit.kind, self.state) {
-            (DirectPeerRelayPermitKind::Closed, DirectPeerRelayCircuitState::Closed) => {
-                if !delivery_succeeded && slo_failed {
-                    self.open(now);
-                }
-            }
-            (
-                DirectPeerRelayPermitKind::HalfOpen,
-                DirectPeerRelayCircuitState::HalfOpenInFlight {
-                    successful_probes, ..
-                },
-            ) => {
-                if !delivery_succeeded {
-                    self.half_open_failed_total = self.half_open_failed_total.saturating_add(1);
-                    self.open(now);
-                    return false;
-                }
-
-                self.half_open_succeeded_total = self.half_open_succeeded_total.saturating_add(1);
-                let successful_probes = successful_probes.saturating_add(1);
-                self.generation = self.generation.wrapping_add(1);
-                if successful_probes >= DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES {
-                    self.state = DirectPeerRelayCircuitState::Closed;
-                    self.recovered_total = self.recovered_total.saturating_add(1);
-                } else {
-                    self.state = DirectPeerRelayCircuitState::HalfOpenReady { successful_probes };
-                }
-                self.last_transition_at = Some(now);
-            }
-            _ => {}
-        }
-        !matches!(self.state, DirectPeerRelayCircuitState::Open { .. })
-    }
-
-    fn open(&mut self, now: u64) {
-        self.generation = self.generation.wrapping_add(1);
-        self.state = DirectPeerRelayCircuitState::Open {
-            retry_at: now.saturating_add(DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS),
-        };
-        self.opened_total = self.opened_total.saturating_add(1);
-        self.last_transition_at = Some(now);
-    }
-
-    fn snapshot(&self, now: u64) -> ChatRelayDirectPeerCircuitStatus {
-        let (state, successful_probes, open_remaining_seconds) = match self.state {
-            DirectPeerRelayCircuitState::Closed => ("closed", 0, None),
-            DirectPeerRelayCircuitState::Open { retry_at } if now < retry_at => {
-                ("open", 0, Some(retry_at.saturating_sub(now)))
-            }
-            DirectPeerRelayCircuitState::Open { .. } => ("half_open", 0, None),
-            DirectPeerRelayCircuitState::HalfOpenReady { successful_probes }
-            | DirectPeerRelayCircuitState::HalfOpenInFlight {
-                successful_probes, ..
-            } => ("half_open", successful_probes, None),
-        };
-        ChatRelayDirectPeerCircuitStatus {
-            state: state.to_string(),
-            half_open_consecutive_successes: successful_probes,
-            opened_total: self.opened_total,
-            blocked_total: self.blocked_total,
-            half_open_attempted_total: self.half_open_attempted_total,
-            half_open_succeeded_total: self.half_open_succeeded_total,
-            half_open_failed_total: self.half_open_failed_total,
-            recovered_total: self.recovered_total,
-            open_remaining_seconds,
-            last_transition_at: self.last_transition_at,
-            restart_protected: self.restart_protected,
-            checkpoint_loaded_at: self.checkpoint_loaded_at,
-            checkpoint_persisted_at: self.checkpoint_persisted_at,
-            checkpoint_failures_total: self.checkpoint_failures_total,
-            last_checkpoint_failure_at: self.last_checkpoint_failure_at,
-            ..ChatRelayDirectPeerCircuitStatus::default()
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DirectPeerRelayCircuitCheckpointRow {
-    schema_version: i64,
-    state: String,
-    successful_probes: i64,
-    deadline_at: Option<i64>,
-    opened_total: i64,
-    blocked_total: i64,
-    half_open_attempted_total: i64,
-    half_open_succeeded_total: i64,
-    half_open_failed_total: i64,
-    recovered_total: i64,
-    last_transition_at: Option<i64>,
-    checkpoint_failures_total: i64,
-    last_checkpoint_failure_at: Option<i64>,
-    updated_at: i64,
-}
-
-impl DirectPeerRelayCircuitCheckpointRow {
-    fn into_circuit(self, now: u64) -> ChatRelayResult<(DirectPeerRelayCircuit, bool)> {
-        // [DURABLE-DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] Decode every
-        // persisted scalar through a bounded conversion before admitting relay.
-        if self.schema_version != DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_version",
-            });
-        }
-        let successful_probes = u8::try_from(self.successful_probes).map_err(|_| {
-            ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_probe_count",
-            }
-        })?;
-        if successful_probes >= DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_probe_count",
-            });
-        }
-        let deadline_at = optional_nonnegative_sqlite_value(
-            self.deadline_at,
-            "direct_peer_circuit_checkpoint_deadline",
-        )?;
-        let last_transition_at = optional_nonnegative_sqlite_value(
-            self.last_transition_at,
-            "direct_peer_circuit_checkpoint_transition",
-        )?;
-        let last_checkpoint_failure_at = optional_nonnegative_sqlite_value(
-            self.last_checkpoint_failure_at,
-            "direct_peer_circuit_checkpoint_failure_time",
-        )?;
-        let updated_at =
-            nonnegative_sqlite_value(self.updated_at, "direct_peer_circuit_checkpoint_updated_at")?;
-        if last_transition_at.is_some_and(|value| value > updated_at)
-            || last_checkpoint_failure_at.is_some_and(|value| value > updated_at)
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_time_order",
-            });
-        }
-        let opened_total = nonnegative_sqlite_value(
-            self.opened_total,
-            "direct_peer_circuit_checkpoint_opened_total",
-        )?;
-        let blocked_total = nonnegative_sqlite_value(
-            self.blocked_total,
-            "direct_peer_circuit_checkpoint_blocked_total",
-        )?;
-        let half_open_attempted_total = nonnegative_sqlite_value(
-            self.half_open_attempted_total,
-            "direct_peer_circuit_checkpoint_attempted_total",
-        )?;
-        let half_open_succeeded_total = nonnegative_sqlite_value(
-            self.half_open_succeeded_total,
-            "direct_peer_circuit_checkpoint_succeeded_total",
-        )?;
-        let half_open_failed_total = nonnegative_sqlite_value(
-            self.half_open_failed_total,
-            "direct_peer_circuit_checkpoint_failed_total",
-        )?;
-        let recovered_total = nonnegative_sqlite_value(
-            self.recovered_total,
-            "direct_peer_circuit_checkpoint_recovered_total",
-        )?;
-        if half_open_succeeded_total.saturating_add(half_open_failed_total)
-            > half_open_attempted_total
-            || u64::from(successful_probes) > half_open_succeeded_total
-            || recovered_total > opened_total
-            || recovered_total.saturating_mul(u64::from(DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES))
-                > half_open_succeeded_total
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_counter_relation",
-            });
-        }
-
-        let state = match self.state.as_str() {
-            "closed" if successful_probes == 0 && deadline_at.is_none() => {
-                DirectPeerRelayCircuitState::Closed
-            }
-            "open" if successful_probes == 0 && opened_total > 0 => {
-                DirectPeerRelayCircuitState::Open {
-                    retry_at: deadline_at.ok_or(ChatRelayError::CorruptStoredData {
-                        field: "direct_peer_circuit_checkpoint_open_deadline",
-                    })?,
-                }
-            }
-            "half_open_ready" if deadline_at.is_none() && opened_total > 0 => {
-                DirectPeerRelayCircuitState::HalfOpenReady { successful_probes }
-            }
-            "half_open_in_flight" if opened_total > 0 => {
-                DirectPeerRelayCircuitState::HalfOpenInFlight {
-                    successful_probes,
-                    lease_expires_at: deadline_at.ok_or(ChatRelayError::CorruptStoredData {
-                        field: "direct_peer_circuit_checkpoint_probe_deadline",
-                    })?,
-                }
-            }
-            _ => {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "direct_peer_circuit_checkpoint_state",
-                });
-            }
-        };
-
-        let mut circuit = DirectPeerRelayCircuit {
-            state,
-            generation: 0,
-            opened_total,
-            blocked_total,
-            half_open_attempted_total,
-            half_open_succeeded_total,
-            half_open_failed_total,
-            recovered_total,
-            last_transition_at,
-            restart_protected: true,
-            checkpoint_loaded_at: Some(now),
-            checkpoint_persisted_at: Some(updated_at),
-            checkpoint_failures_total: nonnegative_sqlite_value(
-                self.checkpoint_failures_total,
-                "direct_peer_circuit_checkpoint_failures_total",
-            )?,
-            last_checkpoint_failure_at,
-        };
-
-        let clock_rollback =
-            updated_at > now.saturating_add(DIRECT_PEER_RELAY_CIRCUIT_CLOCK_SKEW_SECS);
-        let interrupted_probe = matches!(
-            circuit.state,
-            DirectPeerRelayCircuitState::HalfOpenInFlight { .. }
-        );
-        let needs_rewrite = clock_rollback || interrupted_probe;
-        if needs_rewrite {
-            if interrupted_probe {
-                circuit.half_open_failed_total = circuit.half_open_failed_total.saturating_add(1);
-            }
-            circuit.open(now);
-        }
-        Ok((circuit, needs_rewrite))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2606,7 +2151,11 @@ pub struct ChatRelayService {
     dedup: MessageDedup,
     peer_status: RwLock<ChatRelayPeerStatus>,
     direct_peer_retry_slo: Mutex<DirectPeerRetrySloWindow>,
-    direct_peer_relay_circuit: Mutex<DirectPeerRelayCircuit>,
+    /// Source-blind admission state and durable restart checkpoint capability.
+    ///
+    /// [CHAT-DIRECT-PEER-CIRCUIT-DOMAIN 2026-08-25 by Codex] The service
+    /// retains SLO and public telemetry; this domain owns safety transitions.
+    direct_peer_relay_circuit: DirectPeerCircuitDomain,
     maintenance_status: RwLock<ChatRelayMaintenanceStatus>,
     /// Serializes backup publication, replay verification, and retention.
     backup_operations: Mutex<()>,
@@ -5288,7 +4837,10 @@ impl ChatRelayService {
             });
         }
 
-        let _ = Self::read_direct_peer_relay_circuit_checkpoint(conn, now_secs())?;
+        DirectPeerCircuitDomain::<SqliteDirectPeerCircuitRepository>::validate_checkpoint(
+            conn,
+            now_secs(),
+        )?;
 
         let stored_usage = Self::read_storage_usage(conn)?;
         let canonical_usage = Self::read_canonical_storage_usage(conn)?;
@@ -5436,7 +4988,7 @@ impl ChatRelayService {
             dedup: MessageDedup::new(dedup_capacity),
             peer_status: RwLock::new(peer_status),
             direct_peer_retry_slo: Mutex::new(DirectPeerRetrySloWindow::default()),
-            direct_peer_relay_circuit: Mutex::new(DirectPeerRelayCircuit::default()),
+            direct_peer_relay_circuit: DirectPeerCircuitDomain::default(),
             maintenance_status: RwLock::new(ChatRelayMaintenanceStatus::default()),
             backup_operations: Mutex::new(()),
             // v1.3.0-Sovereign: initialise empty route cache
@@ -5444,7 +4996,8 @@ impl ChatRelayService {
         };
 
         svc.init_schema()?;
-        svc.restore_direct_peer_relay_circuit(now_secs())?;
+        svc.direct_peer_relay_circuit
+            .restore(&svc.conn, now_secs())?;
         // [CHAT-RELAY-STARTUP-INTEGRITY 2026-08-14 by Codex] The filesystem
         // path is operator-local state and may contain deployment identities.
         // Keep successful activation observable without publishing that path.
@@ -5462,7 +5015,8 @@ impl ChatRelayService {
         Self::init_blob_and_notification_schema(&conn)?;
         self.durable_quarantine.init_schema(&conn)?;
         Self::init_usage_schema(&conn)?;
-        Self::init_direct_peer_circuit_checkpoint_schema(&mut conn, now_secs())?;
+        self.direct_peer_relay_circuit
+            .init_schema(&mut conn, now_secs())?;
         Self::init_verified_submit_response_schema(&mut conn, now_secs())?;
         Self::init_blind_relay_route_replay_schema(&mut conn, now_secs())?;
         Self::reconcile_storage_usage(&conn)?;
@@ -5470,120 +5024,6 @@ impl ChatRelayService {
         drop(conn);
         self.maintenance_status.write().quarantine_events_retained =
             u64::try_from(retained_quarantine_events).unwrap_or(u64::MAX);
-        Ok(())
-    }
-
-    fn init_direct_peer_circuit_checkpoint_schema(
-        conn: &mut Connection,
-        now: u64,
-    ) -> ChatRelayResult<()> {
-        // [DURABLE-DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] This singleton is
-        // deliberately dimensionless. Do not add peer, route, endpoint, wallet,
-        // message, request commitment, ciphertext, or payload columns.
-        let table_existed = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table'
-                  AND name = 'relay_direct_peer_circuit_checkpoint'
-             )",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS relay_schema_features (
-                feature        TEXT    PRIMARY KEY,
-                schema_version INTEGER NOT NULL CHECK(schema_version > 0),
-                installed_at   INTEGER NOT NULL CHECK(installed_at >= 0)
-            );
-
-            CREATE TABLE IF NOT EXISTS relay_direct_peer_circuit_checkpoint (
-                singleton                     INTEGER PRIMARY KEY CHECK(singleton = 1),
-                schema_version                INTEGER NOT NULL CHECK(schema_version > 0),
-                state                         TEXT    NOT NULL,
-                successful_probes             INTEGER NOT NULL CHECK(successful_probes >= 0),
-                deadline_at                   INTEGER,
-                opened_total                  INTEGER NOT NULL CHECK(opened_total >= 0),
-                blocked_total                 INTEGER NOT NULL CHECK(blocked_total >= 0),
-                half_open_attempted_total     INTEGER NOT NULL CHECK(half_open_attempted_total >= 0),
-                half_open_succeeded_total     INTEGER NOT NULL CHECK(half_open_succeeded_total >= 0),
-                half_open_failed_total        INTEGER NOT NULL CHECK(half_open_failed_total >= 0),
-                recovered_total               INTEGER NOT NULL CHECK(recovered_total >= 0),
-                last_transition_at             INTEGER,
-                checkpoint_failures_total     INTEGER NOT NULL CHECK(checkpoint_failures_total >= 0),
-                last_checkpoint_failure_at    INTEGER,
-                updated_at                    INTEGER NOT NULL CHECK(updated_at >= 0)
-            );
-            ",
-        )?;
-        let installed_version = tx
-            .query_row(
-                "SELECT schema_version FROM relay_schema_features WHERE feature = ?1",
-                params![DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        if installed_version
-            .is_some_and(|version| version != DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION)
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_installation_version",
-            });
-        }
-        if !table_existed && installed_version.is_some() {
-            // [DIRECT-RELAY-SCHEMA-SENTINEL 2026-08-16 by Codex] CREATE TABLE
-            // above is transactional. Returning here rolls it back instead of
-            // manufacturing a closed checkpoint after an installed table loss.
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_table",
-            });
-        }
-        if table_existed {
-            let row_count = tx.query_row(
-                "SELECT COUNT(*) FROM relay_direct_peer_circuit_checkpoint",
-                [],
-                |row| row.get::<_, i64>(0),
-            )?;
-            if row_count != 1 {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "direct_peer_circuit_checkpoint_singleton",
-                });
-            }
-        } else if tx.execute(
-            "INSERT INTO relay_direct_peer_circuit_checkpoint (
-                singleton, schema_version, state, successful_probes, deadline_at,
-                opened_total, blocked_total, half_open_attempted_total,
-                half_open_succeeded_total, half_open_failed_total, recovered_total,
-                last_transition_at, checkpoint_failures_total,
-                last_checkpoint_failure_at, updated_at
-             ) VALUES (1, ?1, 'closed', 0, NULL, 0, 0, 0, 0, 0, 0, NULL, 0, NULL, ?2)",
-            params![
-                DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION,
-                sqlite_integer(now, "direct_peer_circuit_checkpoint_init_time")?
-            ],
-        )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_singleton",
-            });
-        }
-        if installed_version.is_none()
-            && tx.execute(
-                "INSERT INTO relay_schema_features (feature, schema_version, installed_at)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE,
-                    DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION,
-                    sqlite_integer(now, "direct_peer_circuit_schema_installed_at")?
-                ],
-            )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_installation_marker",
-            });
-        }
-        tx.commit()?;
         Ok(())
     }
 
@@ -6031,168 +5471,6 @@ impl ChatRelayService {
             }
         }
         Ok(false)
-    }
-
-    fn read_direct_peer_relay_circuit_checkpoint(
-        conn: &Connection,
-        now: u64,
-    ) -> ChatRelayResult<(DirectPeerRelayCircuit, bool)> {
-        // [CHAT-RELAY-VERIFIED-BACKUP 2026-08-16 by Codex] Startup recovery
-        // and backup certification must validate exactly the same anonymous
-        // checkpoint semantics. Keep this reader free of in-memory locks.
-        let row = conn.query_row(
-            "SELECT schema_version, state, successful_probes, deadline_at,
-                    opened_total, blocked_total, half_open_attempted_total,
-                    half_open_succeeded_total, half_open_failed_total,
-                    recovered_total, last_transition_at,
-                    checkpoint_failures_total, last_checkpoint_failure_at,
-                    updated_at
-             FROM relay_direct_peer_circuit_checkpoint
-             WHERE singleton = 1",
-            [],
-            |row| {
-                Ok(DirectPeerRelayCircuitCheckpointRow {
-                    schema_version: row.get(0)?,
-                    state: row.get(1)?,
-                    successful_probes: row.get(2)?,
-                    deadline_at: row.get(3)?,
-                    opened_total: row.get(4)?,
-                    blocked_total: row.get(5)?,
-                    half_open_attempted_total: row.get(6)?,
-                    half_open_succeeded_total: row.get(7)?,
-                    half_open_failed_total: row.get(8)?,
-                    recovered_total: row.get(9)?,
-                    last_transition_at: row.get(10)?,
-                    checkpoint_failures_total: row.get(11)?,
-                    last_checkpoint_failure_at: row.get(12)?,
-                    updated_at: row.get(13)?,
-                })
-            },
-        )?;
-        row.into_circuit(now)
-    }
-
-    fn restore_direct_peer_relay_circuit(&self, now: u64) -> ChatRelayResult<()> {
-        let mut circuit = {
-            let conn = self.conn.lock();
-            let (mut circuit, needs_rewrite) =
-                Self::read_direct_peer_relay_circuit_checkpoint(&conn, now)?;
-            if needs_rewrite {
-                circuit.mark_checkpoint_persisted(now);
-                Self::write_direct_peer_circuit_checkpoint(&conn, &circuit, now)?;
-            }
-            circuit
-        };
-        // The loaded timestamp is process-local evidence, while persisted_at
-        // identifies the durable safety state that survived the restart.
-        let persisted_at = circuit.checkpoint_persisted_at;
-        circuit.mark_checkpoint_loaded(now, persisted_at);
-        *self.direct_peer_relay_circuit.lock() = circuit;
-        Ok(())
-    }
-
-    fn write_direct_peer_circuit_checkpoint(
-        conn: &Connection,
-        circuit: &DirectPeerRelayCircuit,
-        now: u64,
-    ) -> ChatRelayResult<()> {
-        let (state, successful_probes, deadline_at) = circuit.checkpoint_state();
-        let updated = conn.execute(
-            "UPDATE relay_direct_peer_circuit_checkpoint
-             SET schema_version = ?1,
-                 state = ?2,
-                 successful_probes = ?3,
-                 deadline_at = ?4,
-                 opened_total = ?5,
-                 blocked_total = ?6,
-                 half_open_attempted_total = ?7,
-                 half_open_succeeded_total = ?8,
-                 half_open_failed_total = ?9,
-                 recovered_total = ?10,
-                 last_transition_at = ?11,
-                 checkpoint_failures_total = ?12,
-                 last_checkpoint_failure_at = ?13,
-                 updated_at = ?14
-             WHERE singleton = 1",
-            params![
-                DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION,
-                state,
-                i64::from(successful_probes),
-                optional_sqlite_integer(deadline_at, "direct_peer_circuit_checkpoint_deadline")?,
-                sqlite_integer(
-                    circuit.opened_total,
-                    "direct_peer_circuit_checkpoint_opened_total"
-                )?,
-                sqlite_integer(
-                    circuit.blocked_total,
-                    "direct_peer_circuit_checkpoint_blocked_total"
-                )?,
-                sqlite_integer(
-                    circuit.half_open_attempted_total,
-                    "direct_peer_circuit_checkpoint_attempted_total"
-                )?,
-                sqlite_integer(
-                    circuit.half_open_succeeded_total,
-                    "direct_peer_circuit_checkpoint_succeeded_total"
-                )?,
-                sqlite_integer(
-                    circuit.half_open_failed_total,
-                    "direct_peer_circuit_checkpoint_failed_total"
-                )?,
-                sqlite_integer(
-                    circuit.recovered_total,
-                    "direct_peer_circuit_checkpoint_recovered_total"
-                )?,
-                optional_sqlite_integer(
-                    circuit.last_transition_at,
-                    "direct_peer_circuit_checkpoint_transition"
-                )?,
-                sqlite_integer(
-                    circuit.checkpoint_failures_total,
-                    "direct_peer_circuit_checkpoint_failures_total"
-                )?,
-                optional_sqlite_integer(
-                    circuit.last_checkpoint_failure_at,
-                    "direct_peer_circuit_checkpoint_failure_time"
-                )?,
-                sqlite_integer(now, "direct_peer_circuit_checkpoint_updated_at")?,
-            ],
-        )?;
-        if updated != 1 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "direct_peer_circuit_checkpoint_singleton",
-            });
-        }
-        Ok(())
-    }
-
-    fn persist_direct_peer_circuit_transition(
-        &self,
-        circuit: &mut DirectPeerRelayCircuit,
-        mut next: DirectPeerRelayCircuit,
-        now: u64,
-    ) -> bool {
-        next.mark_checkpoint_persisted(now);
-        let result = {
-            let conn = self.conn.lock();
-            Self::write_direct_peer_circuit_checkpoint(&conn, &next, now)
-        };
-        match result {
-            Ok(()) => {
-                *circuit = next;
-                true
-            }
-            Err(error) => {
-                // Log only the stable bucket. Raw SQLite details can expose an
-                // operator-local path or database internals.
-                warn!(
-                    reason = error.reason_bucket(),
-                    "[CHAT_RELAY] Direct relay circuit checkpoint failed closed"
-                );
-                circuit.fail_closed_after_checkpoint_error(now);
-                false
-            }
-        }
     }
 
     fn init_pending_message_schema(conn: &mut Connection) -> ChatRelayResult<()> {
@@ -7887,31 +7165,13 @@ impl ChatRelayService {
         // [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] Admission is intentionally
         // process-global and source-blind; per-peer quarantine remains owned by
         // PeerStore and must not be duplicated with identity-labelled state here.
-        let mut circuit = self.direct_peer_relay_circuit.lock();
-        let previous = circuit.clone();
-        let mut next = previous.clone();
-        let permit = next.begin(now);
-        if next.safety_state_changed(&previous) {
-            if !self.persist_direct_peer_circuit_transition(&mut circuit, next, now) {
-                return None;
-            }
-        } else {
-            *circuit = next;
-        }
-        permit
+        self.direct_peer_relay_circuit.begin(&self.conn, now)
     }
 
     /// Releases an unused half-open permit after a local preflight failure.
     pub(crate) fn cancel_direct_peer_delivery(&self, now: u64, permit: ChatRelayDirectPeerPermit) {
-        let mut circuit = self.direct_peer_relay_circuit.lock();
-        let previous = circuit.clone();
-        let mut next = previous.clone();
-        next.cancel(now, permit);
-        if next.safety_state_changed(&previous) {
-            let _ = self.persist_direct_peer_circuit_transition(&mut circuit, next, now);
-        } else {
-            *circuit = next;
-        }
+        self.direct_peer_relay_circuit
+            .cancel(&self.conn, now, permit);
     }
 
     /// Completes one aggregate target-bound direct relay delivery observation.
@@ -7938,11 +7198,7 @@ impl ChatRelayService {
         // [DIRECT-RELAY-SLO 2026-08-15 by Codex] Every v3 delivery contributes
         // exactly one aggregate sample, including successful first attempts.
         // The fixed ring retains no event identity or peer dimension.
-        let mut circuit = self.direct_peer_relay_circuit.lock();
-        if !circuit.accepts_completion(permit) {
-            return false;
-        }
-        let slo_failed = {
+        let observe_slo_failed = || {
             let mut window = self.direct_peer_retry_slo.lock();
             window.record(
                 now,
@@ -7952,17 +7208,13 @@ impl ChatRelayService {
             );
             window.snapshot(now).status == "failed"
         };
-        let previous = circuit.clone();
-        let mut next = previous.clone();
-        let mut circuit_allows_more = next.complete(now, permit, delivery_succeeded, slo_failed);
-        if next.safety_state_changed(&previous) {
-            circuit_allows_more =
-                self.persist_direct_peer_circuit_transition(&mut circuit, next, now)
-                    && circuit_allows_more;
-        } else {
-            *circuit = next;
-        }
-        drop(circuit);
+        let circuit_allows_more = self.direct_peer_relay_circuit.complete(
+            &self.conn,
+            now,
+            permit,
+            delivery_succeeded,
+            observe_slo_failed,
+        );
         if !retry_triggered && !final_failure_deterministic {
             return circuit_allows_more;
         }
@@ -8238,7 +7490,7 @@ impl ChatRelayService {
         // aggregate independently; neither guard is held while taking the next.
         // Completion uses circuit -> SLO, so no reverse nested lock exists.
         let now = now_secs();
-        let circuit = self.direct_peer_relay_circuit.lock().snapshot(now);
+        let circuit = self.direct_peer_relay_circuit.snapshot(now);
         let recent_window = self.direct_peer_retry_slo.lock().snapshot(now);
         let mut status = self.peer_status.read().clone();
         status.direct_peer_retry.recent_window = recent_window;
@@ -8762,24 +8014,8 @@ fn nonnegative_sqlite_value(value: i64, field: &'static str) -> ChatRelayResult<
     u64::try_from(value).map_err(|_| ChatRelayError::CorruptStoredData { field })
 }
 
-fn optional_nonnegative_sqlite_value(
-    value: Option<i64>,
-    field: &'static str,
-) -> ChatRelayResult<Option<u64>> {
-    value
-        .map(|value| nonnegative_sqlite_value(value, field))
-        .transpose()
-}
-
 fn sqlite_integer(value: u64, field: &'static str) -> ChatRelayResult<i64> {
     i64::try_from(value).map_err(|_| ChatRelayError::CorruptStoredData { field })
-}
-
-fn optional_sqlite_integer(
-    value: Option<u64>,
-    field: &'static str,
-) -> ChatRelayResult<Option<i64>> {
-    value.map(|value| sqlite_integer(value, field)).transpose()
 }
 
 // ============================================

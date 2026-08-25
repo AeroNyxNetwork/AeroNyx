@@ -33,8 +33,11 @@
 //   typed corrupt-row isolation and de-identified evidence capability.
 //   [CHAT-RELAY-CLEANUP-DOMAIN 2026-08-25 by Codex] Registered the private
 //   bounded retention policy, validation, and persistence capability.
+//   [CHAT-DIRECT-PEER-CIRCUIT-DOMAIN 2026-08-25 by Codex] Registered the
+//   private direct-peer circuit state and checkpoint repository capability.
 //
 // Last Modified:
+//   v0.30.0-DirectPeerCircuitDomain - Registered restart-safe circuit domain
 //   v0.29.0-BoundedCleanupDomain - Registered private cleanup capability
 //   v0.28.0-DurableQuarantineDomain - Registered private quarantine capability
 //   v0.27.0-BlobCustodyDomain - Registered private encrypted-blob capability
@@ -87,6 +90,7 @@ pub mod chat_relay;
 mod chat_relay_blind_route;
 mod chat_relay_blob_custody;
 mod chat_relay_cleanup;
+mod chat_relay_direct_peer_circuit;
 mod chat_relay_expired_delivery;
 mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;
