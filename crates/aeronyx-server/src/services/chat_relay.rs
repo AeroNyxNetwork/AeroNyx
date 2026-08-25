@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.24.0-BlobCustodyDomain
+// Version: 3.25.0-DurableQuarantineDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -55,6 +55,9 @@
 //   [CHAT-BLOB-CUSTODY-DOMAIN 2026-08-25 by Codex] Extracted opaque encrypted
 //   blob identity, quotas, persistence, retrieval, and sender-bound deletion
 //   behind a composed repository capability.
+//   [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex] Extracted atomic
+//   poison-row replacement, de-identified evidence, retention, and backlog
+//   checks behind a typed, composed repository capability.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -299,6 +302,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.25.0-DurableQuarantineDomain — Trait-based quarantine composition
 //   v3.24.0-BlobCustodyDomain — Trait-based encrypted-blob custody composition
 //   v3.23.0-ExpiredDeliveryDomain — Trait-based expiry delivery composition
 //   v3.22.0-PendingCustodyDomain — Trait-based custody write composition
@@ -402,6 +406,14 @@ use crate::services::chat_relay_pending_pull::PendingMessagePullDomain;
 #[cfg(test)]
 use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_CURSOR_V2_BYTES;
 use crate::services::chat_relay_pull_cursor::{ChatPullCursorCodec, PullCursorV2};
+use crate::services::chat_relay_quarantine::{
+    CorruptDurableRow, DurableQuarantineDomain, QuarantineRowTarget,
+    QUARANTINE_SOURCE_PENDING_MESSAGE,
+};
+#[cfg(test)]
+use crate::services::chat_relay_quarantine::{
+    MAX_QUARANTINE_EVENTS, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION,
+};
 #[cfg(unix)]
 use crate::services::chat_relay_runtime_fence::ChatRelayRuntimeFence;
 pub(crate) use crate::services::chat_relay_verified_submit::{
@@ -432,14 +444,8 @@ const CLEANUP_BLOB_BATCH_SIZE: usize = 128;
 const CLEANUP_NOTIFICATION_BATCH_SIZE: usize = 1024;
 /// Maximum expired private verified-submit rows removed per transaction.
 const CLEANUP_VERIFIED_SUBMIT_RESPONSE_BATCH_SIZE: usize = 1024;
-/// Maximum privacy-minimised quarantine events removed by one transaction.
-const CLEANUP_QUARANTINE_EVENT_BATCH_SIZE: usize = 1024;
 /// Maximum cleanup transactions executed by one scheduled maintenance run.
 const CLEANUP_MAX_BATCHES_PER_RUN: usize = 8;
-/// Maximum retained de-identified corruption events.
-const MAX_QUARANTINE_EVENTS: usize = 4096;
-pub(crate) const QUARANTINE_SOURCE_PENDING_MESSAGE: &str = "pending_message";
-pub(crate) const QUARANTINE_SOURCE_EXPIRED_NOTIFICATION: &str = "expired_notification";
 /// Durable verified-submit row format guarded by `relay_schema_features`.
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION: i64 = 3;
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION: i64 = 2;
@@ -2123,14 +2129,6 @@ struct StoredExpiredMessageRow {
     queue_sequence: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CorruptDurableRow {
-    pub(crate) row_key: i64,
-    pub(crate) source_kind: &'static str,
-    pub(crate) reason: &'static str,
-    pub(crate) encoded_bytes: u64,
-}
-
 #[derive(Debug, Default)]
 struct ValidatedExpiredMessageBatch {
     valid_rows: Vec<ExpiredMessageRow>,
@@ -2678,6 +2676,11 @@ pub struct ChatRelayService {
     /// [CHAT-BLOB-CUSTODY-DOMAIN 2026-08-25 by Codex] The service retains API,
     /// connection locking, and telemetry; the composed domain owns mechanics.
     blob_custody: EncryptedBlobCustodyDomain,
+    /// Typed poison-row isolation and de-identified durable evidence.
+    ///
+    /// [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex] Pull and cleanup
+    /// flows retain telemetry; this domain owns atomic replacement mechanics.
+    durable_quarantine: DurableQuarantineDomain,
     /// Private verified-submit replay domain capability.
     ///
     /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
@@ -5496,6 +5499,7 @@ impl ChatRelayService {
         let pending_custody = PendingMessageCustodyDomain::new(&config);
         let expired_notification_delivery = ExpiredNotificationDelivery::new();
         let blob_custody = EncryptedBlobCustodyDomain::new(node_secret, &config);
+        let durable_quarantine = DurableQuarantineDomain::new(&config);
         let verified_submit_replay = VerifiedSubmitReplay::new(node_secret, dedup_capacity)?;
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
@@ -5514,6 +5518,7 @@ impl ChatRelayService {
             pending_custody,
             expired_notification_delivery,
             blob_custody,
+            durable_quarantine,
             verified_submit_replay,
             blind_route_replay,
             replay_process_epoch,
@@ -5544,19 +5549,16 @@ impl ChatRelayService {
         let mut conn = self.conn.lock();
         Self::init_pending_message_schema(&mut conn)?;
         Self::init_blob_and_notification_schema(&conn)?;
-        Self::init_quarantine_schema(&conn)?;
+        self.durable_quarantine.init_schema(&conn)?;
         Self::init_usage_schema(&conn)?;
         Self::init_direct_peer_circuit_checkpoint_schema(&mut conn, now_secs())?;
         Self::init_verified_submit_response_schema(&mut conn, now_secs())?;
         Self::init_blind_relay_route_replay_schema(&mut conn, now_secs())?;
         Self::reconcile_storage_usage(&conn)?;
-        let retained_quarantine_events =
-            conn.query_row("SELECT COUNT(*) FROM relay_quarantine_events", [], |row| {
-                row.get::<_, i64>(0)
-            })?;
+        let retained_quarantine_events = self.durable_quarantine.retained_count(&conn)?;
         drop(conn);
         self.maintenance_status.write().quarantine_events_retained =
-            nonnegative_sqlite_counter(retained_quarantine_events);
+            u64::try_from(retained_quarantine_events).unwrap_or(u64::MAX);
         Ok(())
     }
 
@@ -6439,24 +6441,6 @@ impl ChatRelayService {
                 ON expired_notifications(sender, pushed, created_at, id);
             CREATE INDEX IF NOT EXISTS idx_en_cleanup
                 ON expired_notifications(pushed, created_at, id);
-            ",
-        )?;
-        Ok(())
-    }
-
-    fn init_quarantine_schema(conn: &Connection) -> ChatRelayResult<()> {
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS relay_quarantine_events (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_kind     TEXT    NOT NULL,
-                reason          TEXT    NOT NULL,
-                row_count       INTEGER NOT NULL CHECK(row_count > 0),
-                encoded_bytes   INTEGER NOT NULL CHECK(encoded_bytes >= 0),
-                quarantined_at  INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_rqe_retention
-                ON relay_quarantine_events(quarantined_at, id);
             ",
         )?;
         Ok(())
@@ -7415,107 +7399,6 @@ impl ChatRelayService {
         })
     }
 
-    fn quarantine_retention_cutoff(&self, now: i64) -> i64 {
-        let ttl = i64::try_from(self.config.expired_notification_ttl_secs).unwrap_or(i64::MAX);
-        now.saturating_sub(ttl)
-    }
-
-    fn insert_quarantine_events(
-        tx: &Transaction<'_>,
-        now: i64,
-        rows: &[CorruptDurableRow],
-    ) -> ChatRelayResult<()> {
-        let mut aggregates: HashMap<(&'static str, &'static str), (u64, u64)> = HashMap::new();
-        for row in rows {
-            let aggregate = aggregates
-                .entry((row.source_kind, row.reason))
-                .or_insert((0, 0));
-            aggregate.0 = aggregate.0.saturating_add(1);
-            aggregate.1 = aggregate.1.saturating_add(row.encoded_bytes);
-        }
-
-        let mut stmt = tx.prepare(
-            "INSERT INTO relay_quarantine_events
-             (source_kind, reason, row_count, encoded_bytes, quarantined_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for ((source_kind, reason), (row_count, encoded_bytes)) in aggregates {
-            stmt.execute(params![
-                source_kind,
-                reason,
-                i64::try_from(row_count).unwrap_or(i64::MAX),
-                i64::try_from(encoded_bytes).unwrap_or(i64::MAX),
-                now,
-            ])?;
-        }
-        Ok(())
-    }
-
-    fn delete_pending_rows_by_rowid(
-        tx: &Transaction<'_>,
-        rows: &[CorruptDurableRow],
-    ) -> ChatRelayResult<()> {
-        let mut stmt = tx.prepare("DELETE FROM pending_messages WHERE rowid = ?1")?;
-        for row in rows {
-            if stmt.execute(params![row.row_key])? != 1 {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "pending_message_quarantine_delete_count",
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn delete_notification_rows_by_id(
-        tx: &Transaction<'_>,
-        rows: &[CorruptDurableRow],
-    ) -> ChatRelayResult<()> {
-        let mut stmt = tx.prepare("DELETE FROM expired_notifications WHERE id = ?1")?;
-        for row in rows {
-            if stmt.execute(params![row.row_key])? != 1 {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "expired_notification_quarantine_delete_count",
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn trim_quarantine_events(
-        tx: &Transaction<'_>,
-        retention_cutoff: i64,
-    ) -> ChatRelayResult<usize> {
-        let cleanup_limit = i64::try_from(CLEANUP_QUARANTINE_EVENT_BATCH_SIZE).unwrap_or(i64::MAX);
-        let max_events = i64::try_from(MAX_QUARANTINE_EVENTS).unwrap_or(i64::MAX);
-        let removed_stale = tx.execute(
-            "DELETE FROM relay_quarantine_events
-             WHERE id IN (
-                 SELECT id FROM relay_quarantine_events
-                 WHERE quarantined_at < ?1
-                 ORDER BY quarantined_at ASC, id ASC
-                 LIMIT ?2
-             )",
-            params![retention_cutoff, cleanup_limit],
-        )?;
-        let removed_overflow = tx.execute(
-            "DELETE FROM relay_quarantine_events
-             WHERE id IN (
-                 SELECT id FROM relay_quarantine_events
-                 ORDER BY quarantined_at DESC, id DESC
-                 LIMIT ?1 OFFSET ?2
-             )",
-            params![cleanup_limit, max_events],
-        )?;
-        Ok(removed_stale.saturating_add(removed_overflow))
-    }
-
-    fn quarantine_event_count(tx: &Transaction<'_>) -> ChatRelayResult<usize> {
-        let count = tx.query_row("SELECT COUNT(*) FROM relay_quarantine_events", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
-    }
-
     fn record_pull_quarantine(
         &self,
         now: u64,
@@ -7568,24 +7451,22 @@ impl ChatRelayService {
         }
 
         let quarantine_now = now_secs();
-        let quarantine_now_i64 = i64::try_from(quarantine_now).unwrap_or(i64::MAX);
-        let retention_cutoff = self.quarantine_retention_cutoff(quarantine_now_i64);
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::insert_quarantine_events(&tx, quarantine_now_i64, corrupt_rows)?;
-        Self::delete_pending_rows_by_rowid(&tx, corrupt_rows)?;
-        let removed_events = Self::trim_quarantine_events(&tx, retention_cutoff)?;
-        let retained_events = Self::quarantine_event_count(&tx)?;
-        tx.commit()?;
+        let outcome = self.durable_quarantine.replace_rows(
+            conn,
+            QuarantineRowTarget::PendingMessage,
+            corrupt_rows,
+            quarantine_now,
+        )?;
 
         self.record_pull_quarantine(
             quarantine_now,
-            corrupt_rows.len(),
+            outcome.quarantined_rows,
             0,
-            removed_events,
-            retained_events,
+            outcome.removed_events,
+            outcome.retained_events,
         );
         warn!(
-            quarantined_pending_messages = corrupt_rows.len(),
+            quarantined_pending_messages = outcome.quarantined_rows,
             "[CHAT_RELAY] Corrupt pending rows isolated during pull"
         );
         Ok(())
@@ -7812,25 +7693,23 @@ impl ChatRelayService {
             drop(conn);
         } else {
             let quarantine_now = now_secs();
-            let quarantine_now_i64 = i64::try_from(quarantine_now).unwrap_or(i64::MAX);
-            let retention_cutoff = self.quarantine_retention_cutoff(quarantine_now_i64);
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            Self::insert_quarantine_events(&tx, quarantine_now_i64, &page.corrupt_rows)?;
-            Self::delete_notification_rows_by_id(&tx, &page.corrupt_rows)?;
-            let removed_events = Self::trim_quarantine_events(&tx, retention_cutoff)?;
-            let retained_events = Self::quarantine_event_count(&tx)?;
-            tx.commit()?;
+            let outcome = self.durable_quarantine.replace_rows(
+                &mut conn,
+                QuarantineRowTarget::ExpiredNotification,
+                &page.corrupt_rows,
+                quarantine_now,
+            )?;
             drop(conn);
 
             self.record_pull_quarantine(
                 quarantine_now,
                 0,
-                page.corrupt_rows.len(),
-                removed_events,
-                retained_events,
+                outcome.quarantined_rows,
+                outcome.removed_events,
+                outcome.retained_events,
             );
             warn!(
-                quarantined_expired_notifications = page.corrupt_rows.len(),
+                quarantined_expired_notifications = outcome.quarantined_rows,
                 "[CHAT_RELAY] Corrupt expiry notifications isolated during pull"
             );
         }
@@ -7981,7 +7860,7 @@ impl ChatRelayService {
         for batch_index in 0..max_batches {
             let batch_result = {
                 let mut conn = self.conn.lock();
-                Self::run_cleanup_transaction(
+                self.run_cleanup_transaction(
                     &mut conn,
                     now,
                     cutoff,
@@ -8042,6 +7921,7 @@ impl ChatRelayService {
     }
 
     fn run_cleanup_transaction(
+        &self,
         conn: &mut Connection,
         now: i64,
         cutoff: i64,
@@ -8061,12 +7941,13 @@ impl ChatRelayService {
             let expired_message_count = expired_batch.valid_rows.len();
             let quarantined_pending_messages = expired_batch.corrupt_rows.len();
             Self::queue_expiry_notifications(&tx, now, &expired_batch.valid_rows)?;
-            Self::insert_quarantine_events(&tx, now, &expired_batch.corrupt_rows)?;
+            self.durable_quarantine
+                .record(&tx, now, &expired_batch.corrupt_rows)?;
             Self::delete_expired_message_batch(&tx, &expired_batch.selected_rowids)?;
             let expired_blobs = Self::delete_expired_blob_batch(&tx, cutoff, blob_limit)?;
             let removed_notifications =
                 Self::delete_stale_notification_batch(&tx, notif_cutoff, notification_limit)?;
-            let removed_quarantine_events = Self::trim_quarantine_events(&tx, notif_cutoff)?;
+            let quarantine_maintenance = self.durable_quarantine.maintain(&tx, now)?;
             let removed_verified_submit_responses = Self::delete_stale_verified_submit_batch(
                 &tx,
                 "relay_verified_submit_responses",
@@ -8099,9 +7980,9 @@ impl ChatRelayService {
                 blind_route_cutoff,
                 verified_submit_limit,
             )?;
-            let retained_quarantine_events = Self::quarantine_event_count(&tx)?;
-            let has_more = Self::cleanup_backlog_exists(
+            let has_more = self.cleanup_backlog_exists(
                 &tx,
+                now,
                 cutoff,
                 notif_cutoff,
                 verified_submit_cutoff,
@@ -8113,12 +7994,12 @@ impl ChatRelayService {
                 expired_blobs,
                 removed_notifications,
                 quarantined_pending_messages,
-                removed_quarantine_events,
+                removed_quarantine_events: quarantine_maintenance.removed_events,
                 removed_verified_submit_responses,
                 removed_verified_submit_reservations,
                 removed_blind_route_responses,
                 removed_blind_route_reservations,
-                retained_quarantine_events,
+                retained_quarantine_events: quarantine_maintenance.retained_events,
                 has_more,
             })
         })();
@@ -8384,7 +8265,9 @@ impl ChatRelayService {
     }
 
     fn cleanup_backlog_exists(
+        &self,
         tx: &Transaction<'_>,
+        now: i64,
         cutoff: i64,
         notif_cutoff: i64,
         verified_submit_cutoff: i64,
@@ -8413,17 +8296,7 @@ impl ChatRelayService {
             params![notif_cutoff],
             |row| row.get::<_, i64>(0),
         )? != 0;
-        let max_quarantine_events = i64::try_from(MAX_QUARANTINE_EVENTS).unwrap_or(i64::MAX);
-        let quarantine_has_more = tx.query_row(
-            "SELECT
-                 EXISTS(
-                     SELECT 1 FROM relay_quarantine_events
-                     WHERE quarantined_at < ?1
-                 )
-                 OR (SELECT COUNT(*) FROM relay_quarantine_events) > ?2",
-            params![notif_cutoff, max_quarantine_events],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
+        let quarantine_has_more = self.durable_quarantine.backlog_exists(tx, now)?;
 
         let verified_submit_has_more = tx.query_row(
             "SELECT EXISTS(
@@ -9380,10 +9253,6 @@ impl ChatRelayService {
             now_secs(),
         )
     }
-}
-
-fn nonnegative_sqlite_counter(value: i64) -> u64 {
-    u64::try_from(value).unwrap_or_default()
 }
 
 fn nonnegative_sqlite_value(value: i64, field: &'static str) -> ChatRelayResult<u64> {

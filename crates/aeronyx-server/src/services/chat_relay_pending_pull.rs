@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pending_pull.rs
 // ============================================
-// Version: 1.0.0-PendingPullDomain
+// Version: 1.1.0-DurableQuarantineBoundary
 //
 // Creation Reason:
 //   [CHAT-PENDING-PULL-DOMAIN 2026-08-25 by Codex] Extract pending-message
@@ -15,8 +15,9 @@
 //   - Returns typed valid/corrupt page results without performing side effects.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns the connection lock, quarantine transaction,
-//     telemetry, cursor protection, and final pagination decisions.
+//   - `chat_relay.rs` owns the connection lock, telemetry, cursor protection,
+//     and final pagination decisions.
+//   - `chat_relay_quarantine.rs` owns typed corrupt-row evidence and isolation.
 //   - `aeronyx-core` owns the bounded envelope codec and signature contract.
 //
 // Main Logical Flow:
@@ -34,16 +35,16 @@
 //   - Replacement repositories must preserve limits and deterministic order.
 //
 // Last Modified:
+//   [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex]
+//   v1.1.0-DurableQuarantineBoundary - Consume shared typed corruption model
 //   v1.0.0-PendingPullDomain - Initial repository/validation composition
 // ============================================
 
 use aeronyx_core::protocol::chat::decode_envelope;
 use rusqlite::{params, Connection};
 
-use super::chat_relay::{
-    ChatRelayError, ChatRelayResult, CorruptDurableRow, PendingMessage,
-    QUARANTINE_SOURCE_PENDING_MESSAGE,
-};
+use super::chat_relay::{ChatRelayError, ChatRelayResult, PendingMessage};
+use super::chat_relay_quarantine::{CorruptDurableRow, QUARANTINE_SOURCE_PENDING_MESSAGE};
 
 #[derive(Debug, Clone)]
 pub(crate) struct StoredPendingMessageRow {

@@ -29,8 +29,11 @@
 //   expiry-notification read, validation, pagination, and ACK capability.
 //   [CHAT-BLOB-CUSTODY-DOMAIN 2026-08-25 by Codex] Registered the private
 //   encrypted-blob identity, quota, storage, retrieval, and deletion capability.
+//   [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex] Registered the private
+//   typed corrupt-row isolation and de-identified evidence capability.
 //
 // Last Modified:
+//   v0.28.0-DurableQuarantineDomain - Registered private quarantine capability
 //   v0.27.0-BlobCustodyDomain - Registered private encrypted-blob capability
 //   v0.26.0-ExpiredDeliveryDomain - Registered private expiry delivery capability
 //   v0.25.0-PendingCustodyDomain - Registered private custody write capability
@@ -84,6 +87,7 @@ mod chat_relay_expired_delivery;
 mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;
 mod chat_relay_pull_cursor;
+mod chat_relay_quarantine;
 #[cfg(unix)]
 mod chat_relay_runtime_fence;
 mod chat_relay_verified_submit;

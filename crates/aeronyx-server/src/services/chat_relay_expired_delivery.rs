@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_expired_delivery.rs
 // ============================================
-// Version: 1.0.0-ExpiredDeliveryDomain
+// Version: 1.1.0-DurableQuarantineBoundary
 //
 // Creation Reason:
 //   [CHAT-EXPIRED-DELIVERY-DOMAIN 2026-08-25 by Codex] Extract expiry-control
@@ -15,7 +15,8 @@
 //   - Marks a deduplicated delivered page as pushed in one transaction.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns connection locking, quarantine, telemetry, and API.
+//   - `chat_relay.rs` owns connection locking, telemetry, and API.
+//   - `chat_relay_quarantine.rs` owns typed corrupt-row evidence and isolation.
 //   - `rusqlite` provides the production durable repository implementation.
 //
 // Main Logical Flow:
@@ -31,6 +32,8 @@
 //   - Never log sender/receiver keys, notification IDs, or serialized payloads.
 //
 // Last Modified:
+//   [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex]
+//   v1.1.0-DurableQuarantineBoundary - Consume shared typed corruption model
 //   v1.0.0-ExpiredDeliveryDomain - Initial delivery repository composition
 // ============================================
 
@@ -39,9 +42,10 @@ use std::collections::HashSet;
 use rusqlite::{params, Connection, TransactionBehavior};
 
 use super::chat_relay::{
-    ChatRelayResult, CorruptDurableRow, ExpiredNotification, MAX_EXPIRED_NOTIFICATIONS_PER_PULL,
-    MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION,
+    ChatRelayResult, ExpiredNotification, MAX_EXPIRED_NOTIFICATIONS_PER_PULL,
+    MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES,
 };
+use super::chat_relay_quarantine::{CorruptDurableRow, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION};
 
 /// Raw durable expiry-notification row returned by a repository.
 #[derive(Debug, Clone)]
