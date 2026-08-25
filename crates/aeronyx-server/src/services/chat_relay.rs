@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.19.0-BlindRouteReplayDomain
+// Version: 3.20.0-PullCursorDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -40,6 +40,9 @@
 //   [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Extracted private route
 //   identity and exact ACK protection behind a composed trait capability while
 //   preserving service-owned SQLite admission and completion transactions.
+//   [CHAT-PULL-CURSOR-DOMAIN 2026-08-25 by Codex] Extracted the opaque v2 pull
+//   cursor model, HKDF/AEAD mechanism, and binding rules behind a composed
+//   trait capability while preserving SQLite snapshot paging and wire bytes.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -284,6 +287,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.20.0-PullCursorDomain — Trait-based opaque cursor composition
 //   v3.19.0-BlindRouteReplayDomain — Trait-based route replay composition
 //   v3.18.0-VerifiedSubmitReplayDomain — Trait-based replay-domain composition
 //   v3.17.0-ChatRelayRuntimeFence — OS-owned single-process custody fencing
@@ -338,10 +342,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chacha20poly1305::{
-    aead::{Aead, NewAead, Payload},
-    Key, XChaCha20Poly1305, XNonce,
-};
 use dashmap::{mapref::entry::Entry, DashMap};
 use hmac::{Hmac, Mac};
 use parking_lot::{Mutex, RwLock};
@@ -373,6 +373,9 @@ use crate::services::chat_relay_blind_route::BlindRouteReplay;
 #[cfg(test)]
 use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
     as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
+#[cfg(test)]
+use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_CURSOR_V2_BYTES;
+use crate::services::chat_relay_pull_cursor::{ChatPullCursorCodec, PullCursorV2};
 #[cfg(unix)]
 use crate::services::chat_relay_runtime_fence::ChatRelayRuntimeFence;
 pub(crate) use crate::services::chat_relay_verified_submit::{
@@ -411,11 +414,6 @@ const CLEANUP_MAX_BATCHES_PER_RUN: usize = 8;
 const MAX_QUARANTINE_EVENTS: usize = 4096;
 const QUARANTINE_SOURCE_PENDING_MESSAGE: &str = "pending_message";
 const QUARANTINE_SOURCE_EXPIRED_NOTIFICATION: &str = "expired_notification";
-/// Current binary format for an opaque ChatPullV2 cursor.
-const CHAT_PULL_CURSOR_V2_VERSION: u8 = 1;
-const CHAT_PULL_CURSOR_V2_NONCE_BYTES: usize = 24;
-const CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES: usize = 16;
-const CHAT_PULL_CURSOR_V2_TAG_BYTES: usize = 16;
 /// Durable verified-submit row format guarded by `relay_schema_features`.
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION: i64 = 3;
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION: i64 = 2;
@@ -440,13 +438,6 @@ pub(crate) const VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS: u64 =
 /// Grace period before another process may own and reconcile an exact claim.
 pub(crate) const BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS: u64 =
     REPLAY_OWNER_TAKEOVER_GRACE_SECS;
-const CHAT_PULL_CURSOR_V2_BYTES: usize = 1
-    + CHAT_PULL_CURSOR_V2_NONCE_BYTES
-    + CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES
-    + CHAT_PULL_CURSOR_V2_TAG_BYTES;
-const CHAT_PULL_CURSOR_V2_AAD_DOMAIN: &[u8] = b"AeroNyx-ChatPullCursor-v2";
-const CHAT_PULL_CURSOR_V2_HKDF_SALT: &[u8] = b"AeroNyx-ChatPullCursor-v2-key";
-const CHAT_PULL_CURSOR_V2_HKDF_INFO: &[u8] = b"XChaCha20-Poly1305";
 /// Recent target-bound delivery health uses five fixed one-minute buckets.
 const DIRECT_PEER_RETRY_SLO_BUCKET_SECS: u64 = 60;
 const DIRECT_PEER_RETRY_SLO_BUCKET_COUNT: usize = 5;
@@ -2087,12 +2078,6 @@ pub struct PendingMessagePageV2 {
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PullCursorV2 {
-    position: u64,
-    ceiling: u64,
-}
-
 #[derive(Debug)]
 struct ExpiredMessageRow {
     message_id: [u8; 16],
@@ -2666,8 +2651,11 @@ pub struct ChatRelayService {
     #[cfg(unix)]
     _runtime_fence: Option<ChatRelayRuntimeFence>,
     node_secret: [u8; 32],
-    /// Stable node-local AEAD key for opaque v2 pull cursors.
-    pull_cursor_key: [u8; 32],
+    /// Receiver/filter-bound opaque snapshot cursor capability.
+    ///
+    /// [CHAT-PULL-CURSOR-DOMAIN 2026-08-25 by Codex] The service owns paging;
+    /// this composed object owns the stable wire and cryptographic mechanism.
+    pull_cursor_codec: ChatPullCursorCodec,
     /// Private verified-submit replay domain capability.
     ///
     /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
@@ -5481,7 +5469,7 @@ impl ChatRelayService {
 
         let dedup_capacity = config.dedup_lru_capacity;
         let relay_enabled = config.enabled;
-        let pull_cursor_key = Self::derive_pull_cursor_key(&node_secret)?;
+        let pull_cursor_codec = ChatPullCursorCodec::new(&node_secret)?;
         let verified_submit_replay = VerifiedSubmitReplay::new(node_secret, dedup_capacity)?;
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
@@ -5495,7 +5483,7 @@ impl ChatRelayService {
             #[cfg(unix)]
             _runtime_fence: runtime_fence,
             node_secret,
-            pull_cursor_key,
+            pull_cursor_codec,
             verified_submit_replay,
             blind_route_replay,
             replay_process_epoch,
@@ -6579,60 +6567,14 @@ impl ChatRelayService {
     // Opaque ChatPullV2 cursor protection
     // ============================================
 
-    fn derive_pull_cursor_key(node_secret: &[u8; 32]) -> ChatRelayResult<[u8; 32]> {
-        let hkdf = hkdf::Hkdf::<Sha256>::new(Some(CHAT_PULL_CURSOR_V2_HKDF_SALT), node_secret);
-        let mut key = [0_u8; 32];
-        hkdf.expand(CHAT_PULL_CURSOR_V2_HKDF_INFO, &mut key)
-            .map_err(|_| ChatRelayError::PullCursorEncryptionFailed)?;
-        Ok(key)
-    }
-
-    fn pull_cursor_v2_aad(receiver: &[u8; 32], after_timestamp: u64) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(
-            CHAT_PULL_CURSOR_V2_AAD_DOMAIN.len() + receiver.len() + std::mem::size_of::<u64>(),
-        );
-        aad.extend_from_slice(CHAT_PULL_CURSOR_V2_AAD_DOMAIN);
-        aad.extend_from_slice(receiver);
-        aad.extend_from_slice(&after_timestamp.to_le_bytes());
-        aad
-    }
-
     fn encode_pull_cursor_v2(
         &self,
         receiver: &[u8; 32],
         after_timestamp: u64,
         cursor: PullCursorV2,
     ) -> ChatRelayResult<Vec<u8>> {
-        if cursor.position > cursor.ceiling {
-            return Err(ChatRelayError::PullCursorEncryptionFailed);
-        }
-
-        let mut plaintext = [0_u8; CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES];
-        plaintext[..8].copy_from_slice(&cursor.position.to_le_bytes());
-        plaintext[8..].copy_from_slice(&cursor.ceiling.to_le_bytes());
-
-        let mut nonce_bytes = [0_u8; CHAT_PULL_CURSOR_V2_NONCE_BYTES];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.pull_cursor_key));
-        let aad = Self::pull_cursor_v2_aad(receiver, after_timestamp);
-        let ciphertext = cipher
-            .encrypt(
-                XNonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: &plaintext,
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| ChatRelayError::PullCursorEncryptionFailed)?;
-        if ciphertext.len() != CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES + CHAT_PULL_CURSOR_V2_TAG_BYTES {
-            return Err(ChatRelayError::PullCursorEncryptionFailed);
-        }
-
-        let mut encoded = Vec::with_capacity(CHAT_PULL_CURSOR_V2_BYTES);
-        encoded.push(CHAT_PULL_CURSOR_V2_VERSION);
-        encoded.extend_from_slice(&nonce_bytes);
-        encoded.extend_from_slice(&ciphertext);
-        Ok(encoded)
+        self.pull_cursor_codec
+            .encode(receiver, after_timestamp, cursor)
     }
 
     fn decode_pull_cursor_v2(
@@ -6641,41 +6583,8 @@ impl ChatRelayService {
         after_timestamp: u64,
         encoded: &[u8],
     ) -> ChatRelayResult<PullCursorV2> {
-        if encoded.len() != CHAT_PULL_CURSOR_V2_BYTES
-            || encoded.first().copied() != Some(CHAT_PULL_CURSOR_V2_VERSION)
-        {
-            return Err(ChatRelayError::InvalidPullCursor);
-        }
-
-        let nonce_start = 1;
-        let ciphertext_start = nonce_start + CHAT_PULL_CURSOR_V2_NONCE_BYTES;
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&self.pull_cursor_key));
-        let aad = Self::pull_cursor_v2_aad(receiver, after_timestamp);
-        let plaintext = cipher
-            .decrypt(
-                XNonce::from_slice(&encoded[nonce_start..ciphertext_start]),
-                Payload {
-                    msg: &encoded[ciphertext_start..],
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| ChatRelayError::InvalidPullCursor)?;
-        if plaintext.len() != CHAT_PULL_CURSOR_V2_PAYLOAD_BYTES {
-            return Err(ChatRelayError::InvalidPullCursor);
-        }
-
-        let mut position_bytes = [0_u8; 8];
-        position_bytes.copy_from_slice(&plaintext[..8]);
-        let mut ceiling_bytes = [0_u8; 8];
-        ceiling_bytes.copy_from_slice(&plaintext[8..]);
-        let cursor = PullCursorV2 {
-            position: u64::from_le_bytes(position_bytes),
-            ceiling: u64::from_le_bytes(ceiling_bytes),
-        };
-        if cursor.position > cursor.ceiling || cursor.ceiling > i64::MAX as u64 {
-            return Err(ChatRelayError::InvalidPullCursor);
-        }
-        Ok(cursor)
+        self.pull_cursor_codec
+            .decode(receiver, after_timestamp, encoded)
     }
 
     // ============================================
