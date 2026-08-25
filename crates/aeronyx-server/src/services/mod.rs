@@ -17,8 +17,11 @@
 //   Unix process-lifecycle capability composed by the custody service.
 //   [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Registered the private
 //   verified-submit domain capability composed by the custody service.
+//   [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Registered the private
+//   blind-route replay identity and response-protection capability.
 //
 // Last Modified:
+//   v0.22.0-BlindRouteReplayDomain - Registered private route replay capability
 //   v0.21.0-VerifiedSubmitReplayDomain - Registered private replay capability
 //   v0.20.0-ChatRelayRuntimeFence - Registered private custody ownership guard
 //   v0.19.0-CustodyAuditRotation - Aggregate segmented-audit observability
@@ -60,6 +63,7 @@
 
 pub mod blind_vault;
 pub mod chat_relay;
+mod chat_relay_blind_route;
 #[cfg(unix)]
 mod chat_relay_runtime_fence;
 mod chat_relay_verified_submit;
