@@ -38,8 +38,13 @@
 //! - This is real protocol traffic, not a synthetic counter mutation.
 //! - [CHAT-RELAY-DURABILITY-PREFLIGHT 2026-08-16 by Codex] Missing or
 //!   unverified custody durability must fail before ephemeral sessions exist.
+//! - [RELAY-SMOKE-LOOPBACK-SOURCE 2026-08-25 by Codex] Bind the UDP client to
+//!   the matching loopback family; this command is host-local by contract.
 //!
-//! Last Modified: v1.1.0-DurableCustodyPreflight - Requires verified FULL
+//! Last Modified: v1.2.0-LoopbackSourceBinding - Uses an explicit loopback
+//! source address for portable host-local UDP handshake behavior.
+//!
+//! Previous: v1.1.0-DurableCustodyPreflight - Requires verified FULL
 //! durability before authenticated relay traffic.
 // ============================================
 
@@ -477,9 +482,12 @@ impl RelaySmokeClient {
         identity: IdentityKeyPair,
         deadline: TokioInstant,
     ) -> Result<Self> {
+        // [RELAY-SMOKE-LOOPBACK-SOURCE 2026-08-25 by Codex] Validation makes
+        // the smoke path host-local. Bind the same address family explicitly;
+        // wildcard UDP sources can fail loopback route selection on macOS.
         let bind_addr = match server_addr {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => "[::]:0",
+            SocketAddr::V4(_) => "127.0.0.1:0",
+            SocketAddr::V6(_) => "[::1]:0",
         };
         let socket = UdpSocket::bind(bind_addr)
             .await
