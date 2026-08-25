@@ -108,6 +108,11 @@
 //! - [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Converts parser-front,
 //!   authentication, validation, and durable-store rejection diagnostics into
 //!   a validated aggregate reason before relay health can export it
+//! - [CHAT-PEER-ADMISSION-DOMAIN 2026-08-26 by Codex] Composes global
+//!   admission, authenticated fairness, and exact ACK replay through a private
+//!   trait-based domain instead of retaining policy inside HTTP orchestration
+//! - [CHAT-PEER-ACK-COMPLETION-TTL 2026-08-26 by Codex] Starts exact completed
+//!   ACK retention when durable acceptance finishes rather than request ingress
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -292,8 +297,13 @@
 //!   signature work or sign a failure receipt for an unauthenticated request.
 //!   The owned admission permit must remain inside the blocking worker so task
 //!   cancellation cannot release capacity while verification is still active.
+//! - Direct-peer ACK replay ownership is isolated in `chat_peer_admission.rs`.
+//!   Keep HTTP extraction, signatures, and wire responses in this file while
+//!   admission policy remains replaceable and free of user-level dimensions.
 //!
 //! ## Last Modified
+//! v0.61.0-DirectPeerAdmissionDomain - Compose monotonic admission and exact
+//! ACK replay; completed ACK TTL now begins at durable completion
 //! v0.60.0-RecoverableBlindRelayClaim - Persist a fenced effect boundary so
 //! unarmed restart claims recover while ambiguous side effects stay fail-closed
 //! v0.59.0-BlindRelayBodyAdmissionOrder - Preserve the fixed 413 contract for
@@ -426,6 +436,10 @@ use sha2::{Digest, Sha256};
 use tokio::{sync::Semaphore, time::sleep};
 use tracing::{debug, warn};
 
+use super::chat_peer_admission::{
+    AuthenticatedPeerRelayReplayStart, DirectPeerAdmissionDomain, DirectPeerAdmissionPolicy,
+    PeerRelayRateLimitWindow,
+};
 use crate::api::{
     canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
     InFlightRequestGuard, PEER_ACK_RESPONSE_MAX_BYTES,
@@ -497,19 +511,6 @@ const PEER_CHAT_RELAY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
 
 /// Maximum ordinary peer-relay requests allowed in parser/handler execution.
 const MAX_IN_FLIGHT_PEER_CHAT_REQUESTS: usize = 64;
-
-/// Maximum authenticated direct-relay node buckets retained in memory.
-const MAX_AUTHENTICATED_PEER_RELAY_BUCKETS: usize = 4096;
-
-/// Maximum exact authenticated requests retained for safe ACK replay.
-const MAX_AUTHENTICATED_PEER_RELAY_REPLAYS: usize = 4096;
-
-/// Maximum live and stale generations retained by the ACK replay queue.
-const MAX_AUTHENTICATED_PEER_RELAY_REPLAY_GENERATIONS: usize =
-    MAX_AUTHENTICATED_PEER_RELAY_REPLAYS * 2;
-
-/// Completed ACKs expire before their signed receipt freshness horizon.
-const AUTHENTICATED_PEER_RELAY_REPLAY_TTL: Duration = Duration::from_secs(90);
 
 /// HTTP 425 remains unavailable as a named constant in the pinned http crate.
 const HTTP_TOO_EARLY_STATUS_CODE: u16 = 425;
@@ -612,11 +613,9 @@ struct ChatPeerState {
 #[derive(Clone)]
 struct PeerRelayRequestGate {
     in_flight: Arc<AtomicUsize>,
-    rate_limit: Arc<Mutex<PeerRelayRateLimitWindow>>,
-    requests_per_minute: u32,
-    authenticated_rate_limit: Arc<Mutex<AuthenticatedPeerRelayRateLimiter>>,
-    authenticated_requests_per_minute: u32,
-    authenticated_replays: Arc<Mutex<AuthenticatedPeerRelayReplayCache>>,
+    /// [CHAT-PEER-ADMISSION-DOMAIN 2026-08-26 by Codex] Policy and exact
+    /// replay ownership are composed behind one replaceable capability.
+    admission: Arc<dyn DirectPeerAdmissionPolicy>,
     chat_relay: Option<Arc<ChatRelayService>>,
 }
 
@@ -628,24 +627,16 @@ impl PeerRelayRequestGate {
     ) -> Self {
         Self {
             in_flight: Arc::new(AtomicUsize::new(0)),
-            rate_limit: Arc::new(Mutex::new(PeerRelayRateLimitWindow::new(Instant::now()))),
-            requests_per_minute,
-            authenticated_rate_limit: Arc::new(Mutex::new(
-                AuthenticatedPeerRelayRateLimiter::default(),
-            )),
-            authenticated_requests_per_minute,
-            authenticated_replays: Arc::new(Mutex::new(
-                AuthenticatedPeerRelayReplayCache::default(),
+            admission: Arc::new(DirectPeerAdmissionDomain::new(
+                requests_per_minute,
+                authenticated_requests_per_minute,
             )),
             chat_relay,
         }
     }
 
     fn admit(&self, now: Instant) -> bool {
-        self.rate_limit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .allow(now, self.requests_per_minute)
+        self.admission.admit_global(now)
     }
 
     fn record_rejected(&self, reason: ChatRelayInboundFailureReason) {
@@ -655,10 +646,7 @@ impl PeerRelayRequestGate {
     }
 
     fn admit_authenticated(&self, node_id: [u8; 32], now: Instant) -> bool {
-        self.authenticated_rate_limit
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .allow(node_id, now, self.authenticated_requests_per_minute)
+        self.admission.admit_authenticated(node_id, now)
     }
 
     fn begin_authenticated_replay(
@@ -666,314 +654,7 @@ impl PeerRelayRequestGate {
         request_commitment: [u8; 32],
         now: Instant,
     ) -> AuthenticatedPeerRelayReplayStart {
-        let mut cache = self
-            .authenticated_replays
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match cache.begin(request_commitment, now) {
-            AuthenticatedPeerRelayReplayDecision::New(generation) => {
-                AuthenticatedPeerRelayReplayStart::Acquired(AuthenticatedPeerRelayReplayLease::new(
-                    Arc::clone(&self.authenticated_replays),
-                    request_commitment,
-                    generation,
-                ))
-            }
-            AuthenticatedPeerRelayReplayDecision::InFlight => {
-                AuthenticatedPeerRelayReplayStart::InFlight
-            }
-            AuthenticatedPeerRelayReplayDecision::Completed(response) => {
-                AuthenticatedPeerRelayReplayStart::Completed(response)
-            }
-            AuthenticatedPeerRelayReplayDecision::Saturated => {
-                AuthenticatedPeerRelayReplayStart::Saturated
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AuthenticatedPeerRelayReplayState {
-    InFlight,
-    Completed(PeerChatRelayResponseV2),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AuthenticatedPeerRelayReplayEntry {
-    observed_at: Instant,
-    generation: u64,
-    state: AuthenticatedPeerRelayReplayState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AuthenticatedPeerRelayReplayDecision {
-    New(u64),
-    InFlight,
-    Completed(PeerChatRelayResponseV2),
-    Saturated,
-}
-
-enum AuthenticatedPeerRelayReplayStart {
-    Acquired(AuthenticatedPeerRelayReplayLease),
-    InFlight,
-    Completed(PeerChatRelayResponseV2),
-    Saturated,
-}
-
-/// Owns one authenticated request until its exact ACK is published.
-///
-/// [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Cancellation or an
-/// error removes the in-flight marker through `Drop`; durable success consumes
-/// the lease and publishes the exact signed ACK for bounded replay. The cache
-/// key is only a SHA-256 request commitment and carries no receiver or content.
-struct AuthenticatedPeerRelayReplayLease {
-    cache: Arc<Mutex<AuthenticatedPeerRelayReplayCache>>,
-    request_commitment: [u8; 32],
-    generation: u64,
-    active: bool,
-}
-
-impl AuthenticatedPeerRelayReplayLease {
-    fn new(
-        cache: Arc<Mutex<AuthenticatedPeerRelayReplayCache>>,
-        request_commitment: [u8; 32],
-        generation: u64,
-    ) -> Self {
-        Self {
-            cache,
-            request_commitment,
-            generation,
-            active: true,
-        }
-    }
-
-    fn complete(mut self, response: PeerChatRelayResponseV2) {
-        self.cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .complete(&self.request_commitment, self.generation, response);
-        self.active = false;
-    }
-}
-
-impl Drop for AuthenticatedPeerRelayReplayLease {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .forget(&self.request_commitment, self.generation);
-    }
-}
-
-#[derive(Default)]
-struct AuthenticatedPeerRelayReplayCache {
-    entries: HashMap<[u8; 32], AuthenticatedPeerRelayReplayEntry>,
-    order: VecDeque<([u8; 32], u64)>,
-    next_generation: u64,
-}
-
-impl AuthenticatedPeerRelayReplayCache {
-    fn begin(
-        &mut self,
-        request_commitment: [u8; 32],
-        now: Instant,
-    ) -> AuthenticatedPeerRelayReplayDecision {
-        self.evict_expired(now);
-        if let Some(entry) = self.entries.get(&request_commitment) {
-            return match &entry.state {
-                AuthenticatedPeerRelayReplayState::InFlight => {
-                    AuthenticatedPeerRelayReplayDecision::InFlight
-                }
-                AuthenticatedPeerRelayReplayState::Completed(response) => {
-                    AuthenticatedPeerRelayReplayDecision::Completed(response.clone())
-                }
-            };
-        }
-
-        let generation = self.allocate_generation();
-        self.entries.insert(
-            request_commitment,
-            AuthenticatedPeerRelayReplayEntry {
-                observed_at: now,
-                generation,
-                state: AuthenticatedPeerRelayReplayState::InFlight,
-            },
-        );
-        self.order.push_back((request_commitment, generation));
-        let retained = self.evict_over_capacity(request_commitment, generation);
-        self.compact_stale_generations();
-        if retained {
-            AuthenticatedPeerRelayReplayDecision::New(generation)
-        } else {
-            AuthenticatedPeerRelayReplayDecision::Saturated
-        }
-    }
-
-    fn complete(
-        &mut self,
-        request_commitment: &[u8; 32],
-        generation: u64,
-        response: PeerChatRelayResponseV2,
-    ) {
-        if let Some(entry) = self.entries.get_mut(request_commitment) {
-            if entry.generation == generation {
-                entry.state = AuthenticatedPeerRelayReplayState::Completed(response);
-            }
-        }
-    }
-
-    fn forget(&mut self, request_commitment: &[u8; 32], generation: u64) {
-        if self
-            .entries
-            .get(request_commitment)
-            .is_some_and(|entry| entry.generation == generation)
-        {
-            self.entries.remove(request_commitment);
-        }
-    }
-
-    fn evict_expired(&mut self, now: Instant) {
-        while let Some((request_commitment, generation)) = self.order.front().copied() {
-            let Some(entry) = self.entries.get(&request_commitment) else {
-                self.order.pop_front();
-                continue;
-            };
-            if entry.generation != generation {
-                self.order.pop_front();
-                continue;
-            }
-            if now.saturating_duration_since(entry.observed_at)
-                <= AUTHENTICATED_PEER_RELAY_REPLAY_TTL
-            {
-                break;
-            }
-            self.order.pop_front();
-            self.entries.remove(&request_commitment);
-        }
-    }
-
-    fn evict_over_capacity(
-        &mut self,
-        new_request_commitment: [u8; 32],
-        new_generation: u64,
-    ) -> bool {
-        while self.entries.len() > MAX_AUTHENTICATED_PEER_RELAY_REPLAYS {
-            // [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] Preserve
-            // insertion order while looking past in-flight owners. Rotating
-            // those owners to the tail would break the chronological invariant
-            // used by `evict_expired` and could leave old work pinned forever.
-            let completed_position = self.order.iter().position(|(commitment, generation)| {
-                self.entries.get(commitment).is_some_and(|entry| {
-                    entry.generation == *generation
-                        && matches!(entry.state, AuthenticatedPeerRelayReplayState::Completed(_))
-                })
-            });
-            let Some(completed_position) = completed_position else {
-                self.forget(&new_request_commitment, new_generation);
-                return false;
-            };
-            let Some((commitment, generation)) = self.order.remove(completed_position) else {
-                self.forget(&new_request_commitment, new_generation);
-                return false;
-            };
-            self.forget(&commitment, generation);
-        }
-        true
-    }
-
-    fn compact_stale_generations(&mut self) {
-        if self.order.len() <= MAX_AUTHENTICATED_PEER_RELAY_REPLAY_GENERATIONS {
-            return;
-        }
-        self.order.retain(|(commitment, generation)| {
-            self.entries
-                .get(commitment)
-                .is_some_and(|entry| entry.generation == *generation)
-        });
-    }
-
-    fn allocate_generation(&mut self) -> u64 {
-        self.next_generation = self.next_generation.wrapping_add(1);
-        if self.next_generation == 0 {
-            self.next_generation = 1;
-        }
-        self.next_generation
-    }
-}
-
-#[derive(Debug)]
-struct PeerRelayRateLimitWindow {
-    started_at: Instant,
-    admitted: u32,
-}
-
-#[derive(Default)]
-struct AuthenticatedPeerRelayRateLimiter {
-    buckets: HashMap<[u8; 32], AuthenticatedPeerRelayRateBucket>,
-}
-
-struct AuthenticatedPeerRelayRateBucket {
-    window: PeerRelayRateLimitWindow,
-    last_seen: Instant,
-}
-
-impl AuthenticatedPeerRelayRateLimiter {
-    fn allow(&mut self, node_id: [u8; 32], now: Instant, limit: u32) -> bool {
-        // [AUTHENTICATED-PEER-FAIRNESS 2026-08-15 by Codex] New identities
-        // evict only the least-recently-observed node when the fixed memory
-        // ceiling is reached. The global parser-front guard bounds identity
-        // churn, so this O(capacity) path cannot become unbounded work.
-        if !self.buckets.contains_key(&node_id)
-            && self.buckets.len() >= MAX_AUTHENTICATED_PEER_RELAY_BUCKETS
-        {
-            if let Some(oldest) = self
-                .buckets
-                .iter()
-                .min_by_key(|(_, bucket)| bucket.last_seen)
-                .map(|(node_id, _)| *node_id)
-            {
-                self.buckets.remove(&oldest);
-            }
-        }
-
-        let bucket =
-            self.buckets
-                .entry(node_id)
-                .or_insert_with(|| AuthenticatedPeerRelayRateBucket {
-                    window: PeerRelayRateLimitWindow::new(now),
-                    last_seen: now,
-                });
-        bucket.last_seen = now;
-        bucket.window.allow(now, limit)
-    }
-}
-
-impl PeerRelayRateLimitWindow {
-    fn new(started_at: Instant) -> Self {
-        Self {
-            started_at,
-            admitted: 0,
-        }
-    }
-
-    fn allow(&mut self, now: Instant, limit: u32) -> bool {
-        self.allow_for(now, limit, Duration::from_secs(60))
-    }
-
-    fn allow_for(&mut self, now: Instant, limit: u32, window: Duration) -> bool {
-        if now.saturating_duration_since(self.started_at) >= window {
-            self.started_at = now;
-            self.admitted = 0;
-        }
-
-        if self.admitted >= limit {
-            return false;
-        }
-
-        self.admitted = self.admitted.saturating_add(1);
-        true
+        self.admission.begin_replay(request_commitment, now)
     }
 }
 
@@ -5760,170 +5441,6 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_peer_replay_cache_returns_exact_completed_ack() {
-        let now = Instant::now();
-        let commitment = [0x41; 32];
-        let response = PeerChatRelayResponseV2 {
-            relay: durable_peer_acceptance_response(),
-            receipt: None,
-        };
-        let mut cache = AuthenticatedPeerRelayReplayCache::default();
-
-        let generation = match cache.begin(commitment, now) {
-            AuthenticatedPeerRelayReplayDecision::New(generation) => generation,
-            decision => panic!("unexpected first replay decision: {decision:?}"),
-        };
-        assert_eq!(
-            cache.begin(commitment, now),
-            AuthenticatedPeerRelayReplayDecision::InFlight
-        );
-        cache.complete(&commitment, generation, response.clone());
-        assert_eq!(
-            cache.begin(commitment, now),
-            AuthenticatedPeerRelayReplayDecision::Completed(response)
-        );
-    }
-
-    #[test]
-    fn authenticated_peer_replay_generation_isolation_survives_stale_owner() {
-        // [DIRECT-RELAY-IDEMPOTENT-RETRY 2026-08-15 by Codex] A cancelled or
-        // expired owner must never delete or complete a newer request generation
-        // for the same opaque commitment.
-        let now = Instant::now();
-        let commitment = [0x42; 32];
-        let response = PeerChatRelayResponseV2 {
-            relay: durable_peer_acceptance_response(),
-            receipt: None,
-        };
-        let mut cache = AuthenticatedPeerRelayReplayCache::default();
-        let first_generation = match cache.begin(commitment, now) {
-            AuthenticatedPeerRelayReplayDecision::New(generation) => generation,
-            decision => panic!("unexpected first replay decision: {decision:?}"),
-        };
-        cache.forget(&commitment, first_generation);
-        let second_generation = match cache.begin(commitment, now) {
-            AuthenticatedPeerRelayReplayDecision::New(generation) => generation,
-            decision => panic!("unexpected second replay decision: {decision:?}"),
-        };
-        assert_ne!(first_generation, second_generation);
-
-        cache.complete(&commitment, first_generation, response);
-        cache.forget(&commitment, first_generation);
-        assert_eq!(
-            cache.begin(commitment, now),
-            AuthenticatedPeerRelayReplayDecision::InFlight
-        );
-    }
-
-    #[test]
-    fn authenticated_peer_replay_cache_expires_and_bounds_stale_generations() {
-        let now = Instant::now();
-        let commitment = [0x43; 32];
-        let mut cache = AuthenticatedPeerRelayReplayCache::default();
-        let first_generation = match cache.begin(commitment, now) {
-            AuthenticatedPeerRelayReplayDecision::New(generation) => generation,
-            decision => panic!("unexpected first replay decision: {decision:?}"),
-        };
-        cache.complete(
-            &commitment,
-            first_generation,
-            PeerChatRelayResponseV2 {
-                relay: durable_peer_acceptance_response(),
-                receipt: None,
-            },
-        );
-        assert!(matches!(
-            cache.begin(
-                commitment,
-                now + AUTHENTICATED_PEER_RELAY_REPLAY_TTL + Duration::from_millis(1)
-            ),
-            AuthenticatedPeerRelayReplayDecision::New(_)
-        ));
-
-        for _ in 0..=MAX_AUTHENTICATED_PEER_RELAY_REPLAY_GENERATIONS {
-            let generation = cache.allocate_generation();
-            cache.order.push_back((commitment, generation));
-        }
-        cache.compact_stale_generations();
-        assert!(cache.order.len() <= MAX_AUTHENTICATED_PEER_RELAY_REPLAY_GENERATIONS);
-    }
-
-    #[test]
-    fn authenticated_peer_replay_capacity_preserves_expiry_order() {
-        let now = Instant::now();
-        let response = PeerChatRelayResponseV2 {
-            relay: durable_peer_acceptance_response(),
-            receipt: None,
-        };
-        let mut cache = AuthenticatedPeerRelayReplayCache::default();
-        for index in 0..MAX_AUTHENTICATED_PEER_RELAY_REPLAYS {
-            let mut commitment = [0u8; 32];
-            commitment[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            let generation = (index as u64).saturating_add(1);
-            let state = if index == 0 {
-                AuthenticatedPeerRelayReplayState::InFlight
-            } else {
-                AuthenticatedPeerRelayReplayState::Completed(response.clone())
-            };
-            cache.entries.insert(
-                commitment,
-                AuthenticatedPeerRelayReplayEntry {
-                    observed_at: now,
-                    generation,
-                    state,
-                },
-            );
-            cache.order.push_back((commitment, generation));
-        }
-
-        let oldest_in_flight = cache.order.front().copied().unwrap();
-        let evicted_completed = cache.order.get(1).copied().unwrap();
-        let new_commitment = [0xFF; 32];
-        let new_generation = u64::MAX;
-        cache.entries.insert(
-            new_commitment,
-            AuthenticatedPeerRelayReplayEntry {
-                observed_at: now,
-                generation: new_generation,
-                state: AuthenticatedPeerRelayReplayState::InFlight,
-            },
-        );
-        cache.order.push_back((new_commitment, new_generation));
-
-        assert!(cache.evict_over_capacity(new_commitment, new_generation));
-        assert_eq!(cache.order.front().copied(), Some(oldest_in_flight));
-        assert!(!cache.entries.contains_key(&evicted_completed.0));
-        assert!(cache.entries.contains_key(&oldest_in_flight.0));
-        assert!(cache.entries.contains_key(&new_commitment));
-    }
-
-    #[test]
-    fn authenticated_peer_rate_limit_isolated_by_verified_node_id() {
-        let started_at = Instant::now();
-        let first = [0x31; 32];
-        let second = [0x32; 32];
-        let mut limiter = AuthenticatedPeerRelayRateLimiter::default();
-
-        assert!(limiter.allow(first, started_at, 1));
-        assert!(!limiter.allow(first, started_at + Duration::from_secs(59), 1));
-        assert!(limiter.allow(second, started_at + Duration::from_secs(59), 1));
-        assert!(limiter.allow(first, started_at + Duration::from_secs(60), 1));
-        assert_eq!(limiter.buckets.len(), 2);
-    }
-
-    #[test]
-    fn peer_relay_rate_limit_uses_exact_monotonic_windows() {
-        let started_at = Instant::now();
-        let mut window = PeerRelayRateLimitWindow::new(started_at);
-
-        assert!(window.allow(started_at, 2));
-        assert!(window.allow(started_at + Duration::from_secs(59), 2));
-        assert!(!window.allow(started_at + Duration::from_secs(59), 2));
-        assert!(window.allow(started_at + Duration::from_secs(60), 2));
-        assert_eq!(window.admitted, 1);
-    }
-
-    #[test]
     fn blind_relay_global_rate_limit_uses_exact_monotonic_windows() {
         let started_at = Instant::now();
         let mut guard = BlindRelayAbuseGuard {
@@ -5935,7 +5452,7 @@ mod tests {
         assert!(guard.admit_global(started_at + Duration::from_secs(59), 2));
         assert!(!guard.admit_global(started_at + Duration::from_secs(59), 2));
         assert!(guard.admit_global(started_at + Duration::from_secs(60), 2));
-        assert_eq!(guard.global_rate_limit.admitted, 1);
+        assert_eq!(guard.global_rate_limit.admitted(), 1);
     }
 
     #[tokio::test]

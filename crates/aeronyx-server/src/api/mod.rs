@@ -38,6 +38,7 @@
 //! - [`directory_replica_status`]: privacy-tiered replica health endpoint
 //! - [`directory_replica_sync`]: bounded concurrent outbound replica coordinator
 //! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
+//! - `chat_peer_admission`: private direct-peer admission and ACK replay domain
 //! - [`blind_vault`]: node-blind encrypted object lease/store/recovery routes
 //! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
 //!
@@ -63,6 +64,8 @@
 //! - Public request handlers that buffer or hash attacker-controlled bodies
 //!   must acquire `InFlightRequestGuard` before extraction. Keep independent
 //!   counters for workloads that should not starve each other.
+//! - [CHAT-PEER-ADMISSION-DOMAIN 2026-08-26 by Codex] Direct peer admission
+//!   policy is composed privately; keep user and route data out of its keys.
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial Agent API for MemChain Phase 1
@@ -91,6 +94,8 @@
 //! v1.0.0-BlindVaultApi - Added bounded binary Blind Vault client routes.
 //! v2.8.30-PeerEndpointPolicy - Centralized canonical peer URL parsing and
 //!   public-IP-only SSRF protection for permissionless outbound transports.
+//! v2.8.31-ChatPeerAdmissionDomain - Split direct-peer fairness and exact ACK
+//!   replay ownership from public HTTP orchestration.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{
@@ -445,6 +450,7 @@ pub mod local;
 // ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
 pub mod chat_handlers;
 pub mod chat_peer;
+mod chat_peer_admission;
 pub mod blind_vault;
 pub mod directory_chain_peer;
 pub mod directory_replica_status;
