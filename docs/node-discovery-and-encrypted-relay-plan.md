@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.50.0 - Publish aggregate process-local evidence for
-owner-fenced verified-submit recovery without exposing request, route, peer,
-receipt, endpoint, wallet, ciphertext, or payload dimensions.
+Modification Reason: v1.51.0 - Require one OS-owned runtime fence for each
+persistent Chat Relay custody database so restart recovery can prove the prior
+process has exited before taking over durable work.
 
 Main Functionality:
 
@@ -31,8 +31,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.50.0 - [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Adds aggregate attempted, completed, failed, and deferred entry-recovery transitions to the existing verified-submit health object, preserving rolling JSON compatibility and the blind-relay privacy boundary.
+Last Modified: v1.51.0 - [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] Composes an OS-owned, nonblocking single-process fence into persistent Chat Relay custody, proving predecessor exit before owner-grace recovery while keeping diagnostics path-free and rolling protocol interfaces unchanged.
 
+Previous: v1.50.0 - [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Adds aggregate attempted, completed, failed, and deferred entry-recovery transitions to the existing verified-submit health object, preserving rolling JSON compatibility and the blind-relay privacy boundary.
 Previous: v1.49.0 - [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Gives verified-submit reservations process-owner fencing and permits a replacement process to recover only exact idempotent entry custody, preserving truthful retry availability without repeating an unknown onion side effect.
 Previous: v1.48.0 - [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] Reports process-lifetime attempted, completed, and deferred armed-route reconciliation transitions while deliberately omitting current pending volume and every route-, peer-, endpoint-, receipt-, and payload-derived dimension.
 Previous: v1.47.0 - [MIDDLE-HOP-ARMED-RECOVERY 2026-08-25 by Codex] Gives sealed ACKs an explicit storage-only magic/version codec with legacy-row reads, then proves a crashed middle hop can resend the exact signed downstream onion request, recover the terminal node's durable ACK, and seal upstream success without duplicating custody.
@@ -3360,6 +3361,17 @@ Implemented:
   the independent `owner_acquired_at` lease changes on takeover, so recovery
   cannot extend the 10-minute replay horizon. The compare-and-swap also changes
   process epoch, fencing any still-running old owner from completion.
+- [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] Persistent Chat Relay storage
+  now composes a dedicated Unix runtime-fence capability. The process acquires
+  one nonblocking OS-exclusive lock before opening or migrating the custody
+  database and retains ownership through RAII for the complete service
+  lifetime. A concurrent owner fails closed before storage or network effects;
+  only OS release after process exit permits restart recovery to evaluate the
+  existing five-second age and compare-and-swap rules.
+- The fence uses a private 0600 regular sidecar opened with no-follow and
+  close-on-exec protections. Public errors expose only a closed reason bucket,
+  never the database path, lock path, PID, hostname, operating-system error, or
+  custody identifier. In-memory test storage deliberately has no process fence.
 - An armed recovery repeats only the same authenticated request through
   idempotent boundaries. Terminal Chat Relay storage accepts an exact existing
   envelope without inserting another queue row; Blind Vault accepts the exact
@@ -3395,6 +3407,7 @@ crates/aeronyx-core/src/protocol/chat.rs
 crates/aeronyx-core/src/protocol/memchain.rs
 crates/aeronyx-core/src/protocol/onion.rs
 crates/aeronyx-server/src/services/chat_relay.rs
+crates/aeronyx-server/src/services/chat_relay_runtime_fence.rs
 crates/aeronyx-server/src/services/peer_store.rs
 crates/aeronyx-server/src/api/chat_peer.rs
 crates/aeronyx-server/src/server.rs
@@ -3427,6 +3440,11 @@ Verification:
   table, admission-owned attempt recording, a real handler `completed`
   transition, and default decoding of pre-status heartbeat JSON while
   preserving existing submit counters.
+- Runtime-fence coverage proves a second live service cannot open the same
+  persistent custody database, receives only a path-free closed error reason,
+  and can start normally after the predecessor releases its OS-owned fence.
+  Restart-recovery tests now model real process succession instead of permitting
+  two live service owners in one process.
 - Blind-relay no-eviction coverage fills the complete replay map with live and
   completed evidence, proves the exact ACK remains replayable, proves a new
   authenticated request stops before terminal/forward effects, and confirms

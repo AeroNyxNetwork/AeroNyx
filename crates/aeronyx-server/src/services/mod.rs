@@ -13,8 +13,11 @@
 //   path-free relay custody maintenance audit verification receipt.
 //   [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] Extended that stable
 //   receipt with aggregate immutable-segment and recovery state.
+//   [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] Registered the private
+//   Unix process-lifecycle capability composed by the custody service.
 //
 // Last Modified:
+//   v0.20.0-ChatRelayRuntimeFence - Registered private custody ownership guard
 //   v0.19.0-CustodyAuditRotation - Aggregate segmented-audit observability
 //   v0.18.0-CustodyAuditVerify - Re-exported host-local audit verification
 //   v0.17.0-BlindVaultPutFailureClass - Re-exported the privacy-safe retry
@@ -54,6 +57,8 @@
 
 pub mod blind_vault;
 pub mod chat_relay;
+#[cfg(unix)]
+mod chat_relay_runtime_fence;
 pub mod deny_list;
 pub mod directory_chain;
 pub mod directory_replica;

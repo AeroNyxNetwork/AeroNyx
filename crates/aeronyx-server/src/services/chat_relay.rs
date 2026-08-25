@@ -257,6 +257,11 @@
 //     reservation may be taken over only after its owner grace and exact CAS.
 //     Recovery may repeat local exact-idempotent custody only; never announce a
 //     wallet route, choose another onion path, or manufacture terminal proof.
+//   - [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] One persistent custody
+//     database may be owned by only one live service process. The owner-only,
+//     no-follow OS lock is acquired before SQLite opens and is released by
+//     RAII, so restart recovery proves predecessor exit instead of guessing
+//     from wall-clock age.
 //   - [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Blind-route claims
 //     have an anonymous process epoch and durable effect boundary. Only an
 //     expired, unarmed claim may move to a new process; armed and legacy claims
@@ -265,6 +270,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.17.0-ChatRelayRuntimeFence — OS-owned single-process custody fencing
 //   v3.16.0-VerifiedSubmitRecoveryStatus — Aggregate restart-recovery evidence
 //   v3.15.0-VerifiedSubmitEntryRecovery — Owner-fenced custody-only takeover
 //   v3.14.0-RecoverableBlindRelayClaim — Restart-safe pre-effect claim takeover
@@ -346,6 +352,8 @@ use aeronyx_core::protocol::memchain::{
 };
 
 use crate::config::ChatRelayConfig;
+#[cfg(unix)]
+use crate::services::chat_relay_runtime_fence::ChatRelayRuntimeFence;
 use crate::services::wallet_routes::WalletRouteCache;
 
 // ============================================
@@ -1789,6 +1797,15 @@ pub enum ChatRelayError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// Another live process owns this custody database, or its fence is unsafe.
+    #[error("Chat relay runtime fence unavailable: {reason}")]
+    RuntimeFenceUnavailable {
+        /// Stable path-free reason suitable for operator diagnostics.
+        reason: &'static str,
+        /// Existing or fence-specific public diagnostic class.
+        public_reason_bucket: &'static str,
+    },
+
     /// Envelope or notification serialization failure.
     #[error("Serialization error: {0}")]
     Serialize(#[from] bincode::Error),
@@ -1931,6 +1948,13 @@ impl ChatRelayError {
     pub const fn reason_bucket(&self) -> &'static str {
         match self {
             Self::Sqlite(_) => "sqlite_error",
+            // [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] The typed fence
+            // maps its closed failure enum before entering this public error.
+            // This keeps the existing const reason-bucket API unchanged.
+            Self::RuntimeFenceUnavailable {
+                public_reason_bucket,
+                ..
+            } => public_reason_bucket,
             Self::Serialize(_) => "serialization_error",
             Self::AckBatchTooLarge { .. } => "ack_batch_too_large",
             Self::CorruptStoredData { .. } => "corrupt_stored_data",
@@ -2747,6 +2771,12 @@ impl VerifiedSubmitResponseCache {
 pub struct ChatRelayService {
     config: ChatRelayConfig,
     conn: Mutex<Connection>,
+    /// Kernel-owned lifetime guard for the persistent custody database.
+    ///
+    /// [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] Keep this handle alive
+    /// until after `conn` drops. It contains no serialized or reported state.
+    #[cfg(unix)]
+    _runtime_fence: Option<ChatRelayRuntimeFence>,
     node_secret: [u8; 32],
     /// Stable node-local AEAD key for opaque v2 pull cursors.
     pull_cursor_key: [u8; 32],
@@ -5529,6 +5559,23 @@ impl ChatRelayService {
             }
         }
 
+        // [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] Acquire before
+        // opening or migrating SQLite. A replacement process can recover an
+        // aged reservation only after the kernel has released this guard,
+        // proving that its predecessor no longer owns the custody store.
+        #[cfg(unix)]
+        let runtime_fence = if config.db_path == ":memory:" {
+            None
+        } else {
+            Some(
+                ChatRelayRuntimeFence::acquire(Path::new(&config.db_path)).map_err(|error| {
+                    ChatRelayError::RuntimeFenceUnavailable {
+                        reason: error.as_str(),
+                        public_reason_bucket: error.public_reason_bucket(),
+                    }
+                })?,
+            )
+        };
         let conn = Connection::open(&config.db_path)?;
         if config.db_path != ":memory:" {
             Self::restrict_sqlite_file_permissions(Path::new(&config.db_path))?;
@@ -5553,6 +5600,8 @@ impl ChatRelayService {
         let svc = Self {
             config,
             conn: Mutex::new(conn),
+            #[cfg(unix)]
+            _runtime_fence: runtime_fence,
             node_secret,
             pull_cursor_key,
             verified_submit_response_key,
@@ -10337,6 +10386,10 @@ mod tests {
         for suffix in ["-wal", "-shm"] {
             let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", path.display())));
         }
+        #[cfg(unix)]
+        if let Ok(path) = ChatRelayRuntimeFence::control_path(path) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     fn remove_test_db(path: &Path) {
@@ -10348,6 +10401,10 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(format!("{}-journal", path.display()));
+        #[cfg(unix)]
+        if let Ok(path) = ChatRelayRuntimeFence::control_path(path) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     fn backup_directory_snapshot(path: &Path) -> Vec<(String, Vec<u8>)> {
@@ -10456,6 +10513,8 @@ mod tests {
             db_path.clone(),
             PathBuf::from(format!("{}-wal", db_path.display())),
             PathBuf::from(format!("{}-shm", db_path.display())),
+            ChatRelayRuntimeFence::control_path(&db_path)
+                .expect("derive private runtime fence path"),
         ] {
             let mode = std::fs::metadata(&path)
                 .unwrap_or_else(|error| panic!("inspect {}: {error}", path.display()))
@@ -10466,6 +10525,91 @@ mod tests {
         }
 
         drop(service);
+        remove_test_db(&db_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_relay_runtime_fence_rejects_concurrent_database_owner() {
+        // [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] Reservation takeover
+        // is safe only after the predecessor has exited. Prove that a second
+        // live service cannot open, migrate, or mutate the same custody store,
+        // while RAII release still permits a normal restart.
+        let db_path = unique_test_db_path("runtime-fence-owner");
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let secret = [0xA7; 32];
+
+        let owner = ChatRelayService::new(config.clone(), secret)
+            .expect("acquire first relay runtime fence");
+        let error = match ChatRelayService::new(config.clone(), secret) {
+            Ok(_) => panic!("concurrent relay owner must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            ChatRelayError::RuntimeFenceUnavailable {
+                reason: "already_owned",
+                ..
+            }
+        ));
+        assert_eq!(error.reason_bucket(), "runtime_fence_unavailable");
+        assert!(!error
+            .to_string()
+            .contains(db_path.to_string_lossy().as_ref()));
+
+        drop(owner);
+        let restarted = ChatRelayService::new(config, secret)
+            .expect("kernel releases relay runtime fence after owner drop");
+        drop(restarted);
+        remove_test_db(&db_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_relay_runtime_fence_rejects_hard_linked_control_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] The sidecar must be a
+        // unique inode. Reject a hard link before permission tightening so an
+        // unrelated owner file cannot be modified through the control path.
+        let db_path = unique_test_db_path("runtime-fence-hard-link");
+        let control_path = ChatRelayRuntimeFence::control_path(&db_path)
+            .expect("derive hard-link runtime fence path");
+        let target_path = db_path.with_extension("owner-state");
+        std::fs::write(&target_path, b"owner-state").expect("write hard-link target");
+        std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o640))
+            .expect("set hard-link target mode");
+        std::fs::hard_link(&target_path, &control_path).expect("install hard-linked control file");
+
+        let mut config = test_config();
+        config.db_path = db_path.to_string_lossy().into_owned();
+        let error = match ChatRelayService::new(config, [0xA8; 32]) {
+            Ok(_) => panic!("hard-linked runtime fence must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ChatRelayError::RuntimeFenceUnavailable {
+                reason: "unsafe_control_file",
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read(&target_path).expect("read unchanged hard-link target"),
+            b"owner-state"
+        );
+        assert_eq!(
+            std::fs::metadata(&target_path)
+                .expect("inspect unchanged hard-link target")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+
+        let _ = std::fs::remove_file(control_path);
+        let _ = std::fs::remove_file(target_path);
         remove_test_db(&db_path);
     }
 
@@ -12615,26 +12759,12 @@ mod tests {
                 .any(|window| window == private_value));
         }
 
-        let restarted = ChatRelayService::new(config.clone(), secret)
-            .expect("restart crash-window verified submit relay");
-        assert!(matches!(
-            restarted
-                .verified_submit_cache_lookup(&request)
-                .expect("classify crash-window reservation"),
-            VerifiedSubmitCacheLookup::Pending
-        ));
-        assert_eq!(
-            restarted
-                .reserve_verified_submit(&request)
-                .expect("preserve live predecessor reservation"),
-            VerifiedSubmitAdmission::Pending
-        );
         let aged_owner = sqlite_integer(
             now_secs().saturating_sub(VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS + 1),
             "verified_submit_test_aged_owner",
         )
         .expect("convert aged verified-submit owner timestamp");
-        restarted
+        predecessor
             .conn
             .lock()
             .execute(
@@ -12643,6 +12773,16 @@ mod tests {
                 params![aged_owner],
             )
             .expect("age crash-window owner lease");
+        drop(predecessor);
+
+        let restarted = ChatRelayService::new(config.clone(), secret)
+            .expect("restart crash-window verified submit relay");
+        assert!(matches!(
+            restarted
+                .verified_submit_cache_lookup(&request)
+                .expect("classify crash-window reservation"),
+            VerifiedSubmitCacheLookup::Pending
+        ));
         assert_eq!(
             restarted
                 .reserve_verified_submit(&request)
@@ -12664,12 +12804,6 @@ mod tests {
             true,
             None,
         );
-        assert!(matches!(
-            predecessor.remember_verified_submit_response(&request, &recovered_response),
-            Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_reservation_completion"
-            })
-        ));
         restarted
             .remember_verified_submit_response(&request, &recovered_response)
             .expect("complete recovered entry custody as current owner");
@@ -12715,7 +12849,6 @@ mod tests {
             VerifiedSubmitCacheLookup::Miss
         ));
 
-        drop(predecessor);
         drop(restarted);
         remove_test_database(&db_path);
     }
@@ -12925,11 +13058,11 @@ mod tests {
     }
 
     #[test]
-    fn blind_route_unarmed_claim_is_reclaimed_and_owner_fenced() {
-        // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Rolling restart
-        // can leave the previous process alive briefly. A new process may take
-        // only an aged, unarmed claim; the old epoch can no longer arm or
-        // complete it after the compare-and-swap takeover.
+    fn blind_route_unarmed_claim_is_reclaimed_after_predecessor_exit() {
+        // [CHAT-RELAY-RUNTIME-FENCE 2026-08-25 by Codex] A replacement cannot
+        // coexist with the predecessor. After kernel-confirmed predecessor
+        // exit, it may take only an aged, unarmed durable claim; owner CAS
+        // remains the persisted recovery boundary.
         let db_path = unique_test_db_path("blind-route-unarmed-takeover");
         let mut config = test_config();
         config.db_path = db_path.to_string_lossy().into_owned();
@@ -12968,6 +13101,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("read immutable reservation timestamp");
+        drop(old_owner);
 
         let new_owner =
             ChatRelayService::new(config.clone(), secret).expect("create new blind-route owner");
@@ -12987,17 +13121,6 @@ mod tests {
             )
             .expect("read retained reservation timestamp");
         assert_eq!(retained_reserved_at, takeover_evidence_at);
-        assert!(old_owner
-            .arm_blind_relay_route_effect(&route_id, &request_commitment, now_secs())
-            .is_err());
-        assert!(old_owner
-            .remember_blind_relay_route_response(
-                &route_id,
-                &request_commitment,
-                response,
-                now_secs(),
-            )
-            .is_err());
         new_owner
             .arm_blind_relay_route_effect(&route_id, &request_commitment, now_secs())
             .expect("arm claim under new owner epoch");
@@ -13018,15 +13141,15 @@ mod tests {
         ));
 
         drop(new_owner);
-        drop(old_owner);
         remove_test_database(&db_path);
     }
 
     #[test]
-    fn blind_route_armed_claim_is_recovered_and_old_owner_fenced() {
+    fn blind_route_armed_claim_is_recovered_after_predecessor_exit() {
         // [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] An armed claim is
         // recoverable only by a later process presenting the exact request.
-        // Takeover preserves original evidence age and fences the old process.
+        // Takeover preserves original evidence age after the runtime fence has
+        // proved that the old process no longer owns the custody database.
         let db_path = unique_test_db_path("blind-route-armed-takeover");
         let mut config = test_config();
         config.db_path = db_path.to_string_lossy().into_owned();
@@ -13068,6 +13191,7 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             )
             .expect("read armed evidence age");
+        drop(old_owner);
 
         let new_owner =
             ChatRelayService::new(config.clone(), secret).expect("create armed recovery owner");
@@ -13093,14 +13217,6 @@ mod tests {
             )
             .expect("read recovered evidence age");
         assert_eq!(retained_reserved_at, takeover_evidence_at);
-        assert!(old_owner
-            .remember_blind_relay_route_response(
-                &route_id,
-                &request_commitment,
-                response,
-                now_secs(),
-            )
-            .is_err());
         new_owner
             .remember_blind_relay_route_response(
                 &route_id,
@@ -13118,7 +13234,6 @@ mod tests {
         ));
 
         drop(new_owner);
-        drop(old_owner);
         remove_test_database(&db_path);
     }
 
@@ -13359,6 +13474,7 @@ mod tests {
                 .expect("convert migrated owner timestamp")],
             )
             .expect("age migrated owner lease");
+        drop(migrated);
         let next_owner =
             ChatRelayService::new(config, secret).expect("open migrated claim from next process");
         assert_eq!(
@@ -13369,7 +13485,6 @@ mod tests {
         );
 
         drop(next_owner);
-        drop(migrated);
         remove_test_database(&db_path);
     }
 
