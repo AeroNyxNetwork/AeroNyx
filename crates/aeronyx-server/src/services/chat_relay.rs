@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.21.0-PendingPullDomain
+// Version: 3.22.0-PendingCustodyDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -46,6 +46,9 @@
 //   [CHAT-PENDING-PULL-DOMAIN 2026-08-25 by Codex] Extracted bounded SQLite
 //   reads and signed durable-row validation behind a composed repository trait
 //   while retaining service-owned cursor, quarantine, and telemetry policy.
+//   [CHAT-PENDING-CUSTODY-DOMAIN 2026-08-25 by Codex] Extracted pending-message
+//   idempotence, quotas, sequence allocation, durable writes, and receiver-bound
+//   acknowledgements behind a composed repository capability.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -290,6 +293,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.22.0-PendingCustodyDomain — Trait-based custody write composition
 //   v3.21.0-PendingPullDomain — Trait-based pull repository composition
 //   v3.20.0-PullCursorDomain — Trait-based opaque cursor composition
 //   v3.19.0-BlindRouteReplayDomain — Trait-based route replay composition
@@ -361,9 +365,9 @@ use tracing::{debug, info, warn};
 
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS;
-use aeronyx_core::protocol::chat::{
-    decode_envelope, encode_envelope, ChatEnvelope, CustodyAuditAnchorV1,
-};
+#[cfg(test)]
+use aeronyx_core::protocol::chat::encode_envelope;
+use aeronyx_core::protocol::chat::{decode_envelope, ChatEnvelope, CustodyAuditAnchorV1};
 use aeronyx_core::protocol::memchain::{
     chat_verified_submit_result_label, ChatRelayVerifiedSubmitRequestV1,
     ChatRelayVerifiedSubmitResponseV1, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
@@ -377,6 +381,11 @@ use crate::services::chat_relay_blind_route::BlindRouteReplay;
 #[cfg(test)]
 use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
     as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
+#[cfg(test)]
+use crate::services::chat_relay_pending_custody::allocate_queue_sequence;
+use crate::services::chat_relay_pending_custody::{
+    PendingMessageCustodyDomain, PendingMessageStoreOutcome,
+};
 use crate::services::chat_relay_pending_pull::PendingMessagePullDomain;
 #[cfg(test)]
 use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_CURSOR_V2_BYTES;
@@ -2650,6 +2659,11 @@ pub struct ChatRelayService {
     /// [CHAT-PENDING-PULL-DOMAIN 2026-08-25 by Codex] The repository is
     /// replaceable; the service retains connection locking and side effects.
     pending_pull: PendingMessagePullDomain,
+    /// Offline-message idempotence, quota, sequence, and ACK capability.
+    ///
+    /// [CHAT-PENDING-CUSTODY-DOMAIN 2026-08-25 by Codex] The service retains
+    /// the public API and lock; the composed domain owns durable write policy.
+    pending_custody: PendingMessageCustodyDomain,
     /// Private verified-submit replay domain capability.
     ///
     /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
@@ -5465,6 +5479,7 @@ impl ChatRelayService {
         let relay_enabled = config.enabled;
         let pull_cursor_codec = ChatPullCursorCodec::new(&node_secret)?;
         let pending_pull = PendingMessagePullDomain::new();
+        let pending_custody = PendingMessageCustodyDomain::new(&config);
         let verified_submit_replay = VerifiedSubmitReplay::new(node_secret, dedup_capacity)?;
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
@@ -5480,6 +5495,7 @@ impl ChatRelayService {
             node_secret,
             pull_cursor_codec,
             pending_pull,
+            pending_custody,
             verified_submit_replay,
             blind_route_replay,
             replay_process_epoch,
@@ -6372,29 +6388,6 @@ impl ChatRelayService {
             }
         }
         Ok(false)
-    }
-
-    fn allocate_queue_sequence(tx: &Transaction<'_>) -> ChatRelayResult<i64> {
-        let updated = tx.execute(
-            "UPDATE relay_queue_sequence
-             SET last_sequence = last_sequence + 1
-             WHERE singleton = 1 AND last_sequence < ?1",
-            params![i64::MAX],
-        )?;
-        if updated != 1 {
-            return Err(ChatRelayError::QueueSequenceExhausted);
-        }
-        let sequence = tx.query_row(
-            "SELECT last_sequence FROM relay_queue_sequence WHERE singleton = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if sequence <= 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "relay_queue_sequence_nonpositive",
-            });
-        }
-        Ok(sequence)
     }
 
     fn init_blob_and_notification_schema(conn: &Connection) -> ChatRelayResult<()> {
@@ -7539,100 +7532,16 @@ impl ChatRelayService {
     /// Returns an item-size or durable-capacity error before insertion, or a
     /// serialization/SQLite error if encoding or the atomic write fails.
     pub fn store_pending(&self, envelope: &ChatEnvelope) -> ChatRelayResult<()> {
-        if envelope.ciphertext.len() > self.config.max_message_size {
-            return Err(ChatRelayError::MessageTooLarge {
-                size: envelope.ciphertext.len(),
-                limit: self.config.max_message_size,
-            });
-        }
-
-        let now = now_secs();
-        let received_at = i64::try_from(now).unwrap_or(i64::MAX);
-        let envelope_timestamp =
-            i64::try_from(envelope.timestamp).map_err(|_| ChatRelayError::TimestampOutOfRange)?;
-        let receiver = envelope.receiver;
-        let envelope_bytes = encode_envelope(envelope)?;
-        let incoming_bytes = u64::try_from(envelope_bytes.len()).unwrap_or(u64::MAX);
-
+        let write = self
+            .pending_custody
+            .prepare_store(envelope, now_secs())?;
         let mut conn = self.conn.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        // Idempotence is checked before every quota. A retry of an already
-        // durable message must succeed even while the queue is at capacity.
-        let existing_envelope = tx
-            .query_row(
-                "SELECT envelope FROM pending_messages WHERE message_id = ?1",
-                params![envelope.message_id.as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
-        if let Some(existing_envelope) = existing_envelope {
-            if existing_envelope == envelope_bytes {
-                tx.commit()?;
-                return Ok(());
-            }
-            return Err(ChatRelayError::MessageIdConflict);
-        }
-
-        let usage = Self::read_storage_usage(&tx)?;
-        if usage.pending_messages
-            >= u64::try_from(self.config.max_pending_messages_total).unwrap_or(u64::MAX)
-        {
-            return Err(ChatRelayError::PendingMessageQueueFull {
-                current: usize::try_from(usage.pending_messages).unwrap_or(usize::MAX),
-                limit: self.config.max_pending_messages_total,
-            });
-        }
-        if usage.pending_message_bytes.saturating_add(incoming_bytes)
-            > self.config.max_pending_message_bytes_total
-        {
-            return Err(ChatRelayError::PendingMessageBytesExceeded {
-                current: usage.pending_message_bytes,
-                incoming: incoming_bytes,
-                limit: self.config.max_pending_message_bytes_total,
-            });
-        }
-
-        let count = tx.query_row(
-            "SELECT COUNT(*) FROM pending_messages WHERE receiver = ? AND status = 0",
-            params![receiver.as_slice()],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let count = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
-
-        if count >= self.config.max_pending_per_wallet {
-            return Err(ChatRelayError::MailboxFull {
-                current: count,
-                limit: self.config.max_pending_per_wallet,
-            });
-        }
-
-        // Allocate only after idempotence and all quotas pass. The sequence
-        // update and row insert share this transaction, so failed inserts do
-        // not consume observable ordering state.
-        let queue_sequence = Self::allocate_queue_sequence(&tx)?;
-        tx.execute(
-            "INSERT INTO pending_messages
-             (message_id, sender, receiver, timestamp, envelope, received_at, status,
-              queue_sequence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-            params![
-                envelope.message_id.as_slice(),
-                envelope.sender.as_slice(),
-                envelope.receiver.as_slice(),
-                envelope_timestamp,
-                envelope_bytes,
-                received_at,
-                queue_sequence,
-            ],
-        )?;
-        tx.commit()?;
+        let outcome = self.pending_custody.store(&mut conn, write)?;
         drop(conn);
 
-        debug!(
-            encoded_bytes = incoming_bytes,
-            "[CHAT_RELAY] Message stored pending"
-        );
+        if let PendingMessageStoreOutcome::Stored { encoded_bytes } = outcome {
+            debug!(encoded_bytes, "[CHAT_RELAY] Message stored pending");
+        }
         Ok(())
     }
 
@@ -7795,41 +7704,19 @@ impl ChatRelayService {
         message_ids: &[[u8; 16]],
         receiver_wallet: &[u8; 32],
     ) -> ChatRelayResult<usize> {
-        if message_ids.is_empty() {
+        let Some(batch) = self
+            .pending_custody
+            .prepare_acknowledgement(message_ids)?
+        else {
             return Ok(0);
-        }
-        if message_ids.len() > MAX_CHAT_ACK_MESSAGE_IDS {
-            return Err(ChatRelayError::AckBatchTooLarge {
-                size: message_ids.len(),
-                limit: MAX_CHAT_ACK_MESSAGE_IDS,
-            });
-        }
-
-        let unique_ids: HashSet<[u8; 16]> = message_ids.iter().copied().collect();
-        let deleted =
-            Self::ack_messages_transaction(&mut self.conn.lock(), &unique_ids, receiver_wallet)?;
+        };
+        let deleted = self.pending_custody.acknowledge(
+            &mut self.conn.lock(),
+            &batch,
+            receiver_wallet,
+        )?;
 
         debug!(count = deleted, "[CHAT_RELAY] Messages ACKed and deleted");
-        Ok(deleted)
-    }
-
-    fn ack_messages_transaction(
-        conn: &mut Connection,
-        unique_ids: &HashSet<[u8; 16]>,
-        receiver_wallet: &[u8; 32],
-    ) -> ChatRelayResult<usize> {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut deleted = 0usize;
-
-        for mid in unique_ids {
-            let n = tx.execute(
-                "DELETE FROM pending_messages
-                 WHERE message_id = ?1 AND receiver = ?2",
-                params![mid.as_slice(), receiver_wallet.as_slice()],
-            )?;
-            deleted += n;
-        }
-        tx.commit()?;
         Ok(deleted)
     }
 
@@ -9883,8 +9770,8 @@ mod tests {
                 };
                 envelope.signature = identity.sign(&envelope.sign_data());
                 let encoded_envelope = encode_envelope(&envelope).expect("encode expired envelope");
-                let queue_sequence = ChatRelayService::allocate_queue_sequence(&tx)
-                    .expect("allocate test queue sequence");
+                let queue_sequence =
+                    allocate_queue_sequence(&tx).expect("allocate test queue sequence");
                 stmt.execute(params![
                     message_id.as_slice(),
                     envelope.sender.as_slice(),
