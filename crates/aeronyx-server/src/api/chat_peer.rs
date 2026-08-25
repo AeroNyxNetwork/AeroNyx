@@ -438,7 +438,13 @@ use tracing::{debug, warn};
 
 use super::chat_peer_admission::{
     AuthenticatedPeerRelayReplayStart, DirectPeerAdmissionDomain, DirectPeerAdmissionPolicy,
-    PeerRelayRateLimitWindow,
+};
+use super::chat_peer_abuse_guard::{
+    BlindRelayAbuseDecision, BlindRelayAbuseDomain, BlindRelayAbusePolicy,
+};
+#[cfg(test)]
+use super::chat_peer_abuse_guard::{
+    PREVIOUS_HOP_FAILURE_THRESHOLD as BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD,
 };
 use crate::api::{
     canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
@@ -553,24 +559,6 @@ const MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS: usize = MAX_BLIND_RELAY_SEEN_ROU
 const BLIND_RELAY_AUTHENTICATED_REQUEST_COMMITMENT_DOMAIN: &[u8] =
     b"AeroNyx-BlindRelay-AuthenticatedRequest-v1";
 
-/// Per previous-hop accepted relay attempts allowed in the short window.
-const BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT: u32 = 120;
-
-/// Sliding window for previous-hop relay rate limiting.
-const BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS: u64 = 60;
-
-/// Privacy-safe failure score that puts one previous-hop node into quarantine.
-const BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD: u32 = 12;
-
-/// Failure score decay horizon before a previous-hop gets a clean bucket.
-const BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS: u64 = 5 * 60;
-
-/// Short local quarantine for noisy previous-hop nodes.
-const BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS: u64 = 5 * 60;
-
-/// Maximum previous-hop abuse buckets retained by this process.
-const MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS: usize = 4096;
-
 /// Maximum accepted age for an opaque blind-relay routing frame.
 ///
 /// This is intentionally based only on `BlindRelayEnvelope.timestamp`, a signed
@@ -607,7 +595,9 @@ struct ChatPeerState {
     http_client: Arc<reqwest::Client>,
     blind_relay_in_flight: Arc<AtomicUsize>,
     blind_relay_seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
-    blind_relay_abuse_guard: Arc<Mutex<BlindRelayAbuseGuard>>,
+    /// [CHAT-PEER-ABUSE-DOMAIN 2026-08-26 by Codex] Blind relay rate and
+    /// quarantine state are composed behind a payload-blind policy boundary.
+    blind_relay_abuse_guard: Arc<dyn BlindRelayAbusePolicy>,
 }
 
 #[derive(Clone)]
@@ -940,239 +930,6 @@ impl BlindRelayRouteReplayCache {
         });
         debug_assert!(self.order.len() <= self.seen.len());
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlindRelayAbuseDecision {
-    Allowed,
-    CapacityLimited,
-    RateLimited { quarantine_until: u64 },
-    Quarantined { quarantine_until: u64 },
-}
-
-#[derive(Debug)]
-struct BlindRelayPreviousHopBucket {
-    rate_window: PeerRelayRateLimitWindow,
-    failure_window_started_at: Instant,
-    failure_score: u32,
-    quarantine_until: Option<Instant>,
-    last_seen_at: Instant,
-}
-
-impl BlindRelayPreviousHopBucket {
-    fn new(now: Instant) -> Self {
-        Self {
-            rate_window: PeerRelayRateLimitWindow::new(now),
-            failure_window_started_at: now,
-            failure_score: 0,
-            quarantine_until: None,
-            last_seen_at: now,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct BlindRelayAbuseGuard {
-    buckets: HashMap<[u8; 32], BlindRelayPreviousHopBucket>,
-    global_rate_limit: PeerRelayRateLimitWindow,
-}
-
-impl Default for BlindRelayAbuseGuard {
-    fn default() -> Self {
-        Self {
-            buckets: HashMap::new(),
-            global_rate_limit: PeerRelayRateLimitWindow::new(Instant::now()),
-        }
-    }
-}
-
-impl BlindRelayAbuseGuard {
-    fn admit_global(&mut self, now: Instant, limit: u32) -> bool {
-        self.global_rate_limit.allow(now, limit)
-    }
-
-    fn observe_request(
-        &mut self,
-        previous_hop: [u8; 32],
-        observed_at_epoch: u64,
-    ) -> BlindRelayAbuseDecision {
-        self.observe_request_at(previous_hop, observed_at_epoch, Instant::now())
-    }
-
-    fn observe_request_at(
-        &mut self,
-        previous_hop: [u8; 32],
-        observed_at_epoch: u64,
-        observed_at: Instant,
-    ) -> BlindRelayAbuseDecision {
-        let Some(bucket) = self.bucket_mut(previous_hop, observed_at) else {
-            return BlindRelayAbuseDecision::CapacityLimited;
-        };
-        bucket.last_seen_at = observed_at;
-
-        if let Some(quarantine_until) = bucket
-            .quarantine_until
-            .filter(|quarantine_until| observed_at < *quarantine_until)
-        {
-            return BlindRelayAbuseDecision::Quarantined {
-                quarantine_until: project_monotonic_deadline_to_epoch(
-                    observed_at_epoch,
-                    observed_at,
-                    quarantine_until,
-                ),
-            };
-        }
-        bucket.quarantine_until = None;
-
-        if !bucket.rate_window.allow_for(
-            observed_at,
-            BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT,
-            Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS),
-        ) {
-            let quarantine_deadline = observed_at
-                .checked_add(Duration::from_secs(
-                    BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS,
-                ))
-                .unwrap_or(observed_at);
-            bucket.quarantine_until = Some(quarantine_deadline);
-            return BlindRelayAbuseDecision::RateLimited {
-                quarantine_until: observed_at_epoch
-                    .saturating_add(BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS),
-            };
-        }
-
-        BlindRelayAbuseDecision::Allowed
-    }
-
-    fn record_failure(&mut self, previous_hop: [u8; 32], observed_at_epoch: u64) -> Option<u64> {
-        self.record_failure_at(previous_hop, observed_at_epoch, Instant::now())
-    }
-
-    fn record_failure_at(
-        &mut self,
-        previous_hop: [u8; 32],
-        observed_at_epoch: u64,
-        observed_at: Instant,
-    ) -> Option<u64> {
-        let bucket = self.bucket_mut(previous_hop, observed_at)?;
-        bucket.last_seen_at = observed_at;
-        if observed_at.saturating_duration_since(bucket.failure_window_started_at)
-            >= Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS)
-        {
-            bucket.failure_window_started_at = observed_at;
-            bucket.failure_score = 0;
-        }
-
-        bucket.failure_score = bucket.failure_score.saturating_add(1);
-        if bucket.failure_score >= BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD {
-            let quarantine_deadline = observed_at
-                .checked_add(Duration::from_secs(
-                    BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS,
-                ))
-                .unwrap_or(observed_at);
-            bucket.quarantine_until = Some(quarantine_deadline);
-            bucket.failure_score = 0;
-            return Some(
-                observed_at_epoch.saturating_add(BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS),
-            );
-        }
-        None
-    }
-
-    fn record_success(&mut self, previous_hop: [u8; 32]) {
-        self.record_success_at(previous_hop, Instant::now());
-    }
-
-    fn record_success_at(&mut self, previous_hop: [u8; 32], observed_at: Instant) {
-        if let Some(bucket) = self.buckets.get_mut(&previous_hop) {
-            bucket.last_seen_at = observed_at;
-            if observed_at.saturating_duration_since(bucket.failure_window_started_at)
-                >= Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS)
-            {
-                bucket.failure_window_started_at = observed_at;
-                bucket.failure_score = 0;
-            }
-        }
-    }
-
-    fn bucket_mut(
-        &mut self,
-        previous_hop: [u8; 32],
-        observed_at: Instant,
-    ) -> Option<&mut BlindRelayPreviousHopBucket> {
-        if !self.buckets.contains_key(&previous_hop) {
-            // [BLIND-RELAY-BUCKET-FAIRNESS 2026-08-21 by Codex] Scan only on
-            // new verified identities. Identity churn is already bounded by
-            // the parser-front global window, so fixed-capacity LRU selection
-            // cannot become unbounded per-request work. Active quarantines are
-            // never removed merely to admit a fresh permissionless identity.
-            self.evict_idle(observed_at);
-            if !self.make_room_for_new_bucket(observed_at, MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS) {
-                return None;
-            }
-        }
-        Some(
-            self.buckets
-                .entry(previous_hop)
-                .or_insert_with(|| BlindRelayPreviousHopBucket::new(observed_at)),
-        )
-    }
-
-    fn evict_idle(&mut self, observed_at: Instant) {
-        let retention_secs =
-            BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
-        self.buckets.retain(|_, bucket| {
-            let quarantine_active = bucket
-                .quarantine_until
-                .is_some_and(|quarantine_until| observed_at < quarantine_until);
-            quarantine_active
-                || observed_at.saturating_duration_since(bucket.last_seen_at)
-                    <= Duration::from_secs(retention_secs)
-        });
-    }
-
-    fn make_room_for_new_bucket(&mut self, observed_at: Instant, capacity: usize) -> bool {
-        if capacity == 0 {
-            return false;
-        }
-        while self.buckets.len() >= capacity {
-            let eviction_candidate = self
-                .buckets
-                .iter()
-                .filter(|(_, bucket)| {
-                    !bucket
-                        .quarantine_until
-                        .is_some_and(|quarantine_until| observed_at < quarantine_until)
-                })
-                .min_by(|(left_id, left), (right_id, right)| {
-                    left.last_seen_at
-                        .cmp(&right.last_seen_at)
-                        .then_with(|| left_id.cmp(right_id))
-                })
-                .map(|(node_id, _)| *node_id);
-            let Some(eviction_candidate) = eviction_candidate else {
-                return false;
-            };
-            self.buckets.remove(&eviction_candidate);
-        }
-        true
-    }
-}
-
-fn project_monotonic_deadline_to_epoch(
-    observed_at_epoch: u64,
-    observed_at: Instant,
-    deadline: Instant,
-) -> u64 {
-    // [BLIND-RELAY-MONOTONIC-ABUSE-CLOCK 2026-08-21 by Codex] Enforcement
-    // remains monotonic. This projection exists only for the established
-    // PeerStore/API timestamp contract and rounds up so observability never
-    // reports an active quarantine as expired one second too early.
-    let remaining = deadline.saturating_duration_since(observed_at);
-    let remaining_secs = remaining
-        .as_secs()
-        .saturating_add(u64::from(remaining.subsec_nanos() != 0));
-    observed_at_epoch.saturating_add(remaining_secs)
 }
 
 /// Node-to-node encrypted envelope relay request.
@@ -1953,7 +1710,7 @@ pub fn build_chat_peer_router(
         http_client,
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
         blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-        blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+        blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
     };
     let peer_relay_router = Router::new()
         .route("/api/chat/peer/relay", post(peer_relay_handler))
@@ -2084,8 +1841,6 @@ async fn peer_blind_relay_request_gate(
     let requests_per_minute = relay.config().peer_relay_requests_per_minute;
     let admitted = state
         .blind_relay_abuse_guard
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .admit_global(Instant::now(), requests_per_minute);
     if !admitted {
         state
@@ -3369,13 +3124,9 @@ fn check_blind_relay_previous_hop_allowed(
     previous_hop: [u8; 32],
     now: u64,
 ) -> Result<(), BlindRelayError> {
-    let decision = {
-        let mut abuse_guard = state
-            .blind_relay_abuse_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        abuse_guard.observe_request(previous_hop, now)
-    };
+    let decision = state
+        .blind_relay_abuse_guard
+        .observe_request(previous_hop, now);
 
     match decision {
         BlindRelayAbuseDecision::Allowed => Ok(()),
@@ -3439,13 +3190,9 @@ fn reject_blind_relay_previous_hop(
         return;
     }
 
-    let quarantine_until = {
-        let mut abuse_guard = state
-            .blind_relay_abuse_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        abuse_guard.record_failure(previous_hop, now)
-    };
+    let quarantine_until = state
+        .blind_relay_abuse_guard
+        .record_failure(previous_hop, now);
     if let Some(quarantine_until) = quarantine_until {
         state
             .peer_store
@@ -3460,11 +3207,7 @@ fn reject_blind_relay_previous_hop(
 }
 
 fn record_blind_relay_previous_hop_success(state: &ChatPeerState, previous_hop: [u8; 32]) {
-    let mut abuse_guard = state
-        .blind_relay_abuse_guard
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    abuse_guard.record_success(previous_hop);
+    state.blind_relay_abuse_guard.record_success(previous_hop);
 }
 
 fn blind_relay_reason_counts_toward_quarantine(reason: &str) -> bool {
@@ -5440,22 +5183,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn blind_relay_global_rate_limit_uses_exact_monotonic_windows() {
-        let started_at = Instant::now();
-        let mut guard = BlindRelayAbuseGuard {
-            global_rate_limit: PeerRelayRateLimitWindow::new(started_at),
-            ..BlindRelayAbuseGuard::default()
-        };
-
-        assert!(guard.admit_global(started_at, 2));
-        assert!(guard.admit_global(started_at + Duration::from_secs(59), 2));
-        assert!(!guard.admit_global(started_at + Duration::from_secs(59), 2));
-        assert!(guard.admit_global(started_at + Duration::from_secs(60), 2));
-        assert_eq!(guard.global_rate_limit.admitted(), 1);
-    }
-
-    #[tokio::test]
+     #[tokio::test]
     async fn peer_relay_rate_limit_rejects_before_duplicate_processing() {
         let (relay, path) = temp_chat_relay_with_peer_rate("chat-peer-rate-limit", 1);
         let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
@@ -5822,7 +5550,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
         let envelope = BlindRelayEnvelope {
@@ -5873,7 +5601,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
         let envelope = BlindRelayEnvelope {
@@ -5927,7 +5655,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
 
@@ -6086,7 +5814,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
         let recovered = process_peer_blind_relay(state, request)
@@ -6170,7 +5898,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let route_id = [0x69; 16];
         let request = PeerBlindRelayRequest {
@@ -6286,7 +6014,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let recovered_peel = try_open_onion_layer(
             &request.envelope.encrypted_blob,
@@ -6372,7 +6100,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
         let receiver = [0xA2; 32];
@@ -6464,7 +6192,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
         let make_envelope = |route_id| {
@@ -6553,7 +6281,8 @@ mod tests {
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let peer_store = Arc::new(PeerStore::new());
         let seen_routes = Arc::new(Mutex::new(BlindRelayRouteReplayCache::default()));
-        let abuse_guard = Arc::new(Mutex::new(BlindRelayAbuseGuard::default()));
+        let abuse_guard: Arc<dyn BlindRelayAbusePolicy> =
+            Arc::new(BlindRelayAbuseDomain::default());
         let failed_state = ChatPeerState {
             chat_relay: None,
             blind_vault: None,
@@ -6654,7 +6383,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
 
@@ -6755,7 +6484,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
         // Build a true two-layer onion. The middle hop can peel only the outer
@@ -6959,7 +6688,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
         let middle_hop = OnionHop {
@@ -7055,7 +6784,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let app = Router::new()
             .route("/api/chat/peer/blind-relay", post(peer_blind_relay_handler))
@@ -7114,7 +6843,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
         assert!(InFlightRequestGuard::try_acquire(
@@ -7161,7 +6890,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x44u8; 16],
@@ -7548,233 +7277,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn blind_relay_abuse_guard_rate_limits_previous_hop_without_payload_data() {
-        let mut guard = BlindRelayAbuseGuard::default();
-        let previous_hop = [0x52u8; 32];
-        let now_epoch = 1_800_000_000;
-        let started_at = Instant::now();
-
-        for _ in 0..BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
-            assert_eq!(
-                guard.observe_request_at(previous_hop, now_epoch, started_at),
-                BlindRelayAbuseDecision::Allowed
-            );
-        }
-
-        assert_eq!(
-            guard.observe_request_at(previous_hop, now_epoch, started_at),
-            BlindRelayAbuseDecision::RateLimited {
-                quarantine_until: now_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
-            }
-        );
-        assert_eq!(
-            guard.observe_request_at(
-                previous_hop,
-                now_epoch + 1,
-                started_at + Duration::from_secs(1),
-            ),
-            BlindRelayAbuseDecision::Quarantined {
-                quarantine_until: now_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
-            }
-        );
-    }
-
-    #[test]
-    fn blind_relay_abuse_guard_uses_exact_monotonic_rate_window() {
-        let mut guard = BlindRelayAbuseGuard::default();
-        let previous_hop = [0x54u8; 32];
-        let now_epoch = 1_800_000_000;
-        let started_at = Instant::now();
-
-        for _ in 0..BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
-            assert_eq!(
-                guard.observe_request_at(previous_hop, now_epoch, started_at),
-                BlindRelayAbuseDecision::Allowed
-            );
-        }
-        assert_eq!(
-            guard.observe_request_at(
-                previous_hop,
-                now_epoch + BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS,
-                started_at + Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_RATE_WINDOW_SECS),
-            ),
-            BlindRelayAbuseDecision::Allowed
-        );
-    }
-
-    #[test]
-    fn blind_relay_abuse_guard_ignores_wall_clock_rollback() {
-        let mut guard = BlindRelayAbuseGuard::default();
-        let previous_hop = [0x55u8; 32];
-        let started_epoch = 1_800_000_000;
-        let rolled_back_epoch = started_epoch - 3_600;
-        let started_at = Instant::now();
-
-        for _ in 0..BLIND_RELAY_PREVIOUS_HOP_RATE_LIMIT {
-            assert_eq!(
-                guard.observe_request_at(previous_hop, started_epoch, started_at),
-                BlindRelayAbuseDecision::Allowed
-            );
-        }
-        assert_eq!(
-            guard.observe_request_at(
-                previous_hop,
-                rolled_back_epoch,
-                started_at + Duration::from_secs(59),
-            ),
-            BlindRelayAbuseDecision::RateLimited {
-                quarantine_until: rolled_back_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
-            }
-        );
-        assert_eq!(
-            guard.observe_request_at(
-                previous_hop,
-                rolled_back_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS,
-                started_at + Duration::from_secs(59 + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS,),
-            ),
-            BlindRelayAbuseDecision::Allowed
-        );
-    }
-
-    #[test]
-    fn blind_relay_abuse_guard_quarantines_repeated_bad_previous_hop() {
-        let mut guard = BlindRelayAbuseGuard::default();
-        let previous_hop = [0x53u8; 32];
-        let now_epoch = 1_800_000_000;
-        let started_at = Instant::now();
-
-        for offset in 0..(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD - 1) {
-            assert_eq!(
-                guard.record_failure_at(
-                    previous_hop,
-                    now_epoch + u64::from(offset),
-                    started_at + Duration::from_secs(u64::from(offset)),
-                ),
-                None
-            );
-        }
-
-        let quarantine_offset = u64::from(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD);
-        let quarantine_at_epoch = now_epoch + quarantine_offset;
-        let quarantine_at = started_at + Duration::from_secs(quarantine_offset);
-        assert_eq!(
-            guard.record_failure_at(previous_hop, quarantine_at_epoch, quarantine_at),
-            Some(quarantine_at_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS)
-        );
-        assert_eq!(
-            guard.observe_request_at(
-                previous_hop,
-                quarantine_at_epoch + 1,
-                quarantine_at + Duration::from_secs(1),
-            ),
-            BlindRelayAbuseDecision::Quarantined {
-                quarantine_until: quarantine_at_epoch + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS
-            }
-        );
-    }
-
-    #[test]
-    fn blind_relay_abuse_guard_decays_failures_at_exact_monotonic_boundary() {
-        let mut guard = BlindRelayAbuseGuard::default();
-        let previous_hop = [0x56u8; 32];
-        let now_epoch = 1_800_000_000;
-        let started_at = Instant::now();
-
-        for _ in 0..(BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD - 1) {
-            assert_eq!(
-                guard.record_failure_at(previous_hop, now_epoch, started_at),
-                None
-            );
-        }
-        assert_eq!(
-            guard.record_failure_at(
-                previous_hop,
-                now_epoch + BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS,
-                started_at + Duration::from_secs(BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS),
-            ),
-            None
-        );
-        assert_eq!(guard.buckets[&previous_hop].failure_score, 1);
-    }
-
-    #[test]
-    fn blind_relay_abuse_guard_removes_idle_buckets_behind_active_identity() {
-        let mut guard = BlindRelayAbuseGuard::default();
-        let active = [0x61u8; 32];
-        let stale = [0x62u8; 32];
-        let newcomer = [0x63u8; 32];
-        let started_at_epoch = 1_800_000_000;
-        let started_at = Instant::now();
-        let retention_secs =
-            BLIND_RELAY_PREVIOUS_HOP_FAILURE_WINDOW_SECS + BLIND_RELAY_PREVIOUS_HOP_QUARANTINE_SECS;
-        let now_epoch = started_at_epoch + retention_secs + 2;
-        let now = started_at + Duration::from_secs(retention_secs + 2);
-
-        assert_eq!(
-            guard.observe_request_at(active, started_at_epoch, started_at),
-            BlindRelayAbuseDecision::Allowed
-        );
-        assert_eq!(
-            guard.observe_request_at(
-                stale,
-                started_at_epoch + 1,
-                started_at + Duration::from_secs(1),
-            ),
-            BlindRelayAbuseDecision::Allowed
-        );
-        guard.record_success_at(active, now);
-        assert_eq!(
-            guard.observe_request_at(newcomer, now_epoch, now),
-            BlindRelayAbuseDecision::Allowed
-        );
-
-        assert!(guard.buckets.contains_key(&active));
-        assert!(guard.buckets.contains_key(&newcomer));
-        assert!(!guard.buckets.contains_key(&stale));
-    }
-
-    #[test]
-    fn blind_relay_abuse_guard_evicts_lru_without_erasing_active_quarantine() {
-        let mut guard = BlindRelayAbuseGuard::default();
-        let quarantined = [0x71u8; 32];
-        let evictable = [0x72u8; 32];
-        let now = Instant::now();
-        let mut quarantined_bucket =
-            BlindRelayPreviousHopBucket::new(now - Duration::from_secs(100));
-        quarantined_bucket.quarantine_until = Some(now + Duration::from_secs(60));
-        guard.buckets.insert(quarantined, quarantined_bucket);
-        guard.buckets.insert(
-            evictable,
-            BlindRelayPreviousHopBucket::new(now - Duration::from_secs(10)),
-        );
-
-        assert!(guard.make_room_for_new_bucket(now, 2));
-        assert!(guard.buckets.contains_key(&quarantined));
-        assert!(!guard.buckets.contains_key(&evictable));
-    }
-
-    #[test]
-    fn blind_relay_abuse_guard_rejects_new_identity_when_all_buckets_quarantined() {
-        let mut guard = BlindRelayAbuseGuard::default();
-        let now_epoch = 1_800_000_000;
-        let now = Instant::now();
-        for index in 0..MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS {
-            let mut node_id = [0u8; 32];
-            node_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
-            let mut bucket = BlindRelayPreviousHopBucket::new(now);
-            bucket.quarantine_until = Some(now + Duration::from_secs(60));
-            guard.buckets.insert(node_id, bucket);
-        }
-
-        assert_eq!(
-            guard.observe_request_at([0xffu8; 32], now_epoch, now),
-            BlindRelayAbuseDecision::CapacityLimited
-        );
-        assert_eq!(guard.buckets.len(), MAX_BLIND_RELAY_PREVIOUS_HOP_BUCKETS);
-    }
-
-    #[tokio::test]
+     #[tokio::test]
     async fn forged_previous_hop_signatures_cannot_poison_node_quarantine() {
         let claimed_previous_hop = IdentityKeyPair::generate();
         let attacker = IdentityKeyPair::generate();
@@ -7790,7 +7293,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
         let claimed_node_id = claimed_previous_hop.public_key_bytes();
@@ -7825,8 +7328,6 @@ mod tests {
 
         let decision = state
             .blind_relay_abuse_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .observe_request(claimed_node_id, now);
         assert_eq!(decision, BlindRelayAbuseDecision::Allowed);
 
@@ -7876,7 +7377,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x45u8; 16],
@@ -7972,7 +7473,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let error = process_peer_blind_relay(state, request).await.unwrap_err();
 
@@ -8033,7 +7534,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(replay_cache)),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let error = process_peer_blind_relay(state, request).await.unwrap_err();
 
@@ -8107,7 +7608,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x42u8; 16],
@@ -8208,7 +7709,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let outer_envelope = BlindRelayEnvelope {
             route_id: [0x62u8; 16],
@@ -8329,7 +7830,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x56u8; 16],
@@ -8411,7 +7912,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x57u8; 16],
@@ -8501,7 +8002,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x54u8; 16],
@@ -8591,7 +8092,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x59u8; 16],
@@ -8713,7 +8214,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x59u8; 16],
@@ -8827,7 +8328,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let request = PeerBlindRelayRequest {
             envelope: BlindRelayEnvelope {
@@ -8936,7 +8437,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let request = PeerBlindRelayRequest {
             envelope: BlindRelayEnvelope {
@@ -9027,7 +8528,7 @@ mod tests {
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x43u8; 16],
@@ -9134,7 +8635,7 @@ mod tests {
             ),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
             blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            blind_relay_abuse_guard: Arc::new(Mutex::new(BlindRelayAbuseGuard::default())),
+            blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
             route_id: [0x58u8; 16],
