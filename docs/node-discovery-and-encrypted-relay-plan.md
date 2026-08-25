@@ -4,9 +4,9 @@
 
 Creation Reason: Define the long-term Rust protocol plan for node-to-node discovery, signed node descriptors, encrypted envelope relay, Memory Chain coordination, and a future Directory Chain without smart contracts.
 
-Modification Reason: v1.49.0 - Recover an exact crash-left verified submission
-through owner-fenced, idempotent entry custody without reselecting an uncertain
-onion path or inventing a terminal receipt that was not durably retained.
+Modification Reason: v1.50.0 - Publish aggregate process-local evidence for
+owner-fenced verified-submit recovery without exposing request, route, peer,
+receipt, endpoint, wallet, ciphertext, or payload dimensions.
 
 Main Functionality:
 
@@ -31,8 +31,9 @@ Important Note for Next Developer:
 - Do not store or sync packet payloads, DNS contents, destinations, domains, URLs, browsing history, voucher secrets, client public IPs, chat plaintext, private keys, or wallet-level traffic.
 - Default routing policy must be no-exit unless an operator explicitly enables a future exit capability.
 
-Last Modified: v1.49.0 - [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Gives verified-submit reservations process-owner fencing and permits a replacement process to recover only exact idempotent entry custody, preserving truthful retry availability without repeating an unknown onion side effect.
+Last Modified: v1.50.0 - [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Adds aggregate attempted, completed, failed, and deferred entry-recovery transitions to the existing verified-submit health object, preserving rolling JSON compatibility and the blind-relay privacy boundary.
 
+Previous: v1.49.0 - [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Gives verified-submit reservations process-owner fencing and permits a replacement process to recover only exact idempotent entry custody, preserving truthful retry availability without repeating an unknown onion side effect.
 Previous: v1.48.0 - [BLIND-ROUTE-RECOVERY-STATUS 2026-08-25 by Codex] Reports process-lifetime attempted, completed, and deferred armed-route reconciliation transitions while deliberately omitting current pending volume and every route-, peer-, endpoint-, receipt-, and payload-derived dimension.
 Previous: v1.47.0 - [MIDDLE-HOP-ARMED-RECOVERY 2026-08-25 by Codex] Gives sealed ACKs an explicit storage-only magic/version codec with legacy-row reads, then proves a crashed middle hop can resend the exact signed downstream onion request, recover the terminal node's durable ACK, and seal upstream success without duplicating custody.
 Previous: v1.46.0 - [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Safely takes over an exact armed claim after process grace, repeats only idempotent terminal or downstream work, reconstructs byte-stable onion forwarding, and persists the recovered sealed ACK without duplicating terminal custody.
@@ -3292,6 +3293,17 @@ Implemented:
   terminal receipt. A predecessor fenced by takeover cannot seal a response.
   This preserves retry availability without claiming proof the node no longer
   possesses or creating custody on a second terminal.
+- [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex]
+  `peer_relay.verified_submit.entry_recovery` reports only process-lifetime
+  aggregate `attempted_total`, `completed_total`, `failed_total`,
+  `deferred_total`, `last_outcome`, and `last_event_at`. Admission records the
+  attempted transition only after the owner compare-and-swap commits. A
+  restored custody plus durable exact response is `completed`; a durably
+  closed no-custody response is `failed`; response-persistence failure is
+  `deferred` because the reservation remains available to a later process.
+  These transitions do not increment the normal submit total a second time.
+  The object has no request, message, wallet, route, peer, receipt, endpoint,
+  ciphertext, payload, or current-pending dimension.
 - Capacity is now admission, not eviction: unexpired completed responses and
   reservations are never removed to accept new work. A full node rejects the
   new request before side effects, while expired rows are pruned in the same
@@ -3411,6 +3423,10 @@ Verification:
   fencing, and exact response replay. The real client handler repeats an
   already-stored encrypted envelope without increasing pending custody, route
   rounds, or wallet-route state and returns no terminal receipt.
+- Recovery-status coverage proves the complete custody/persistence outcome
+  table, admission-owned attempt recording, a real handler `completed`
+  transition, and default decoding of pre-status heartbeat JSON while
+  preserving existing submit counters.
 - Blind-relay no-eviction coverage fills the complete replay map with live and
   completed evidence, proves the exact ACK remains replayable, proves a new
   authenticated request stops before terminal/forward effects, and confirms

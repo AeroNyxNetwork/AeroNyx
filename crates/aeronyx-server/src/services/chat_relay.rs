@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.15.0-VerifiedSubmitEntryRecovery
+// Version: 3.16.0-VerifiedSubmitRecoveryStatus
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -30,6 +30,9 @@
 //   fencing and lease takeover to verified-submit reservations. A replacement
 //   process may recover exact idempotent entry custody without reselecting an
 //   uncertain onion path or inventing a lost terminal receipt.
+//   [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Added aggregate-only
+//   attempted/completed/failed/deferred recovery transitions so operators can
+//   verify restart behavior without receiving request-derived dimensions.
 //   [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Reused the node-private
 //   custody database for HMAC-indexed blind-route reservations and AEAD-sealed
 //   ACK replay. Advertised relay nodes now retain their idempotency boundary
@@ -262,6 +265,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.16.0-VerifiedSubmitRecoveryStatus — Aggregate restart-recovery evidence
 //   v3.15.0-VerifiedSubmitEntryRecovery — Owner-fenced custody-only takeover
 //   v3.14.0-RecoverableBlindRelayClaim — Restart-safe pre-effect claim takeover
 //   v3.13.0-CrashSafeVerifiedSubmitAdmission — Durable pre-side-effect reservation
@@ -578,10 +582,88 @@ pub struct ChatRelayVerifiedSubmitStatus {
     pub pending_rejected_total: u64,
     /// New requests rejected before side effects because replay slots were full.
     pub capacity_rejected_total: u64,
+    /// Aggregate process-local evidence for restart entry-custody recovery.
+    pub entry_recovery: ChatRelayVerifiedSubmitRecoveryStatus,
     /// Last closed result bucket observed.
     pub last_result: Option<String>,
     /// Timestamp of the last observed verified-submit result.
     pub last_at: Option<u64>,
+}
+
+/// Aggregate evidence for owner-fenced verified-submit entry recovery.
+///
+/// [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] This process-lifetime
+/// status deliberately carries no request, message, wallet, route, peer,
+/// receipt, endpoint, ciphertext, or payload-derived dimension.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatRelayVerifiedSubmitRecoveryStatus {
+    /// Foreign-process reservations admitted after the fixed owner grace.
+    pub attempted_total: u64,
+    /// Attempts that restored custody and durably retained the exact response.
+    pub completed_total: u64,
+    /// Attempts that durably closed without restoring entry custody.
+    pub failed_total: u64,
+    /// Attempts left recoverable because response persistence did not complete.
+    pub deferred_total: u64,
+    /// Last coarse transition: `attempted`, `completed`, `failed`, or `deferred`.
+    pub last_outcome: Option<String>,
+    /// Timestamp of the latest process-local recovery transition.
+    pub last_event_at: Option<u64>,
+}
+
+impl ChatRelayVerifiedSubmitRecoveryStatus {
+    fn record_attempted(&mut self, now: u64) {
+        self.attempted_total = self.attempted_total.saturating_add(1);
+        self.last_outcome = Some("attempted".to_string());
+        self.last_event_at = Some(now);
+    }
+
+    fn record_outcome(&mut self, now: u64, outcome: VerifiedSubmitRecoveryOutcome) {
+        let bucket = match outcome {
+            VerifiedSubmitRecoveryOutcome::Completed => {
+                self.completed_total = self.completed_total.saturating_add(1);
+                "completed"
+            }
+            VerifiedSubmitRecoveryOutcome::Failed => {
+                self.failed_total = self.failed_total.saturating_add(1);
+                "failed"
+            }
+            VerifiedSubmitRecoveryOutcome::Deferred => {
+                self.deferred_total = self.deferred_total.saturating_add(1);
+                "deferred"
+            }
+        };
+        self.last_outcome = Some(bucket.to_string());
+        self.last_event_at = Some(now);
+    }
+}
+
+/// Closed aggregate outcomes after one entry-recovery admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifiedSubmitRecoveryOutcome {
+    /// Entry custody and exact response persistence both completed.
+    Completed,
+    /// The attempt durably closed without entry custody.
+    Failed,
+    /// Response persistence failed, leaving durable retry evidence recoverable.
+    Deferred,
+}
+
+impl VerifiedSubmitRecoveryOutcome {
+    /// Derives the one closed recovery bucket from custody and replay state.
+    pub(crate) const fn from_results(entry_custody: bool, response_persisted: bool) -> Self {
+        // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Persistence
+        // failure dominates because the owner-fenced reservation remains the
+        // restart authority regardless of the preceding custody outcome.
+        if !response_persisted {
+            Self::Deferred
+        } else if entry_custody {
+            Self::Completed
+        } else {
+            Self::Failed
+        }
+    }
 }
 
 impl ChatRelayVerifiedSubmitStatus {
@@ -603,7 +685,7 @@ impl ChatRelayVerifiedSubmitStatus {
             _ => {
                 self.unknown_result_total = self.unknown_result_total.saturating_add(1);
             }
-        };
+        }
         let bucket = chat_verified_submit_result_label(result).unwrap_or("unknown");
         self.last_result = Some(bucket.to_string());
         self.last_at = Some(now);
@@ -7159,6 +7241,17 @@ impl ChatRelayService {
                 VerifiedSubmitAdmission::Pending
             };
             tx.commit()?;
+            drop(conn);
+            if matches!(
+                outcome,
+                VerifiedSubmitAdmission::ReservedForEntryRecovery
+            ) {
+                // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex]
+                // Admission is the only authoritative attempted transition.
+                self.record_verified_submit_recovery_attempted(
+                    u64::try_from(reserved_at).unwrap_or(u64::MAX),
+                );
+            }
             return Ok(outcome);
         }
 
@@ -9502,6 +9595,31 @@ impl ChatRelayService {
             .write()
             .verified_submit
             .record_capacity_rejection(now, result);
+    }
+
+    /// Records one foreign-owner takeover after durable admission commits.
+    pub(crate) fn record_verified_submit_recovery_attempted(&self, now: u64) {
+        self.peer_status
+            .write()
+            .verified_submit
+            .entry_recovery
+            .record_attempted(now);
+    }
+
+    /// Records one closed restart-recovery transition without request data.
+    pub(crate) fn record_verified_submit_recovery_outcome(
+        &self,
+        now: u64,
+        outcome: VerifiedSubmitRecoveryOutcome,
+    ) {
+        // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Keep this
+        // process-local aggregate independent from the normal protocol result
+        // counters; one recovered request must not be counted as two submits.
+        self.peer_status
+            .write()
+            .verified_submit
+            .entry_recovery
+            .record_outcome(now, outcome);
     }
 
     /// Records an accepted inbound peer relay request.
@@ -12142,6 +12260,21 @@ mod tests {
             1_800_000_068,
             CHAT_VERIFIED_SUBMIT_REJECTED_V1,
         );
+        svc.record_verified_submit_recovery_attempted(1_800_000_069);
+        svc.record_verified_submit_recovery_outcome(
+            1_800_000_070,
+            VerifiedSubmitRecoveryOutcome::Completed,
+        );
+        svc.record_verified_submit_recovery_attempted(1_800_000_071);
+        svc.record_verified_submit_recovery_outcome(
+            1_800_000_072,
+            VerifiedSubmitRecoveryOutcome::Failed,
+        );
+        svc.record_verified_submit_recovery_attempted(1_800_000_073);
+        svc.record_verified_submit_recovery_outcome(
+            1_800_000_074,
+            VerifiedSubmitRecoveryOutcome::Deferred,
+        );
 
         let status = svc.peer_status().verified_submit;
         assert_eq!(status.total, 9);
@@ -12154,8 +12287,37 @@ mod tests {
         assert_eq!(status.request_conflict_total, 1);
         assert_eq!(status.pending_rejected_total, 1);
         assert_eq!(status.capacity_rejected_total, 1);
+        assert_eq!(status.entry_recovery.attempted_total, 3);
+        assert_eq!(status.entry_recovery.completed_total, 1);
+        assert_eq!(status.entry_recovery.failed_total, 1);
+        assert_eq!(status.entry_recovery.deferred_total, 1);
+        assert_eq!(
+            status.entry_recovery.last_outcome.as_deref(),
+            Some("deferred")
+        );
+        assert_eq!(status.entry_recovery.last_event_at, Some(1_800_000_074));
         assert_eq!(status.last_result.as_deref(), Some("rejected"));
         assert_eq!(status.last_at, Some(1_800_000_068));
+    }
+
+    #[test]
+    fn verified_submit_recovery_outcome_truth_table_is_closed() {
+        assert_eq!(
+            VerifiedSubmitRecoveryOutcome::from_results(true, true),
+            VerifiedSubmitRecoveryOutcome::Completed
+        );
+        assert_eq!(
+            VerifiedSubmitRecoveryOutcome::from_results(false, true),
+            VerifiedSubmitRecoveryOutcome::Failed
+        );
+        assert_eq!(
+            VerifiedSubmitRecoveryOutcome::from_results(true, false),
+            VerifiedSubmitRecoveryOutcome::Deferred
+        );
+        assert_eq!(
+            VerifiedSubmitRecoveryOutcome::from_results(false, false),
+            VerifiedSubmitRecoveryOutcome::Deferred
+        );
     }
 
     #[test]
@@ -12486,6 +12648,14 @@ mod tests {
                 .reserve_verified_submit(&request)
                 .expect("take over abandoned entry custody"),
             VerifiedSubmitAdmission::ReservedForEntryRecovery
+        );
+        assert_eq!(
+            restarted
+                .peer_status()
+                .verified_submit
+                .entry_recovery
+                .attempted_total,
+            1
         );
         let recovered_response = ChatRelayVerifiedSubmitResponseV1::from_evidence(
             request.request_id,
@@ -13500,6 +13670,39 @@ mod tests {
         assert_eq!(
             decoded.blind_route_recovery,
             ChatRelayBlindRouteRecoveryStatus::default()
+        );
+    }
+
+    #[test]
+    fn verified_submit_health_preserves_nested_rolling_compatibility() {
+        // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] An older
+        // heartbeat snapshot has normal verified-submit counters but no nested
+        // recovery evidence. New readers must preserve the former and default
+        // the additive recovery object without guessing historical outcomes.
+        let svc = make_service();
+        svc.record_verified_submit_result(
+            1_800_000_075,
+            CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
+        );
+        svc.record_verified_submit_recovery_attempted(1_800_000_076);
+        svc.record_verified_submit_recovery_outcome(
+            1_800_000_077,
+            VerifiedSubmitRecoveryOutcome::Completed,
+        );
+        let mut encoded = serde_json::to_value(svc.peer_status()).expect("serialize peer status");
+        encoded
+            .get_mut("verified_submit")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("verified-submit status object")
+            .remove("entry_recovery");
+
+        let decoded: ChatRelayPeerStatus = serde_json::from_value(encoded)
+            .expect("deserialize pre-recovery verified-submit status");
+        assert_eq!(decoded.verified_submit.total, 1);
+        assert_eq!(decoded.verified_submit.entry_retry_total, 1);
+        assert_eq!(
+            decoded.verified_submit.entry_recovery,
+            ChatRelayVerifiedSubmitRecoveryStatus::default()
         );
     }
 

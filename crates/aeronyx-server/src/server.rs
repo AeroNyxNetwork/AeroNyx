@@ -615,8 +615,14 @@
 //     process may repeat only exact idempotent local entry custody. It must not
 //     re-announce a wallet route, select another onion path, or claim terminal
 //     evidence that was not durably retained before the predecessor stopped.
+//   - [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Recovery telemetry
+//     is aggregate and process-local. Never attach request, message, wallet,
+//     route, peer, receipt, endpoint, ciphertext, or payload dimensions.
 //
 // Last Modified:
+//   [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Classified each
+//     owner-fenced recovery as completed, failed, or deferred after combining
+//     entry-custody and exact-response persistence outcomes.
 //   [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Routed abandoned
 //     verified submissions through owner-fenced custody-only recovery while
 //     preserving the existing fail-closed pending and capacity boundaries.
@@ -1025,7 +1031,7 @@ use crate::miner::ReflectionMiner;
 use crate::services::chat_relay::{
     derive_node_secret, ChatRelayOutboundFailureReason, ChatRelayPeerStatus, ChatRelayService,
     ExpiredNotification, VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
-    MAX_CHAT_ACK_MESSAGE_IDS,
+    VerifiedSubmitRecoveryOutcome, MAX_CHAT_ACK_MESSAGE_IDS,
 };
 use crate::services::memchain::derive_rawlog_key;
 use crate::services::memchain::derive_record_key;
@@ -14660,8 +14666,21 @@ impl Server {
         );
         // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] The relay
         // status records only the closed result bucket, never identifiers.
-        relay.record_verified_submit_result(unix_now_secs(), response.result);
-        if let Err(error) = relay.remember_verified_submit_response(&request, &response) {
+        let completed_at = unix_now_secs();
+        relay.record_verified_submit_result(completed_at, response.result);
+        let persistence = relay.remember_verified_submit_response(&request, &response);
+        if entry_recovery {
+            // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Recovery
+            // closes exactly once: successful custody plus durable replay is
+            // completed; a durable no-custody result is failed; persistence
+            // failure remains deferred for a later replacement process.
+            let recovery_outcome = VerifiedSubmitRecoveryOutcome::from_results(
+                entry_custody,
+                persistence.is_ok(),
+            );
+            relay.record_verified_submit_recovery_outcome(completed_at, recovery_outcome);
+        }
+        if let Err(error) = persistence {
             // [DURABLE-VERIFIED-SUBMIT-IDEMPOTENCY 2026-08-24 by Codex]
             // Delivery/custody has already completed, so changing the result
             // would misreport evidence and encourage another submission. Keep
@@ -19330,7 +19349,16 @@ mod tests {
                 .pending_messages,
             1
         );
-        assert_eq!(relay.peer_status().verified_submit.replayed_total, 1);
+        let verified_status = relay.peer_status().verified_submit;
+        assert_eq!(verified_status.replayed_total, 1);
+        assert_eq!(verified_status.entry_recovery.attempted_total, 1);
+        assert_eq!(verified_status.entry_recovery.completed_total, 1);
+        assert_eq!(verified_status.entry_recovery.failed_total, 0);
+        assert_eq!(verified_status.entry_recovery.deferred_total, 0);
+        assert_eq!(
+            verified_status.entry_recovery.last_outcome.as_deref(),
+            Some("completed")
+        );
     }
 
     #[tokio::test]
