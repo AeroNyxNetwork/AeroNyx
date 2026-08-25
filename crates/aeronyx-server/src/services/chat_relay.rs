@@ -64,6 +64,8 @@
 //   [CHAT-DIRECT-PEER-CIRCUIT-DOMAIN 2026-08-25 by Codex] Extracted the
 //   generation-safe circuit state machine and anonymous durable checkpoint
 //   behind a composed repository capability.
+//   [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] Extracted privacy-safe
+//   relay health classification and atomic process telemetry composition.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -308,6 +310,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.28.0-PeerRelayTelemetryDomain — Trait-based aggregate telemetry
 //   v3.27.0-DirectPeerCircuitDomain — Trait-based durable circuit composition
 //   v3.25.0-DurableQuarantineDomain — Trait-based quarantine composition
 //   v3.24.0-BlobCustodyDomain — Trait-based encrypted-blob custody composition
@@ -388,10 +391,12 @@ use aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS;
 use aeronyx_core::protocol::chat::encode_envelope;
 use aeronyx_core::protocol::chat::{ChatEnvelope, CustodyAuditAnchorV1};
 use aeronyx_core::protocol::memchain::{
-    chat_verified_submit_result_label, ChatRelayVerifiedSubmitRequestV1,
-    ChatRelayVerifiedSubmitResponseV1, CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1,
-    CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1, CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1,
-    CHAT_VERIFIED_SUBMIT_REJECTED_V1,
+    ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
+};
+#[cfg(test)]
+use aeronyx_core::protocol::memchain::{
+    CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1, CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1,
+    CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1, CHAT_VERIFIED_SUBMIT_REJECTED_V1,
 };
 
 use crate::config::ChatRelayConfig;
@@ -417,6 +422,15 @@ use crate::services::chat_relay_direct_peer_circuit::{
 #[cfg(test)]
 use crate::services::chat_relay_cleanup::CLEANUP_MESSAGE_BATCH_SIZE;
 use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
+use crate::services::chat_relay_peer_telemetry::{
+    BlindRouteRecoveryEvent, OutboundRouteClass, PeerRelayTelemetryDomain, PeerRelayTelemetrySink,
+    VerifiedSubmitEvent, DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES,
+    DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS, DIRECT_PEER_RETRY_SLO_TARGET_BPS,
+    DIRECT_PEER_RETRY_SLO_WINDOW_SECS,
+};
+pub(crate) use crate::services::chat_relay_peer_telemetry::{
+    ChatRelayInboundFailureReason, ChatRelayOutboundFailureReason, VerifiedSubmitRecoveryOutcome,
+};
 #[cfg(test)]
 use crate::services::chat_relay_pending_custody::allocate_queue_sequence;
 use crate::services::chat_relay_pending_custody::{
@@ -480,17 +494,6 @@ pub(crate) const VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS: u64 =
 /// Grace period before another process may own and reconcile an exact claim.
 pub(crate) const BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS: u64 =
     REPLAY_OWNER_TAKEOVER_GRACE_SECS;
-/// Recent target-bound delivery health uses five fixed one-minute buckets.
-const DIRECT_PEER_RETRY_SLO_BUCKET_SECS: u64 = 60;
-const DIRECT_PEER_RETRY_SLO_BUCKET_COUNT: usize = 5;
-const DIRECT_PEER_RETRY_SLO_WINDOW_SECS: u64 =
-    DIRECT_PEER_RETRY_SLO_BUCKET_SECS * DIRECT_PEER_RETRY_SLO_BUCKET_COUNT as u64;
-/// 99.00% target-bound delivery success target, represented in basis points.
-const DIRECT_PEER_RETRY_SLO_TARGET_BPS: u16 = 9_900;
-/// Require repeated failures before declaring a short-window outage.
-const DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES: u64 = 3;
-/// At or below 50% delivery success with enough failures is a failed window.
-const DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS: u16 = 5_000;
 /// Minimum SQLite synchronous level permitted for acknowledged relay custody.
 const CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL: i64 = 2;
 /// Pages copied per online-backup step before SQLite releases its read lock.
@@ -649,106 +652,6 @@ pub struct ChatRelayVerifiedSubmitRecoveryStatus {
     pub last_outcome: Option<String>,
     /// Timestamp of the latest process-local recovery transition.
     pub last_event_at: Option<u64>,
-}
-
-impl ChatRelayVerifiedSubmitRecoveryStatus {
-    fn record_attempted(&mut self, now: u64) {
-        self.attempted_total = self.attempted_total.saturating_add(1);
-        self.last_outcome = Some("attempted".to_string());
-        self.last_event_at = Some(now);
-    }
-
-    fn record_outcome(&mut self, now: u64, outcome: VerifiedSubmitRecoveryOutcome) {
-        let bucket = match outcome {
-            VerifiedSubmitRecoveryOutcome::Completed => {
-                self.completed_total = self.completed_total.saturating_add(1);
-                "completed"
-            }
-            VerifiedSubmitRecoveryOutcome::Failed => {
-                self.failed_total = self.failed_total.saturating_add(1);
-                "failed"
-            }
-            VerifiedSubmitRecoveryOutcome::Deferred => {
-                self.deferred_total = self.deferred_total.saturating_add(1);
-                "deferred"
-            }
-        };
-        self.last_outcome = Some(bucket.to_string());
-        self.last_event_at = Some(now);
-    }
-}
-
-/// Closed aggregate outcomes after one entry-recovery admission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerifiedSubmitRecoveryOutcome {
-    /// Entry custody and exact response persistence both completed.
-    Completed,
-    /// The attempt durably closed without entry custody.
-    Failed,
-    /// Response persistence failed, leaving durable retry evidence recoverable.
-    Deferred,
-}
-
-impl VerifiedSubmitRecoveryOutcome {
-    /// Derives the one closed recovery bucket from custody and replay state.
-    pub(crate) const fn from_results(entry_custody: bool, response_persisted: bool) -> Self {
-        // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Persistence
-        // failure dominates because the owner-fenced reservation remains the
-        // restart authority regardless of the preceding custody outcome.
-        if !response_persisted {
-            Self::Deferred
-        } else if entry_custody {
-            Self::Completed
-        } else {
-            Self::Failed
-        }
-    }
-}
-
-impl ChatRelayVerifiedSubmitStatus {
-    fn record(&mut self, now: u64, result: u8) {
-        self.total = self.total.saturating_add(1);
-        match result {
-            CHAT_VERIFIED_SUBMIT_ONION_AND_ENTRY_V1 => {
-                self.onion_and_entry_total = self.onion_and_entry_total.saturating_add(1);
-            }
-            CHAT_VERIFIED_SUBMIT_ONION_ONLY_V1 => {
-                self.onion_only_total = self.onion_only_total.saturating_add(1);
-            }
-            CHAT_VERIFIED_SUBMIT_ENTRY_RETRY_V1 => {
-                self.entry_retry_total = self.entry_retry_total.saturating_add(1);
-            }
-            CHAT_VERIFIED_SUBMIT_REJECTED_V1 => {
-                self.rejected_total = self.rejected_total.saturating_add(1);
-            }
-            _ => {
-                self.unknown_result_total = self.unknown_result_total.saturating_add(1);
-            }
-        }
-        let bucket = chat_verified_submit_result_label(result).unwrap_or("unknown");
-        self.last_result = Some(bucket.to_string());
-        self.last_at = Some(now);
-    }
-
-    fn record_replay(&mut self, now: u64, result: u8) {
-        self.replayed_total = self.replayed_total.saturating_add(1);
-        self.record(now, result);
-    }
-
-    fn record_conflict(&mut self, now: u64, result: u8) {
-        self.request_conflict_total = self.request_conflict_total.saturating_add(1);
-        self.record(now, result);
-    }
-
-    fn record_pending_rejection(&mut self, now: u64, result: u8) {
-        self.pending_rejected_total = self.pending_rejected_total.saturating_add(1);
-        self.record(now, result);
-    }
-
-    fn record_capacity_rejection(&mut self, now: u64, result: u8) {
-        self.capacity_rejected_total = self.capacity_rejected_total.saturating_add(1);
-        self.record(now, result);
-    }
 }
 
 /// Fixed-window target-bound direct relay delivery SLO.
@@ -918,266 +821,6 @@ impl Default for ChatRelayDirectPeerCircuitStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct DirectPeerRetrySloBucket {
-    initialized: bool,
-    epoch_minute: u64,
-    deliveries: u64,
-    delivered: u64,
-    retry_triggered: u64,
-    retry_recovered: u64,
-    retry_exhausted: u64,
-    deterministic_failure: u64,
-}
-
-#[derive(Debug, Default)]
-struct DirectPeerRetrySloWindow {
-    buckets: [DirectPeerRetrySloBucket; DIRECT_PEER_RETRY_SLO_BUCKET_COUNT],
-    latest_epoch_minute: u64,
-}
-
-impl DirectPeerRetrySloWindow {
-    fn record(
-        &mut self,
-        now: u64,
-        retry_triggered: bool,
-        delivery_succeeded: bool,
-        final_failure_deterministic: bool,
-    ) {
-        let observed_epoch = now / DIRECT_PEER_RETRY_SLO_BUCKET_SECS;
-        let epoch_minute = observed_epoch.max(self.latest_epoch_minute);
-        self.latest_epoch_minute = epoch_minute;
-        let index = (epoch_minute % DIRECT_PEER_RETRY_SLO_BUCKET_COUNT as u64) as usize;
-        let bucket = &mut self.buckets[index];
-        if !bucket.initialized || bucket.epoch_minute != epoch_minute {
-            *bucket = DirectPeerRetrySloBucket {
-                initialized: true,
-                epoch_minute,
-                ..DirectPeerRetrySloBucket::default()
-            };
-        }
-
-        bucket.deliveries = bucket.deliveries.saturating_add(1);
-        if delivery_succeeded {
-            bucket.delivered = bucket.delivered.saturating_add(1);
-        }
-        if retry_triggered {
-            bucket.retry_triggered = bucket.retry_triggered.saturating_add(1);
-            if delivery_succeeded {
-                bucket.retry_recovered = bucket.retry_recovered.saturating_add(1);
-            } else {
-                bucket.retry_exhausted = bucket.retry_exhausted.saturating_add(1);
-            }
-        }
-        if final_failure_deterministic {
-            bucket.deterministic_failure = bucket.deterministic_failure.saturating_add(1);
-        }
-    }
-
-    fn snapshot(&self, now: u64) -> ChatRelayDirectPeerSloStatus {
-        let current_epoch = (now / DIRECT_PEER_RETRY_SLO_BUCKET_SECS).max(self.latest_epoch_minute);
-        let mut snapshot = ChatRelayDirectPeerSloStatus {
-            evaluated_at: now,
-            ..ChatRelayDirectPeerSloStatus::default()
-        };
-        for bucket in &self.buckets {
-            if !bucket.initialized
-                || bucket.epoch_minute > current_epoch
-                || current_epoch.saturating_sub(bucket.epoch_minute)
-                    >= DIRECT_PEER_RETRY_SLO_BUCKET_COUNT as u64
-            {
-                continue;
-            }
-            snapshot.deliveries_total = snapshot.deliveries_total.saturating_add(bucket.deliveries);
-            snapshot.delivered_total = snapshot.delivered_total.saturating_add(bucket.delivered);
-            snapshot.retry_triggered_total = snapshot
-                .retry_triggered_total
-                .saturating_add(bucket.retry_triggered);
-            snapshot.retry_recovered_total = snapshot
-                .retry_recovered_total
-                .saturating_add(bucket.retry_recovered);
-            snapshot.retry_exhausted_total = snapshot
-                .retry_exhausted_total
-                .saturating_add(bucket.retry_exhausted);
-            snapshot.deterministic_failure_total = snapshot
-                .deterministic_failure_total
-                .saturating_add(bucket.deterministic_failure);
-        }
-        snapshot.failed_total = snapshot
-            .deliveries_total
-            .saturating_sub(snapshot.delivered_total);
-        snapshot.delivery_success_bps =
-            ratio_basis_points(snapshot.delivered_total, snapshot.deliveries_total);
-        snapshot.retry_recovery_bps = ratio_basis_points(
-            snapshot.retry_recovered_total,
-            snapshot.retry_triggered_total,
-        );
-        snapshot.meets_slo = snapshot
-            .delivery_success_bps
-            .map(|ratio| ratio >= DIRECT_PEER_RETRY_SLO_TARGET_BPS);
-        snapshot.status = if snapshot.deliveries_total == 0 {
-            "idle"
-        } else if snapshot.failed_total >= DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES
-            && snapshot.delivery_success_bps.unwrap_or(0)
-                <= DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS
-        {
-            "failed"
-        } else if snapshot.meets_slo == Some(true) {
-            "healthy"
-        } else {
-            "degraded"
-        }
-        .to_string();
-        snapshot
-    }
-}
-
-fn ratio_basis_points(numerator: u64, denominator: u64) -> Option<u16> {
-    if denominator == 0 {
-        return None;
-    }
-    let basis_points = (u128::from(numerator).saturating_mul(10_000)) / u128::from(denominator);
-    Some(basis_points.min(10_000) as u16)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundRouteClass {
-    AuthenticatedOnion,
-    DirectPeer,
-}
-
-/// Validated outbound relay-health reason accepted by heartbeat telemetry.
-///
-/// The field is private by design: callers cannot construct this value from a
-/// raw error, endpoint, request identifier, or payload. `from_bucket` retains
-/// the established operational vocabulary and collapses everything else to a
-/// single aggregate `unknown` bucket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChatRelayOutboundFailureReason(String);
-
-impl ChatRelayOutboundFailureReason {
-    /// Sanitizes one internal diagnostic bucket for aggregate health export.
-    pub(crate) fn from_bucket(reason: &str) -> Self {
-        // [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Keep this list
-        // closed. Dynamic HTTP buckets are accepted only when their suffix is
-        // a valid three-digit status; all peer-controlled text is discarded.
-        let safe = matches!(
-            reason,
-            "peer_http_client_unavailable"
-                | "no_receipt_capable_terminal"
-                | "no_network_diverse_receipt_path"
-                | "no_receipt_capable_middle"
-                | "onion_terminal_selection_changed"
-                | "onion_terminal_diversity_exhausted"
-                | "onion_middle_candidate_unavailable"
-                | "onion_middle_endpoint_missing"
-                | "onion_middle_endpoint_invalid"
-                | "onion_request_build_failed"
-                | "onion_delivery_receipt_rejected"
-                | "onion_delivery_route_surface_changed"
-                | "onion_delivery_ack_response_too_large"
-                | "onion_delivery_ack_response_body_read_failed"
-                | "onion_delivery_ack_response_json_decode_failed"
-                | "onion_delivery_request_timeout"
-                | "onion_delivery_request_connect"
-                | "onion_delivery_request_http_status"
-                | "onion_delivery_request_decode"
-                | "onion_delivery_request_body"
-                | "onion_delivery_request_request"
-                | "onion_delivery_request_unknown"
-                | "peer_relay_circuit_open"
-                | "peer_relay_half_open_probe_unavailable"
-                | "peer_relay_target_auth_encode_failed"
-                | "peer_relay_auth_encode_failed"
-                | "peer_relay_request_timeout"
-                | "peer_relay_request_connect"
-                | "peer_relay_request_http_status"
-                | "peer_relay_request_decode"
-                | "peer_relay_request_body"
-                | "peer_relay_request_request"
-                | "peer_relay_request_unknown"
-                | "peer_relay_ack_response_too_large"
-                | "peer_relay_ack_response_body_read_failed"
-                | "peer_relay_ack_response_json_decode_failed"
-                | "peer_relay_ack_rejected"
-                | "peer_relay_receipt_request_missing"
-                | "peer_relay_receipt_missing"
-                | "peer_relay_receipt_version_invalid"
-                | "peer_relay_receipt_binding_invalid"
-                | "peer_relay_receipt_signature_invalid"
-                | "peer_relay_receipt_timestamp_in_future"
-                | "peer_relay_receipt_timestamp_expired"
-        ) || relay_http_status_bucket(reason, "onion_delivery_http_")
-            || relay_http_status_bucket(reason, "onion_delivery_request_http_")
-            || relay_http_status_bucket(reason, "peer_relay_http_")
-            || relay_http_status_bucket(reason, "peer_relay_request_http_");
-
-        Self(if safe { reason } else { "unknown" }.to_string())
-    }
-
-    fn into_bucket(self) -> String {
-        self.0
-    }
-}
-
-/// Validated inbound relay-health reason accepted by heartbeat telemetry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChatRelayInboundFailureReason(String);
-
-impl ChatRelayInboundFailureReason {
-    /// Sanitizes one inbound rejection bucket for aggregate health export.
-    pub(crate) fn from_bucket(reason: &str) -> Self {
-        // [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Inbound reasons
-        // are intentionally fixed; request content and parser details never
-        // become health labels even when an upstream caller makes a mistake.
-        let safe = matches!(
-            reason,
-            "rate_limited"
-                | "backpressure"
-                | "peer_auth_invalid"
-                | "peer_target_mismatch"
-                | "peer_auth_retry_in_flight"
-                | "peer_auth_retry_cache_saturated"
-                | "peer_auth_rate_limited"
-                | "relay_unavailable"
-                | "invalid_signature"
-                | "envelope_too_large"
-                | "envelope_serialization_failed"
-                | "timestamp_expired"
-                | "timestamp_in_future"
-                | "pending_capacity_exhausted"
-                | "store_pending_failed"
-                | "sqlite_error"
-                | "serialization_error"
-                | "corrupt_stored_data"
-                | "timestamp_out_of_range"
-                | "message_id_conflict"
-                | "queue_sequence_exhausted"
-                | "message_too_large"
-                | "mailbox_full"
-                | "pending_message_count_quota"
-                | "pending_message_byte_quota"
-        );
-
-        Self(if safe { reason } else { "unknown" }.to_string())
-    }
-
-    fn into_bucket(self) -> String {
-        self.0
-    }
-}
-
-fn relay_http_status_bucket(reason: &str, prefix: &str) -> bool {
-    let Some(status) = reason.strip_prefix(prefix) else {
-        return false;
-    };
-    status.len() == 3
-        && status.bytes().all(|byte| byte.is_ascii_digit())
-        && status
-            .parse::<u16>()
-            .is_ok_and(|status| (100..=599).contains(&status))
-}
-
 /// Aggregate commit-durability evidence for encrypted relay custody.
 ///
 /// [CHAT-RELAY-DURABILITY-STATUS 2026-08-16 by Codex] This is configuration
@@ -1231,26 +874,6 @@ pub struct ChatRelayBlindRouteRecoveryStatus {
     pub last_outcome: Option<String>,
     /// Timestamp of the last process-local recovery transition.
     pub last_event_at: Option<u64>,
-}
-
-impl ChatRelayBlindRouteRecoveryStatus {
-    fn record_attempted(&mut self, now: u64) {
-        self.attempted_total = self.attempted_total.saturating_add(1);
-        self.last_outcome = Some("attempted".to_string());
-        self.last_event_at = Some(now);
-    }
-
-    fn record_completed(&mut self, now: u64) {
-        self.completed_total = self.completed_total.saturating_add(1);
-        self.last_outcome = Some("completed".to_string());
-        self.last_event_at = Some(now);
-    }
-
-    fn record_deferred(&mut self, now: u64) {
-        self.deferred_total = self.deferred_total.saturating_add(1);
-        self.last_outcome = Some("deferred".to_string());
-        self.last_event_at = Some(now);
-    }
 }
 
 /// Privacy-safe node-to-node encrypted chat relay health snapshot.
@@ -2149,12 +1772,15 @@ pub struct ChatRelayService {
     /// independent HMAC namespaces and tables.
     replay_process_epoch: [u8; REPLAY_PROCESS_EPOCH_BYTES],
     dedup: MessageDedup,
-    peer_status: RwLock<ChatRelayPeerStatus>,
-    direct_peer_retry_slo: Mutex<DirectPeerRetrySloWindow>,
+    /// Privacy-safe process telemetry and bounded SLO classification.
+    ///
+    /// [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] One composed state
+    /// lock prevents partial SLO/lifetime snapshots without widening labels.
+    peer_telemetry: PeerRelayTelemetryDomain,
     /// Source-blind admission state and durable restart checkpoint capability.
     ///
     /// [CHAT-DIRECT-PEER-CIRCUIT-DOMAIN 2026-08-25 by Codex] The service
-    /// retains SLO and public telemetry; this domain owns safety transitions.
+    /// composes public telemetry separately; this domain owns transitions.
     direct_peer_relay_circuit: DirectPeerCircuitDomain,
     maintenance_status: RwLock<ChatRelayMaintenanceStatus>,
     /// Serializes backup publication, replay verification, and retention.
@@ -4986,8 +4612,7 @@ impl ChatRelayService {
             blind_route_replay,
             replay_process_epoch,
             dedup: MessageDedup::new(dedup_capacity),
-            peer_status: RwLock::new(peer_status),
-            direct_peer_retry_slo: Mutex::new(DirectPeerRetrySloWindow::default()),
+            peer_telemetry: PeerRelayTelemetryDomain::new(peer_status),
             direct_peer_relay_circuit: DirectPeerCircuitDomain::default(),
             maintenance_status: RwLock::new(ChatRelayMaintenanceStatus::default()),
             backup_operations: Mutex::new(()),
@@ -6353,10 +5978,10 @@ impl ChatRelayService {
                 tx.commit()?;
                 drop(conn);
                 if matches!(admission, BlindRelayRouteAdmission::ReservedForRecovery) {
-                    self.peer_status
-                        .write()
-                        .blind_route_recovery
-                        .record_attempted(u64::try_from(reserved_at).unwrap_or(u64::MAX));
+                    self.peer_telemetry.record_blind_route_recovery(
+                        u64::try_from(reserved_at).unwrap_or(u64::MAX),
+                        BlindRouteRecoveryEvent::Attempted,
+                    );
                 }
                 return Ok(admission);
             }
@@ -7199,14 +6824,12 @@ impl ChatRelayService {
         // exactly one aggregate sample, including successful first attempts.
         // The fixed ring retains no event identity or peer dimension.
         let observe_slo_failed = || {
-            let mut window = self.direct_peer_retry_slo.lock();
-            window.record(
+            self.peer_telemetry.record_direct_peer_delivery(
                 now,
                 retry_triggered,
                 delivery_succeeded,
                 final_failure_deterministic,
-            );
-            window.snapshot(now).status == "failed"
+            )
         };
         let circuit_allows_more = self.direct_peer_relay_circuit.complete(
             &self.conn,
@@ -7215,28 +6838,6 @@ impl ChatRelayService {
             delivery_succeeded,
             observe_slo_failed,
         );
-        if !retry_triggered && !final_failure_deterministic {
-            return circuit_allows_more;
-        }
-
-        let mut status = self.peer_status.write();
-        let retry = &mut status.direct_peer_retry;
-        if retry_triggered {
-            retry.retry_triggered_total = retry.retry_triggered_total.saturating_add(1);
-            if delivery_succeeded {
-                retry.retry_recovered_total = retry.retry_recovered_total.saturating_add(1);
-                retry.last_outcome = Some("recovered".to_string());
-            } else {
-                retry.retry_exhausted_total = retry.retry_exhausted_total.saturating_add(1);
-                retry.last_outcome = Some("exhausted".to_string());
-            }
-        } else {
-            retry.last_outcome = Some("deterministic_failure".to_string());
-        }
-        if final_failure_deterministic {
-            retry.deterministic_failure_total = retry.deterministic_failure_total.saturating_add(1);
-        }
-        retry.last_at = Some(now);
         circuit_allows_more
     }
 
@@ -7288,76 +6889,13 @@ impl ChatRelayService {
         failure_reason: Option<ChatRelayOutboundFailureReason>,
         route_class: OutboundRouteClass,
     ) {
-        let failed = attempted.saturating_sub(accepted);
-        let status_bucket = if attempted == 0 && failure_reason.is_some() {
-            "failed"
-        } else if attempted == 0 {
-            "idle"
-        } else if accepted == attempted {
-            "healthy"
-        } else if accepted > 0 {
-            "degraded"
-        } else {
-            "failed"
-        };
-        let failure_reason = if failed > 0 || (attempted == 0 && status_bucket == "failed") {
-            Some(
-                failure_reason
-                    .map(ChatRelayOutboundFailureReason::into_bucket)
-                    .unwrap_or_else(|| "unknown".to_string()),
-            )
-        } else {
-            None
-        };
-
-        let mut status = self.peer_status.write();
-        let route_status = match route_class {
-            OutboundRouteClass::AuthenticatedOnion => &mut status.authenticated_onion_outbound,
-            OutboundRouteClass::DirectPeer => &mut status.direct_peer_outbound,
-        };
-        route_status.attempted_total = route_status
-            .attempted_total
-            .saturating_add(attempted as u64);
-        route_status.accepted_total = route_status.accepted_total.saturating_add(accepted as u64);
-        route_status.failed_total = route_status.failed_total.saturating_add(failed as u64);
-        route_status.rounds = route_status.rounds.saturating_add(1);
-        route_status.last_attempted = attempted as u64;
-        route_status.last_accepted = accepted as u64;
-        route_status.last_failed = failed as u64;
-        route_status.last_status = Some(status_bucket.to_string());
-        route_status.last_failure_reason = failure_reason.clone();
-        route_status.last_at = Some(now);
-        if accepted > 0 {
-            route_status.consecutive_failures = 0;
-            route_status.last_success_at = Some(now);
-        } else if attempted > 0 || route_status.last_failure_reason.is_some() {
-            route_status.consecutive_failures = route_status.consecutive_failures.saturating_add(1);
-        }
-
-        // Preserve the original aggregate contract for existing health and
-        // heartbeat consumers while route-specific readers use the fields above.
-        status.outbound_attempted_total = status
-            .outbound_attempted_total
-            .saturating_add(attempted as u64);
-        status.outbound_accepted_total = status
-            .outbound_accepted_total
-            .saturating_add(accepted as u64);
-        status.outbound_failed_total = status.outbound_failed_total.saturating_add(failed as u64);
-        status.outbound_rounds = status.outbound_rounds.saturating_add(1);
-        status.last_outbound_attempted = attempted as u64;
-        status.last_outbound_accepted = accepted as u64;
-        status.last_outbound_failed = failed as u64;
-        status.last_outbound_status = Some(status_bucket.to_string());
-        status.last_outbound_failure_reason = failure_reason;
-        status.last_outbound_at = Some(now);
-
-        if accepted > 0 {
-            status.consecutive_outbound_failures = 0;
-            status.last_outbound_success_at = Some(now);
-        } else if attempted > 0 || status.last_outbound_failure_reason.is_some() {
-            status.consecutive_outbound_failures =
-                status.consecutive_outbound_failures.saturating_add(1);
-        }
+        self.peer_telemetry.record_outbound_round(
+            now,
+            attempted,
+            accepted,
+            failure_reason,
+            route_class,
+        );
     }
 
     /// Records the closed aggregate result of one explicit verified submit.
@@ -7365,48 +6903,44 @@ impl ChatRelayService {
         // [CHAT-VERIFIED-SUBMIT-TELEMETRY 2026-08-23 by Codex] This is a
         // single node-wide counter update. Do not attach request, message,
         // route, endpoint, wallet, receipt, or payload dimensions here.
-        self.peer_status.write().verified_submit.record(now, result);
+        self.peer_telemetry
+            .record_verified_submit(now, result, VerifiedSubmitEvent::Closed);
     }
 
     /// Records one exact retry served without repeating route or custody work.
     pub(crate) fn record_verified_submit_replay(&self, now: u64, result: u8) {
-        self.peer_status
-            .write()
-            .verified_submit
-            .record_replay(now, result);
+        self.peer_telemetry
+            .record_verified_submit(now, result, VerifiedSubmitEvent::Replay);
     }
 
     /// Records fail-closed reuse of a request id for a different envelope.
     pub(crate) fn record_verified_submit_conflict(&self, now: u64, result: u8) {
-        self.peer_status
-            .write()
-            .verified_submit
-            .record_conflict(now, result);
+        self.peer_telemetry
+            .record_verified_submit(now, result, VerifiedSubmitEvent::Conflict);
     }
 
     /// Records a crash-left exact request rejected before repeating effects.
     pub(crate) fn record_verified_submit_pending_rejection(&self, now: u64, result: u8) {
-        self.peer_status
-            .write()
-            .verified_submit
-            .record_pending_rejection(now, result);
+        self.peer_telemetry.record_verified_submit(
+            now,
+            result,
+            VerifiedSubmitEvent::PendingRejection,
+        );
     }
 
     /// Records admission saturation without exposing retained request metadata.
     pub(crate) fn record_verified_submit_capacity_rejection(&self, now: u64, result: u8) {
-        self.peer_status
-            .write()
-            .verified_submit
-            .record_capacity_rejection(now, result);
+        self.peer_telemetry.record_verified_submit(
+            now,
+            result,
+            VerifiedSubmitEvent::CapacityRejection,
+        );
     }
 
     /// Records one foreign-owner takeover after durable admission commits.
     pub(crate) fn record_verified_submit_recovery_attempted(&self, now: u64) {
-        self.peer_status
-            .write()
-            .verified_submit
-            .entry_recovery
-            .record_attempted(now);
+        self.peer_telemetry
+            .record_verified_submit_recovery_attempted(now);
     }
 
     /// Records one closed restart-recovery transition without request data.
@@ -7418,11 +6952,8 @@ impl ChatRelayService {
         // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex] Keep this
         // process-local aggregate independent from the normal protocol result
         // counters; one recovered request must not be counted as two submits.
-        self.peer_status
-            .write()
-            .verified_submit
-            .entry_recovery
-            .record_outcome(now, outcome);
+        self.peer_telemetry
+            .record_verified_submit_recovery_outcome(now, outcome);
     }
 
     /// Records an accepted inbound peer relay request.
@@ -7433,21 +6964,12 @@ impl ChatRelayService {
         delivered_online: usize,
         stored_pending: bool,
     ) {
-        let mut status = self.peer_status.write();
-        status.inbound_accepted_total = status.inbound_accepted_total.saturating_add(1);
-        if duplicate {
-            status.inbound_duplicate_total = status.inbound_duplicate_total.saturating_add(1);
-        }
-        status.inbound_delivered_online_total = status
-            .inbound_delivered_online_total
-            .saturating_add(delivered_online as u64);
-        if stored_pending {
-            status.inbound_stored_pending_total =
-                status.inbound_stored_pending_total.saturating_add(1);
-        }
-        status.last_inbound_status = Some(if duplicate { "duplicate" } else { "accepted" }.into());
-        status.last_inbound_failure_reason = None;
-        status.last_inbound_at = Some(now);
+        self.peer_telemetry.record_inbound_accepted(
+            now,
+            duplicate,
+            delivered_online,
+            stored_pending,
+        );
     }
 
     /// Records a rejected inbound peer relay request with a stable reason bucket.
@@ -7467,11 +6989,7 @@ impl ChatRelayService {
         now: u64,
         reason: ChatRelayInboundFailureReason,
     ) {
-        let mut status = self.peer_status.write();
-        status.inbound_rejected_total = status.inbound_rejected_total.saturating_add(1);
-        status.last_inbound_status = Some("rejected".to_string());
-        status.last_inbound_failure_reason = Some(reason.into_bucket());
-        status.last_inbound_at = Some(now);
+        self.peer_telemetry.record_inbound_rejected(now, reason);
     }
 
     // ============================================
@@ -7486,32 +7004,23 @@ impl ChatRelayService {
     /// Returns a privacy-safe node-to-node relay health snapshot.
     #[must_use]
     pub fn peer_status(&self) -> ChatRelayPeerStatus {
-        // [DIRECT-RELAY-CIRCUIT 2026-08-15 by Codex] Snapshot each process-local
-        // aggregate independently; neither guard is held while taking the next.
-        // Completion uses circuit -> SLO, so no reverse nested lock exists.
+        // [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] Circuit state stays
+        // independently durable; all process telemetry is copied atomically.
         let now = now_secs();
         let circuit = self.direct_peer_relay_circuit.snapshot(now);
-        let recent_window = self.direct_peer_retry_slo.lock().snapshot(now);
-        let mut status = self.peer_status.read().clone();
-        status.direct_peer_retry.recent_window = recent_window;
-        status.direct_peer_retry.circuit = circuit;
-        status
+        self.peer_telemetry.snapshot(now, circuit)
     }
 
     /// Records a successfully sealed ACK for an armed route takeover.
     pub(crate) fn record_blind_route_recovery_completed(&self, now: u64) {
-        self.peer_status
-            .write()
-            .blind_route_recovery
-            .record_completed(now);
+        self.peer_telemetry
+            .record_blind_route_recovery(now, BlindRouteRecoveryEvent::Completed);
     }
 
     /// Records an armed takeover retained for a later exact retry.
     pub(crate) fn record_blind_route_recovery_deferred(&self, now: u64) {
-        self.peer_status
-            .write()
-            .blind_route_recovery
-            .record_deferred(now);
+        self.peer_telemetry
+            .record_blind_route_recovery(now, BlindRouteRecoveryEvent::Deferred);
     }
 
     /// Returns aggregate TTL cleanup execution evidence.
@@ -11611,45 +11120,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_peer_retry_slo_window_expires_and_requires_repeated_failure() {
-        let mut window = DirectPeerRetrySloWindow::default();
-        let base = 1_800_000_000;
-
-        window.record(base, false, true, false);
-        window.record(base + 1, true, true, false);
-        let healthy = window.snapshot(base + 2);
-        assert_eq!(healthy.deliveries_total, 2);
-        assert_eq!(healthy.delivery_success_bps, Some(10_000));
-        assert_eq!(healthy.retry_recovery_bps, Some(10_000));
-        assert_eq!(healthy.meets_slo, Some(true));
-        assert_eq!(healthy.status, "healthy");
-
-        window.record(base + 61, false, false, true);
-        let one_failure = window.snapshot(base + 61);
-        assert_eq!(one_failure.failed_total, 1);
-        assert_eq!(one_failure.status, "degraded");
-
-        window.record(base + 62, true, false, false);
-        window.record(base + 63, true, false, true);
-        let failed = window.snapshot(base + 64);
-        assert_eq!(failed.deliveries_total, 5);
-        assert_eq!(failed.delivered_total, 2);
-        assert_eq!(failed.failed_total, 3);
-        assert_eq!(failed.delivery_success_bps, Some(4_000));
-        assert_eq!(failed.retry_triggered_total, 3);
-        assert_eq!(failed.retry_recovered_total, 1);
-        assert_eq!(failed.retry_exhausted_total, 2);
-        assert_eq!(failed.deterministic_failure_total, 2);
-        assert_eq!(failed.status, "failed");
-
-        let expired = window.snapshot(base + DIRECT_PEER_RETRY_SLO_WINDOW_SECS + 61);
-        assert_eq!(expired.deliveries_total, 0);
-        assert_eq!(expired.delivery_success_bps, None);
-        assert_eq!(expired.meets_slo, None);
-        assert_eq!(expired.status, "idle");
-    }
-
-    #[test]
     fn direct_peer_circuit_opens_half_opens_and_requires_two_successes() {
         let svc = make_service();
         let base = 1_800_000_100;
@@ -11685,9 +11155,8 @@ mod tests {
         assert_eq!(after_stale.state, "half_open");
         assert_eq!(after_stale.half_open_failed_total, 0);
         assert_eq!(
-            svc.direct_peer_retry_slo
-                .lock()
-                .snapshot(base + 34)
+            svc.peer_telemetry
+                .direct_peer_slo_snapshot(base + 34)
                 .deliveries_total,
             4
         );
@@ -11753,9 +11222,10 @@ mod tests {
             "open"
         );
         assert_eq!(
-            svc.direct_peer_retry_slo
-                .lock()
-                .snapshot(first_probe_at + DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS + 1)
+            svc.peer_telemetry
+                .direct_peer_slo_snapshot(
+                    first_probe_at + DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS + 1,
+                )
                 .deliveries_total,
             3
         );

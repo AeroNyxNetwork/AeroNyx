@@ -35,8 +35,11 @@
 //   bounded retention policy, validation, and persistence capability.
 //   [CHAT-DIRECT-PEER-CIRCUIT-DOMAIN 2026-08-25 by Codex] Registered the
 //   private direct-peer circuit state and checkpoint repository capability.
+//   [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] Registered the private
+//   aggregate health policy, SLO window, and telemetry sink capability.
 //
 // Last Modified:
+//   v0.31.0-PeerRelayTelemetryDomain - Registered atomic telemetry composition
 //   v0.30.0-DirectPeerCircuitDomain - Registered restart-safe circuit domain
 //   v0.29.0-BoundedCleanupDomain - Registered private cleanup capability
 //   v0.28.0-DurableQuarantineDomain - Registered private quarantine capability
@@ -92,6 +95,7 @@ mod chat_relay_blob_custody;
 mod chat_relay_cleanup;
 mod chat_relay_direct_peer_circuit;
 mod chat_relay_expired_delivery;
+mod chat_relay_peer_telemetry;
 mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;
 mod chat_relay_pull_cursor;
