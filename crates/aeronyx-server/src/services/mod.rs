@@ -21,8 +21,11 @@
 //   blind-route replay identity and response-protection capability.
 //   [CHAT-PULL-CURSOR-DOMAIN 2026-08-25 by Codex] Registered the private,
 //   receiver-bound ChatPullV2 cursor protection capability.
+//   [CHAT-PENDING-PULL-DOMAIN 2026-08-25 by Codex] Registered the private
+//   pending-message repository and durable-row validation capability.
 //
 // Last Modified:
+//   v0.24.0-PendingPullDomain - Registered private pull repository capability
 //   v0.23.0-PullCursorDomain - Registered private pull cursor capability
 //   v0.22.0-BlindRouteReplayDomain - Registered private route replay capability
 //   v0.21.0-VerifiedSubmitReplayDomain - Registered private replay capability
@@ -67,6 +70,7 @@
 pub mod blind_vault;
 pub mod chat_relay;
 mod chat_relay_blind_route;
+mod chat_relay_pending_pull;
 mod chat_relay_pull_cursor;
 #[cfg(unix)]
 mod chat_relay_runtime_fence;

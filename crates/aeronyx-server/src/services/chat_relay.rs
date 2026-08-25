@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.20.0-PullCursorDomain
+// Version: 3.21.0-PendingPullDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -43,6 +43,9 @@
 //   [CHAT-PULL-CURSOR-DOMAIN 2026-08-25 by Codex] Extracted the opaque v2 pull
 //   cursor model, HKDF/AEAD mechanism, and binding rules behind a composed
 //   trait capability while preserving SQLite snapshot paging and wire bytes.
+//   [CHAT-PENDING-PULL-DOMAIN 2026-08-25 by Codex] Extracted bounded SQLite
+//   reads and signed durable-row validation behind a composed repository trait
+//   while retaining service-owned cursor, quarantine, and telemetry policy.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -287,6 +290,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.21.0-PendingPullDomain — Trait-based pull repository composition
 //   v3.20.0-PullCursorDomain — Trait-based opaque cursor composition
 //   v3.19.0-BlindRouteReplayDomain — Trait-based route replay composition
 //   v3.18.0-VerifiedSubmitReplayDomain — Trait-based replay-domain composition
@@ -373,6 +377,7 @@ use crate::services::chat_relay_blind_route::BlindRouteReplay;
 #[cfg(test)]
 use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
     as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
+use crate::services::chat_relay_pending_pull::PendingMessagePullDomain;
 #[cfg(test)]
 use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_CURSOR_V2_BYTES;
 use crate::services::chat_relay_pull_cursor::{ChatPullCursorCodec, PullCursorV2};
@@ -412,7 +417,7 @@ const CLEANUP_QUARANTINE_EVENT_BATCH_SIZE: usize = 1024;
 const CLEANUP_MAX_BATCHES_PER_RUN: usize = 8;
 /// Maximum retained de-identified corruption events.
 const MAX_QUARANTINE_EVENTS: usize = 4096;
-const QUARANTINE_SOURCE_PENDING_MESSAGE: &str = "pending_message";
+pub(crate) const QUARANTINE_SOURCE_PENDING_MESSAGE: &str = "pending_message";
 const QUARANTINE_SOURCE_EXPIRED_NOTIFICATION: &str = "expired_notification";
 /// Durable verified-submit row format guarded by `relay_schema_features`.
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION: i64 = 3;
@@ -2095,22 +2100,6 @@ struct StoredExpiredNotificationRow {
 }
 
 #[derive(Debug)]
-struct StoredPendingMessageRow {
-    rowid: i64,
-    message_id: Vec<u8>,
-    sender: Vec<u8>,
-    receiver: Vec<u8>,
-    timestamp: i64,
-    envelope: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct StoredSequencedPendingMessageRow {
-    queue_sequence: i64,
-    row: StoredPendingMessageRow,
-}
-
-#[derive(Debug)]
 struct StoredExpiredMessageRow {
     rowid: i64,
     message_id: Vec<u8>,
@@ -2122,11 +2111,11 @@ struct StoredExpiredMessageRow {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct CorruptDurableRow {
-    row_key: i64,
-    source_kind: &'static str,
-    reason: &'static str,
-    encoded_bytes: u64,
+pub(crate) struct CorruptDurableRow {
+    pub(crate) row_key: i64,
+    pub(crate) source_kind: &'static str,
+    pub(crate) reason: &'static str,
+    pub(crate) encoded_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -2656,6 +2645,11 @@ pub struct ChatRelayService {
     /// [CHAT-PULL-CURSOR-DOMAIN 2026-08-25 by Codex] The service owns paging;
     /// this composed object owns the stable wire and cryptographic mechanism.
     pull_cursor_codec: ChatPullCursorCodec,
+    /// Bounded pending-message reads and durable-row authentication.
+    ///
+    /// [CHAT-PENDING-PULL-DOMAIN 2026-08-25 by Codex] The repository is
+    /// replaceable; the service retains connection locking and side effects.
+    pending_pull: PendingMessagePullDomain,
     /// Private verified-submit replay domain capability.
     ///
     /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
@@ -5470,6 +5464,7 @@ impl ChatRelayService {
         let dedup_capacity = config.dedup_lru_capacity;
         let relay_enabled = config.enabled;
         let pull_cursor_codec = ChatPullCursorCodec::new(&node_secret)?;
+        let pending_pull = PendingMessagePullDomain::new();
         let verified_submit_replay = VerifiedSubmitReplay::new(node_secret, dedup_capacity)?;
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
@@ -5484,6 +5479,7 @@ impl ChatRelayService {
             _runtime_fence: runtime_fence,
             node_secret,
             pull_cursor_codec,
+            pending_pull,
             verified_submit_replay,
             blind_route_replay,
             replay_process_epoch,
@@ -7640,57 +7636,6 @@ impl ChatRelayService {
         Ok(())
     }
 
-    fn validate_pending_message_row(
-        row: StoredPendingMessageRow,
-        expected_receiver: &[u8; 32],
-    ) -> Result<PendingMessage, CorruptDurableRow> {
-        let encoded_bytes = u64::try_from(row.envelope.len()).unwrap_or(u64::MAX);
-        let corrupt = |reason| CorruptDurableRow {
-            row_key: row.rowid,
-            source_kind: QUARANTINE_SOURCE_PENDING_MESSAGE,
-            reason,
-            encoded_bytes,
-        };
-        let message_id: [u8; 16] = row
-            .message_id
-            .try_into()
-            .map_err(|_| corrupt("pending_message_id"))?;
-        let stored_sender: [u8; 32] = row
-            .sender
-            .try_into()
-            .map_err(|_| corrupt("pending_message_sender"))?;
-        let stored_receiver: [u8; 32] = row
-            .receiver
-            .try_into()
-            .map_err(|_| corrupt("pending_message_receiver"))?;
-        let stored_timestamp =
-            u64::try_from(row.timestamp).map_err(|_| corrupt("pending_message_timestamp"))?;
-        if stored_receiver != *expected_receiver {
-            return Err(corrupt("pending_message_receiver_mismatch"));
-        }
-        let envelope =
-            decode_envelope(&row.envelope).map_err(|_| corrupt("pending_message_envelope"))?;
-        if envelope.message_id != message_id {
-            return Err(corrupt("pending_message_id_mismatch"));
-        }
-        if envelope.receiver != *expected_receiver {
-            return Err(corrupt("pending_message_envelope_receiver_mismatch"));
-        }
-        if envelope.sender != stored_sender {
-            return Err(corrupt("pending_message_sender_mismatch"));
-        }
-        if envelope.timestamp != stored_timestamp {
-            return Err(corrupt("pending_message_timestamp_mismatch"));
-        }
-        envelope
-            .verify_signature()
-            .map_err(|_| corrupt("pending_message_signature"))?;
-        Ok(PendingMessage {
-            message_id,
-            envelope,
-        })
-    }
-
     fn quarantine_pending_pull_rows(
         &self,
         conn: &mut Connection,
@@ -7743,57 +7688,19 @@ impl ChatRelayService {
         limit: u32,
     ) -> ChatRelayResult<(Vec<PendingMessage>, bool)> {
         let page_limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
-        let effective_limit = page_limit.saturating_add(1);
-        let query_after_timestamp = i64::try_from(after_timestamp).unwrap_or(i64::MAX);
-        let query_limit = i64::try_from(effective_limit).unwrap_or(i64::MAX);
-
         let mut conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT rowid, message_id, sender, receiver, timestamp, envelope
-             FROM pending_messages
-             WHERE receiver = ?1
-               AND status = 0
-               AND timestamp > ?2
-               AND message_id > ?3
-             ORDER BY message_id ASC
-             LIMIT ?4",
+        let page = self.pending_pull.read_legacy_page(
+            &conn,
+            receiver,
+            after_timestamp,
+            cursor,
+            page_limit,
         )?;
-
-        let rows: Vec<StoredPendingMessageRow> = stmt
-            .query_map(
-                params![
-                    receiver.as_slice(),
-                    query_after_timestamp,
-                    cursor.as_slice(),
-                    query_limit,
-                ],
-                |row| {
-                    Ok(StoredPendingMessageRow {
-                        rowid: row.get(0)?,
-                        message_id: row.get(1)?,
-                        sender: row.get(2)?,
-                        receiver: row.get(3)?,
-                        timestamp: row.get(4)?,
-                        envelope: row.get(5)?,
-                    })
-                },
-            )?
-            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-        drop(stmt);
-        let raw_has_more = rows.len() == effective_limit;
-        let mut messages = Vec::with_capacity(rows.len().min(page_limit));
-        let mut corrupt_rows = Vec::new();
-        for row in rows {
-            match Self::validate_pending_message_row(row, receiver) {
-                Ok(message) => messages.push(message),
-                Err(corrupt) => corrupt_rows.push(corrupt),
-            }
-        }
-
-        self.quarantine_pending_pull_rows(&mut conn, &corrupt_rows)?;
+        self.quarantine_pending_pull_rows(&mut conn, &page.corrupt_rows)?;
         drop(conn);
 
-        let has_more = raw_has_more || messages.len() > page_limit;
+        let mut messages = page.messages;
+        let has_more = page.raw_has_more || messages.len() > page_limit;
         messages.truncate(page_limit);
         Ok((messages, has_more))
     }
@@ -7818,113 +7725,40 @@ impl ChatRelayService {
         limit: u32,
     ) -> ChatRelayResult<PendingMessagePageV2> {
         let page_limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
-        let effective_limit = page_limit.saturating_add(1);
-        let query_after_timestamp = i64::try_from(after_timestamp).unwrap_or(i64::MAX);
-        let query_limit = i64::try_from(effective_limit).unwrap_or(i64::MAX);
-
         let mut conn = self.conn.lock();
         let cursor = if encoded_cursor.is_empty() {
-            let ceiling = conn.query_row(
-                "SELECT COALESCE(MAX(queue_sequence), 0)
-                 FROM pending_messages
-                 WHERE receiver = ?1
-                   AND status = 0
-                   AND timestamp > ?2
-                   AND queue_sequence > 0",
-                params![receiver.as_slice(), query_after_timestamp],
-                |row| row.get::<_, i64>(0),
-            )?;
-            if ceiling < 0 {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "pending_message_snapshot_ceiling",
-                });
-            }
             PullCursorV2 {
                 position: 0,
-                ceiling: u64::try_from(ceiling).unwrap_or(0),
+                ceiling: self.pending_pull.capture_snapshot_ceiling(
+                    &conn,
+                    receiver,
+                    after_timestamp,
+                )?,
             }
         } else {
             self.decode_pull_cursor_v2(receiver, after_timestamp, encoded_cursor)?
         };
-
-        let query_position =
-            i64::try_from(cursor.position).map_err(|_| ChatRelayError::InvalidPullCursor)?;
-        let query_ceiling =
-            i64::try_from(cursor.ceiling).map_err(|_| ChatRelayError::InvalidPullCursor)?;
-        let mut stmt = conn.prepare(
-            "SELECT queue_sequence, rowid, message_id, sender, receiver, timestamp, envelope
-             FROM pending_messages
-             WHERE receiver = ?1
-               AND status = 0
-               AND timestamp > ?2
-               AND queue_sequence > ?3
-               AND queue_sequence <= ?4
-             ORDER BY queue_sequence ASC
-             LIMIT ?5",
+        let page = self.pending_pull.read_snapshot_page(
+            &conn,
+            receiver,
+            after_timestamp,
+            cursor.position,
+            cursor.ceiling,
+            page_limit,
         )?;
-        let rows: Vec<StoredSequencedPendingMessageRow> = stmt
-            .query_map(
-                params![
-                    receiver.as_slice(),
-                    query_after_timestamp,
-                    query_position,
-                    query_ceiling,
-                    query_limit,
-                ],
-                |row| {
-                    Ok(StoredSequencedPendingMessageRow {
-                        queue_sequence: row.get(0)?,
-                        row: StoredPendingMessageRow {
-                            rowid: row.get(1)?,
-                            message_id: row.get(2)?,
-                            sender: row.get(3)?,
-                            receiver: row.get(4)?,
-                            timestamp: row.get(5)?,
-                            envelope: row.get(6)?,
-                        },
-                    })
-                },
-            )?
-            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-        drop(stmt);
-
-        let raw_has_more = rows.len() == effective_limit;
-        let raw_max_sequence = rows
-            .last()
-            .and_then(|row| u64::try_from(row.queue_sequence).ok());
-        let mut valid_messages = Vec::with_capacity(rows.len().min(page_limit));
-        let mut corrupt_rows = Vec::new();
-        for stored in rows {
-            let sequence = match u64::try_from(stored.queue_sequence) {
-                Ok(sequence) if sequence > 0 => sequence,
-                _ => {
-                    corrupt_rows.push(CorruptDurableRow {
-                        row_key: stored.row.rowid,
-                        source_kind: QUARANTINE_SOURCE_PENDING_MESSAGE,
-                        reason: "pending_message_queue_sequence",
-                        encoded_bytes: u64::try_from(stored.row.envelope.len()).unwrap_or(u64::MAX),
-                    });
-                    continue;
-                }
-            };
-            match Self::validate_pending_message_row(stored.row, receiver) {
-                Ok(message) => valid_messages.push((sequence, message)),
-                Err(corrupt) => corrupt_rows.push(corrupt),
-            }
-        }
-
-        self.quarantine_pending_pull_rows(&mut conn, &corrupt_rows)?;
+        self.quarantine_pending_pull_rows(&mut conn, &page.corrupt_rows)?;
         drop(conn);
 
+        let mut valid_messages = page.messages;
         let valid_overflow = valid_messages.len() > page_limit;
-        let has_more = raw_has_more || valid_overflow;
+        let has_more = page.raw_has_more || valid_overflow;
         let next_position = if valid_overflow {
             valid_messages
                 .get(page_limit.saturating_sub(1))
                 .map(|(sequence, _)| *sequence)
                 .unwrap_or(cursor.position)
         } else if has_more {
-            raw_max_sequence.unwrap_or(cursor.position)
+            page.raw_max_sequence.unwrap_or(cursor.position)
         } else {
             cursor.ceiling
         };
