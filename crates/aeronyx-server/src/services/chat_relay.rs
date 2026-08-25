@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.22.0-PendingCustodyDomain
+// Version: 3.23.0-ExpiredDeliveryDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -49,6 +49,9 @@
 //   [CHAT-PENDING-CUSTODY-DOMAIN 2026-08-25 by Codex] Extracted pending-message
 //   idempotence, quotas, sequence allocation, durable writes, and receiver-bound
 //   acknowledgements behind a composed repository capability.
+//   [CHAT-EXPIRED-DELIVERY-DOMAIN 2026-08-25 by Codex] Extracted expiry-control
+//   reads, durable-row validation, pagination, and pushed-state writes behind a
+//   composed repository capability while retaining quarantine and telemetry.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -293,6 +296,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.23.0-ExpiredDeliveryDomain — Trait-based expiry delivery composition
 //   v3.22.0-PendingCustodyDomain — Trait-based custody write composition
 //   v3.21.0-PendingPullDomain — Trait-based pull repository composition
 //   v3.20.0-PullCursorDomain — Trait-based opaque cursor composition
@@ -381,6 +385,7 @@ use crate::services::chat_relay_blind_route::BlindRouteReplay;
 #[cfg(test)]
 use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
     as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
+use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
 #[cfg(test)]
 use crate::services::chat_relay_pending_custody::allocate_queue_sequence;
 use crate::services::chat_relay_pending_custody::{
@@ -409,9 +414,9 @@ pub const MAX_CHAT_ACK_MESSAGE_IDS: usize = 100;
 /// Maximum IDs encoded into one `ChatExpired` frame.
 const MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION: usize = 32;
 /// Maximum notification rows offered during one authenticated pull.
-const MAX_EXPIRED_NOTIFICATIONS_PER_PULL: usize = 16;
+pub(crate) const MAX_EXPIRED_NOTIFICATIONS_PER_PULL: usize = 16;
 /// Defensive ceiling for one persisted bincode notification payload.
-const MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES: usize = 1024;
+pub(crate) const MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES: usize = 1024;
 /// Maximum expired message rows processed by one `SQLite` transaction.
 const CLEANUP_MESSAGE_BATCH_SIZE: usize = 1024;
 /// Maximum expired encrypted blobs deleted by one `SQLite` transaction.
@@ -427,7 +432,7 @@ const CLEANUP_MAX_BATCHES_PER_RUN: usize = 8;
 /// Maximum retained de-identified corruption events.
 const MAX_QUARANTINE_EVENTS: usize = 4096;
 pub(crate) const QUARANTINE_SOURCE_PENDING_MESSAGE: &str = "pending_message";
-const QUARANTINE_SOURCE_EXPIRED_NOTIFICATION: &str = "expired_notification";
+pub(crate) const QUARANTINE_SOURCE_EXPIRED_NOTIFICATION: &str = "expired_notification";
 /// Durable verified-submit row format guarded by `relay_schema_features`.
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION: i64 = 3;
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION: i64 = 2;
@@ -2101,14 +2106,6 @@ struct ExpiredMessageRow {
 
 type ExpiredMessagesBySender = HashMap<[u8; 32], HashMap<[u8; 32], Vec<[u8; 16]>>>;
 #[derive(Debug)]
-struct StoredExpiredNotificationRow {
-    id: i64,
-    sender: Vec<u8>,
-    receiver: Vec<u8>,
-    message_ids_raw: Vec<u8>,
-}
-
-#[derive(Debug)]
 struct StoredExpiredMessageRow {
     rowid: i64,
     message_id: Vec<u8>,
@@ -2664,6 +2661,11 @@ pub struct ChatRelayService {
     /// [CHAT-PENDING-CUSTODY-DOMAIN 2026-08-25 by Codex] The service retains
     /// the public API and lock; the composed domain owns durable write policy.
     pending_custody: PendingMessageCustodyDomain,
+    /// Expiry-control read, validation, pagination, and delivery ACK capability.
+    ///
+    /// [CHAT-EXPIRED-DELIVERY-DOMAIN 2026-08-25 by Codex] Quarantine and
+    /// telemetry remain service-owned; durable delivery mechanics are composed.
+    expired_notification_delivery: ExpiredNotificationDelivery,
     /// Private verified-submit replay domain capability.
     ///
     /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
@@ -5480,6 +5482,7 @@ impl ChatRelayService {
         let pull_cursor_codec = ChatPullCursorCodec::new(&node_secret)?;
         let pending_pull = PendingMessagePullDomain::new();
         let pending_custody = PendingMessageCustodyDomain::new(&config);
+        let expired_notification_delivery = ExpiredNotificationDelivery::new();
         let verified_submit_replay = VerifiedSubmitReplay::new(node_secret, dedup_capacity)?;
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
@@ -5496,6 +5499,7 @@ impl ChatRelayService {
             pull_cursor_codec,
             pending_pull,
             pending_custody,
+            expired_notification_delivery,
             verified_submit_replay,
             blind_route_replay,
             replay_process_epoch,
@@ -7898,43 +7902,6 @@ impl ChatRelayService {
     // Expired notifications
     // ============================================
 
-    fn validate_expired_notification_row(
-        row: StoredExpiredNotificationRow,
-        expected_sender: &[u8; 32],
-    ) -> Result<ExpiredNotification, CorruptDurableRow> {
-        let encoded_bytes = u64::try_from(row.message_ids_raw.len()).unwrap_or(u64::MAX);
-        let corrupt = |reason| CorruptDurableRow {
-            row_key: row.id,
-            source_kind: QUARANTINE_SOURCE_EXPIRED_NOTIFICATION,
-            reason,
-            encoded_bytes,
-        };
-        if row.message_ids_raw.len() > MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES {
-            return Err(corrupt("expired_notification_payload_size"));
-        }
-        let stored_sender: [u8; 32] = row
-            .sender
-            .try_into()
-            .map_err(|_| corrupt("expired_notification_sender"))?;
-        if stored_sender != *expected_sender {
-            return Err(corrupt("expired_notification_sender_mismatch"));
-        }
-        let receiver: [u8; 32] = row
-            .receiver
-            .try_into()
-            .map_err(|_| corrupt("expired_notification_receiver"))?;
-        let notification = ExpiredNotification {
-            id: row.id,
-            sender: stored_sender,
-            receiver,
-            message_ids_raw: row.message_ids_raw,
-        };
-        notification
-            .message_ids()
-            .map_err(|_| corrupt("expired_notification_message_ids"))?;
-        Ok(notification)
-    }
-
     /// Retrieves one bounded page of expiry notifications for a sender.
     ///
     /// The extra row is used only to compute `has_more`; it is never returned.
@@ -7948,49 +7915,18 @@ impl ChatRelayService {
         &self,
         sender: &[u8; 32],
     ) -> ChatRelayResult<(Vec<ExpiredNotification>, bool)> {
-        let effective_limit = MAX_EXPIRED_NOTIFICATIONS_PER_PULL + 1;
-        let query_limit = i64::try_from(effective_limit).unwrap_or(i64::MAX);
         let mut conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, sender, receiver, message_ids
-             FROM expired_notifications
-             WHERE sender = ?1 AND pushed = 0
-             ORDER BY created_at ASC, id ASC
-             LIMIT ?2",
-        )?;
+        let page = self.expired_notification_delivery.read_page(&conn, sender)?;
 
-        let rows: Vec<StoredExpiredNotificationRow> = stmt
-            .query_map(params![sender.as_slice(), query_limit], |row| {
-                Ok(StoredExpiredNotificationRow {
-                    id: row.get(0)?,
-                    sender: row.get(1)?,
-                    receiver: row.get(2)?,
-                    message_ids_raw: row.get(3)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-        drop(stmt);
-
-        let raw_has_more = rows.len() == effective_limit;
-        let mut notifications =
-            Vec::with_capacity(rows.len().min(MAX_EXPIRED_NOTIFICATIONS_PER_PULL));
-        let mut corrupt_rows = Vec::new();
-        for row in rows {
-            match Self::validate_expired_notification_row(row, sender) {
-                Ok(notification) => notifications.push(notification),
-                Err(corrupt) => corrupt_rows.push(corrupt),
-            }
-        }
-
-        if corrupt_rows.is_empty() {
+        if page.corrupt_rows.is_empty() {
             drop(conn);
         } else {
             let quarantine_now = now_secs();
             let quarantine_now_i64 = i64::try_from(quarantine_now).unwrap_or(i64::MAX);
             let retention_cutoff = self.quarantine_retention_cutoff(quarantine_now_i64);
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            Self::insert_quarantine_events(&tx, quarantine_now_i64, &corrupt_rows)?;
-            Self::delete_notification_rows_by_id(&tx, &corrupt_rows)?;
+            Self::insert_quarantine_events(&tx, quarantine_now_i64, &page.corrupt_rows)?;
+            Self::delete_notification_rows_by_id(&tx, &page.corrupt_rows)?;
             let removed_events = Self::trim_quarantine_events(&tx, retention_cutoff)?;
             let retained_events = Self::quarantine_event_count(&tx)?;
             tx.commit()?;
@@ -7999,19 +7935,17 @@ impl ChatRelayService {
             self.record_pull_quarantine(
                 quarantine_now,
                 0,
-                corrupt_rows.len(),
+                page.corrupt_rows.len(),
                 removed_events,
                 retained_events,
             );
             warn!(
-                quarantined_expired_notifications = corrupt_rows.len(),
+                quarantined_expired_notifications = page.corrupt_rows.len(),
                 "[CHAT_RELAY] Corrupt expiry notifications isolated during pull"
             );
         }
 
-        let has_more = raw_has_more || notifications.len() > MAX_EXPIRED_NOTIFICATIONS_PER_PULL;
-        notifications.truncate(MAX_EXPIRED_NOTIFICATIONS_PER_PULL);
-        Ok((notifications, has_more))
+        Ok((page.notifications, page.has_more))
     }
 
     /// Compatibility wrapper for callers that do not consume pagination yet.
@@ -8036,26 +7970,14 @@ impl ChatRelayService {
     ///
     /// Returns a `SQLite` error and rolls back the whole page on failure.
     pub fn mark_notifications_pushed(&self, ids: &[i64]) -> ChatRelayResult<()> {
-        if ids.is_empty() {
+        let Some(batch) = self
+            .expired_notification_delivery
+            .prepare_acknowledgement(ids)
+        else {
             return Ok(());
-        }
-        let unique_ids: HashSet<i64> = ids.iter().copied().collect();
-        Self::mark_notifications_pushed_transaction(&mut self.conn.lock(), &unique_ids)
-    }
-
-    fn mark_notifications_pushed_transaction(
-        conn: &mut Connection,
-        unique_ids: &HashSet<i64>,
-    ) -> ChatRelayResult<()> {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for id in unique_ids {
-            tx.execute(
-                "UPDATE expired_notifications SET pushed = 1 WHERE id = ?",
-                params![id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        };
+        self.expired_notification_delivery
+            .mark_pushed(&mut self.conn.lock(), &batch)
     }
 
     // ============================================

@@ -25,8 +25,11 @@
 //   pending-message repository and durable-row validation capability.
 //   [CHAT-PENDING-CUSTODY-DOMAIN 2026-08-25 by Codex] Registered the private
 //   pending-message write, quota, sequence, and acknowledgement capability.
+//   [CHAT-EXPIRED-DELIVERY-DOMAIN 2026-08-25 by Codex] Registered the private
+//   expiry-notification read, validation, pagination, and ACK capability.
 //
 // Last Modified:
+//   v0.26.0-ExpiredDeliveryDomain - Registered private expiry delivery capability
 //   v0.25.0-PendingCustodyDomain - Registered private custody write capability
 //   v0.24.0-PendingPullDomain - Registered private pull repository capability
 //   v0.23.0-PullCursorDomain - Registered private pull cursor capability
@@ -73,6 +76,7 @@
 pub mod blind_vault;
 pub mod chat_relay;
 mod chat_relay_blind_route;
+mod chat_relay_expired_delivery;
 mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;
 mod chat_relay_pull_cursor;
