@@ -113,6 +113,8 @@
 //!   trait-based domain instead of retaining policy inside HTTP orchestration
 //! - [CHAT-PEER-ACK-COMPLETION-TTL 2026-08-26 by Codex] Starts exact completed
 //!   ACK retention when durable acceptance finishes rather than request ingress
+//! - [BLIND-TRANSPORT-DOMAIN 2026-08-26 by Codex] Composes bounded outbound
+//!   HTTP through a replaceable trait while retaining route and receipt policy
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -306,8 +308,13 @@
 //! - [BLIND-RETRY-DOMAIN 2026-08-26 by Codex] Forward retry policy is isolated
 //!   in `chat_peer_retry.rs`; it may use only coarse transport state and signed
 //!   route metadata, while I/O and observability remain composed here.
+//! - [BLIND-TRANSPORT-DOMAIN 2026-08-26 by Codex] HTTP request execution and
+//!   bounded ACK decoding are isolated in `chat_peer_transport.rs`; keep
+//!   receipt verification, retry decisions, and route evidence in this file.
 //!
 //! ## Last Modified
+//! v0.64.0-BlindTransportDomain - Compose bounded outbound HTTP behind a
+//! replaceable trait without changing response, retry, or telemetry contracts
 //! v0.63.0-BlindRetryDomain - Compose payload-blind retry classification and
 //! deterministic jitter behind a replaceable policy trait
 //! v0.62.0-BlindReplayCodecDomain - Move versioned durable ACK storage rules
@@ -411,8 +418,11 @@
 
 use std::{
     sync::{atomic::AtomicUsize, Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
+
+#[cfg(test)]
+use std::time::Duration;
 
 use aeronyx_core::crypto::transport::{
     DefaultTransportCrypto, TransportCrypto, ENCRYPTION_OVERHEAD,
@@ -464,12 +474,12 @@ use super::chat_peer_replay::{
 use super::chat_peer_retry::DEFAULT_MAX_ATTEMPTS_FOR_TESTS as MAX_BLIND_RELAY_FORWARD_ATTEMPTS;
 use super::chat_peer_retry::{
     BlindRelayDownstreamFailure, BlindRelayRetryAction, BlindRelayRetryContext,
-    BlindRelayRetryDomain, BlindRelayRetryPolicy, BlindRelayTransportFailureKind,
+    BlindRelayRetryDomain, BlindRelayRetryPolicy,
 };
-use crate::api::{
-    canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
-    InFlightRequestGuard, PEER_ACK_RESPONSE_MAX_BYTES,
+use super::chat_peer_transport::{
+    BlindRelayTransport, BlindRelayTransportOutcome, ReqwestBlindRelayTransport,
 };
+use crate::api::{canonical_peer_http_url, peer_endpoint_is_public_ip, InFlightRequestGuard};
 use crate::config_chat_relay::{
     DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE, DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE,
 };
@@ -3070,16 +3080,27 @@ async fn forward_blind_relay_with_retry(
     now: u64,
 ) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
     let retry_policy = BlindRelayRetryDomain::default();
-    forward_blind_relay_with_policy(state, url, descriptor, request, now, &retry_policy).await
+    let transport = ReqwestBlindRelayTransport::new(Arc::clone(&state.http_client));
+    forward_blind_relay_with_components(
+        state,
+        url,
+        descriptor,
+        request,
+        now,
+        &retry_policy,
+        &transport,
+    )
+    .await
 }
 
-async fn forward_blind_relay_with_policy(
+async fn forward_blind_relay_with_components(
     state: &ChatPeerState,
     url: &str,
     descriptor: &SignedNodeDescriptor,
     request: PeerBlindRelayRequest,
     now: u64,
     retry_policy: &dyn BlindRelayRetryPolicy,
+    transport: &dyn BlindRelayTransport,
 ) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
     // [ROUTE-FAILURE-SURFACE-BINDING 2026-08-11 by Codex] Keep the exact
     // descriptor that selected `url` through every retry. A delayed response
@@ -3096,13 +3117,8 @@ async fn forward_blind_relay_with_policy(
         let retry_context =
             BlindRelayRetryContext::new(request.envelope.route_id, next_hop, attempt)
                 .ok_or(BlindRelayError::ForwardFailed)?;
-        match state.http_client.post(url).json(&request).send().await {
-            Ok(response) if response.status().is_success() => {
-                let ack = decode_bounded_json_response::<PeerBlindRelayResponse>(
-                    response,
-                    PEER_ACK_RESPONSE_MAX_BYTES,
-                )
-                .await;
+        match transport.send(url, &request).await {
+            BlindRelayTransportOutcome::SuccessStatus { response: ack } => {
                 let observed_at = blind_relay_response_observed_at(now, &request_started_at);
                 match ack {
                     Ok(ack) if ack.accepted => {
@@ -3136,7 +3152,7 @@ async fn forward_blind_relay_with_policy(
                                 .record_blind_relay_retry_succeeded(observed_at, attempt);
                         }
                         return Ok(BlindRelayForwardOutcome {
-                            response: ack,
+                            response: *ack,
                             observed_at,
                         });
                     }
@@ -3174,19 +3190,15 @@ async fn forward_blind_relay_with_policy(
                     .record_blind_relay_rejected(observed_at, "forward_failed");
                 return Err(BlindRelayError::ForwardFailed);
             }
-            Ok(response) => {
-                let status = response.status();
+            BlindRelayTransportOutcome::RejectedStatus {
+                status,
+                declared_response,
+            } => {
                 let reason = format!("http_{}", status.as_u16());
-                let declared_response = decode_bounded_json_response::<PeerBlindRelayResponse>(
-                    response,
-                    PEER_ACK_RESPONSE_MAX_BYTES,
-                )
-                .await
-                .ok();
                 let observed_at = blind_relay_response_observed_at(now, &request_started_at);
                 if let (Some(failure), Some(declared_ack)) = (
-                    retry_policy.classify_declared_failure(status, declared_response.as_ref()),
-                    declared_response.as_ref(),
+                    retry_policy.classify_declared_failure(status, declared_response.as_deref()),
+                    declared_response.as_deref(),
                 ) {
                     let error = BlindRelayError::from(failure);
                     let receipt_authenticated = match validate_downstream_failure_receipt(
@@ -3291,11 +3303,10 @@ async fn forward_blind_relay_with_policy(
                     .record_blind_relay_rejected(observed_at, reason);
                 return Err(BlindRelayError::ForwardFailed);
             }
-            Err(error) => {
+            BlindRelayTransportOutcome::RequestFailed(failure) => {
                 let observed_at = blind_relay_response_observed_at(now, &request_started_at);
-                let reason = classify_reqwest_error("blind_relay_request", &error);
-                let failure = blind_relay_transport_failure_kind(&error);
-                match retry_policy.transport_action(failure, retry_context) {
+                let reason = failure.reason_bucket();
+                match retry_policy.transport_action(failure.retry_kind(), retry_context) {
                     BlindRelayRetryAction::RetryAfter(delay) => {
                         state
                             .peer_store
@@ -3353,19 +3364,6 @@ async fn forward_blind_relay_with_policy(
     }
 
     Err(BlindRelayError::ForwardFailed)
-}
-
-fn blind_relay_transport_failure_kind(error: &reqwest::Error) -> BlindRelayTransportFailureKind {
-    if error.is_timeout() {
-        return BlindRelayTransportFailureKind::Timeout;
-    }
-    if error.is_connect() {
-        return BlindRelayTransportFailureKind::Connect;
-    }
-    if error.is_request() {
-        return BlindRelayTransportFailureKind::Request;
-    }
-    BlindRelayTransportFailureKind::Other
 }
 
 fn validate_blind_relay_envelope(
@@ -3426,31 +3424,6 @@ fn blind_peer_relay_url(endpoint: &str) -> Option<String> {
     canonical_peer_http_url(endpoint, "/api/chat/peer/blind-relay")
         .ok()
         .map(|url| url.to_string())
-}
-
-fn classify_reqwest_error(phase: &str, error: &reqwest::Error) -> String {
-    if error.is_timeout() {
-        return format!("{phase}_timeout");
-    }
-    if error.is_connect() {
-        return format!("{phase}_connect");
-    }
-    if error.is_status() {
-        if let Some(status) = error.status() {
-            return format!("{phase}_http_{}", status.as_u16());
-        }
-        return format!("{phase}_http_status");
-    }
-    if error.is_decode() {
-        return format!("{phase}_decode");
-    }
-    if error.is_body() {
-        return format!("{phase}_body");
-    }
-    if error.is_request() {
-        return format!("{phase}_request");
-    }
-    format!("{phase}_unknown")
 }
 
 fn validate_peer_envelope(envelope: &ChatEnvelope, now: u64) -> Result<(), ChatPeerRelayError> {
@@ -3570,6 +3543,7 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
+    use crate::api::PEER_ACK_RESPONSE_MAX_BYTES;
     use crate::config::{BlindVaultConfig, ChatRelayConfig};
     use crate::services::{BlindVaultLeaseProvisionOutcome, BlindVaultService};
 
