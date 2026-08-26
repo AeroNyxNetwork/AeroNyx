@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.31.0-BackupAuditRecordDomain
+// Version: 3.32.0-AuditCheckpointDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -70,6 +70,10 @@
 //   recovery-image retention planning behind a trait. Complete and interrupted
 //   deletion candidates are now deterministic oldest-first so a partial I/O
 //   failure preserves the strongest remaining recovery history.
+//   [CHAT-RELAY-AUDIT-CHECKPOINT-DOMAIN 2026-08-26 by Codex] Extracted the
+//   immutable maintenance checkpoint model and v1 HMAC policy behind a trait,
+//   while keeping sequence continuity, filesystem publication, and recovery
+//   transitions in the service-owned I/O boundary.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -314,6 +318,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.32.0-AuditCheckpointDomain — Trait-based authenticated checkpoints
 //   v3.31.0-BackupAuditRecordDomain — Typed authenticated audit records
 //   v3.30.0-RestorePlanDomain — Trait-based authenticated restore planning
 //   v3.29.0-BackupRetentionDomain — Trait-based oldest-first retention planning
@@ -411,6 +416,11 @@ use crate::services::chat_relay_backup_audit::{
     BackupAuditPhase, BackupAuditRecordAuthenticator, BackupAuditRecordError,
     ChatRelayBackupMaintenanceAuditCounts, ChatRelayBackupMaintenanceAuditRecord,
     HmacBackupAuditRecordAuthenticator,
+};
+use crate::services::chat_relay_backup_audit_checkpoint::{
+    BackupAuditCheckpointAuthenticator, BackupAuditCheckpointError,
+    BackupAuditCheckpointState, ChatRelayBackupAuditCheckpoint,
+    HmacBackupAuditCheckpointAuthenticator,
 };
 use crate::services::chat_relay_backup_retention::{
     BackupRetentionArtifact, BackupRetentionLimits, BackupRetentionPlanner,
@@ -538,9 +548,6 @@ const CHAT_RELAY_RESTORE_PLAN_NONCE_BYTES: usize = RESTORE_PLAN_NONCE_BYTES;
 const CHAT_RELAY_BACKUP_DIRECTORY_ENTRY_HARD_LIMIT: usize = 1024;
 /// Exact phrase required before a host-local command may delete backup files.
 pub const CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION: &str = "PRUNE-VERIFIED-RELAY-BACKUPS";
-/// Domain separation for immutable audit-segment checkpoints.
-const CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_HMAC_DOMAIN: &[u8] =
-    b"AeroNyx-RelayCustodyBackup-MaintenanceAuditCheckpoint-v1";
 /// Domain separation for the public opaque digest of one private checkpoint.
 const CHAT_RELAY_BACKUP_AUDIT_ANCHOR_DIGEST_DOMAIN: &[u8] =
     b"AeroNyx-RelayCustodyBackup-MaintenanceAuditAnchorDigest-v1";
@@ -1515,29 +1522,6 @@ struct ChatRelayActiveRestoreBoundary {
     inode: u64,
 }
 
-// [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] A checkpoint authenticates
-// one immutable segment plus the cumulative chain state. It contains no path,
-// identity, message metadata, ciphertext, or backup artifact name.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChatRelayBackupAuditCheckpoint {
-    version: u8,
-    checkpoint_index: u64,
-    segment_first_sequence: u64,
-    segment_last_sequence: u64,
-    segment_bytes: u64,
-    segment_sha256: String,
-    cumulative_verified_bytes: u64,
-    cumulative_last_recorded_at: Option<u64>,
-    cumulative_dry_run_count: u64,
-    cumulative_planned_count: u64,
-    cumulative_completed_count: u64,
-    cumulative_failed_count: u64,
-    head_mac: String,
-    previous_checkpoint_mac: String,
-    checkpoint_mac: String,
-}
-
 struct ChatRelayBackupAuditVerificationState {
     receipt: ChatRelayBackupAuditVerificationReceipt,
     head_mac: String,
@@ -2317,57 +2301,23 @@ impl ChatRelayService {
         Ok(())
     }
 
-    fn backup_audit_checkpoint_signing_bytes(
-        checkpoint: &ChatRelayBackupAuditCheckpoint,
-    ) -> ChatRelayResult<Vec<u8>> {
-        bincode::serialize(&(
-            checkpoint.version,
-            checkpoint.checkpoint_index,
-            checkpoint.segment_first_sequence,
-            checkpoint.segment_last_sequence,
-            checkpoint.segment_bytes,
-            checkpoint.segment_sha256.as_str(),
-            checkpoint.cumulative_verified_bytes,
-            checkpoint.cumulative_last_recorded_at,
-            checkpoint.cumulative_dry_run_count,
-            checkpoint.cumulative_planned_count,
-            checkpoint.cumulative_completed_count,
-            checkpoint.cumulative_failed_count,
-            checkpoint.head_mac.as_str(),
-            checkpoint.previous_checkpoint_mac.as_str(),
-        ))
-        .map_err(|_| {
-            Self::backup_io_error(
+    fn map_backup_audit_checkpoint_error(
+        error: BackupAuditCheckpointError,
+    ) -> ChatRelayError {
+        match error {
+            BackupAuditCheckpointError::EncodingFailed => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_FORMAT,
                 "unable to encode relay backup maintenance audit checkpoint",
-            )
-        })
-    }
-
-    fn backup_audit_checkpoint_mac_engine(
-        node_secret: &[u8; 32],
-        checkpoint: &ChatRelayBackupAuditCheckpoint,
-    ) -> ChatRelayResult<HmacSha256> {
-        let mut mac = HmacSha256::new_from_slice(node_secret).map_err(|_| {
-            Self::backup_io_error(
+            ),
+            BackupAuditCheckpointError::AuthenticatorInitFailed => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_AUTH,
                 "unable to initialize relay backup maintenance audit checkpoint",
-            )
-        })?;
-        mac.update(CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_HMAC_DOMAIN);
-        mac.update(&Self::backup_audit_checkpoint_signing_bytes(checkpoint)?);
-        Ok(mac)
-    }
-
-    fn backup_audit_checkpoint_mac(
-        node_secret: &[u8; 32],
-        checkpoint: &ChatRelayBackupAuditCheckpoint,
-    ) -> ChatRelayResult<String> {
-        Ok(hex::encode(
-            Self::backup_audit_checkpoint_mac_engine(node_secret, checkpoint)?
-                .finalize()
-                .into_bytes(),
-        ))
+            ),
+            BackupAuditCheckpointError::InvalidCheckpoint => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CORRUPT,
+                "relay backup maintenance audit checkpoint verification failed",
+            ),
+        }
     }
 
     fn backup_audit_anchor_digest(
@@ -2729,52 +2679,37 @@ impl ChatRelayService {
                         "relay backup maintenance audit checkpoint index overflow",
                     )
                 })?;
-        let phase_total = checkpoint
-            .cumulative_dry_run_count
-            .checked_add(checkpoint.cumulative_planned_count)
-            .and_then(|total| total.checked_add(checkpoint.cumulative_completed_count))
-            .and_then(|total| total.checked_add(checkpoint.cumulative_failed_count));
-        if checkpoint.version != 1
-            || checkpoint.checkpoint_index != expected_checkpoint_index
-            || checkpoint.segment_first_sequence != range.first_sequence
-            || checkpoint.segment_last_sequence != range.last_sequence
-            || range.first_sequence != previous_record_count.checked_add(1).unwrap_or(0)
+        if range.first_sequence != previous_record_count.checked_add(1).unwrap_or(0)
             || range.last_sequence != state.receipt.record_count
-            || checkpoint.segment_bytes != segment_bytes
-            || checkpoint.segment_sha256 != segment_sha256
-            || !Self::is_lower_hex(&checkpoint.segment_sha256, 64)
-            || checkpoint.cumulative_verified_bytes != state.receipt.verified_bytes
-            || checkpoint.cumulative_last_recorded_at != state.receipt.last_recorded_at
-            || checkpoint.cumulative_dry_run_count != state.receipt.dry_run_count
-            || checkpoint.cumulative_planned_count != state.receipt.planned_count
-            || checkpoint.cumulative_completed_count != state.receipt.completed_count
-            || checkpoint.cumulative_failed_count != state.receipt.failed_count
-            || phase_total != Some(state.receipt.record_count)
-            || checkpoint.head_mac != state.head_mac
-            || checkpoint.previous_checkpoint_mac != state.checkpoint_head_mac
-            || !Self::is_lower_hex(&checkpoint.head_mac, 64)
-            || !Self::is_lower_hex(&checkpoint.previous_checkpoint_mac, 64)
-            || !Self::is_lower_hex(&checkpoint.checkpoint_mac, 64)
         {
             return Err(Self::backup_io_error(
                 rusqlite::ffi::SQLITE_CORRUPT,
                 "relay backup maintenance audit checkpoint verification failed",
             ));
         }
-        let decoded_mac = hex::decode(&checkpoint.checkpoint_mac).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit checkpoint verification failed",
+        let expected = BackupAuditCheckpointState {
+            checkpoint_index: expected_checkpoint_index,
+            segment_first_sequence: range.first_sequence,
+            segment_last_sequence: range.last_sequence,
+            segment_bytes,
+            segment_sha256: segment_sha256.to_string(),
+            cumulative_verified_bytes: state.receipt.verified_bytes,
+            cumulative_last_recorded_at: state.receipt.last_recorded_at,
+            cumulative_dry_run_count: state.receipt.dry_run_count,
+            cumulative_planned_count: state.receipt.planned_count,
+            cumulative_completed_count: state.receipt.completed_count,
+            cumulative_failed_count: state.receipt.failed_count,
+            head_mac: state.head_mac.clone(),
+            previous_checkpoint_mac: state.checkpoint_head_mac.clone(),
+        };
+        HmacBackupAuditCheckpointAuthenticator
+            .authenticate(
+                node_secret,
+                &checkpoint,
+                &expected,
+                state.receipt.record_count,
             )
-        })?;
-        Self::backup_audit_checkpoint_mac_engine(node_secret, &checkpoint)?
-            .verify_slice(&decoded_mac)
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CORRUPT,
-                    "relay backup maintenance audit checkpoint verification failed",
-                )
-            })?;
+            .map_err(Self::map_backup_audit_checkpoint_error)?;
         state.receipt.checkpoint_count = expected_checkpoint_index;
         state.receipt.archived_record_count = state.receipt.record_count;
         state.receipt.archived_bytes = state
@@ -3073,24 +3008,36 @@ impl ChatRelayService {
             last_sequence: state.receipt.record_count,
         };
         let (segment_bytes, segment_sha256) = Self::hash_backup_audit_segment(&mut active)?;
-        let mut checkpoint = ChatRelayBackupAuditCheckpoint {
-            version: 1,
-            checkpoint_index: state.receipt.checkpoint_count + 1,
-            segment_first_sequence: range.first_sequence,
-            segment_last_sequence: range.last_sequence,
-            segment_bytes,
-            segment_sha256,
-            cumulative_verified_bytes: state.receipt.verified_bytes,
-            cumulative_last_recorded_at: state.receipt.last_recorded_at,
-            cumulative_dry_run_count: state.receipt.dry_run_count,
-            cumulative_planned_count: state.receipt.planned_count,
-            cumulative_completed_count: state.receipt.completed_count,
-            cumulative_failed_count: state.receipt.failed_count,
-            head_mac: state.head_mac.clone(),
-            previous_checkpoint_mac: state.checkpoint_head_mac.clone(),
-            checkpoint_mac: String::new(),
-        };
-        checkpoint.checkpoint_mac = Self::backup_audit_checkpoint_mac(node_secret, &checkpoint)?;
+        let checkpoint_index = state
+            .receipt
+            .checkpoint_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                Self::backup_io_error(
+                    rusqlite::ffi::SQLITE_FULL,
+                    "relay backup maintenance audit checkpoint index overflow",
+                )
+            })?;
+        let checkpoint = HmacBackupAuditCheckpointAuthenticator
+            .build(
+                node_secret,
+                BackupAuditCheckpointState {
+                    checkpoint_index,
+                    segment_first_sequence: range.first_sequence,
+                    segment_last_sequence: range.last_sequence,
+                    segment_bytes,
+                    segment_sha256,
+                    cumulative_verified_bytes: state.receipt.verified_bytes,
+                    cumulative_last_recorded_at: state.receipt.last_recorded_at,
+                    cumulative_dry_run_count: state.receipt.dry_run_count,
+                    cumulative_planned_count: state.receipt.planned_count,
+                    cumulative_completed_count: state.receipt.completed_count,
+                    cumulative_failed_count: state.receipt.failed_count,
+                    head_mac: state.head_mac.clone(),
+                    previous_checkpoint_mac: state.checkpoint_head_mac.clone(),
+                },
+            )
+            .map_err(Self::map_backup_audit_checkpoint_error)?;
         drop(active);
         Self::publish_backup_audit_checkpoint(parent, range, &checkpoint)?;
         Self::complete_pending_backup_audit_rotation(
