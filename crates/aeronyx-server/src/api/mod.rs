@@ -40,6 +40,7 @@
 //! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
 //! - `chat_peer_admission`: private direct-peer admission and ACK replay domain
 //! - `chat_peer_abuse_guard`: private blind-relay abuse-control domain
+//! - `chat_peer_observer`: private aggregate forward observation capability
 //! - `chat_peer_replay`: private generation-fenced blind-route replay domain
 //! - `chat_peer_retry`: private payload-blind forwarding retry policy domain
 //! - `chat_peer_response`: private receipt and response decision domain
@@ -81,6 +82,8 @@
 //!   bounded response decoding but no routing, receipt, or health decisions.
 //! - [BLIND-RESPONSE-DOMAIN 2026-08-26 by Codex] Response policy validates
 //!   receipts and returns decisions but owns no I/O, clocks, logs, or storage.
+//! - [BLIND-FORWARD-OBSERVER 2026-08-26 by Codex] Forward observations are
+//!   write-only aggregate effects and never influence relay control decisions.
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial Agent API for MemChain Phase 1
@@ -123,6 +126,8 @@
 //!   routing, receipt validation, retry policy, and route-health effects.
 //! v2.8.37-ChatPeerResponseDomain - Split receipt verification and response
 //!   interpretation from asynchronous forwarding and observability effects.
+//! v2.8.38-ChatPeerObserverDomain - Split aggregate retry and route-health
+//!   persistence from forwarding control behind a write-only observer trait.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{
@@ -475,15 +480,16 @@ pub mod admin_handlers;
 // ── Legacy API (deprecated) ──
 pub mod local;
 // ── v1.0.0-Voice: Peer virtual IP resolution for UDP direct-connect routing ──
+pub mod blind_vault;
 pub mod chat_handlers;
 pub mod chat_peer;
-mod chat_peer_admission;
 mod chat_peer_abuse_guard;
+mod chat_peer_admission;
+mod chat_peer_observer;
 mod chat_peer_replay;
 mod chat_peer_response;
 mod chat_peer_retry;
 mod chat_peer_transport;
-pub mod blind_vault;
 pub mod directory_chain_peer;
 pub mod directory_replica_status;
 pub mod directory_replica_sync;

@@ -117,6 +117,8 @@
 //!   HTTP through a replaceable trait while retaining route and receipt policy
 //! - [BLIND-RESPONSE-DOMAIN 2026-08-26 by Codex] Interprets bounded responses
 //!   through a pure policy while orchestration owns I/O and aggregate effects
+//! - [BLIND-FORWARD-OBSERVER 2026-08-26 by Codex] Emits write-only aggregate
+//!   forwarding observations through a replaceable persistence capability
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -316,8 +318,13 @@
 //! - [BLIND-RESPONSE-DOMAIN 2026-08-26 by Codex] Receipt verification and
 //!   response interpretation are isolated in `chat_peer_response.rs`; this
 //!   module only executes typed decisions and records aggregate effects.
+//! - [BLIND-FORWARD-OBSERVER 2026-08-26 by Codex] Aggregate retry and route
+//!   health writes are isolated in `chat_peer_observer.rs`. Keep the observer
+//!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.66.0-BlindForwardObserver - Compose aggregate forwarding observations
+//! behind a write-only trait without changing route-health attribution
 //! v0.65.0-BlindResponseDomain - Compose receipt validation and response
 //! decisions behind a pure policy while preserving all observable contracts
 //! v0.64.0-BlindTransportDomain - Compose bounded outbound HTTP behind a
@@ -470,6 +477,7 @@ use super::chat_peer_abuse_guard::{
 use super::chat_peer_admission::{
     AuthenticatedPeerRelayReplayStart, DirectPeerAdmissionDomain, DirectPeerAdmissionPolicy,
 };
+use super::chat_peer_observer::{BlindRelayForwardObserver, PeerStoreBlindRelayForwardObserver};
 #[cfg(test)]
 use super::chat_peer_replay::REPLAY_CAPACITY_FOR_TESTS as MAX_BLIND_RELAY_SEEN_ROUTES;
 use super::chat_peer_replay::{
@@ -2988,6 +2996,7 @@ struct BlindRelayForwardComponents<'a> {
     retry_policy: &'a dyn BlindRelayRetryPolicy,
     response_policy: &'a dyn BlindRelayResponsePolicy,
     transport: &'a dyn BlindRelayTransport,
+    observer: &'a dyn BlindRelayForwardObserver,
 }
 
 async fn forward_blind_relay_with_retry(
@@ -3000,8 +3009,8 @@ async fn forward_blind_relay_with_retry(
     let retry_policy = BlindRelayRetryDomain::default();
     let response_policy = BlindRelayResponseDomain;
     let transport = ReqwestBlindRelayTransport::new(Arc::clone(&state.http_client));
+    let observer = PeerStoreBlindRelayForwardObserver::new(state.peer_store.as_ref());
     forward_blind_relay_with_components(
-        state,
         url,
         descriptor,
         request,
@@ -3010,6 +3019,7 @@ async fn forward_blind_relay_with_retry(
             retry_policy: &retry_policy,
             response_policy: &response_policy,
             transport: &transport,
+            observer: &observer,
         },
     )
     .await
@@ -3019,7 +3029,6 @@ async fn forward_blind_relay_with_retry(
 /// descriptor that selected `url` through retries, so delayed observations can
 /// update health only when the selected route surface remains current.
 async fn forward_blind_relay_with_components(
-    state: &ChatPeerState,
     url: &str,
     descriptor: &SignedNodeDescriptor,
     request: PeerBlindRelayRequest,
@@ -3047,7 +3056,7 @@ async fn forward_blind_relay_with_components(
         match decision {
             BlindRelayResponseDecision::Accepted(response) => {
                 return Ok(complete_blind_relay_forward(
-                    state,
+                    components.observer,
                     *response,
                     observed_at,
                     attempt,
@@ -3067,9 +3076,9 @@ async fn forward_blind_relay_with_components(
                     "[BLIND_RELAY] Peer-declared downstream failure left unattributed"
                 );
                 let error = BlindRelayError::from(failure);
-                state
-                    .peer_store
-                    .record_blind_relay_rejected(observed_at, error.reason_bucket());
+                components
+                    .observer
+                    .rejected(observed_at, error.reason_bucket());
                 return Err(error);
             }
             BlindRelayResponseDecision::RetryAfter {
@@ -3077,20 +3086,15 @@ async fn forward_blind_relay_with_components(
                 reason,
                 source,
             } => {
-                state
-                    .peer_store
-                    .record_blind_relay_retry_attempt(observed_at, &reason);
+                components.observer.retry_attempted(observed_at, &reason);
                 log_blind_relay_retry(attempt, source, &reason);
                 sleep(delay).await;
             }
             BlindRelayResponseDecision::Reject(failure) => {
                 let error = BlindRelayError::from(failure);
-                record_blind_relay_route_failure(
-                    state,
-                    descriptor,
-                    observed_at,
-                    error.reason_bucket(),
-                );
+                components
+                    .observer
+                    .route_failed(descriptor, observed_at, error.reason_bucket());
                 return Err(error);
             }
             BlindRelayResponseDecision::InvalidResponse {
@@ -3101,25 +3105,25 @@ async fn forward_blind_relay_with_components(
             } => {
                 log_invalid_blind_relay_response(attempt, kind, diagnostic);
                 if counts_as_retry_exhaustion && attempt > 1 {
-                    state.peer_store.record_blind_relay_retry_exhausted(
-                        observed_at,
-                        attempt,
-                        health_reason,
-                    );
+                    components
+                        .observer
+                        .retry_exhausted(observed_at, attempt, health_reason);
                 }
-                record_blind_relay_route_failure(state, descriptor, observed_at, health_reason);
+                components
+                    .observer
+                    .route_failed(descriptor, observed_at, health_reason);
                 return Err(BlindRelayError::ForwardFailed);
             }
             BlindRelayResponseDecision::Exhausted { reason, source } => {
                 log_blind_relay_exhausted(attempt, source, &reason);
                 if attempt > 1 {
-                    state.peer_store.record_blind_relay_retry_exhausted(
-                        observed_at,
-                        attempt,
-                        &reason,
-                    );
+                    components
+                        .observer
+                        .retry_exhausted(observed_at, attempt, &reason);
                 }
-                record_blind_relay_route_failure(state, descriptor, observed_at, &reason);
+                components
+                    .observer
+                    .route_failed(descriptor, observed_at, &reason);
                 return Err(BlindRelayError::ForwardFailed);
             }
         }
@@ -3147,34 +3151,18 @@ fn blind_relay_failure_receipt_required(descriptor: &SignedNodeDescriptor) -> bo
 }
 
 fn complete_blind_relay_forward(
-    state: &ChatPeerState,
+    observer: &dyn BlindRelayForwardObserver,
     response: PeerBlindRelayResponse,
     observed_at: u64,
     attempt: usize,
 ) -> BlindRelayForwardOutcome {
     if attempt > 1 {
-        state
-            .peer_store
-            .record_blind_relay_retry_succeeded(observed_at, attempt);
+        observer.retry_succeeded(observed_at, attempt);
     }
     BlindRelayForwardOutcome {
         response,
         observed_at,
     }
-}
-
-fn record_blind_relay_route_failure(
-    state: &ChatPeerState,
-    descriptor: &SignedNodeDescriptor,
-    observed_at: u64,
-    reason: &str,
-) {
-    let _ = state
-        .peer_store
-        .record_route_forward_failure_for_descriptor(descriptor, observed_at, reason);
-    state
-        .peer_store
-        .record_blind_relay_rejected(observed_at, reason);
 }
 
 fn log_blind_relay_retry(attempt: usize, source: BlindRelayResponseSource, reason: &str) {
