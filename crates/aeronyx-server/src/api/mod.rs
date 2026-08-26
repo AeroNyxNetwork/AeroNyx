@@ -41,6 +41,7 @@
 //! - `chat_peer_admission`: private direct-peer admission and ACK replay domain
 //! - `chat_peer_abuse_guard`: private blind-relay abuse-control domain
 //! - `chat_peer_replay`: private generation-fenced blind-route replay domain
+//! - `chat_peer_retry`: private payload-blind forwarding retry policy domain
 //! - [`blind_vault`]: node-blind encrypted object lease/store/recovery routes
 //! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
 //!
@@ -72,6 +73,8 @@
 //!   composed privately; keep payload, user, route, endpoint, and IP data out.
 //! - [BLIND-REPLAY-DOMAIN 2026-08-26 by Codex] Process-local route ownership
 //!   is generation-fenced; stale leases must never mutate a newer owner.
+//! - [BLIND-RETRY-DOMAIN 2026-08-26 by Codex] Retry policy may use only coarse
+//!   transport state and signed route metadata, never payload or user data.
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial Agent API for MemChain Phase 1
@@ -108,6 +111,8 @@
 //!   blind-route replay ownership.
 //! v2.8.34-ChatPeerReplayCodec - Move versioned durable ACK storage rules into
 //!   the replay domain while retaining legacy sealed-row reads.
+//! v2.8.35-ChatPeerRetryDomain - Split payload-blind retry decisions from HTTP
+//!   forwarding, telemetry, and route-health effects.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{
@@ -465,6 +470,7 @@ pub mod chat_peer;
 mod chat_peer_admission;
 mod chat_peer_abuse_guard;
 mod chat_peer_replay;
+mod chat_peer_retry;
 pub mod blind_vault;
 pub mod directory_chain_peer;
 pub mod directory_replica_status;
