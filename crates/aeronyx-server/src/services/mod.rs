@@ -39,8 +39,11 @@
 //   aggregate health policy, SLO window, and telemetry sink capability.
 //   [CHAT-BACKUP-RETENTION-DOMAIN 2026-08-26 by Codex] Registered the private,
 //   path-blind recovery-image retention planning capability.
+//   [CHAT-RELAY-RESTORE-PLAN-DOMAIN 2026-08-26 by Codex] Registered the
+//   private authenticated restore-plan contract and policy capability.
 //
 // Last Modified:
+//   v0.33.0-RestorePlanDomain - Registered authenticated restore planning
 //   v0.32.0-BackupRetentionDomain - Registered deterministic retention policy
 //   v0.31.0-PeerRelayTelemetryDomain - Registered atomic telemetry composition
 //   v0.30.0-DirectPeerCircuitDomain - Registered restart-safe circuit domain
@@ -104,6 +107,7 @@ mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;
 mod chat_relay_pull_cursor;
 mod chat_relay_quarantine;
+mod chat_relay_restore_plan;
 #[cfg(unix)]
 mod chat_relay_runtime_fence;
 mod chat_relay_verified_submit;
