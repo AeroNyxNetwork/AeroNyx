@@ -106,6 +106,8 @@
 //!   identity-capacity ownership from public HTTP orchestration.
 //! v2.8.33-ChatPeerReplayDomain - Split and generation-fence process-local
 //!   blind-route replay ownership.
+//! v2.8.34-ChatPeerReplayCodec - Move versioned durable ACK storage rules into
+//!   the replay domain while retaining legacy sealed-row reads.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{

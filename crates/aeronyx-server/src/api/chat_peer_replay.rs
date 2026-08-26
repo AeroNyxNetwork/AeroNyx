@@ -12,6 +12,7 @@
 //! - Models new, in-flight, completed, conflicting, and saturated admission.
 //! - Retains exact bounded ACKs from their completion boundary.
 //! - Fences release and completion by route, commitment, and owner generation.
+//! - Owns the versioned restart-durable ACK codec and legacy read compatibility.
 //! - Bounds both live entries and stale queue generations without evicting
 //!   unexpired at-most-once evidence.
 //!
@@ -34,13 +35,16 @@
 //! - Keep serialized HTTP contracts and durable replay rows backward compatible.
 //!
 //! ## Last Modified
-//! v2.8.33-ChatPeerReplayDomain - Initial trait-based extraction and fencing.
+//! v2.8.34-ChatPeerReplayCodec - Own durable ACK encoding and validation.
 //! ============================================
 
 use std::{
     collections::{HashMap, VecDeque},
     sync::Mutex,
 };
+
+use aeronyx_core::protocol::chat::{BlindRelayDeliveryReceipt, BlindRelayFailureReceipt};
+use serde::{Deserialize, Serialize};
 
 use super::chat_peer::PeerBlindRelayResponse;
 use crate::services::chat_relay::{
@@ -49,13 +53,160 @@ use crate::services::chat_relay::{
 
 /// Maximum live and stale generations retained by the replay eviction queue.
 const MAX_REPLAY_QUEUE_GENERATIONS: usize = BLIND_RELAY_ROUTE_REPLAY_CAPACITY * 2;
+const DURABLE_RESPONSE_MAGIC: &[u8; 5] = b"ANBR\x01";
+const DURABLE_RESPONSE_VERSION: u8 = 1;
+
+/// Failure class for the private restart-durable response representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlindRelayReplayCodecError {
+    Encode,
+    Decode,
+    UnsupportedVersion,
+    InvalidCompletedState,
+}
+
+/// Private, versioned representation of one restart-durable route ACK.
+///
+/// [DURABLE-BLIND-RELAY-RESPONSE-CODEC 2026-08-25 by Codex] The public JSON
+/// response omits absent receipt fields for rolling compatibility. Reusing that
+/// Serde shape with bincode truncated trailing fields and made a successfully
+/// sealed ACK unreadable after the first delivery. This storage-only frame has
+/// no conditional fields and is prefixed independently from the public wire.
+#[derive(Debug, Serialize, Deserialize)]
+struct DurableBlindRelayResponseV1 {
+    version: u8,
+    accepted: bool,
+    terminal: bool,
+    forwarded: bool,
+    ttl_remaining: u8,
+    reason: Option<String>,
+    delivery_receipt: Option<BlindRelayDeliveryReceipt>,
+    failure_receipt: Option<BlindRelayFailureReceipt>,
+}
+
+type LegacyResponseWithDelivery = (
+    bool,
+    bool,
+    bool,
+    u8,
+    Option<String>,
+    Option<BlindRelayDeliveryReceipt>,
+);
+type LegacyResponseWithoutReceipts = (bool, bool, bool, u8, Option<String>);
+
+impl From<&PeerBlindRelayResponse> for DurableBlindRelayResponseV1 {
+    fn from(response: &PeerBlindRelayResponse) -> Self {
+        Self {
+            version: DURABLE_RESPONSE_VERSION,
+            accepted: response.accepted,
+            terminal: response.terminal,
+            forwarded: response.forwarded,
+            ttl_remaining: response.ttl_remaining,
+            reason: response.reason.clone(),
+            delivery_receipt: response.delivery_receipt.clone(),
+            failure_receipt: response.failure_receipt.clone(),
+        }
+    }
+}
+
+impl From<DurableBlindRelayResponseV1> for PeerBlindRelayResponse {
+    fn from(response: DurableBlindRelayResponseV1) -> Self {
+        Self {
+            accepted: response.accepted,
+            terminal: response.terminal,
+            forwarded: response.forwarded,
+            ttl_remaining: response.ttl_remaining,
+            reason: response.reason,
+            delivery_receipt: response.delivery_receipt,
+            failure_receipt: response.failure_receipt,
+        }
+    }
+}
+
+pub(super) fn encode_durable_blind_relay_response(
+    response: &PeerBlindRelayResponse,
+) -> Result<Vec<u8>, BlindRelayReplayCodecError> {
+    let frame = DurableBlindRelayResponseV1::from(response);
+    let body = bincode::serialize(&frame).map_err(|_| BlindRelayReplayCodecError::Encode)?;
+    let mut encoded = Vec::with_capacity(DURABLE_RESPONSE_MAGIC.len() + body.len());
+    encoded.extend_from_slice(DURABLE_RESPONSE_MAGIC);
+    encoded.extend_from_slice(&body);
+    Ok(encoded)
+}
+
+pub(super) fn decode_durable_blind_relay_response(
+    encoded: &[u8],
+) -> Result<PeerBlindRelayResponse, BlindRelayReplayCodecError> {
+    if let Some(body) = encoded.strip_prefix(DURABLE_RESPONSE_MAGIC) {
+        let frame: DurableBlindRelayResponseV1 =
+            bincode::deserialize(body).map_err(|_| BlindRelayReplayCodecError::Decode)?;
+        if frame.version != DURABLE_RESPONSE_VERSION {
+            return Err(BlindRelayReplayCodecError::UnsupportedVersion);
+        }
+        return Ok(frame.into());
+    }
+
+    // [DURABLE-BLIND-RELAY-RESPONSE-CODEC 2026-08-25 by Codex] Read ACKs
+    // sealed before v1 without rewriting them. The old public response omitted
+    // absent trailing fields, so only the two successful shapes that could
+    // enter this table are accepted: a delivery receipt or no receipts.
+    if let Ok((accepted, terminal, forwarded, ttl_remaining, reason, delivery_receipt)) =
+        bincode::deserialize::<LegacyResponseWithDelivery>(encoded)
+    {
+        return Ok(PeerBlindRelayResponse {
+            accepted,
+            terminal,
+            forwarded,
+            ttl_remaining,
+            reason,
+            delivery_receipt,
+            failure_receipt: None,
+        });
+    }
+
+    let (accepted, terminal, forwarded, ttl_remaining, reason) =
+        bincode::deserialize::<LegacyResponseWithoutReceipts>(encoded)
+            .map_err(|_| BlindRelayReplayCodecError::Decode)?;
+    Ok(PeerBlindRelayResponse {
+        accepted,
+        terminal,
+        forwarded,
+        ttl_remaining,
+        reason,
+        delivery_receipt: None,
+        failure_receipt: None,
+    })
+}
+
+pub(super) fn validate_completed_blind_relay_response(
+    response: &PeerBlindRelayResponse,
+) -> Result<(), BlindRelayReplayCodecError> {
+    let valid_reason = matches!(
+        response.reason.as_deref(),
+        Some(
+            "terminal_next_hop"
+                | "forwarded"
+                | "onion_terminal_delivered"
+                | "onion_forwarded"
+                | "onion_middle_forwarded"
+        )
+    );
+    if !response.accepted
+        || response.terminal == response.forwarded
+        || response.failure_receipt.is_some()
+        || !valid_reason
+    {
+        return Err(BlindRelayReplayCodecError::InvalidCompletedState);
+    }
+    Ok(())
+}
 
 /// Result of observing one exact blind-route request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum BlindRelayRouteReplayDecision {
     New { generation: u64 },
     InFlight,
-    Completed(PeerBlindRelayResponse),
+    Completed(Box<PeerBlindRelayResponse>),
     Conflict,
     Saturated,
 }
@@ -155,7 +306,7 @@ impl BlindRelayReplayDomain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BlindRelayRouteReplayState {
     InFlight,
-    Completed(PeerBlindRelayResponse),
+    Completed(Box<PeerBlindRelayResponse>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,7 +397,7 @@ impl BlindRelayReplayState {
         if let Some(entry) = self.seen.get_mut(&route_id) {
             entry.observed_at = observed_at;
             entry.generation = completed_generation;
-            entry.state = BlindRelayRouteReplayState::Completed(response);
+            entry.state = BlindRelayRouteReplayState::Completed(Box::new(response));
         }
         self.order.push_back((route_id, completed_generation));
         self.evict_expired(observed_at);
@@ -324,6 +475,7 @@ pub(super) const REPLAY_CAPACITY_FOR_TESTS: usize = BLIND_RELAY_ROUTE_REPLAY_CAP
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aeronyx_core::crypto::IdentityKeyPair;
 
     fn forwarded_response() -> PeerBlindRelayResponse {
         PeerBlindRelayResponse {
@@ -350,6 +502,83 @@ mod tests {
     }
 
     #[test]
+    fn durable_response_codec_round_trips_and_reads_legacy_rows() {
+        // [DURABLE-BLIND-RELAY-RESPONSE-CODEC 2026-08-25 by Codex] Protect
+        // both the storage-only frame and already-sealed public-Serde rows.
+        let terminal = IdentityKeyPair::generate();
+        let response_with_receipt = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 1,
+            reason: Some("onion_terminal_delivered".to_string()),
+            delivery_receipt: Some(BlindRelayDeliveryReceipt::accepted(
+                [0xD8; 16],
+                [0xD9; 32],
+                1_800_000_100,
+                &terminal,
+            )),
+            failure_receipt: None,
+        };
+        let encoded = encode_durable_blind_relay_response(&response_with_receipt)
+            .expect("encode versioned durable response");
+        assert!(encoded.starts_with(DURABLE_RESPONSE_MAGIC));
+        assert_eq!(
+            decode_durable_blind_relay_response(&encoded)
+                .expect("decode versioned durable response"),
+            response_with_receipt
+        );
+
+        let legacy_with_receipt = bincode::serialize(&response_with_receipt)
+            .expect("encode legacy response with receipt");
+        assert_eq!(
+            decode_durable_blind_relay_response(&legacy_with_receipt)
+                .expect("decode legacy response with receipt"),
+            response_with_receipt
+        );
+
+        let legacy_without_receipts = PeerBlindRelayResponse {
+            accepted: true,
+            terminal: true,
+            forwarded: false,
+            ttl_remaining: 2,
+            reason: Some("terminal_next_hop".to_string()),
+            delivery_receipt: None,
+            failure_receipt: None,
+        };
+        let legacy_without_receipts = bincode::serialize(&legacy_without_receipts)
+            .expect("encode legacy response without receipts");
+        assert_eq!(
+            decode_durable_blind_relay_response(&legacy_without_receipts)
+                .expect("decode legacy response without receipts")
+                .reason
+                .as_deref(),
+            Some("terminal_next_hop")
+        );
+    }
+
+    #[test]
+    fn durable_response_codec_rejects_unsupported_version() {
+        let mut encoded = encode_durable_blind_relay_response(&forwarded_response())
+            .expect("encode durable response");
+        encoded[DURABLE_RESPONSE_MAGIC.len()] = DURABLE_RESPONSE_VERSION + 1;
+        assert_eq!(
+            decode_durable_blind_relay_response(&encoded),
+            Err(BlindRelayReplayCodecError::UnsupportedVersion)
+        );
+    }
+
+    #[test]
+    fn completed_response_validation_rejects_ambiguous_success() {
+        let mut response = forwarded_response();
+        response.forwarded = false;
+        assert_eq!(
+            validate_completed_blind_relay_response(&response),
+            Err(BlindRelayReplayCodecError::InvalidCompletedState)
+        );
+    }
+
+    #[test]
     fn returns_exact_completed_ack_from_completion_boundary() {
         let route_id = [0x41; 16];
         let commitment = [0xA1; 32];
@@ -371,7 +600,7 @@ mod tests {
         );
         assert_eq!(
             state.observe(route_id, commitment, completed_at + 1),
-            BlindRelayRouteReplayDecision::Completed(response)
+            BlindRelayRouteReplayDecision::Completed(Box::new(response))
         );
         assert!(matches!(
             state.observe(
@@ -473,7 +702,7 @@ mod tests {
         );
         assert_eq!(
             state.observe(completed_route, commitment, now),
-            BlindRelayRouteReplayDecision::Completed(response)
+            BlindRelayRouteReplayDecision::Completed(Box::new(response))
         );
         assert_eq!(
             state.observe(live_route, commitment, now),
