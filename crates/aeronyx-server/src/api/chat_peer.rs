@@ -400,8 +400,7 @@
 // ============================================================================
 
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::{atomic::AtomicUsize, Arc, Mutex, OnceLock},
+    sync::{atomic::AtomicUsize, Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -436,15 +435,19 @@ use sha2::{Digest, Sha256};
 use tokio::{sync::Semaphore, time::sleep};
 use tracing::{debug, warn};
 
-use super::chat_peer_admission::{
-    AuthenticatedPeerRelayReplayStart, DirectPeerAdmissionDomain, DirectPeerAdmissionPolicy,
-};
+#[cfg(test)]
+use super::chat_peer_abuse_guard::PREVIOUS_HOP_FAILURE_THRESHOLD as BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD;
 use super::chat_peer_abuse_guard::{
     BlindRelayAbuseDecision, BlindRelayAbuseDomain, BlindRelayAbusePolicy,
 };
+use super::chat_peer_admission::{
+    AuthenticatedPeerRelayReplayStart, DirectPeerAdmissionDomain, DirectPeerAdmissionPolicy,
+};
 #[cfg(test)]
-use super::chat_peer_abuse_guard::{
-    PREVIOUS_HOP_FAILURE_THRESHOLD as BLIND_RELAY_PREVIOUS_HOP_FAILURE_THRESHOLD,
+use super::chat_peer_replay::REPLAY_CAPACITY_FOR_TESTS as MAX_BLIND_RELAY_SEEN_ROUTES;
+use super::chat_peer_replay::{
+    BlindRelayReplayDomain, BlindRelayReplayMutation, BlindRelayReplayRegistry,
+    BlindRelayRouteReplayDecision,
 };
 use crate::api::{
     canonical_peer_http_url, decode_bounded_json_response, peer_endpoint_is_public_ip,
@@ -455,8 +458,6 @@ use crate::config_chat_relay::{
 };
 use crate::services::chat_relay::{
     BlindRelayRouteAdmission, ChatRelayError, ChatRelayInboundFailureReason,
-    BLIND_RELAY_ROUTE_REPLAY_CAPACITY as MAX_BLIND_RELAY_SEEN_ROUTES,
-    BLIND_RELAY_ROUTE_REPLAY_TTL_SECS as BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS,
 };
 use crate::services::peer_store::PeerStore;
 use crate::services::{
@@ -552,9 +553,6 @@ const BLIND_RELAY_RETRY_BASE_MS: u64 = 25;
 /// Extra deterministic jitter window used to avoid retry herds.
 const BLIND_RELAY_RETRY_JITTER_MS: u64 = 35;
 
-/// Maximum live and stale generations retained by the replay eviction queue.
-const MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS: usize = MAX_BLIND_RELAY_SEEN_ROUTES * 2;
-
 /// Domain for the complete authenticated blind request, including onward data.
 const BLIND_RELAY_AUTHENTICATED_REQUEST_COMMITMENT_DOMAIN: &[u8] =
     b"AeroNyx-BlindRelay-AuthenticatedRequest-v1";
@@ -594,7 +592,7 @@ struct ChatPeerState {
     node_identity: Arc<IdentityKeyPair>,
     http_client: Arc<reqwest::Client>,
     blind_relay_in_flight: Arc<AtomicUsize>,
-    blind_relay_seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
+    blind_relay_replay_registry: Arc<dyn BlindRelayReplayRegistry>,
     /// [CHAT-PEER-ABUSE-DOMAIN 2026-08-26 by Codex] Blind relay rate and
     /// quarantine state are composed behind a payload-blind policy boundary.
     blind_relay_abuse_guard: Arc<dyn BlindRelayAbusePolicy>,
@@ -648,29 +646,6 @@ impl PeerRelayRequestGate {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BlindRelayRouteReplayState {
-    InFlight,
-    Completed(PeerBlindRelayResponse),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BlindRelayRouteReplayEntry {
-    request_commitment: [u8; 32],
-    observed_at: u64,
-    generation: u64,
-    state: BlindRelayRouteReplayState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BlindRelayRouteReplayDecision {
-    New,
-    InFlight,
-    Completed(PeerBlindRelayResponse),
-    Conflict,
-    Saturated,
-}
-
 enum BlindRelayRouteStart {
     Acquired(BlindRelayRouteLease),
     Completed(PeerBlindRelayResponse),
@@ -685,7 +660,8 @@ enum BlindRelayRouteStart {
 /// through `complete`, atomically replacing the in-flight marker with the exact
 /// bounded ACK before disarming cleanup.
 struct BlindRelayRouteLease {
-    seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
+    replay_registry: Option<Arc<dyn BlindRelayReplayRegistry>>,
+    owner_generation: Option<u64>,
     durable_relay: Option<Arc<ChatRelayService>>,
     route_id: [u8; 16],
     request_commitment: [u8; 32],
@@ -695,9 +671,26 @@ struct BlindRelayRouteLease {
 }
 
 impl BlindRelayRouteLease {
-    fn new(
-        seen_routes: Arc<Mutex<BlindRelayRouteReplayCache>>,
-        durable_relay: Option<Arc<ChatRelayService>>,
+    fn local(
+        replay_registry: Arc<dyn BlindRelayReplayRegistry>,
+        route_id: [u8; 16],
+        request_commitment: [u8; 32],
+        owner_generation: u64,
+    ) -> Self {
+        Self {
+            replay_registry: Some(replay_registry),
+            owner_generation: Some(owner_generation),
+            durable_relay: None,
+            route_id,
+            request_commitment,
+            effect_started: false,
+            recovered: false,
+            active: true,
+        }
+    }
+
+    fn durable(
+        durable_relay: Arc<ChatRelayService>,
         route_id: [u8; 16],
         request_commitment: [u8; 32],
         effect_started: bool,
@@ -708,8 +701,9 @@ impl BlindRelayRouteLease {
         // without retaining a route or peer identifier in telemetry.
         let recovered = effect_started;
         Self {
-            seen_routes,
-            durable_relay,
+            replay_registry: None,
+            owner_generation: None,
+            durable_relay: Some(durable_relay),
             route_id,
             request_commitment,
             effect_started,
@@ -749,13 +743,23 @@ impl BlindRelayRouteLease {
                     now,
                 )
                 .map_err(|_| BlindRelayError::ReplayProtectionUnavailable)?;
+        } else {
+            let (Some(registry), Some(owner_generation)) =
+                (self.replay_registry.as_ref(), self.owner_generation)
+            else {
+                return Err(BlindRelayError::ReplayProtectionUnavailable);
+            };
+            if registry.complete(
+                self.route_id,
+                self.request_commitment,
+                owner_generation,
+                now,
+                response,
+            ) != BlindRelayReplayMutation::Applied
+            {
+                return Err(BlindRelayError::ReplayProtectionUnavailable);
+            }
         }
-        let mut seen_routes = self
-            .seen_routes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        seen_routes.complete(&self.route_id, now, response);
-        drop(seen_routes);
         self.active = false;
         if self.recovered {
             if let Some(relay) = self.durable_relay.as_ref() {
@@ -787,148 +791,11 @@ impl Drop for BlindRelayRouteLease {
         if self.effect_started {
             return;
         }
-        let mut seen_routes = self
-            .seen_routes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        seen_routes.forget(&self.route_id);
-    }
-}
-
-#[derive(Default)]
-struct BlindRelayRouteReplayCache {
-    seen: HashMap<[u8; 16], BlindRelayRouteReplayEntry>,
-    order: VecDeque<([u8; 16], u64)>,
-    monotonic_observed_at: u64,
-    generation_counter: u64,
-}
-
-impl BlindRelayRouteReplayCache {
-    fn observe(
-        &mut self,
-        route_id: [u8; 16],
-        request_commitment: [u8; 32],
-        now: u64,
-    ) -> BlindRelayRouteReplayDecision {
-        let now = self.normalize_observation_time(now);
-        self.evict_expired(now);
-        if let Some(entry) = self.seen.get(&route_id) {
-            if entry.request_commitment != request_commitment {
-                return BlindRelayRouteReplayDecision::Conflict;
-            }
-            return match &entry.state {
-                BlindRelayRouteReplayState::InFlight => BlindRelayRouteReplayDecision::InFlight,
-                BlindRelayRouteReplayState::Completed(response) => {
-                    BlindRelayRouteReplayDecision::Completed(response.clone())
-                }
-            };
+        if let (Some(registry), Some(owner_generation)) =
+            (self.replay_registry.as_ref(), self.owner_generation)
+        {
+            let _ = registry.release(self.route_id, self.request_commitment, owner_generation);
         }
-        // [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] A completed
-        // ACK is still the only proof that an ACK-loss retry must not repeat
-        // forwarding or terminal delivery. Treat capacity as admission rather
-        // than deleting valid safety evidence to make room for newer work.
-        if self.seen.len() >= MAX_BLIND_RELAY_SEEN_ROUTES {
-            self.compact_stale_generations_if_needed();
-            return BlindRelayRouteReplayDecision::Saturated;
-        }
-
-        let generation = self.allocate_generation();
-        self.seen.insert(
-            route_id,
-            BlindRelayRouteReplayEntry {
-                request_commitment,
-                observed_at: now,
-                generation,
-                state: BlindRelayRouteReplayState::InFlight,
-            },
-        );
-        self.order.push_back((route_id, generation));
-        self.compact_stale_generations_if_needed();
-        BlindRelayRouteReplayDecision::New
-    }
-
-    /// Moves one accepted route's replay horizon to its completion boundary.
-    ///
-    /// [DURABLE-TERMINAL-REPLAY-WINDOW 2026-08-11 by Codex] The old queue
-    /// entry remains as a harmless stale generation. Eviction removes a route
-    /// only when the queued generation still matches the current map value.
-    fn complete(&mut self, route_id: &[u8; 16], now: u64, response: PeerBlindRelayResponse) {
-        let now = self.normalize_observation_time(now);
-        let Some(current) = self.seen.get(route_id).cloned() else {
-            return;
-        };
-        if current.observed_at >= now {
-            if let Some(entry) = self.seen.get_mut(route_id) {
-                entry.state = BlindRelayRouteReplayState::Completed(response);
-            }
-            return;
-        }
-        let generation = self.allocate_generation();
-        self.seen.insert(
-            *route_id,
-            BlindRelayRouteReplayEntry {
-                request_commitment: current.request_commitment,
-                observed_at: now,
-                generation,
-                state: BlindRelayRouteReplayState::Completed(response),
-            },
-        );
-        self.order.push_back((*route_id, generation));
-        self.evict_expired(now);
-        // Completion never increases the number of live map entries.
-        self.compact_stale_generations_if_needed();
-    }
-
-    fn normalize_observation_time(&mut self, now: u64) -> u64 {
-        self.monotonic_observed_at = self.monotonic_observed_at.max(now);
-        self.monotonic_observed_at
-    }
-
-    fn allocate_generation(&mut self) -> u64 {
-        // Generation zero is reserved for the `Default` state. Exhausting the
-        // full u64 space in one process is infeasible; skipping zero also keeps
-        // wrap behavior deterministic in fuzzing and model tests.
-        self.generation_counter = self.generation_counter.wrapping_add(1);
-        if self.generation_counter == 0 {
-            self.generation_counter = 1;
-        }
-        self.generation_counter
-    }
-
-    fn evict_expired(&mut self, now: u64) {
-        while let Some((route_id, queued_generation)) = self.order.front().copied() {
-            let Some(current) = self.seen.get(&route_id) else {
-                self.order.pop_front();
-                continue;
-            };
-            if current.generation != queued_generation {
-                self.order.pop_front();
-                continue;
-            }
-            if now.saturating_sub(current.observed_at) <= BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS {
-                break;
-            }
-            self.order.pop_front();
-            self.seen.remove(&route_id);
-        }
-    }
-
-    fn forget(&mut self, route_id: &[u8; 16]) {
-        self.seen.remove(route_id);
-        self.compact_stale_generations_if_needed();
-    }
-
-    fn compact_stale_generations_if_needed(&mut self) {
-        if self.order.len() <= MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS {
-            return;
-        }
-
-        let seen = &self.seen;
-        self.order.retain(|(route_id, generation)| {
-            seen.get(route_id)
-                .is_some_and(|entry| entry.generation == *generation)
-        });
-        debug_assert!(self.order.len() <= self.seen.len());
     }
 }
 
@@ -1709,7 +1576,7 @@ pub fn build_chat_peer_router(
         node_identity,
         http_client,
         blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-        blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+        blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
         blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
     };
     let peer_relay_router = Router::new()
@@ -2961,24 +2828,22 @@ fn begin_blind_relay_route(
             .reserve_blind_relay_route(&route_id, &request_commitment)
             .map_err(|_| record_blind_relay_replay_protection_failure(state, now))?;
         return match admission {
-            BlindRelayRouteAdmission::Reserved => {
-                Ok(BlindRelayRouteStart::Acquired(BlindRelayRouteLease::new(
-                    Arc::clone(&state.blind_relay_seen_routes),
-                    Some(Arc::clone(relay)),
+            BlindRelayRouteAdmission::Reserved => Ok(BlindRelayRouteStart::Acquired(
+                BlindRelayRouteLease::durable(
+                    Arc::clone(relay),
                     route_id,
                     request_commitment,
                     false,
-                )))
-            }
-            BlindRelayRouteAdmission::ReservedForRecovery => {
-                Ok(BlindRelayRouteStart::Acquired(BlindRelayRouteLease::new(
-                    Arc::clone(&state.blind_relay_seen_routes),
-                    Some(Arc::clone(relay)),
+                ),
+            )),
+            BlindRelayRouteAdmission::ReservedForRecovery => Ok(BlindRelayRouteStart::Acquired(
+                BlindRelayRouteLease::durable(
+                    Arc::clone(relay),
                     route_id,
                     request_commitment,
                     true,
-                )))
-            }
+                ),
+            )),
             BlindRelayRouteAdmission::Pending => {
                 state
                     .peer_store
@@ -3023,21 +2888,17 @@ fn begin_blind_relay_route(
         };
     }
 
-    let mut seen_routes = state
-        .blind_relay_seen_routes
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let decision = seen_routes.observe(route_id, request_commitment, now);
-    drop(seen_routes);
+    let decision = state
+        .blind_relay_replay_registry
+        .observe(route_id, request_commitment, now);
 
     match decision {
-        BlindRelayRouteReplayDecision::New => {
-            Ok(BlindRelayRouteStart::Acquired(BlindRelayRouteLease::new(
-                Arc::clone(&state.blind_relay_seen_routes),
-                None,
+        BlindRelayRouteReplayDecision::New { generation } => {
+            Ok(BlindRelayRouteStart::Acquired(BlindRelayRouteLease::local(
+                Arc::clone(&state.blind_relay_replay_registry),
                 route_id,
                 request_commitment,
-                false,
+                generation,
             )))
         }
         BlindRelayRouteReplayDecision::InFlight => {
@@ -3857,6 +3718,7 @@ mod tests {
     use axum::response::IntoResponse;
     use rusqlite::Connection;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex;
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
@@ -5183,7 +5045,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-     #[tokio::test]
+    #[tokio::test]
     async fn peer_relay_rate_limit_rejects_before_duplicate_processing() {
         let (relay, path) = temp_chat_relay_with_peer_rate("chat-peer-rate-limit", 1);
         let sessions = Arc::new(SessionManager::new(16, std::time::Duration::from_secs(60)));
@@ -5549,7 +5411,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
@@ -5600,7 +5462,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
@@ -5654,7 +5516,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
@@ -5813,7 +5675,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
@@ -5897,7 +5759,7 @@ mod tests {
             node_identity: Arc::clone(&middle_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let route_id = [0x69; 16];
@@ -6013,7 +5875,7 @@ mod tests {
             node_identity: Arc::clone(&middle_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let recovered_peel = try_open_onion_layer(
@@ -6099,7 +5961,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
@@ -6191,7 +6053,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
@@ -6280,7 +6142,8 @@ mod tests {
         let source = IdentityKeyPair::generate();
         let node_identity = Arc::new(IdentityKeyPair::generate());
         let peer_store = Arc::new(PeerStore::new());
-        let seen_routes = Arc::new(Mutex::new(BlindRelayRouteReplayCache::default()));
+        let replay_registry: Arc<dyn BlindRelayReplayRegistry> =
+            Arc::new(BlindRelayReplayDomain::default());
         let abuse_guard: Arc<dyn BlindRelayAbusePolicy> =
             Arc::new(BlindRelayAbuseDomain::default());
         let failed_state = ChatPeerState {
@@ -6292,7 +6155,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::clone(&seen_routes),
+            blind_relay_replay_registry: Arc::clone(&replay_registry),
             blind_relay_abuse_guard: Arc::clone(&abuse_guard),
         };
         let now = now_secs();
@@ -6332,7 +6195,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::clone(&seen_routes),
+            blind_relay_replay_registry: Arc::clone(&replay_registry),
             blind_relay_abuse_guard: Arc::clone(&abuse_guard),
         };
 
@@ -6382,7 +6245,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
@@ -6483,7 +6346,7 @@ mod tests {
             node_identity: Arc::clone(&middle_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
@@ -6687,7 +6550,7 @@ mod tests {
             node_identity: Arc::clone(&middle_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
@@ -6783,7 +6646,7 @@ mod tests {
             node_identity: Arc::new(IdentityKeyPair::generate()),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let app = Router::new()
@@ -6842,7 +6705,7 @@ mod tests {
             node_identity: Arc::new(IdentityKeyPair::generate()),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
 
@@ -6889,7 +6752,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
@@ -6927,82 +6790,54 @@ mod tests {
     }
 
     #[test]
-    fn blind_relay_replay_cache_forgets_failed_route_ids() {
-        let mut cache = BlindRelayRouteReplayCache::default();
-        let route_id = [0x46u8; 16];
-        let request_commitment = [0xA6u8; 32];
-
-        assert_eq!(
-            cache.observe(route_id, request_commitment, 1_800_000_000),
-            BlindRelayRouteReplayDecision::New
-        );
-        assert_eq!(
-            cache.observe(route_id, request_commitment, 1_800_000_001),
-            BlindRelayRouteReplayDecision::InFlight
-        );
-        cache.forget(&route_id);
-        assert_eq!(
-            cache.observe(route_id, request_commitment, 1_800_000_002),
-            BlindRelayRouteReplayDecision::New
-        );
-    }
-
-    #[test]
     fn blind_relay_route_lease_releases_cancellation_and_commits_exact_ack() {
         // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Cancellation
         // releases an unarmed claim, but preserves an armed claim whose effect
         // may have happened. Completion still publishes the exact bounded ACK.
-        let seen_routes = Arc::new(Mutex::new(BlindRelayRouteReplayCache::default()));
+        let replay_registry: Arc<dyn BlindRelayReplayRegistry> =
+            Arc::new(BlindRelayReplayDomain::default());
         let route_id = [0x48u8; 16];
         let request_commitment = [0xA8u8; 32];
         let started_at = 1_800_000_000;
 
-        assert_eq!(
-            seen_routes
-                .lock()
-                .unwrap()
-                .observe(route_id, request_commitment, started_at),
-            BlindRelayRouteReplayDecision::New
-        );
-        drop(BlindRelayRouteLease::new(
-            Arc::clone(&seen_routes),
-            None,
+        let first_generation =
+            match replay_registry.observe(route_id, request_commitment, started_at) {
+                BlindRelayRouteReplayDecision::New { generation } => generation,
+                decision => panic!("unexpected replay decision: {decision:?}"),
+            };
+        drop(BlindRelayRouteLease::local(
+            Arc::clone(&replay_registry),
             route_id,
             request_commitment,
-            false,
+            first_generation,
         ));
-        assert_eq!(
-            seen_routes
-                .lock()
-                .unwrap()
-                .observe(route_id, request_commitment, started_at + 1),
-            BlindRelayRouteReplayDecision::New
-        );
+        let armed_generation =
+            match replay_registry.observe(route_id, request_commitment, started_at + 1) {
+                BlindRelayRouteReplayDecision::New { generation } => generation,
+                decision => panic!("unexpected replay decision: {decision:?}"),
+            };
 
-        let mut armed_lease = BlindRelayRouteLease::new(
-            Arc::clone(&seen_routes),
-            None,
+        let mut armed_lease = BlindRelayRouteLease::local(
+            Arc::clone(&replay_registry),
             route_id,
             request_commitment,
-            false,
+            armed_generation,
         );
         armed_lease.arm_effect(started_at + 2).unwrap();
         drop(armed_lease);
         assert_eq!(
-            seen_routes
-                .lock()
-                .unwrap()
-                .observe(route_id, request_commitment, started_at + 3),
+            replay_registry.observe(route_id, request_commitment, started_at + 3),
             BlindRelayRouteReplayDecision::InFlight
         );
-        seen_routes.lock().unwrap().forget(&route_id);
         assert_eq!(
-            seen_routes
-                .lock()
-                .unwrap()
-                .observe(route_id, request_commitment, started_at + 4),
-            BlindRelayRouteReplayDecision::New
+            replay_registry.release(route_id, request_commitment, armed_generation),
+            BlindRelayReplayMutation::Applied
         );
+        let completion_generation =
+            match replay_registry.observe(route_id, request_commitment, started_at + 4) {
+                BlindRelayRouteReplayDecision::New { generation } => generation,
+                decision => panic!("unexpected replay decision: {decision:?}"),
+            };
 
         let response = PeerBlindRelayResponse {
             accepted: true,
@@ -7013,20 +6848,16 @@ mod tests {
             delivery_receipt: None,
             failure_receipt: None,
         };
-        BlindRelayRouteLease::new(
-            Arc::clone(&seen_routes),
-            None,
+        BlindRelayRouteLease::local(
+            Arc::clone(&replay_registry),
             route_id,
             request_commitment,
-            false,
+            completion_generation,
         )
         .complete(started_at + 5, response.clone())
         .unwrap();
         assert_eq!(
-            seen_routes
-                .lock()
-                .unwrap()
-                .observe(route_id, request_commitment, started_at + 6),
+            replay_registry.observe(route_id, request_commitment, started_at + 6),
             BlindRelayRouteReplayDecision::Completed(response)
         );
     }
@@ -7075,9 +6906,8 @@ mod tests {
                 .expect("take over armed route"),
             BlindRelayRouteAdmission::ReservedForRecovery
         );
-        drop(BlindRelayRouteLease::new(
-            Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
-            Some(Arc::clone(&recovered_relay)),
+        drop(BlindRelayRouteLease::durable(
+            Arc::clone(&recovered_relay),
             route_id,
             request_commitment,
             true,
@@ -7094,190 +6924,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn blind_relay_replay_capacity_preserves_completed_and_in_flight_evidence() {
-        // [BLIND-RELAY-NO-EVICTION-ADMISSION 2026-08-24 by Codex] A full cache
-        // must preserve both the exact completed ACK and every unresolved route.
-        // Only the newly presented route is rejected until evidence expires.
-        let mut cache = BlindRelayRouteReplayCache::default();
-        let completed_route = [0x91u8; 16];
-        let live_route = [0x92u8; 16];
-        let saturated_route = [0x94u8; 16];
-        let request_commitment = [0xB1u8; 32];
-        let now = 1_800_000_000;
-        let completed_response = PeerBlindRelayResponse {
-            accepted: true,
-            terminal: false,
-            forwarded: true,
-            ttl_remaining: 1,
-            reason: Some("forwarded".to_string()),
-            delivery_receipt: None,
-            failure_receipt: None,
-        };
-
-        assert_eq!(
-            cache.observe(completed_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::New
-        );
-        cache.complete(&completed_route, now, completed_response.clone());
-        assert_eq!(
-            cache.observe(live_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::New
-        );
-
-        for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES.saturating_sub(2) {
-            let mut route_id = [0x93u8; 16];
-            route_id[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
-            assert_eq!(
-                cache.observe(route_id, request_commitment, now),
-                BlindRelayRouteReplayDecision::New
-            );
-        }
-
-        assert_eq!(
-            cache.observe(saturated_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::Saturated
-        );
-        assert_eq!(cache.seen.len(), MAX_BLIND_RELAY_SEEN_ROUTES);
-        assert_eq!(
-            cache.observe(completed_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::Completed(completed_response)
-        );
-        assert_eq!(
-            cache.observe(live_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::InFlight
-        );
-        assert_eq!(
-            cache.observe(
-                saturated_route,
-                request_commitment,
-                now + BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS + 1,
-            ),
-            BlindRelayRouteReplayDecision::New
-        );
-    }
-
-    #[test]
-    fn blind_relay_replay_cache_fails_closed_when_all_routes_are_in_flight() {
-        let mut cache = BlindRelayRouteReplayCache::default();
-        let now = 1_800_000_000;
-        let request_commitment = [0xB2u8; 32];
-
-        for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES {
-            let mut route_id = [0x97u8; 16];
-            route_id[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
-            assert_eq!(
-                cache.observe(route_id, request_commitment, now),
-                BlindRelayRouteReplayDecision::New
-            );
-        }
-
-        let saturated_route = [0x98u8; 16];
-        assert_eq!(
-            cache.observe(saturated_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::Saturated
-        );
-        assert_eq!(cache.seen.len(), MAX_BLIND_RELAY_SEEN_ROUTES);
-
-        let mut first_route = [0x97u8; 16];
-        first_route[..8].copy_from_slice(&0u64.to_be_bytes());
-        assert_eq!(
-            cache.observe(first_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::InFlight
-        );
-        cache.forget(&first_route);
-        assert_eq!(
-            cache.observe(saturated_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::New
-        );
-    }
-
-    #[test]
-    fn blind_relay_replay_cache_bounds_same_second_failed_generations() {
-        // [REPLAY-GENERATION-COMPACTION 2026-08-11 by Codex] Second-resolution
-        // timestamps cannot distinguish a failed attempt from its immediate
-        // retry. Unique generations preserve the retry while bounded
-        // compaction prevents an active queue prefix from retaining unlimited
-        // stale attempts.
-        let mut cache = BlindRelayRouteReplayCache::default();
-        let live_route = [0x95u8; 16];
-        let retried_route = [0x96u8; 16];
-        let now = 1_800_000_000;
-        let request_commitment = [0xB3u8; 32];
-
-        assert_eq!(
-            cache.observe(live_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::New
-        );
-        for _ in 0..=MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS {
-            assert_eq!(
-                cache.observe(retried_route, request_commitment, now),
-                BlindRelayRouteReplayDecision::New
-            );
-            cache.forget(&retried_route);
-        }
-
-        assert!(cache.order.len() <= MAX_BLIND_RELAY_REPLAY_QUEUE_GENERATIONS);
-        assert_eq!(
-            cache.observe(live_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::InFlight
-        );
-        assert_eq!(
-            cache.observe(retried_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::New
-        );
-        assert_eq!(
-            cache.observe(retried_route, request_commitment, now),
-            BlindRelayRouteReplayDecision::InFlight
-        );
-    }
-
-    #[test]
-    fn blind_relay_replay_cache_starts_window_at_route_completion() {
-        let mut cache = BlindRelayRouteReplayCache::default();
-        let route_id = [0x94u8; 16];
-        let started_at = 1_800_000_000;
-        let completed_at = started_at + BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS;
-        let request_commitment = [0xB4u8; 32];
-        let terminal_identity = IdentityKeyPair::generate();
-        let delivery_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
-            route_id,
-            b"opaque terminal payload",
-            OnionRoutePurpose::MessageRelay,
-            completed_at,
-            &terminal_identity,
-        );
-
-        let response = PeerBlindRelayResponse {
-            accepted: true,
-            terminal: true,
-            forwarded: false,
-            ttl_remaining: 1,
-            reason: Some("onion_terminal_delivered".to_string()),
-            delivery_receipt: Some(delivery_receipt),
-            failure_receipt: None,
-        };
-
-        assert_eq!(
-            cache.observe(route_id, request_commitment, started_at),
-            BlindRelayRouteReplayDecision::New
-        );
-        cache.complete(&route_id, completed_at, response.clone());
-        assert_eq!(
-            cache.observe(route_id, request_commitment, completed_at + 1),
-            BlindRelayRouteReplayDecision::Completed(response)
-        );
-        assert_eq!(
-            cache.observe(
-                route_id,
-                request_commitment,
-                completed_at + BLIND_RELAY_ROUTE_REPLAY_WINDOW_SECS + 1,
-            ),
-            BlindRelayRouteReplayDecision::New
-        );
-    }
-
-     #[tokio::test]
+    #[tokio::test]
     async fn forged_previous_hop_signatures_cannot_poison_node_quarantine() {
         let claimed_previous_hop = IdentityKeyPair::generate();
         let attacker = IdentityKeyPair::generate();
@@ -7292,7 +6939,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let now = now_secs();
@@ -7376,7 +7023,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
@@ -7472,7 +7119,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let error = process_peer_blind_relay(state, request).await.unwrap_err();
@@ -7514,14 +7161,14 @@ mod tests {
             onward_descriptor_hint: None,
         };
         let request_commitment = blind_relay_authenticated_request_commitment(&request).unwrap();
-        let mut replay_cache = BlindRelayRouteReplayCache::default();
+        let replay_registry = BlindRelayReplayDomain::default();
         for sequence in 0..MAX_BLIND_RELAY_SEEN_ROUTES {
             let mut retained_route = [0x49u8; 16];
             retained_route[..8].copy_from_slice(&(sequence as u64).to_be_bytes());
-            assert_eq!(
-                replay_cache.observe(retained_route, request_commitment, now),
-                BlindRelayRouteReplayDecision::New
-            );
+            assert!(matches!(
+                replay_registry.observe(retained_route, request_commitment, now),
+                BlindRelayRouteReplayDecision::New { .. }
+            ));
         }
         let peer_store = Arc::new(PeerStore::new());
         let state = ChatPeerState {
@@ -7533,7 +7180,7 @@ mod tests {
             node_identity: Arc::clone(&node_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(replay_cache)),
+            blind_relay_replay_registry: Arc::new(replay_registry),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let error = process_peer_blind_relay(state, request).await.unwrap_err();
@@ -7607,7 +7254,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
@@ -7708,7 +7355,7 @@ mod tests {
             node_identity: Arc::clone(&middle_identity),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let outer_envelope = BlindRelayEnvelope {
@@ -7829,7 +7476,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
@@ -7911,7 +7558,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
@@ -8001,7 +7648,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
@@ -8091,7 +7738,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
@@ -8213,7 +7860,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
@@ -8327,7 +7974,7 @@ mod tests {
             node_identity: Arc::clone(&current_node),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let request = PeerBlindRelayRequest {
@@ -8436,7 +8083,7 @@ mod tests {
             node_identity: Arc::clone(&current_node),
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let request = PeerBlindRelayRequest {
@@ -8527,7 +8174,7 @@ mod tests {
             node_identity,
             http_client: Arc::new(reqwest::Client::new()),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {
@@ -8634,7 +8281,7 @@ mod tests {
                     .unwrap(),
             ),
             blind_relay_in_flight: Arc::new(AtomicUsize::new(0)),
-            blind_relay_seen_routes: Arc::new(Mutex::new(BlindRelayRouteReplayCache::default())),
+            blind_relay_replay_registry: Arc::new(BlindRelayReplayDomain::default()),
             blind_relay_abuse_guard: Arc::new(BlindRelayAbuseDomain::default()),
         };
         let envelope = BlindRelayEnvelope {

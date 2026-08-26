@@ -40,6 +40,7 @@
 //! - [`chat_peer`]: v0.1.0 node-to-node encrypted chat envelope relay
 //! - `chat_peer_admission`: private direct-peer admission and ACK replay domain
 //! - `chat_peer_abuse_guard`: private blind-relay abuse-control domain
+//! - `chat_peer_replay`: private generation-fenced blind-route replay domain
 //! - [`blind_vault`]: node-blind encrypted object lease/store/recovery routes
 //! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
 //!
@@ -69,6 +70,8 @@
 //!   policy is composed privately; keep user and route data out of its keys.
 //! - [CHAT-PEER-ABUSE-DOMAIN 2026-08-26 by Codex] Blind-relay abuse policy is
 //!   composed privately; keep payload, user, route, endpoint, and IP data out.
+//! - [BLIND-REPLAY-DOMAIN 2026-08-26 by Codex] Process-local route ownership
+//!   is generation-fenced; stale leases must never mutate a newer owner.
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial Agent API for MemChain Phase 1
@@ -101,6 +104,8 @@
 //!   replay ownership from public HTTP orchestration.
 //! v2.8.32-ChatPeerAbuseDomain - Split blind-relay rate, quarantine, and fixed
 //!   identity-capacity ownership from public HTTP orchestration.
+//! v2.8.33-ChatPeerReplayDomain - Split and generation-fence process-local
+//!   blind-route replay ownership.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{
@@ -457,6 +462,7 @@ pub mod chat_handlers;
 pub mod chat_peer;
 mod chat_peer_admission;
 mod chat_peer_abuse_guard;
+mod chat_peer_replay;
 pub mod blind_vault;
 pub mod directory_chain_peer;
 pub mod directory_replica_status;
