@@ -37,8 +37,11 @@
 //   private direct-peer circuit state and checkpoint repository capability.
 //   [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] Registered the private
 //   aggregate health policy, SLO window, and telemetry sink capability.
+//   [CHAT-BACKUP-RETENTION-DOMAIN 2026-08-26 by Codex] Registered the private,
+//   path-blind recovery-image retention planning capability.
 //
 // Last Modified:
+//   v0.32.0-BackupRetentionDomain - Registered deterministic retention policy
 //   v0.31.0-PeerRelayTelemetryDomain - Registered atomic telemetry composition
 //   v0.30.0-DirectPeerCircuitDomain - Registered restart-safe circuit domain
 //   v0.29.0-BoundedCleanupDomain - Registered private cleanup capability
@@ -90,6 +93,7 @@
 
 pub mod blind_vault;
 pub mod chat_relay;
+mod chat_relay_backup_retention;
 mod chat_relay_blind_route;
 mod chat_relay_blob_custody;
 mod chat_relay_cleanup;
