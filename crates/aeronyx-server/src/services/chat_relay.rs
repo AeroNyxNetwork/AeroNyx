@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.26.0-BoundedCleanupDomain
+// Version: 3.29.0-BackupRetentionDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -66,6 +66,10 @@
 //   behind a composed repository capability.
 //   [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] Extracted privacy-safe
 //   relay health classification and atomic process telemetry composition.
+//   [CHAT-BACKUP-RETENTION-DOMAIN 2026-08-26 by Codex] Extracted path-blind
+//   recovery-image retention planning behind a trait. Complete and interrupted
+//   deletion candidates are now deterministic oldest-first so a partial I/O
+//   failure preserves the strongest remaining recovery history.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -310,6 +314,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.29.0-BackupRetentionDomain — Trait-based oldest-first retention planning
 //   v3.28.0-PeerRelayTelemetryDomain — Trait-based aggregate telemetry
 //   v3.27.0-DirectPeerCircuitDomain — Trait-based durable circuit composition
 //   v3.25.0-DurableQuarantineDomain — Trait-based quarantine composition
@@ -400,6 +405,10 @@ use aeronyx_core::protocol::memchain::{
 };
 
 use crate::config::ChatRelayConfig;
+use crate::services::chat_relay_backup_retention::{
+    BackupRetentionArtifact, BackupRetentionLimits, BackupRetentionPlanner,
+    BackupRetentionPolicyError, BoundedBackupRetentionPlanner,
+};
 pub(crate) use crate::services::chat_relay_blind_route::BlindRelayRouteAdmission;
 use crate::services::chat_relay_blind_route::BlindRouteReplay;
 #[cfg(test)]
@@ -1494,6 +1503,20 @@ struct ChatRelayBackupArtifact {
     device_id: u64,
     #[cfg(unix)]
     inode: u64,
+}
+
+impl BackupRetentionArtifact for ChatRelayBackupArtifact {
+    fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    fn modified_at(&self) -> SystemTime {
+        self.modified_at
+    }
+
+    fn stable_name(&self) -> &str {
+        &self.file_name
+    }
 }
 
 struct ChatRelayBackupRetentionInspection {
@@ -3564,90 +3587,54 @@ impl ChatRelayService {
             }
         }
 
-        artifacts.sort_by(|left, right| {
-            right
-                .modified_at
-                .cmp(&left.modified_at)
-                .then_with(|| right.file_name.cmp(&left.file_name))
-        });
-        let newest_backup = artifacts.first().cloned();
-        let mut retained_count = 0usize;
-        let mut retained_bytes = 0u64;
-        let mut excess_count = 0usize;
-        let mut excess_bytes = 0u64;
-        let mut excess_backups = Vec::new();
-        for artifact in artifacts {
-            let next_bytes = retained_bytes.checked_add(artifact.size_bytes);
-            let fits = retained_count < config.custody_backup_retention_target_artifacts
-                && next_bytes
-                    .map(|bytes| bytes <= config.custody_backup_retention_target_bytes)
-                    .unwrap_or(false);
-            if retained_count == 0 || fits {
-                retained_count += 1;
-                retained_bytes =
-                    retained_bytes
-                        .checked_add(artifact.size_bytes)
-                        .ok_or_else(|| {
-                            Self::backup_io_error(
-                                rusqlite::ffi::SQLITE_FULL,
-                                "relay backup retained-byte accounting overflow",
-                            )
-                        })?;
-            } else {
-                excess_count += 1;
-                excess_bytes = excess_bytes
-                    .checked_add(artifact.size_bytes)
-                    .ok_or_else(|| {
-                        Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_FULL,
-                            "relay backup excess-byte accounting overflow",
-                        )
-                    })?;
-                excess_backups.push(artifact);
-            }
-        }
-
-        let partial_bytes = partials.iter().try_fold(0u64, |total, partial| {
-            total.checked_add(partial.size_bytes).ok_or_else(|| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_FULL,
-                    "relay backup partial-byte accounting overflow",
-                )
-            })
-        })?;
-
-        let partial_count = partials.len();
-        let partial_cutoff = UNIX_EPOCH
-            .checked_add(Duration::from_secs(
-                now_unix_secs.saturating_sub(config.custody_backup_partial_grace_secs),
-            ))
-            .ok_or_else(|| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_RANGE,
-                    "relay backup partial grace cutoff is out of range",
-                )
-            })?;
-        let stale_partials = partials
-            .into_iter()
-            .filter(|partial| partial.modified_at <= partial_cutoff)
-            .collect();
+        let retention = BoundedBackupRetentionPlanner
+            .plan(
+                artifacts,
+                partials,
+                now_unix_secs,
+                BackupRetentionLimits::new(
+                    config.custody_backup_retention_target_artifacts,
+                    config.custody_backup_retention_target_bytes,
+                    config.custody_backup_partial_grace_secs,
+                ),
+            )
+            .map_err(Self::backup_retention_policy_error)?;
 
         Ok(ChatRelayBackupRetentionInspection {
             receipt: ChatRelayBackupRetentionReceipt {
-                retained_count,
-                retained_bytes,
-                excess_count,
-                excess_bytes,
-                partial_count,
-                partial_bytes,
-                budget_exceeded: excess_count > 0
-                    || retained_count > config.custody_backup_retention_target_artifacts
-                    || retained_bytes > config.custody_backup_retention_target_bytes,
+                retained_count: retention.retained_count,
+                retained_bytes: retention.retained_bytes,
+                excess_count: retention.excess_count,
+                excess_bytes: retention.excess_bytes,
+                partial_count: retention.partial_count,
+                partial_bytes: retention.partial_bytes,
+                budget_exceeded: retention.budget_exceeded,
             },
-            newest_backup,
-            excess_backups,
-            stale_partials,
+            newest_backup: retention.newest_backup,
+            excess_backups: retention.excess_oldest_first,
+            stale_partials: retention.stale_partials_oldest_first,
         })
+    }
+
+    fn backup_retention_policy_error(error: BackupRetentionPolicyError) -> ChatRelayError {
+        match error {
+            BackupRetentionPolicyError::RetainedBytesOverflow => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_FULL,
+                "relay backup retained-byte accounting overflow",
+            ),
+            BackupRetentionPolicyError::ExcessBytesOverflow => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_FULL,
+                "relay backup excess-byte accounting overflow",
+            ),
+            BackupRetentionPolicyError::PartialBytesOverflow => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_FULL,
+                "relay backup partial-byte accounting overflow",
+            ),
+            BackupRetentionPolicyError::PartialCutoffOutOfRange => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_RANGE,
+                "relay backup partial grace cutoff is out of range",
+            ),
+        }
     }
 
     fn inspect_active_restore_boundary(
