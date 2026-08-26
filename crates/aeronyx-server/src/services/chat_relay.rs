@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.30.0-RestorePlanDomain
+// Version: 3.31.0-BackupAuditRecordDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -314,6 +314,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.31.0-BackupAuditRecordDomain — Typed authenticated audit records
 //   v3.30.0-RestorePlanDomain — Trait-based authenticated restore planning
 //   v3.29.0-BackupRetentionDomain — Trait-based oldest-first retention planning
 //   v3.28.0-PeerRelayTelemetryDomain — Trait-based aggregate telemetry
@@ -406,6 +407,11 @@ use aeronyx_core::protocol::memchain::{
 };
 
 use crate::config::ChatRelayConfig;
+use crate::services::chat_relay_backup_audit::{
+    BackupAuditPhase, BackupAuditRecordAuthenticator, BackupAuditRecordError,
+    ChatRelayBackupMaintenanceAuditCounts, ChatRelayBackupMaintenanceAuditRecord,
+    HmacBackupAuditRecordAuthenticator,
+};
 use crate::services::chat_relay_backup_retention::{
     BackupRetentionArtifact, BackupRetentionLimits, BackupRetentionPlanner,
     BackupRetentionPolicyError, BoundedBackupRetentionPlanner,
@@ -532,9 +538,6 @@ const CHAT_RELAY_RESTORE_PLAN_NONCE_BYTES: usize = RESTORE_PLAN_NONCE_BYTES;
 const CHAT_RELAY_BACKUP_DIRECTORY_ENTRY_HARD_LIMIT: usize = 1024;
 /// Exact phrase required before a host-local command may delete backup files.
 pub const CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION: &str = "PRUNE-VERIFIED-RELAY-BACKUPS";
-/// Domain separation for the private append-only maintenance audit HMAC.
-const CHAT_RELAY_BACKUP_AUDIT_HMAC_DOMAIN: &[u8] =
-    b"AeroNyx-RelayCustodyBackup-MaintenanceAudit-v1";
 /// Domain separation for immutable audit-segment checkpoints.
 const CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_HMAC_DOMAIN: &[u8] =
     b"AeroNyx-RelayCustodyBackup-MaintenanceAuditCheckpoint-v1";
@@ -1512,29 +1515,6 @@ struct ChatRelayActiveRestoreBoundary {
     inode: u64,
 }
 
-// [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Unknown fields are not covered
-// by the canonical v1 signing frame and must therefore fail closed instead of
-// being silently ignored by Serde.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChatRelayBackupMaintenanceAuditRecord {
-    version: u8,
-    sequence: u64,
-    timestamp: u64,
-    action: String,
-    phase: String,
-    planned_backup_count: u64,
-    planned_backup_bytes: u64,
-    planned_partial_count: u64,
-    planned_partial_bytes: u64,
-    completed_backup_count: u64,
-    completed_backup_bytes: u64,
-    completed_partial_count: u64,
-    completed_partial_bytes: u64,
-    previous_mac: String,
-    mac: String,
-}
-
 // [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] A checkpoint authenticates
 // one immutable segment plus the cumulative chain state. It contains no path,
 // identity, message metadata, ciphertext, or backup artifact name.
@@ -1556,18 +1536,6 @@ struct ChatRelayBackupAuditCheckpoint {
     head_mac: String,
     previous_checkpoint_mac: String,
     checkpoint_mac: String,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct ChatRelayBackupMaintenanceAuditCounts {
-    planned_backup_count: usize,
-    planned_backup_bytes: u64,
-    planned_partial_count: usize,
-    planned_partial_bytes: u64,
-    completed_backup_count: usize,
-    completed_backup_bytes: u64,
-    completed_partial_count: usize,
-    completed_partial_bytes: u64,
 }
 
 struct ChatRelayBackupAuditVerificationState {
@@ -2132,132 +2100,25 @@ impl ChatRelayService {
         Ok(lock)
     }
 
-    fn backup_audit_signing_bytes(
-        record: &ChatRelayBackupMaintenanceAuditRecord,
-    ) -> ChatRelayResult<Vec<u8>> {
-        bincode::serialize(&(
-            record.version,
-            record.sequence,
-            record.timestamp,
-            record.action.as_str(),
-            record.phase.as_str(),
-            record.planned_backup_count,
-            record.planned_backup_bytes,
-            record.planned_partial_count,
-            record.planned_partial_bytes,
-            record.completed_backup_count,
-            record.completed_backup_bytes,
-            record.completed_partial_count,
-            record.completed_partial_bytes,
-            record.previous_mac.as_str(),
-        ))
-        .map_err(|_| {
-            Self::backup_io_error(
+    fn map_backup_audit_record_error(error: BackupAuditRecordError) -> ChatRelayError {
+        match error {
+            BackupAuditRecordError::CountOutOfRange => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_TOOBIG,
+                "relay backup maintenance count exceeds audit format",
+            ),
+            BackupAuditRecordError::EncodingFailed => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_FORMAT,
                 "unable to encode relay backup maintenance audit",
-            )
-        })
-    }
-
-    fn backup_audit_mac_engine(
-        node_secret: &[u8; 32],
-        record: &ChatRelayBackupMaintenanceAuditRecord,
-    ) -> ChatRelayResult<HmacSha256> {
-        let mut mac = HmacSha256::new_from_slice(node_secret).map_err(|_| {
-            Self::backup_io_error(
+            ),
+            BackupAuditRecordError::AuthenticatorInitFailed => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_AUTH,
                 "unable to initialize relay backup maintenance audit",
-            )
-        })?;
-        mac.update(CHAT_RELAY_BACKUP_AUDIT_HMAC_DOMAIN);
-        mac.update(&Self::backup_audit_signing_bytes(record)?);
-        Ok(mac)
-    }
-
-    fn backup_audit_mac(
-        node_secret: &[u8; 32],
-        record: &ChatRelayBackupMaintenanceAuditRecord,
-    ) -> ChatRelayResult<String> {
-        Ok(hex::encode(
-            Self::backup_audit_mac_engine(node_secret, record)?
-                .finalize()
-                .into_bytes(),
-        ))
-    }
-
-    fn authenticate_backup_audit_record(
-        node_secret: &[u8; 32],
-        record: &ChatRelayBackupMaintenanceAuditRecord,
-        expected_sequence: u64,
-        expected_previous_mac: &str,
-    ) -> ChatRelayResult<()> {
-        if record.version != 1
-            || record.sequence != expected_sequence
-            || record.previous_mac != expected_previous_mac
-            || !Self::is_lower_hex(&record.previous_mac, 64)
-            || !Self::is_lower_hex(&record.mac, 64)
-            || record.action != "prune"
-            || !matches!(
-                record.phase.as_str(),
-                "dry_run" | "planned" | "completed" | "failed"
-            )
-        {
-            return Err(Self::backup_io_error(
+            ),
+            BackupAuditRecordError::InvalidRecord => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_CORRUPT,
                 "relay backup maintenance audit verification failed",
-            ));
+            ),
         }
-        let decoded_mac = hex::decode(&record.mac).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit verification failed",
-            )
-        })?;
-        Self::backup_audit_mac_engine(node_secret, record)?
-            .verify_slice(&decoded_mac)
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CORRUPT,
-                    "relay backup maintenance audit verification failed",
-                )
-            })
-    }
-
-    fn build_backup_maintenance_audit_record(
-        node_secret: &[u8; 32],
-        sequence: u64,
-        previous_mac: String,
-        phase: &str,
-        timestamp: u64,
-        counts: ChatRelayBackupMaintenanceAuditCounts,
-    ) -> ChatRelayResult<ChatRelayBackupMaintenanceAuditRecord> {
-        let count = |value: usize| {
-            u64::try_from(value).map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_TOOBIG,
-                    "relay backup maintenance count exceeds audit format",
-                )
-            })
-        };
-        let mut record = ChatRelayBackupMaintenanceAuditRecord {
-            version: 1,
-            sequence,
-            timestamp,
-            action: "prune".to_string(),
-            phase: phase.to_string(),
-            planned_backup_count: count(counts.planned_backup_count)?,
-            planned_backup_bytes: counts.planned_backup_bytes,
-            planned_partial_count: count(counts.planned_partial_count)?,
-            planned_partial_bytes: counts.planned_partial_bytes,
-            completed_backup_count: count(counts.completed_backup_count)?,
-            completed_backup_bytes: counts.completed_backup_bytes,
-            completed_partial_count: count(counts.completed_partial_count)?,
-            completed_partial_bytes: counts.completed_partial_bytes,
-            previous_mac,
-            mac: String::new(),
-        };
-        record.mac = Self::backup_audit_mac(node_secret, &record)?;
-        Ok(record)
     }
 
     fn backup_audit_segment_file_name(range: ChatRelayBackupAuditSegmentRange) -> String {
@@ -2806,20 +2667,19 @@ impl ChatRelayService {
             initial_verified_bytes,
             initial_record_count,
         )? {
-            Self::authenticate_backup_audit_record(
-                node_secret,
-                &record,
-                state.receipt.record_count + 1,
-                &state.head_mac,
-            )?;
-            if record.phase == "dry_run" {
-                state.receipt.dry_run_count += 1;
-            } else if record.phase == "planned" {
-                state.receipt.planned_count += 1;
-            } else if record.phase == "completed" {
-                state.receipt.completed_count += 1;
-            } else {
-                state.receipt.failed_count += 1;
+            let phase = HmacBackupAuditRecordAuthenticator
+                .authenticate(
+                    node_secret,
+                    &record,
+                    state.receipt.record_count + 1,
+                    &state.head_mac,
+                )
+                .map_err(Self::map_backup_audit_record_error)?;
+            match phase {
+                BackupAuditPhase::DryRun => state.receipt.dry_run_count += 1,
+                BackupAuditPhase::Planned => state.receipt.planned_count += 1,
+                BackupAuditPhase::Completed => state.receipt.completed_count += 1,
+                BackupAuditPhase::Failed => state.receipt.failed_count += 1,
             }
             state.receipt.record_count += 1;
             state.receipt.last_recorded_at = Some(record.timestamp);
@@ -3267,7 +3127,7 @@ impl ChatRelayService {
     fn append_backup_maintenance_audit(
         backup_directory: &Path,
         node_secret: &[u8; 32],
-        phase: &str,
+        phase: BackupAuditPhase,
         timestamp: u64,
         counts: ChatRelayBackupMaintenanceAuditCounts,
     ) -> ChatRelayResult<()> {
@@ -3299,14 +3159,16 @@ impl ChatRelayService {
                     "relay backup maintenance audit sequence overflow",
                 )
             })?;
-        let record = Self::build_backup_maintenance_audit_record(
-            node_secret,
-            next_sequence,
-            verification.head_mac.clone(),
-            phase,
-            timestamp,
-            counts,
-        )?;
+        let record = HmacBackupAuditRecordAuthenticator
+            .build(
+                node_secret,
+                next_sequence,
+                verification.head_mac.clone(),
+                phase,
+                timestamp,
+                counts,
+            )
+            .map_err(Self::map_backup_audit_record_error)?;
         let mut encoded = serde_json::to_vec(&record).map_err(|_| {
             Self::backup_io_error(
                 rusqlite::ffi::SQLITE_FORMAT,
@@ -3842,7 +3704,7 @@ impl ChatRelayService {
             Self::append_backup_maintenance_audit(
                 &backup_directory,
                 node_secret,
-                "dry_run",
+                BackupAuditPhase::DryRun,
                 now_unix_secs,
                 planned_audit_counts,
             )?;
@@ -3860,7 +3722,7 @@ impl ChatRelayService {
         Self::append_backup_maintenance_audit(
             &backup_directory,
             node_secret,
-            "planned",
+            BackupAuditPhase::Planned,
             now_unix_secs,
             planned_audit_counts,
         )?;
@@ -3913,7 +3775,7 @@ impl ChatRelayService {
             let _ = Self::append_backup_maintenance_audit(
                 &backup_directory,
                 node_secret,
-                "failed",
+                BackupAuditPhase::Failed,
                 now_unix_secs,
                 ChatRelayBackupMaintenanceAuditCounts {
                     completed_backup_count: deleted_backup_count,
@@ -3934,7 +3796,7 @@ impl ChatRelayService {
                     let _ = Self::append_backup_maintenance_audit(
                         &backup_directory,
                         node_secret,
-                        "failed",
+                        BackupAuditPhase::Failed,
                         now_unix_secs,
                         ChatRelayBackupMaintenanceAuditCounts {
                             completed_backup_count: deleted_backup_count,
@@ -3950,7 +3812,7 @@ impl ChatRelayService {
         Self::append_backup_maintenance_audit(
             &backup_directory,
             node_secret,
-            "completed",
+            BackupAuditPhase::Completed,
             now_unix_secs,
             ChatRelayBackupMaintenanceAuditCounts {
                 completed_backup_count: deleted_backup_count,
