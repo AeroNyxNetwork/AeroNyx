@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.29.0-BackupRetentionDomain
+// Version: 3.30.0-RestorePlanDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -314,6 +314,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.30.0-RestorePlanDomain — Trait-based authenticated restore planning
 //   v3.29.0-BackupRetentionDomain — Trait-based oldest-first retention planning
 //   v3.28.0-PeerRelayTelemetryDomain — Trait-based aggregate telemetry
 //   v3.27.0-DirectPeerCircuitDomain — Trait-based durable circuit composition
@@ -457,6 +458,12 @@ use crate::services::chat_relay_quarantine::{
     MAX_QUARANTINE_EVENTS, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION,
     QUARANTINE_SOURCE_PENDING_MESSAGE,
 };
+pub use crate::services::chat_relay_restore_plan::ChatRelayRestorePlanReceipt;
+use crate::services::chat_relay_restore_plan::{
+    HmacRestorePlanAuthenticator, RestorePlanAggregate, RestorePlanAuthenticator,
+    RestorePlanError, RestorePlanPrivateBoundary, RESTORE_PLAN_NONCE_BYTES,
+    RESTORE_PLAN_VALIDITY_SECS, RESTORE_PLAN_VERSION,
+};
 #[cfg(unix)]
 use crate::services::chat_relay_runtime_fence::ChatRelayRuntimeFence;
 pub(crate) use crate::services::chat_relay_verified_submit::{
@@ -516,13 +523,11 @@ const CHAT_RELAY_BACKUP_OPERATION_ID_MAX_BYTES: usize = 128;
 /// Domain separation for opaque, node-local backup operation artifact keys.
 const CHAT_RELAY_BACKUP_OPERATION_HMAC_DOMAIN: &[u8] = b"AeroNyx-RelayCustodyBackup-Operation-v1";
 /// Fixed validity window for a host-local authenticated restore plan.
-pub const CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS: u64 = 10 * 60;
-/// Domain separation for short-lived restore-plan commitments.
-const CHAT_RELAY_RESTORE_PLAN_HMAC_DOMAIN: &[u8] = b"AeroNyx-RelayCustodyRestorePlan-v1";
+pub const CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS: u64 = RESTORE_PLAN_VALIDITY_SECS;
 /// Current restore-plan wire contract.
-const CHAT_RELAY_RESTORE_PLAN_VERSION: u8 = 1;
+const CHAT_RELAY_RESTORE_PLAN_VERSION: u8 = RESTORE_PLAN_VERSION;
 /// Random nonce bytes encoded into each restore plan.
-const CHAT_RELAY_RESTORE_PLAN_NONCE_BYTES: usize = 16;
+const CHAT_RELAY_RESTORE_PLAN_NONCE_BYTES: usize = RESTORE_PLAN_NONCE_BYTES;
 /// Defensive ceiling for one verified backup-directory maintenance scan.
 const CHAT_RELAY_BACKUP_DIRECTORY_ENTRY_HARD_LIMIT: usize = 1024;
 /// Exact phrase required before a host-local command may delete backup files.
@@ -1462,36 +1467,6 @@ pub struct ChatRelayRestoreReadinessReceipt {
     pub blocker: Option<&'static str>,
 }
 
-/// Short-lived, path-free commitment to one verified recovery plan.
-///
-/// [CHAT-RELAY-RESTORE-PLAN 2026-08-16 by Codex] The HMAC binds this public
-/// aggregate state to private backup/active-file identity metadata without
-/// disclosing those identities. The plan is a stale-state guard only. A future
-/// restore must additionally require an explicit stopped-node assertion,
-/// confirmation phrase, rollback image, and post-restore verification.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChatRelayRestorePlanReceipt {
-    /// Restore-plan wire contract version.
-    pub version: u8,
-    /// Host wall-clock issue time in Unix seconds.
-    pub issued_at: u64,
-    /// Exclusive expiry time in Unix seconds.
-    pub expires_at: u64,
-    /// Number of verified recovery images observed when planning.
-    pub verified_backup_count: u64,
-    /// Size of the selected newest recovery image.
-    pub selected_backup_bytes: u64,
-    /// Whether the configured active main database existed at issuance.
-    pub active_database_present: bool,
-    /// Size of the active main database at issuance, or zero when absent.
-    pub active_database_bytes: u64,
-    /// Per-plan random lowercase hexadecimal nonce.
-    pub nonce: String,
-    /// Lowercase HMAC-SHA256 commitment over public and private plan state.
-    pub commitment: String,
-}
-
 /// Private filesystem metadata used only while enforcing backup retention.
 #[derive(Clone)]
 struct ChatRelayBackupArtifact {
@@ -1535,29 +1510,6 @@ struct ChatRelayActiveRestoreBoundary {
     modified_at: Option<SystemTime>,
     device_id: u64,
     inode: u64,
-}
-
-/// Canonical HMAC input. Private identities never cross the service boundary.
-#[derive(Serialize)]
-struct ChatRelayRestorePlanSigningState<'a> {
-    version: u8,
-    issued_at: u64,
-    expires_at: u64,
-    verified_backup_count: u64,
-    selected_backup_bytes: u64,
-    active_database_present: bool,
-    active_database_bytes: u64,
-    nonce: &'a str,
-    configured_database_path: &'a str,
-    selected_backup_name: &'a str,
-    selected_backup_modified_secs: u64,
-    selected_backup_modified_nanos: u32,
-    active_database_modified_secs: u64,
-    active_database_modified_nanos: u32,
-    selected_backup_device_id: u64,
-    selected_backup_inode: u64,
-    active_database_device_id: u64,
-    active_database_inode: u64,
 }
 
 // [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Unknown fields are not covered
@@ -3714,16 +3666,6 @@ impl ChatRelayService {
         Ok(boundary)
     }
 
-    fn restore_plan_time_components(time: SystemTime) -> ChatRelayResult<(u64, u32)> {
-        let elapsed = time.duration_since(UNIX_EPOCH).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_RANGE,
-                "relay restore-plan filesystem time is out of range",
-            )
-        })?;
-        Ok((elapsed.as_secs(), elapsed.subsec_nanos()))
-    }
-
     fn verified_restore_backup_count(
         inspection: &ChatRelayBackupRetentionInspection,
     ) -> ChatRelayResult<usize> {
@@ -3739,34 +3681,19 @@ impl ChatRelayService {
             })
     }
 
-    fn restore_plan_signing_bytes(
-        config: &ChatRelayConfig,
-        plan: &ChatRelayRestorePlanReceipt,
-        backup: &ChatRelayBackupArtifact,
+    // [CHAT-RELAY-RESTORE-PLAN-DOMAIN 2026-08-26 by Codex] The service owns
+    // private filesystem identity collection; the composed authenticator owns
+    // only canonical policy and cryptography.
+    fn restore_plan_private_boundary<'a>(
+        config: &'a ChatRelayConfig,
+        backup: &'a ChatRelayBackupArtifact,
         active: &ChatRelayActiveRestoreBoundary,
-    ) -> ChatRelayResult<Vec<u8>> {
-        let (selected_backup_modified_secs, selected_backup_modified_nanos) =
-            Self::restore_plan_time_components(backup.modified_at)?;
-        let (active_database_modified_secs, active_database_modified_nanos) = active
-            .modified_at
-            .map(Self::restore_plan_time_components)
-            .transpose()?
-            .unwrap_or_default();
-        let signing_state = ChatRelayRestorePlanSigningState {
-            version: plan.version,
-            issued_at: plan.issued_at,
-            expires_at: plan.expires_at,
-            verified_backup_count: plan.verified_backup_count,
-            selected_backup_bytes: plan.selected_backup_bytes,
-            active_database_present: plan.active_database_present,
-            active_database_bytes: plan.active_database_bytes,
-            nonce: &plan.nonce,
+    ) -> RestorePlanPrivateBoundary<'a> {
+        RestorePlanPrivateBoundary {
             configured_database_path: &config.db_path,
             selected_backup_name: &backup.file_name,
-            selected_backup_modified_secs,
-            selected_backup_modified_nanos,
-            active_database_modified_secs,
-            active_database_modified_nanos,
+            selected_backup_modified_at: backup.modified_at,
+            active_database_modified_at: active.modified_at,
             #[cfg(unix)]
             selected_backup_device_id: backup.device_id,
             #[cfg(not(unix))]
@@ -3777,40 +3704,32 @@ impl ChatRelayService {
             selected_backup_inode: 0,
             active_database_device_id: active.device_id,
             active_database_inode: active.inode,
-        };
-        bincode::serialize(&signing_state).map_err(|_| {
-            Self::backup_io_error(
+        }
+    }
+
+    fn map_restore_plan_error(error: RestorePlanError) -> ChatRelayError {
+        match error {
+            RestorePlanError::ExpiryOutOfRange => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_RANGE,
+                "relay restore-plan expiry is out of range",
+            ),
+            RestorePlanError::FilesystemTimeOutOfRange => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_RANGE,
+                "relay restore-plan filesystem time is out of range",
+            ),
+            RestorePlanError::EncodingFailed => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_FORMAT,
                 "unable to encode relay restore plan",
-            )
-        })
-    }
-
-    fn restore_plan_mac(
-        node_secret: &[u8; 32],
-        config: &ChatRelayConfig,
-        plan: &ChatRelayRestorePlanReceipt,
-        backup: &ChatRelayBackupArtifact,
-        active: &ChatRelayActiveRestoreBoundary,
-    ) -> ChatRelayResult<HmacSha256> {
-        let mut mac = HmacSha256::new_from_slice(node_secret).map_err(|_| {
-            Self::backup_io_error(
+            ),
+            RestorePlanError::AuthenticatorInitFailed => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_AUTH,
                 "unable to initialize relay restore plan",
-            )
-        })?;
-        mac.update(CHAT_RELAY_RESTORE_PLAN_HMAC_DOMAIN);
-        mac.update(&Self::restore_plan_signing_bytes(
-            config, plan, backup, active,
-        )?);
-        Ok(mac)
-    }
-
-    fn invalid_restore_plan() -> ChatRelayError {
-        Self::backup_io_error(
-            rusqlite::ffi::SQLITE_AUTH,
-            "relay restore plan is invalid, expired, or stale",
-        )
+            ),
+            RestorePlanError::InvalidOrStale => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_AUTH,
+                "relay restore plan is invalid, expired, or stale",
+            ),
+        }
     }
 
     fn backup_artifact_identity_matches(
@@ -7374,20 +7293,9 @@ impl ChatRelayService {
             ));
         }
 
-        let expires_at = issued_at
-            .checked_add(CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS)
-            .ok_or_else(|| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_RANGE,
-                    "relay restore-plan expiry is out of range",
-                )
-            })?;
         let mut nonce = [0u8; CHAT_RELAY_RESTORE_PLAN_NONCE_BYTES];
         OsRng.fill_bytes(&mut nonce);
-        let mut plan = ChatRelayRestorePlanReceipt {
-            version: CHAT_RELAY_RESTORE_PLAN_VERSION,
-            issued_at,
-            expires_at,
+        let aggregate = RestorePlanAggregate {
             verified_backup_count: u64::try_from(Self::verified_restore_backup_count(&inspection)?)
                 .map_err(|_| {
                     Self::backup_io_error(
@@ -7398,15 +7306,16 @@ impl ChatRelayService {
             selected_backup_bytes: backup.size_bytes,
             active_database_present: active.present,
             active_database_bytes: active.size_bytes,
-            nonce: hex::encode(nonce),
-            commitment: String::new(),
         };
-        plan.commitment = hex::encode(
-            Self::restore_plan_mac(node_secret, config, &plan, backup, &active)?
-                .finalize()
-                .into_bytes(),
-        );
-        Ok(plan)
+        HmacRestorePlanAuthenticator
+            .issue(
+                node_secret,
+                issued_at,
+                aggregate,
+                Self::restore_plan_private_boundary(config, backup, &active),
+                nonce,
+            )
+            .map_err(Self::map_restore_plan_error)
     }
 
     /// Re-verifies that an authenticated restore plan remains current.
@@ -7438,19 +7347,9 @@ impl ChatRelayService {
         plan: &ChatRelayRestorePlanReceipt,
         now_unix_secs: u64,
     ) -> ChatRelayResult<()> {
-        let valid_time = plan.version == CHAT_RELAY_RESTORE_PLAN_VERSION
-            && plan
-                .issued_at
-                .checked_add(CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS)
-                == Some(plan.expires_at)
-            && plan.issued_at <= now_unix_secs
-            && now_unix_secs < plan.expires_at;
-        if !valid_time
-            || !Self::is_lower_hex(&plan.nonce, CHAT_RELAY_RESTORE_PLAN_NONCE_BYTES * 2)
-            || !Self::is_lower_hex(&plan.commitment, 64)
-        {
-            return Err(Self::invalid_restore_plan());
-        }
+        HmacRestorePlanAuthenticator
+            .validate_public_contract(plan, now_unix_secs)
+            .map_err(Self::map_restore_plan_error)?;
 
         let backup_directory = Self::private_backup_directory_for_config(config)?;
         let _filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
@@ -7459,23 +7358,30 @@ impl ChatRelayService {
         let backup = inspection
             .newest_backup
             .as_ref()
-            .ok_or_else(Self::invalid_restore_plan)?;
+            .ok_or_else(|| Self::map_restore_plan_error(RestorePlanError::InvalidOrStale))?;
         let active = Self::inspect_active_restore_boundary(config)?;
         let current_count = u64::try_from(Self::verified_restore_backup_count(&inspection)?)
-            .map_err(|_| Self::invalid_restore_plan())?;
-        if active.sidecars_present
-            || plan.verified_backup_count != current_count
-            || plan.selected_backup_bytes != backup.size_bytes
-            || plan.active_database_present != active.present
-            || plan.active_database_bytes != active.size_bytes
-        {
-            return Err(Self::invalid_restore_plan());
+            .map_err(|_| Self::map_restore_plan_error(RestorePlanError::InvalidOrStale))?;
+        if active.sidecars_present {
+            return Err(Self::map_restore_plan_error(
+                RestorePlanError::InvalidOrStale,
+            ));
         }
-
-        let commitment = hex::decode(&plan.commitment).map_err(|_| Self::invalid_restore_plan())?;
-        Self::restore_plan_mac(node_secret, config, plan, backup, &active)?
-            .verify_slice(&commitment)
-            .map_err(|_| Self::invalid_restore_plan())
+        let aggregate = RestorePlanAggregate {
+            verified_backup_count: current_count,
+            selected_backup_bytes: backup.size_bytes,
+            active_database_present: active.present,
+            active_database_bytes: active.size_bytes,
+        };
+        HmacRestorePlanAuthenticator
+            .verify(
+                node_secret,
+                plan,
+                now_unix_secs,
+                aggregate,
+                Self::restore_plan_private_boundary(config, backup, &active),
+            )
+            .map_err(Self::map_restore_plan_error)
     }
 
     /// Runs a host-local retention dry-run or explicitly-confirmed prune.
