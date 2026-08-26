@@ -41,8 +41,11 @@
 //   path-blind recovery-image retention planning capability.
 //   [CHAT-RELAY-RESTORE-PLAN-DOMAIN 2026-08-26 by Codex] Registered the
 //   private authenticated restore-plan contract and policy capability.
+//   [CHAT-RELAY-BACKUP-AUDIT-DOMAIN 2026-08-26 by Codex] Registered the
+//   private authenticated maintenance-record contract and phase capability.
 //
 // Last Modified:
+//   v0.34.0-BackupAuditRecordDomain - Registered authenticated audit records
 //   v0.33.0-RestorePlanDomain - Registered authenticated restore planning
 //   v0.32.0-BackupRetentionDomain - Registered deterministic retention policy
 //   v0.31.0-PeerRelayTelemetryDomain - Registered atomic telemetry composition
@@ -96,6 +99,7 @@
 
 pub mod blind_vault;
 pub mod chat_relay;
+mod chat_relay_backup_audit;
 mod chat_relay_backup_retention;
 mod chat_relay_blind_route;
 mod chat_relay_blob_custody;
