@@ -115,6 +115,8 @@
 //!   ACK retention when durable acceptance finishes rather than request ingress
 //! - [BLIND-TRANSPORT-DOMAIN 2026-08-26 by Codex] Composes bounded outbound
 //!   HTTP through a replaceable trait while retaining route and receipt policy
+//! - [BLIND-RESPONSE-DOMAIN 2026-08-26 by Codex] Interprets bounded responses
+//!   through a pure policy while orchestration owns I/O and aggregate effects
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -311,8 +313,13 @@
 //! - [BLIND-TRANSPORT-DOMAIN 2026-08-26 by Codex] HTTP request execution and
 //!   bounded ACK decoding are isolated in `chat_peer_transport.rs`; keep
 //!   receipt verification, retry decisions, and route evidence in this file.
+//! - [BLIND-RESPONSE-DOMAIN 2026-08-26 by Codex] Receipt verification and
+//!   response interpretation are isolated in `chat_peer_response.rs`; this
+//!   module only executes typed decisions and records aggregate effects.
 //!
 //! ## Last Modified
+//! v0.65.0-BlindResponseDomain - Compose receipt validation and response
+//! decisions behind a pure policy while preserving all observable contracts
 //! v0.64.0-BlindTransportDomain - Compose bounded outbound HTTP behind a
 //! replaceable trait without changing response, retry, or telemetry contracts
 //! v0.63.0-BlindRetryDomain - Compose payload-blind retry classification and
@@ -471,14 +478,22 @@ use super::chat_peer_replay::{
     BlindRelayReplayRegistry, BlindRelayRouteReplayDecision,
 };
 #[cfg(test)]
+use super::chat_peer_response::{
+    validate_downstream_delivery_receipt, validate_downstream_failure_receipt,
+    BLIND_RELAY_FAILURE_RECEIPT_MAX_AGE_SECS, BLIND_RELAY_FAILURE_RECEIPT_MAX_FUTURE_SKEW_SECS,
+};
+use super::chat_peer_response::{
+    BlindRelayInvalidResponseKind, BlindRelayResponseContext, BlindRelayResponseDecision,
+    BlindRelayResponseDomain, BlindRelayResponsePolicy, BlindRelayResponseSource,
+    BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS,
+};
+#[cfg(test)]
 use super::chat_peer_retry::DEFAULT_MAX_ATTEMPTS_FOR_TESTS as MAX_BLIND_RELAY_FORWARD_ATTEMPTS;
 use super::chat_peer_retry::{
-    BlindRelayDownstreamFailure, BlindRelayRetryAction, BlindRelayRetryContext,
-    BlindRelayRetryDomain, BlindRelayRetryPolicy,
+    BlindRelayDownstreamFailure, BlindRelayRetryContext, BlindRelayRetryDomain,
+    BlindRelayRetryPolicy,
 };
-use super::chat_peer_transport::{
-    BlindRelayTransport, BlindRelayTransportOutcome, ReqwestBlindRelayTransport,
-};
+use super::chat_peer_transport::{BlindRelayTransport, ReqwestBlindRelayTransport};
 use crate::api::{canonical_peer_http_url, peer_endpoint_is_public_ip, InFlightRequestGuard};
 use crate::config_chat_relay::{
     DEFAULT_AUTHENTICATED_PEER_RELAY_REQUESTS_PER_MINUTE, DEFAULT_PEER_RELAY_REQUESTS_PER_MINUTE,
@@ -582,15 +597,6 @@ const BLIND_RELAY_MAX_ENVELOPE_AGE_SECS: u64 = 10 * 60;
 
 /// Small clock-skew allowance for peers whose clocks run slightly ahead.
 const BLIND_RELAY_MAX_FUTURE_SKEW_SECS: u64 = 120;
-/// Terminal delivery receipts are short-lived acknowledgements, not durable tokens.
-const BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS: u64 = 120;
-/// Delivery receipt future skew is intentionally tighter than relay-frame skew.
-const BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
-/// Signed failure ACKs use the same short replay horizon as success receipts.
-const BLIND_RELAY_FAILURE_RECEIPT_MAX_AGE_SECS: u64 = 120;
-/// Failure receipts tolerate only bounded peer clock skew.
-const BLIND_RELAY_FAILURE_RECEIPT_MAX_FUTURE_SKEW_SECS: u64 = 30;
-
 // ============================================
 // State / Request / Response Types
 // ============================================
@@ -2967,101 +2973,6 @@ fn blind_relay_reason_counts_toward_quarantine(reason: &str) -> bool {
     )
 }
 
-/// Validates the downstream success state and receipt surface visible at this hop.
-///
-/// [MULTIHOP-RECEIPT-VALIDATION 2026-08-01 by Codex] A direct terminal ACK must
-/// be signed by `immediate_next_hop`. A forwarded ACK may carry a receipt from a
-/// deeper terminal, so requiring that terminal to equal the immediate next hop
-/// incorrectly rejects every path longer than two relay nodes. This hop still
-/// verifies the route id, freshness, disposition, and Ed25519 signature. The
-/// source must additionally call `verify_expected` with the final payload
-/// commitment and terminal selected when it built the onion path.
-fn validate_downstream_delivery_receipt(
-    ack: &PeerBlindRelayResponse,
-    route_id: &[u8; 16],
-    immediate_next_hop: &[u8; 32],
-    observed_at: u64,
-) -> Result<(), &'static str> {
-    // [RELAY-ACK-STATE-MACHINE 2026-08-11 by Codex] Treat the response as a
-    // protocol state transition, not a collection of independent booleans.
-    // A malicious peer previously could return `accepted=true` with neither
-    // terminal delivery nor forwarding and still receive route-success credit
-    // whenever it omitted the optional legacy receipt. XOR keeps old receipt-
-    // less terminal/forwarded ACKs compatible while rejecting false evidence.
-    if !ack.accepted {
-        return Err("ack_not_accepted");
-    }
-    if ack.terminal == ack.forwarded {
-        return Err("invalid_ack_shape");
-    }
-    if ack.failure_receipt.is_some() {
-        return Err("unexpected_failure_receipt");
-    }
-
-    let Some(receipt) = ack.delivery_receipt.as_ref() else {
-        // Legacy peers may omit receipts. Keep wire compatibility; callers
-        // separately expose that this is not verified client-delivery evidence.
-        return Ok(());
-    };
-
-    if &receipt.route_id != route_id {
-        return Err("receipt_route_mismatch");
-    }
-    if receipt.delivered_at
-        > observed_at.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
-    {
-        return Err("receipt_timestamp_in_future");
-    }
-    if observed_at.saturating_sub(receipt.delivered_at) > BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS
-    {
-        return Err("receipt_timestamp_expired");
-    }
-    receipt
-        .verify_signature()
-        .map_err(|_| "receipt_signature_invalid")?;
-
-    if ack.terminal && &receipt.terminal_node_id != immediate_next_hop {
-        return Err("terminal_receipt_signer_mismatch");
-    }
-
-    Ok(())
-}
-
-/// Verifies an optional immediate-hop failure receipt without widening blame.
-///
-/// `Ok(false)` is the explicit rolling-upgrade path for legacy peers. A valid
-/// receipt proves only that `immediate_next_hop` returned this exact coarse
-/// response for this exact opaque request. It cannot identify which deeper hop
-/// caused an end-to-end failure and must not be used for downstream blame.
-fn validate_downstream_failure_receipt(
-    ack: &PeerBlindRelayResponse,
-    request: &PeerBlindRelayRequest,
-    immediate_next_hop: &[u8; 32],
-    observed_at: u64,
-    receipt_required: bool,
-) -> Result<bool, &'static str> {
-    let Some(receipt) = ack.failure_receipt.as_ref() else {
-        return if receipt_required {
-            Err("failure_receipt_required")
-        } else {
-            Ok(false)
-        };
-    };
-    let reason = ack.reason.as_deref().ok_or("failure_reason_missing")?;
-    if receipt.failed_at
-        > observed_at.saturating_add(BLIND_RELAY_FAILURE_RECEIPT_MAX_FUTURE_SKEW_SECS)
-    {
-        return Err("failure_receipt_timestamp_in_future");
-    }
-    if observed_at.saturating_sub(receipt.failed_at) > BLIND_RELAY_FAILURE_RECEIPT_MAX_AGE_SECS {
-        return Err("failure_receipt_timestamp_expired");
-    }
-    receipt
-        .verify_expected(&request.envelope, reason, immediate_next_hop)
-        .map_err(|_| "failure_receipt_binding_invalid")?;
-    Ok(true)
-}
-
 /// Projects a monotonic request duration onto the caller's Unix timestamp.
 ///
 /// [RELAY-RESPONSE-OBSERVATION-TIME 2026-08-11 by Codex] Tests and recovery
@@ -3072,6 +2983,13 @@ fn blind_relay_response_observed_at(started_at: u64, started: &Instant) -> u64 {
     started_at.saturating_add(started.elapsed().as_secs())
 }
 
+/// Replaceable capabilities composed for one forwarding operation.
+struct BlindRelayForwardComponents<'a> {
+    retry_policy: &'a dyn BlindRelayRetryPolicy,
+    response_policy: &'a dyn BlindRelayResponsePolicy,
+    transport: &'a dyn BlindRelayTransport,
+}
+
 async fn forward_blind_relay_with_retry(
     state: &ChatPeerState,
     url: &str,
@@ -3080,6 +2998,7 @@ async fn forward_blind_relay_with_retry(
     now: u64,
 ) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
     let retry_policy = BlindRelayRetryDomain::default();
+    let response_policy = BlindRelayResponseDomain;
     let transport = ReqwestBlindRelayTransport::new(Arc::clone(&state.http_client));
     forward_blind_relay_with_components(
         state,
@@ -3087,260 +3006,112 @@ async fn forward_blind_relay_with_retry(
         descriptor,
         request,
         now,
-        &retry_policy,
-        &transport,
+        BlindRelayForwardComponents {
+            retry_policy: &retry_policy,
+            response_policy: &response_policy,
+            transport: &transport,
+        },
     )
     .await
 }
 
+/// [ROUTE-FAILURE-SURFACE-BINDING 2026-08-11 by Codex] Keeps the exact signed
+/// descriptor that selected `url` through retries, so delayed observations can
+/// update health only when the selected route surface remains current.
 async fn forward_blind_relay_with_components(
     state: &ChatPeerState,
     url: &str,
     descriptor: &SignedNodeDescriptor,
     request: PeerBlindRelayRequest,
     now: u64,
-    retry_policy: &dyn BlindRelayRetryPolicy,
-    transport: &dyn BlindRelayTransport,
+    components: BlindRelayForwardComponents<'_>,
 ) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
-    // [ROUTE-FAILURE-SURFACE-BINDING 2026-08-11 by Codex] Keep the exact
-    // descriptor that selected `url` through every retry. A delayed response
-    // can then update health only if the signed route surface is still current.
     let next_hop = descriptor.node_id();
-    // [FAILURE-RECEIPT-ANTI-DOWNGRADE 2026-08-11 by Codex] Negotiate from the
-    // exact signed descriptor that selected this URL. An attacker cannot strip
-    // this token without invalidating the descriptor signature.
-    let failure_receipt_required = descriptor
-        .descriptor
-        .advertises_protocol_feature(NodeProtocolFeature::BlindRelayFailureReceiptV1);
+    let failure_receipt_required = blind_relay_failure_receipt_required(descriptor);
     let request_started_at = Instant::now();
-    for attempt in 1..=retry_policy.max_attempts().get() {
-        let retry_context =
-            BlindRelayRetryContext::new(request.envelope.route_id, next_hop, attempt)
-                .ok_or(BlindRelayError::ForwardFailed)?;
-        match transport.send(url, &request).await {
-            BlindRelayTransportOutcome::SuccessStatus { response: ack } => {
-                let observed_at = blind_relay_response_observed_at(now, &request_started_at);
-                match ack {
-                    Ok(ack) if ack.accepted => {
-                        if let Err(reason) = validate_downstream_delivery_receipt(
-                            &ack,
-                            &request.envelope.route_id,
-                            &next_hop,
-                            observed_at,
-                        ) {
-                            debug!(
-                                attempt,
-                                reason,
-                                "[BLIND_RELAY] Next-hop delivery receipt verification failed"
-                            );
-                            let _ = state
-                                .peer_store
-                                .record_route_forward_failure_for_descriptor(
-                                    descriptor,
-                                    observed_at,
-                                    "delivery_receipt_invalid",
-                                );
-                            state.peer_store.record_blind_relay_rejected(
-                                observed_at,
-                                "delivery_receipt_invalid",
-                            );
-                            return Err(BlindRelayError::ForwardFailed);
-                        }
-                        if attempt > 1 {
-                            state
-                                .peer_store
-                                .record_blind_relay_retry_succeeded(observed_at, attempt);
-                        }
-                        return Ok(BlindRelayForwardOutcome {
-                            response: *ack,
-                            observed_at,
-                        });
-                    }
-                    Ok(_ack) => {
-                        debug!(
-                            attempt,
-                            "[BLIND_RELAY] Next-hop ACK rejected opaque relay envelope"
-                        );
-                    }
-                    Err(error) => {
-                        debug!(
-                            attempt,
-                            reason = error.as_str(),
-                            "[BLIND_RELAY] Next-hop ACK decode failed"
-                        );
-                    }
-                }
-
-                if attempt > 1 {
-                    state.peer_store.record_blind_relay_retry_exhausted(
-                        observed_at,
-                        attempt,
-                        "forward_failed",
-                    );
-                }
-                let _ = state
-                    .peer_store
-                    .record_route_forward_failure_for_descriptor(
-                        descriptor,
-                        observed_at,
-                        "forward_failed",
-                    );
-                state
-                    .peer_store
-                    .record_blind_relay_rejected(observed_at, "forward_failed");
-                return Err(BlindRelayError::ForwardFailed);
+    for attempt in 1..=components.retry_policy.max_attempts().get() {
+        let retry_context = blind_relay_retry_context(&request, next_hop, attempt)?;
+        let transport_outcome = components.transport.send(url, &request).await;
+        let observed_at = blind_relay_response_observed_at(now, &request_started_at);
+        let decision = components.response_policy.evaluate(
+            transport_outcome,
+            BlindRelayResponseContext {
+                request: &request,
+                next_hop,
+                observed_at,
+                failure_receipt_required,
+                retry_context,
+                retry_policy: components.retry_policy,
+            },
+        );
+        match decision {
+            BlindRelayResponseDecision::Accepted(response) => {
+                return Ok(complete_blind_relay_forward(
+                    state,
+                    *response,
+                    observed_at,
+                    attempt,
+                ))
             }
-            BlindRelayTransportOutcome::RejectedStatus {
+            BlindRelayResponseDecision::PeerDeclaredFailure {
+                failure,
                 status,
-                declared_response,
+                receipt_authenticated,
             } => {
-                let reason = format!("http_{}", status.as_u16());
-                let observed_at = blind_relay_response_observed_at(now, &request_started_at);
-                if let (Some(failure), Some(declared_ack)) = (
-                    retry_policy.classify_declared_failure(status, declared_response.as_deref()),
-                    declared_response.as_deref(),
-                ) {
-                    let error = BlindRelayError::from(failure);
-                    let receipt_authenticated = match validate_downstream_failure_receipt(
-                        declared_ack,
-                        &request,
-                        &next_hop,
-                        observed_at,
-                        failure_receipt_required,
-                    ) {
-                        Ok(authenticated) => authenticated,
-                        Err(reason) => {
-                            debug!(
-                                attempt,
-                                reason,
-                                "[BLIND_RELAY] Next-hop failure receipt verification failed"
-                            );
-                            let failure_bucket = if reason == "failure_receipt_required" {
-                                "failure_receipt_downgrade"
-                            } else {
-                                "failure_receipt_invalid"
-                            };
-                            let _ = state
-                                .peer_store
-                                .record_route_forward_failure_for_descriptor(
-                                    descriptor,
-                                    observed_at,
-                                    failure_bucket,
-                                );
-                            state
-                                .peer_store
-                                .record_blind_relay_rejected(observed_at, failure_bucket);
-                            return Err(BlindRelayError::ForwardFailed);
-                        }
-                    };
-                    // [DOWNSTREAM-FAILURE-ATTRIBUTION 2026-08-11 by Codex]
-                    // A valid bounded error ACK proves the immediate endpoint
-                    // responded. Signed and legacy forms alike cannot identify
-                    // which deeper hop failed. Preserve coarse retry semantics
-                    // and aggregate observability without poisoning route health.
-                    debug!(
-                        attempt,
-                        status = %status,
-                        receipt_authenticated,
-                        "[BLIND_RELAY] Peer-declared downstream failure left unattributed"
-                    );
-                    state
-                        .peer_store
-                        .record_blind_relay_rejected(observed_at, error.reason_bucket());
-                    return Err(error);
-                }
-                match retry_policy.status_action(status, retry_context) {
-                    BlindRelayRetryAction::Reject(failure) => {
-                        let error = BlindRelayError::from(failure);
-                        let _ = state
-                            .peer_store
-                            .record_route_forward_failure_for_descriptor(
-                                descriptor,
-                                observed_at,
-                                error.reason_bucket(),
-                            );
-                        state
-                            .peer_store
-                            .record_blind_relay_rejected(observed_at, error.reason_bucket());
-                        return Err(error);
-                    }
-                    BlindRelayRetryAction::RetryAfter(delay) => {
-                        state
-                            .peer_store
-                            .record_blind_relay_retry_attempt(observed_at, &reason);
-                        debug!(
-                            attempt,
-                            status = %status,
-                            "[BLIND_RELAY] Next-hop returned retryable status"
-                        );
-                        sleep(delay).await;
-                        continue;
-                    }
-                    BlindRelayRetryAction::Exhausted => {}
-                }
-
+                // [DOWNSTREAM-FAILURE-ATTRIBUTION 2026-08-11 by Codex] A
+                // bounded error ACK cannot identify which deeper hop failed.
                 debug!(
                     attempt,
                     status = %status,
-                    "[BLIND_RELAY] Next-hop returned non-success"
+                    receipt_authenticated,
+                    "[BLIND_RELAY] Peer-declared downstream failure left unattributed"
                 );
-                if attempt > 1 {
+                let error = BlindRelayError::from(failure);
+                state
+                    .peer_store
+                    .record_blind_relay_rejected(observed_at, error.reason_bucket());
+                return Err(error);
+            }
+            BlindRelayResponseDecision::RetryAfter {
+                delay,
+                reason,
+                source,
+            } => {
+                state
+                    .peer_store
+                    .record_blind_relay_retry_attempt(observed_at, &reason);
+                log_blind_relay_retry(attempt, source, &reason);
+                sleep(delay).await;
+            }
+            BlindRelayResponseDecision::Reject(failure) => {
+                let error = BlindRelayError::from(failure);
+                record_blind_relay_route_failure(
+                    state,
+                    descriptor,
+                    observed_at,
+                    error.reason_bucket(),
+                );
+                return Err(error);
+            }
+            BlindRelayResponseDecision::InvalidResponse {
+                kind,
+                diagnostic,
+                health_reason,
+                counts_as_retry_exhaustion,
+            } => {
+                log_invalid_blind_relay_response(attempt, kind, diagnostic);
+                if counts_as_retry_exhaustion && attempt > 1 {
                     state.peer_store.record_blind_relay_retry_exhausted(
                         observed_at,
                         attempt,
-                        &reason,
+                        health_reason,
                     );
                 }
-                let _ = state
-                    .peer_store
-                    .record_route_forward_failure_for_descriptor(
-                        descriptor,
-                        observed_at,
-                        reason.clone(),
-                    );
-                state
-                    .peer_store
-                    .record_blind_relay_rejected(observed_at, reason);
+                record_blind_relay_route_failure(state, descriptor, observed_at, health_reason);
                 return Err(BlindRelayError::ForwardFailed);
             }
-            BlindRelayTransportOutcome::RequestFailed(failure) => {
-                let observed_at = blind_relay_response_observed_at(now, &request_started_at);
-                let reason = failure.reason_bucket();
-                match retry_policy.transport_action(failure.retry_kind(), retry_context) {
-                    BlindRelayRetryAction::RetryAfter(delay) => {
-                        state
-                            .peer_store
-                            .record_blind_relay_retry_attempt(observed_at, &reason);
-                        debug!(
-                            attempt,
-                            reason = %reason,
-                            "[BLIND_RELAY] Next-hop forward failed; retrying"
-                        );
-                        sleep(delay).await;
-                        continue;
-                    }
-                    BlindRelayRetryAction::Reject(failure) => {
-                        let failure = BlindRelayError::from(failure);
-                        let _ = state
-                            .peer_store
-                            .record_route_forward_failure_for_descriptor(
-                                descriptor,
-                                observed_at,
-                                failure.reason_bucket(),
-                            );
-                        state
-                            .peer_store
-                            .record_blind_relay_rejected(observed_at, failure.reason_bucket());
-                        return Err(failure);
-                    }
-                    BlindRelayRetryAction::Exhausted => {}
-                }
-
-                debug!(
-                    attempt,
-                    reason = %reason,
-                    "[BLIND_RELAY] Next-hop forward failed"
-                );
+            BlindRelayResponseDecision::Exhausted { reason, source } => {
+                log_blind_relay_exhausted(attempt, source, &reason);
                 if attempt > 1 {
                     state.peer_store.record_blind_relay_retry_exhausted(
                         observed_at,
@@ -3348,22 +3119,113 @@ async fn forward_blind_relay_with_components(
                         &reason,
                     );
                 }
-                let _ = state
-                    .peer_store
-                    .record_route_forward_failure_for_descriptor(
-                        descriptor,
-                        observed_at,
-                        reason.clone(),
-                    );
-                state
-                    .peer_store
-                    .record_blind_relay_rejected(observed_at, reason);
+                record_blind_relay_route_failure(state, descriptor, observed_at, &reason);
                 return Err(BlindRelayError::ForwardFailed);
             }
         }
     }
 
     Err(BlindRelayError::ForwardFailed)
+}
+
+fn blind_relay_retry_context(
+    request: &PeerBlindRelayRequest,
+    next_hop: [u8; 32],
+    attempt: usize,
+) -> Result<BlindRelayRetryContext, BlindRelayError> {
+    BlindRelayRetryContext::new(request.envelope.route_id, next_hop, attempt)
+        .ok_or(BlindRelayError::ForwardFailed)
+}
+
+fn blind_relay_failure_receipt_required(descriptor: &SignedNodeDescriptor) -> bool {
+    // [FAILURE-RECEIPT-ANTI-DOWNGRADE 2026-08-11 by Codex] Negotiate from the
+    // exact signed descriptor that selected this URL. An attacker cannot strip
+    // this token without invalidating the descriptor signature.
+    descriptor
+        .descriptor
+        .advertises_protocol_feature(NodeProtocolFeature::BlindRelayFailureReceiptV1)
+}
+
+fn complete_blind_relay_forward(
+    state: &ChatPeerState,
+    response: PeerBlindRelayResponse,
+    observed_at: u64,
+    attempt: usize,
+) -> BlindRelayForwardOutcome {
+    if attempt > 1 {
+        state
+            .peer_store
+            .record_blind_relay_retry_succeeded(observed_at, attempt);
+    }
+    BlindRelayForwardOutcome {
+        response,
+        observed_at,
+    }
+}
+
+fn record_blind_relay_route_failure(
+    state: &ChatPeerState,
+    descriptor: &SignedNodeDescriptor,
+    observed_at: u64,
+    reason: &str,
+) {
+    let _ = state
+        .peer_store
+        .record_route_forward_failure_for_descriptor(descriptor, observed_at, reason);
+    state
+        .peer_store
+        .record_blind_relay_rejected(observed_at, reason);
+}
+
+fn log_blind_relay_retry(attempt: usize, source: BlindRelayResponseSource, reason: &str) {
+    match source {
+        BlindRelayResponseSource::HttpStatus(status) => debug!(
+            attempt,
+            status = %status,
+            "[BLIND_RELAY] Next-hop returned retryable status"
+        ),
+        BlindRelayResponseSource::Transport => debug!(
+            attempt,
+            reason, "[BLIND_RELAY] Next-hop forward failed; retrying"
+        ),
+    }
+}
+
+fn log_blind_relay_exhausted(attempt: usize, source: BlindRelayResponseSource, reason: &str) {
+    match source {
+        BlindRelayResponseSource::HttpStatus(status) => debug!(
+            attempt,
+            status = %status,
+            "[BLIND_RELAY] Next-hop returned non-success"
+        ),
+        BlindRelayResponseSource::Transport => {
+            debug!(attempt, reason, "[BLIND_RELAY] Next-hop forward failed")
+        }
+    }
+}
+
+fn log_invalid_blind_relay_response(
+    attempt: usize,
+    kind: BlindRelayInvalidResponseKind,
+    diagnostic: &'static str,
+) {
+    match kind {
+        BlindRelayInvalidResponseKind::SuccessAck => debug!(
+            attempt,
+            reason = diagnostic,
+            "[BLIND_RELAY] Next-hop ACK invalid"
+        ),
+        BlindRelayInvalidResponseKind::DeliveryReceipt => debug!(
+            attempt,
+            reason = diagnostic,
+            "[BLIND_RELAY] Next-hop delivery receipt verification failed"
+        ),
+        BlindRelayInvalidResponseKind::FailureReceipt => debug!(
+            attempt,
+            reason = diagnostic,
+            "[BLIND_RELAY] Next-hop failure receipt verification failed"
+        ),
+    }
 }
 
 fn validate_blind_relay_envelope(

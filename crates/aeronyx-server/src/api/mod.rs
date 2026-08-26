@@ -42,6 +42,7 @@
 //! - `chat_peer_abuse_guard`: private blind-relay abuse-control domain
 //! - `chat_peer_replay`: private generation-fenced blind-route replay domain
 //! - `chat_peer_retry`: private payload-blind forwarding retry policy domain
+//! - `chat_peer_response`: private receipt and response decision domain
 //! - `chat_peer_transport`: private bounded blind-relay HTTP transport domain
 //! - [`blind_vault`]: node-blind encrypted object lease/store/recovery routes
 //! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
@@ -78,6 +79,8 @@
 //!   transport state and signed route metadata, never payload or user data.
 //! - [BLIND-TRANSPORT-DOMAIN 2026-08-26 by Codex] Outbound HTTP adapters own
 //!   bounded response decoding but no routing, receipt, or health decisions.
+//! - [BLIND-RESPONSE-DOMAIN 2026-08-26 by Codex] Response policy validates
+//!   receipts and returns decisions but owns no I/O, clocks, logs, or storage.
 //!
 //! ## Last Modified
 //! v0.3.0 - Initial Agent API for MemChain Phase 1
@@ -118,6 +121,8 @@
 //!   forwarding, telemetry, and route-health effects.
 //! v2.8.36-ChatPeerTransportDomain - Split bounded reqwest I/O from blind-relay
 //!   routing, receipt validation, retry policy, and route-health effects.
+//! v2.8.37-ChatPeerResponseDomain - Split receipt verification and response
+//!   interpretation from asynchronous forwarding and observability effects.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{
@@ -475,6 +480,7 @@ pub mod chat_peer;
 mod chat_peer_admission;
 mod chat_peer_abuse_guard;
 mod chat_peer_replay;
+mod chat_peer_response;
 mod chat_peer_retry;
 mod chat_peer_transport;
 pub mod blind_vault;
