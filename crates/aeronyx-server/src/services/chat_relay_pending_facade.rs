@@ -1,12 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pending_facade.rs
 // ============================================
-// Version: 1.0.0-PendingMessageFacade
+// Version: 1.1.0-PendingCursorTestSeam
 //
 // Creation Reason:
 //   [CHAT-PENDING-FACADE-DOMAIN 2026-08-28 by Codex] Move offline-message
 //   custody, delivery, quarantine telemetry, and acknowledgement APIs out of
 //   the relay composition root without widening service field visibility.
+//
+// Modification Reason:
+//   [CHAT-PENDING-CURSOR-SEAM-DOMAIN 2026-08-28 by Codex] Co-locate the
+//   deterministic test-only v2 cursor decoder with pending delivery APIs.
 //
 // Main Functionality:
 //   - Stores bounded encrypted envelopes for offline receivers.
@@ -33,6 +37,7 @@
 //   - Never log message IDs, wallet keys, ciphertext, routes, or raw rows.
 //
 // Last Modified:
+//   v1.1.0-PendingCursorTestSeam - Co-located test-only cursor decoding
 //   v1.0.0-PendingMessageFacade - Initial pending-message facade extraction
 // ============================================
 
@@ -42,10 +47,24 @@ use tracing::{debug, warn};
 use crate::services::chat_relay_pending_contract::{PendingMessage, PendingMessagePageV2};
 use crate::services::chat_relay_pending_custody::PendingMessageStoreOutcome;
 use crate::services::chat_relay_pending_delivery::PendingPullQuarantineSummary;
+#[cfg(test)]
+use crate::services::chat_relay_pull_cursor::PullCursorV2;
 
 use super::{now_secs, ChatRelayResult, ChatRelayService};
 
 impl ChatRelayService {
+    /// Decodes one opaque v2 cursor for deterministic in-module tests.
+    #[cfg(test)]
+    pub(super) fn decode_pull_cursor_v2(
+        &self,
+        receiver: &[u8; 32],
+        after_timestamp: u64,
+        encoded: &[u8],
+    ) -> ChatRelayResult<PullCursorV2> {
+        self.pending_delivery
+            .decode_cursor(receiver, after_timestamp, encoded)
+    }
+
     /// Stores a pending offline message for a receiver that is not currently online.
     ///
     /// # Errors

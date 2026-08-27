@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.80.0-BackupSupportBoundary
+// Version: 3.81.0-PendingCursorTestSeam
 //
 // Modification Reason:
+//   [CHAT-PENDING-CURSOR-SEAM-DOMAIN 2026-08-28 by Codex] Moved the test-only
+//   v2 cursor decoder beside pending delivery so the composition root contains
+//   no operational inherent methods.
 //   [CHAT-BACKUP-SUPPORT-DOMAIN 2026-08-28 by Codex] Moved private backup
 //   composition helpers and deterministic test seams into a sibling support
 //   module without widening them beyond the relay module tree.
@@ -455,6 +458,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.81.0-PendingCursorTestSeam - Co-located test-only cursor decoding
 //   v3.80.0-BackupSupportBoundary - Extracted private backup support methods
 //   v3.79.0-BootstrapFacade - Extracted runtime and schema bootstrap boundary
 //   v3.78.0-OnlineAdmissionFacade - Co-located live-path duplicate admission
@@ -634,8 +638,6 @@ pub use crate::services::chat_relay_pending_contract::{PendingMessage, PendingMe
 use crate::services::chat_relay_pending_delivery::PendingMessageDeliveryDomain;
 #[cfg(test)]
 use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_CURSOR_V2_BYTES;
-#[cfg(test)]
-use crate::services::chat_relay_pull_cursor::PullCursorV2;
 use crate::services::chat_relay_quarantine::DurableQuarantineDomain;
 #[cfg(test)]
 use crate::services::chat_relay_quarantine::{
@@ -833,24 +835,6 @@ pub struct ChatRelayService {
     /// Arc so the cleanup task and each handler can hold independent references
     /// without borrowing the whole ChatRelayService.
     pub wallet_routes: Arc<WalletRouteCache>,
-}
-
-impl ChatRelayService {
-    // ============================================
-    // Opaque ChatPullV2 cursor protection
-    // ============================================
-
-    #[cfg(test)]
-    fn decode_pull_cursor_v2(
-        &self,
-        receiver: &[u8; 32],
-        after_timestamp: u64,
-        encoded: &[u8],
-    ) -> ChatRelayResult<PullCursorV2> {
-        self.pending_delivery
-            .decode_cursor(receiver, after_timestamp, encoded)
-    }
-
 }
 
 #[path = "chat_relay_bootstrap.rs"]
