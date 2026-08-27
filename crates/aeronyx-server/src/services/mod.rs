@@ -4,6 +4,8 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-CREATE-DOMAIN 2026-08-27 by Codex] Registered the
+//   composed verified backup creation, replay, and publication command.
 //   Registered `deny_list` submodule and re-exported DenyList + DenyReason.
 //   Registered `dns_proxy` so AeroNyx clients can resolve DNS through the gateway.
 //   Registered `peer_store` for Phase 1 decentralized node discovery.
@@ -77,6 +79,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.51.0-ChatRelayBackupCreateDomain - Registered backup creation command
 //   v0.50.0-ChatRelayRestoreCommandDomain - Registered restore commands
 //   v0.49.0-ChatRelayBackupPruneDomain - Registered audited prune command
 //   v0.48.0-ChatRelayBackupInventoryDomain - Registered verified inventory
@@ -157,6 +160,7 @@ mod chat_relay_backup_audit_rotation;
 mod chat_relay_backup_audit_verification;
 mod chat_relay_backup_contract;
 mod chat_relay_backup_copy;
+mod chat_relay_backup_create;
 mod chat_relay_backup_io;
 mod chat_relay_backup_inventory;
 mod chat_relay_backup_namespace;
