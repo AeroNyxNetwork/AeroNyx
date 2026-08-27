@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.61.0-CustodyAnchorGuardDomain
+// Version: 3.62.0-BackupSqliteDomain
 //
 // Modification Reason:
+//   [CHAT-BACKUP-SQLITE-DOMAIN 2026-08-28 by Codex] Moved SQLite online copy,
+//   retry mapping, durability activation, and private file mode into an adapter.
 //   [CHAT-CUSTODY-ANCHOR-GUARD-DOMAIN 2026-08-28 by Codex] Moved the signed
 //   anchor and maintenance-lock RAII contract into a focused resource type.
 //   [CHAT-MAINTENANCE-TELEMETRY-DOMAIN 2026-08-28 by Codex] Moved the
@@ -407,6 +409,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.62.0-BackupSqliteDomain - Composed SQLite backup adapter
 //   v3.61.0-CustodyAnchorGuardDomain - Composed custody anchor RAII contract
 //   v3.60.0-MaintenanceTelemetryDomain - Composed maintenance state machine
 //   v3.59.0-PendingContractDomain - Decoupled pending delivery models
@@ -495,14 +498,11 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use rand::{rngs::OsRng, RngCore};
-use rusqlite::{
-    backup::{Backup, StepResult},
-    params, Connection,
-};
+use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 
 use tracing::{debug, info, warn};
@@ -564,13 +564,9 @@ pub use crate::services::chat_relay_backup_contract::{
     ChatRelayBackupPruneReceipt, ChatRelayBackupPruneRequest, ChatRelayBackupRetentionReceipt,
     ChatRelayRestoreReadinessReceipt, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
 };
-use crate::services::chat_relay_backup_copy::{
-    BackupCopyAction, BackupCopyPolicyError, BackupCopyProgress, BackupCopyRetryPolicy,
-    BackupCopyRetryState, BoundedBackupCopyRetryPolicy,
-};
 use crate::services::chat_relay_backup_create::{
     verify_existing_backup_artifact as verify_existing_backup_creation_artifact,
-    BackupDatabaseCertification, VerifiedBackupCreationCommand, VerifiedBackupCreationRequest,
+    VerifiedBackupCreationCommand, VerifiedBackupCreationRequest,
 };
 use crate::services::chat_relay_backup_io::{
     backup_io_error, BackupFilesystem, LocalBackupFilesystem, PrivateBackupControlFileMode,
@@ -584,6 +580,9 @@ use crate::services::chat_relay_backup_namespace::{
 };
 use crate::services::chat_relay_backup_retention::{
     BackupRetentionLimits, BoundedBackupRetentionPlanner,
+};
+use crate::services::chat_relay_backup_sqlite::{
+    configure_full_durability, restrict_private_sqlite_permissions, SqliteRelayBackupDatabase,
 };
 use crate::services::chat_relay_backup_prune::{
     admit_backup_prune_request, AuditedBackupPruneExecutor, BackupPruneExecutor,
@@ -907,73 +906,13 @@ pub struct ChatRelayService {
     pub wallet_routes: Arc<WalletRouteCache>,
 }
 
-/// Service-owned SQLite capability composed into backup artifact creation.
-///
-/// [CHAT-RELAY-BACKUP-CREATE-DOMAIN 2026-08-27 by Codex] The command owns
-/// filesystem publication while this adapter keeps the live custody connection
-/// lock and relay-specific logical certification inside `ChatRelayService`.
-struct ChatRelayBackupDatabaseCertification<'a> {
-    service: &'a ChatRelayService,
-    certifier: SqliteBackupRecoveryImageCertifier,
-}
-
-impl BackupDatabaseCertification for ChatRelayBackupDatabaseCertification<'_> {
-    fn copy_source_into(&self, destination: &mut Connection) -> ChatRelayResult<()> {
-        let source = self.service.conn.lock();
-        ChatRelayService::copy_sqlite_backup(&source, destination)
-    }
-
-    fn normalize_isolated_journal(&self, connection: &Connection) -> ChatRelayResult<()> {
-        self.certifier.normalize_journal(connection)
-    }
-
-    fn verify_recovery_image(&self, connection: &Connection) -> ChatRelayResult<()> {
-        self.certifier.verify(connection, now_secs())
-    }
-
-    fn restrict_file_permissions(&self, path: &Path) -> ChatRelayResult<()> {
-        ChatRelayService::restrict_sqlite_file_permissions(path)
-    }
-}
-
 impl ChatRelayService {
-    #[cfg(unix)]
+    #[cfg(test)]
     fn restrict_sqlite_file_permissions(path: &Path) -> ChatRelayResult<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        // [CHAT-RELAY-PRIVATE-FILE 2026-08-16 by Codex] SQLite creates WAL
-        // sidecars using the primary database mode. Tighten the primary file
-        // before enabling WAL, and keep the configured path out of the error.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|_| {
-            ChatRelayError::Sqlite(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_PERM),
-                Some("unable to restrict relay database permissions".to_string()),
-            ))
-        })
-    }
-
-    #[cfg(not(unix))]
-    fn restrict_sqlite_file_permissions(_path: &Path) -> ChatRelayResult<()> {
-        Ok(())
-    }
-
-    fn configure_sqlite_durability(conn: &Connection) -> ChatRelayResult<u8> {
-        // [CHAT-RELAY-FULL-DURABILITY 2026-08-16 by Codex] NORMAL protects
-        // SQLite consistency across process failure but may lose a recently
-        // acknowledged transaction after host power loss. The relay signs
-        // custody receipts and persists its outage circuit from this database,
-        // so activation requires FULL-or-stronger durability.
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
-        let synchronous_level =
-            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))?;
-        if synchronous_level < CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_synchronous_level",
-            });
-        }
-        u8::try_from(synchronous_level).map_err(|_| ChatRelayError::CorruptStoredData {
-            field: "sqlite_synchronous_level",
-        })
+        // [CHAT-BACKUP-SQLITE-DOMAIN 2026-08-28 by Codex] Preserve the
+        // established in-crate fixture entry point while production ownership
+        // remains entirely inside the SQLite backup adapter.
+        restrict_private_sqlite_permissions(path)
     }
 
     fn backup_io_error(code: i32, message: &'static str) -> ChatRelayError {
@@ -1492,10 +1431,13 @@ impl ChatRelayService {
         let temporary = backup_directory.join(temporary_name.as_str());
         VerifiedBackupCreationCommand::new(
             LocalBackupFilesystem,
-            ChatRelayBackupDatabaseCertification {
-                service: self,
-                certifier: Self::backup_recovery_image_certifier(),
-            },
+            SqliteRelayBackupDatabase::new(
+                &self.conn,
+                Self::backup_recovery_image_certifier(),
+                CHAT_RELAY_BACKUP_PAGES_PER_STEP,
+                CHAT_RELAY_BACKUP_BUSY_TIMEOUT,
+                CHAT_RELAY_BACKUP_BUSY_RETRY_DELAY,
+            ),
         )
         .execute(VerifiedBackupCreationRequest {
             backup_directory,
@@ -1503,61 +1445,6 @@ impl ChatRelayService {
             temporary: &temporary,
             reuse_existing,
         })
-    }
-
-    fn backup_copy_retry_policy() -> BoundedBackupCopyRetryPolicy {
-        BoundedBackupCopyRetryPolicy::new(
-            CHAT_RELAY_BACKUP_BUSY_TIMEOUT,
-            CHAT_RELAY_BACKUP_BUSY_RETRY_DELAY,
-        )
-    }
-
-    fn backup_copy_progress(step: StepResult) -> BackupCopyProgress {
-        match step {
-            StepResult::Done => BackupCopyProgress::Complete,
-            StepResult::More => BackupCopyProgress::More,
-            StepResult::Busy => BackupCopyProgress::Busy,
-            StepResult::Locked => BackupCopyProgress::Locked,
-            _ => BackupCopyProgress::Unsupported,
-        }
-    }
-
-    fn map_backup_copy_policy_error(error: BackupCopyPolicyError) -> ChatRelayError {
-        match error {
-            BackupCopyPolicyError::BusyTimeout => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_BUSY,
-                "relay backup remained busy",
-            ),
-            BackupCopyPolicyError::ObservationTimeRegressed => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_ABORT,
-                "relay backup retry observation time regressed",
-            ),
-            BackupCopyPolicyError::UnsupportedProgress => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_ERROR,
-                "unsupported relay backup step result",
-            ),
-        }
-    }
-
-    fn copy_sqlite_backup(
-        source: &Connection,
-        destination: &mut Connection,
-    ) -> ChatRelayResult<()> {
-        let backup = Backup::new(source, destination)?;
-        let retry_policy = Self::backup_copy_retry_policy();
-        let mut retry_state = BackupCopyRetryState::default();
-        loop {
-            let progress =
-                Self::backup_copy_progress(backup.step(CHAT_RELAY_BACKUP_PAGES_PER_STEP)?);
-            let action = retry_policy
-                .transition(&mut retry_state, progress, Instant::now())
-                .map_err(Self::map_backup_copy_policy_error)?;
-            match action {
-                BackupCopyAction::Complete => return Ok(()),
-                BackupCopyAction::Continue => {}
-                BackupCopyAction::RetryAfter(delay) => std::thread::sleep(delay),
-            }
-        }
     }
 
     fn verify_sqlite_backup(conn: &Connection) -> ChatRelayResult<()> {
@@ -1599,13 +1486,14 @@ impl ChatRelayService {
         };
         let conn = Connection::open(&config.db_path)?;
         if config.db_path != ":memory:" {
-            Self::restrict_sqlite_file_permissions(Path::new(&config.db_path))?;
+            restrict_private_sqlite_permissions(Path::new(&config.db_path))?;
         }
         // A short bounded wait absorbs transient locks from an operator backup
         // or diagnostic reader without allowing relay requests to hang forever.
         conn.busy_timeout(Duration::from_secs(5))?;
         verify_sqlite_physical_integrity(&conn, "sqlite_startup_integrity")?;
-        let synchronous_level = Self::configure_sqlite_durability(&conn)?;
+        let synchronous_level =
+            configure_full_durability(&conn, CHAT_RELAY_SQLITE_MINIMUM_SYNCHRONOUS_LEVEL)?;
 
         let dedup_capacity = config.dedup_lru_capacity;
         let relay_enabled = config.enabled;

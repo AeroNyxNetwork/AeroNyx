@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.63.0-CustodyAnchorGuardDomain
+// Version: 0.64.0-BackupSqliteDomain
 //
 // Modification Reason:
+//   [CHAT-BACKUP-SQLITE-DOMAIN 2026-08-28 by Codex] Registered the live SQLite
+//   backup, durability, certification, and private-file adapter.
 //   [CHAT-CUSTODY-ANCHOR-GUARD-DOMAIN 2026-08-28 by Codex] Registered the
 //   signed custody anchor and maintenance-lock RAII contract.
 //   [CHAT-MAINTENANCE-TELEMETRY-DOMAIN 2026-08-28 by Codex] Registered the
@@ -103,6 +105,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.64.0-BackupSqliteDomain - Registered SQLite backup adapter
 //   v0.63.0-CustodyAnchorGuardDomain - Registered custody anchor guard
 //   v0.62.0-MaintenanceTelemetryDomain - Registered maintenance state machine
 //   v0.61.0-PendingContractDomain - Registered pending delivery contracts
@@ -203,6 +206,7 @@ mod chat_relay_backup_inventory;
 mod chat_relay_backup_namespace;
 mod chat_relay_backup_prune;
 mod chat_relay_backup_retention;
+mod chat_relay_backup_sqlite;
 mod chat_relay_blind_route;
 mod chat_relay_blind_route_store;
 mod chat_relay_blob_custody;

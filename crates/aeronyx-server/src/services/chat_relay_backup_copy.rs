@@ -1,11 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_copy.rs
 // ============================================
-// Version: 1.0.0-BackupCopyRetryDomain
+// Version: 1.1.0-SqliteAdapterComposition
 //
 // Creation Reason:
 //   [CHAT-RELAY-BACKUP-COPY-RETRY-DOMAIN 2026-08-27 by Codex] Isolate the
 //   bounded SQLite online-backup retry state machine from service-owned I/O.
+//
+// Modification Reason:
+//   [CHAT-BACKUP-SQLITE-DOMAIN 2026-08-28 by Codex] Updated composition after
+//   SQLite step mapping and sleeping moved out of the central relay service.
 //
 // Main Functionality:
 //   - Models SQLite backup progress through a closed enum.
@@ -15,13 +19,13 @@
 //
 // Dependencies:
 //   - Uses only `std::time`; it does not depend on SQLite or the filesystem.
-//   - `chat_relay.rs` maps `rusqlite::StepResult` and executes returned actions.
+//   - `chat_relay_backup_sqlite.rs` maps SQLite progress and executes actions.
 //
 // Main Logical Flow:
-//   1. The service performs one bounded SQLite backup step.
+//   1. The SQLite adapter performs one bounded online-backup step.
 //   2. It maps the result into `BackupCopyProgress` with an observation time.
 //   3. The policy transitions consecutive-busy state and returns one action.
-//   4. The service completes, steps immediately, sleeps, or returns an error.
+//   4. The adapter completes, steps immediately, sleeps, or returns an error.
 //
 // Important Note for Next Developer:
 //   - Only consecutive Busy/Locked observations consume the timeout budget.
@@ -30,6 +34,7 @@
 //   - This module must remain side-effect free; never sleep or access SQLite.
 //
 // Last Modified:
+//   v1.1.0-SqliteAdapterComposition - Documented adapter ownership
 //   v1.0.0-BackupCopyRetryDomain - Initial bounded retry state machine
 // ============================================
 
