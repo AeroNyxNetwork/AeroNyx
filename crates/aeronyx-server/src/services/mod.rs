@@ -61,8 +61,11 @@
 //   privacy-safe serialized relay status contract and shared policy defaults.
 //   [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Registered the typed relay
 //   failure contract consumed directly by composed relay domains.
+//   [CHAT-RELAY-BACKUP-CONTRACT-DOMAIN 2026-08-27 by Codex] Registered the
+//   aggregate backup contracts and fail-closed prune admission state.
 //
 // Last Modified:
+//   v0.44.0-ChatRelayBackupContractDomain - Registered backup contracts
 //   v0.43.0-ChatRelayErrorDomain - Registered typed relay failures
 //   v0.42.0-ChatRelayStatusDomain - Registered relay status contracts
 //   v0.41.0-BackupCopyRetryDomain - Registered backup-copy retry policy
@@ -132,6 +135,7 @@ mod chat_relay_backup_audit_catalog;
 mod chat_relay_backup_audit_checkpoint;
 mod chat_relay_backup_audit_rotation;
 mod chat_relay_backup_audit_verification;
+mod chat_relay_backup_contract;
 mod chat_relay_backup_copy;
 mod chat_relay_backup_namespace;
 mod chat_relay_backup_retention;
