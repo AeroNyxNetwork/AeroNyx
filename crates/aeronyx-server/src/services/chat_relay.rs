@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.69.0-BackupManagementFacade
+// Version: 3.70.0-PendingMessageFacade
 //
 // Modification Reason:
+//   [CHAT-PENDING-FACADE-DOMAIN 2026-08-28 by Codex] Moved pending-message
+//   custody, snapshot delivery, quarantine telemetry, and acknowledgement APIs
+//   into a nested facade without changing wire or storage semantics.
 //   [CHAT-BACKUP-FACADE-DOMAIN 2026-08-28 by Codex] Moved host-local backup,
 //   retention, audit, anchor, and restore-plan APIs into a nested facade
 //   without widening service field visibility or changing inherent methods.
@@ -422,6 +425,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.70.0-PendingMessageFacade - Extracted pending-message API facade
 //   v3.69.0-BackupManagementFacade - Extracted host-local backup API facade
 //   v3.68.0-BackupAuditMaintenanceCoordinator - Composed audit maintenance
 //   v3.67.0-BackupAuditAnchorDomain - Extracted public anchor digest derivation
@@ -529,6 +533,7 @@ use tracing::{debug, info, warn};
 use aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS;
 #[cfg(test)]
 use aeronyx_core::protocol::chat::encode_envelope;
+#[cfg(test)]
 use aeronyx_core::protocol::chat::ChatEnvelope;
 use aeronyx_core::protocol::memchain::{
     ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
@@ -640,13 +645,9 @@ pub(crate) use crate::services::chat_relay_peer_telemetry::{
 };
 #[cfg(test)]
 use crate::services::chat_relay_pending_custody::allocate_queue_sequence;
-use crate::services::chat_relay_pending_custody::{
-    PendingMessageCustodyDomain, PendingMessageStoreOutcome,
-};
+use crate::services::chat_relay_pending_custody::PendingMessageCustodyDomain;
 pub use crate::services::chat_relay_pending_contract::{PendingMessage, PendingMessagePageV2};
-use crate::services::chat_relay_pending_delivery::{
-    PendingMessageDeliveryDomain, PendingPullQuarantineSummary,
-};
+use crate::services::chat_relay_pending_delivery::PendingMessageDeliveryDomain;
 use crate::services::chat_relay_pending_schema::{
     ChatRelayPendingSchemaMigration, SqliteChatRelayPendingSchemaMigrator,
 };
@@ -1483,142 +1484,6 @@ impl ChatRelayService {
     }
 
     // ============================================
-    // Message store / pull / ack
-    // ============================================
-
-    /// Stores a pending offline message for a receiver that is not currently online.
-    ///
-    /// # Errors
-    ///
-    /// Returns an item-size or durable-capacity error before insertion, or a
-    /// serialization/SQLite error if encoding or the atomic write fails.
-    pub fn store_pending(&self, envelope: &ChatEnvelope) -> ChatRelayResult<()> {
-        let write = self
-            .pending_custody
-            .prepare_store(envelope, now_secs())?;
-        let mut conn = self.conn.lock();
-        let outcome = self.pending_custody.store(&mut conn, write)?;
-        drop(conn);
-
-        if let PendingMessageStoreOutcome::Stored { encoded_bytes } = outcome {
-            debug!(encoded_bytes, "[CHAT_RELAY] Message stored pending");
-        }
-        Ok(())
-    }
-
-    fn record_pending_pull_quarantine(&self, summary: PendingPullQuarantineSummary) {
-        let PendingPullQuarantineSummary::Replaced {
-            quarantined_at,
-            quarantined_rows,
-            removed_events,
-            retained_events,
-        } = summary
-        else {
-            return;
-        };
-        self.maintenance_telemetry.record_quarantine(
-            quarantined_at,
-            quarantined_rows,
-            0,
-            removed_events,
-            retained_events,
-        );
-        warn!(
-            quarantined_pending_messages = quarantined_rows,
-            "[CHAT_RELAY] Corrupt pending rows isolated during pull"
-        );
-    }
-
-    /// Retrieves a page of pending messages for the given receiver wallet.
-    ///
-    /// The v1 wire cursor contains only `message_id`, so rows must be ordered
-    /// by that same key. Ordering by timestamp first can permanently skip a
-    /// later row whose random ID sorts below the previous page's cursor.
-    ///
-    /// # Errors
-    ///
-    /// Corrupt rows are atomically replaced by de-identified quarantine events
-    /// so one poison row cannot permanently block a receiver's mailbox.
-    /// Returns a storage error if reading or quarantine persistence fails.
-    pub fn pull_pending(
-        &self,
-        receiver: &[u8; 32],
-        after_timestamp: u64,
-        cursor: &[u8; 16],
-        limit: u32,
-    ) -> ChatRelayResult<(Vec<PendingMessage>, bool)> {
-        let delivery = self.pending_delivery.pull_legacy(
-            &self.conn,
-            &self.durable_quarantine,
-            receiver,
-            after_timestamp,
-            cursor,
-            limit,
-        )?;
-        self.record_pending_pull_quarantine(delivery.quarantine);
-        Ok((delivery.messages, delivery.has_more))
-    }
-
-    /// Retrieves one stable monotonic snapshot page for ChatPullV2.
-    ///
-    /// An empty cursor captures the current receiver-specific sequence ceiling.
-    /// Later inserts receive larger sequences and cannot move into that snapshot,
-    /// preventing duplicate/skip behavior while the client paginates. The
-    /// sequence and ceiling remain node-internal inside an AEAD-protected cursor.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChatRelayError::InvalidPullCursor`] for tampered, cross-wallet,
-    /// cross-filter, malformed, or foreign-node cursors. Corrupt durable rows are
-    /// atomically quarantined using the same path as v1 pulls.
-    pub fn pull_pending_v2(
-        &self,
-        receiver: &[u8; 32],
-        after_timestamp: u64,
-        encoded_cursor: &[u8],
-        limit: u32,
-    ) -> ChatRelayResult<PendingMessagePageV2> {
-        let delivery = self.pending_delivery.pull_snapshot(
-            &self.conn,
-            &self.durable_quarantine,
-            receiver,
-            after_timestamp,
-            encoded_cursor,
-            limit,
-        )?;
-        self.record_pending_pull_quarantine(delivery.quarantine);
-        Ok(delivery.page)
-    }
-
-    /// Acknowledges delivery of a batch of messages, deleting them from the store.
-    ///
-    /// Only deletes rows where `receiver = receiver_wallet`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an oversized-batch or `SQLite` error. The transaction is atomic.
-    pub fn ack_messages(
-        &self,
-        message_ids: &[[u8; 16]],
-        receiver_wallet: &[u8; 32],
-    ) -> ChatRelayResult<usize> {
-        let Some(batch) = self
-            .pending_custody
-            .prepare_acknowledgement(message_ids)?
-        else {
-            return Ok(0);
-        };
-        let deleted = self.pending_custody.acknowledge(
-            &mut self.conn.lock(),
-            &batch,
-            receiver_wallet,
-        )?;
-
-        debug!(count = deleted, "[CHAT_RELAY] Messages ACKed and deleted");
-        Ok(deleted)
-    }
-
-    // ============================================
     // Blob store / get / delete
     // ============================================
 
@@ -2153,6 +2018,9 @@ impl ChatRelayService {
 
 #[path = "chat_relay_backup_facade.rs"]
 mod backup_facade;
+
+#[path = "chat_relay_pending_facade.rs"]
+mod pending_facade;
 
 fn sqlite_integer(value: u64, field: &'static str) -> ChatRelayResult<i64> {
     i64::try_from(value).map_err(|_| ChatRelayError::CorruptStoredData { field })
