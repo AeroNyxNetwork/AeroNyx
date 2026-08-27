@@ -658,9 +658,7 @@ pub(crate) use crate::services::chat_relay_expired_contract::{
     MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION, MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES,
 };
 use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
-use crate::services::chat_relay_message_dedup::{
-    BoundedOnlineMessageDedup as MessageDedup, OnlineMessageDeduplication,
-};
+use crate::services::chat_relay_message_dedup::BoundedOnlineMessageDedup as MessageDedup;
 pub use crate::services::chat_relay_node_secret::derive_node_secret;
 pub use crate::services::chat_relay_maintenance_telemetry::ChatRelayMaintenanceStatus;
 use crate::services::chat_relay_maintenance_telemetry::RelayMaintenanceTelemetry;

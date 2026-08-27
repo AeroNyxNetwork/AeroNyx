@@ -41,6 +41,7 @@
 //   v1.0.0-PeerRelayFacade - Initial peer relay facade extraction
 // ============================================
 
+use crate::services::chat_relay_message_dedup::OnlineMessageDeduplication;
 use crate::services::chat_relay_peer_telemetry::{
     BlindRouteRecoveryEvent, OutboundRouteClass, PeerRelayTelemetrySink, VerifiedSubmitEvent,
 };
