@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.44.0-BackupAuditIoDomain
+// Version: 3.45.0-BackupAuditChainDomain
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-AUDIT-CHAIN-DOMAIN 2026-08-27 by Codex] Extracted
+//   authenticated multi-segment verification, checkpoint admission, and
+//   active-tail recovery classification behind a composed verifier.
 //   [CHAT-RELAY-BACKUP-AUDIT-IO-DOMAIN 2026-08-27 by Codex] Extracted bounded
 //   audit artifact discovery, stable reads/hashing, crash recovery, and atomic
 //   checkpoint publication behind a composed host-I/O capability.
@@ -356,6 +359,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.45.0-BackupAuditChainDomain - Composed audit-chain verification
 //   v3.44.0-BackupAuditIoDomain - Trait-based audit artifact host I/O
 //   v3.43.0-BackupFilesystemDomain - Trait-based private backup host I/O
 //   v3.39.0-TestModuleSplit - Moved the complete test module out of production
@@ -425,7 +429,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -459,17 +463,18 @@ use aeronyx_core::protocol::memchain::{
 
 use crate::config::ChatRelayConfig;
 use crate::services::chat_relay_backup_audit::{
-    BackupAuditPhase, BackupAuditRecordAuthenticator, BackupAuditRecordError,
-    ChatRelayBackupMaintenanceAuditCounts, ChatRelayBackupMaintenanceAuditRecord,
+    BackupAuditPhase, BackupAuditRecordAuthenticator, ChatRelayBackupMaintenanceAuditCounts,
     HmacBackupAuditRecordAuthenticator,
 };
-use crate::services::chat_relay_backup_audit_catalog::{
-    BackupAuditSegmentCatalog, BoundedBackupAuditSegmentCatalog,
+use crate::services::chat_relay_backup_audit_chain::{
+    map_backup_audit_checkpoint_error, map_backup_audit_record_error,
+    map_backup_audit_verification_error, AuthenticatedBackupAuditChainVerifier,
+    BackupAuditChainLimits, BackupAuditChainVerifier, ChatRelayBackupAuditChainVerification,
+    LocalBackupAuditChainVerifier,
 };
 use crate::services::chat_relay_backup_audit_checkpoint::{
-    BackupAuditCheckpointAuthenticator, BackupAuditCheckpointError,
-    BackupAuditCheckpointState, ChatRelayBackupAuditCheckpoint,
-    HmacBackupAuditCheckpointAuthenticator,
+    BackupAuditCheckpointAuthenticator, BackupAuditCheckpointState,
+    ChatRelayBackupAuditCheckpoint, HmacBackupAuditCheckpointAuthenticator,
 };
 #[cfg(test)]
 use crate::services::chat_relay_backup_audit_io::BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX
@@ -481,14 +486,13 @@ use crate::services::chat_relay_backup_audit_io::{
     BACKUP_AUDIT_MAX_SEGMENTS as CHAT_RELAY_BACKUP_AUDIT_MAX_SEGMENTS,
 };
 use crate::services::chat_relay_backup_audit_rotation::{
-    BackupAuditActiveTailDisposition, BackupAuditRotationError, BackupAuditRotationLimits,
-    BackupAuditRotationPolicy, BackupAuditRotationState, BackupAuditSegmentFingerprint,
-    BoundedBackupAuditRotationPolicy, ChatRelayBackupAuditSegmentRange,
+    BackupAuditRotationError, BackupAuditRotationLimits, BackupAuditRotationPolicy,
+    BackupAuditRotationState, BoundedBackupAuditRotationPolicy,
+    ChatRelayBackupAuditSegmentRange,
 };
 pub use crate::services::chat_relay_backup_audit_verification::ChatRelayBackupAuditVerificationReceipt;
 use crate::services::chat_relay_backup_audit_verification::{
-    BackupAuditCheckpointAdmission, BackupAuditRecordAdmission, BackupAuditSegmentBaseline,
-    BackupAuditVerificationError, BackupAuditVerificationLimits, BackupAuditVerificationPolicy,
+    BackupAuditVerificationLimits, BackupAuditVerificationPolicy,
     BoundedBackupAuditVerificationPolicy, ChatRelayBackupAuditVerificationState,
 };
 use crate::services::chat_relay_backup_artifact::{
@@ -801,11 +805,6 @@ struct ChatRelayActiveRestoreBoundary {
     inode: u64,
 }
 
-struct ChatRelayBackupAuditChainVerification {
-    state: ChatRelayBackupAuditVerificationState,
-    pending_rotation: Option<ChatRelayBackupAuditPendingRotation>,
-}
-
 impl ExpiredNotification {
     /// Deserialise the stored message IDs.
     pub fn message_ids(&self) -> ChatRelayResult<Vec<[u8; 16]>> {
@@ -1028,6 +1027,21 @@ impl ChatRelayService {
         LocalBackupAuditIo::new(LocalBackupFilesystem)
     }
 
+    fn backup_audit_chain_verifier() -> LocalBackupAuditChainVerifier {
+        // [CHAT-RELAY-BACKUP-AUDIT-CHAIN-DOMAIN 2026-08-27 by Codex] Compose
+        // host I/O with pure verification and rotation policies at one edge.
+        AuthenticatedBackupAuditChainVerifier::new(
+            LocalBackupFilesystem,
+            Self::backup_audit_io(),
+            Self::backup_audit_verification_policy(),
+            Self::backup_audit_rotation_policy(),
+            BackupAuditChainLimits {
+                max_record_bytes: CHAT_RELAY_BACKUP_AUDIT_MAX_RECORD_BYTES,
+                max_segment_bytes: CHAT_RELAY_BACKUP_AUDIT_MAX_BYTES,
+            },
+        )
+    }
+
     fn reserve_private_backup_file(path: &Path) -> ChatRelayResult<()> {
         LocalBackupFilesystem.reserve_private_file(path)
     }
@@ -1079,61 +1093,17 @@ impl ChatRelayService {
         )
     }
 
-    fn map_backup_audit_record_error(error: BackupAuditRecordError) -> ChatRelayError {
-        match error {
-            BackupAuditRecordError::CountOutOfRange => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_TOOBIG,
-                "relay backup maintenance count exceeds audit format",
-            ),
-            BackupAuditRecordError::EncodingFailed => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FORMAT,
-                "unable to encode relay backup maintenance audit",
-            ),
-            BackupAuditRecordError::AuthenticatorInitFailed => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_AUTH,
-                "unable to initialize relay backup maintenance audit",
-            ),
-            BackupAuditRecordError::InvalidRecord => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit verification failed",
-            ),
-        }
-    }
-
     fn backup_audit_segment_file_name(range: ChatRelayBackupAuditSegmentRange) -> String {
-        Self::backup_audit_segment_catalog().segment_file_name(range)
+        Self::backup_audit_io().segment_file_name(range)
     }
 
     #[cfg(test)]
     fn backup_audit_checkpoint_file_name(range: ChatRelayBackupAuditSegmentRange) -> String {
-        Self::backup_audit_segment_catalog().checkpoint_file_name(range)
-    }
-
-    fn backup_audit_segment_catalog() -> BoundedBackupAuditSegmentCatalog {
-        BoundedBackupAuditSegmentCatalog::new(CHAT_RELAY_BACKUP_AUDIT_MAX_SEGMENTS)
+        Self::backup_audit_io().checkpoint_file_name(range)
     }
 
     fn cleanup_backup_audit_checkpoint_temporaries(parent: &Path) -> ChatRelayResult<()> {
         Self::backup_audit_io().cleanup_checkpoint_temporaries(parent)
-    }
-
-    fn map_backup_audit_checkpoint_error(
-        error: BackupAuditCheckpointError,
-    ) -> ChatRelayError {
-        match error {
-            BackupAuditCheckpointError::EncodingFailed => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FORMAT,
-                "unable to encode relay backup maintenance audit checkpoint",
-            ),
-            BackupAuditCheckpointError::AuthenticatorInitFailed => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_AUTH,
-                "unable to initialize relay backup maintenance audit checkpoint",
-            ),
-            BackupAuditCheckpointError::InvalidCheckpoint => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit checkpoint verification failed",
-            ),
-        }
     }
 
     fn map_backup_audit_rotation_error(error: BackupAuditRotationError) -> ChatRelayError {
@@ -1165,60 +1135,6 @@ impl ChatRelayService {
             BackupAuditRotationError::ByteCountOverflow => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_FULL,
                 "relay backup maintenance audit byte count overflow",
-            ),
-        }
-    }
-
-    fn map_backup_audit_verification_error(error: BackupAuditVerificationError) -> ChatRelayError {
-        match error {
-            BackupAuditVerificationError::RecordLimitReached => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit record limit reached",
-            ),
-            BackupAuditVerificationError::RecordSizeOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit byte count overflow",
-            ),
-            BackupAuditVerificationError::SegmentSizeExceeded => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit exceeds its bounded size",
-            ),
-            BackupAuditVerificationError::TotalSizeExceeded => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit chain exceeds its bounded size",
-            ),
-            BackupAuditVerificationError::ByteCountOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit byte count overflow",
-            ),
-            BackupAuditVerificationError::RecordCountOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit sequence overflow",
-            ),
-            BackupAuditVerificationError::PhaseCountOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit phase count overflow",
-            ),
-            BackupAuditVerificationError::CheckpointIndexOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit checkpoint index overflow",
-            ),
-            BackupAuditVerificationError::InvalidSegmentRange => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit checkpoint verification failed",
-            ),
-            BackupAuditVerificationError::ArchivedByteCountOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit archived byte count overflow",
-            ),
-            BackupAuditVerificationError::InvalidRecordAccounting => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit record accounting is invalid",
-            ),
-            BackupAuditVerificationError::StaleRecordAdmission
-            | BackupAuditVerificationError::StaleCheckpointAdmission => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit verification state changed unexpectedly",
             ),
         }
     }
@@ -1280,12 +1196,6 @@ impl ChatRelayService {
         Ok(hasher.finalize().into())
     }
 
-    fn read_backup_audit_checkpoint(
-        path: &Path,
-    ) -> ChatRelayResult<ChatRelayBackupAuditCheckpoint> {
-        Self::backup_audit_io().read_checkpoint(path)
-    }
-
     fn hash_backup_audit_segment(file: &mut File) -> ChatRelayResult<(u64, String)> {
         Self::backup_audit_io().hash_segment(file)
     }
@@ -1295,305 +1205,14 @@ impl ChatRelayService {
         file: &mut File,
         node_secret: &[u8; 32],
     ) -> ChatRelayResult<ChatRelayBackupAuditVerificationState> {
-        Self::verify_backup_audit_segment(
-            file,
-            node_secret,
-            Self::backup_audit_verification_policy().empty_state(),
-        )
-    }
-
-    // [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] Keep bounded I/O and
-    // aggregate accounting in one primitive so active and archived segments
-    // are parsed under exactly the same resource limits.
-    fn read_next_backup_audit_record(
-        reader: &mut BufReader<File>,
-        line: &mut String,
-        policy: &BoundedBackupAuditVerificationPolicy,
-        state: &ChatRelayBackupAuditVerificationState,
-        baseline: BackupAuditSegmentBaseline,
-    ) -> ChatRelayResult<
-        Option<(
-            ChatRelayBackupMaintenanceAuditRecord,
-            BackupAuditRecordAdmission,
-        )>,
-    > {
-        line.clear();
-        // Metadata length is not a read bound: a concurrent writer can grow
-        // the file after inspection. Limit every record before allocation and
-        // separately account total authenticated bytes.
-        let bytes = Read::by_ref(reader)
-            .take((CHAT_RELAY_BACKUP_AUDIT_MAX_RECORD_BYTES + 1) as u64)
-            .read_line(line)
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to read relay backup maintenance audit",
-                )
-            })?;
-        if bytes == 0 {
-            return Ok(None);
-        }
-        if bytes > CHAT_RELAY_BACKUP_AUDIT_MAX_RECORD_BYTES || !line.ends_with('\n') {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit record is malformed",
-            ));
-        }
-        let admission = policy
-            .prepare_record(state, baseline, bytes)
-            .map_err(Self::map_backup_audit_verification_error)?;
-        let record = serde_json::from_str(line.trim_end_matches('\n')).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit record is malformed",
-            )
-        })?;
-        Ok(Some((record, admission)))
-    }
-
-    fn verify_backup_audit_segment(
-        file: &mut File,
-        node_secret: &[u8; 32],
-        mut state: ChatRelayBackupAuditVerificationState,
-    ) -> ChatRelayResult<ChatRelayBackupAuditVerificationState> {
-        let metadata = file.metadata().map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_IOERR,
-                "unable to inspect relay backup maintenance audit",
-            )
-        })?;
-        if metadata.len() > CHAT_RELAY_BACKUP_AUDIT_MAX_BYTES {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup maintenance audit exceeds its bounded size",
-            ));
-        }
-        let initial_len = metadata.len();
-        let policy = Self::backup_audit_verification_policy();
-        let baseline = policy.begin_segment(&state);
-        let initial_verified_bytes = state.receipt().verified_bytes;
-        file.seek(SeekFrom::Start(0)).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_IOERR,
-                "unable to read relay backup maintenance audit",
-            )
-        })?;
-
-        let mut reader = BufReader::new(file.try_clone().map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_IOERR,
-                "unable to read relay backup maintenance audit",
-            )
-        })?);
-        let mut line = String::new();
-        while let Some((record, admission)) =
-            Self::read_next_backup_audit_record(&mut reader, &mut line, &policy, &state, baseline)?
-        {
-            let phase = HmacBackupAuditRecordAuthenticator
-                .authenticate(
-                    node_secret,
-                    &record,
-                    admission.expected_sequence(),
-                    admission.expected_previous_mac(),
-                )
-                .map_err(Self::map_backup_audit_record_error)?;
-            policy
-                .commit_record(&mut state, admission, phase, record.timestamp, record.mac)
-                .map_err(Self::map_backup_audit_verification_error)?;
-        }
-        let final_len = file
-            .metadata()
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to re-inspect relay backup maintenance audit",
-                )
-            })?
-            .len();
-        if final_len != initial_len
-            || state
-                .receipt()
-                .verified_bytes
-                .checked_sub(initial_verified_bytes)
-                != Some(initial_len)
-        {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit changed during verification",
-            ));
-        }
-        Ok(state)
-    }
-
-    fn apply_backup_audit_checkpoint(
-        node_secret: &[u8; 32],
-        range: ChatRelayBackupAuditSegmentRange,
-        segment_bytes: u64,
-        segment_sha256: &str,
-        previous_record_count: u64,
-        checkpoint: ChatRelayBackupAuditCheckpoint,
-        state: &mut ChatRelayBackupAuditVerificationState,
-    ) -> ChatRelayResult<()> {
-        let policy = Self::backup_audit_verification_policy();
-        let admission: BackupAuditCheckpointAdmission = policy
-            .prepare_checkpoint(
-                state,
-                range,
-                segment_bytes,
-                segment_sha256.to_string(),
-                previous_record_count,
-            )
-            .map_err(Self::map_backup_audit_verification_error)?;
-        HmacBackupAuditCheckpointAuthenticator
-            .authenticate(
-                node_secret,
-                &checkpoint,
-                admission.expected(),
-                admission.expected_record_count(),
-            )
-            .map_err(Self::map_backup_audit_checkpoint_error)?;
-        policy
-            .commit_checkpoint(state, admission, checkpoint.checkpoint_mac)
-            .map_err(Self::map_backup_audit_verification_error)
-    }
-
-    // [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] The active file has two
-    // valid meanings after a crash: an uncheckpointed continuation, or the
-    // already-published segment whose old name still awaits removal. Isolate
-    // that state transition from archived-chain verification.
-    fn verify_backup_audit_active_tail(
-        active_path: &Path,
-        latest_segment_fingerprint: Option<&BackupAuditSegmentFingerprint>,
-        node_secret: &[u8; 32],
-        mut state: ChatRelayBackupAuditVerificationState,
-    ) -> ChatRelayResult<(
-        ChatRelayBackupAuditVerificationState,
-        Option<ChatRelayBackupAuditPendingRotation>,
-    )> {
-        let Some(mut active) = Self::open_existing_private_backup_control_file(active_path)? else {
-            return Ok((state, None));
-        };
-        let active_len = active
-            .metadata()
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to inspect active relay backup maintenance audit",
-                )
-            })?
-            .len();
-        let active_fingerprint = if active_len > 0 {
-            let (bytes, sha256) = Self::hash_backup_audit_segment(&mut active)?;
-            Some(BackupAuditSegmentFingerprint { bytes, sha256 })
-        } else {
-            None
-        };
-        match Self::backup_audit_rotation_policy()
-            .classify_active_tail(active_fingerprint.as_ref(), latest_segment_fingerprint)
-        {
-            BackupAuditActiveTailDisposition::RetirePublishedDuplicate => {
-                return Ok((
-                    state,
-                    Some(ChatRelayBackupAuditPendingRotation::RemoveDuplicateActive {
-                        active_path: active_path.to_path_buf(),
-                    }),
-                ));
-            }
-            BackupAuditActiveTailDisposition::VerifyActiveTail => {}
-        }
-        state = Self::verify_backup_audit_segment(&mut active, node_secret, state)?;
-        Ok((state, None))
+        Self::backup_audit_chain_verifier().verify_log(file, node_secret)
     }
 
     fn verify_backup_audit_chain(
         parent: &Path,
         node_secret: &[u8; 32],
     ) -> ChatRelayResult<ChatRelayBackupAuditChainVerification> {
-        let active_path = parent.join(CHAT_RELAY_BACKUP_AUDIT_FILE_NAME);
-        let segments = Self::backup_audit_io().collect_segment_files(parent)?;
-        let segment_count = segments.len();
-        let verification_policy = Self::backup_audit_verification_policy();
-        let mut state = verification_policy.empty_state();
-        let mut pending_rotation = None;
-        let mut latest_segment_fingerprint: Option<BackupAuditSegmentFingerprint> = None;
-
-        for (index, (range, files)) in segments.into_iter().enumerate() {
-            let checkpoint_path = parent.join(files.checkpoint_file_name.ok_or_else(|| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CORRUPT,
-                    "relay backup maintenance audit segment checkpoint is missing",
-                )
-            })?);
-            let previous_record_count = state.receipt().record_count;
-            let (mut segment, uses_active) = if let Some(segment_file_name) = files.segment_file_name
-            {
-                let segment_path = parent.join(segment_file_name);
-                let segment = Self::open_existing_private_backup_control_file(&segment_path)?
-                    .ok_or_else(|| {
-                        Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_CORRUPT,
-                            "relay backup maintenance audit segment is missing",
-                        )
-                    })?;
-                (segment, false)
-            } else {
-                if index + 1 != segment_count || pending_rotation.is_some() {
-                    return Err(Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_CORRUPT,
-                        "relay backup maintenance audit segment publication is incomplete",
-                    ));
-                }
-                let segment = Self::open_existing_private_backup_control_file(&active_path)?
-                    .ok_or_else(|| {
-                        Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_CORRUPT,
-                            "relay backup maintenance audit pending segment is missing",
-                        )
-                    })?;
-                let segment_path = parent.join(Self::backup_audit_segment_file_name(range));
-                pending_rotation = Some(ChatRelayBackupAuditPendingRotation::PublishSegment {
-                    active_path: active_path.clone(),
-                    segment_path,
-                });
-                (segment, true)
-            };
-            state = Self::verify_backup_audit_segment(&mut segment, node_secret, state)?;
-            let (segment_bytes, segment_sha256) = Self::hash_backup_audit_segment(&mut segment)?;
-            let checkpoint = Self::read_backup_audit_checkpoint(&checkpoint_path)?;
-            Self::apply_backup_audit_checkpoint(
-                node_secret,
-                range,
-                segment_bytes,
-                &segment_sha256,
-                previous_record_count,
-                checkpoint,
-                &mut state,
-            )?;
-            latest_segment_fingerprint = Some(BackupAuditSegmentFingerprint {
-                bytes: segment_bytes,
-                sha256: segment_sha256,
-            });
-            if uses_active {
-                break;
-            }
-        }
-
-        if pending_rotation.is_none() {
-            (state, pending_rotation) = Self::verify_backup_audit_active_tail(
-                &active_path,
-                latest_segment_fingerprint.as_ref(),
-                node_secret,
-                state,
-            )?;
-        }
-
-        verification_policy
-            .finalize_chain(&mut state, pending_rotation.is_some())
-            .map_err(Self::map_backup_audit_verification_error)?;
-        Ok(ChatRelayBackupAuditChainVerification {
-            state,
-            pending_rotation,
-        })
+        Self::backup_audit_chain_verifier().verify_chain(parent, node_secret)
     }
 
     fn complete_pending_backup_audit_rotation(
@@ -1665,7 +1284,7 @@ impl ChatRelayService {
                     previous_checkpoint_mac: state.checkpoint_head_mac().to_string(),
                 },
             )
-            .map_err(Self::map_backup_audit_checkpoint_error)?;
+            .map_err(map_backup_audit_checkpoint_error)?;
         drop(active);
         Self::publish_backup_audit_checkpoint(parent, range, &checkpoint)?;
         Self::complete_pending_backup_audit_rotation(
@@ -1715,7 +1334,7 @@ impl ChatRelayService {
         let verification = chain.state;
         let next_sequence = verification
             .next_sequence()
-            .map_err(Self::map_backup_audit_verification_error)?;
+            .map_err(map_backup_audit_verification_error)?;
         let record = HmacBackupAuditRecordAuthenticator
             .build(
                 node_secret,
@@ -1725,7 +1344,7 @@ impl ChatRelayService {
                 timestamp,
                 counts,
             )
-            .map_err(Self::map_backup_audit_record_error)?;
+            .map_err(map_backup_audit_record_error)?;
         let mut encoded = serde_json::to_vec(&record).map_err(|_| {
             Self::backup_io_error(
                 rusqlite::ffi::SQLITE_FORMAT,

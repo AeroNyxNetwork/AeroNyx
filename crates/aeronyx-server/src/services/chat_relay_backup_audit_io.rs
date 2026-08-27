@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_audit_io.rs
 // ============================================
-// Version: 1.0.0-BackupAuditIoDomain
+// Version: 1.1.0-CanonicalSegmentNaming
 //
 // Creation Reason:
 //   [CHAT-RELAY-BACKUP-AUDIT-IO-DOMAIN 2026-08-27 by Codex] Extract bounded
@@ -32,6 +32,8 @@
 //   - HMAC policy and chain state transitions belong outside this I/O module.
 //
 // Last Modified:
+//   v1.1.0-CanonicalSegmentNaming - Exposed canonical segment naming to the
+//     composed chain verifier without leaking catalog implementation details
 //   v1.0.0-BackupAuditIoDomain - Initial bounded audit I/O extraction
 // ============================================
 
@@ -81,6 +83,13 @@ pub(super) enum ChatRelayBackupAuditPendingRotation {
 
 /// Bounded host I/O required by backup-audit verification and publication.
 pub(super) trait BackupAuditIo {
+    /// Returns the canonical immutable segment name for one validated range.
+    fn segment_file_name(&self, range: ChatRelayBackupAuditSegmentRange) -> String;
+
+    /// Returns the canonical immutable checkpoint name for one validated range.
+    #[cfg(test)]
+    fn checkpoint_file_name(&self, range: ChatRelayBackupAuditSegmentRange) -> String;
+
     /// Catalogs canonical immutable segment/checkpoint names.
     fn collect_segment_files(
         &self,
@@ -159,6 +168,18 @@ impl<F> LocalBackupAuditIo<F> {
 }
 
 impl<F: BackupFilesystem> BackupAuditIo for LocalBackupAuditIo<F> {
+    fn segment_file_name(&self, range: ChatRelayBackupAuditSegmentRange) -> String {
+        // [CHAT-RELAY-BACKUP-AUDIT-CHAIN-DOMAIN 2026-08-27 by Codex] Keep
+        // canonical artifact naming behind the I/O boundary consumed by the
+        // chain verifier and service compatibility wrappers.
+        Self::segment_catalog().segment_file_name(range)
+    }
+
+    #[cfg(test)]
+    fn checkpoint_file_name(&self, range: ChatRelayBackupAuditSegmentRange) -> String {
+        Self::segment_catalog().checkpoint_file_name(range)
+    }
+
     fn collect_segment_files(
         &self,
         parent: &Path,

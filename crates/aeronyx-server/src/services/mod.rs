@@ -67,8 +67,11 @@
 //   private host filesystem and maintenance-lock capability.
 //   [CHAT-RELAY-BACKUP-AUDIT-IO-DOMAIN 2026-08-27 by Codex] Registered the
 //   bounded audit artifact I/O and crash-safe publication capability.
+//   [CHAT-RELAY-BACKUP-AUDIT-CHAIN-DOMAIN 2026-08-27 by Codex] Registered the
+//   composed authenticated chain-verification and recovery classifier.
 //
 // Last Modified:
+//   v0.47.0-ChatRelayBackupAuditChainDomain - Registered composed chain verifier
 //   v0.46.0-ChatRelayBackupAuditIoDomain - Registered audit artifact host I/O
 //   v0.45.0-ChatRelayBackupFilesystemDomain - Registered backup filesystem I/O
 //   v0.44.0-ChatRelayBackupContractDomain - Registered backup contracts
@@ -137,6 +140,7 @@ pub mod blind_vault;
 pub mod chat_relay;
 mod chat_relay_backup_artifact;
 mod chat_relay_backup_audit;
+mod chat_relay_backup_audit_chain;
 mod chat_relay_backup_audit_catalog;
 mod chat_relay_backup_audit_checkpoint;
 mod chat_relay_backup_audit_io;
