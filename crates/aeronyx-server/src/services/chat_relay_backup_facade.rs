@@ -1,12 +1,17 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_facade.rs
 // ============================================
-// Version: 1.0.0-BackupManagementFacade
+// Version: 1.1.0-ExplicitBackupCapabilities
 //
 // Creation Reason:
 //   [CHAT-BACKUP-FACADE-DOMAIN 2026-08-28 by Codex] Move the host-local backup,
 //   retention, audit, anchor, and restore-plan API surface out of the oversized
 //   relay orchestration file without widening service field visibility.
+//
+// Modification Reason:
+//   [CHAT-BACKUP-SUPPORT-DOMAIN 2026-08-28 by Codex] Made namespace and
+//   restore-command traits explicit at their caller boundary after extracting
+//   private support composition from the parent module.
 //
 // Main Functionality:
 //   - Creates unique or operation-idempotent verified recovery images.
@@ -34,6 +39,7 @@
 //   - `*_at` methods are `pub(super)` only for deterministic sibling tests.
 //
 // Last Modified:
+//   v1.1.0-ExplicitBackupCapabilities - Scoped caller capability traits
 //   v1.0.0-BackupManagementFacade - Initial nested facade extraction
 // ============================================
 
@@ -43,6 +49,8 @@ use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::chat::CustodyAuditAnchorV1;
 
 use crate::config::ChatRelayConfig;
+use crate::services::chat_relay_backup_namespace::BackupArtifactNamespace;
+use crate::services::chat_relay_restore_command::RestorePlanCommand;
 
 use super::{
     derive_node_secret, now_secs, ChatRelayBackupAuditVerificationReceipt,

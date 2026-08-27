@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.79.0-BootstrapFacade
+// Version: 3.80.0-BackupSupportBoundary
 //
 // Modification Reason:
+//   [CHAT-BACKUP-SUPPORT-DOMAIN 2026-08-28 by Codex] Moved private backup
+//   composition helpers and deterministic test seams into a sibling support
+//   module without widening them beyond the relay module tree.
 //   [CHAT-BOOTSTRAP-FACADE-DOMAIN 2026-08-28 by Codex] Moved fail-closed
 //   runtime construction, schema migration, accounting reconciliation, and
 //   restart-state restoration into one nested bootstrap boundary.
@@ -452,6 +455,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.80.0-BackupSupportBoundary - Extracted private backup support methods
 //   v3.79.0-BootstrapFacade - Extracted runtime and schema bootstrap boundary
 //   v3.78.0-OnlineAdmissionFacade - Co-located live-path duplicate admission
 //   v3.77.0-BlobIdentityFacade - Co-located opaque blob identity API
@@ -554,9 +558,6 @@
 //   v1.3.1-Maintenance — Removed stale imports; behavior unchanged
 // ============================================================================
 
-#[cfg(test)]
-use std::fs::File;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -579,13 +580,6 @@ use aeronyx_core::protocol::memchain::{
 };
 
 use crate::config::ChatRelayConfig;
-use crate::services::chat_relay_backup_audit::{
-    BackupAuditPhase, ChatRelayBackupMaintenanceAuditCounts,
-};
-use crate::services::chat_relay_backup_audit_anchor::{
-    derive_backup_audit_anchor_digest, BackupAuditAnchorDigestError,
-};
-use crate::services::chat_relay_backup_audit_chain::ChatRelayBackupAuditChainVerification;
 #[cfg(test)]
 use crate::services::chat_relay_backup_audit_io::BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX
     as CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX;
@@ -596,47 +590,13 @@ use crate::services::chat_relay_backup_audit_io::{
 #[cfg(test)]
 use crate::services::chat_relay_backup_audit_io::BACKUP_AUDIT_FILE_NAME
     as CHAT_RELAY_BACKUP_AUDIT_FILE_NAME;
-use crate::services::chat_relay_backup_audit_maintenance::{
-    BackupAuditMaintenance, BackupAuditMaintenanceLimits,
-};
 #[cfg(test)]
 use crate::services::chat_relay_backup_audit_rotation::ChatRelayBackupAuditSegmentRange;
 pub use crate::services::chat_relay_backup_audit_verification::ChatRelayBackupAuditVerificationReceipt;
-use crate::services::chat_relay_backup_audit_verification::ChatRelayBackupAuditVerificationState;
-use crate::services::chat_relay_backup_certification::{
-    BackupRecoveryImageCertification, RecoveryImageSchemaRequirement,
-    SqliteBackupRecoveryImageCertifier,
-};
 use crate::services::chat_relay_backup_contract::ChatRelayBackupReceipt;
 pub use crate::services::chat_relay_backup_contract::{
     ChatRelayBackupPruneReceipt, ChatRelayBackupPruneRequest, ChatRelayBackupRetentionReceipt,
     ChatRelayRestoreReadinessReceipt, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
-};
-use crate::services::chat_relay_backup_create::{
-    verify_existing_backup_artifact as verify_existing_backup_creation_artifact,
-    VerifiedBackupCreationCommand, VerifiedBackupCreationRequest,
-};
-use crate::services::chat_relay_backup_io::{
-    backup_io_error, BackupFilesystem, LocalBackupFilesystem,
-};
-#[cfg(test)]
-use crate::services::chat_relay_backup_io::PrivateBackupControlFileMode;
-use crate::services::chat_relay_backup_inventory::{
-    BackupInventory, BackupInventoryLimits, ChatRelayBackupRetentionInspection,
-    VerifiedBackupInventory,
-};
-use crate::services::chat_relay_backup_namespace::{
-    BackupArtifactNamespace, BackupNamespaceError, HmacBackupArtifactNamespace,
-};
-use crate::services::chat_relay_backup_retention::{
-    BackupRetentionLimits, BoundedBackupRetentionPlanner,
-};
-use crate::services::chat_relay_backup_sqlite::{
-    restrict_private_sqlite_permissions, SqliteRelayBackupDatabase,
-};
-use crate::services::chat_relay_backup_prune::{
-    admit_backup_prune_request, AuditedBackupPruneExecutor, BackupPruneExecutor,
-    LocalBackupArtifactRemoval,
 };
 pub(crate) use crate::services::chat_relay_blind_route::BlindRelayRouteAdmission;
 use crate::services::chat_relay_blind_route_coordinator::BlindRouteCoordinator;
@@ -682,7 +642,6 @@ use crate::services::chat_relay_quarantine::{
     MAX_QUARANTINE_EVENTS, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION,
     QUARANTINE_SOURCE_PENDING_MESSAGE,
 };
-use crate::services::chat_relay_restore_command::{local_restore_plan_command, RestorePlanCommand};
 pub use crate::services::chat_relay_restore_plan::ChatRelayRestorePlanReceipt;
 #[cfg(test)]
 use crate::services::chat_relay_restore_plan::{RESTORE_PLAN_NONCE_BYTES, RESTORE_PLAN_VERSION};
@@ -877,307 +836,6 @@ pub struct ChatRelayService {
 }
 
 impl ChatRelayService {
-    #[cfg(test)]
-    fn restrict_sqlite_file_permissions(path: &Path) -> ChatRelayResult<()> {
-        // [CHAT-BACKUP-SQLITE-DOMAIN 2026-08-28 by Codex] Preserve the
-        // established in-crate fixture entry point while production ownership
-        // remains entirely inside the SQLite backup adapter.
-        restrict_private_sqlite_permissions(path)
-    }
-
-    fn backup_io_error(code: i32, message: &'static str) -> ChatRelayError {
-        backup_io_error(code, message)
-    }
-
-    fn backup_audit_maintenance() -> BackupAuditMaintenance {
-        // [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Build
-        // verification, rotation, and append from one immutable limit set so
-        // no service wrapper can compose mismatched safety policies.
-        BackupAuditMaintenance::new(BackupAuditMaintenanceLimits {
-            max_record_bytes: CHAT_RELAY_BACKUP_AUDIT_MAX_RECORD_BYTES,
-            max_records_per_segment: u64::try_from(CHAT_RELAY_BACKUP_AUDIT_MAX_RECORDS)
-                .unwrap_or(u64::MAX),
-            max_segment_bytes: CHAT_RELAY_BACKUP_AUDIT_MAX_BYTES,
-            max_segments: u64::try_from(CHAT_RELAY_BACKUP_AUDIT_MAX_SEGMENTS)
-                .unwrap_or(u64::MAX),
-            max_total_bytes: CHAT_RELAY_BACKUP_AUDIT_TOTAL_MAX_BYTES,
-        })
-    }
-
-    #[cfg(test)]
-    fn reserve_private_backup_file(path: &Path) -> ChatRelayResult<()> {
-        // Test fixtures use the production no-follow/private reservation
-        // boundary when simulating an interrupted maintenance artifact.
-        LocalBackupFilesystem.reserve_private_file(path)
-    }
-
-    fn private_backup_directory_for_config(config: &ChatRelayConfig) -> ChatRelayResult<PathBuf> {
-        LocalBackupFilesystem.private_directory_for_database(&config.db_path)
-    }
-
-    fn private_backup_directory(&self) -> ChatRelayResult<PathBuf> {
-        Self::private_backup_directory_for_config(&self.config)
-    }
-
-    fn backup_artifact_namespace() -> HmacBackupArtifactNamespace {
-        HmacBackupArtifactNamespace::new(CHAT_RELAY_BACKUP_OPERATION_ID_MAX_BYTES)
-    }
-
-    fn backup_recovery_image_certifier() -> SqliteBackupRecoveryImageCertifier {
-        // [CHAT-RELAY-BACKUP-CERTIFICATION-DOMAIN 2026-08-27 by Codex] Keep
-        // runtime schema installation and recovery certification bound to the
-        // same exact versions without moving service migration ownership.
-        SqliteBackupRecoveryImageCertifier::new(
-            RecoveryImageSchemaRequirement::new(
-                VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
-                VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
-            ),
-            RecoveryImageSchemaRequirement::new(
-                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
-                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
-            ),
-        )
-    }
-
-    fn verify_existing_backup_artifact(path: &Path) -> ChatRelayResult<u64> {
-        verify_existing_backup_creation_artifact(
-            &LocalBackupFilesystem,
-            path,
-            Self::verify_sqlite_backup,
-        )
-    }
-
-    fn backup_inventory() -> VerifiedBackupInventory<
-        HmacBackupArtifactNamespace,
-        BoundedBackupRetentionPlanner,
-        fn(&Path) -> ChatRelayResult<u64>,
-    > {
-        // [CHAT-RELAY-BACKUP-INVENTORY-DOMAIN 2026-08-27 by Codex] Compose
-        // trusted namespace and retention policy around the full SQLite
-        // verifier; no private path or mutable state enters the policies.
-        VerifiedBackupInventory::new(
-            Self::backup_artifact_namespace(),
-            BoundedBackupRetentionPlanner,
-            Self::verify_existing_backup_artifact,
-        )
-    }
-
-    fn backup_inventory_limits(config: &ChatRelayConfig) -> BackupInventoryLimits {
-        BackupInventoryLimits::new(
-            CHAT_RELAY_BACKUP_DIRECTORY_ENTRY_HARD_LIMIT,
-            BackupRetentionLimits::new(
-                config.custody_backup_retention_target_artifacts,
-                config.custody_backup_retention_target_bytes,
-                config.custody_backup_partial_grace_secs,
-            ),
-        )
-    }
-
-    fn restore_plan_command() -> impl RestorePlanCommand {
-        // [CHAT-RELAY-RESTORE-COMMAND-DOMAIN 2026-08-27 by Codex] Compose the
-        // verified private inventory with metadata-only active inspection and
-        // the v1 authenticator at the service edge.
-        local_restore_plan_command(Self::backup_inventory())
-    }
-
-    fn inspect_verified_backup_retention(
-        config: &ChatRelayConfig,
-        backup_directory: &Path,
-        now_unix_secs: u64,
-    ) -> ChatRelayResult<ChatRelayBackupRetentionInspection> {
-        Self::backup_inventory().inspect(
-            backup_directory,
-            now_unix_secs,
-            Self::backup_inventory_limits(config),
-        )
-    }
-
-    fn map_backup_namespace_error(error: BackupNamespaceError) -> ChatRelayError {
-        match error {
-            BackupNamespaceError::EmptyOperationId
-            | BackupNamespaceError::OperationIdTooLarge
-            | BackupNamespaceError::OperationIdLengthOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_MISUSE,
-                "invalid relay backup operation identifier",
-            ),
-            BackupNamespaceError::SecretRejected => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_AUTH,
-                "unable to derive private relay backup artifact identity",
-            ),
-        }
-    }
-
-    #[cfg(test)]
-    fn open_private_backup_control_file(path: &Path, append: bool) -> ChatRelayResult<File> {
-        let mode = if append {
-            PrivateBackupControlFileMode::Append
-        } else {
-            PrivateBackupControlFileMode::ReadWrite
-        };
-        LocalBackupFilesystem.open_control_file(path, mode)
-    }
-
-    fn acquire_backup_filesystem_lock(backup_directory: &Path) -> ChatRelayResult<Connection> {
-        LocalBackupFilesystem.acquire_maintenance_lock(
-            backup_directory,
-            CHAT_RELAY_BACKUP_LOCK_FILE_NAME,
-        )
-    }
-
-    #[cfg(test)]
-    fn backup_audit_segment_file_name(range: ChatRelayBackupAuditSegmentRange) -> String {
-        Self::backup_audit_maintenance().segment_file_name(range)
-    }
-
-    #[cfg(test)]
-    fn backup_audit_checkpoint_file_name(range: ChatRelayBackupAuditSegmentRange) -> String {
-        Self::backup_audit_maintenance().checkpoint_file_name(range)
-    }
-
-    fn backup_audit_anchor_digest(
-        state: &ChatRelayBackupAuditVerificationState,
-    ) -> ChatRelayResult<[u8; 32]> {
-        derive_backup_audit_anchor_digest(state).map_err(|error| match error {
-            BackupAuditAnchorDigestError::MissingImmutableCheckpoint => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_NOTFOUND,
-                "relay backup maintenance audit has no immutable checkpoint to anchor",
-            ),
-            BackupAuditAnchorDigestError::InvalidCheckpointAuthenticator => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit checkpoint anchor is invalid",
-            ),
-        })
-    }
-
-    #[cfg(test)]
-    fn verify_backup_audit_log(
-        file: &mut File,
-        node_secret: &[u8; 32],
-    ) -> ChatRelayResult<ChatRelayBackupAuditVerificationState> {
-        Self::backup_audit_maintenance().verify_log(file, node_secret)
-    }
-
-    fn verify_backup_audit_chain(
-        parent: &Path,
-        node_secret: &[u8; 32],
-    ) -> ChatRelayResult<ChatRelayBackupAuditChainVerification> {
-        Self::backup_audit_maintenance().verify_chain(parent, node_secret)
-    }
-
-    #[cfg(test)]
-    fn rotate_backup_audit_segment(
-        parent: &Path,
-        node_secret: &[u8; 32],
-        state: &ChatRelayBackupAuditVerificationState,
-    ) -> ChatRelayResult<()> {
-        Self::backup_audit_maintenance().rotate_segment(parent, node_secret, state)
-    }
-
-    #[cfg(test)]
-    fn backup_audit_segment_needs_rotation(
-        active_record_count: u64,
-        active_bytes: u64,
-        next_record_bytes: usize,
-    ) -> ChatRelayResult<bool> {
-        Self::backup_audit_maintenance().segment_needs_rotation(
-            active_record_count,
-            active_bytes,
-            next_record_bytes,
-        )
-    }
-
-    fn append_backup_maintenance_audit(
-        backup_directory: &Path,
-        node_secret: &[u8; 32],
-        phase: BackupAuditPhase,
-        timestamp: u64,
-        counts: ChatRelayBackupMaintenanceAuditCounts,
-    ) -> ChatRelayResult<()> {
-        Self::backup_audit_maintenance().append(
-            backup_directory,
-            node_secret,
-            phase,
-            timestamp,
-            counts,
-        )
-    }
-
-    #[cfg(test)]
-    fn is_lower_hex(value: &str, expected_len: usize) -> bool {
-        // [CHAT-RELAY-BACKUP-AUDIT-IO-DOMAIN 2026-08-27 by Codex] Preserve
-        // the shared private test helper without reintroducing production I/O.
-        value.len() == expected_len
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }
-
-    fn prune_verified_backup_retention_at(
-        config: &ChatRelayConfig,
-        node_secret: &[u8; 32],
-        request: &ChatRelayBackupPruneRequest,
-        now_unix_secs: u64,
-    ) -> ChatRelayResult<ChatRelayBackupPruneReceipt> {
-        // [CHAT-RELAY-BACKUP-PRUNE-DOMAIN 2026-08-27 by Codex] Admission
-        // remains before path resolution so an invalid command has no storage
-        // side effect. The service keeps lock ownership for the full command.
-        let admission = admit_backup_prune_request(request)?;
-        let backup_directory = Self::private_backup_directory_for_config(config)?;
-        let _filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
-        let audit = |phase, counts| {
-            Self::append_backup_maintenance_audit(
-                &backup_directory,
-                node_secret,
-                phase,
-                now_unix_secs,
-                counts,
-            )
-        };
-        AuditedBackupPruneExecutor::new(
-            Self::backup_inventory(),
-            LocalBackupArtifactRemoval,
-            audit,
-        )
-        .execute(
-            &backup_directory,
-            admission,
-            now_unix_secs,
-            Self::backup_inventory_limits(config),
-        )
-    }
-
-    fn create_verified_backup_artifact(
-        &self,
-        backup_directory: &Path,
-        destination: &Path,
-        reuse_existing: bool,
-    ) -> ChatRelayResult<ChatRelayBackupReceipt> {
-        let temporary_nonce = rand::random::<u64>();
-        let temporary_name = Self::backup_artifact_namespace()
-            .temporary_recovery_image_name(now_secs(), temporary_nonce);
-        let temporary = backup_directory.join(temporary_name.as_str());
-        VerifiedBackupCreationCommand::new(
-            LocalBackupFilesystem,
-            SqliteRelayBackupDatabase::new(
-                &self.conn,
-                Self::backup_recovery_image_certifier(),
-                CHAT_RELAY_BACKUP_PAGES_PER_STEP,
-                CHAT_RELAY_BACKUP_BUSY_TIMEOUT,
-                CHAT_RELAY_BACKUP_BUSY_RETRY_DELAY,
-            ),
-        )
-        .execute(VerifiedBackupCreationRequest {
-            backup_directory,
-            destination,
-            temporary: &temporary,
-            reuse_existing,
-        })
-    }
-
-    fn verify_sqlite_backup(conn: &Connection) -> ChatRelayResult<()> {
-        Self::backup_recovery_image_certifier().verify(conn, now_secs())
-    }
-
     // ============================================
     // Opaque ChatPullV2 cursor protection
     // ============================================
@@ -1197,6 +855,9 @@ impl ChatRelayService {
 
 #[path = "chat_relay_bootstrap.rs"]
 mod bootstrap;
+
+#[path = "chat_relay_backup_support.rs"]
+mod backup_support;
 
 #[path = "chat_relay_backup_facade.rs"]
 mod backup_facade;
