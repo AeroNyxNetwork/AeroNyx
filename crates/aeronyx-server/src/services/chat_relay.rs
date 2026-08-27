@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.74.0-PeerRelayFacade
+// Version: 3.75.0-DurableReplayFacade
 //
 // Modification Reason:
+//   [CHAT-REPLAY-FACADE-DOMAIN 2026-08-28 by Codex] Moved verified-submit and
+//   blind-route owner-fenced replay workflows into one nested facade while
+//   preserving pre-effect reservation and exact-response persistence.
 //   [CHAT-PEER-FACADE-DOMAIN 2026-08-28 by Codex] Moved privacy-safe relay
 //   observations, direct-peer circuit permits, verified-submit outcomes, and
 //   peer status snapshots into one nested facade.
@@ -437,6 +440,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.75.0-DurableReplayFacade - Extracted owner-fenced replay API facade
 //   v3.74.0-PeerRelayFacade - Extracted peer relay and circuit API facade
 //   v3.73.0-CleanupFacade - Extracted bounded-cleanup API facade
 //   v3.72.0-ExpiredNotificationFacade - Extracted expiry-control API facade
@@ -551,6 +555,7 @@ use aeronyx_core::protocol::auth::TIMESTAMP_WINDOW_SECS;
 use aeronyx_core::protocol::chat::encode_envelope;
 #[cfg(test)]
 use aeronyx_core::protocol::chat::ChatEnvelope;
+#[cfg(test)]
 use aeronyx_core::protocol::memchain::{
     ChatRelayVerifiedSubmitRequestV1, ChatRelayVerifiedSubmitResponseV1,
 };
@@ -1364,132 +1369,6 @@ impl ChatRelayService {
         self.dedup.check_and_insert(message_id)
     }
 
-    /// Serializes requests sharing one private sender/request-id cache key.
-    ///
-    /// Unrelated submissions remain concurrent across fixed lock lanes. The
-    /// caller must hold the returned guard through lookup, relay/custody, and
-    /// response insertion so duplicate requests cannot both become leaders.
-    pub(crate) async fn lock_verified_submit(
-        &self,
-        request: &ChatRelayVerifiedSubmitRequestV1,
-    ) -> tokio::sync::MutexGuard<'_, ()> {
-        self.verified_submit.lock(request).await
-    }
-
-    /// Looks up a completed response after request authentication.
-    pub(crate) fn verified_submit_cache_lookup(
-        &self,
-        request: &ChatRelayVerifiedSubmitRequestV1,
-    ) -> ChatRelayResult<VerifiedSubmitCacheLookup> {
-        self.verified_submit.lookup(&self.conn, request, now_secs())
-    }
-
-    /// Atomically reserves one private replay slot before any external effect.
-    pub(crate) fn reserve_verified_submit(
-        &self,
-        request: &ChatRelayVerifiedSubmitRequestV1,
-    ) -> ChatRelayResult<VerifiedSubmitAdmission> {
-        let now = now_secs();
-        let outcome = self.verified_submit.reserve(
-            &self.conn,
-            request,
-            self.replay_process_epoch.as_slice(),
-            now,
-        )?;
-        if matches!(
-            outcome,
-            VerifiedSubmitAdmission::ReservedForEntryRecovery
-        ) {
-            // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex]
-            // Admission remains the authoritative attempted transition.
-            self.record_verified_submit_recovery_attempted(now);
-        }
-        Ok(outcome)
-    }
-
-    /// Retains one completed response for exact retry replay across restarts.
-    pub(crate) fn remember_verified_submit_response(
-        &self,
-        request: &ChatRelayVerifiedSubmitRequestV1,
-        response: &ChatRelayVerifiedSubmitResponseV1,
-    ) -> ChatRelayResult<()> {
-        self.verified_submit.remember_response(
-            &self.conn,
-            request,
-            response,
-            self.replay_process_epoch.as_slice(),
-            now_secs(),
-        )
-    }
-
-    /// Reserves one authenticated blind route before peel, forward, or store.
-    pub(crate) fn reserve_blind_relay_route(
-        &self,
-        route_id: &[u8; 16],
-        request_commitment: &[u8; 32],
-    ) -> ChatRelayResult<BlindRelayRouteAdmission> {
-        let now = now_secs();
-        let admission = self.blind_route.reserve(
-            &self.conn,
-            route_id,
-            request_commitment,
-            self.replay_process_epoch.as_slice(),
-            now,
-        )?;
-        if matches!(admission, BlindRelayRouteAdmission::ReservedForRecovery) {
-            self.record_blind_route_recovery_attempted(now);
-        }
-        Ok(admission)
-    }
-
-    /// Arms an owned route claim immediately before its first external effect.
-    pub(crate) fn arm_blind_relay_route_effect(
-        &self,
-        route_id: &[u8; 16],
-        request_commitment: &[u8; 32],
-        started_at: u64,
-    ) -> ChatRelayResult<()> {
-        self.blind_route.arm_effect(
-            &self.conn,
-            route_id,
-            request_commitment,
-            self.replay_process_epoch.as_slice(),
-            started_at,
-        )
-    }
-
-    /// Releases only this process's claim when no external effect was armed.
-    pub(crate) fn release_unarmed_blind_relay_route(
-        &self,
-        route_id: &[u8; 16],
-        request_commitment: &[u8; 32],
-    ) -> ChatRelayResult<bool> {
-        self.blind_route.release_unarmed(
-            &self.conn,
-            route_id,
-            request_commitment,
-            self.replay_process_epoch.as_slice(),
-        )
-    }
-
-    /// Atomically replaces one route reservation with its sealed exact ACK.
-    pub(crate) fn remember_blind_relay_route_response(
-        &self,
-        route_id: &[u8; 16],
-        request_commitment: &[u8; 32],
-        response: &[u8],
-        completed_at: u64,
-    ) -> ChatRelayResult<()> {
-        self.blind_route.remember_response(
-            &self.conn,
-            route_id,
-            request_commitment,
-            self.replay_process_epoch.as_slice(),
-            response,
-            completed_at,
-        )
-    }
-
     // ============================================
     // Accessors
     // ============================================
@@ -1547,6 +1426,9 @@ mod pending_facade;
 
 #[path = "chat_relay_peer_facade.rs"]
 mod peer_facade;
+
+#[path = "chat_relay_replay_facade.rs"]
+mod replay_facade;
 
 fn sqlite_integer(value: u64, field: &'static str) -> ChatRelayResult<i64> {
     i64::try_from(value).map_err(|_| ChatRelayError::CorruptStoredData { field })
