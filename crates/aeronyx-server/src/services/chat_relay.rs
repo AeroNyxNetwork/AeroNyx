@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.70.0-PendingMessageFacade
+// Version: 3.71.0-EncryptedBlobFacade
 //
 // Modification Reason:
+//   [CHAT-BLOB-FACADE-DOMAIN 2026-08-28 by Codex] Moved opaque encrypted-blob
+//   storage, retrieval, and sender-authorized deletion APIs into a nested
+//   facade without changing quotas, identifiers, or durable representation.
 //   [CHAT-PENDING-FACADE-DOMAIN 2026-08-28 by Codex] Moved pending-message
 //   custody, snapshot delivery, quarantine telemetry, and acknowledgement APIs
 //   into a nested facade without changing wire or storage semantics.
@@ -425,6 +428,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.71.0-EncryptedBlobFacade - Extracted encrypted-blob API facade
 //   v3.70.0-PendingMessageFacade - Extracted pending-message API facade
 //   v3.69.0-BackupManagementFacade - Extracted host-local backup API facade
 //   v3.68.0-BackupAuditMaintenanceCoordinator - Composed audit maintenance
@@ -609,9 +613,7 @@ use crate::services::chat_relay_blind_route_coordinator::BlindRouteCoordinator;
 #[cfg(test)]
 use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
     as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
-use crate::services::chat_relay_blob_custody::{
-    EncryptedBlobCustodyDomain, EncryptedBlobStoreOutcome,
-};
+use crate::services::chat_relay_blob_custody::EncryptedBlobCustodyDomain;
 use crate::services::chat_relay_cleanup::{CleanupRunSummary, CLEANUP_MAX_BATCHES_PER_RUN};
 use crate::services::chat_relay_cleanup_execution::{
     BoundedRelayCleanupExecutor, RelayCleanupExecution,
@@ -1484,61 +1486,6 @@ impl ChatRelayService {
     }
 
     // ============================================
-    // Blob store / get / delete
-    // ============================================
-
-    /// Stores one opaque encrypted blob under node-wide and receiver quotas.
-    ///
-    /// # Errors
-    ///
-    /// Returns an item-size, capacity, serialization, or `SQLite` error.
-    pub fn put_blob(
-        &self,
-        sender: &[u8; 32],
-        receiver: &[u8; 32],
-        data: &[u8],
-        file_hash: &[u8; 32],
-    ) -> ChatRelayResult<String> {
-        let write =
-            self.blob_custody
-                .prepare_put(sender, receiver, data, file_hash, now_secs())?;
-        let mut conn = self.conn.lock();
-        let outcome = self.blob_custody.put(&mut conn, write)?;
-        drop(conn);
-
-        if let EncryptedBlobStoreOutcome::Stored { size, .. } = &outcome {
-            info!(size = *size, "[CHAT_RELAY] Encrypted blob stored");
-        }
-        Ok(outcome.blob_id().to_owned())
-    }
-
-    /// Retrieves an opaque encrypted blob by its HMAC-derived identifier.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `SQLite` error or [`ChatRelayError::BlobNotFound`].
-    pub fn get_blob(&self, blob_id: &str) -> ChatRelayResult<Vec<u8>> {
-        let conn = self.conn.lock();
-        let data = self.blob_custody.get(&conn, blob_id)?;
-        drop(conn);
-        debug!(size = data.len(), "[CHAT_RELAY] Encrypted blob retrieved");
-        Ok(data)
-    }
-
-    /// Deletes an encrypted blob when requested by its original sender.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `SQLite`, not-found, or authorization error.
-    pub fn delete_blob(&self, blob_id: &str, requester: &[u8; 32]) -> ChatRelayResult<()> {
-        let conn = self.conn.lock();
-        self.blob_custody.delete(&conn, blob_id, requester)?;
-        drop(conn);
-        info!("[CHAT_RELAY] Encrypted blob deleted by authorized sender");
-        Ok(())
-    }
-
-    // ============================================
     // Expired notifications
     // ============================================
 
@@ -2018,6 +1965,9 @@ impl ChatRelayService {
 
 #[path = "chat_relay_backup_facade.rs"]
 mod backup_facade;
+
+#[path = "chat_relay_blob_facade.rs"]
+mod blob_facade;
 
 #[path = "chat_relay_pending_facade.rs"]
 mod pending_facade;
