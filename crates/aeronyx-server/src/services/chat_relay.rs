@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.56.0-CleanupExecutionDomain
+// Version: 3.57.0-OnlineDedupDomain
 //
 // Modification Reason:
+//   [CHAT-ONLINE-DEDUP-DOMAIN 2026-08-28 by Codex] Moved concurrent bounded
+//   online message-id admission behind a focused deduplication capability.
 //   [CHAT-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Extracted bounded
 //   cleanup batching, transaction commits, lock release, partial failure, and
 //   deferred-backlog policy behind a replaceable execution capability.
@@ -397,6 +399,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.57.0-OnlineDedupDomain - Composed process-local duplicate admission
 //   v3.56.0-CleanupExecutionDomain - Composed bounded cleanup execution
 //   v3.55.0-PendingDeliveryDomain - Composed pending pull use cases
 //   v3.54.0-BlindRouteDurableStoreDomain - Composed route replay repository
@@ -479,11 +482,9 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::{Mutex, RwLock};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{
@@ -601,6 +602,9 @@ use crate::services::chat_relay_direct_peer_circuit::{
 #[cfg(test)]
 use crate::services::chat_relay_cleanup::CLEANUP_MESSAGE_BATCH_SIZE;
 use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
+use crate::services::chat_relay_message_dedup::{
+    BoundedOnlineMessageDedup as MessageDedup, OnlineMessageDeduplication,
+};
 use crate::services::chat_relay_peer_telemetry::{
     BlindRouteRecoveryEvent, OutboundRouteClass, PeerRelayTelemetryDomain, PeerRelayTelemetrySink,
     VerifiedSubmitEvent,
@@ -880,46 +884,6 @@ impl ExpiredNotification {
             });
         }
         Ok(message_ids)
-    }
-}
-
-// ============================================
-// Minimal LRU for online-path deduplication
-// ============================================
-
-/// Fixed-capacity LRU cache for `message_id` deduplication on the online path.
-struct MessageDedup {
-    map: DashMap<[u8; 16], u64>,
-    capacity: usize,
-    seq: AtomicU64,
-}
-
-impl MessageDedup {
-    fn new(capacity: usize) -> Self {
-        Self {
-            map: DashMap::with_capacity(capacity),
-            capacity,
-            seq: AtomicU64::new(0),
-        }
-    }
-
-    /// Returns `true` if the message_id was already seen (duplicate).
-    fn check_and_insert(&self, message_id: &[u8; 16]) -> bool {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        match self.map.entry(*message_id) {
-            Entry::Occupied(_) => return true,
-            Entry::Vacant(entry) => {
-                entry.insert(seq);
-            }
-        }
-
-        if self.map.len() > self.capacity {
-            let oldest_key = self.map.iter().min_by_key(|e| *e.value()).map(|e| *e.key());
-            if let Some(k) = oldest_key {
-                self.map.remove(&k);
-            }
-        }
-        false
     }
 }
 

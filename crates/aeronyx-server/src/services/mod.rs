@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.58.0-CleanupExecutionDomain
+// Version: 0.59.0-OnlineDedupDomain
 //
 // Modification Reason:
+//   [CHAT-ONLINE-DEDUP-DOMAIN 2026-08-28 by Codex] Registered bounded
+//   process-local online message duplicate admission.
 //   [CHAT-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Registered bounded
 //   multi-transaction cleanup execution and partial-progress reporting.
 //   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Registered the composed
@@ -93,6 +95,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.59.0-OnlineDedupDomain - Registered online duplicate admission
 //   v0.58.0-CleanupExecutionDomain - Registered bounded cleanup executor
 //   v0.57.0-PendingDeliveryDomain - Registered pull use-case composition
 //   v0.56.0-BlindRouteDurableStoreDomain - Registered route repository
@@ -196,6 +199,7 @@ mod chat_relay_cleanup_execution;
 mod chat_relay_direct_peer_circuit;
 mod chat_relay_error;
 mod chat_relay_expired_delivery;
+mod chat_relay_message_dedup;
 mod chat_relay_peer_telemetry;
 mod chat_relay_pending_custody;
 mod chat_relay_pending_delivery;
