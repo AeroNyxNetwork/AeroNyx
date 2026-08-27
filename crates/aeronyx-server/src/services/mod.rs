@@ -65,8 +65,11 @@
 //   aggregate backup contracts and fail-closed prune admission state.
 //   [CHAT-RELAY-BACKUP-FILESYSTEM-DOMAIN 2026-08-27 by Codex] Registered the
 //   private host filesystem and maintenance-lock capability.
+//   [CHAT-RELAY-BACKUP-AUDIT-IO-DOMAIN 2026-08-27 by Codex] Registered the
+//   bounded audit artifact I/O and crash-safe publication capability.
 //
 // Last Modified:
+//   v0.46.0-ChatRelayBackupAuditIoDomain - Registered audit artifact host I/O
 //   v0.45.0-ChatRelayBackupFilesystemDomain - Registered backup filesystem I/O
 //   v0.44.0-ChatRelayBackupContractDomain - Registered backup contracts
 //   v0.43.0-ChatRelayErrorDomain - Registered typed relay failures
@@ -136,6 +139,7 @@ mod chat_relay_backup_artifact;
 mod chat_relay_backup_audit;
 mod chat_relay_backup_audit_catalog;
 mod chat_relay_backup_audit_checkpoint;
+mod chat_relay_backup_audit_io;
 mod chat_relay_backup_audit_rotation;
 mod chat_relay_backup_audit_verification;
 mod chat_relay_backup_contract;
