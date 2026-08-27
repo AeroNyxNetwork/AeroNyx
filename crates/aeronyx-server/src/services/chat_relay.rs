@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.45.0-BackupAuditChainDomain
+// Version: 3.46.0-VerifiedBackupInventoryDomain
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-INVENTORY-DOMAIN 2026-08-27 by Codex] Extracted
+//   private backup inventory, artifact revalidation, checked accounting, and
+//   active restore-boundary inspection behind a composed capability.
 //   [CHAT-RELAY-BACKUP-AUDIT-CHAIN-DOMAIN 2026-08-27 by Codex] Extracted
 //   authenticated multi-segment verification, checkpoint admission, and
 //   active-tail recovery classification behind a composed verifier.
@@ -359,6 +362,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.46.0-VerifiedBackupInventoryDomain - Composed private backup inventory
 //   v3.45.0-BackupAuditChainDomain - Composed audit-chain verification
 //   v3.44.0-BackupAuditIoDomain - Trait-based audit artifact host I/O
 //   v3.43.0-BackupFilesystemDomain - Trait-based private backup host I/O
@@ -495,10 +499,7 @@ use crate::services::chat_relay_backup_audit_verification::{
     BackupAuditVerificationLimits, BackupAuditVerificationPolicy,
     BoundedBackupAuditVerificationPolicy, ChatRelayBackupAuditVerificationState,
 };
-use crate::services::chat_relay_backup_artifact::{
-    BackupArtifactAccountingError, BackupArtifactIdentityState, BackupArtifactSnapshot,
-    BackupStorageIdentity,
-};
+use crate::services::chat_relay_backup_artifact::BackupArtifactSnapshot;
 use crate::services::chat_relay_backup_contract::{BackupPruneAdmission, ChatRelayBackupReceipt};
 pub use crate::services::chat_relay_backup_contract::{
     ChatRelayBackupPruneReceipt, ChatRelayBackupPruneRequest, ChatRelayBackupRetentionReceipt,
@@ -511,13 +512,16 @@ use crate::services::chat_relay_backup_copy::{
 use crate::services::chat_relay_backup_io::{
     backup_io_error, BackupFilesystem, LocalBackupFilesystem, PrivateBackupControlFileMode,
 };
+use crate::services::chat_relay_backup_inventory::{
+    checked_backup_artifact_bytes, inspect_active_restore_boundary,
+    verified_restore_backup_count, BackupInventory, BackupInventoryLimits,
+    ChatRelayActiveRestoreBoundary, ChatRelayBackupRetentionInspection, VerifiedBackupInventory,
+};
 use crate::services::chat_relay_backup_namespace::{
-    BackupArtifactKind, BackupArtifactNamespace, BackupNamespaceError,
-    HmacBackupArtifactNamespace,
+    BackupArtifactNamespace, BackupNamespaceError, HmacBackupArtifactNamespace,
 };
 use crate::services::chat_relay_backup_retention::{
-    BackupRetentionLimits, BackupRetentionPlanner, BackupRetentionPolicyError,
-    BoundedBackupRetentionPlanner,
+    BackupRetentionLimits, BoundedBackupRetentionPlanner,
 };
 pub(crate) use crate::services::chat_relay_blind_route::BlindRelayRouteAdmission;
 use crate::services::chat_relay_blind_route::BlindRouteReplay;
@@ -787,24 +791,6 @@ impl ChatRelayCustodyAuditAnchorGuard {
     }
 }
 
-struct ChatRelayBackupRetentionInspection {
-    receipt: ChatRelayBackupRetentionReceipt,
-    newest_backup: Option<BackupArtifactSnapshot>,
-    excess_backups: Vec<BackupArtifactSnapshot>,
-    stale_partials: Vec<BackupArtifactSnapshot>,
-}
-
-/// Private active-custody metadata included in restore-plan commitments.
-#[derive(Default)]
-struct ChatRelayActiveRestoreBoundary {
-    present: bool,
-    size_bytes: u64,
-    sidecars_present: bool,
-    modified_at: Option<SystemTime>,
-    device_id: u64,
-    inode: u64,
-}
-
 impl ExpiredNotification {
     /// Deserialise the stored message IDs.
     pub fn message_ids(&self) -> ChatRelayResult<Vec<[u8; 16]>> {
@@ -1056,6 +1042,44 @@ impl ChatRelayService {
 
     fn backup_artifact_namespace() -> HmacBackupArtifactNamespace {
         HmacBackupArtifactNamespace::new(CHAT_RELAY_BACKUP_OPERATION_ID_MAX_BYTES)
+    }
+
+    fn backup_inventory() -> VerifiedBackupInventory<
+        HmacBackupArtifactNamespace,
+        BoundedBackupRetentionPlanner,
+        fn(&Path) -> ChatRelayResult<u64>,
+    > {
+        // [CHAT-RELAY-BACKUP-INVENTORY-DOMAIN 2026-08-27 by Codex] Compose
+        // trusted namespace and retention policy around the full SQLite
+        // verifier; no private path or mutable state enters the policies.
+        VerifiedBackupInventory::new(
+            Self::backup_artifact_namespace(),
+            BoundedBackupRetentionPlanner,
+            Self::verify_existing_backup_artifact,
+        )
+    }
+
+    fn backup_inventory_limits(config: &ChatRelayConfig) -> BackupInventoryLimits {
+        BackupInventoryLimits::new(
+            CHAT_RELAY_BACKUP_DIRECTORY_ENTRY_HARD_LIMIT,
+            BackupRetentionLimits::new(
+                config.custody_backup_retention_target_artifacts,
+                config.custody_backup_retention_target_bytes,
+                config.custody_backup_partial_grace_secs,
+            ),
+        )
+    }
+
+    fn inspect_verified_backup_retention(
+        config: &ChatRelayConfig,
+        backup_directory: &Path,
+        now_unix_secs: u64,
+    ) -> ChatRelayResult<ChatRelayBackupRetentionInspection> {
+        Self::backup_inventory().inspect(
+            backup_directory,
+            now_unix_secs,
+            Self::backup_inventory_limits(config),
+        )
     }
 
     fn map_backup_namespace_error(error: BackupNamespaceError) -> ChatRelayError {
@@ -1414,296 +1438,23 @@ impl ChatRelayService {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
-    fn inspect_private_backup_entry(
-        path: PathBuf,
-        file_name: String,
-    ) -> ChatRelayResult<BackupArtifactSnapshot> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
-        let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "unable to inspect relay backup retention entry",
-            )
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "relay backup retention entry is not a private regular file",
-            ));
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            if metadata.permissions().mode() & 0o077 != 0 {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_PERM,
-                    "relay backup retention entry is not owner-private",
-                ));
-            }
-        }
-
-        let modified_at = metadata.modified().map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_IOERR,
-                "unable to inspect relay backup retention age",
-            )
-        })?;
-        #[cfg(unix)]
-        let storage_identity = BackupStorageIdentity::Unix {
-            device_id: metadata.dev(),
-            inode: metadata.ino(),
-        };
-        #[cfg(not(unix))]
-        let storage_identity = BackupStorageIdentity::Portable;
-
-        Ok(BackupArtifactSnapshot::new(
-            path,
-            file_name,
-            metadata.len(),
-            modified_at,
-            storage_identity,
-        ))
-    }
-
-    fn inspect_verified_backup_retention(
-        config: &ChatRelayConfig,
-        backup_directory: &Path,
-        now_unix_secs: u64,
-    ) -> ChatRelayResult<ChatRelayBackupRetentionInspection> {
-        // [CHAT-RELAY-BACKUP-RETENTION 2026-08-16 by Codex] Scan and classify
-        // the complete private namespace without deleting anything. Unknown,
-        // non-private, corrupt, or racing entries fail closed rather than
-        // turning an audit command into an unreliable capacity estimate.
-        let namespace = Self::backup_artifact_namespace();
-        let mut artifacts = Vec::new();
-        let mut partials = Vec::new();
-        for (index, entry) in std::fs::read_dir(backup_directory)
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CANTOPEN,
-                    "unable to read private relay backup directory",
-                )
-            })?
-            .enumerate()
-        {
-            if index >= CHAT_RELAY_BACKUP_DIRECTORY_ENTRY_HARD_LIMIT {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_FULL,
-                    "relay backup directory exceeds maintenance scan limit",
-                ));
-            }
-            let entry = entry.map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to inspect relay backup directory entry",
-                )
-            })?;
-            let file_name = entry.file_name().into_string().map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_MISMATCH,
-                    "relay backup directory contains an unsupported entry name",
-                )
-            })?;
-            let inspected = Self::inspect_private_backup_entry(entry.path(), file_name.clone())?;
-            match namespace.classify(&file_name) {
-                BackupArtifactKind::RecoveryImage => {
-                    if inspected.size_bytes() == 0 {
-                        return Err(Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_CORRUPT,
-                            "relay backup retention artifact is empty",
-                        ));
-                    }
-                    artifacts.push(inspected);
-                }
-                BackupArtifactKind::InterruptedTemporary => partials.push(inspected),
-                BackupArtifactKind::Unmanaged => {
-                    return Err(Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_MISMATCH,
-                        "relay backup directory contains an unmanaged entry",
-                    ));
-                }
-            }
-        }
-
-        for artifact in &artifacts {
-            let verified_size = Self::verify_existing_backup_artifact(artifact.path())?;
-            let rechecked = Self::inspect_private_backup_entry(
-                artifact.path_buf(),
-                artifact.file_name_owned(),
-            )?;
-            if !artifact.verified_size_matches(verified_size)
-                || artifact.identity_state(&rechecked) != BackupArtifactIdentityState::Stable
-            {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CORRUPT,
-                    "relay backup retention artifact changed during verification",
-                ));
-            }
-        }
-
-        let retention = BoundedBackupRetentionPlanner
-            .plan(
-                artifacts,
-                partials,
-                now_unix_secs,
-                BackupRetentionLimits::new(
-                    config.custody_backup_retention_target_artifacts,
-                    config.custody_backup_retention_target_bytes,
-                    config.custody_backup_partial_grace_secs,
-                ),
-            )
-            .map_err(Self::backup_retention_policy_error)?;
-
-        Ok(ChatRelayBackupRetentionInspection {
-            receipt: ChatRelayBackupRetentionReceipt {
-                retained_count: retention.retained_count,
-                retained_bytes: retention.retained_bytes,
-                excess_count: retention.excess_count,
-                excess_bytes: retention.excess_bytes,
-                partial_count: retention.partial_count,
-                partial_bytes: retention.partial_bytes,
-                budget_exceeded: retention.budget_exceeded,
-            },
-            newest_backup: retention.newest_backup,
-            excess_backups: retention.excess_oldest_first,
-            stale_partials: retention.stale_partials_oldest_first,
-        })
-    }
-
-    fn backup_retention_policy_error(error: BackupRetentionPolicyError) -> ChatRelayError {
-        match error {
-            BackupRetentionPolicyError::RetainedBytesOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup retained-byte accounting overflow",
-            ),
-            BackupRetentionPolicyError::ExcessBytesOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup excess-byte accounting overflow",
-            ),
-            BackupRetentionPolicyError::PartialBytesOverflow => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_FULL,
-                "relay backup partial-byte accounting overflow",
-            ),
-            BackupRetentionPolicyError::PartialCutoffOutOfRange => Self::backup_io_error(
-                rusqlite::ffi::SQLITE_RANGE,
-                "relay backup partial grace cutoff is out of range",
-            ),
-        }
-    }
-
-    fn backup_artifact_accounting_error(
-        error: BackupArtifactAccountingError,
-        reason: &'static str,
-    ) -> ChatRelayError {
-        match error {
-            BackupArtifactAccountingError::BytesOverflow => {
-                Self::backup_io_error(rusqlite::ffi::SQLITE_FULL, reason)
-            }
-        }
-    }
-
     fn checked_backup_artifact_bytes(
         artifacts: &[BackupArtifactSnapshot],
         reason: &'static str,
     ) -> ChatRelayResult<u64> {
-        BackupArtifactSnapshot::checked_total_bytes(artifacts)
-            .map_err(|error| Self::backup_artifact_accounting_error(error, reason))
+        checked_backup_artifact_bytes(artifacts, reason)
     }
 
     fn inspect_active_restore_boundary(
         config: &ChatRelayConfig,
     ) -> ChatRelayResult<ChatRelayActiveRestoreBoundary> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
-        // [CHAT-RELAY-RESTORE-READINESS 2026-08-16 by Codex] This preflight
-        // uses metadata only. Opening an active WAL database read-only can
-        // still create shared-memory sidecars, which would violate the
-        // command's no-mutation contract.
-        let active_path = Path::new(&config.db_path);
-        let mut boundary = ChatRelayActiveRestoreBoundary::default();
-        match std::fs::symlink_metadata(active_path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_PERM,
-                        "active relay custody boundary is not a regular file",
-                    ));
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-
-                    if metadata.permissions().mode() & 0o077 != 0 {
-                        return Err(Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_PERM,
-                            "active relay custody file is not owner-private",
-                        ));
-                    }
-                    boundary.device_id = metadata.dev();
-                    boundary.inode = metadata.ino();
-                }
-                boundary.present = true;
-                boundary.size_bytes = metadata.len();
-                boundary.modified_at = Some(metadata.modified().map_err(|_| {
-                    Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_IOERR,
-                        "unable to inspect active relay custody age",
-                    )
-                })?);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CANTOPEN,
-                    "unable to inspect active relay custody boundary",
-                ));
-            }
-        }
-
-        for suffix in ["-journal", "-wal", "-shm"] {
-            let mut sidecar = active_path.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            match std::fs::symlink_metadata(PathBuf::from(sidecar)) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_symlink() || !metadata.is_file() {
-                        return Err(Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_PERM,
-                            "active relay custody sidecar boundary is unsafe",
-                        ));
-                    }
-                    boundary.sidecars_present = true;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => {
-                    return Err(Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_CANTOPEN,
-                        "unable to inspect active relay custody sidecar boundary",
-                    ));
-                }
-            }
-        }
-
-        Ok(boundary)
+        inspect_active_restore_boundary(&config.db_path)
     }
 
     fn verified_restore_backup_count(
         inspection: &ChatRelayBackupRetentionInspection,
     ) -> ChatRelayResult<usize> {
-        inspection
-            .receipt
-            .retained_count
-            .checked_add(inspection.receipt.excess_count)
-            .ok_or_else(|| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_FULL,
-                    "relay restore-plan backup count overflow",
-                )
-            })
+        verified_restore_backup_count(inspection)
     }
 
     // [CHAT-RELAY-RESTORE-PLAN-DOMAIN 2026-08-26 by Codex] The service owns
@@ -1755,30 +1506,7 @@ impl ChatRelayService {
         artifact: &BackupArtifactSnapshot,
         verify_sqlite: bool,
     ) -> ChatRelayResult<()> {
-        let before =
-            Self::inspect_private_backup_entry(artifact.path_buf(), artifact.file_name_owned())?;
-        if artifact.identity_state(&before) != BackupArtifactIdentityState::Stable {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup prune candidate changed after planning",
-            ));
-        }
-        if verify_sqlite {
-            let verified_size = Self::verify_existing_backup_artifact(artifact.path())?;
-            let after = Self::inspect_private_backup_entry(
-                artifact.path_buf(),
-                artifact.file_name_owned(),
-            )?;
-            if !artifact.verified_size_matches(verified_size)
-                || artifact.identity_state(&after) != BackupArtifactIdentityState::Stable
-            {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CORRUPT,
-                    "relay backup prune candidate changed during verification",
-                ));
-            }
-        }
-        Ok(())
+        Self::backup_inventory().reverify_candidate(artifact, verify_sqlite)
     }
 
     fn sync_backup_directory(backup_directory: &Path) -> ChatRelayResult<()> {
