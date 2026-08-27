@@ -1,9 +1,15 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.51.0-ReplaySchemaMigrationDomain
+// Version: 3.52.0-CustodySchemaDomains
 //
 // Modification Reason:
+//   [CHAT-RELAY-PENDING-SCHEMA-DOMAIN 2026-08-27 by Codex] Extracted the
+//   pending-message schema and atomic legacy queue-sequence migration behind
+//   a composed SQLite capability.
+//   [CHAT-RELAY-STORAGE-SCHEMA-DOMAIN 2026-08-27 by Codex] Extracted blob,
+//   expiry-notification, usage-trigger, and startup accounting reconciliation
+//   schema work behind a composed SQLite capability.
 //   [CHAT-RELAY-REPLAY-SCHEMA-DOMAIN 2026-08-27 by Codex] Extracted
 //   verified-submit and blind-route replay installation, legacy migration,
 //   row validation, marker advancement, and startup retention behind a
@@ -379,6 +385,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.52.0-CustodySchemaDomains - Composed custody schema migrations
 //   v3.51.0-ReplaySchemaMigrationDomain - Composed replay schema migrations
 //   v3.50.0-RecoveryImageCertificationDomain - Composed SQLite certification
 //   v3.49.0-VerifiedBackupCreationDomain - Composed backup creation command
@@ -453,7 +460,6 @@
 //   v1.3.1-Maintenance — Removed stale imports; behavior unchanged
 // ============================================================================
 
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -466,7 +472,7 @@ use parking_lot::{Mutex, RwLock};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{
     backup::{Backup, StepResult},
-    params, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    params, Connection, OptionalExtension, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -589,6 +595,9 @@ use crate::services::chat_relay_pending_custody::{
     PendingMessageCustodyDomain, PendingMessageStoreOutcome,
 };
 use crate::services::chat_relay_pending_pull::PendingMessagePullDomain;
+use crate::services::chat_relay_pending_schema::{
+    ChatRelayPendingSchemaMigration, SqliteChatRelayPendingSchemaMigrator,
+};
 #[cfg(test)]
 use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_CURSOR_V2_BYTES;
 use crate::services::chat_relay_pull_cursor::{ChatPullCursorCodec, PullCursorV2};
@@ -615,6 +624,9 @@ pub(crate) use crate::services::chat_relay_verified_submit::{
     VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
 };
 use crate::services::chat_relay_verified_submit::VerifiedSubmitReplay;
+use crate::services::chat_relay_storage_schema::{
+    ChatRelayStorageSchemaMigration, SqliteChatRelayStorageSchemaMigrator,
+};
 use crate::services::wallet_routes::WalletRouteCache;
 
 // ============================================
@@ -1741,10 +1753,12 @@ impl ChatRelayService {
 
     fn init_schema(&self) -> ChatRelayResult<()> {
         let mut conn = self.conn.lock();
-        Self::init_pending_message_schema(&mut conn)?;
-        Self::init_blob_and_notification_schema(&conn)?;
+        let pending_schema = SqliteChatRelayPendingSchemaMigrator::new();
+        pending_schema.migrate(&mut conn)?;
+        let storage_schema = SqliteChatRelayStorageSchemaMigrator::new();
+        storage_schema.install_custody_tables(&conn)?;
         self.durable_quarantine.init_schema(&conn)?;
-        Self::init_usage_schema(&conn)?;
+        storage_schema.install_usage_accounting(&conn)?;
         self.direct_peer_relay_circuit
             .init_schema(&mut conn, now_secs())?;
         let replay_schema = SqliteChatRelayReplaySchemaMigrator::new(
@@ -1768,281 +1782,11 @@ impl ChatRelayService {
         );
         replay_schema.migrate_verified_submit(&mut conn, now_secs())?;
         replay_schema.migrate_blind_route(&mut conn, now_secs())?;
-        Self::reconcile_storage_usage(&conn)?;
+        storage_schema.reconcile_usage(&conn)?;
         let retained_quarantine_events = self.durable_quarantine.retained_count(&conn)?;
         drop(conn);
         self.maintenance_status.write().quarantine_events_retained =
             u64::try_from(retained_quarantine_events).unwrap_or(u64::MAX);
-        Ok(())
-    }
-
-    fn init_pending_message_schema(conn: &mut Connection) -> ChatRelayResult<()> {
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS pending_messages (
-                message_id   BLOB(16) PRIMARY KEY,
-                sender       BLOB(32) NOT NULL,
-                receiver     BLOB(32) NOT NULL,
-                timestamp    INTEGER  NOT NULL,
-                envelope     BLOB     NOT NULL,
-                received_at  INTEGER  NOT NULL,
-                status       INTEGER  NOT NULL DEFAULT 0,
-                queue_sequence INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_pm_receiver_status
-                ON pending_messages(receiver, status);
-            CREATE INDEX IF NOT EXISTS idx_pm_receiver_status_message_id
-                ON pending_messages(receiver, status, message_id);
-            CREATE INDEX IF NOT EXISTS idx_pm_received_at
-                ON pending_messages(received_at);
-            CREATE INDEX IF NOT EXISTS idx_pm_cleanup
-                ON pending_messages(status, received_at, message_id);
-            ",
-        )?;
-
-        // Upgrade legacy queues atomically. Existing positive unique sequence
-        // values are stable across restarts; only missing/invalid/duplicate
-        // values are assigned above the current maximum. No routing metadata
-        // leaves SQLite during this migration.
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !Self::pending_message_column_exists(&tx, "queue_sequence")? {
-            tx.execute(
-                "ALTER TABLE pending_messages ADD COLUMN queue_sequence INTEGER",
-                [],
-            )?;
-        }
-        tx.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS relay_queue_sequence (
-                singleton     INTEGER PRIMARY KEY CHECK(singleton = 1),
-                last_sequence INTEGER NOT NULL CHECK(last_sequence >= 0)
-            );
-            INSERT OR IGNORE INTO relay_queue_sequence (singleton, last_sequence)
-            VALUES (1, 0);
-            ",
-        )?;
-
-        let mut seen_sequences = HashSet::new();
-        let mut max_sequence = 0_i64;
-        let mut rowids_to_assign = Vec::new();
-        {
-            let mut stmt = tx.prepare(
-                "SELECT rowid, queue_sequence
-                 FROM pending_messages
-                 ORDER BY rowid ASC",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
-            })?;
-            for row in rows {
-                let (rowid, sequence) = row?;
-                match sequence {
-                    Some(sequence) if sequence > 0 && seen_sequences.insert(sequence) => {
-                        max_sequence = max_sequence.max(sequence);
-                    }
-                    _ => rowids_to_assign.push(rowid),
-                }
-            }
-        }
-
-        let persisted_last = tx.query_row(
-            "SELECT last_sequence FROM relay_queue_sequence WHERE singleton = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if persisted_last < 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "relay_queue_sequence_negative",
-            });
-        }
-        max_sequence = max_sequence.max(persisted_last);
-        for rowid in rowids_to_assign {
-            max_sequence = max_sequence
-                .checked_add(1)
-                .ok_or(ChatRelayError::QueueSequenceExhausted)?;
-            if tx.execute(
-                "UPDATE pending_messages SET queue_sequence = ?1 WHERE rowid = ?2",
-                params![max_sequence, rowid],
-            )? != 1
-            {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "pending_message_sequence_backfill_count",
-                });
-            }
-        }
-        tx.execute(
-            "UPDATE relay_queue_sequence
-             SET last_sequence = ?1
-             WHERE singleton = 1",
-            params![max_sequence],
-        )?;
-        tx.execute_batch(
-            "
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_pm_queue_sequence
-                ON pending_messages(queue_sequence);
-            CREATE INDEX IF NOT EXISTS idx_pm_receiver_snapshot_v2
-                ON pending_messages(receiver, status, queue_sequence, timestamp);
-            ",
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn pending_message_column_exists(
-        tx: &Transaction<'_>,
-        expected_column: &str,
-    ) -> ChatRelayResult<bool> {
-        let mut stmt = tx.prepare("PRAGMA table_info(pending_messages)")?;
-        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for column in columns {
-            if column? == expected_column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn init_blob_and_notification_schema(conn: &Connection) -> ChatRelayResult<()> {
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS pending_blobs (
-                blob_id      TEXT PRIMARY KEY,
-                sender       BLOB(32) NOT NULL,
-                receiver     BLOB(32) NOT NULL,
-                data         BLOB     NOT NULL,
-                size         INTEGER  NOT NULL,
-                received_at  INTEGER  NOT NULL,
-                downloaded   INTEGER  NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_pb_received_at
-                ON pending_blobs(received_at);
-            CREATE INDEX IF NOT EXISTS idx_pb_receiver
-                ON pending_blobs(receiver);
-
-            CREATE TABLE IF NOT EXISTS expired_notifications (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                sender      BLOB(32) NOT NULL,
-                receiver    BLOB(32) NOT NULL,
-                message_ids BLOB     NOT NULL,
-                created_at  INTEGER  NOT NULL,
-                pushed      INTEGER  NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_en_sender_pushed
-                ON expired_notifications(sender, pushed);
-            CREATE INDEX IF NOT EXISTS idx_en_sender_pull_order
-                ON expired_notifications(sender, pushed, created_at, id);
-            CREATE INDEX IF NOT EXISTS idx_en_cleanup
-                ON expired_notifications(pushed, created_at, id);
-            ",
-        )?;
-        Ok(())
-    }
-
-    fn init_usage_schema(conn: &Connection) -> ChatRelayResult<()> {
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS relay_storage_usage (
-                singleton              INTEGER PRIMARY KEY CHECK(singleton = 1),
-                pending_message_count  INTEGER NOT NULL CHECK(pending_message_count >= 0),
-                pending_message_bytes  INTEGER NOT NULL CHECK(pending_message_bytes >= 0),
-                pending_blob_count     INTEGER NOT NULL CHECK(pending_blob_count >= 0),
-                pending_blob_bytes     INTEGER NOT NULL CHECK(pending_blob_bytes >= 0)
-            );
-
-            CREATE TRIGGER IF NOT EXISTS trg_relay_message_usage_insert
-            AFTER INSERT ON pending_messages
-            WHEN NEW.status = 0
-            BEGIN
-                UPDATE relay_storage_usage
-                SET pending_message_count = pending_message_count + 1,
-                    pending_message_bytes = pending_message_bytes + LENGTH(NEW.envelope)
-                WHERE singleton = 1;
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_relay_message_usage_delete
-            AFTER DELETE ON pending_messages
-            WHEN OLD.status = 0
-            BEGIN
-                UPDATE relay_storage_usage
-                SET pending_message_count = MAX(0, pending_message_count - 1),
-                    pending_message_bytes = MAX(
-                        0,
-                        pending_message_bytes - LENGTH(OLD.envelope)
-                    )
-                WHERE singleton = 1;
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_relay_message_usage_status
-            AFTER UPDATE OF status ON pending_messages
-            WHEN OLD.status != NEW.status
-            BEGIN
-                UPDATE relay_storage_usage
-                SET pending_message_count = MAX(
-                        0,
-                        pending_message_count
-                        + CASE
-                            WHEN OLD.status = 0 AND NEW.status != 0 THEN -1
-                            WHEN OLD.status != 0 AND NEW.status = 0 THEN 1
-                            ELSE 0
-                          END
-                    ),
-                    pending_message_bytes = MAX(
-                        0,
-                        pending_message_bytes
-                        + CASE
-                            WHEN OLD.status = 0 AND NEW.status != 0
-                                THEN -LENGTH(OLD.envelope)
-                            WHEN OLD.status != 0 AND NEW.status = 0
-                                THEN LENGTH(NEW.envelope)
-                            ELSE 0
-                          END
-                    )
-                WHERE singleton = 1;
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_relay_blob_usage_insert
-            AFTER INSERT ON pending_blobs
-            BEGIN
-                UPDATE relay_storage_usage
-                SET pending_blob_count = pending_blob_count + 1,
-                    pending_blob_bytes = pending_blob_bytes + NEW.size
-                WHERE singleton = 1;
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS trg_relay_blob_usage_delete
-            AFTER DELETE ON pending_blobs
-            BEGIN
-                UPDATE relay_storage_usage
-                SET pending_blob_count = MAX(0, pending_blob_count - 1),
-                    pending_blob_bytes = MAX(0, pending_blob_bytes - OLD.size)
-                WHERE singleton = 1;
-            END;
-            ",
-        )?;
-        Ok(())
-    }
-
-    fn reconcile_storage_usage(conn: &Connection) -> ChatRelayResult<()> {
-        // Reconcile from canonical rows at every startup. This makes upgrades
-        // and restored databases deterministic even if an older process never
-        // maintained the aggregate usage row.
-        let usage = Self::read_canonical_storage_usage(conn)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO relay_storage_usage (
-                singleton,
-                pending_message_count,
-                pending_message_bytes,
-                pending_blob_count,
-                pending_blob_bytes
-             )
-             VALUES (1, ?1, ?2, ?3, ?4)",
-            params![
-                sqlite_integer(usage.pending_messages, "pending_message_count")?,
-                sqlite_integer(usage.pending_message_bytes, "pending_message_bytes")?,
-                sqlite_integer(usage.pending_blobs, "pending_blob_count")?,
-                sqlite_integer(usage.pending_blob_bytes, "pending_blob_bytes")?,
-            ],
-        )?;
         Ok(())
     }
 
@@ -2853,41 +2597,6 @@ impl ChatRelayService {
             pending_message_bytes: nonnegative_sqlite_value(counters.1, "pending_message_bytes")?,
             pending_blobs: nonnegative_sqlite_value(counters.2, "pending_blob_count")?,
             pending_blob_bytes: nonnegative_sqlite_value(counters.3, "pending_blob_bytes")?,
-        })
-    }
-
-    fn read_canonical_storage_usage(conn: &Connection) -> ChatRelayResult<ChatRelayStorageUsage> {
-        let counters = conn.query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM pending_messages WHERE status = 0),
-                (SELECT COALESCE(SUM(LENGTH(envelope)), 0)
-                   FROM pending_messages WHERE status = 0),
-                (SELECT COUNT(*) FROM pending_blobs),
-                (SELECT COALESCE(SUM(size), 0) FROM pending_blobs)",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )?;
-        Ok(ChatRelayStorageUsage {
-            pending_messages: nonnegative_sqlite_value(
-                counters.0,
-                "canonical_pending_message_count",
-            )?,
-            pending_message_bytes: nonnegative_sqlite_value(
-                counters.1,
-                "canonical_pending_message_bytes",
-            )?,
-            pending_blobs: nonnegative_sqlite_value(counters.2, "canonical_pending_blob_count")?,
-            pending_blob_bytes: nonnegative_sqlite_value(
-                counters.3,
-                "canonical_pending_blob_bytes",
-            )?,
         })
     }
 

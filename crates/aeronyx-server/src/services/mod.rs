@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 1.0.0-Membership
+// Version: 0.54.0-ChatRelayCustodySchemaDomains
 //
 // Modification Reason:
+//   [CHAT-RELAY-CUSTODY-SCHEMA-DOMAINS 2026-08-27 by Codex] Registered the
+//   pending-message and aggregate storage SQLite migration capabilities.
 //   [CHAT-RELAY-REPLAY-SCHEMA-DOMAIN 2026-08-27 by Codex] Registered the
 //   composed verified-submit and blind-route SQLite migration capability.
 //   [CHAT-RELAY-BACKUP-CERTIFICATION-DOMAIN 2026-08-27 by Codex] Registered
@@ -83,6 +85,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.54.0-ChatRelayCustodySchemaDomains - Registered custody schema domains
 //   v0.53.0-ChatRelayReplaySchemaDomain - Registered replay schema migrator
 //   v0.52.0-ChatRelayBackupCertificationDomain - Registered image certifier
 //   v0.51.0-ChatRelayBackupCreateDomain - Registered backup creation command
@@ -182,6 +185,7 @@ mod chat_relay_expired_delivery;
 mod chat_relay_peer_telemetry;
 mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;
+mod chat_relay_pending_schema;
 mod chat_relay_pull_cursor;
 mod chat_relay_quarantine;
 mod chat_relay_replay_schema;
@@ -190,6 +194,7 @@ mod chat_relay_restore_plan;
 #[cfg(unix)]
 mod chat_relay_runtime_fence;
 mod chat_relay_status;
+mod chat_relay_storage_schema;
 mod chat_relay_verified_submit;
 pub mod deny_list;
 pub mod directory_chain;
