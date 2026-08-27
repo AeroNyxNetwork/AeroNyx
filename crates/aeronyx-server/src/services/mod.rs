@@ -57,8 +57,11 @@
 //   immutable private artifact identity and accounting capability.
 //   [CHAT-RELAY-BACKUP-COPY-RETRY-DOMAIN 2026-08-27 by Codex] Registered the
 //   bounded SQLite-independent backup-copy retry state machine.
+//   [CHAT-RELAY-STATUS-CONTRACT-DOMAIN 2026-08-27 by Codex] Registered the
+//   privacy-safe serialized relay status contract and shared policy defaults.
 //
 // Last Modified:
+//   v0.42.0-ChatRelayStatusDomain - Registered relay status contracts
 //   v0.41.0-BackupCopyRetryDomain - Registered backup-copy retry policy
 //   v0.40.0-BackupArtifactDomain - Registered backup artifact snapshots
 //   v0.39.0-BackupNamespaceDomain - Registered backup namespace policy
@@ -142,6 +145,7 @@ mod chat_relay_quarantine;
 mod chat_relay_restore_plan;
 #[cfg(unix)]
 mod chat_relay_runtime_fence;
+mod chat_relay_status;
 mod chat_relay_verified_submit;
 pub mod deny_list;
 pub mod directory_chain;
