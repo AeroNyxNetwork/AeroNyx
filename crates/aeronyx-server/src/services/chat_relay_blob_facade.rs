@@ -1,14 +1,19 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_blob_facade.rs
 // ============================================
-// Version: 1.0.0-EncryptedBlobFacade
+// Version: 1.1.0-BlobIdentityFacade
 //
 // Creation Reason:
 //   [CHAT-BLOB-FACADE-DOMAIN 2026-08-28 by Codex] Move opaque encrypted-blob
 //   storage, retrieval, and sender-authorized deletion APIs out of the relay
 //   composition root without changing identifiers, quotas, or durable format.
 //
+// Modification Reason:
+//   [CHAT-BLOB-IDENTITY-FACADE-DOMAIN 2026-08-28 by Codex] Co-locate opaque
+//   blob identifier derivation with the custody operations that consume it.
+//
 // Main Functionality:
+//   - Derives stable node-private identifiers for opaque encrypted blobs.
 //   - Stores bounded opaque ciphertext under node and receiver quotas.
 //   - Retrieves ciphertext by its node-private HMAC-derived identifier.
 //   - Deletes ciphertext only for the sender bound at creation time.
@@ -18,10 +23,10 @@
 //   - `EncryptedBlobCustodyDomain` owns validation, identity, and persistence.
 //
 // Main Logical Flow:
-//   1. Prepare and validate the blob command before taking the DB lock.
-//   2. Execute one bounded custody operation through the domain component.
-//   3. Emit aggregate size/action telemetry without content or identities.
-//   4. Return only the opaque blob identifier or ciphertext requested.
+//   1. Derive an opaque identifier from bounded custody-domain inputs.
+//   2. Prepare and validate a blob command before taking the DB lock.
+//   3. Execute one bounded custody operation through the domain component.
+//   4. Return only the opaque identifier or ciphertext requested.
 //
 // Important Note for Next Developer:
 //   - The relay must never parse, decrypt, classify, or inspect blob contents.
@@ -30,6 +35,7 @@
 //   - Quota and durable-write behavior belongs to the custody domain.
 //
 // Last Modified:
+//   v1.1.0-BlobIdentityFacade - Co-located opaque identifier derivation
 //   v1.0.0-EncryptedBlobFacade - Initial encrypted-blob facade extraction
 // ============================================
 
@@ -40,6 +46,18 @@ use crate::services::chat_relay_blob_custody::EncryptedBlobStoreOutcome;
 use super::{now_secs, ChatRelayResult, ChatRelayService};
 
 impl ChatRelayService {
+    /// Derives the stable node-private identifier for one encrypted blob.
+    #[must_use]
+    pub fn compute_blob_id(
+        &self,
+        sender: &[u8; 32],
+        receiver: &[u8; 32],
+        file_hash: &[u8; 32],
+    ) -> String {
+        self.blob_custody
+            .compute_blob_id(sender, receiver, file_hash)
+    }
+
     /// Stores one opaque encrypted blob under node-wide and receiver quotas.
     ///
     /// # Errors

@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.76.0-OperatorStatusFacade
+// Version: 3.77.0-BlobIdentityFacade
 //
 // Modification Reason:
+//   [CHAT-BLOB-IDENTITY-FACADE-DOMAIN 2026-08-28 by Codex] Moved the stable
+//   encrypted-blob identifier API beside blob custody operations so the relay
+//   composition root no longer exposes blob-domain mechanics directly.
 //   [CHAT-STATUS-FACADE-DOMAIN 2026-08-28 by Codex] Moved configuration,
 //   maintenance health, worker-failure recording, and durable storage usage
 //   APIs into one operator-facing facade without changing public contracts.
@@ -443,6 +446,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.77.0-BlobIdentityFacade - Co-located opaque blob identity API
 //   v3.76.0-OperatorStatusFacade - Extracted operator-facing status API facade
 //   v3.75.0-DurableReplayFacade - Extracted owner-fenced replay API facade
 //   v3.74.0-PeerRelayFacade - Extracted peer relay and circuit API facade
@@ -1345,20 +1349,6 @@ impl ChatRelayService {
     ) -> ChatRelayResult<PullCursorV2> {
         self.pending_delivery
             .decode_cursor(receiver, after_timestamp, encoded)
-    }
-
-    // ============================================
-    // Blob ID derivation
-    // ============================================
-
-    pub fn compute_blob_id(
-        &self,
-        sender: &[u8; 32],
-        receiver: &[u8; 32],
-        file_hash: &[u8; 32],
-    ) -> String {
-        self.blob_custody
-            .compute_blob_id(sender, receiver, file_hash)
     }
 
     // ============================================
