@@ -1,12 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_direct_peer_circuit.rs
 // ============================================
-// Version: 1.0.0-DirectPeerCircuitDomain
+// Version: 1.1.0-StatusContractDependency
 //
 // Creation Reason:
 //   [CHAT-DIRECT-PEER-CIRCUIT-DOMAIN 2026-08-25 by Codex] Extract the
 //   source-blind direct-peer admission state machine and its durable SQLite
 //   checkpoint from the oversized chat relay service.
+//
+// Modification Reason:
+//   [CHAT-RELAY-STATUS-CONTRACT-DOMAIN 2026-08-27 by Codex] Depend directly
+//   on the focused status contract domain instead of the orchestration facade.
 //
 // Main Functionality:
 //   - Models closed, open, and leased half-open states as a closed enum.
@@ -16,7 +20,8 @@
 //   - Restores restart safety and fails closed on corrupt or missing state.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns the public API, SLO window, and telemetry.
+//   - `chat_relay_status.rs` owns the serialized status and policy defaults.
+//   - `chat_relay.rs` owns the public compatibility facade and service.
 //   - `rusqlite` supplies the production checkpoint repository.
 //   - `parking_lot` supplies process-local state and connection guards.
 //
@@ -34,6 +39,7 @@
 //   - A runtime checkpoint failure must continue to fail closed.
 //
 // Last Modified:
+//   v1.1.0-StatusContractDependency - Consumed shared status contracts directly
 //   v1.0.0-DirectPeerCircuitDomain - Initial state/repository composition
 // ============================================
 
@@ -43,14 +49,11 @@ use parking_lot::MutexGuard;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use tracing::warn;
 
-use super::chat_relay::{ChatRelayDirectPeerCircuitStatus, ChatRelayError, ChatRelayResult};
-
-/// Cooldown before one source-blind target-bound relay recovery probe.
-pub(super) const DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS: u64 = 30;
-/// Maximum time reserved for one half-open delivery before fail-closed reopen.
-pub(super) const DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS: u64 = 15;
-/// Consecutive half-open delivery successes required to close the circuit.
-pub(super) const DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES: u8 = 2;
+use super::chat_relay::{ChatRelayError, ChatRelayResult};
+use super::chat_relay_status::{
+    ChatRelayDirectPeerCircuitStatus, DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS,
+    DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS, DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES,
+};
 /// Durable singleton format for source-blind direct relay circuit state.
 pub(super) const DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION: i64 = 1;
 /// Fixed schema marker proving the durable circuit checkpoint was installed.

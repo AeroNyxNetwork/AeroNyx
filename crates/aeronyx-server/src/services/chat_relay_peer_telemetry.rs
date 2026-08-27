@@ -1,12 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_peer_telemetry.rs
 // ============================================
-// Version: 1.0.0-PeerRelayTelemetryDomain
+// Version: 1.1.0-StatusContractDependency
 //
 // Creation Reason:
 //   [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] Extract privacy-safe
 //   relay health classification and process-local aggregation from the
 //   oversized chat relay orchestration service.
+//
+// Modification Reason:
+//   [CHAT-RELAY-STATUS-CONTRACT-DOMAIN 2026-08-27 by Codex] Depend directly
+//   on the focused status contract and its single-source policy defaults.
 //
 // Main Functionality:
 //   - Defines validated inbound and outbound failure reason value objects.
@@ -16,7 +20,7 @@
 //   - Exposes a replaceable telemetry sink capability to the relay service.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns the stable serialized status contracts.
+//   - `chat_relay_status.rs` owns stable status contracts and policy defaults.
 //   - `chat_relay_direct_peer_circuit.rs` owns durable admission state.
 //   - `aeronyx_core::protocol::memchain` owns verified-submit result codes.
 //
@@ -30,9 +34,10 @@
 //   - Never add peer, route, endpoint, wallet, message, or payload dimensions.
 //   - Keep the failure vocabularies closed; unrecognized values are `unknown`.
 //   - Preserve one-lock updates for SLO and lifetime direct-peer counters.
-//   - Keep serialized field names and defaults in `chat_relay.rs` compatible.
+//   - Keep serialized field names and defaults in `chat_relay_status.rs` compatible.
 //
 // Last Modified:
+//   v1.1.0-StatusContractDependency - Consumed shared status contracts directly
 //   v1.0.0-PeerRelayTelemetryDomain - Initial trait-based composition
 // ============================================
 
@@ -44,21 +49,14 @@ use aeronyx_core::protocol::memchain::{
     CHAT_VERIFIED_SUBMIT_REJECTED_V1,
 };
 
-use super::chat_relay::{
+#[cfg(test)]
+use super::chat_relay_status::DIRECT_PEER_RETRY_SLO_WINDOW_SECS;
+use super::chat_relay_status::{
     ChatRelayDirectPeerCircuitStatus, ChatRelayDirectPeerSloStatus, ChatRelayPeerStatus,
+    DIRECT_PEER_RETRY_SLO_BUCKET_COUNT, DIRECT_PEER_RETRY_SLO_BUCKET_SECS,
+    DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES, DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS,
+    DIRECT_PEER_RETRY_SLO_TARGET_BPS,
 };
-
-/// Recent target-bound delivery health uses five fixed one-minute buckets.
-pub(super) const DIRECT_PEER_RETRY_SLO_BUCKET_SECS: u64 = 60;
-const DIRECT_PEER_RETRY_SLO_BUCKET_COUNT: usize = 5;
-pub(super) const DIRECT_PEER_RETRY_SLO_WINDOW_SECS: u64 =
-    DIRECT_PEER_RETRY_SLO_BUCKET_SECS * DIRECT_PEER_RETRY_SLO_BUCKET_COUNT as u64;
-/// 99.00% target-bound delivery success target, represented in basis points.
-pub(super) const DIRECT_PEER_RETRY_SLO_TARGET_BPS: u16 = 9_900;
-/// Require repeated failures before declaring a short-window outage.
-pub(super) const DIRECT_PEER_RETRY_SLO_FAILED_MIN_FAILURES: u64 = 3;
-/// At or below 50% delivery success with enough failures is a failed window.
-pub(super) const DIRECT_PEER_RETRY_SLO_FAILED_SUCCESS_BPS: u16 = 5_000;
 
 /// Closed aggregate outcomes after one entry-recovery admission.
 // [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] The containing module is
