@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.65.0-NodeSecretDomain
+// Version: 0.66.0-VerifiedSubmitCoordinator
 //
 // Modification Reason:
+//   [VERIFIED-SUBMIT-COORDINATOR-DOMAIN 2026-08-28 by Codex] Registered the
+//   composed verified-submit replay and durable ownership use-case boundary.
 //   [CHAT-NODE-SECRET-DOMAIN 2026-08-28 by Codex] Registered versioned relay
 //   node-secret HKDF derivation.
 //   [CHAT-BACKUP-SQLITE-DOMAIN 2026-08-28 by Codex] Registered the live SQLite
@@ -107,6 +109,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.66.0-VerifiedSubmitCoordinator - Registered verified-submit use cases
 //   v0.65.0-NodeSecretDomain - Registered relay node-secret derivation
 //   v0.64.0-BackupSqliteDomain - Registered SQLite backup adapter
 //   v0.63.0-CustodyAnchorGuardDomain - Registered custody anchor guard
@@ -239,6 +242,7 @@ mod chat_relay_status;
 mod chat_relay_storage_schema;
 mod chat_relay_storage_usage;
 mod chat_relay_verified_submit;
+mod chat_relay_verified_submit_coordinator;
 mod chat_relay_verified_submit_store;
 pub mod deny_list;
 pub mod directory_chain;

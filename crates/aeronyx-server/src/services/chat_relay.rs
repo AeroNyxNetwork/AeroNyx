@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.63.0-NodeSecretDomain
+// Version: 3.64.0-VerifiedSubmitCoordinator
 //
 // Modification Reason:
+//   [VERIFIED-SUBMIT-COORDINATOR-DOMAIN 2026-08-28 by Codex] Composed private
+//   replay, durable ownership, recovery, and response completion as one use case.
 //   [CHAT-NODE-SECRET-DOMAIN 2026-08-28 by Codex] Re-exported versioned HKDF
 //   node-secret derivation from a focused cryptographic boundary.
 //   [CHAT-BACKUP-SQLITE-DOMAIN 2026-08-28 by Codex] Moved SQLite online copy,
@@ -411,6 +413,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.64.0-VerifiedSubmitCoordinator - Composed verified-submit use cases
 //   v3.63.0-NodeSecretDomain - Decoupled node-secret HKDF derivation
 //   v3.62.0-BackupSqliteDomain - Composed SQLite backup adapter
 //   v3.61.0-CustodyAnchorGuardDomain - Composed custody anchor RAII contract
@@ -665,11 +668,7 @@ use crate::services::chat_relay_runtime_fence::ChatRelayRuntimeFence;
 pub(crate) use crate::services::chat_relay_verified_submit::{
     VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
 };
-use crate::services::chat_relay_verified_submit::VerifiedSubmitReplay;
-use crate::services::chat_relay_verified_submit_store::{
-    DurableVerifiedSubmitLookup, SqliteVerifiedSubmitDurableStore,
-    VerifiedSubmitDurableRepository,
-};
+use crate::services::chat_relay_verified_submit_coordinator::VerifiedSubmitCoordinator;
 use crate::services::chat_relay_storage_schema::{
     ChatRelayStorageSchemaMigration, SqliteChatRelayStorageSchemaMigrator,
 };
@@ -855,17 +854,12 @@ pub struct ChatRelayService {
     /// cutoffs, lock scope, commits, partial failure, and batch budget while
     /// the service retains scheduling, logs, and aggregate health status.
     cleanup_execution: BoundedRelayCleanupExecutor,
-    /// Private verified-submit replay domain capability.
+    /// Private verified-submit replay and durable ownership coordinator.
     ///
-    /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
-    /// lock striping, key derivation, and response protection are composed.
-    verified_submit_replay: VerifiedSubmitReplay,
-    /// Private durable reservation, recovery lease, and completion repository.
-    ///
-    /// [VERIFIED-SUBMIT-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] The service
-    /// retains request binding and telemetry while this capability owns every
-    /// verified-submit SQLite transaction and compare-and-swap transition.
-    verified_submit_store: SqliteVerifiedSubmitDurableStore,
+    /// [VERIFIED-SUBMIT-COORDINATOR-DOMAIN 2026-08-28 by Codex] The service
+    /// retains aggregate telemetry while this capability owns request binding,
+    /// replay lookup, owner-fenced reservation, recovery, and completion.
+    verified_submit: VerifiedSubmitCoordinator,
     /// Private blind-route replay identity and exact-response protector.
     ///
     /// [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Private identity and
@@ -1511,12 +1505,12 @@ impl ChatRelayService {
             VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
             BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
         );
-        let verified_submit_replay = VerifiedSubmitReplay::new(node_secret, dedup_capacity)?;
-        let verified_submit_store = SqliteVerifiedSubmitDurableStore::new(
-            VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
+        let verified_submit = VerifiedSubmitCoordinator::new(
+            node_secret,
             dedup_capacity,
+            VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
             VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
-        );
+        )?;
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
         let blind_route_store = SqliteBlindRouteDurableStore::new(
             BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
@@ -1540,8 +1534,7 @@ impl ChatRelayService {
             blob_custody,
             durable_quarantine,
             cleanup_execution,
-            verified_submit_replay,
-            verified_submit_store,
+            verified_submit,
             blind_route_replay,
             blind_route_store,
             replay_process_epoch,
@@ -1647,17 +1640,6 @@ impl ChatRelayService {
         self.dedup.check_and_insert(message_id)
     }
 
-    fn verified_submit_cache_key(&self, request: &ChatRelayVerifiedSubmitRequestV1) -> [u8; 32] {
-        self.verified_submit_replay.cache_key(request)
-    }
-
-    fn verified_submit_envelope_fingerprint(
-        &self,
-        request: &ChatRelayVerifiedSubmitRequestV1,
-    ) -> [u8; 32] {
-        self.verified_submit_replay.envelope_fingerprint(request)
-    }
-
     /// Serializes requests sharing one private sender/request-id cache key.
     ///
     /// Unrelated submissions remain concurrent across fixed lock lanes. The
@@ -1667,7 +1649,7 @@ impl ChatRelayService {
         &self,
         request: &ChatRelayVerifiedSubmitRequestV1,
     ) -> tokio::sync::MutexGuard<'_, ()> {
-        self.verified_submit_replay.lock(request).await
+        self.verified_submit.lock(request).await
     }
 
     /// Looks up a completed response after request authentication.
@@ -1675,44 +1657,7 @@ impl ChatRelayService {
         &self,
         request: &ChatRelayVerifiedSubmitRequestV1,
     ) -> ChatRelayResult<VerifiedSubmitCacheLookup> {
-        let cache_key = self.verified_submit_cache_key(request);
-        let envelope_fingerprint = self.verified_submit_envelope_fingerprint(request);
-        let memory_lookup = self
-            .verified_submit_replay
-            .lookup_cached(&cache_key, &envelope_fingerprint);
-        if !matches!(memory_lookup, VerifiedSubmitCacheLookup::Miss) {
-            return Ok(memory_lookup);
-        }
-
-        match self.verified_submit_store.lookup(
-            &self.conn,
-            &cache_key,
-            &envelope_fingerprint,
-            now_secs(),
-        )? {
-            DurableVerifiedSubmitLookup::Miss => Ok(VerifiedSubmitCacheLookup::Miss),
-            DurableVerifiedSubmitLookup::Conflict => Ok(VerifiedSubmitCacheLookup::Conflict),
-            DurableVerifiedSubmitLookup::Pending => Ok(VerifiedSubmitCacheLookup::Pending),
-            DurableVerifiedSubmitLookup::Completed(durable) => {
-                let response = self.verified_submit_replay.recover_response(
-                    &cache_key,
-                    &envelope_fingerprint,
-                    &durable.nonce,
-                    &durable.ciphertext,
-                )?;
-                response.validate_for_request(request).map_err(|_| {
-                    ChatRelayError::CorruptStoredData {
-                        field: "verified_submit_response_request_binding",
-                    }
-                })?;
-                self.verified_submit_replay.remember_cached(
-                    cache_key,
-                    envelope_fingerprint,
-                    response.clone(),
-                );
-                Ok(VerifiedSubmitCacheLookup::Exact(response))
-            }
-        }
+        self.verified_submit.lookup(&self.conn, request, now_secs())
     }
 
     /// Atomically reserves one private replay slot before any external effect.
@@ -1720,13 +1665,10 @@ impl ChatRelayService {
         &self,
         request: &ChatRelayVerifiedSubmitRequestV1,
     ) -> ChatRelayResult<VerifiedSubmitAdmission> {
-        let cache_key = self.verified_submit_cache_key(request);
-        let envelope_fingerprint = self.verified_submit_envelope_fingerprint(request);
         let now = now_secs();
-        let outcome = self.verified_submit_store.reserve(
+        let outcome = self.verified_submit.reserve(
             &self.conn,
-            &cache_key,
-            &envelope_fingerprint,
+            request,
             self.replay_process_epoch.as_slice(),
             now,
         )?;
@@ -1747,34 +1689,13 @@ impl ChatRelayService {
         request: &ChatRelayVerifiedSubmitRequestV1,
         response: &ChatRelayVerifiedSubmitResponseV1,
     ) -> ChatRelayResult<()> {
-        let cache_key = self.verified_submit_cache_key(request);
-        let envelope_fingerprint = self.verified_submit_envelope_fingerprint(request);
-        response
-            .validate_for_request(request)
-            .map_err(|_| ChatRelayError::VerifiedSubmitProtectionFailed)?;
-        let protected = self.verified_submit_replay.protect_response(
-            &cache_key,
-            &envelope_fingerprint,
-            response,
-        )?;
-        let durable_result = self.verified_submit_store.complete(
+        self.verified_submit.remember_response(
             &self.conn,
-            &cache_key,
-            &envelope_fingerprint,
+            request,
+            response,
             self.replay_process_epoch.as_slice(),
-            protected,
             now_secs(),
-        );
-
-        // Preserve same-process retry safety even if the durable write fails.
-        // The caller receives the storage error and records only its fixed
-        // reason bucket; no request-derived values enter logs or health.
-        self.verified_submit_replay.remember_cached(
-            cache_key,
-            envelope_fingerprint,
-            response.clone(),
-        );
-        durable_result
+        )
     }
 
     fn blind_relay_route_cache_key(&self, route_id: &[u8; 16]) -> [u8; 32] {

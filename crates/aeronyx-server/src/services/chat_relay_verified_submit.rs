@@ -1,12 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_verified_submit.rs
 // ============================================
-// Version: 1.0.0-VerifiedSubmitReplayDomain
+// Version: 1.1.0-CoordinatorComposition
 //
 // Creation Reason:
 //   [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Extract the private
 //   verified-submit replay domain from the oversized ChatRelay service while
 //   preserving every existing wire, SQLite, retention, and error contract.
+//
+// Modification Reason:
+//   [VERIFIED-SUBMIT-COORDINATOR-DOMAIN 2026-08-28 by Codex] Updated ownership
+//   after replay and durable transitions moved behind one use-case coordinator.
 //
 // Main Functionality:
 //   - Models lookup and durable admission states as closed enums.
@@ -16,7 +20,7 @@
 //     sender keys, request IDs, commitments, or response contents.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns SQLite transactions and composes this capability.
+//   - `chat_relay_verified_submit_coordinator.rs` composes persistence.
 //   - `aeronyx-core` owns the authenticated verified-submit wire models.
 //
 // Main Logical Flow:
@@ -28,11 +32,12 @@
 // Important Note for Next Developer:
 //   - Do not add request-derived values to logs, status, or durable metadata.
 //   - Preserve exact response replay and fixed-capacity eviction semantics.
-//   - SQLite reservation/response transitions must remain one IMMEDIATE
-//     transaction in `chat_relay.rs`; this module does not own persistence.
+//   - SQLite reservation/response transitions remain owned by the durable
+//     repository composed through the coordinator; this module has no I/O.
 //   - A replacement protector must authenticate both private fingerprints.
 //
 // Last Modified:
+//   v1.1.0-CoordinatorComposition - Documented use-case coordinator ownership
 //   v1.0.0-VerifiedSubmitReplayDomain - Initial trait/composition extraction
 // ============================================
 
