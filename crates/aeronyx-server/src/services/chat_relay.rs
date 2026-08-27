@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.35.0-AuditVerificationDomain
+// Version: 3.36.0-BackupNamespaceDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -84,6 +84,9 @@
 //   [CHAT-RELAY-AUDIT-VERIFICATION-DOMAIN 2026-08-27 by Codex] Extracted
 //   bounded record/checkpoint admissions and cumulative verification state
 //   transitions behind a pure fail-closed policy.
+//   [CHAT-RELAY-BACKUP-NAMESPACE-DOMAIN 2026-08-27 by Codex] Extracted
+//   canonical recovery-image naming, opaque operation-key derivation, and
+//   fail-closed private-directory entry classification.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -328,6 +331,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.36.0-BackupNamespaceDomain — Trait-based private artifact namespace
 //   v3.35.0-AuditVerificationDomain — Trait-based verification state machine
 //   v3.34.0-AuditCatalogDomain — Trait-based path-free segment catalog
 //   v3.33.0-AuditRotationDomain — Trait-based segment rotation planning
@@ -398,7 +402,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use hmac::{Hmac, Mac};
 use parking_lot::{Mutex, RwLock};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{
@@ -449,6 +452,10 @@ use crate::services::chat_relay_backup_audit_verification::{
     BackupAuditCheckpointAdmission, BackupAuditRecordAdmission, BackupAuditSegmentBaseline,
     BackupAuditVerificationError, BackupAuditVerificationLimits, BackupAuditVerificationPolicy,
     BoundedBackupAuditVerificationPolicy, ChatRelayBackupAuditVerificationState,
+};
+use crate::services::chat_relay_backup_namespace::{
+    BackupArtifactKind, BackupArtifactNamespace, BackupNamespaceError,
+    HmacBackupArtifactNamespace,
 };
 use crate::services::chat_relay_backup_retention::{
     BackupRetentionArtifact, BackupRetentionLimits, BackupRetentionPlanner,
@@ -517,11 +524,8 @@ use crate::services::chat_relay_verified_submit::VerifiedSubmitReplay;
 use crate::services::wallet_routes::WalletRouteCache;
 
 // ============================================
-// Type aliases
+// Constants
 // ============================================
-
-type HmacSha256 = Hmac<Sha256>;
-
 /// Maximum IDs accepted in one authenticated `ChatAck` frame.
 pub const MAX_CHAT_ACK_MESSAGE_IDS: usize = 100;
 /// Maximum IDs encoded into one `ChatExpired` frame.
@@ -564,8 +568,6 @@ const CHAT_RELAY_BACKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const CHAT_RELAY_BACKUP_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 /// Maximum UTF-8 bytes accepted from one management-plane operation ID.
 const CHAT_RELAY_BACKUP_OPERATION_ID_MAX_BYTES: usize = 128;
-/// Domain separation for opaque, node-local backup operation artifact keys.
-const CHAT_RELAY_BACKUP_OPERATION_HMAC_DOMAIN: &[u8] = b"AeroNyx-RelayCustodyBackup-Operation-v1";
 /// Fixed validity window for a host-local authenticated restore plan.
 pub const CHAT_RELAY_RESTORE_PLAN_VALIDITY_SECS: u64 = RESTORE_PLAN_VALIDITY_SECS;
 /// Current restore-plan wire contract.
@@ -1876,6 +1878,25 @@ impl ChatRelayService {
         Self::private_backup_directory_for_config(&self.config)
     }
 
+    fn backup_artifact_namespace() -> HmacBackupArtifactNamespace {
+        HmacBackupArtifactNamespace::new(CHAT_RELAY_BACKUP_OPERATION_ID_MAX_BYTES)
+    }
+
+    fn map_backup_namespace_error(error: BackupNamespaceError) -> ChatRelayError {
+        match error {
+            BackupNamespaceError::EmptyOperationId
+            | BackupNamespaceError::OperationIdTooLarge
+            | BackupNamespaceError::OperationIdLengthOverflow => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_MISUSE,
+                "invalid relay backup operation identifier",
+            ),
+            BackupNamespaceError::SecretRejected => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_AUTH,
+                "unable to derive private relay backup artifact identity",
+            ),
+        }
+    }
+
     fn open_private_backup_control_file(path: &Path, append: bool) -> ChatRelayResult<File> {
         #[cfg(unix)]
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -3053,45 +3074,6 @@ impl ChatRelayService {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
-    fn is_managed_backup_file_name(name: &str) -> bool {
-        let Some(stem) = name
-            .strip_prefix("relay-custody-")
-            .and_then(|value| value.strip_suffix(".sqlite"))
-        else {
-            return false;
-        };
-
-        if let Some(operation_key) = stem.strip_prefix("operation-") {
-            return Self::is_lower_hex(operation_key, 32);
-        }
-
-        let Some((created_at, nonce)) = stem.rsplit_once('-') else {
-            return false;
-        };
-        !created_at.is_empty()
-            && created_at.bytes().all(|byte| byte.is_ascii_digit())
-            && Self::is_lower_hex(nonce, 16)
-    }
-
-    fn is_managed_backup_temporary_name(name: &str) -> bool {
-        let base = ["-journal", "-wal", "-shm"]
-            .into_iter()
-            .find_map(|suffix| name.strip_suffix(suffix))
-            .unwrap_or(name);
-        let Some(stem) = base
-            .strip_prefix(".relay-custody-")
-            .and_then(|value| value.strip_suffix(".tmp"))
-        else {
-            return false;
-        };
-        let Some((created_at, nonce)) = stem.rsplit_once('-') else {
-            return false;
-        };
-        !created_at.is_empty()
-            && created_at.bytes().all(|byte| byte.is_ascii_digit())
-            && Self::is_lower_hex(nonce, 16)
-    }
-
     fn inspect_private_backup_entry(
         path: PathBuf,
         file_name: String,
@@ -3150,6 +3132,7 @@ impl ChatRelayService {
         // the complete private namespace without deleting anything. Unknown,
         // non-private, corrupt, or racing entries fail closed rather than
         // turning an audit command into an unreliable capacity estimate.
+        let namespace = Self::backup_artifact_namespace();
         let mut artifacts = Vec::new();
         let mut partials = Vec::new();
         for (index, entry) in std::fs::read_dir(backup_directory)
@@ -3180,21 +3163,23 @@ impl ChatRelayService {
                 )
             })?;
             let inspected = Self::inspect_private_backup_entry(entry.path(), file_name.clone())?;
-            if Self::is_managed_backup_file_name(&file_name) {
-                if inspected.size_bytes == 0 {
+            match namespace.classify(&file_name) {
+                BackupArtifactKind::RecoveryImage => {
+                    if inspected.size_bytes == 0 {
+                        return Err(Self::backup_io_error(
+                            rusqlite::ffi::SQLITE_CORRUPT,
+                            "relay backup retention artifact is empty",
+                        ));
+                    }
+                    artifacts.push(inspected);
+                }
+                BackupArtifactKind::InterruptedTemporary => partials.push(inspected),
+                BackupArtifactKind::Unmanaged => {
                     return Err(Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_CORRUPT,
-                        "relay backup retention artifact is empty",
+                        rusqlite::ffi::SQLITE_MISMATCH,
+                        "relay backup directory contains an unmanaged entry",
                     ));
                 }
-                artifacts.push(inspected);
-            } else if Self::is_managed_backup_temporary_name(&file_name) {
-                partials.push(inspected);
-            } else {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_MISMATCH,
-                    "relay backup directory contains an unmanaged entry",
-                ));
             }
         }
 
@@ -3790,10 +3775,9 @@ impl ChatRelayService {
         }
 
         let temporary_nonce = rand::random::<u64>();
-        let temporary = backup_directory.join(format!(
-            ".relay-custody-{}-{temporary_nonce:016x}.tmp",
-            now_secs()
-        ));
+        let temporary_name = Self::backup_artifact_namespace()
+            .temporary_recovery_image_name(now_secs(), temporary_nonce);
+        let temporary = backup_directory.join(temporary_name.as_str());
         Self::reserve_private_backup_file(&temporary)?;
 
         let mut destination_published = false;
@@ -6671,8 +6655,9 @@ impl ChatRelayService {
         let _filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
         let created_at = now_secs();
         let nonce = rand::random::<u64>();
-        let destination =
-            backup_directory.join(format!("relay-custody-{created_at}-{nonce:016x}.sqlite"));
+        let artifact_name =
+            Self::backup_artifact_namespace().unique_recovery_image_name(created_at, nonce);
+        let destination = backup_directory.join(artifact_name.as_str());
         self.create_verified_backup_artifact(&backup_directory, &destination, false)?;
         Ok(destination)
     }
@@ -6698,27 +6683,14 @@ impl ChatRelayService {
         &self,
         operation_id: &str,
     ) -> ChatRelayResult<ChatRelayBackupReceipt> {
-        if operation_id.is_empty() || operation_id.len() > CHAT_RELAY_BACKUP_OPERATION_ID_MAX_BYTES
-        {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_MISUSE,
-                "invalid relay backup operation identifier",
-            ));
-        }
-
-        let mut mac =
-            HmacSha256::new_from_slice(&self.node_secret).expect("HMAC accepts any key length");
-        mac.update(CHAT_RELAY_BACKUP_OPERATION_HMAC_DOMAIN);
-        mac.update(&(operation_id.len() as u64).to_be_bytes());
-        mac.update(operation_id.as_bytes());
-        let digest = mac.finalize().into_bytes();
-        let opaque_key = hex::encode(&digest[..16]);
+        let artifact_name = Self::backup_artifact_namespace()
+            .idempotent_recovery_image_name(&self.node_secret, operation_id)
+            .map_err(Self::map_backup_namespace_error)?;
 
         let _operation = self.backup_operations.lock();
         let backup_directory = self.private_backup_directory()?;
         let _filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
-        let destination =
-            backup_directory.join(format!("relay-custody-operation-{opaque_key}.sqlite"));
+        let destination = backup_directory.join(artifact_name.as_str());
         self.create_verified_backup_artifact(&backup_directory, &destination, true)
     }
 
