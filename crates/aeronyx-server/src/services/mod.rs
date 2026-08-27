@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.57.0-PendingDeliveryDomain
+// Version: 0.58.0-CleanupExecutionDomain
 //
 // Modification Reason:
+//   [CHAT-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Registered bounded
+//   multi-transaction cleanup execution and partial-progress reporting.
 //   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Registered the composed
 //   pending pull, cursor, quarantine, and pagination use-case domain.
 //   [BLIND-ROUTE-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Registered the
@@ -91,6 +93,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.58.0-CleanupExecutionDomain - Registered bounded cleanup executor
 //   v0.57.0-PendingDeliveryDomain - Registered pull use-case composition
 //   v0.56.0-BlindRouteDurableStoreDomain - Registered route repository
 //   v0.55.0-VerifiedSubmitDurableStoreDomain - Registered replay repository
@@ -189,6 +192,7 @@ mod chat_relay_blind_route;
 mod chat_relay_blind_route_store;
 mod chat_relay_blob_custody;
 mod chat_relay_cleanup;
+mod chat_relay_cleanup_execution;
 mod chat_relay_direct_peer_circuit;
 mod chat_relay_error;
 mod chat_relay_expired_delivery;

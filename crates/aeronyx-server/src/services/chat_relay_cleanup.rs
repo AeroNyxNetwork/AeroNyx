@@ -1,12 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_cleanup.rs
 // ============================================
-// Version: 1.0.0-BoundedCleanupDomain
+// Version: 1.1.0-CleanupExecutionComposition
 //
 // Creation Reason:
 //   [CHAT-RELAY-CLEANUP-DOMAIN 2026-08-25 by Codex] Extract bounded retention
 //   policy, expired-row validation, notification generation, private replay
 //   cleanup, and backlog detection from the oversized relay service.
+//
+// Modification Reason:
+//   [CHAT-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Updated ownership after
+//   transaction batching and partial-progress handling moved to an executor.
 //
 // Main Functionality:
 //   - Models immutable cleanup policy and one run's stable TTL cutoffs.
@@ -17,7 +21,8 @@
 //
 // Dependencies:
 //   - `config_chat_relay.rs` supplies validated retention durations.
-//   - `chat_relay.rs` owns connection locking, commits, telemetry, and APIs.
+//   - `chat_relay_cleanup_execution.rs` owns locking, commits, and run budget.
+//   - `chat_relay.rs` owns scheduling, telemetry, logs, and public APIs.
 //   - `chat_relay_quarantine.rs` owns privacy-minimised poison-row evidence.
 //   - `rusqlite` provides the production durable repository implementation.
 //
@@ -29,13 +34,14 @@
 //   5. Report aggregate counts and whether another transaction is required.
 //
 // Important Note for Next Developer:
-//   - The caller must commit or roll back the surrounding immediate transaction.
+//   - The execution capability must commit or roll back the immediate transaction.
 //   - Never log or expose message IDs, wallets, blobs, replay keys, or payloads.
 //   - Cleanup targets are a closed enum; do not reintroduce dynamic SQL names.
 //   - Out-of-range TTLs retain data rather than expiring potentially fresh rows.
 //   - Preserve oldest-first limits and expiry notification chunking semantics.
 //
 // Last Modified:
+//   v1.1.0-CleanupExecutionComposition - Documented executor ownership
 //   v1.0.0-BoundedCleanupDomain - Initial policy/repository composition
 // ============================================
 

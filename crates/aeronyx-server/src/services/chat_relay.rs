@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.55.0-PendingDeliveryDomain
+// Version: 3.56.0-CleanupExecutionDomain
 //
 // Modification Reason:
+//   [CHAT-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Extracted bounded
+//   cleanup batching, transaction commits, lock release, partial failure, and
+//   deferred-backlog policy behind a replaceable execution capability.
 //   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Composed legacy and v2
 //   pending pulls, cursor protection, bounded lock scope, quarantine, and final
 //   pagination behind one delivery use-case domain.
@@ -394,6 +397,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.56.0-CleanupExecutionDomain - Composed bounded cleanup execution
 //   v3.55.0-PendingDeliveryDomain - Composed pending pull use cases
 //   v3.54.0-BlindRouteDurableStoreDomain - Composed route replay repository
 //   v3.53.0-VerifiedSubmitDurableStoreDomain - Composed replay repository
@@ -484,7 +488,7 @@ use parking_lot::{Mutex, RwLock};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{
     backup::{Backup, StepResult},
-    params, Connection, TransactionBehavior,
+    params, Connection,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -584,9 +588,9 @@ use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
 use crate::services::chat_relay_blob_custody::{
     EncryptedBlobCustodyDomain, EncryptedBlobStoreOutcome,
 };
-use crate::services::chat_relay_cleanup::{
-    CleanupBatchOutcome, CleanupRunSummary, RelayCleanupCutoffs, RelayCleanupDomain,
-    CLEANUP_MAX_BATCHES_PER_RUN,
+use crate::services::chat_relay_cleanup::{CleanupRunSummary, CLEANUP_MAX_BATCHES_PER_RUN};
+use crate::services::chat_relay_cleanup_execution::{
+    BoundedRelayCleanupExecutor, RelayCleanupExecution,
 };
 pub(crate) use crate::services::chat_relay_direct_peer_circuit::ChatRelayDirectPeerPermit;
 use crate::services::chat_relay_direct_peer_circuit::DirectPeerCircuitDomain;
@@ -965,11 +969,12 @@ pub struct ChatRelayService {
     /// [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex] Pull and cleanup
     /// flows retain telemetry; this domain owns atomic replacement mechanics.
     durable_quarantine: DurableQuarantineDomain,
-    /// Immutable retention policy and bounded durable cleanup capability.
+    /// Bounded multi-transaction cleanup execution capability.
     ///
-    /// [CHAT-RELAY-CLEANUP-DOMAIN 2026-08-25 by Codex] The service retains
-    /// connection locking, transaction commits, telemetry, and scheduling.
-    cleanup: RelayCleanupDomain,
+    /// [CHAT-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] The executor owns
+    /// cutoffs, lock scope, commits, partial failure, and batch budget while
+    /// the service retains scheduling, logs, and aggregate health status.
+    cleanup_execution: BoundedRelayCleanupExecutor,
     /// Private verified-submit replay domain capability.
     ///
     /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
@@ -1726,7 +1731,7 @@ impl ChatRelayService {
         let expired_notification_delivery = ExpiredNotificationDelivery::new();
         let blob_custody = EncryptedBlobCustodyDomain::new(node_secret, &config);
         let durable_quarantine = DurableQuarantineDomain::new(&config);
-        let cleanup = RelayCleanupDomain::new(
+        let cleanup_execution = BoundedRelayCleanupExecutor::new(
             &config,
             VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
             BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
@@ -1759,7 +1764,7 @@ impl ChatRelayService {
             expired_notification_delivery,
             blob_custody,
             durable_quarantine,
-            cleanup,
+            cleanup_execution,
             verified_submit_replay,
             verified_submit_store,
             blind_route_replay,
@@ -2450,7 +2455,7 @@ impl ChatRelayService {
     fn run_cleanup_with_batch_budget(&self, max_batches: usize) -> ChatRelayResult<(usize, usize)> {
         let now = now_secs();
         let cleanup_now = i64::try_from(now).unwrap_or(i64::MAX);
-        let (summary, failure) = self.run_cleanup_at(cleanup_now, max_batches.max(1));
+        let (summary, failure) = self.run_cleanup_at(cleanup_now, max_batches);
 
         self.record_cleanup_run(now, summary, failure.as_ref());
 
@@ -2521,32 +2526,14 @@ impl ChatRelayService {
         now: i64,
         max_batches: usize,
     ) -> (CleanupRunSummary, Option<ChatRelayError>) {
-        let cutoffs = self.cleanup.cutoffs(now);
-
-        let mut summary = CleanupRunSummary::default();
-        let mut failure = None;
-        for batch_index in 0..max_batches {
-            let batch_result = {
-                let mut conn = self.conn.lock();
-                self.run_cleanup_transaction(&mut conn, now, cutoffs)
-            };
-            match batch_result {
-                Ok(batch) => {
-                    let has_more = batch.has_more;
-                    summary.absorb(batch);
-                    if !has_more {
-                        break;
-                    }
-                    if batch_index + 1 == max_batches {
-                        summary.backlog_deferred = true;
-                    }
-                }
-                Err(error) => {
-                    failure = Some(error);
-                    break;
-                }
-            }
-        }
+        let execution = self.cleanup_execution.execute(
+            &self.conn,
+            &self.durable_quarantine,
+            now,
+            max_batches,
+        );
+        let summary = execution.summary;
+        let failure = execution.failure;
 
         if summary.removed_anything() || summary.backlog_deferred {
             info!(
@@ -2579,26 +2566,6 @@ impl ChatRelayService {
         }
 
         (summary, failure)
-    }
-
-    fn run_cleanup_transaction(
-        &self,
-        conn: &mut Connection,
-        now: i64,
-        cutoffs: RelayCleanupCutoffs,
-    ) -> ChatRelayResult<CleanupBatchOutcome> {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let transaction_result =
-            self.cleanup
-                .run_batch(&tx, &self.durable_quarantine, now, cutoffs);
-
-        match transaction_result {
-            Ok(counts) => {
-                tx.commit()?;
-                Ok(counts)
-            }
-            Err(error) => Err(error),
-        }
     }
 
     // ============================================

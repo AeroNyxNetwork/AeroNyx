@@ -1,13 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_tests.rs
 // ============================================
-// Version: 1.2.0-ExplicitCollectionDependency
+// Version: 1.3.0-ExplicitTransactionDependency
 //
 // Creation Reason:
 //   [CHAT-RELAY-TEST-MODULE-SPLIT 2026-08-27 by Codex] Move the complete
 //   `chat_relay` in-crate test module out of the production implementation.
 //
 // Modification Reason:
+//   [CHAT-RELAY-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Declared the
+//   test module's transaction behavior dependency explicitly after cleanup
+//   transaction ownership moved out of the parent relay implementation.
 //   [CHAT-RELAY-PENDING-SCHEMA-DOMAIN 2026-08-27 by Codex] Declared the test
 //   module's `HashSet` dependency explicitly after schema migration ownership
 //   moved out of the parent relay implementation.
@@ -36,6 +39,7 @@
 //   - New relay tests belong here or in a focused extracted domain module.
 //
 // Last Modified:
+//   v1.3.0-ExplicitTransactionDependency - Removed parent-import coupling
 //   v1.2.0-ExplicitCollectionDependency - Removed parent-import coupling
 //   v1.1.0-RestoreValidationSideEffectInvariant - Pinned pre-path rejection
 //   v1.0.0-TestModuleSplit - Mechanical extraction from `chat_relay.rs`
@@ -45,6 +49,7 @@ use super::*;
 use aeronyx_common::types::SessionId;
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::chat::ChatContentType;
+use rusqlite::TransactionBehavior;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::net::SocketAddr;
