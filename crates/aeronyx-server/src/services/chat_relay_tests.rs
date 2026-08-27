@@ -1,11 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_tests.rs
 // ============================================
-// Version: 1.0.0-TestModuleSplit
+// Version: 1.1.0-RestoreValidationSideEffectInvariant
 //
 // Creation Reason:
 //   [CHAT-RELAY-TEST-MODULE-SPLIT 2026-08-27 by Codex] Move the complete
 //   `chat_relay` in-crate test module out of the production implementation.
+//
+// Modification Reason:
+//   [CHAT-RELAY-RESTORE-COMMAND-DOMAIN 2026-08-27 by Codex] Pin public-plan
+//   validation before any private path or maintenance-lock side effect.
 //
 // Main Functionality:
 //   - Preserves all unit, integration, restart, concurrency, and fault tests.
@@ -29,6 +33,7 @@
 //   - New relay tests belong here or in a focused extracted domain module.
 //
 // Last Modified:
+//   v1.1.0-RestoreValidationSideEffectInvariant - Pinned pre-path rejection
 //   v1.0.0-TestModuleSplit - Mechanical extraction from `chat_relay.rs`
 // ============================================
 
@@ -714,6 +719,43 @@ fn restore_plan_rejects_tampering_wrong_key_and_expiry() {
         .expect_err("wrong node secret must fail closed");
     ChatRelayService::verify_latest_restore_plan_at(&config, &secret, &plan, plan.expires_at)
         .expect_err("expired plan must fail closed");
+}
+
+#[test]
+fn invalid_restore_plan_is_rejected_before_private_path_resolution() {
+    // [CHAT-RELAY-RESTORE-COMMAND-DOMAIN 2026-08-27 by Codex] The public
+    // contract is untrusted input. Reject it before resolving the backup
+    // directory so malformed traffic cannot create host-local artifacts.
+    let directory = tempfile::tempdir().expect("restore validation directory");
+    let unresolved_parent = directory.path().join("must-remain-absent");
+    let mut config = test_config();
+    config.db_path = unresolved_parent
+        .join("relay.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let invalid = ChatRelayRestorePlanReceipt {
+        version: 0,
+        issued_at: 1_000,
+        expires_at: 1_600,
+        verified_backup_count: 0,
+        selected_backup_bytes: 0,
+        active_database_present: false,
+        active_database_bytes: 0,
+        nonce: "00".repeat(CHAT_RELAY_RESTORE_PLAN_NONCE_BYTES),
+        commitment: "00".repeat(32),
+    };
+
+    ChatRelayService::verify_latest_restore_plan_at(
+        &config,
+        &[0x42u8; 32],
+        &invalid,
+        1_000,
+    )
+    .expect_err("invalid public plan must fail before path resolution");
+    assert!(
+        !unresolved_parent.exists(),
+        "invalid plan must not create the configured custody parent"
+    );
 }
 
 #[test]

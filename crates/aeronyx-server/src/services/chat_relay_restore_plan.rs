@@ -1,12 +1,17 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_restore_plan.rs
 // ============================================
-// Version: 1.0.0-AuthenticatedRestorePlan
+// Version: 1.1.0-ComposedRestoreCommandIntegration
 //
 // Creation Reason:
 //   [CHAT-RELAY-RESTORE-PLAN-DOMAIN 2026-08-26 by Codex] Isolate the
 //   short-lived restore-plan contract and authentication policy from the
 //   filesystem-owning relay service.
+//
+// Modification Reason:
+//   [CHAT-RELAY-RESTORE-COMMAND-DOMAIN 2026-08-27 by Codex] Document the
+//   composed command as the owner of private snapshot orchestration while this
+//   module remains a side-effect-free authentication policy.
 //
 // Main Functionality:
 //   - Models the public, path-free restore-plan receipt.
@@ -15,8 +20,8 @@
 //   - Detects public or private state drift without performing filesystem I/O.
 //
 // Dependencies:
-//   - `chat_relay.rs` verifies SQLite artifacts, holds the maintenance lock,
-//     and supplies a private boundary snapshot to this module.
+//   - `chat_relay_restore_command` supplies verified private boundary snapshots.
+//   - `chat_relay.rs` retains public compatibility and maintenance-lock scope.
 //   - `hmac`, `sha2`, `bincode`, and `hex` preserve the existing v1 wire and
 //     commitment format.
 //
@@ -29,11 +34,12 @@
 // Important Note for Next Developer:
 //   - Keep the v1 signing-field order byte-for-byte compatible.
 //   - Private boundary fields must never be serialized into the public receipt.
-//   - This module must remain side-effect free; lock and I/O ownership belongs
-//     to `ChatRelayService`.
+//   - This module must remain side-effect free; command I/O executes only
+//     inside the maintenance-lock scope retained by `ChatRelayService`.
 //   - New wire fields require a new version and explicit migration handling.
 //
 // Last Modified:
+//   v1.1.0-ComposedRestoreCommandIntegration - Documented command ownership
 //   v1.0.0-AuthenticatedRestorePlan - Initial trait-based extraction
 // ============================================
 
