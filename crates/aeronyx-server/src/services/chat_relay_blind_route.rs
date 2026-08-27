@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_blind_route.rs
 // ============================================
-// Version: 1.1.0-BlindRouteDurableStoreComposition
+// Version: 1.2.0-BlindRouteCoordinatorComposition
 //
 // Creation Reason:
 //   [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Extract blind-route replay
@@ -9,6 +9,9 @@
 //   without changing its API, SQLite schema, retention, or error contracts.
 //
 // Modification Reason:
+//   [BLIND-ROUTE-COORDINATOR-DOMAIN 2026-08-28 by Codex] Updated ownership
+//   notes after this cryptographic domain and durable storage were composed by
+//   a dedicated use-case coordinator.
 //   [BLIND-ROUTE-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Updated the domain
 //   boundary after durable route ownership moved into a composed repository.
 //
@@ -19,7 +22,7 @@
 //   - Binds every sealed response to both private replay identifiers.
 //
 // Dependencies:
-//   - `chat_relay.rs` composes this cryptographic capability with storage.
+//   - `chat_relay_blind_route_coordinator.rs` composes this with storage.
 //   - `chat_relay_blind_route_store.rs` owns durable route transitions.
 //   - `chat_relay_error.rs` owns the stable typed storage error boundary.
 //
@@ -37,6 +40,7 @@
 //   - Response plaintext is opaque here and must never be parsed or logged.
 //
 // Last Modified:
+//   v1.2.0-BlindRouteCoordinatorComposition - Documented coordinator boundary
 //   v1.1.0-BlindRouteDurableStoreComposition - Documented repository boundary
 //   v1.0.0-BlindRouteReplayDomain - Initial trait/composition extraction
 // ============================================

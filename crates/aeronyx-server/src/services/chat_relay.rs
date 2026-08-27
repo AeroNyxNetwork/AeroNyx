@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.64.0-VerifiedSubmitCoordinator
+// Version: 3.65.0-BlindRouteCoordinator
 //
 // Modification Reason:
+//   [BLIND-ROUTE-COORDINATOR-DOMAIN 2026-08-28 by Codex] Composed private
+//   route identity, durable ownership, effect arming, and exact ACK replay as
+//   one use case while retaining aggregate recovery telemetry in this service.
 //   [VERIFIED-SUBMIT-COORDINATOR-DOMAIN 2026-08-28 by Codex] Composed private
 //   replay, durable ownership, recovery, and response completion as one use case.
 //   [CHAT-NODE-SECRET-DOMAIN 2026-08-28 by Codex] Re-exported versioned HKDF
@@ -413,6 +416,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.65.0-BlindRouteCoordinator - Composed blind-route replay use cases
 //   v3.64.0-VerifiedSubmitCoordinator - Composed verified-submit use cases
 //   v3.63.0-NodeSecretDomain - Decoupled node-secret HKDF derivation
 //   v3.62.0-BackupSqliteDomain - Composed SQLite backup adapter
@@ -595,10 +599,7 @@ use crate::services::chat_relay_backup_prune::{
     LocalBackupArtifactRemoval,
 };
 pub(crate) use crate::services::chat_relay_blind_route::BlindRelayRouteAdmission;
-use crate::services::chat_relay_blind_route::BlindRouteReplay;
-use crate::services::chat_relay_blind_route_store::{
-    BlindRouteDurableRepository, DurableBlindRouteAdmission, SqliteBlindRouteDurableStore,
-};
+use crate::services::chat_relay_blind_route_coordinator::BlindRouteCoordinator;
 #[cfg(test)]
 use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
     as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
@@ -860,17 +861,12 @@ pub struct ChatRelayService {
     /// retains aggregate telemetry while this capability owns request binding,
     /// replay lookup, owner-fenced reservation, recovery, and completion.
     verified_submit: VerifiedSubmitCoordinator,
-    /// Private blind-route replay identity and exact-response protector.
+    /// Private blind-route replay and durable ownership coordinator.
     ///
-    /// [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Private identity and
-    /// response cryptography remain isolated from durable route ownership.
-    blind_route_replay: BlindRouteReplay,
-    /// Private durable blind-route lease and completion repository.
-    ///
-    /// [BLIND-ROUTE-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] The service
-    /// retains opaque response cryptography and telemetry while this capability
-    /// owns every replay SQLite transaction and ownership transition.
-    blind_route_store: SqliteBlindRouteDurableStore,
+    /// [BLIND-ROUTE-COORDINATOR-DOMAIN 2026-08-28 by Codex] The service keeps
+    /// aggregate recovery telemetry while this capability owns private route
+    /// binding, owner-fenced admission, effect arming, and exact ACK replay.
+    blind_route: BlindRouteCoordinator,
     /// Random process epoch fencing every restart-recoverable replay claim.
     ///
     /// [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Verified submit
@@ -1511,12 +1507,12 @@ impl ChatRelayService {
             VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
             VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
         )?;
-        let blind_route_replay = BlindRouteReplay::new(node_secret)?;
-        let blind_route_store = SqliteBlindRouteDurableStore::new(
+        let blind_route = BlindRouteCoordinator::new(
+            node_secret,
             BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
             BLIND_RELAY_ROUTE_REPLAY_CAPACITY,
             BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS,
-        );
+        )?;
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
         OsRng.fill_bytes(&mut replay_process_epoch);
         let mut peer_status = ChatRelayPeerStatus::new(relay_enabled);
@@ -1535,8 +1531,7 @@ impl ChatRelayService {
             durable_quarantine,
             cleanup_execution,
             verified_submit,
-            blind_route_replay,
-            blind_route_store,
+            blind_route,
             replay_process_epoch,
             dedup: MessageDedup::new(dedup_capacity),
             storage_usage_repository: SqliteRelayStorageUsageRepository,
@@ -1698,59 +1693,25 @@ impl ChatRelayService {
         )
     }
 
-    fn blind_relay_route_cache_key(&self, route_id: &[u8; 16]) -> [u8; 32] {
-        self.blind_route_replay.cache_key(route_id)
-    }
-
-    fn blind_relay_route_fingerprint(&self, request_commitment: &[u8; 32]) -> [u8; 32] {
-        self.blind_route_replay
-            .request_fingerprint(request_commitment)
-    }
-
     /// Reserves one authenticated blind route before peel, forward, or store.
     pub(crate) fn reserve_blind_relay_route(
         &self,
         route_id: &[u8; 16],
         request_commitment: &[u8; 32],
     ) -> ChatRelayResult<BlindRelayRouteAdmission> {
-        let cache_key = self.blind_relay_route_cache_key(route_id);
-        let request_fingerprint = self.blind_relay_route_fingerprint(request_commitment);
         let now = now_secs();
-        let admission = self.blind_route_store.reserve(
+        let admission = self.blind_route.reserve(
             &self.conn,
-            &cache_key,
-            &request_fingerprint,
+            route_id,
+            request_commitment,
             self.replay_process_epoch.as_slice(),
             now,
         )?;
-
-        match admission {
-            DurableBlindRouteAdmission::Reserved => Ok(BlindRelayRouteAdmission::Reserved),
-            DurableBlindRouteAdmission::ReservedForRecovery => {
-                self.peer_telemetry.record_blind_route_recovery(
-                    now,
-                    BlindRouteRecoveryEvent::Attempted,
-                );
-                Ok(BlindRelayRouteAdmission::ReservedForRecovery)
-            }
-            DurableBlindRouteAdmission::Pending => Ok(BlindRelayRouteAdmission::Pending),
-            DurableBlindRouteAdmission::Conflict => Ok(BlindRelayRouteAdmission::Conflict),
-            DurableBlindRouteAdmission::CapacityExhausted => {
-                Ok(BlindRelayRouteAdmission::CapacityExhausted)
-            }
-            DurableBlindRouteAdmission::Completed(durable) => {
-                let response = self.blind_route_replay.recover_response(
-                    &cache_key,
-                    &request_fingerprint,
-                    &durable.nonce,
-                    &durable.ciphertext,
-                )?;
-                Ok(BlindRelayRouteAdmission::Completed {
-                    response,
-                    completed_at: durable.completed_at,
-                })
-            }
+        if matches!(admission, BlindRelayRouteAdmission::ReservedForRecovery) {
+            self.peer_telemetry
+                .record_blind_route_recovery(now, BlindRouteRecoveryEvent::Attempted);
         }
+        Ok(admission)
     }
 
     /// Arms an owned route claim immediately before its first external effect.
@@ -1760,12 +1721,10 @@ impl ChatRelayService {
         request_commitment: &[u8; 32],
         started_at: u64,
     ) -> ChatRelayResult<()> {
-        let cache_key = self.blind_relay_route_cache_key(route_id);
-        let request_fingerprint = self.blind_relay_route_fingerprint(request_commitment);
-        self.blind_route_store.arm_effect(
+        self.blind_route.arm_effect(
             &self.conn,
-            &cache_key,
-            &request_fingerprint,
+            route_id,
+            request_commitment,
             self.replay_process_epoch.as_slice(),
             started_at,
         )
@@ -1777,12 +1736,10 @@ impl ChatRelayService {
         route_id: &[u8; 16],
         request_commitment: &[u8; 32],
     ) -> ChatRelayResult<bool> {
-        let cache_key = self.blind_relay_route_cache_key(route_id);
-        let request_fingerprint = self.blind_relay_route_fingerprint(request_commitment);
-        self.blind_route_store.release_unarmed(
+        self.blind_route.release_unarmed(
             &self.conn,
-            &cache_key,
-            &request_fingerprint,
+            route_id,
+            request_commitment,
             self.replay_process_epoch.as_slice(),
         )
     }
@@ -1795,17 +1752,12 @@ impl ChatRelayService {
         response: &[u8],
         completed_at: u64,
     ) -> ChatRelayResult<()> {
-        let cache_key = self.blind_relay_route_cache_key(route_id);
-        let request_fingerprint = self.blind_relay_route_fingerprint(request_commitment);
-        let protected =
-            self.blind_route_replay
-                .protect_response(&cache_key, &request_fingerprint, response)?;
-        self.blind_route_store.complete(
+        self.blind_route.remember_response(
             &self.conn,
-            &cache_key,
-            &request_fingerprint,
+            route_id,
+            request_commitment,
             self.replay_process_epoch.as_slice(),
-            protected,
+            response,
             completed_at,
         )
     }

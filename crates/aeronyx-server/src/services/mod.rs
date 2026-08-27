@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.66.0-VerifiedSubmitCoordinator
+// Version: 0.67.0-BlindRouteCoordinator
 //
 // Modification Reason:
+//   [BLIND-ROUTE-COORDINATOR-DOMAIN 2026-08-28 by Codex] Registered the
+//   composed blind-route identity, ownership, effect, and replay use cases.
 //   [VERIFIED-SUBMIT-COORDINATOR-DOMAIN 2026-08-28 by Codex] Registered the
 //   composed verified-submit replay and durable ownership use-case boundary.
 //   [CHAT-NODE-SECRET-DOMAIN 2026-08-28 by Codex] Registered versioned relay
@@ -109,6 +111,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.67.0-BlindRouteCoordinator - Registered blind-route use cases
 //   v0.66.0-VerifiedSubmitCoordinator - Registered verified-submit use cases
 //   v0.65.0-NodeSecretDomain - Registered relay node-secret derivation
 //   v0.64.0-BackupSqliteDomain - Registered SQLite backup adapter
@@ -214,6 +217,7 @@ mod chat_relay_backup_prune;
 mod chat_relay_backup_retention;
 mod chat_relay_backup_sqlite;
 mod chat_relay_blind_route;
+mod chat_relay_blind_route_coordinator;
 mod chat_relay_blind_route_store;
 mod chat_relay_blob_custody;
 mod chat_relay_cleanup;
