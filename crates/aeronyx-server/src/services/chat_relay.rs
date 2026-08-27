@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.60.0-MaintenanceTelemetryDomain
+// Version: 3.61.0-CustodyAnchorGuardDomain
 //
 // Modification Reason:
+//   [CHAT-CUSTODY-ANCHOR-GUARD-DOMAIN 2026-08-28 by Codex] Moved the signed
+//   anchor and maintenance-lock RAII contract into a focused resource type.
 //   [CHAT-MAINTENANCE-TELEMETRY-DOMAIN 2026-08-28 by Codex] Moved the
 //   maintenance status contract, lock, and all mutation rules into one domain.
 //   [CHAT-PENDING-CONTRACT-DOMAIN 2026-08-28 by Codex] Re-exported pending
@@ -405,6 +407,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.61.0-CustodyAnchorGuardDomain - Composed custody anchor RAII contract
 //   v3.60.0-MaintenanceTelemetryDomain - Composed maintenance state machine
 //   v3.59.0-PendingContractDomain - Decoupled pending delivery models
 //   v3.58.0-StorageUsageDomain - Composed aggregate usage repository
@@ -601,6 +604,7 @@ use crate::services::chat_relay_cleanup::{CleanupRunSummary, CLEANUP_MAX_BATCHES
 use crate::services::chat_relay_cleanup_execution::{
     BoundedRelayCleanupExecutor, RelayCleanupExecution,
 };
+pub use crate::services::chat_relay_custody_anchor_guard::ChatRelayCustodyAuditAnchorGuard;
 pub(crate) use crate::services::chat_relay_direct_peer_circuit::ChatRelayDirectPeerPermit;
 use crate::services::chat_relay_direct_peer_circuit::DirectPeerCircuitDomain;
 #[cfg(test)]
@@ -776,30 +780,6 @@ pub struct ExpiredNotification {
     pub receiver: [u8; 32],
     /// bincode-serialised `Vec<[u8; 16]>`
     pub message_ids_raw: Vec<u8>,
-}
-
-/// Cross-process guard binding one signed custody anchor to the current
-/// immutable maintenance checkpoint for the complete lifetime of the value.
-///
-/// [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] The private `SQLite`
-/// connection owns an exclusive maintenance transaction and is released by
-/// RAII. Callers may inspect only the signed aggregate anchor; no lock path,
-/// private audit state, HMAC, or custody metadata crosses this boundary.
-pub struct ChatRelayCustodyAuditAnchorGuard {
-    _filesystem_lock: Connection,
-    anchor: CustodyAuditAnchorV1,
-}
-
-impl ChatRelayCustodyAuditAnchorGuard {
-    /// Returns the exact current producer-signed anchor protected by the guard.
-    #[must_use]
-    pub const fn anchor(&self) -> &CustodyAuditAnchorV1 {
-        &self.anchor
-    }
-
-    fn into_anchor(self) -> CustodyAuditAnchorV1 {
-        self.anchor
-    }
 }
 
 impl ExpiredNotification {
@@ -2908,10 +2888,10 @@ impl ChatRelayService {
                 "unable to sign relay backup maintenance audit anchor",
             )
         })?;
-        Ok(ChatRelayCustodyAuditAnchorGuard {
-            _filesystem_lock: filesystem_lock,
+        Ok(ChatRelayCustodyAuditAnchorGuard::new(
+            filesystem_lock,
             anchor,
-        })
+        ))
     }
 
     /// Verifies whether the newest private recovery image is ready for a

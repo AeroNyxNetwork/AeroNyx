@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.62.0-MaintenanceTelemetryDomain
+// Version: 0.63.0-CustodyAnchorGuardDomain
 //
 // Modification Reason:
+//   [CHAT-CUSTODY-ANCHOR-GUARD-DOMAIN 2026-08-28 by Codex] Registered the
+//   signed custody anchor and maintenance-lock RAII contract.
 //   [CHAT-MAINTENANCE-TELEMETRY-DOMAIN 2026-08-28 by Codex] Registered the
 //   privacy-safe maintenance status contract and atomic state transitions.
 //   [CHAT-PENDING-CONTRACT-DOMAIN 2026-08-28 by Codex] Registered the
@@ -101,6 +103,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.63.0-CustodyAnchorGuardDomain - Registered custody anchor guard
 //   v0.62.0-MaintenanceTelemetryDomain - Registered maintenance state machine
 //   v0.61.0-PendingContractDomain - Registered pending delivery contracts
 //   v0.60.0-StorageUsageDomain - Registered aggregate usage repository
@@ -205,6 +208,7 @@ mod chat_relay_blind_route_store;
 mod chat_relay_blob_custody;
 mod chat_relay_cleanup;
 mod chat_relay_cleanup_execution;
+mod chat_relay_custody_anchor_guard;
 mod chat_relay_direct_peer_circuit;
 mod chat_relay_error;
 mod chat_relay_expired_delivery;
