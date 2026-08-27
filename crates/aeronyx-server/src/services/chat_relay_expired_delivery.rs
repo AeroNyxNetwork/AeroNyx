@@ -42,9 +42,12 @@ use std::collections::HashSet;
 use rusqlite::{params, Connection, TransactionBehavior};
 
 use super::chat_relay::{
-    ChatRelayResult, ExpiredNotification, MAX_EXPIRED_NOTIFICATIONS_PER_PULL,
+    ExpiredNotification, MAX_EXPIRED_NOTIFICATIONS_PER_PULL,
     MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES,
 };
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Delivery repositories depend
+// directly on the typed result boundary while row models remain service-owned.
+use super::chat_relay_error::ChatRelayResult;
 use super::chat_relay_quarantine::{CorruptDurableRow, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION};
 
 /// Raw durable expiry-notification row returned by a repository.

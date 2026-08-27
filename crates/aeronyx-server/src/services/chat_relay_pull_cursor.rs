@@ -16,7 +16,7 @@
 //
 // Dependencies:
 //   - `chat_relay.rs` owns SQLite snapshot queries and composes this codec.
-//   - `ChatRelayError` remains the stable service-facing error boundary.
+//   - `chat_relay_error.rs` owns the stable service-facing error boundary.
 //
 // Main Logical Flow:
 //   1. Validate the monotonic snapshot position and ceiling.
@@ -42,7 +42,9 @@ use chacha20poly1305::{
 use rand::{rngs::OsRng, RngCore};
 use sha2::Sha256;
 
-use super::chat_relay::{ChatRelayError, ChatRelayResult};
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Cursor protection depends
+// directly on the typed failure contract instead of relay orchestration.
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 
 const CURSOR_VERSION: u8 = 1;
 const NONCE_BYTES: usize = 24;

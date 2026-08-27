@@ -41,7 +41,9 @@ use sha2::Sha256;
 
 use crate::config::ChatRelayConfig;
 
-use super::chat_relay::{ChatRelayError, ChatRelayResult};
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Storage depends directly on
+// the typed failure boundary, not on the composed relay service.
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 
 type HmacSha256 = Hmac<Sha256>;
 

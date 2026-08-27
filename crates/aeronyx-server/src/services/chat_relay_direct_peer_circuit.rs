@@ -49,11 +49,14 @@ use parking_lot::MutexGuard;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use tracing::warn;
 
-use super::chat_relay::{ChatRelayError, ChatRelayResult};
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] The circuit repository
+// consumes the typed failure boundary without depending on orchestration.
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 use super::chat_relay_status::{
     ChatRelayDirectPeerCircuitStatus, DIRECT_PEER_RELAY_CIRCUIT_COOLDOWN_SECS,
     DIRECT_PEER_RELAY_HALF_OPEN_LEASE_SECS, DIRECT_PEER_RELAY_HALF_OPEN_SUCCESSES,
 };
+
 /// Durable singleton format for source-blind direct relay circuit state.
 pub(super) const DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION: i64 = 1;
 /// Fixed schema marker proving the durable circuit checkpoint was installed.

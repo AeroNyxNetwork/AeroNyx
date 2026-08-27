@@ -16,7 +16,7 @@
 //
 // Dependencies:
 //   - `chat_relay.rs` owns SQLite transactions and composes this capability.
-//   - `ChatRelayError` provides the existing stable storage error boundary.
+//   - `chat_relay_error.rs` owns the stable typed storage error boundary.
 //
 // Main Logical Flow:
 //   1. Derive domain-separated HMAC identifiers after request authentication.
@@ -43,7 +43,9 @@ use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use sha2::Sha256;
 
-use super::chat_relay::{ChatRelayError, ChatRelayResult};
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Depend on the typed failure
+// boundary directly instead of the orchestration facade.
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 
 type HmacSha256 = Hmac<Sha256>;
 

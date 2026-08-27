@@ -41,7 +41,9 @@ use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use crate::config::ChatRelayConfig;
 
-use super::chat_relay::{ChatRelayError, ChatRelayResult};
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Quarantine persistence
+// consumes typed failures directly instead of the relay service facade.
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 
 /// Maximum privacy-minimised quarantine events removed by one transaction.
 const CLEANUP_QUARANTINE_EVENT_BATCH_SIZE: usize = 1024;

@@ -59,8 +59,11 @@
 //   bounded SQLite-independent backup-copy retry state machine.
 //   [CHAT-RELAY-STATUS-CONTRACT-DOMAIN 2026-08-27 by Codex] Registered the
 //   privacy-safe serialized relay status contract and shared policy defaults.
+//   [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Registered the typed relay
+//   failure contract consumed directly by composed relay domains.
 //
 // Last Modified:
+//   v0.43.0-ChatRelayErrorDomain - Registered typed relay failures
 //   v0.42.0-ChatRelayStatusDomain - Registered relay status contracts
 //   v0.41.0-BackupCopyRetryDomain - Registered backup-copy retry policy
 //   v0.40.0-BackupArtifactDomain - Registered backup artifact snapshots
@@ -136,6 +139,7 @@ mod chat_relay_blind_route;
 mod chat_relay_blob_custody;
 mod chat_relay_cleanup;
 mod chat_relay_direct_peer_circuit;
+mod chat_relay_error;
 mod chat_relay_expired_delivery;
 mod chat_relay_peer_telemetry;
 mod chat_relay_pending_custody;

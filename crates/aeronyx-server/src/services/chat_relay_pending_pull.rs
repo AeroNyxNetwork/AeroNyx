@@ -43,7 +43,10 @@
 use aeronyx_core::protocol::chat::decode_envelope;
 use rusqlite::{params, Connection};
 
-use super::chat_relay::{ChatRelayError, ChatRelayResult, PendingMessage};
+use super::chat_relay::PendingMessage;
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Pull repositories consume the
+// typed failure boundary directly while pending row models remain service-owned.
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 use super::chat_relay_quarantine::{CorruptDurableRow, QUARANTINE_SOURCE_PENDING_MESSAGE};
 
 #[derive(Debug, Clone)]

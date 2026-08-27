@@ -50,7 +50,9 @@ use parking_lot::Mutex;
 use rand::{rngs::OsRng, RngCore};
 use sha2::Sha256;
 
-use super::chat_relay::{ChatRelayError, ChatRelayResult};
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Verified-submit protection
+// consumes the typed failure boundary without depending on orchestration.
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 
 type HmacSha256 = Hmac<Sha256>;
 
