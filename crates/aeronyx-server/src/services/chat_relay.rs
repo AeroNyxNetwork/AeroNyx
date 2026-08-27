@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.66.0-ExpiredNotificationContract
+// Version: 3.67.0-BackupAuditAnchorDomain
 //
 // Modification Reason:
+//   [CHAT-BACKUP-AUDIT-ANCHOR-DOMAIN 2026-08-28 by Codex] Moved conversion of
+//   authenticated private checkpoints into public opaque anchor digests behind
+//   a pure domain function and closed failure vocabulary.
 //   [CHAT-EXPIRED-CONTRACT-DOMAIN 2026-08-28 by Codex] Re-exported the expiry
 //   notification model and bounded decoding invariants from a focused contract.
 //   [BLIND-ROUTE-COORDINATOR-DOMAIN 2026-08-28 by Codex] Composed private
@@ -413,6 +416,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.67.0-BackupAuditAnchorDomain - Extracted public anchor digest derivation
 //   v3.66.0-ExpiredNotificationContract - Extracted expiry notification model
 //   v3.65.0-BlindRouteCoordinator - Composed blind-route replay use cases
 //   v3.64.0-VerifiedSubmitCoordinator - Composed verified-submit use cases
@@ -511,7 +515,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection};
-use sha2::{Digest, Sha256};
 
 use tracing::{debug, info, warn};
 
@@ -533,6 +536,9 @@ use crate::config::ChatRelayConfig;
 use crate::services::chat_relay_backup_audit::{
     BackupAuditPhase, BackupAuditRecordAuthenticator, ChatRelayBackupMaintenanceAuditCounts,
     HmacBackupAuditRecordAuthenticator,
+};
+use crate::services::chat_relay_backup_audit_anchor::{
+    derive_backup_audit_anchor_digest, BackupAuditAnchorDigestError,
 };
 use crate::services::chat_relay_backup_audit_chain::{
     map_backup_audit_checkpoint_error, map_backup_audit_record_error,
@@ -732,9 +738,6 @@ const CHAT_RELAY_RESTORE_PLAN_VERSION: u8 = RESTORE_PLAN_VERSION;
 const CHAT_RELAY_RESTORE_PLAN_NONCE_BYTES: usize = RESTORE_PLAN_NONCE_BYTES;
 /// Defensive ceiling for one verified backup-directory maintenance scan.
 const CHAT_RELAY_BACKUP_DIRECTORY_ENTRY_HARD_LIMIT: usize = 1024;
-/// Domain separation for the public opaque digest of one private checkpoint.
-const CHAT_RELAY_BACKUP_AUDIT_ANCHOR_DIGEST_DOMAIN: &[u8] =
-    b"AeroNyx-RelayCustodyBackup-MaintenanceAuditAnchorDigest-v1";
 /// Private sibling file serializing maintenance across server processes.
 const CHAT_RELAY_BACKUP_LOCK_FILE_NAME: &str = ".aeronyx-relay-backup-maintenance.lock";
 /// Hard ceiling for one audit record, including its trailing newline.
@@ -1089,39 +1092,16 @@ impl ChatRelayService {
     fn backup_audit_anchor_digest(
         state: &ChatRelayBackupAuditVerificationState,
     ) -> ChatRelayResult<[u8; 32]> {
-        let receipt = state.receipt();
-        if receipt.checkpoint_count == 0
-            || receipt.archived_record_count == 0
-            || receipt.archived_bytes == 0
-        {
-            return Err(Self::backup_io_error(
+        derive_backup_audit_anchor_digest(state).map_err(|error| match error {
+            BackupAuditAnchorDigestError::MissingImmutableCheckpoint => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_NOTFOUND,
                 "relay backup maintenance audit has no immutable checkpoint to anchor",
-            ));
-        }
-        let checkpoint_mac = hex::decode(state.checkpoint_head_mac()).map_err(|_| {
-            Self::backup_io_error(
+            ),
+            BackupAuditAnchorDigestError::InvalidCheckpointAuthenticator => Self::backup_io_error(
                 rusqlite::ffi::SQLITE_CORRUPT,
                 "relay backup maintenance audit checkpoint anchor is invalid",
-            )
-        })?;
-        let checkpoint_mac: [u8; 32] = checkpoint_mac.try_into().map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit checkpoint anchor is invalid",
-            )
-        })?;
-        // [CUSTODY-AUDIT-ANCHOR 2026-08-16 by Codex] The private checkpoint
-        // MAC authenticates the full cumulative chain. Hash it into a separate
-        // public domain so exporting an anchor cannot turn the HMAC itself into
-        // a reusable capability or reveal the private signing frame.
-        let mut hasher = Sha256::new();
-        hasher.update(CHAT_RELAY_BACKUP_AUDIT_ANCHOR_DIGEST_DOMAIN);
-        hasher.update(receipt.checkpoint_count.to_le_bytes());
-        hasher.update(receipt.archived_record_count.to_le_bytes());
-        hasher.update(receipt.archived_bytes.to_le_bytes());
-        hasher.update(checkpoint_mac);
-        Ok(hasher.finalize().into())
+            ),
+        })
     }
 
     fn hash_backup_audit_segment(file: &mut File) -> ChatRelayResult<(u64, String)> {
