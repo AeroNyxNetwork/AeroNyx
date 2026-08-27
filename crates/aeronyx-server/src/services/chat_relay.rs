@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.75.0-DurableReplayFacade
+// Version: 3.76.0-OperatorStatusFacade
 //
 // Modification Reason:
+//   [CHAT-STATUS-FACADE-DOMAIN 2026-08-28 by Codex] Moved configuration,
+//   maintenance health, worker-failure recording, and durable storage usage
+//   APIs into one operator-facing facade without changing public contracts.
 //   [CHAT-REPLAY-FACADE-DOMAIN 2026-08-28 by Codex] Moved verified-submit and
 //   blind-route owner-fenced replay workflows into one nested facade while
 //   preserving pre-effect reservation and exact-response persistence.
@@ -440,6 +443,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.76.0-OperatorStatusFacade - Extracted operator-facing status API facade
 //   v3.75.0-DurableReplayFacade - Extracted owner-fenced replay API facade
 //   v3.74.0-PeerRelayFacade - Extracted peer relay and circuit API facade
 //   v3.73.0-CleanupFacade - Extracted bounded-cleanup API facade
@@ -693,9 +697,7 @@ use crate::services::chat_relay_storage_schema::{
     ChatRelayStorageSchemaMigration, SqliteChatRelayStorageSchemaMigrator,
 };
 pub use crate::services::chat_relay_storage_usage::ChatRelayStorageUsage;
-use crate::services::chat_relay_storage_usage::{
-    RelayStorageUsageRepository, SqliteRelayStorageUsageRepository,
-};
+use crate::services::chat_relay_storage_usage::SqliteRelayStorageUsageRepository;
 use crate::services::wallet_routes::WalletRouteCache;
 
 // ============================================
@@ -1369,44 +1371,6 @@ impl ChatRelayService {
         self.dedup.check_and_insert(message_id)
     }
 
-    // ============================================
-    // Accessors
-    // ============================================
-
-    #[must_use]
-    pub fn config(&self) -> &ChatRelayConfig {
-        &self.config
-    }
-
-    /// Returns aggregate TTL cleanup execution evidence.
-    #[must_use]
-    pub fn maintenance_status(&self) -> ChatRelayMaintenanceStatus {
-        self.maintenance_telemetry.snapshot()
-    }
-
-    /// Records a blocking-worker failure that occurred outside `run_cleanup`.
-    ///
-    /// Tokio join failures are deliberately converted to stable buckets so a
-    /// heartbeat never exposes panic payloads or other runtime internals.
-    pub(crate) fn record_maintenance_worker_failure(&self, reason: &'static str) {
-        self.maintenance_telemetry
-            .record_worker_failure(now_secs(), reason);
-    }
-
-    /// Returns aggregate durable queue usage maintained by `SQLite` triggers.
-    ///
-    /// The result contains no message, wallet, sender, receiver, route, or
-    /// payload identifiers and is safe for operator-capacity telemetry.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `SQLite` error if the reconciled singleton usage row cannot be
-    /// read. Callers must treat that as unavailable telemetry, not zero usage.
-    pub fn storage_usage(&self) -> ChatRelayResult<ChatRelayStorageUsage> {
-        let conn = self.conn.lock();
-        self.storage_usage_repository.read(&conn)
-    }
-
 }
 
 #[path = "chat_relay_backup_facade.rs"]
@@ -1429,6 +1393,9 @@ mod peer_facade;
 
 #[path = "chat_relay_replay_facade.rs"]
 mod replay_facade;
+
+#[path = "chat_relay_status_facade.rs"]
+mod status_facade;
 
 fn sqlite_integer(value: u64, field: &'static str) -> ChatRelayResult<i64> {
     i64::try_from(value).map_err(|_| ChatRelayError::CorruptStoredData { field })
