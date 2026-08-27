@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.33.0-AuditRotationDomain
+// Version: 3.34.0-AuditCatalogDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -78,6 +78,9 @@
 //   segment rotation planning and active-tail crash classification behind a
 //   pure trait while retaining locks, fsync, links, and deletion in this I/O
 //   owner.
+//   [CHAT-RELAY-AUDIT-CATALOG-DOMAIN 2026-08-26 by Codex] Extracted canonical
+//   artifact naming, parsing, pairing, ordering, duplicate rejection, and
+//   catalog bounds behind a path-free composed capability.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -322,6 +325,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.34.0-AuditCatalogDomain — Trait-based path-free segment catalog
 //   v3.33.0-AuditRotationDomain — Trait-based segment rotation planning
 //   v3.32.0-AuditCheckpointDomain — Trait-based authenticated checkpoints
 //   v3.31.0-BackupAuditRecordDomain — Typed authenticated audit records
@@ -421,6 +425,10 @@ use crate::services::chat_relay_backup_audit::{
     BackupAuditPhase, BackupAuditRecordAuthenticator, BackupAuditRecordError,
     ChatRelayBackupMaintenanceAuditCounts, ChatRelayBackupMaintenanceAuditRecord,
     HmacBackupAuditRecordAuthenticator,
+};
+use crate::services::chat_relay_backup_audit_catalog::{
+    BackupAuditCatalogError, BackupAuditCatalogFiles, BackupAuditSegmentCatalog,
+    BoundedBackupAuditSegmentCatalog,
 };
 use crate::services::chat_relay_backup_audit_checkpoint::{
     BackupAuditCheckpointAuthenticator, BackupAuditCheckpointError,
@@ -563,12 +571,6 @@ const CHAT_RELAY_BACKUP_AUDIT_ANCHOR_DIGEST_DOMAIN: &[u8] =
     b"AeroNyx-RelayCustodyBackup-MaintenanceAuditAnchorDigest-v1";
 /// Private sibling file holding aggregate-only maintenance audit records.
 const CHAT_RELAY_BACKUP_AUDIT_FILE_NAME: &str = ".aeronyx-relay-backup-maintenance-audit.jsonl";
-/// Prefix for immutable, sequence-addressed audit segments.
-const CHAT_RELAY_BACKUP_AUDIT_SEGMENT_PREFIX: &str =
-    ".aeronyx-relay-backup-maintenance-audit.segment-";
-/// Prefix for authenticated segment checkpoints.
-const CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_PREFIX: &str =
-    ".aeronyx-relay-backup-maintenance-audit.checkpoint-";
 /// Prefix for owner-private checkpoint files not yet atomically published.
 const CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_TEMP_PREFIX: &str =
     ".aeronyx-relay-backup-maintenance-audit.tmp-checkpoint-";
@@ -1551,12 +1553,6 @@ impl ChatRelayBackupAuditVerificationState {
     }
 }
 
-#[derive(Default)]
-struct ChatRelayBackupAuditSegmentFiles {
-    segment_path: Option<PathBuf>,
-    checkpoint_path: Option<PathBuf>,
-}
-
 enum ChatRelayBackupAuditPendingRotation {
     PublishSegment {
         active_path: PathBuf,
@@ -2110,74 +2106,47 @@ impl ChatRelayService {
     }
 
     fn backup_audit_segment_file_name(range: ChatRelayBackupAuditSegmentRange) -> String {
-        format!(
-            "{CHAT_RELAY_BACKUP_AUDIT_SEGMENT_PREFIX}{:020}-{:020}.jsonl",
-            range.first_sequence, range.last_sequence
-        )
+        Self::backup_audit_segment_catalog().segment_file_name(range)
     }
 
     fn backup_audit_checkpoint_file_name(range: ChatRelayBackupAuditSegmentRange) -> String {
-        format!(
-            "{CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_PREFIX}{:020}-{:020}.json",
-            range.first_sequence, range.last_sequence
-        )
+        Self::backup_audit_segment_catalog().checkpoint_file_name(range)
     }
 
-    fn parse_backup_audit_range(
-        file_name: &str,
-        prefix: &str,
-        suffix: &str,
-    ) -> ChatRelayResult<Option<ChatRelayBackupAuditSegmentRange>> {
-        if !file_name.starts_with(prefix) {
-            return Ok(None);
+    fn backup_audit_segment_catalog() -> BoundedBackupAuditSegmentCatalog {
+        BoundedBackupAuditSegmentCatalog::new(CHAT_RELAY_BACKUP_AUDIT_MAX_SEGMENTS)
+    }
+
+    fn map_backup_audit_catalog_error(error: BackupAuditCatalogError) -> ChatRelayError {
+        match error {
+            BackupAuditCatalogError::MalformedName => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CORRUPT,
+                "relay backup maintenance audit segment name is malformed",
+            ),
+            BackupAuditCatalogError::AmbiguousName => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CORRUPT,
+                "relay backup maintenance audit segment name is ambiguous",
+            ),
+            BackupAuditCatalogError::InvalidRange => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CORRUPT,
+                "relay backup maintenance audit segment range is invalid",
+            ),
+            BackupAuditCatalogError::DuplicateArtifact => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_CORRUPT,
+                "relay backup maintenance audit segment is duplicated",
+            ),
+            BackupAuditCatalogError::SegmentLimitReached => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_FULL,
+                "relay backup maintenance audit segment limit reached",
+            ),
         }
-        let Some(body) = file_name
-            .strip_prefix(prefix)
-            .and_then(|name| name.strip_suffix(suffix))
-        else {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit segment name is malformed",
-            ));
-        };
-        let Some((first, last)) = body.split_once('-') else {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit segment name is malformed",
-            ));
-        };
-        if first.len() != 20
-            || last.len() != 20
-            || !first.bytes().all(|byte| byte.is_ascii_digit())
-            || !last.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit segment name is malformed",
-            ));
-        }
-        let first_sequence = first.parse::<u64>().map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit segment name is malformed",
-            )
-        })?;
-        let last_sequence = last.parse::<u64>().map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CORRUPT,
-                "relay backup maintenance audit segment name is malformed",
-            )
-        })?;
-        ChatRelayBackupAuditSegmentRange::new(first_sequence, last_sequence)
-            .map(Some)
-            .map_err(Self::map_backup_audit_rotation_error)
     }
 
     fn collect_backup_audit_segment_files(
         parent: &Path,
-    ) -> ChatRelayResult<BTreeMap<ChatRelayBackupAuditSegmentRange, ChatRelayBackupAuditSegmentFiles>>
+    ) -> ChatRelayResult<BTreeMap<ChatRelayBackupAuditSegmentRange, BackupAuditCatalogFiles>>
     {
-        let mut segments = BTreeMap::new();
+        let mut catalog = Self::backup_audit_segment_catalog();
         let entries = std::fs::read_dir(parent).map_err(|_| {
             Self::backup_io_error(
                 rusqlite::ffi::SQLITE_CANTOPEN,
@@ -2194,49 +2163,11 @@ impl ChatRelayService {
             let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let segment_range = Self::parse_backup_audit_range(
-                &file_name,
-                CHAT_RELAY_BACKUP_AUDIT_SEGMENT_PREFIX,
-                ".jsonl",
-            )?;
-            let checkpoint_range = Self::parse_backup_audit_range(
-                &file_name,
-                CHAT_RELAY_BACKUP_AUDIT_CHECKPOINT_PREFIX,
-                ".json",
-            )?;
-            let (range, is_checkpoint) = match (segment_range, checkpoint_range) {
-                (Some(range), None) => (range, false),
-                (None, Some(range)) => (range, true),
-                (None, None) => continue,
-                (Some(_), Some(_)) => {
-                    return Err(Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_CORRUPT,
-                        "relay backup maintenance audit segment name is ambiguous",
-                    ));
-                }
-            };
-            let files = segments
-                .entry(range)
-                .or_insert_with(ChatRelayBackupAuditSegmentFiles::default);
-            let slot = if is_checkpoint {
-                &mut files.checkpoint_path
-            } else {
-                &mut files.segment_path
-            };
-            if slot.replace(entry.path()).is_some() {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CORRUPT,
-                    "relay backup maintenance audit segment is duplicated",
-                ));
-            }
-            if segments.len() > CHAT_RELAY_BACKUP_AUDIT_MAX_SEGMENTS {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_FULL,
-                    "relay backup maintenance audit segment limit reached",
-                ));
-            }
+            catalog
+                .insert_file_name(file_name)
+                .map_err(Self::map_backup_audit_catalog_error)?;
         }
-        Ok(segments)
+        Ok(catalog.into_files())
     }
 
     fn cleanup_backup_audit_checkpoint_temporaries(parent: &Path) -> ChatRelayResult<()> {
@@ -2826,14 +2757,16 @@ impl ChatRelayService {
         let mut latest_segment_fingerprint: Option<BackupAuditSegmentFingerprint> = None;
 
         for (index, (range, files)) in segments.into_iter().enumerate() {
-            let checkpoint_path = files.checkpoint_path.ok_or_else(|| {
+            let checkpoint_path = parent.join(files.checkpoint_file_name.ok_or_else(|| {
                 Self::backup_io_error(
                     rusqlite::ffi::SQLITE_CORRUPT,
                     "relay backup maintenance audit segment checkpoint is missing",
                 )
-            })?;
+            })?);
             let previous_record_count = state.receipt.record_count;
-            let (mut segment, uses_active) = if let Some(segment_path) = files.segment_path {
+            let (mut segment, uses_active) = if let Some(segment_file_name) = files.segment_file_name
+            {
+                let segment_path = parent.join(segment_file_name);
                 let segment = Self::open_existing_private_backup_control_file(&segment_path)?
                     .ok_or_else(|| {
                         Self::backup_io_error(

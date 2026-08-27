@@ -47,8 +47,11 @@
 //   private immutable checkpoint contract and authentication capability.
 //   [CHAT-RELAY-AUDIT-ROTATION-DOMAIN 2026-08-26 by Codex] Registered the
 //   private bounded segment-rotation policy and recovery state model.
+//   [CHAT-RELAY-AUDIT-CATALOG-DOMAIN 2026-08-26 by Codex] Registered the
+//   private path-free segment/checkpoint catalog capability.
 //
 // Last Modified:
+//   v0.37.0-AuditCatalogDomain - Registered bounded artifact catalog
 //   v0.36.0-AuditRotationDomain - Registered segment rotation policy
 //   v0.35.0-AuditCheckpointDomain - Registered authenticated checkpoints
 //   v0.34.0-BackupAuditRecordDomain - Registered authenticated audit records
@@ -106,6 +109,7 @@
 pub mod blind_vault;
 pub mod chat_relay;
 mod chat_relay_backup_audit;
+mod chat_relay_backup_audit_catalog;
 mod chat_relay_backup_audit_checkpoint;
 mod chat_relay_backup_audit_rotation;
 mod chat_relay_backup_retention;
