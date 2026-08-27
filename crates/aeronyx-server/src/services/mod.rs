@@ -4,6 +4,8 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-CERTIFICATION-DOMAIN 2026-08-27 by Codex] Registered
+//   the composed SQLite recovery-image certification capability.
 //   [CHAT-RELAY-BACKUP-CREATE-DOMAIN 2026-08-27 by Codex] Registered the
 //   composed verified backup creation, replay, and publication command.
 //   Registered `deny_list` submodule and re-exported DenyList + DenyReason.
@@ -79,6 +81,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.52.0-ChatRelayBackupCertificationDomain - Registered image certifier
 //   v0.51.0-ChatRelayBackupCreateDomain - Registered backup creation command
 //   v0.50.0-ChatRelayRestoreCommandDomain - Registered restore commands
 //   v0.49.0-ChatRelayBackupPruneDomain - Registered audited prune command
@@ -158,6 +161,7 @@ mod chat_relay_backup_audit_checkpoint;
 mod chat_relay_backup_audit_io;
 mod chat_relay_backup_audit_rotation;
 mod chat_relay_backup_audit_verification;
+mod chat_relay_backup_certification;
 mod chat_relay_backup_contract;
 mod chat_relay_backup_copy;
 mod chat_relay_backup_create;

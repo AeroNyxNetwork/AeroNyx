@@ -1,9 +1,13 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.49.0-VerifiedBackupCreationDomain
+// Version: 3.50.0-RecoveryImageCertificationDomain
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-CERTIFICATION-DOMAIN 2026-08-27 by Codex] Extracted
+//   SQLite recovery-image journal normalization, physical verification,
+//   schema/replay checks, accounting reconciliation, and queue continuity
+//   behind a composed certification capability.
 //   [CHAT-RELAY-BACKUP-CREATE-DOMAIN 2026-08-27 by Codex] Extracted verified
 //   backup certification, idempotent replay verification, no-replace
 //   publication, and owned-artifact rollback behind a composed command.
@@ -371,6 +375,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.50.0-RecoveryImageCertificationDomain - Composed SQLite certification
 //   v3.49.0-VerifiedBackupCreationDomain - Composed backup creation command
 //   v3.48.0-ComposedRestoreCommandDomain - Composed restore plan commands
 //   v3.47.0-AuditedBackupPruneDomain - Composed backup prune command
@@ -511,6 +516,10 @@ use crate::services::chat_relay_backup_audit_verification::{
     BackupAuditVerificationLimits, BackupAuditVerificationPolicy,
     BoundedBackupAuditVerificationPolicy, ChatRelayBackupAuditVerificationState,
 };
+use crate::services::chat_relay_backup_certification::{
+    verify_sqlite_physical_integrity, BackupRecoveryImageCertification,
+    RecoveryImageSchemaRequirement, SqliteBackupRecoveryImageCertifier,
+};
 use crate::services::chat_relay_backup_contract::ChatRelayBackupReceipt;
 pub use crate::services::chat_relay_backup_contract::{
     ChatRelayBackupPruneReceipt, ChatRelayBackupPruneRequest, ChatRelayBackupRetentionReceipt,
@@ -554,8 +563,9 @@ use crate::services::chat_relay_cleanup::{
     CLEANUP_MAX_BATCHES_PER_RUN,
 };
 pub(crate) use crate::services::chat_relay_direct_peer_circuit::ChatRelayDirectPeerPermit;
+use crate::services::chat_relay_direct_peer_circuit::DirectPeerCircuitDomain;
+#[cfg(test)]
 use crate::services::chat_relay_direct_peer_circuit::{
-    DirectPeerCircuitDomain, SqliteDirectPeerCircuitRepository,
     DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION, DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE,
 };
 #[cfg(test)]
@@ -968,6 +978,7 @@ pub struct ChatRelayService {
 /// lock and relay-specific logical certification inside `ChatRelayService`.
 struct ChatRelayBackupDatabaseCertification<'a> {
     service: &'a ChatRelayService,
+    certifier: SqliteBackupRecoveryImageCertifier,
 }
 
 impl BackupDatabaseCertification for ChatRelayBackupDatabaseCertification<'_> {
@@ -977,11 +988,11 @@ impl BackupDatabaseCertification for ChatRelayBackupDatabaseCertification<'_> {
     }
 
     fn normalize_isolated_journal(&self, connection: &Connection) -> ChatRelayResult<()> {
-        ChatRelayService::normalize_sqlite_backup_journal(connection)
+        self.certifier.normalize_journal(connection)
     }
 
     fn verify_recovery_image(&self, connection: &Connection) -> ChatRelayResult<()> {
-        ChatRelayService::verify_sqlite_backup(connection)
+        self.certifier.verify(connection, now_secs())
     }
 
     fn restrict_file_permissions(&self, path: &Path) -> ChatRelayResult<()> {
@@ -1007,26 +1018,6 @@ impl ChatRelayService {
 
     #[cfg(not(unix))]
     fn restrict_sqlite_file_permissions(_path: &Path) -> ChatRelayResult<()> {
-        Ok(())
-    }
-
-    fn verify_sqlite_integrity(
-        conn: &Connection,
-        failure_field: &'static str,
-    ) -> ChatRelayResult<()> {
-        // [CHAT-RELAY-STARTUP-QUICK-CHECK 2026-08-16 by Codex] `quick_check(1)`
-        // bounds returned findings while still traversing the database. Both a
-        // non-`ok` finding and an SQLite error collapse to one path-free bucket.
-        let outcome = conn
-            .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
-            .map_err(|_| ChatRelayError::CorruptStoredData {
-                field: failure_field,
-            })?;
-        if outcome != "ok" {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: failure_field,
-            });
-        }
         Ok(())
     }
 
@@ -1092,6 +1083,22 @@ impl ChatRelayService {
 
     fn backup_artifact_namespace() -> HmacBackupArtifactNamespace {
         HmacBackupArtifactNamespace::new(CHAT_RELAY_BACKUP_OPERATION_ID_MAX_BYTES)
+    }
+
+    fn backup_recovery_image_certifier() -> SqliteBackupRecoveryImageCertifier {
+        // [CHAT-RELAY-BACKUP-CERTIFICATION-DOMAIN 2026-08-27 by Codex] Keep
+        // runtime schema installation and recovery certification bound to the
+        // same exact versions without moving service migration ownership.
+        SqliteBackupRecoveryImageCertifier::new(
+            RecoveryImageSchemaRequirement::new(
+                VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
+                VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
+            ),
+            RecoveryImageSchemaRequirement::new(
+                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
+            ),
+        )
     }
 
     fn verify_existing_backup_artifact(path: &Path) -> ChatRelayResult<u64> {
@@ -1549,7 +1556,10 @@ impl ChatRelayService {
         let temporary = backup_directory.join(temporary_name.as_str());
         VerifiedBackupCreationCommand::new(
             LocalBackupFilesystem,
-            ChatRelayBackupDatabaseCertification { service: self },
+            ChatRelayBackupDatabaseCertification {
+                service: self,
+                certifier: Self::backup_recovery_image_certifier(),
+            },
         )
         .execute(VerifiedBackupCreationRequest {
             backup_directory,
@@ -1614,189 +1624,8 @@ impl ChatRelayService {
         }
     }
 
-    fn verify_sqlite_backup_logical_integrity(conn: &Connection) -> ChatRelayResult<()> {
-        let installed_version = conn
-            .query_row(
-                "SELECT schema_version
-                 FROM relay_schema_features
-                 WHERE feature = ?1",
-                params![DIRECT_PEER_RELAY_CIRCUIT_SCHEMA_FEATURE],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        if installed_version != Some(DIRECT_PEER_RELAY_CIRCUIT_CHECKPOINT_VERSION) {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_schema_sentinel",
-            });
-        }
-
-        let verified_submit_version = conn
-            .query_row(
-                "SELECT schema_version
-                 FROM relay_schema_features
-                 WHERE feature = ?1",
-                params![VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        if verified_submit_version != Some(VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION) {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_verified_submit_schema_sentinel",
-            });
-        }
-        let invalid_verified_submit_rows = conn.query_row(
-            "SELECT COUNT(*) FROM relay_verified_submit_responses
-             WHERE LENGTH(cache_key) != 32
-                OR LENGTH(envelope_fingerprint) != 32
-                OR LENGTH(response_nonce) != 24
-                OR LENGTH(response_ciphertext) <= 16
-                OR LENGTH(response_ciphertext) > 528
-                OR completed_at < 0",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if invalid_verified_submit_rows != 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_verified_submit_rows",
-            });
-        }
-        let invalid_verified_submit_reservations = conn.query_row(
-            "SELECT COUNT(*) FROM relay_verified_submit_reservations
-             WHERE LENGTH(cache_key) != 32
-                OR LENGTH(envelope_fingerprint) != 32
-                OR reserved_at < 0
-                OR owner_epoch IS NULL
-                OR TYPEOF(owner_epoch) != 'blob'
-                OR LENGTH(owner_epoch) != 16
-                OR TYPEOF(owner_acquired_at) != 'integer'
-                OR owner_acquired_at < reserved_at",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if invalid_verified_submit_reservations != 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_verified_submit_reservations",
-            });
-        }
-
-        // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] A recovery image
-        // must carry the same route side-effect boundary as the live database.
-        // Validate only fixed shape here; AEAD authenticity remains bound to
-        // the node secret and is checked when an exact response is recovered.
-        let blind_route_version = conn
-            .query_row(
-                "SELECT schema_version
-                 FROM relay_schema_features
-                 WHERE feature = ?1",
-                params![BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        if blind_route_version != Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION) {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_blind_route_schema_sentinel",
-            });
-        }
-        let invalid_blind_route_responses = conn.query_row(
-            "SELECT COUNT(*) FROM relay_blind_route_responses
-             WHERE LENGTH(cache_key) != 32
-                OR LENGTH(request_fingerprint) != 32
-                OR LENGTH(response_nonce) != 24
-                OR LENGTH(response_ciphertext) <= 16
-                OR LENGTH(response_ciphertext) > 2064
-                OR completed_at < 0",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let invalid_blind_route_reservations = conn.query_row(
-            "SELECT COUNT(*) FROM relay_blind_route_reservations
-             WHERE LENGTH(cache_key) != 32
-                OR LENGTH(request_fingerprint) != 32
-                OR reserved_at < 0
-                OR owner_epoch IS NULL
-                OR TYPEOF(owner_epoch) != 'blob'
-                OR LENGTH(owner_epoch) != 16
-                OR TYPEOF(owner_acquired_at) != 'integer'
-                OR owner_acquired_at < reserved_at
-                OR (effect_started_at IS NOT NULL
-                    AND (TYPEOF(effect_started_at) != 'integer'
-                         OR effect_started_at < reserved_at))",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if invalid_blind_route_responses != 0 || invalid_blind_route_reservations != 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_blind_route_rows",
-            });
-        }
-
-        DirectPeerCircuitDomain::<SqliteDirectPeerCircuitRepository>::validate_checkpoint(
-            conn,
-            now_secs(),
-        )?;
-
-        let stored_usage = Self::read_storage_usage(conn)?;
-        let canonical_usage = Self::read_canonical_storage_usage(conn)?;
-        if stored_usage != canonical_usage {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_storage_usage",
-            });
-        }
-
-        let (last_sequence, max_sequence, missing_sequences) = conn.query_row(
-            "SELECT
-                (SELECT last_sequence FROM relay_queue_sequence WHERE singleton = 1),
-                (SELECT COALESCE(MAX(queue_sequence), 0) FROM pending_messages),
-                (SELECT COUNT(*) FROM pending_messages WHERE queue_sequence IS NULL)",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )?;
-        if last_sequence < 0
-            || max_sequence < 0
-            || missing_sequences != 0
-            || last_sequence < max_sequence
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_queue_sequence",
-            });
-        }
-        Ok(())
-    }
-
     fn verify_sqlite_backup(conn: &Connection) -> ChatRelayResult<()> {
-        Self::verify_sqlite_integrity(conn, "sqlite_backup_integrity")?;
-        Self::verify_sqlite_backup_logical_integrity(conn).map_err(|_| {
-            ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_logical_integrity",
-            }
-        })
-    }
-
-    fn normalize_sqlite_backup_journal(conn: &Connection) -> ChatRelayResult<()> {
-        // [CHAT-RELAY-BACKUP-IDEMPOTENCY 2026-08-16 by Codex] SQLite may copy
-        // the source WAL mode into the isolated image. A later read-only open
-        // can then create `-wal`/`-shm`, violating immutable artifact replay.
-        // Normalize only the offline copy; restored service startup explicitly
-        // re-enables WAL + FULL before accepting custody.
-        let journal_mode = conn
-            .query_row("PRAGMA journal_mode=DELETE", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|_| ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_journal_mode",
-            })?;
-        if !journal_mode.eq_ignore_ascii_case("delete") {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "sqlite_backup_journal_mode",
-            });
-        }
-        Ok(())
+        Self::backup_recovery_image_certifier().verify(conn, now_secs())
     }
 
     /// Creates a new `ChatRelayService`, opening (or creating) the SQLite database.
@@ -1839,7 +1668,7 @@ impl ChatRelayService {
         // A short bounded wait absorbs transient locks from an operator backup
         // or diagnostic reader without allowing relay requests to hang forever.
         conn.busy_timeout(Duration::from_secs(5))?;
-        Self::verify_sqlite_integrity(&conn, "sqlite_startup_integrity")?;
+        verify_sqlite_physical_integrity(&conn, "sqlite_startup_integrity")?;
         let synchronous_level = Self::configure_sqlite_durability(&conn)?;
 
         let dedup_capacity = config.dedup_lru_capacity;
