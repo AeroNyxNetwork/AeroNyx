@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.72.0-ExpiredNotificationFacade
+// Version: 3.73.0-CleanupFacade
 //
 // Modification Reason:
+//   [CHAT-CLEANUP-FACADE-DOMAIN 2026-08-28 by Codex] Moved bounded cleanup
+//   orchestration, aggregate telemetry, and stable failure propagation into a
+//   nested facade while preserving deterministic sibling-test seams.
 //   [CHAT-EXPIRED-FACADE-DOMAIN 2026-08-28 by Codex] Moved expiry-control
 //   delivery, poison-row isolation, compatibility reads, and pushed-state ACK
 //   APIs into a nested facade without changing durable semantics.
@@ -431,6 +434,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.73.0-CleanupFacade - Extracted bounded-cleanup API facade
 //   v3.72.0-ExpiredNotificationFacade - Extracted expiry-control API facade
 //   v3.71.0-EncryptedBlobFacade - Extracted encrypted-blob API facade
 //   v3.70.0-PendingMessageFacade - Extracted pending-message API facade
@@ -618,10 +622,7 @@ use crate::services::chat_relay_blind_route_coordinator::BlindRouteCoordinator;
 use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
     as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
 use crate::services::chat_relay_blob_custody::EncryptedBlobCustodyDomain;
-use crate::services::chat_relay_cleanup::{CleanupRunSummary, CLEANUP_MAX_BATCHES_PER_RUN};
-use crate::services::chat_relay_cleanup_execution::{
-    BoundedRelayCleanupExecutor, RelayCleanupExecution,
-};
+use crate::services::chat_relay_cleanup_execution::BoundedRelayCleanupExecutor;
 pub use crate::services::chat_relay_custody_anchor_guard::ChatRelayCustodyAuditAnchorGuard;
 pub(crate) use crate::services::chat_relay_direct_peer_circuit::ChatRelayDirectPeerPermit;
 use crate::services::chat_relay_direct_peer_circuit::DirectPeerCircuitDomain;
@@ -1490,86 +1491,6 @@ impl ChatRelayService {
     }
 
     // ============================================
-    // TTL cleanup
-    // ============================================
-
-    /// Runs one TTL cleanup cycle (synchronous — call from `spawn_blocking`).
-    ///
-    /// Mutations run in a bounded sequence of `SQLite` IMMEDIATE transactions.
-    /// Each committed batch releases the connection before the next begins.
-    /// Returns `(expired_messages, expired_blobs)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage, serialization, or durable-data integrity error. A
-    /// failed batch is rolled back and counted in maintenance evidence. Earlier
-    /// committed batches remain durable and are included in aggregate counters.
-    pub fn run_cleanup(&self) -> ChatRelayResult<(usize, usize)> {
-        self.run_cleanup_with_batch_budget(CLEANUP_MAX_BATCHES_PER_RUN)
-    }
-
-    fn run_cleanup_with_batch_budget(&self, max_batches: usize) -> ChatRelayResult<(usize, usize)> {
-        let now = now_secs();
-        let cleanup_now = i64::try_from(now).unwrap_or(i64::MAX);
-        let (summary, failure) = self.run_cleanup_at(cleanup_now, max_batches);
-
-        self.maintenance_telemetry
-            .record_cleanup(now, summary, failure.as_ref());
-
-        let Some(error) = failure else {
-            return Ok((summary.expired_messages, summary.expired_blobs));
-        };
-        Err(error)
-    }
-
-    fn run_cleanup_at(
-        &self,
-        now: i64,
-        max_batches: usize,
-    ) -> (CleanupRunSummary, Option<ChatRelayError>) {
-        let execution = self.cleanup_execution.execute(
-            &self.conn,
-            &self.durable_quarantine,
-            now,
-            max_batches,
-        );
-        let summary = execution.summary;
-        let failure = execution.failure;
-
-        if summary.removed_anything() || summary.backlog_deferred {
-            info!(
-                expired_messages = summary.expired_messages,
-                expired_blobs = summary.expired_blobs,
-                removed_notifications = summary.removed_notifications,
-                quarantined_pending_messages = summary.quarantined_pending_messages,
-                removed_quarantine_events = summary.removed_quarantine_events,
-                removed_verified_submit_responses = summary.removed_verified_submit_responses,
-                removed_verified_submit_reservations = summary.removed_verified_submit_reservations,
-                removed_blind_route_responses = summary.removed_blind_route_responses,
-                removed_blind_route_reservations = summary.removed_blind_route_reservations,
-                retained_quarantine_events = summary.retained_quarantine_events,
-                committed_batches = summary.successful_batches,
-                backlog_deferred = summary.backlog_deferred,
-                cleanup_failed = failure.is_some(),
-                "[CHAT_RELAY] Bounded cleanup run complete"
-            );
-        } else {
-            debug!(
-                cleanup_failed = failure.is_some(),
-                "[CHAT_RELAY] Cleanup: nothing to expire"
-            );
-        }
-        if summary.quarantined_pending_messages > 0 {
-            warn!(
-                quarantined_pending_messages = summary.quarantined_pending_messages,
-                "[CHAT_RELAY] Corrupt pending rows isolated during cleanup"
-            );
-        }
-
-        (summary, failure)
-    }
-
-    // ============================================
     // Peer relay health
     // ============================================
 
@@ -1892,6 +1813,9 @@ mod backup_facade;
 
 #[path = "chat_relay_blob_facade.rs"]
 mod blob_facade;
+
+#[path = "chat_relay_cleanup_facade.rs"]
+mod cleanup_facade;
 
 #[path = "chat_relay_expired_facade.rs"]
 mod expired_facade;
