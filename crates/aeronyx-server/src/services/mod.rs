@@ -4,6 +4,8 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [CHAT-RELAY-REPLAY-SCHEMA-DOMAIN 2026-08-27 by Codex] Registered the
+//   composed verified-submit and blind-route SQLite migration capability.
 //   [CHAT-RELAY-BACKUP-CERTIFICATION-DOMAIN 2026-08-27 by Codex] Registered
 //   the composed SQLite recovery-image certification capability.
 //   [CHAT-RELAY-BACKUP-CREATE-DOMAIN 2026-08-27 by Codex] Registered the
@@ -81,6 +83,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.53.0-ChatRelayReplaySchemaDomain - Registered replay schema migrator
 //   v0.52.0-ChatRelayBackupCertificationDomain - Registered image certifier
 //   v0.51.0-ChatRelayBackupCreateDomain - Registered backup creation command
 //   v0.50.0-ChatRelayRestoreCommandDomain - Registered restore commands
@@ -181,6 +184,7 @@ mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;
 mod chat_relay_pull_cursor;
 mod chat_relay_quarantine;
+mod chat_relay_replay_schema;
 mod chat_relay_restore_command;
 mod chat_relay_restore_plan;
 #[cfg(unix)]

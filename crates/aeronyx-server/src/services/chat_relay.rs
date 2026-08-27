@@ -1,9 +1,13 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.50.0-RecoveryImageCertificationDomain
+// Version: 3.51.0-ReplaySchemaMigrationDomain
 //
 // Modification Reason:
+//   [CHAT-RELAY-REPLAY-SCHEMA-DOMAIN 2026-08-27 by Codex] Extracted
+//   verified-submit and blind-route replay installation, legacy migration,
+//   row validation, marker advancement, and startup retention behind a
+//   composed SQLite schema migration capability.
 //   [CHAT-RELAY-BACKUP-CERTIFICATION-DOMAIN 2026-08-27 by Codex] Extracted
 //   SQLite recovery-image journal normalization, physical verification,
 //   schema/replay checks, accounting reconciliation, and queue continuity
@@ -375,6 +379,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.51.0-ReplaySchemaMigrationDomain - Composed replay schema migrations
 //   v3.50.0-RecoveryImageCertificationDomain - Composed SQLite certification
 //   v3.49.0-VerifiedBackupCreationDomain - Composed backup creation command
 //   v3.48.0-ComposedRestoreCommandDomain - Composed restore plan commands
@@ -600,6 +605,10 @@ pub use crate::services::chat_relay_restore_plan::ChatRelayRestorePlanReceipt;
 #[cfg(test)]
 use crate::services::chat_relay_restore_plan::{RESTORE_PLAN_NONCE_BYTES, RESTORE_PLAN_VERSION};
 use crate::services::chat_relay_restore_plan::RESTORE_PLAN_VALIDITY_SECS;
+use crate::services::chat_relay_replay_schema::{
+    ChatRelayReplaySchemaMigration, ReplaySchemaContract, ReplaySchemaVersion,
+    SqliteChatRelayReplaySchemaMigrator,
+};
 #[cfg(unix)]
 use crate::services::chat_relay_runtime_fence::ChatRelayRuntimeFence;
 pub(crate) use crate::services::chat_relay_verified_submit::{
@@ -1738,460 +1747,33 @@ impl ChatRelayService {
         Self::init_usage_schema(&conn)?;
         self.direct_peer_relay_circuit
             .init_schema(&mut conn, now_secs())?;
-        Self::init_verified_submit_response_schema(&mut conn, now_secs())?;
-        Self::init_blind_relay_route_replay_schema(&mut conn, now_secs())?;
+        let replay_schema = SqliteChatRelayReplaySchemaMigrator::new(
+            ReplaySchemaContract::new(
+                ReplaySchemaVersion::new(
+                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
+                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
+                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
+                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
+                ),
+                ReplaySchemaVersion::new(
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION,
+                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
+                ),
+                VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
+                BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
+                REPLAY_PROCESS_EPOCH_BYTES,
+            ),
+        );
+        replay_schema.migrate_verified_submit(&mut conn, now_secs())?;
+        replay_schema.migrate_blind_route(&mut conn, now_secs())?;
         Self::reconcile_storage_usage(&conn)?;
         let retained_quarantine_events = self.durable_quarantine.retained_count(&conn)?;
         drop(conn);
         self.maintenance_status.write().quarantine_events_retained =
             u64::try_from(retained_quarantine_events).unwrap_or(u64::MAX);
         Ok(())
-    }
-
-    fn init_verified_submit_response_schema(
-        conn: &mut Connection,
-        now: u64,
-    ) -> ChatRelayResult<()> {
-        // [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] Completed
-        // responses and unfinished reservations contain only node-secret HMACs,
-        // sealed bytes, retention timestamps, and random process ownership.
-        // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Schema v3
-        // fences abandoned reservations so a replacement process can recover
-        // entry custody without repeating an uncertain onion side effect.
-        let response_table_existed = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table'
-                  AND name = 'relay_verified_submit_responses'
-             )",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        let reservation_table_existed = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table'
-                  AND name = 'relay_verified_submit_reservations'
-             )",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS relay_verified_submit_responses (
-                cache_key            BLOB    PRIMARY KEY CHECK(LENGTH(cache_key) = 32),
-                envelope_fingerprint BLOB    NOT NULL CHECK(LENGTH(envelope_fingerprint) = 32),
-                response_nonce       BLOB    NOT NULL CHECK(LENGTH(response_nonce) = 24),
-                response_ciphertext  BLOB    NOT NULL CHECK(
-                    LENGTH(response_ciphertext) > 16
-                    AND LENGTH(response_ciphertext) <= 528
-                ),
-                completed_at         INTEGER NOT NULL CHECK(completed_at >= 0)
-            );
-            CREATE INDEX IF NOT EXISTS idx_verified_submit_response_retention
-                ON relay_verified_submit_responses(completed_at);
-
-            CREATE TABLE IF NOT EXISTS relay_verified_submit_reservations (
-                cache_key            BLOB    PRIMARY KEY CHECK(LENGTH(cache_key) = 32),
-                envelope_fingerprint BLOB    NOT NULL CHECK(LENGTH(envelope_fingerprint) = 32),
-                reserved_at          INTEGER NOT NULL CHECK(reserved_at >= 0),
-                owner_epoch         BLOB    NOT NULL CHECK(LENGTH(owner_epoch) = 16),
-                owner_acquired_at   INTEGER NOT NULL CHECK(owner_acquired_at >= reserved_at)
-            );
-            CREATE INDEX IF NOT EXISTS idx_verified_submit_reservation_retention
-                ON relay_verified_submit_reservations(reserved_at);
-            ",
-        )?;
-        let installed_version = tx
-            .query_row(
-                "SELECT schema_version FROM relay_schema_features WHERE feature = ?1",
-                params![VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        if installed_version.is_some_and(|version| {
-            version != VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION
-                && version != VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION
-                && version != VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION
-        }) {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_response_installation_version",
-            });
-        }
-        if !response_table_existed && installed_version.is_some() {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_response_table",
-            });
-        }
-        if matches!(
-            installed_version,
-            Some(
-                VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION
-                    | VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION
-            )
-        ) && !reservation_table_existed
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_reservation_table",
-            });
-        }
-        let owner_epoch_exists =
-            Self::verified_submit_reservation_column_exists(&tx, "owner_epoch")?;
-        let owner_acquired_at_exists =
-            Self::verified_submit_reservation_column_exists(&tx, "owner_acquired_at")?;
-        if installed_version == Some(VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION)
-            && (!owner_epoch_exists || !owner_acquired_at_exists)
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_reservation_columns",
-            });
-        }
-        if !owner_epoch_exists {
-            tx.execute_batch(
-                "ALTER TABLE relay_verified_submit_reservations
-                 ADD COLUMN owner_epoch BLOB",
-            )?;
-        }
-        if !owner_acquired_at_exists {
-            tx.execute_batch(
-                "ALTER TABLE relay_verified_submit_reservations
-                 ADD COLUMN owner_acquired_at INTEGER",
-            )?;
-        }
-        if installed_version != Some(VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION) {
-            // A pre-v3 owner is deliberately foreign to this process. Its
-            // immutable reservation age becomes the first takeover lease.
-            tx.execute(
-                "UPDATE relay_verified_submit_reservations
-                 SET owner_epoch = zeroblob(?1), owner_acquired_at = reserved_at",
-                params![i64::try_from(REPLAY_PROCESS_EPOCH_BYTES).unwrap_or(i64::MAX)],
-            )?;
-        }
-        let invalid_rows = tx.query_row(
-            "SELECT COUNT(*) FROM relay_verified_submit_responses
-             WHERE LENGTH(cache_key) != 32
-                OR LENGTH(envelope_fingerprint) != 32
-                OR LENGTH(response_nonce) != 24
-                OR LENGTH(response_ciphertext) <= 16
-                OR LENGTH(response_ciphertext) > 528
-                OR completed_at < 0",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if invalid_rows != 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_response_row_shape",
-            });
-        }
-        let invalid_reservations = tx.query_row(
-            "SELECT COUNT(*) FROM relay_verified_submit_reservations
-             WHERE LENGTH(cache_key) != 32
-                OR LENGTH(envelope_fingerprint) != 32
-                OR reserved_at < 0
-                OR owner_epoch IS NULL
-                OR TYPEOF(owner_epoch) != 'blob'
-                OR LENGTH(owner_epoch) != 16
-                OR TYPEOF(owner_acquired_at) != 'integer'
-                OR owner_acquired_at < reserved_at",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if invalid_reservations != 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_reservation_row_shape",
-            });
-        }
-        if installed_version.is_none()
-            && tx.execute(
-                "INSERT INTO relay_schema_features (feature, schema_version, installed_at)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
-                    VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
-                    sqlite_integer(now, "verified_submit_response_schema_installed_at")?
-                ],
-            )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_response_installation_marker",
-            });
-        }
-        if matches!(
-            installed_version,
-            Some(
-                VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION
-                    | VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION
-            )
-        ) && tx.execute(
-            "UPDATE relay_schema_features SET schema_version = ?1
-                 WHERE feature = ?2 AND schema_version IN (?3, ?4)",
-            params![
-                VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION,
-                VERIFIED_SUBMIT_RESPONSE_SCHEMA_FEATURE,
-                VERIFIED_SUBMIT_RESPONSE_SCHEMA_LEGACY_VERSION,
-                VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION,
-            ],
-        )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_response_migration_marker",
-            });
-        }
-
-        let cutoff = sqlite_integer(
-            now.saturating_sub(VERIFIED_SUBMIT_RESPONSE_TTL_SECS),
-            "verified_submit_response_startup_cutoff",
-        )?;
-        tx.execute(
-            "DELETE FROM relay_verified_submit_responses WHERE completed_at < ?1",
-            params![cutoff],
-        )?;
-        tx.execute(
-            "DELETE FROM relay_verified_submit_reservations WHERE reserved_at < ?1",
-            params![cutoff],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn verified_submit_reservation_column_exists(
-        tx: &Transaction<'_>,
-        expected_column: &str,
-    ) -> ChatRelayResult<bool> {
-        let mut stmt = tx.prepare("PRAGMA table_info(relay_verified_submit_reservations)")?;
-        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for column in columns {
-            if column? == expected_column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn init_blind_relay_route_replay_schema(
-        conn: &mut Connection,
-        now: u64,
-    ) -> ChatRelayResult<()> {
-        // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] These tables carry
-        // only node-secret HMACs, sealed ACK bytes, and retention timestamps.
-        // An installed schema marker plus missing table is corruption, not a
-        // first-run migration, because silently recreating it would erase the
-        // route side-effect boundary after an operator accident.
-        let response_table_existed = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table'
-                  AND name = 'relay_blind_route_responses'
-             )",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        let reservation_table_existed = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table'
-                  AND name = 'relay_blind_route_reservations'
-             )",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS relay_blind_route_responses (
-                cache_key           BLOB    PRIMARY KEY CHECK(LENGTH(cache_key) = 32),
-                request_fingerprint BLOB    NOT NULL CHECK(LENGTH(request_fingerprint) = 32),
-                response_nonce      BLOB    NOT NULL CHECK(LENGTH(response_nonce) = 24),
-                response_ciphertext BLOB    NOT NULL CHECK(
-                    LENGTH(response_ciphertext) > 16
-                    AND LENGTH(response_ciphertext) <= 2064
-                ),
-                completed_at        INTEGER NOT NULL CHECK(completed_at >= 0)
-            );
-            CREATE INDEX IF NOT EXISTS idx_blind_route_response_retention
-                ON relay_blind_route_responses(completed_at);
-
-            CREATE TABLE IF NOT EXISTS relay_blind_route_reservations (
-                cache_key           BLOB    PRIMARY KEY CHECK(LENGTH(cache_key) = 32),
-                request_fingerprint BLOB    NOT NULL CHECK(LENGTH(request_fingerprint) = 32),
-                reserved_at         INTEGER NOT NULL CHECK(reserved_at >= 0),
-                owner_epoch         BLOB    NOT NULL CHECK(LENGTH(owner_epoch) = 16),
-                owner_acquired_at   INTEGER NOT NULL CHECK(owner_acquired_at >= reserved_at),
-                effect_started_at   INTEGER CHECK(
-                    effect_started_at IS NULL OR effect_started_at >= reserved_at
-                )
-            );
-            CREATE INDEX IF NOT EXISTS idx_blind_route_reservation_retention
-                ON relay_blind_route_reservations(reserved_at);
-            ",
-        )?;
-        let installed_version = tx
-            .query_row(
-                "SELECT schema_version FROM relay_schema_features WHERE feature = ?1",
-                params![BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        if installed_version.is_some_and(|version| {
-            version != BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION
-                && version != BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION
-                && version != BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION
-        }) {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_replay_installation_version",
-            });
-        }
-        if installed_version.is_some() && (!response_table_existed || !reservation_table_existed) {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_replay_table",
-            });
-        }
-        let owner_epoch_exists = Self::blind_relay_reservation_column_exists(&tx, "owner_epoch")?;
-        let owner_acquired_at_exists =
-            Self::blind_relay_reservation_column_exists(&tx, "owner_acquired_at")?;
-        let effect_started_at_exists =
-            Self::blind_relay_reservation_column_exists(&tx, "effect_started_at")?;
-        if installed_version == Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION)
-            && (!owner_epoch_exists || !owner_acquired_at_exists || !effect_started_at_exists)
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_replay_reservation_columns",
-            });
-        }
-        if !owner_epoch_exists {
-            tx.execute_batch(
-                "ALTER TABLE relay_blind_route_reservations
-                 ADD COLUMN owner_epoch BLOB",
-            )?;
-        }
-        if !effect_started_at_exists {
-            tx.execute_batch(
-                "ALTER TABLE relay_blind_route_reservations
-                 ADD COLUMN effect_started_at INTEGER",
-            )?;
-        }
-        if !owner_acquired_at_exists {
-            tx.execute_batch(
-                "ALTER TABLE relay_blind_route_reservations
-                 ADD COLUMN owner_acquired_at INTEGER",
-            )?;
-        }
-        if installed_version == Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION) {
-            // [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] A v1 row may
-            // have crossed an external side-effect boundary before upgrade.
-            // Mark every legacy claim armed; only v2 claims created with an
-            // explicit process epoch may participate in safe takeover.
-            tx.execute(
-                "UPDATE relay_blind_route_reservations
-                 SET owner_epoch = zeroblob(?1), effect_started_at = reserved_at",
-                params![i64::try_from(REPLAY_PROCESS_EPOCH_BYTES).unwrap_or(i64::MAX)],
-            )?;
-        }
-        if installed_version != Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION) {
-            // [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Evidence age is
-            // immutable. Process ownership gets a separate lease timestamp so
-            // recovery cannot extend replay retention by taking over a claim.
-            tx.execute(
-                "UPDATE relay_blind_route_reservations
-                 SET owner_acquired_at = reserved_at",
-                [],
-            )?;
-        }
-        let invalid_responses = tx.query_row(
-            "SELECT COUNT(*) FROM relay_blind_route_responses
-             WHERE LENGTH(cache_key) != 32
-                OR LENGTH(request_fingerprint) != 32
-                OR LENGTH(response_nonce) != 24
-                OR LENGTH(response_ciphertext) <= 16
-                OR LENGTH(response_ciphertext) > 2064
-                OR completed_at < 0",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let invalid_reservations = tx.query_row(
-            "SELECT COUNT(*) FROM relay_blind_route_reservations
-             WHERE LENGTH(cache_key) != 32
-                OR LENGTH(request_fingerprint) != 32
-                OR reserved_at < 0
-                OR owner_epoch IS NULL
-                OR TYPEOF(owner_epoch) != 'blob'
-                OR LENGTH(owner_epoch) != 16
-                OR TYPEOF(owner_acquired_at) != 'integer'
-                OR owner_acquired_at < reserved_at
-                OR (effect_started_at IS NOT NULL
-                    AND (TYPEOF(effect_started_at) != 'integer'
-                         OR effect_started_at < reserved_at))",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if invalid_responses != 0 || invalid_reservations != 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_replay_row_shape",
-            });
-        }
-        if installed_version.is_none()
-            && tx.execute(
-                "INSERT INTO relay_schema_features (feature, schema_version, installed_at)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
-                    BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
-                    sqlite_integer(now, "blind_relay_route_replay_schema_installed_at")?
-                ],
-            )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_replay_installation_marker",
-            });
-        }
-        if matches!(
-            installed_version,
-            Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION)
-                | Some(BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION)
-        ) && tx.execute(
-            "UPDATE relay_schema_features SET schema_version = ?1
-                 WHERE feature = ?2 AND schema_version IN (?3, ?4)",
-            params![
-                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_VERSION,
-                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_FEATURE,
-                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_LEGACY_VERSION,
-                BLIND_RELAY_ROUTE_REPLAY_SCHEMA_V2_VERSION,
-            ],
-        )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_replay_migration_marker",
-            });
-        }
-        let cutoff = sqlite_integer(
-            now.saturating_sub(BLIND_RELAY_ROUTE_REPLAY_TTL_SECS),
-            "blind_relay_route_replay_startup_cutoff",
-        )?;
-        tx.execute(
-            "DELETE FROM relay_blind_route_responses WHERE completed_at < ?1",
-            params![cutoff],
-        )?;
-        tx.execute(
-            "DELETE FROM relay_blind_route_reservations WHERE reserved_at < ?1",
-            params![cutoff],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn blind_relay_reservation_column_exists(
-        tx: &Transaction<'_>,
-        expected_column: &str,
-    ) -> ChatRelayResult<bool> {
-        let mut stmt = tx.prepare("PRAGMA table_info(relay_blind_route_reservations)")?;
-        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for column in columns {
-            if column? == expected_column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     fn init_pending_message_schema(conn: &mut Connection) -> ChatRelayResult<()> {
