@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.65.0-BlindRouteCoordinator
+// Version: 3.66.0-ExpiredNotificationContract
 //
 // Modification Reason:
+//   [CHAT-EXPIRED-CONTRACT-DOMAIN 2026-08-28 by Codex] Re-exported the expiry
+//   notification model and bounded decoding invariants from a focused contract.
 //   [BLIND-ROUTE-COORDINATOR-DOMAIN 2026-08-28 by Codex] Composed private
 //   route identity, durable ownership, effect arming, and exact ACK replay as
 //   one use case while retaining aggregate recovery telemetry in this service.
@@ -398,24 +400,20 @@
 //     no-follow OS lock is acquired before SQLite opens and is released by
 //     RAII, so restart recovery proves predecessor exit instead of guessing
 //     from wall-clock age.
-//   - [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Verified-submit
-//     cache policy, lock striping, private key derivation, and AEAD response
-//     protection live in a composed domain capability. Keep SQLite admission
-//     and completion transactions service-owned until a repository can share
-//     the same custody connection without weakening atomicity.
-//   - [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Blind-route HMAC
-//     identities and sealed ACK cryptography live in a composed capability.
-//     Keep durable reservation, takeover, and completion transactions on the
-//     service-owned SQLite connection until repository extraction can retain
-//     the exact same single-transaction safety boundary.
+//   - [REPLAY-COORDINATOR-DOMAINS 2026-08-28 by Codex] Verified-submit and
+//     blind-route coordinators compose private identity, response protection,
+//     and owner-fenced SQLite repositories. The service supplies only its
+//     custody connection, process epoch, time, and aggregate telemetry.
 //   - [RECOVERABLE-BLIND-RELAY-CLAIM 2026-08-24 by Codex] Blind-route claims
-//     have an anonymous process epoch and durable effect boundary. Only an
-//     expired, unarmed claim may move to a new process; armed and legacy claims
-//     remain fail-closed for the complete replay horizon.
+//     have an anonymous process epoch and durable effect boundary. After the
+//     owner grace, an unarmed claim resumes as normal reservation while an
+//     armed claim becomes explicit idempotent recovery work. Corrupt or
+//     ownership-conflicting state remains fail-closed.
 //   - Quarantine events must remain de-identified. Never persist message IDs,
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.66.0-ExpiredNotificationContract - Extracted expiry notification model
 //   v3.65.0-BlindRouteCoordinator - Composed blind-route replay use cases
 //   v3.64.0-VerifiedSubmitCoordinator - Composed verified-submit use cases
 //   v3.63.0-NodeSecretDomain - Decoupled node-secret HKDF derivation
@@ -619,6 +617,10 @@ use crate::services::chat_relay_direct_peer_circuit::{
 };
 #[cfg(test)]
 use crate::services::chat_relay_cleanup::CLEANUP_MESSAGE_BATCH_SIZE;
+pub use crate::services::chat_relay_expired_contract::ExpiredNotification;
+pub(crate) use crate::services::chat_relay_expired_contract::{
+    MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION, MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES,
+};
 use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
 use crate::services::chat_relay_message_dedup::{
     BoundedOnlineMessageDedup as MessageDedup, OnlineMessageDeduplication,
@@ -684,12 +686,8 @@ use crate::services::wallet_routes::WalletRouteCache;
 // ============================================
 /// Maximum IDs accepted in one authenticated `ChatAck` frame.
 pub const MAX_CHAT_ACK_MESSAGE_IDS: usize = 100;
-/// Maximum IDs encoded into one `ChatExpired` frame.
-pub(crate) const MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION: usize = 32;
 /// Maximum notification rows offered during one authenticated pull.
 pub(crate) const MAX_EXPIRED_NOTIFICATIONS_PER_PULL: usize = 16;
-/// Defensive ceiling for one persisted bincode notification payload.
-pub(crate) const MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES: usize = 1024;
 /// Durable verified-submit row format guarded by `relay_schema_features`.
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_VERSION: i64 = 3;
 const VERIFIED_SUBMIT_RESPONSE_SCHEMA_V2_VERSION: i64 = 2;
@@ -767,41 +765,6 @@ use crate::services::chat_relay_status::{
 // ============================================
 
 pub use crate::services::chat_relay_error::{ChatRelayError, ChatRelayResult};
-
-// ============================================
-// Expired notification row
-// ============================================
-
-/// A queued `ChatExpired` notification for an offline sender.
-#[derive(Debug)]
-pub struct ExpiredNotification {
-    /// Local notification row identifier.
-    pub id: i64,
-    /// Original sender public key used only for authenticated delivery lookup.
-    pub sender: [u8; 32],
-    /// Original receiver public key returned inside the encrypted client flow.
-    pub receiver: [u8; 32],
-    /// bincode-serialised `Vec<[u8; 16]>`
-    pub message_ids_raw: Vec<u8>,
-}
-
-impl ExpiredNotification {
-    /// Deserialise the stored message IDs.
-    pub fn message_ids(&self) -> ChatRelayResult<Vec<[u8; 16]>> {
-        if self.message_ids_raw.len() > MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "expired_notification_payload_size",
-            });
-        }
-        let message_ids: Vec<[u8; 16]> = bincode::deserialize(&self.message_ids_raw)?;
-        if message_ids.is_empty() || message_ids.len() > MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "expired_notification_message_count",
-            });
-        }
-        Ok(message_ids)
-    }
-}
 
 // ============================================
 // ChatRelayService

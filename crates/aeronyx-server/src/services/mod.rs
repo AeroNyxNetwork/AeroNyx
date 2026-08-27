@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.67.0-BlindRouteCoordinator
+// Version: 0.68.0-ExpiredNotificationContract
 //
 // Modification Reason:
+//   [CHAT-EXPIRED-CONTRACT-DOMAIN 2026-08-28 by Codex] Registered the stable
+//   queued expiry-notification model and bounded decoding invariants.
 //   [BLIND-ROUTE-COORDINATOR-DOMAIN 2026-08-28 by Codex] Registered the
 //   composed blind-route identity, ownership, effect, and replay use cases.
 //   [VERIFIED-SUBMIT-COORDINATOR-DOMAIN 2026-08-28 by Codex] Registered the
@@ -111,6 +113,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.68.0-ExpiredNotificationContract - Registered expiry contract
 //   v0.67.0-BlindRouteCoordinator - Registered blind-route use cases
 //   v0.66.0-VerifiedSubmitCoordinator - Registered verified-submit use cases
 //   v0.65.0-NodeSecretDomain - Registered relay node-secret derivation
@@ -225,6 +228,7 @@ mod chat_relay_cleanup_execution;
 mod chat_relay_custody_anchor_guard;
 mod chat_relay_direct_peer_circuit;
 mod chat_relay_error;
+mod chat_relay_expired_contract;
 mod chat_relay_expired_delivery;
 mod chat_relay_maintenance_telemetry;
 mod chat_relay_message_dedup;
