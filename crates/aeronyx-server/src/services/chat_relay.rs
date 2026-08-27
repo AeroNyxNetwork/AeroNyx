@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.46.0-VerifiedBackupInventoryDomain
+// Version: 3.47.0-AuditedBackupPruneDomain
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-PRUNE-DOMAIN 2026-08-27 by Codex] Extracted prune
+//   admission, checked planning, candidate deletion, recovery audit, and
+//   post-mutation verification behind a composed command executor.
 //   [CHAT-RELAY-BACKUP-INVENTORY-DOMAIN 2026-08-27 by Codex] Extracted
 //   private backup inventory, artifact revalidation, checked accounting, and
 //   active restore-boundary inspection behind a composed capability.
@@ -362,6 +365,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.47.0-AuditedBackupPruneDomain - Composed backup prune command
 //   v3.46.0-VerifiedBackupInventoryDomain - Composed private backup inventory
 //   v3.45.0-BackupAuditChainDomain - Composed audit-chain verification
 //   v3.44.0-BackupAuditIoDomain - Trait-based audit artifact host I/O
@@ -500,7 +504,7 @@ use crate::services::chat_relay_backup_audit_verification::{
     BoundedBackupAuditVerificationPolicy, ChatRelayBackupAuditVerificationState,
 };
 use crate::services::chat_relay_backup_artifact::BackupArtifactSnapshot;
-use crate::services::chat_relay_backup_contract::{BackupPruneAdmission, ChatRelayBackupReceipt};
+use crate::services::chat_relay_backup_contract::ChatRelayBackupReceipt;
 pub use crate::services::chat_relay_backup_contract::{
     ChatRelayBackupPruneReceipt, ChatRelayBackupPruneRequest, ChatRelayBackupRetentionReceipt,
     ChatRelayRestoreReadinessReceipt, CHAT_RELAY_BACKUP_PRUNE_CONFIRMATION,
@@ -513,15 +517,19 @@ use crate::services::chat_relay_backup_io::{
     backup_io_error, BackupFilesystem, LocalBackupFilesystem, PrivateBackupControlFileMode,
 };
 use crate::services::chat_relay_backup_inventory::{
-    checked_backup_artifact_bytes, inspect_active_restore_boundary,
-    verified_restore_backup_count, BackupInventory, BackupInventoryLimits,
-    ChatRelayActiveRestoreBoundary, ChatRelayBackupRetentionInspection, VerifiedBackupInventory,
+    inspect_active_restore_boundary, verified_restore_backup_count, BackupInventory,
+    BackupInventoryLimits, ChatRelayActiveRestoreBoundary, ChatRelayBackupRetentionInspection,
+    VerifiedBackupInventory,
 };
 use crate::services::chat_relay_backup_namespace::{
     BackupArtifactNamespace, BackupNamespaceError, HmacBackupArtifactNamespace,
 };
 use crate::services::chat_relay_backup_retention::{
     BackupRetentionLimits, BoundedBackupRetentionPlanner,
+};
+use crate::services::chat_relay_backup_prune::{
+    admit_backup_prune_request, AuditedBackupPruneExecutor, BackupPruneExecutor,
+    LocalBackupArtifactRemoval,
 };
 pub(crate) use crate::services::chat_relay_blind_route::BlindRelayRouteAdmission;
 use crate::services::chat_relay_blind_route::BlindRouteReplay;
@@ -1438,13 +1446,6 @@ impl ChatRelayService {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
-    fn checked_backup_artifact_bytes(
-        artifacts: &[BackupArtifactSnapshot],
-        reason: &'static str,
-    ) -> ChatRelayResult<u64> {
-        checked_backup_artifact_bytes(artifacts, reason)
-    }
-
     fn inspect_active_restore_boundary(
         config: &ChatRelayConfig,
     ) -> ChatRelayResult<ChatRelayActiveRestoreBoundary> {
@@ -1502,190 +1503,38 @@ impl ChatRelayService {
         }
     }
 
-    fn reverify_planned_backup_artifact(
-        artifact: &BackupArtifactSnapshot,
-        verify_sqlite: bool,
-    ) -> ChatRelayResult<()> {
-        Self::backup_inventory().reverify_candidate(artifact, verify_sqlite)
-    }
-
-    fn sync_backup_directory(backup_directory: &Path) -> ChatRelayResult<()> {
-        LocalBackupFilesystem.sync_backup_directory(backup_directory)
-    }
-
     fn prune_verified_backup_retention_at(
         config: &ChatRelayConfig,
         node_secret: &[u8; 32],
         request: &ChatRelayBackupPruneRequest,
         now_unix_secs: u64,
     ) -> ChatRelayResult<ChatRelayBackupPruneReceipt> {
-        // [CHAT-RELAY-BACKUP-PRUNE 2026-08-16 by Codex] Execution is host
-        // local, explicit, and fail-closed. A dry-run may run beside the node;
-        // deletion additionally requires the operator to assert it is stopped.
-        let admission = request.admission().map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_AUTH,
-                "relay backup prune confirmation is incomplete",
-            )
-        })?;
-
+        // [CHAT-RELAY-BACKUP-PRUNE-DOMAIN 2026-08-27 by Codex] Admission
+        // remains before path resolution so an invalid command has no storage
+        // side effect. The service keeps lock ownership for the full command.
+        let admission = admit_backup_prune_request(request)?;
         let backup_directory = Self::private_backup_directory_for_config(config)?;
         let _filesystem_lock = Self::acquire_backup_filesystem_lock(&backup_directory)?;
-        let inspection =
-            Self::inspect_verified_backup_retention(config, &backup_directory, now_unix_secs)?;
-        let planned_backup_count = inspection.excess_backups.len();
-        let planned_backup_bytes = Self::checked_backup_artifact_bytes(
-            &inspection.excess_backups,
-            "relay backup prune-plan byte accounting overflow",
-        )?;
-        let planned_partial_count = inspection.stale_partials.len();
-        let planned_partial_bytes = Self::checked_backup_artifact_bytes(
-            &inspection.stale_partials,
-            "relay backup partial-prune byte accounting overflow",
-        )?;
-        let planned_audit_counts = ChatRelayBackupMaintenanceAuditCounts {
-            planned_backup_count,
-            planned_backup_bytes,
-            planned_partial_count,
-            planned_partial_bytes,
-            ..Default::default()
-        };
-
-        if admission == BackupPruneAdmission::DryRun {
+        let audit = |phase, counts| {
             Self::append_backup_maintenance_audit(
                 &backup_directory,
                 node_secret,
-                BackupAuditPhase::DryRun,
+                phase,
                 now_unix_secs,
-                planned_audit_counts,
-            )?;
-            return Ok(ChatRelayBackupPruneReceipt {
-                executed: false,
-                planned_backup_count,
-                planned_backup_bytes,
-                planned_partial_count,
-                planned_partial_bytes,
-                remaining: inspection.receipt,
-                ..Default::default()
-            });
-        }
-
-        Self::append_backup_maintenance_audit(
+                counts,
+            )
+        };
+        AuditedBackupPruneExecutor::new(
+            Self::backup_inventory(),
+            LocalBackupArtifactRemoval,
+            audit,
+        )
+        .execute(
             &backup_directory,
-            node_secret,
-            BackupAuditPhase::Planned,
+            admission,
             now_unix_secs,
-            planned_audit_counts,
-        )?;
-
-        let mut deleted_backup_count = 0usize;
-        let mut deleted_backup_bytes = 0u64;
-        let mut deleted_partial_count = 0usize;
-        let mut deleted_partial_bytes = 0u64;
-        let deletion_result = (|| -> ChatRelayResult<()> {
-            for artifact in &inspection.excess_backups {
-                Self::reverify_planned_backup_artifact(artifact, true)?;
-                std::fs::remove_file(artifact.path()).map_err(|_| {
-                    Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_IOERR_DELETE,
-                        "unable to remove verified relay backup artifact",
-                    )
-                })?;
-                deleted_backup_count += 1;
-                deleted_backup_bytes = deleted_backup_bytes
-                    .checked_add(artifact.size_bytes())
-                    .ok_or_else(|| {
-                        Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_FULL,
-                            "relay backup deletion byte accounting overflow",
-                        )
-                    })?;
-            }
-            for partial in &inspection.stale_partials {
-                Self::reverify_planned_backup_artifact(partial, false)?;
-                std::fs::remove_file(partial.path()).map_err(|_| {
-                    Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_IOERR_DELETE,
-                        "unable to remove grace-expired relay backup partial",
-                    )
-                })?;
-                deleted_partial_count += 1;
-                deleted_partial_bytes = deleted_partial_bytes
-                    .checked_add(partial.size_bytes())
-                    .ok_or_else(|| {
-                        Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_FULL,
-                            "relay backup partial deletion byte accounting overflow",
-                        )
-                    })?;
-            }
-            Self::sync_backup_directory(&backup_directory)
-        })();
-
-        if let Err(error) = deletion_result {
-            let _ = Self::append_backup_maintenance_audit(
-                &backup_directory,
-                node_secret,
-                BackupAuditPhase::Failed,
-                now_unix_secs,
-                ChatRelayBackupMaintenanceAuditCounts {
-                    completed_backup_count: deleted_backup_count,
-                    completed_backup_bytes: deleted_backup_bytes,
-                    completed_partial_count: deleted_partial_count,
-                    completed_partial_bytes: deleted_partial_bytes,
-                    ..planned_audit_counts
-                },
-            );
-            return Err(error);
-        }
-
-        let remaining =
-            match Self::inspect_verified_backup_retention(config, &backup_directory, now_unix_secs)
-            {
-                Ok(inspection) => inspection.receipt,
-                Err(error) => {
-                    let _ = Self::append_backup_maintenance_audit(
-                        &backup_directory,
-                        node_secret,
-                        BackupAuditPhase::Failed,
-                        now_unix_secs,
-                        ChatRelayBackupMaintenanceAuditCounts {
-                            completed_backup_count: deleted_backup_count,
-                            completed_backup_bytes: deleted_backup_bytes,
-                            completed_partial_count: deleted_partial_count,
-                            completed_partial_bytes: deleted_partial_bytes,
-                            ..planned_audit_counts
-                        },
-                    );
-                    return Err(error);
-                }
-            };
-        Self::append_backup_maintenance_audit(
-            &backup_directory,
-            node_secret,
-            BackupAuditPhase::Completed,
-            now_unix_secs,
-            ChatRelayBackupMaintenanceAuditCounts {
-                completed_backup_count: deleted_backup_count,
-                completed_backup_bytes: deleted_backup_bytes,
-                completed_partial_count: deleted_partial_count,
-                completed_partial_bytes: deleted_partial_bytes,
-                ..planned_audit_counts
-            },
-        )?;
-
-        Ok(ChatRelayBackupPruneReceipt {
-            executed: true,
-            planned_backup_count,
-            planned_backup_bytes,
-            planned_partial_count,
-            planned_partial_bytes,
-            deleted_backup_count,
-            deleted_backup_bytes,
-            deleted_partial_count,
-            deleted_partial_bytes,
-            remaining,
-        })
+            Self::backup_inventory_limits(config),
+        )
     }
 
     fn verify_existing_backup_artifact(path: &Path) -> ChatRelayResult<u64> {
