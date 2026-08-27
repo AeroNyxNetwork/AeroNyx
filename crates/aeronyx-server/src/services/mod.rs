@@ -51,8 +51,11 @@
 //   private path-free segment/checkpoint catalog capability.
 //   [CHAT-RELAY-AUDIT-VERIFICATION-DOMAIN 2026-08-27 by Codex] Registered the
 //   private bounded verification state machine and public aggregate receipt.
+//   [CHAT-RELAY-BACKUP-NAMESPACE-DOMAIN 2026-08-27 by Codex] Registered the
+//   canonical private recovery artifact namespace capability.
 //
 // Last Modified:
+//   v0.39.0-BackupNamespaceDomain - Registered backup namespace policy
 //   v0.38.0-AuditVerificationDomain - Registered verification state policy
 //   v0.37.0-AuditCatalogDomain - Registered bounded artifact catalog
 //   v0.36.0-AuditRotationDomain - Registered segment rotation policy
@@ -116,6 +119,7 @@ mod chat_relay_backup_audit_catalog;
 mod chat_relay_backup_audit_checkpoint;
 mod chat_relay_backup_audit_rotation;
 mod chat_relay_backup_audit_verification;
+mod chat_relay_backup_namespace;
 mod chat_relay_backup_retention;
 mod chat_relay_blind_route;
 mod chat_relay_blob_custody;
