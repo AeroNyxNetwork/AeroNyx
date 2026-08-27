@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.69.0-BackupAuditAnchorDomain
+// Version: 0.70.0-BackupAuditMaintenanceCoordinator
 //
 // Modification Reason:
+//   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Registered the
+//   composed audit verification, recovery, rotation, and append coordinator.
 //   [CHAT-BACKUP-AUDIT-ANCHOR-DOMAIN 2026-08-28 by Codex] Registered the pure
 //   private-checkpoint to public opaque anchor digest boundary.
 //   [CHAT-EXPIRED-CONTRACT-DOMAIN 2026-08-28 by Codex] Registered the stable
@@ -115,6 +117,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.70.0-BackupAuditMaintenanceCoordinator - Registered audit maintenance
 //   v0.69.0-BackupAuditAnchorDomain - Registered anchor digest derivation
 //   v0.68.0-ExpiredNotificationContract - Registered expiry contract
 //   v0.67.0-BlindRouteCoordinator - Registered blind-route use cases
@@ -211,6 +214,7 @@ mod chat_relay_backup_audit_chain;
 mod chat_relay_backup_audit_catalog;
 mod chat_relay_backup_audit_checkpoint;
 mod chat_relay_backup_audit_io;
+mod chat_relay_backup_audit_maintenance;
 mod chat_relay_backup_audit_rotation;
 mod chat_relay_backup_audit_verification;
 mod chat_relay_backup_certification;

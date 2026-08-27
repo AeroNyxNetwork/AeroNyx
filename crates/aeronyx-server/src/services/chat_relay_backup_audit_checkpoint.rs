@@ -1,12 +1,17 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_audit_checkpoint.rs
 // ============================================
-// Version: 1.0.0-AuthenticatedAuditCheckpoint
+// Version: 1.1.0-MaintenanceCoordinatorComposition
 //
 // Creation Reason:
 //   [CHAT-RELAY-AUDIT-CHECKPOINT-DOMAIN 2026-08-26 by Codex] Isolate the
 //   immutable maintenance checkpoint contract and authentication policy from
 //   segment hashing, filesystem publication, and crash recovery.
+//
+// Modification Reason:
+//   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Updated the
+//   ownership boundary after checkpoint construction and publication were
+//   composed by the dedicated maintenance coordinator.
 //
 // Main Functionality:
 //   - Models cumulative path-free audit-chain checkpoint state.
@@ -15,12 +20,13 @@
 //   - Preserves the existing canonical bincode signing-field order.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns segment files, hashes, locks, atomic publication,
-//     archived-byte accounting, and crash-window recovery.
+//   - `chat_relay_backup_audit_maintenance.rs` owns checkpoint construction.
+//   - `chat_relay_backup_audit_io.rs` owns atomic filesystem publication.
+//   - `chat_relay.rs` retains the outer cross-process maintenance lock.
 //   - `hmac`, `sha2`, `bincode`, and `hex` preserve the existing v1 format.
 //
 // Main Logical Flow:
-//   1. Receive a service-verified cumulative state and segment fingerprint.
+//   1. Receive coordinator-verified cumulative state and segment fingerprint.
 //   2. Encode the exact legacy v1 signing frame.
 //   3. Sign or authenticate the checkpoint with a domain-separated HMAC.
 //   4. Reject any field drift, invalid digest, count mismatch, or unknown JSON.
@@ -28,10 +34,11 @@
 // Important Note for Next Developer:
 //   - Keep v1 JSON fields and signing order byte-for-byte stable.
 //   - Never add paths, artifact identities, message metadata, or ciphertext.
-//   - Filesystem publication and sequence continuity remain service-owned.
+//   - Filesystem publication and sequence continuity remain coordinator-owned.
 //   - New checkpoint semantics require a versioned migration.
 //
 // Last Modified:
+//   v1.1.0-MaintenanceCoordinatorComposition - Updated ownership boundaries
 //   v1.0.0-AuthenticatedAuditCheckpoint - Initial trait-based extraction
 // ============================================
 

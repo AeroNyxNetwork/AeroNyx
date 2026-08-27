@@ -1,11 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_audit_rotation.rs
 // ============================================
-// Version: 1.0.0-RotationDomain
+// Version: 1.1.0-MaintenanceCoordinatorComposition
 //
 // Creation Reason:
 //   [CHAT-RELAY-AUDIT-ROTATION-DOMAIN 2026-08-26 by Codex] Separate bounded
 //   audit-segment rotation and crash-tail classification from filesystem I/O.
+//
+// Modification Reason:
+//   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Updated the
+//   ownership boundary after the pure policy became part of one maintenance
+//   coordinator with verification and publication capabilities.
 //
 // Main Functionality:
 //   - Models immutable segment ranges, fingerprints, limits, state, and plans.
@@ -14,14 +19,14 @@
 //   - Classifies a verified active file as a live tail or published duplicate.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns file handles, hashing, HMAC verification, hard links,
-//     fsync ordering, removal, and crash-safe publication recovery.
+//   - `chat_relay_backup_audit_maintenance.rs` consumes rotation decisions.
+//   - Audit I/O owns hard links, fsync ordering, removal, and crash recovery.
 //
 // Main Logical Flow:
 //   1. Check fixed record, byte, and segment limits without touching storage.
 //   2. Build a monotonic segment range and checkpoint index with checked math.
 //   3. Compare path-free fingerprints to classify the active crash window.
-//   4. Return a closed plan/disposition for the service to execute.
+//   4. Return a closed plan/disposition for the coordinator to execute.
 //
 // Important Note for Next Developer:
 //   - This module must remain path-free and side-effect-free.
@@ -30,6 +35,7 @@
 //   - New recovery states require an explicit enum variant and service mapping.
 //
 // Last Modified:
+//   v1.1.0-MaintenanceCoordinatorComposition - Updated policy ownership
 //   v1.0.0-RotationDomain - Initial trait-based extraction
 // ============================================
 

@@ -1,11 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_audit_chain.rs
 // ============================================
-// Version: 1.0.0-BackupAuditChainDomain
+// Version: 1.1.0-MaintenanceCoordinatorComposition
 //
 // Creation Reason:
 //   [CHAT-RELAY-BACKUP-AUDIT-CHAIN-DOMAIN 2026-08-27 by Codex] Extract the
 //   authenticated multi-segment audit-chain verifier from the relay service.
+//
+// Modification Reason:
+//   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Documented the
+//   dedicated coordinator that consumes authenticated state and recovery work.
 //
 // Main Functionality:
 //   - Verifies bounded newline-delimited HMAC audit records.
@@ -18,6 +22,7 @@
 //   - `chat_relay_backup_io` supplies private no-follow control-file access.
 //   - Audit verification/rotation modules supply pure transition policies.
 //   - Audit record/checkpoint modules supply HMAC authenticators.
+//   - Audit maintenance owns recovery execution, rotation, and durable append.
 //
 // Main Logical Flow:
 //   1. Catalog canonical immutable segments and checkpoints.
@@ -32,6 +37,7 @@
 //   - Recovery actions may be returned only after full authentication.
 //
 // Last Modified:
+//   v1.1.0-MaintenanceCoordinatorComposition - Documented use-case ownership
 //   v1.0.0-BackupAuditChainDomain - Initial composed chain verifier extraction
 // ============================================
 
@@ -98,7 +104,7 @@ pub(super) struct AuthenticatedBackupAuditChainVerifier<F, I, V, R> {
     limits: BackupAuditChainLimits,
 }
 
-/// Production composition used by the relay service.
+/// Production composition used by the audit maintenance coordinator.
 pub(super) type LocalBackupAuditChainVerifier = AuthenticatedBackupAuditChainVerifier<
     LocalBackupFilesystem,
     LocalBackupAuditIo<LocalBackupFilesystem>,

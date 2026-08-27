@@ -1,11 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_backup_audit_io.rs
 // ============================================
-// Version: 1.1.0-CanonicalSegmentNaming
+// Version: 1.2.0-MaintenanceCoordinatorComposition
 //
 // Creation Reason:
 //   [CHAT-RELAY-BACKUP-AUDIT-IO-DOMAIN 2026-08-27 by Codex] Extract bounded
 //   audit artifact reads and crash-safe publication from the relay service.
+//
+// Modification Reason:
+//   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Documented the
+//   coordinator that now composes this I/O capability with chain policies.
 //
 // Main Functionality:
 //   - Catalogs immutable audit segment and checkpoint files.
@@ -16,6 +20,7 @@
 // Dependencies:
 //   - `chat_relay_backup_io` supplies private no-follow file operations.
 //   - Audit catalog/checkpoint/rotation modules supply typed path-free data.
+//   - Audit maintenance sequences verification, recovery, rotation, and append.
 //   - `sha2` and `serde_json` preserve the existing artifact contracts.
 //
 // Main Logical Flow:
@@ -32,6 +37,7 @@
 //   - HMAC policy and chain state transitions belong outside this I/O module.
 //
 // Last Modified:
+//   v1.2.0-MaintenanceCoordinatorComposition - Documented use-case ownership
 //   v1.1.0-CanonicalSegmentNaming - Exposed canonical segment naming to the
 //     composed chain verifier without leaking catalog implementation details
 //   v1.0.0-BackupAuditIoDomain - Initial bounded audit I/O extraction
