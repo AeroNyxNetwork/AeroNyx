@@ -73,8 +73,11 @@
 //   composed private inventory, identity recheck, and restore-boundary domain.
 //   [CHAT-RELAY-BACKUP-PRUNE-DOMAIN 2026-08-27 by Codex] Registered the
 //   admission-gated, audited, and post-verified backup prune command domain.
+//   [CHAT-RELAY-RESTORE-COMMAND-DOMAIN 2026-08-27 by Codex] Registered the
+//   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.50.0-ChatRelayRestoreCommandDomain - Registered restore commands
 //   v0.49.0-ChatRelayBackupPruneDomain - Registered audited prune command
 //   v0.48.0-ChatRelayBackupInventoryDomain - Registered verified inventory
 //   v0.47.0-ChatRelayBackupAuditChainDomain - Registered composed chain verifier
@@ -170,6 +173,7 @@ mod chat_relay_pending_custody;
 mod chat_relay_pending_pull;
 mod chat_relay_pull_cursor;
 mod chat_relay_quarantine;
+mod chat_relay_restore_command;
 mod chat_relay_restore_plan;
 #[cfg(unix)]
 mod chat_relay_runtime_fence;
