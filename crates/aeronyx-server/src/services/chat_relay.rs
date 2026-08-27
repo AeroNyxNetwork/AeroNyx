@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.52.0-CustodySchemaDomains
+// Version: 3.53.0-VerifiedSubmitDurableStoreDomain
 //
 // Modification Reason:
+//   [VERIFIED-SUBMIT-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Extracted
+//   completed-response lookup, reservation capacity, lease takeover, and
+//   atomic completion behind a composed SQLite repository capability.
 //   [CHAT-RELAY-PENDING-SCHEMA-DOMAIN 2026-08-27 by Codex] Extracted the
 //   pending-message schema and atomic legacy queue-sequence migration behind
 //   a composed SQLite capability.
@@ -385,6 +388,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.53.0-VerifiedSubmitDurableStoreDomain - Composed replay repository
 //   v3.52.0-CustodySchemaDomains - Composed custody schema migrations
 //   v3.51.0-ReplaySchemaMigrationDomain - Composed replay schema migrations
 //   v3.50.0-RecoveryImageCertificationDomain - Composed SQLite certification
@@ -624,6 +628,10 @@ pub(crate) use crate::services::chat_relay_verified_submit::{
     VerifiedSubmitAdmission, VerifiedSubmitCacheLookup,
 };
 use crate::services::chat_relay_verified_submit::VerifiedSubmitReplay;
+use crate::services::chat_relay_verified_submit_store::{
+    DurableVerifiedSubmitLookup, SqliteVerifiedSubmitDurableStore,
+    VerifiedSubmitDurableRepository,
+};
 use crate::services::chat_relay_storage_schema::{
     ChatRelayStorageSchemaMigration, SqliteChatRelayStorageSchemaMigrator,
 };
@@ -957,9 +965,14 @@ pub struct ChatRelayService {
     /// Private verified-submit replay domain capability.
     ///
     /// [VERIFIED-SUBMIT-REPLAY-DOMAIN 2026-08-25 by Codex] Cache policy,
-    /// lock striping, key derivation, and response protection are composed
-    /// behind one domain object; SQLite transactions remain service-owned.
+    /// lock striping, key derivation, and response protection are composed.
     verified_submit_replay: VerifiedSubmitReplay,
+    /// Private durable reservation, recovery lease, and completion repository.
+    ///
+    /// [VERIFIED-SUBMIT-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] The service
+    /// retains request binding and telemetry while this capability owns every
+    /// verified-submit SQLite transaction and compare-and-swap transition.
+    verified_submit_store: SqliteVerifiedSubmitDurableStore,
     /// Private blind-route replay identity and exact-response protector.
     ///
     /// [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Durable ownership and
@@ -1706,6 +1719,11 @@ impl ChatRelayService {
             BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
         );
         let verified_submit_replay = VerifiedSubmitReplay::new(node_secret, dedup_capacity)?;
+        let verified_submit_store = SqliteVerifiedSubmitDurableStore::new(
+            VERIFIED_SUBMIT_RESPONSE_TTL_SECS,
+            dedup_capacity,
+            VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
+        );
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
         OsRng.fill_bytes(&mut replay_process_epoch);
@@ -1726,6 +1744,7 @@ impl ChatRelayService {
             durable_quarantine,
             cleanup,
             verified_submit_replay,
+            verified_submit_store,
             blind_route_replay,
             replay_process_epoch,
             dedup: MessageDedup::new(dedup_capacity),
@@ -1875,103 +1894,35 @@ impl ChatRelayService {
             return Ok(memory_lookup);
         }
 
-        let now = sqlite_integer(now_secs(), "verified_submit_response_lookup_time")?;
-        let durable_row = {
-            let conn = self.conn.lock();
-            conn.query_row(
-                "SELECT envelope_fingerprint, response_nonce,
-                        response_ciphertext, completed_at
-                 FROM relay_verified_submit_responses
-                 WHERE cache_key = ?1",
-                params![cache_key.as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .optional()?
-        };
-        let Some((stored_fingerprint, nonce, ciphertext, completed_at)) = durable_row else {
-            let reservation = {
-                let conn = self.conn.lock();
-                conn.query_row(
-                    "SELECT envelope_fingerprint, reserved_at
-                     FROM relay_verified_submit_reservations
-                     WHERE cache_key = ?1",
-                    params![cache_key.as_slice()],
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()?
-            };
-            let Some((stored_fingerprint, reserved_at)) = reservation else {
-                return Ok(VerifiedSubmitCacheLookup::Miss);
-            };
-            if reserved_at < 0
-                || now.saturating_sub(reserved_at)
-                    > i64::try_from(VERIFIED_SUBMIT_RESPONSE_TTL_SECS).unwrap_or(i64::MAX)
-            {
-                let conn = self.conn.lock();
-                conn.execute(
-                    "DELETE FROM relay_verified_submit_reservations
-                     WHERE cache_key = ?1 AND reserved_at = ?2",
-                    params![cache_key.as_slice(), reserved_at],
-                )?;
-                return Ok(VerifiedSubmitCacheLookup::Miss);
-            }
-            let stored_fingerprint: [u8; 32] =
-                stored_fingerprint
-                    .try_into()
-                    .map_err(|_| ChatRelayError::CorruptStoredData {
-                        field: "verified_submit_reservation_envelope_fingerprint",
-                    })?;
-            return if stored_fingerprint == envelope_fingerprint {
-                Ok(VerifiedSubmitCacheLookup::Pending)
-            } else {
-                Ok(VerifiedSubmitCacheLookup::Conflict)
-            };
-        };
-        if completed_at < 0
-            || now.saturating_sub(completed_at)
-                > i64::try_from(VERIFIED_SUBMIT_RESPONSE_TTL_SECS).unwrap_or(i64::MAX)
-        {
-            let conn = self.conn.lock();
-            conn.execute(
-                "DELETE FROM relay_verified_submit_responses
-                 WHERE cache_key = ?1 AND completed_at = ?2",
-                params![cache_key.as_slice(), completed_at],
-            )?;
-            return Ok(VerifiedSubmitCacheLookup::Miss);
-        }
-        let stored_fingerprint: [u8; 32] =
-            stored_fingerprint
-                .try_into()
-                .map_err(|_| ChatRelayError::CorruptStoredData {
-                    field: "verified_submit_response_envelope_fingerprint",
-                })?;
-        if stored_fingerprint != envelope_fingerprint {
-            return Ok(VerifiedSubmitCacheLookup::Conflict);
-        }
-        let response = self.verified_submit_replay.recover_response(
+        match self.verified_submit_store.lookup(
+            &self.conn,
             &cache_key,
             &envelope_fingerprint,
-            &nonce,
-            &ciphertext,
-        )?;
-        response
-            .validate_for_request(request)
-            .map_err(|_| ChatRelayError::CorruptStoredData {
-                field: "verified_submit_response_request_binding",
-            })?;
-        self.verified_submit_replay.remember_cached(
-            cache_key,
-            envelope_fingerprint,
-            response.clone(),
-        );
-        Ok(VerifiedSubmitCacheLookup::Exact(response))
+            now_secs(),
+        )? {
+            DurableVerifiedSubmitLookup::Miss => Ok(VerifiedSubmitCacheLookup::Miss),
+            DurableVerifiedSubmitLookup::Conflict => Ok(VerifiedSubmitCacheLookup::Conflict),
+            DurableVerifiedSubmitLookup::Pending => Ok(VerifiedSubmitCacheLookup::Pending),
+            DurableVerifiedSubmitLookup::Completed(durable) => {
+                let response = self.verified_submit_replay.recover_response(
+                    &cache_key,
+                    &envelope_fingerprint,
+                    &durable.nonce,
+                    &durable.ciphertext,
+                )?;
+                response.validate_for_request(request).map_err(|_| {
+                    ChatRelayError::CorruptStoredData {
+                        field: "verified_submit_response_request_binding",
+                    }
+                })?;
+                self.verified_submit_replay.remember_cached(
+                    cache_key,
+                    envelope_fingerprint,
+                    response.clone(),
+                );
+                Ok(VerifiedSubmitCacheLookup::Exact(response))
+            }
+        }
     }
 
     /// Atomically reserves one private replay slot before any external effect.
@@ -1979,182 +1930,25 @@ impl ChatRelayService {
         &self,
         request: &ChatRelayVerifiedSubmitRequestV1,
     ) -> ChatRelayResult<VerifiedSubmitAdmission> {
-        // [CRASH-SAFE-VERIFIED-SUBMIT-ADMISSION 2026-08-24 by Codex] A
-        // reservation is the durable intent boundary. Capacity is checked
-        // inside the same IMMEDIATE transaction and no unexpired row is ever
-        // evicted to admit a new route/custody attempt.
         let cache_key = self.verified_submit_cache_key(request);
         let envelope_fingerprint = self.verified_submit_envelope_fingerprint(request);
-        let reserved_at = sqlite_integer(now_secs(), "verified_submit_reservation_time")?;
-        let cutoff = reserved_at
-            .saturating_sub(i64::try_from(VERIFIED_SUBMIT_RESPONSE_TTL_SECS).unwrap_or(i64::MAX));
-        let capacity = sqlite_integer(
-            u64::try_from(self.config.dedup_lru_capacity.max(1)).unwrap_or(u64::MAX),
-            "verified_submit_reservation_capacity",
+        let now = now_secs();
+        let outcome = self.verified_submit_store.reserve(
+            &self.conn,
+            &cache_key,
+            &envelope_fingerprint,
+            self.replay_process_epoch.as_slice(),
+            now,
         )?;
-
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM relay_verified_submit_responses WHERE completed_at < ?1",
-            params![cutoff],
-        )?;
-        tx.execute(
-            "DELETE FROM relay_verified_submit_reservations WHERE reserved_at < ?1",
-            params![cutoff],
-        )?;
-
-        let completed_fingerprint = tx
-            .query_row(
-                "SELECT envelope_fingerprint FROM relay_verified_submit_responses
-                 WHERE cache_key = ?1",
-                params![cache_key.as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
-        if let Some(stored_fingerprint) = completed_fingerprint {
-            let stored_fingerprint: [u8; 32] =
-                stored_fingerprint
-                    .try_into()
-                    .map_err(|_| ChatRelayError::CorruptStoredData {
-                        field: "verified_submit_response_envelope_fingerprint",
-                    })?;
-            let outcome = if stored_fingerprint == envelope_fingerprint {
-                VerifiedSubmitAdmission::Completed
-            } else {
-                VerifiedSubmitAdmission::Conflict
-            };
-            tx.commit()?;
-            return Ok(outcome);
+        if matches!(
+            outcome,
+            VerifiedSubmitAdmission::ReservedForEntryRecovery
+        ) {
+            // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex]
+            // Admission remains the authoritative attempted transition.
+            self.record_verified_submit_recovery_attempted(now);
         }
-
-        let existing_reservation = tx
-            .query_row(
-                "SELECT envelope_fingerprint, reserved_at, owner_epoch,
-                        owner_acquired_at
-                 FROM relay_verified_submit_reservations
-                 WHERE cache_key = ?1",
-                params![cache_key.as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((stored_fingerprint, stored_at, owner_epoch, owner_acquired_at)) =
-            existing_reservation
-        {
-            let stored_fingerprint: [u8; 32] =
-                stored_fingerprint
-                    .try_into()
-                    .map_err(|_| ChatRelayError::CorruptStoredData {
-                        field: "verified_submit_reservation_envelope_fingerprint",
-                    })?;
-            if stored_fingerprint != envelope_fingerprint {
-                tx.commit()?;
-                return Ok(VerifiedSubmitAdmission::Conflict);
-            }
-            let owner_epoch: [u8; REPLAY_PROCESS_EPOCH_BYTES] = owner_epoch
-                .try_into()
-                .map_err(|_| ChatRelayError::CorruptStoredData {
-                    field: "verified_submit_reservation_owner_epoch",
-                })?;
-            if stored_at < 0 || owner_acquired_at < stored_at {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "verified_submit_reservation_state",
-                });
-            }
-            let reclaim_at = owner_acquired_at.saturating_add(
-                i64::try_from(VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS)
-                    .unwrap_or(i64::MAX),
-            );
-            let outcome = if owner_epoch != self.replay_process_epoch
-                && reserved_at >= reclaim_at
-            {
-                // [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] The
-                // owner CAS fences a still-running predecessor. Recovery owns
-                // only entry custody; it never repeats path selection.
-                if tx.execute(
-                    "UPDATE relay_verified_submit_reservations
-                     SET owner_epoch = ?1, owner_acquired_at = ?2
-                     WHERE cache_key = ?3
-                       AND envelope_fingerprint = ?4
-                       AND reserved_at = ?5
-                       AND owner_epoch = ?6
-                       AND owner_acquired_at = ?7",
-                    params![
-                        self.replay_process_epoch.as_slice(),
-                        reserved_at,
-                        cache_key.as_slice(),
-                        envelope_fingerprint.as_slice(),
-                        stored_at,
-                        owner_epoch.as_slice(),
-                        owner_acquired_at,
-                    ],
-                )? != 1
-                {
-                    return Err(ChatRelayError::CorruptStoredData {
-                        field: "verified_submit_reservation_takeover",
-                    });
-                }
-                VerifiedSubmitAdmission::ReservedForEntryRecovery
-            } else {
-                VerifiedSubmitAdmission::Pending
-            };
-            tx.commit()?;
-            drop(conn);
-            if matches!(
-                outcome,
-                VerifiedSubmitAdmission::ReservedForEntryRecovery
-            ) {
-                // [VERIFIED-SUBMIT-RECOVERY-STATUS 2026-08-25 by Codex]
-                // Admission is the only authoritative attempted transition.
-                self.record_verified_submit_recovery_attempted(
-                    u64::try_from(reserved_at).unwrap_or(u64::MAX),
-                );
-            }
-            return Ok(outcome);
-        }
-
-        let retained = tx.query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM relay_verified_submit_responses)
-              + (SELECT COUNT(*) FROM relay_verified_submit_reservations)",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if retained < 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_retained_count",
-            });
-        }
-        if retained >= capacity {
-            tx.commit()?;
-            return Ok(VerifiedSubmitAdmission::CapacityExhausted);
-        }
-        if tx.execute(
-            "INSERT INTO relay_verified_submit_reservations (
-                cache_key, envelope_fingerprint, reserved_at,
-                owner_epoch, owner_acquired_at
-             ) VALUES (?1, ?2, ?3, ?4, ?3)",
-            params![
-                cache_key.as_slice(),
-                envelope_fingerprint.as_slice(),
-                reserved_at,
-                self.replay_process_epoch.as_slice(),
-            ],
-        )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "verified_submit_reservation_insert",
-            });
-        }
-        tx.commit()?;
-        Ok(VerifiedSubmitAdmission::Reserved)
+        Ok(outcome)
     }
 
     /// Retains one completed response for exact retry replay across restarts.
@@ -2173,54 +1967,14 @@ impl ChatRelayService {
             &envelope_fingerprint,
             response,
         )?;
-        let completed_at = sqlite_integer(now_secs(), "verified_submit_response_completed_at")?;
-        let durable_result: ChatRelayResult<()> = (|| {
-            let mut conn = self.conn.lock();
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO relay_verified_submit_responses (
-                    cache_key, envelope_fingerprint, response_nonce,
-                    response_ciphertext, completed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    cache_key.as_slice(),
-                    envelope_fingerprint.as_slice(),
-                    protected.nonce.as_slice(),
-                    protected.ciphertext,
-                    completed_at,
-                ],
-            )?;
-            let stored_fingerprint = tx.query_row(
-                "SELECT envelope_fingerprint
-                 FROM relay_verified_submit_responses
-                 WHERE cache_key = ?1",
-                params![cache_key.as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            if stored_fingerprint.as_slice() != envelope_fingerprint.as_slice() {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "verified_submit_response_insert_conflict",
-                });
-            }
-            let removed_reservation = tx.execute(
-                "DELETE FROM relay_verified_submit_reservations
-                 WHERE cache_key = ?1
-                   AND envelope_fingerprint = ?2
-                   AND owner_epoch = ?3",
-                params![
-                    cache_key.as_slice(),
-                    envelope_fingerprint.as_slice(),
-                    self.replay_process_epoch.as_slice(),
-                ],
-            )?;
-            if removed_reservation != 1 {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "verified_submit_reservation_completion",
-                });
-            }
-            tx.commit()?;
-            Ok(())
-        })();
+        let durable_result = self.verified_submit_store.complete(
+            &self.conn,
+            &cache_key,
+            &envelope_fingerprint,
+            self.replay_process_epoch.as_slice(),
+            protected,
+            now_secs(),
+        );
 
         // Preserve same-process retry safety even if the durable write fails.
         // The caller receives the storage error and records only its fixed
@@ -2230,8 +1984,7 @@ impl ChatRelayService {
             envelope_fingerprint,
             response.clone(),
         );
-        durable_result?;
-        Ok(())
+        durable_result
     }
 
     fn blind_relay_route_cache_key(&self, route_id: &[u8; 16]) -> [u8; 32] {

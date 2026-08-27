@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.54.0-ChatRelayCustodySchemaDomains
+// Version: 0.55.0-VerifiedSubmitDurableStoreDomain
 //
 // Modification Reason:
+//   [VERIFIED-SUBMIT-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Registered the
+//   private verified-submit SQLite reservation and completion repository.
 //   [CHAT-RELAY-CUSTODY-SCHEMA-DOMAINS 2026-08-27 by Codex] Registered the
 //   pending-message and aggregate storage SQLite migration capabilities.
 //   [CHAT-RELAY-REPLAY-SCHEMA-DOMAIN 2026-08-27 by Codex] Registered the
@@ -85,6 +87,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.55.0-VerifiedSubmitDurableStoreDomain - Registered replay repository
 //   v0.54.0-ChatRelayCustodySchemaDomains - Registered custody schema domains
 //   v0.53.0-ChatRelayReplaySchemaDomain - Registered replay schema migrator
 //   v0.52.0-ChatRelayBackupCertificationDomain - Registered image certifier
@@ -196,6 +199,7 @@ mod chat_relay_runtime_fence;
 mod chat_relay_status;
 mod chat_relay_storage_schema;
 mod chat_relay_verified_submit;
+mod chat_relay_verified_submit_store;
 pub mod deny_list;
 pub mod directory_chain;
 pub mod directory_replica;
