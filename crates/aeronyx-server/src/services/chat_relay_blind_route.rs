@@ -1,12 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_blind_route.rs
 // ============================================
-// Version: 1.0.0-BlindRouteReplayDomain
+// Version: 1.1.0-BlindRouteDurableStoreComposition
 //
 // Creation Reason:
 //   [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Extract blind-route replay
 //   identity and response protection from the oversized ChatRelay service
 //   without changing its API, SQLite schema, retention, or error contracts.
+//
+// Modification Reason:
+//   [BLIND-ROUTE-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Updated the domain
+//   boundary after durable route ownership moved into a composed repository.
 //
 // Main Functionality:
 //   - Models durable blind-route admission as a closed enum.
@@ -15,23 +19,25 @@
 //   - Binds every sealed response to both private replay identifiers.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns SQLite transactions and composes this capability.
+//   - `chat_relay.rs` composes this cryptographic capability with storage.
+//   - `chat_relay_blind_route_store.rs` owns durable route transitions.
 //   - `chat_relay_error.rs` owns the stable typed storage error boundary.
 //
 // Main Logical Flow:
 //   1. Derive domain-separated HMAC identifiers after request authentication.
-//   2. Let `chat_relay.rs` reserve durable capacity transactionally.
+//   2. Let the durable repository reserve route capacity transactionally.
 //   3. Seal the exact opaque ACK before atomic reservation completion.
 //   4. Authenticate and recover the ACK for an exact restart replay.
 //
 // Important Note for Next Developer:
 //   - Never persist or report raw route ids or request commitments.
 //   - A replacement protector must bind both private replay identifiers.
-//   - SQLite reservation/response transitions stay in `chat_relay.rs`; moving
-//     them requires preserving one IMMEDIATE transaction on the same connection.
+//   - SQLite reservation/response transitions belong to the durable repository
+//     and must preserve one IMMEDIATE transaction on the same connection.
 //   - Response plaintext is opaque here and must never be parsed or logged.
 //
 // Last Modified:
+//   v1.1.0-BlindRouteDurableStoreComposition - Documented repository boundary
 //   v1.0.0-BlindRouteReplayDomain - Initial trait/composition extraction
 // ============================================
 

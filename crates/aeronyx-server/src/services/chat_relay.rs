@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.53.0-VerifiedSubmitDurableStoreDomain
+// Version: 3.54.0-BlindRouteDurableStoreDomain
 //
 // Modification Reason:
+//   [BLIND-ROUTE-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Extracted route
+//   replay admission, effect arming, lease takeover, release, and atomic
+//   completion behind a composed SQLite repository capability.
 //   [VERIFIED-SUBMIT-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Extracted
 //   completed-response lookup, reservation capacity, lease takeover, and
 //   atomic completion behind a composed SQLite repository capability.
@@ -388,6 +391,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.54.0-BlindRouteDurableStoreDomain - Composed route replay repository
 //   v3.53.0-VerifiedSubmitDurableStoreDomain - Composed replay repository
 //   v3.52.0-CustodySchemaDomains - Composed custody schema migrations
 //   v3.51.0-ReplaySchemaMigrationDomain - Composed replay schema migrations
@@ -476,7 +480,7 @@ use parking_lot::{Mutex, RwLock};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{
     backup::{Backup, StepResult},
-    params, Connection, OptionalExtension, TransactionBehavior,
+    params, Connection, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -567,6 +571,9 @@ use crate::services::chat_relay_backup_prune::{
 };
 pub(crate) use crate::services::chat_relay_blind_route::BlindRelayRouteAdmission;
 use crate::services::chat_relay_blind_route::BlindRouteReplay;
+use crate::services::chat_relay_blind_route_store::{
+    BlindRouteDurableRepository, DurableBlindRouteAdmission, SqliteBlindRouteDurableStore,
+};
 #[cfg(test)]
 use crate::services::chat_relay_blind_route::RESPONSE_NONCE_BYTES
     as BLIND_RELAY_ROUTE_RESPONSE_NONCE_BYTES;
@@ -975,9 +982,15 @@ pub struct ChatRelayService {
     verified_submit_store: SqliteVerifiedSubmitDurableStore,
     /// Private blind-route replay identity and exact-response protector.
     ///
-    /// [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Durable ownership and
-    /// SQLite transactions stay service-owned; cryptography is composed.
+    /// [BLIND-ROUTE-REPLAY-DOMAIN 2026-08-25 by Codex] Private identity and
+    /// response cryptography remain isolated from durable route ownership.
     blind_route_replay: BlindRouteReplay,
+    /// Private durable blind-route lease and completion repository.
+    ///
+    /// [BLIND-ROUTE-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] The service
+    /// retains opaque response cryptography and telemetry while this capability
+    /// owns every replay SQLite transaction and ownership transition.
+    blind_route_store: SqliteBlindRouteDurableStore,
     /// Random process epoch fencing every restart-recoverable replay claim.
     ///
     /// [VERIFIED-SUBMIT-ENTRY-RECOVERY 2026-08-25 by Codex] Verified submit
@@ -1725,6 +1738,11 @@ impl ChatRelayService {
             VERIFIED_SUBMIT_OWNER_TAKEOVER_GRACE_SECS,
         );
         let blind_route_replay = BlindRouteReplay::new(node_secret)?;
+        let blind_route_store = SqliteBlindRouteDurableStore::new(
+            BLIND_RELAY_ROUTE_REPLAY_TTL_SECS,
+            BLIND_RELAY_ROUTE_REPLAY_CAPACITY,
+            BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS,
+        );
         let mut replay_process_epoch = [0_u8; REPLAY_PROCESS_EPOCH_BYTES];
         OsRng.fill_bytes(&mut replay_process_epoch);
         let mut peer_status = ChatRelayPeerStatus::new(relay_enabled);
@@ -1746,6 +1764,7 @@ impl ChatRelayService {
             verified_submit_replay,
             verified_submit_store,
             blind_route_replay,
+            blind_route_store,
             replay_process_epoch,
             dedup: MessageDedup::new(dedup_capacity),
             peer_telemetry: PeerRelayTelemetryDomain::new(peer_status),
@@ -2002,203 +2021,44 @@ impl ChatRelayService {
         route_id: &[u8; 16],
         request_commitment: &[u8; 32],
     ) -> ChatRelayResult<BlindRelayRouteAdmission> {
-        // [DURABLE-BLIND-RELAY-REPLAY 2026-08-24 by Codex] Reservation and
-        // capacity admission share one IMMEDIATE transaction.
-        // [ARMED-BLIND-RELAY-RECOVERY 2026-08-25 by Codex] Ownership may move
-        // after a short process grace period without changing immutable route
-        // evidence age. Armed takeover is exposed separately so the caller can
-        // reconcile only exact idempotent work and recover a lost sealed ACK.
         let cache_key = self.blind_relay_route_cache_key(route_id);
         let request_fingerprint = self.blind_relay_route_fingerprint(request_commitment);
-        let reserved_at = sqlite_integer(now_secs(), "blind_relay_route_reserved_at")?;
-        let cutoff = reserved_at
-            .saturating_sub(i64::try_from(BLIND_RELAY_ROUTE_REPLAY_TTL_SECS).unwrap_or(i64::MAX));
-        let capacity = i64::try_from(BLIND_RELAY_ROUTE_REPLAY_CAPACITY).unwrap_or(i64::MAX);
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM relay_blind_route_responses WHERE completed_at < ?1",
-            params![cutoff],
-        )?;
-        tx.execute(
-            "DELETE FROM relay_blind_route_reservations WHERE reserved_at < ?1",
-            params![cutoff],
+        let now = now_secs();
+        let admission = self.blind_route_store.reserve(
+            &self.conn,
+            &cache_key,
+            &request_fingerprint,
+            self.replay_process_epoch.as_slice(),
+            now,
         )?;
 
-        let completed = tx
-            .query_row(
-                "SELECT request_fingerprint, response_nonce,
-                        response_ciphertext, completed_at
-                 FROM relay_blind_route_responses WHERE cache_key = ?1",
-                params![cache_key.as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((stored_fingerprint, nonce, ciphertext, completed_at)) = completed {
-            let stored_fingerprint: [u8; 32] =
-                stored_fingerprint
-                    .try_into()
-                    .map_err(|_| ChatRelayError::CorruptStoredData {
-                        field: "blind_relay_route_response_fingerprint",
-                    })?;
-            if stored_fingerprint != request_fingerprint {
-                tx.commit()?;
-                return Ok(BlindRelayRouteAdmission::Conflict);
+        match admission {
+            DurableBlindRouteAdmission::Reserved => Ok(BlindRelayRouteAdmission::Reserved),
+            DurableBlindRouteAdmission::ReservedForRecovery => {
+                self.peer_telemetry.record_blind_route_recovery(
+                    now,
+                    BlindRouteRecoveryEvent::Attempted,
+                );
+                Ok(BlindRelayRouteAdmission::ReservedForRecovery)
             }
-            let completed_at =
-                u64::try_from(completed_at).map_err(|_| ChatRelayError::CorruptStoredData {
-                    field: "blind_relay_route_response_completed_at",
-                })?;
-            let response = self.blind_route_replay.recover_response(
-                &cache_key,
-                &request_fingerprint,
-                &nonce,
-                &ciphertext,
-            )?;
-            tx.commit()?;
-            return Ok(BlindRelayRouteAdmission::Completed {
-                response,
-                completed_at,
-            });
-        }
-
-        let reservation = tx
-            .query_row(
-                "SELECT request_fingerprint, reserved_at, owner_epoch,
-                        owner_acquired_at, effect_started_at
-                 FROM relay_blind_route_reservations
-                 WHERE cache_key = ?1",
-                params![cache_key.as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((
-            stored_fingerprint,
-            stored_at,
-            owner_epoch,
-            owner_acquired_at,
-            effect_started_at,
-        )) = reservation
-        {
-            let stored_fingerprint: [u8; 32] =
-                stored_fingerprint
-                    .try_into()
-                    .map_err(|_| ChatRelayError::CorruptStoredData {
-                        field: "blind_relay_route_reservation_fingerprint",
-                    })?;
-            if stored_fingerprint != request_fingerprint {
-                tx.commit()?;
-                return Ok(BlindRelayRouteAdmission::Conflict);
+            DurableBlindRouteAdmission::Pending => Ok(BlindRelayRouteAdmission::Pending),
+            DurableBlindRouteAdmission::Conflict => Ok(BlindRelayRouteAdmission::Conflict),
+            DurableBlindRouteAdmission::CapacityExhausted => {
+                Ok(BlindRelayRouteAdmission::CapacityExhausted)
             }
-            let owner_epoch: [u8; REPLAY_PROCESS_EPOCH_BYTES] = owner_epoch
-                .try_into()
-                .map_err(|_| ChatRelayError::CorruptStoredData {
-                    field: "blind_relay_route_reservation_owner_epoch",
-                })?;
-            if stored_at < 0
-                || owner_acquired_at < stored_at
-                || effect_started_at.is_some_and(|started_at| started_at < stored_at)
-            {
-                return Err(ChatRelayError::CorruptStoredData {
-                    field: "blind_relay_route_reservation_state",
-                });
+            DurableBlindRouteAdmission::Completed(durable) => {
+                let response = self.blind_route_replay.recover_response(
+                    &cache_key,
+                    &request_fingerprint,
+                    &durable.nonce,
+                    &durable.ciphertext,
+                )?;
+                Ok(BlindRelayRouteAdmission::Completed {
+                    response,
+                    completed_at: durable.completed_at,
+                })
             }
-            let reclaim_at = owner_acquired_at.saturating_add(
-                i64::try_from(BLIND_RELAY_OWNER_TAKEOVER_GRACE_SECS).unwrap_or(i64::MAX),
-            );
-            if owner_epoch != self.replay_process_epoch && reserved_at >= reclaim_at {
-                if tx.execute(
-                    "UPDATE relay_blind_route_reservations
-                     SET owner_epoch = ?1, owner_acquired_at = ?2
-                     WHERE cache_key = ?3
-                       AND request_fingerprint = ?4
-                       AND reserved_at = ?5
-                       AND owner_epoch = ?6
-                       AND owner_acquired_at = ?7",
-                    params![
-                        self.replay_process_epoch.as_slice(),
-                        reserved_at,
-                        cache_key.as_slice(),
-                        request_fingerprint.as_slice(),
-                        stored_at,
-                        owner_epoch.as_slice(),
-                        owner_acquired_at,
-                    ],
-                )? != 1
-                {
-                    return Err(ChatRelayError::CorruptStoredData {
-                        field: "blind_relay_route_reservation_takeover",
-                    });
-                }
-                let admission = if effect_started_at.is_some() {
-                    BlindRelayRouteAdmission::ReservedForRecovery
-                } else {
-                    BlindRelayRouteAdmission::Reserved
-                };
-                tx.commit()?;
-                drop(conn);
-                if matches!(admission, BlindRelayRouteAdmission::ReservedForRecovery) {
-                    self.peer_telemetry.record_blind_route_recovery(
-                        u64::try_from(reserved_at).unwrap_or(u64::MAX),
-                        BlindRouteRecoveryEvent::Attempted,
-                    );
-                }
-                return Ok(admission);
-            }
-            tx.commit()?;
-            return Ok(BlindRelayRouteAdmission::Pending);
         }
-
-        let retained = tx.query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM relay_blind_route_responses)
-              + (SELECT COUNT(*) FROM relay_blind_route_reservations)",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if retained < 0 {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_retained_count",
-            });
-        }
-        if retained >= capacity {
-            tx.commit()?;
-            return Ok(BlindRelayRouteAdmission::CapacityExhausted);
-        }
-        if tx.execute(
-            "INSERT INTO relay_blind_route_reservations (
-                cache_key, request_fingerprint, reserved_at, owner_epoch,
-                owner_acquired_at, effect_started_at
-             ) VALUES (?1, ?2, ?3, ?4, ?3, NULL)",
-            params![
-                cache_key.as_slice(),
-                request_fingerprint.as_slice(),
-                reserved_at,
-                self.replay_process_epoch.as_slice(),
-            ],
-        )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_reservation_insert",
-            });
-        }
-        tx.commit()?;
-        Ok(BlindRelayRouteAdmission::Reserved)
     }
 
     /// Arms an owned route claim immediately before its first external effect.
@@ -2210,28 +2070,13 @@ impl ChatRelayService {
     ) -> ChatRelayResult<()> {
         let cache_key = self.blind_relay_route_cache_key(route_id);
         let request_fingerprint = self.blind_relay_route_fingerprint(request_commitment);
-        let started_at = sqlite_integer(started_at, "blind_relay_route_effect_started_at")?;
-        let conn = self.conn.lock();
-        if conn.execute(
-            "UPDATE relay_blind_route_reservations
-             SET effect_started_at = MAX(?1, reserved_at)
-             WHERE cache_key = ?2
-               AND request_fingerprint = ?3
-               AND owner_epoch = ?4
-               AND effect_started_at IS NULL",
-            params![
-                started_at,
-                cache_key.as_slice(),
-                request_fingerprint.as_slice(),
-                self.replay_process_epoch.as_slice(),
-            ],
-        )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_effect_admission",
-            });
-        }
-        Ok(())
+        self.blind_route_store.arm_effect(
+            &self.conn,
+            &cache_key,
+            &request_fingerprint,
+            self.replay_process_epoch.as_slice(),
+            started_at,
+        )
     }
 
     /// Releases only this process's claim when no external effect was armed.
@@ -2242,19 +2087,12 @@ impl ChatRelayService {
     ) -> ChatRelayResult<bool> {
         let cache_key = self.blind_relay_route_cache_key(route_id);
         let request_fingerprint = self.blind_relay_route_fingerprint(request_commitment);
-        let conn = self.conn.lock();
-        Ok(conn.execute(
-            "DELETE FROM relay_blind_route_reservations
-             WHERE cache_key = ?1
-               AND request_fingerprint = ?2
-               AND owner_epoch = ?3
-               AND effect_started_at IS NULL",
-            params![
-                cache_key.as_slice(),
-                request_fingerprint.as_slice(),
-                self.replay_process_epoch.as_slice(),
-            ],
-        )? == 1)
+        self.blind_route_store.release_unarmed(
+            &self.conn,
+            &cache_key,
+            &request_fingerprint,
+            self.replay_process_epoch.as_slice(),
+        )
     }
 
     /// Atomically replaces one route reservation with its sealed exact ACK.
@@ -2270,56 +2108,14 @@ impl ChatRelayService {
         let protected =
             self.blind_route_replay
                 .protect_response(&cache_key, &request_fingerprint, response)?;
-        let completed_at = sqlite_integer(completed_at, "blind_relay_route_completed_at")?;
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if tx.execute(
-            "INSERT OR IGNORE INTO relay_blind_route_responses (
-                cache_key, request_fingerprint, response_nonce,
-                response_ciphertext, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                cache_key.as_slice(),
-                request_fingerprint.as_slice(),
-                protected.nonce.as_slice(),
-                protected.ciphertext,
-                completed_at,
-            ],
-        )? > 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_response_insert",
-            });
-        }
-        let stored_fingerprint = tx.query_row(
-            "SELECT request_fingerprint FROM relay_blind_route_responses
-             WHERE cache_key = ?1",
-            params![cache_key.as_slice()],
-            |row| row.get::<_, Vec<u8>>(0),
-        )?;
-        if stored_fingerprint.as_slice() != request_fingerprint.as_slice() {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_response_insert_conflict",
-            });
-        }
-        if tx.execute(
-            "DELETE FROM relay_blind_route_reservations
-             WHERE cache_key = ?1
-               AND request_fingerprint = ?2
-               AND owner_epoch = ?3",
-            params![
-                cache_key.as_slice(),
-                request_fingerprint.as_slice(),
-                self.replay_process_epoch.as_slice(),
-            ],
-        )? != 1
-        {
-            return Err(ChatRelayError::CorruptStoredData {
-                field: "blind_relay_route_reservation_completion",
-            });
-        }
-        tx.commit()?;
-        Ok(())
+        self.blind_route_store.complete(
+            &self.conn,
+            &cache_key,
+            &request_fingerprint,
+            self.replay_process_epoch.as_slice(),
+            protected,
+            completed_at,
+        )
     }
 
     // ============================================

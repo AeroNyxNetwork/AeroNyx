@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.55.0-VerifiedSubmitDurableStoreDomain
+// Version: 0.56.0-BlindRouteDurableStoreDomain
 //
 // Modification Reason:
+//   [BLIND-ROUTE-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Registered the
+//   private blind-route SQLite lease and completion repository.
 //   [VERIFIED-SUBMIT-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Registered the
 //   private verified-submit SQLite reservation and completion repository.
 //   [CHAT-RELAY-CUSTODY-SCHEMA-DOMAINS 2026-08-27 by Codex] Registered the
@@ -87,6 +89,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.56.0-BlindRouteDurableStoreDomain - Registered route repository
 //   v0.55.0-VerifiedSubmitDurableStoreDomain - Registered replay repository
 //   v0.54.0-ChatRelayCustodySchemaDomains - Registered custody schema domains
 //   v0.53.0-ChatRelayReplaySchemaDomain - Registered replay schema migrator
@@ -180,6 +183,7 @@ mod chat_relay_backup_namespace;
 mod chat_relay_backup_prune;
 mod chat_relay_backup_retention;
 mod chat_relay_blind_route;
+mod chat_relay_blind_route_store;
 mod chat_relay_blob_custody;
 mod chat_relay_cleanup;
 mod chat_relay_direct_peer_circuit;
