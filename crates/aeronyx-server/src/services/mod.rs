@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.59.0-OnlineDedupDomain
+// Version: 0.60.0-StorageUsageDomain
 //
 // Modification Reason:
+//   [CHAT-STORAGE-USAGE-DOMAIN 2026-08-28 by Codex] Registered the aggregate
+//   privacy-safe relay storage accounting repository.
 //   [CHAT-ONLINE-DEDUP-DOMAIN 2026-08-28 by Codex] Registered bounded
 //   process-local online message duplicate admission.
 //   [CHAT-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Registered bounded
@@ -95,6 +97,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.60.0-StorageUsageDomain - Registered aggregate usage repository
 //   v0.59.0-OnlineDedupDomain - Registered online duplicate admission
 //   v0.58.0-CleanupExecutionDomain - Registered bounded cleanup executor
 //   v0.57.0-PendingDeliveryDomain - Registered pull use-case composition
@@ -214,6 +217,7 @@ mod chat_relay_restore_plan;
 mod chat_relay_runtime_fence;
 mod chat_relay_status;
 mod chat_relay_storage_schema;
+mod chat_relay_storage_usage;
 mod chat_relay_verified_submit;
 mod chat_relay_verified_submit_store;
 pub mod deny_list;

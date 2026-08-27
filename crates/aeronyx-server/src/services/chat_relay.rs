@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.57.0-OnlineDedupDomain
+// Version: 3.58.0-StorageUsageDomain
 //
 // Modification Reason:
+//   [CHAT-STORAGE-USAGE-DOMAIN 2026-08-28 by Codex] Moved aggregate usage
+//   snapshot, SQLite reads, and fail-closed counter decoding into a repository.
 //   [CHAT-ONLINE-DEDUP-DOMAIN 2026-08-28 by Codex] Moved concurrent bounded
 //   online message-id admission behind a focused deduplication capability.
 //   [CHAT-CLEANUP-EXECUTION-DOMAIN 2026-08-28 by Codex] Extracted bounded
@@ -399,6 +401,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.58.0-StorageUsageDomain - Composed aggregate usage repository
 //   v3.57.0-OnlineDedupDomain - Composed process-local duplicate admission
 //   v3.56.0-CleanupExecutionDomain - Composed bounded cleanup execution
 //   v3.55.0-PendingDeliveryDomain - Composed pending pull use cases
@@ -655,6 +658,10 @@ use crate::services::chat_relay_verified_submit_store::{
 use crate::services::chat_relay_storage_schema::{
     ChatRelayStorageSchemaMigration, SqliteChatRelayStorageSchemaMigrator,
 };
+pub use crate::services::chat_relay_storage_usage::ChatRelayStorageUsage;
+use crate::services::chat_relay_storage_usage::{
+    RelayStorageUsageRepository, SqliteRelayStorageUsageRepository,
+};
 use crate::services::wallet_routes::WalletRouteCache;
 
 // ============================================
@@ -745,19 +752,6 @@ use crate::services::chat_relay_status::{
 // ============================================
 
 pub use crate::services::chat_relay_error::{ChatRelayError, ChatRelayResult};
-
-/// Aggregate durable relay usage with no user or routing identifiers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChatRelayStorageUsage {
-    /// Active pending message rows.
-    pub pending_messages: u64,
-    /// Encoded bytes held by active pending messages.
-    pub pending_message_bytes: u64,
-    /// Pending encrypted blob rows.
-    pub pending_blobs: u64,
-    /// Encrypted blob bytes retained by the node.
-    pub pending_blob_bytes: u64,
-}
 
 /// Aggregate TTL maintenance evidence safe for heartbeat and node health APIs.
 ///
@@ -968,6 +962,11 @@ pub struct ChatRelayService {
     /// independent HMAC namespaces and tables.
     replay_process_epoch: [u8; REPLAY_PROCESS_EPOCH_BYTES],
     dedup: MessageDedup,
+    /// Read-only privacy-safe aggregate storage accounting capability.
+    ///
+    /// [CHAT-STORAGE-USAGE-DOMAIN 2026-08-28 by Codex] Counter SQL and
+    /// fail-closed signed conversion stay outside orchestration code.
+    storage_usage_repository: SqliteRelayStorageUsageRepository,
     /// Privacy-safe process telemetry and bounded SLO classification.
     ///
     /// [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] One composed state
@@ -1735,6 +1734,7 @@ impl ChatRelayService {
             blind_route_store,
             replay_process_epoch,
             dedup: MessageDedup::new(dedup_capacity),
+            storage_usage_repository: SqliteRelayStorageUsageRepository,
             peer_telemetry: PeerRelayTelemetryDomain::new(peer_status),
             direct_peer_relay_circuit: DirectPeerCircuitDomain::default(),
             maintenance_status: RwLock::new(ChatRelayMaintenanceStatus::default()),
@@ -2080,33 +2080,6 @@ impl ChatRelayService {
     // ============================================
     // Message store / pull / ack
     // ============================================
-
-    fn read_storage_usage(conn: &Connection) -> ChatRelayResult<ChatRelayStorageUsage> {
-        let counters = conn.query_row(
-            "SELECT
-                pending_message_count,
-                pending_message_bytes,
-                pending_blob_count,
-                pending_blob_bytes
-             FROM relay_storage_usage
-             WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )?;
-        Ok(ChatRelayStorageUsage {
-            pending_messages: nonnegative_sqlite_value(counters.0, "pending_message_count")?,
-            pending_message_bytes: nonnegative_sqlite_value(counters.1, "pending_message_bytes")?,
-            pending_blobs: nonnegative_sqlite_value(counters.2, "pending_blob_count")?,
-            pending_blob_bytes: nonnegative_sqlite_value(counters.3, "pending_blob_bytes")?,
-        })
-    }
 
     fn record_pull_quarantine(
         &self,
@@ -2851,7 +2824,7 @@ impl ChatRelayService {
     /// read. Callers must treat that as unavailable telemetry, not zero usage.
     pub fn storage_usage(&self) -> ChatRelayResult<ChatRelayStorageUsage> {
         let conn = self.conn.lock();
-        Self::read_storage_usage(&conn)
+        self.storage_usage_repository.read(&conn)
     }
 
     /// Creates an owner-private, verified recovery image of relay custody.
@@ -3217,10 +3190,6 @@ impl ChatRelayService {
             now_secs(),
         )
     }
-}
-
-fn nonnegative_sqlite_value(value: i64, field: &'static str) -> ChatRelayResult<u64> {
-    u64::try_from(value).map_err(|_| ChatRelayError::CorruptStoredData { field })
 }
 
 fn sqlite_integer(value: u64, field: &'static str) -> ChatRelayResult<i64> {
