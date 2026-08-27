@@ -26,6 +26,8 @@
 //!   negotiation for Rust nodes, Apps, SDKs, and autonomous agents.
 //! - [SIGNED-PROTOCOL-FEATURES 2026-08-11 by Codex] Re-exported signed,
 //!   backward-compatible node wire-feature negotiation.
+//! - [ONION-REPLY 2026-08-28 by Codex] Added a workload-neutral, fixed-size
+//!   encrypted return carrier for anonymous terminal recovery responses.
 //!
 //! ## Main Functionality
 //!
@@ -83,6 +85,7 @@ pub mod discovery;
 pub mod memchain;
 pub mod messages;
 pub mod onion;
+pub mod onion_reply;
 pub mod version;
 
 // Re-export primary types
@@ -113,5 +116,12 @@ pub use messages::{ClientHello, DataPacket, MessageType, ServerHello};
 pub use onion::{
     build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel, OnionRoutePurpose,
     KEM_ALG_X25519, KEM_ALG_XWING, ONION_MAGIC, ONION_ROUTE_PURPOSE_VALUES, ONION_SALT,
+};
+pub use onion_reply::{
+    decode_onion_reply_request, decode_onion_sealed_response, encode_onion_reply_request,
+    encode_onion_sealed_response, is_onion_reply_request, open_onion_reply, seal_onion_reply,
+    OnionReplyError, OnionReplyPayload, OnionReplyRequest, OnionSealedResponse,
+    MAX_ONION_REPLY_REQUEST_PAYLOAD_BYTES, MAX_ONION_SEALED_RESPONSE_BYTES,
+    ONION_REPLY_RESPONSE_SIZE_CLASSES,
 };
 pub use version::{ProtocolVersion, CURRENT_PROTOCOL_VERSION};
