@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.77.0-BlobIdentityFacade
+// Version: 3.78.0-OnlineAdmissionFacade
 //
 // Modification Reason:
+//   [CHAT-ONLINE-ADMISSION-FACADE-DOMAIN 2026-08-28 by Codex] Moved live-path
+//   duplicate admission beside direct-peer relay operations so the composition
+//   root no longer mixes online delivery policy with service construction.
 //   [CHAT-BLOB-IDENTITY-FACADE-DOMAIN 2026-08-28 by Codex] Moved the stable
 //   encrypted-blob identifier API beside blob custody operations so the relay
 //   composition root no longer exposes blob-domain mechanics directly.
@@ -446,6 +449,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.78.0-OnlineAdmissionFacade - Co-located live-path duplicate admission
 //   v3.77.0-BlobIdentityFacade - Co-located opaque blob identity API
 //   v3.76.0-OperatorStatusFacade - Extracted operator-facing status API facade
 //   v3.75.0-DurableReplayFacade - Extracted owner-fenced replay API facade
@@ -1349,16 +1353,6 @@ impl ChatRelayService {
     ) -> ChatRelayResult<PullCursorV2> {
         self.pending_delivery
             .decode_cursor(receiver, after_timestamp, encoded)
-    }
-
-    // ============================================
-    // Online-path deduplication
-    // ============================================
-
-    /// Returns `true` if this `message_id` has already been forwarded on the
-    /// online path (duplicate detection for live sessions).
-    pub fn is_online_duplicate(&self, message_id: &[u8; 16]) -> bool {
-        self.dedup.check_and_insert(message_id)
     }
 
 }

@@ -1,14 +1,19 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_peer_facade.rs
 // ============================================
-// Version: 1.0.0-PeerRelayFacade
+// Version: 1.1.0-OnlineAdmissionFacade
 //
 // Creation Reason:
 //   [CHAT-PEER-FACADE-DOMAIN 2026-08-28 by Codex] Move privacy-safe relay
 //   observations, direct-peer circuit permits, verified-submit outcomes, and
 //   peer status snapshots out of the relay composition root.
 //
+// Modification Reason:
+//   [CHAT-ONLINE-ADMISSION-FACADE-DOMAIN 2026-08-28 by Codex] Co-locate the
+//   bounded live-path duplicate admission API with online relay operations.
+//
 // Main Functionality:
+//   - Admits each live-path message identifier at most once per process window.
 //   - Records typed direct-peer and authenticated-onion relay rounds.
 //   - Owns the begin/cancel/complete lifecycle for direct-peer circuit permits.
 //   - Records aggregate verified-submit, inbound, and recovery outcomes.
@@ -20,10 +25,10 @@
 //   - Peer telemetry owns process-local aggregate counters and SLO windows.
 //
 // Main Logical Flow:
-//   1. Sanitize compatibility failure strings into closed typed buckets.
-//   2. Admit one direct delivery through the durable circuit when required.
-//   3. Record only aggregate outcome dimensions after the network attempt.
-//   4. Combine circuit and process telemetry into the public status snapshot.
+//   1. Reject a duplicate live-path identifier through bounded in-memory state.
+//   2. Sanitize compatibility failure strings into closed typed buckets.
+//   3. Admit direct delivery through the durable circuit when required.
+//   4. Return only aggregate relay and circuit status to public consumers.
 //
 // Important Note for Next Developer:
 //   - Never add peer, endpoint, wallet, message, route, receipt, or payload IDs.
@@ -32,6 +37,7 @@
 //   - Compatibility strings must remain sanitized into the closed reason enum.
 //
 // Last Modified:
+//   v1.1.0-OnlineAdmissionFacade - Co-located live-path duplicate admission
 //   v1.0.0-PeerRelayFacade - Initial peer relay facade extraction
 // ============================================
 
@@ -46,6 +52,11 @@ use super::{
 };
 
 impl ChatRelayService {
+    /// Returns `true` when this message was already admitted on the live path.
+    pub fn is_online_duplicate(&self, message_id: &[u8; 16]) -> bool {
+        self.dedup.check_and_insert(message_id)
+    }
+
     /// Records a compatibility direct node-to-node encrypted relay round.
     ///
     /// The backward-compatible aggregate fields are also advanced.
