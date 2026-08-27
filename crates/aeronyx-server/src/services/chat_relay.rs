@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.71.0-EncryptedBlobFacade
+// Version: 3.72.0-ExpiredNotificationFacade
 //
 // Modification Reason:
+//   [CHAT-EXPIRED-FACADE-DOMAIN 2026-08-28 by Codex] Moved expiry-control
+//   delivery, poison-row isolation, compatibility reads, and pushed-state ACK
+//   APIs into a nested facade without changing durable semantics.
 //   [CHAT-BLOB-FACADE-DOMAIN 2026-08-28 by Codex] Moved opaque encrypted-blob
 //   storage, retrieval, and sender-authorized deletion APIs into a nested
 //   facade without changing quotas, identifiers, or durable representation.
@@ -428,6 +431,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.72.0-ExpiredNotificationFacade - Extracted expiry-control API facade
 //   v3.71.0-EncryptedBlobFacade - Extracted encrypted-blob API facade
 //   v3.70.0-PendingMessageFacade - Extracted pending-message API facade
 //   v3.69.0-BackupManagementFacade - Extracted host-local backup API facade
@@ -657,7 +661,7 @@ use crate::services::chat_relay_pending_schema::{
 use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_CURSOR_V2_BYTES;
 #[cfg(test)]
 use crate::services::chat_relay_pull_cursor::PullCursorV2;
-use crate::services::chat_relay_quarantine::{DurableQuarantineDomain, QuarantineRowTarget};
+use crate::services::chat_relay_quarantine::DurableQuarantineDomain;
 #[cfg(test)]
 use crate::services::chat_relay_quarantine::{
     MAX_QUARANTINE_EVENTS, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION,
@@ -1486,86 +1490,6 @@ impl ChatRelayService {
     }
 
     // ============================================
-    // Expired notifications
-    // ============================================
-
-    /// Retrieves one bounded page of expiry notifications for a sender.
-    ///
-    /// The extra row is used only to compute `has_more`; it is never returned.
-    /// Invalid durable rows are atomically replaced by de-identified quarantine
-    /// evidence so one poison row cannot permanently block sender control flow.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error if reading or quarantine persistence fails.
-    pub fn pull_pending_notifications(
-        &self,
-        sender: &[u8; 32],
-    ) -> ChatRelayResult<(Vec<ExpiredNotification>, bool)> {
-        let mut conn = self.conn.lock();
-        let page = self.expired_notification_delivery.read_page(&conn, sender)?;
-
-        if page.corrupt_rows.is_empty() {
-            drop(conn);
-        } else {
-            let quarantine_now = now_secs();
-            let outcome = self.durable_quarantine.replace_rows(
-                &mut conn,
-                QuarantineRowTarget::ExpiredNotification,
-                &page.corrupt_rows,
-                quarantine_now,
-            )?;
-            drop(conn);
-
-            self.maintenance_telemetry.record_quarantine(
-                quarantine_now,
-                0,
-                outcome.quarantined_rows,
-                outcome.removed_events,
-                outcome.retained_events,
-            );
-            warn!(
-                quarantined_expired_notifications = outcome.quarantined_rows,
-                "[CHAT_RELAY] Corrupt expiry notifications isolated during pull"
-            );
-        }
-
-        Ok((page.notifications, page.has_more))
-    }
-
-    /// Compatibility wrapper for callers that do not consume pagination yet.
-    ///
-    /// New runtime code should use [`Self::pull_pending_notifications`] and
-    /// propagate its `has_more` flag.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage, decoding, or durable-data integrity error.
-    pub fn get_pending_notifications(
-        &self,
-        sender: &[u8; 32],
-    ) -> ChatRelayResult<Vec<ExpiredNotification>> {
-        self.pull_pending_notifications(sender)
-            .map(|(notifications, _)| notifications)
-    }
-
-    /// Atomically marks a successfully written notification page as pushed.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `SQLite` error and rolls back the whole page on failure.
-    pub fn mark_notifications_pushed(&self, ids: &[i64]) -> ChatRelayResult<()> {
-        let Some(batch) = self
-            .expired_notification_delivery
-            .prepare_acknowledgement(ids)
-        else {
-            return Ok(());
-        };
-        self.expired_notification_delivery
-            .mark_pushed(&mut self.conn.lock(), &batch)
-    }
-
-    // ============================================
     // TTL cleanup
     // ============================================
 
@@ -1968,6 +1892,9 @@ mod backup_facade;
 
 #[path = "chat_relay_blob_facade.rs"]
 mod blob_facade;
+
+#[path = "chat_relay_expired_facade.rs"]
+mod expired_facade;
 
 #[path = "chat_relay_pending_facade.rs"]
 mod pending_facade;
