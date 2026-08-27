@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.42.0-BackupContractDomain
+// Version: 3.43.0-BackupFilesystemDomain
 //
 // Modification Reason:
+//   [CHAT-RELAY-BACKUP-FILESYSTEM-DOMAIN 2026-08-27 by Codex] Extracted the
+//   private backup directory, control-file, fsync, and cross-process lock
+//   capability while preserving service-owned compatibility wrappers.
 //   [CHAT-RELAY-BACKUP-CONTRACT-DOMAIN 2026-08-27 by Codex] Extracted the
 //   aggregate backup command/receipt contracts and fail-closed prune admission
 //   state while preserving every public path through explicit re-exports.
@@ -350,6 +353,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.43.0-BackupFilesystemDomain - Trait-based private backup host I/O
 //   v3.39.0-TestModuleSplit - Moved the complete test module out of production
 //   v3.38.0-BackupCopyRetryDomain - Typed bounded SQLite copy retries
 //   v3.37.0-BackupArtifactDomain - Typed artifact identity and accounting
@@ -416,7 +420,7 @@
 // ============================================================================
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -487,6 +491,9 @@ pub use crate::services::chat_relay_backup_contract::{
 use crate::services::chat_relay_backup_copy::{
     BackupCopyAction, BackupCopyPolicyError, BackupCopyProgress, BackupCopyRetryPolicy,
     BackupCopyRetryState, BoundedBackupCopyRetryPolicy,
+};
+use crate::services::chat_relay_backup_io::{
+    backup_io_error, BackupFilesystem, LocalBackupFilesystem, PrivateBackupControlFileMode,
 };
 use crate::services::chat_relay_backup_namespace::{
     BackupArtifactKind, BackupArtifactNamespace, BackupNamespaceError,
@@ -1022,140 +1029,15 @@ impl ChatRelayService {
     }
 
     fn backup_io_error(code: i32, message: &'static str) -> ChatRelayError {
-        ChatRelayError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(code),
-            Some(message.to_string()),
-        ))
+        backup_io_error(code, message)
     }
 
-    #[cfg(unix)]
     fn reserve_private_backup_file(path: &Path) -> ChatRelayResult<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map(drop)
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CANTOPEN,
-                    "unable to reserve private relay backup file",
-                )
-            })
-    }
-
-    #[cfg(not(unix))]
-    fn reserve_private_backup_file(path: &Path) -> ChatRelayResult<()> {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map(drop)
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CANTOPEN,
-                    "unable to reserve private relay backup file",
-                )
-            })
-    }
-
-    #[cfg(unix)]
-    fn create_backup_directory(path: &Path) -> std::io::Result<()> {
-        use std::os::unix::fs::DirBuilderExt;
-
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700).create(path)
-    }
-
-    #[cfg(not(unix))]
-    fn create_backup_directory(path: &Path) -> std::io::Result<()> {
-        std::fs::create_dir(path)
-    }
-
-    #[cfg(unix)]
-    fn restrict_backup_directory_permissions(path: &Path) -> ChatRelayResult<()> {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "unable to restrict relay backup directory permissions",
-            )
-        })
-    }
-
-    #[cfg(not(unix))]
-    fn restrict_backup_directory_permissions(_path: &Path) -> ChatRelayResult<()> {
-        Ok(())
-    }
-
-    fn ensure_private_backup_directory(path: &Path) -> ChatRelayResult<()> {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_CANTOPEN,
-                        "relay backup boundary is not a private directory",
-                    ));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // The active database parent already exists. A single-level,
-                // owner-private create avoids a world-readable umask window.
-                // A concurrent backup may win this create; re-inspection below
-                // is the authority for an AlreadyExists race.
-                match Self::create_backup_directory(path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(_) => {
-                        return Err(Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_CANTOPEN,
-                            "unable to create private relay backup directory",
-                        ));
-                    }
-                }
-            }
-            Err(_) => {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CANTOPEN,
-                    "unable to inspect private relay backup directory",
-                ));
-            }
-        }
-        let metadata = std::fs::symlink_metadata(path).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "unable to inspect private relay backup directory",
-            )
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "relay backup boundary is not a private directory",
-            ));
-        }
-        Self::restrict_backup_directory_permissions(path)
+        LocalBackupFilesystem.reserve_private_file(path)
     }
 
     fn private_backup_directory_for_config(config: &ChatRelayConfig) -> ChatRelayResult<PathBuf> {
-        if config.db_path == ":memory:" {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "in-memory relay storage has no private backup boundary",
-            ));
-        }
-        let source_path = Path::new(&config.db_path);
-        let source_parent = source_path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let backup_directory = source_parent.join(".aeronyx-relay-backups");
-        Self::ensure_private_backup_directory(&backup_directory)?;
-        Ok(backup_directory)
+        LocalBackupFilesystem.private_directory_for_database(&config.db_path)
     }
 
     fn private_backup_directory(&self) -> ChatRelayResult<PathBuf> {
@@ -1182,167 +1064,23 @@ impl ChatRelayService {
     }
 
     fn open_private_backup_control_file(path: &Path, append: bool) -> ChatRelayResult<File> {
-        #[cfg(unix)]
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        #[cfg(not(unix))]
-        if let Ok(metadata) = std::fs::symlink_metadata(path) {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_PERM,
-                    "relay backup control boundary is not a private regular file",
-                ));
-            }
-        }
-
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(!append)
-            .append(append)
-            .create(true);
-        #[cfg(unix)]
-        options
-            .mode(0o600)
-            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
-        let file = options.open(path).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "unable to open private relay backup control file",
-            )
-        })?;
-        let metadata = file.metadata().map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_IOERR,
-                "unable to inspect private relay backup control file",
-            )
-        })?;
-        if !metadata.is_file() {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "relay backup control boundary is not a private regular file",
-            ));
-        }
-        #[cfg(unix)]
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "relay backup control file is not owner-private",
-            ));
-        }
-        Ok(file)
+        let mode = if append {
+            PrivateBackupControlFileMode::Append
+        } else {
+            PrivateBackupControlFileMode::ReadWrite
+        };
+        LocalBackupFilesystem.open_control_file(path, mode)
     }
 
     fn open_existing_private_backup_control_file(path: &Path) -> ChatRelayResult<Option<File>> {
-        #[cfg(unix)]
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        #[cfg(not(unix))]
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_PERM,
-                    "relay backup control boundary is not a private regular file",
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CANTOPEN,
-                    "unable to inspect private relay backup control file",
-                ));
-            }
-        }
-
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
-        let file = match options.open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => {
-                return Err(Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_CANTOPEN,
-                    "unable to open private relay backup control file",
-                ));
-            }
-        };
-        let metadata = file.metadata().map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_IOERR,
-                "unable to inspect private relay backup control file",
-            )
-        })?;
-        if !metadata.is_file() {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "relay backup control boundary is not a private regular file",
-            ));
-        }
-        #[cfg(unix)]
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(Self::backup_io_error(
-                rusqlite::ffi::SQLITE_PERM,
-                "relay backup control file is not owner-private",
-            ));
-        }
-        Ok(Some(file))
+        LocalBackupFilesystem.open_existing_control_file(path)
     }
 
     fn acquire_backup_filesystem_lock(backup_directory: &Path) -> ChatRelayResult<Connection> {
-        let parent = backup_directory.parent().ok_or_else(|| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "relay backup directory has no private control parent",
-            )
-        })?;
-        let lock_path = parent.join(CHAT_RELAY_BACKUP_LOCK_FILE_NAME);
-        // [CHAT-RELAY-AUDIT-ROTATION 2026-08-16 by Codex] `File::try_lock`
-        // requires Rust 1.89 while this workspace promises MSRV 1.75. Reuse
-        // SQLite's cross-platform exclusive transaction lock so the guard is
-        // RAII-released without adding another platform lock dependency.
-        drop(Self::open_private_backup_control_file(&lock_path, false)?);
-        let canonical_parent = std::fs::canonicalize(parent).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "unable to resolve relay backup maintenance lock parent",
-            )
-        })?;
-        let lock_name = lock_path.file_name().ok_or_else(|| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "relay backup maintenance lock has no private name",
-            )
-        })?;
-        let nofollow_lock_path = canonical_parent.join(lock_name);
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let lock = Connection::open_with_flags(&nofollow_lock_path, flags).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_CANTOPEN,
-                "unable to open relay backup maintenance lock",
-            )
-        })?;
-        lock.busy_timeout(Duration::ZERO).map_err(|_| {
-            Self::backup_io_error(
-                rusqlite::ffi::SQLITE_IOERR,
-                "unable to configure relay backup maintenance lock",
-            )
-        })?;
-        lock.execute_batch("BEGIN EXCLUSIVE;").map_err(|error| {
-            let code = match error.sqlite_error_code() {
-                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
-                    rusqlite::ffi::SQLITE_BUSY
-                }
-                _ => rusqlite::ffi::SQLITE_IOERR,
-            };
-            Self::backup_io_error(code, "relay backup maintenance lock is unavailable")
-        })?;
-        Ok(lock)
+        LocalBackupFilesystem.acquire_maintenance_lock(
+            backup_directory,
+            CHAT_RELAY_BACKUP_LOCK_FILE_NAME,
+        )
     }
 
     fn map_backup_audit_record_error(error: BackupAuditRecordError) -> ChatRelayError {
@@ -2726,14 +2464,7 @@ impl ChatRelayService {
     }
 
     fn sync_backup_directory(backup_directory: &Path) -> ChatRelayResult<()> {
-        File::open(backup_directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR_FSYNC,
-                    "unable to durably sync relay backup directory",
-                )
-            })
+        LocalBackupFilesystem.sync_backup_directory(backup_directory)
     }
 
     fn prune_verified_backup_retention_at(
@@ -3141,21 +2872,8 @@ impl ChatRelayService {
         }
     }
 
-    #[cfg(unix)]
     fn sync_backup_parent(parent: &Path) -> ChatRelayResult<()> {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to synchronize relay backup directory",
-                )
-            })
-    }
-
-    #[cfg(not(unix))]
-    fn sync_backup_parent(_parent: &Path) -> ChatRelayResult<()> {
-        Ok(())
+        LocalBackupFilesystem.sync_backup_parent(parent)
     }
 
     fn backup_copy_retry_policy() -> BoundedBackupCopyRetryPolicy {
