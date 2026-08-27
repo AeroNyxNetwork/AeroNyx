@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.61.0-PendingContractDomain
+// Version: 0.62.0-MaintenanceTelemetryDomain
 //
 // Modification Reason:
+//   [CHAT-MAINTENANCE-TELEMETRY-DOMAIN 2026-08-28 by Codex] Registered the
+//   privacy-safe maintenance status contract and atomic state transitions.
 //   [CHAT-PENDING-CONTRACT-DOMAIN 2026-08-28 by Codex] Registered the
 //   dependency-neutral pending message and snapshot page contracts.
 //   [CHAT-STORAGE-USAGE-DOMAIN 2026-08-28 by Codex] Registered the aggregate
@@ -99,6 +101,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.62.0-MaintenanceTelemetryDomain - Registered maintenance state machine
 //   v0.61.0-PendingContractDomain - Registered pending delivery contracts
 //   v0.60.0-StorageUsageDomain - Registered aggregate usage repository
 //   v0.59.0-OnlineDedupDomain - Registered online duplicate admission
@@ -205,6 +208,7 @@ mod chat_relay_cleanup_execution;
 mod chat_relay_direct_peer_circuit;
 mod chat_relay_error;
 mod chat_relay_expired_delivery;
+mod chat_relay_maintenance_telemetry;
 mod chat_relay_message_dedup;
 mod chat_relay_peer_telemetry;
 mod chat_relay_pending_contract;

@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.59.0-PendingContractDomain
+// Version: 3.60.0-MaintenanceTelemetryDomain
 //
 // Modification Reason:
+//   [CHAT-MAINTENANCE-TELEMETRY-DOMAIN 2026-08-28 by Codex] Moved the
+//   maintenance status contract, lock, and all mutation rules into one domain.
 //   [CHAT-PENDING-CONTRACT-DOMAIN 2026-08-28 by Codex] Re-exported pending
 //   delivery contracts from a dependency-neutral module.
 //   [CHAT-STORAGE-USAGE-DOMAIN 2026-08-28 by Codex] Moved aggregate usage
@@ -403,6 +405,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.60.0-MaintenanceTelemetryDomain - Composed maintenance state machine
 //   v3.59.0-PendingContractDomain - Decoupled pending delivery models
 //   v3.58.0-StorageUsageDomain - Composed aggregate usage repository
 //   v3.57.0-OnlineDedupDomain - Composed process-local duplicate admission
@@ -491,13 +494,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{
     backup::{Backup, StepResult},
     params, Connection,
 };
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use tracing::{debug, info, warn};
@@ -611,6 +613,8 @@ use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
 use crate::services::chat_relay_message_dedup::{
     BoundedOnlineMessageDedup as MessageDedup, OnlineMessageDeduplication,
 };
+pub use crate::services::chat_relay_maintenance_telemetry::ChatRelayMaintenanceStatus;
+use crate::services::chat_relay_maintenance_telemetry::RelayMaintenanceTelemetry;
 use crate::services::chat_relay_peer_telemetry::{
     BlindRouteRecoveryEvent, OutboundRouteClass, PeerRelayTelemetryDomain, PeerRelayTelemetrySink,
     VerifiedSubmitEvent,
@@ -756,51 +760,6 @@ use crate::services::chat_relay_status::{
 // ============================================
 
 pub use crate::services::chat_relay_error::{ChatRelayError, ChatRelayResult};
-
-/// Aggregate TTL maintenance evidence safe for heartbeat and node health APIs.
-///
-/// This snapshot intentionally excludes message IDs, wallet keys, routes,
-/// endpoints, payloads, and per-user counts.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ChatRelayMaintenanceStatus {
-    /// Total cleanup attempts, including failed transactions.
-    pub cleanup_runs_total: u64,
-    /// Cleanup attempts that returned an error.
-    pub cleanup_failures_total: u64,
-    /// Successfully committed bounded cleanup transactions.
-    pub cleanup_batches_total: u64,
-    /// Runs that reached their transaction budget with work still pending.
-    pub cleanup_backlog_deferred_total: u64,
-    /// Pending message rows removed by successfully committed batches.
-    pub expired_messages_total: u64,
-    /// Encrypted blob rows removed by successfully committed batches.
-    pub expired_blobs_total: u64,
-    /// Delivered or stale expiry-notification rows removed by committed batches.
-    pub expired_notifications_removed_total: u64,
-    /// Corrupt pending-message rows atomically isolated from active delivery.
-    pub quarantined_pending_messages_total: u64,
-    /// Corrupt expiry-notification rows atomically isolated from delivery.
-    pub quarantined_expired_notifications_total: u64,
-    /// De-identified quarantine event rows removed by bounded retention.
-    pub quarantine_events_removed_total: u64,
-    /// Current durable de-identified quarantine event rows.
-    pub quarantine_events_retained: u64,
-    /// Unix timestamp of the most recent poison-row isolation.
-    pub last_quarantine_at: Option<u64>,
-    /// Unix timestamp of the most recent cleanup attempt.
-    pub last_cleanup_at: Option<u64>,
-    /// Stable state bucket: `succeeded` or `failed`.
-    pub last_cleanup_status: Option<String>,
-    /// Stable aggregate failure bucket from [`ChatRelayError::reason_bucket`].
-    pub last_cleanup_failure_reason: Option<String>,
-    /// Number of successfully committed transactions in the latest run.
-    pub last_cleanup_batches: u64,
-    /// Whether the latest run deferred remaining work to the next timer tick.
-    pub last_cleanup_backlog_deferred: bool,
-    /// Corrupt pending-message rows isolated by the latest cleanup run.
-    pub last_cleanup_quarantined_pending_messages: u64,
-}
 
 // ============================================
 // Expired notification row
@@ -957,7 +916,8 @@ pub struct ChatRelayService {
     /// [CHAT-DIRECT-PEER-CIRCUIT-DOMAIN 2026-08-25 by Codex] The service
     /// composes public telemetry separately; this domain owns transitions.
     direct_peer_relay_circuit: DirectPeerCircuitDomain,
-    maintenance_status: RwLock<ChatRelayMaintenanceStatus>,
+    /// Privacy-safe maintenance snapshot and atomic transition capability.
+    maintenance_telemetry: RelayMaintenanceTelemetry,
     /// Serializes backup publication, replay verification, and retention.
     backup_operations: Mutex<()>,
     /// In-memory wallet → session routing table.
@@ -1717,7 +1677,7 @@ impl ChatRelayService {
             storage_usage_repository: SqliteRelayStorageUsageRepository,
             peer_telemetry: PeerRelayTelemetryDomain::new(peer_status),
             direct_peer_relay_circuit: DirectPeerCircuitDomain::default(),
-            maintenance_status: RwLock::new(ChatRelayMaintenanceStatus::default()),
+            maintenance_telemetry: RelayMaintenanceTelemetry::default(),
             backup_operations: Mutex::new(()),
             // v1.3.0-Sovereign: initialise empty route cache
             wallet_routes: Arc::new(WalletRouteCache::new()),
@@ -1771,8 +1731,8 @@ impl ChatRelayService {
         storage_schema.reconcile_usage(&conn)?;
         let retained_quarantine_events = self.durable_quarantine.retained_count(&conn)?;
         drop(conn);
-        self.maintenance_status.write().quarantine_events_retained =
-            u64::try_from(retained_quarantine_events).unwrap_or(u64::MAX);
+        self.maintenance_telemetry
+            .set_retained_quarantine_events(retained_quarantine_events);
         Ok(())
     }
 
@@ -2061,28 +2021,6 @@ impl ChatRelayService {
     // Message store / pull / ack
     // ============================================
 
-    fn record_pull_quarantine(
-        &self,
-        now: u64,
-        pending_messages: usize,
-        expired_notifications: usize,
-        removed_events: usize,
-        retained_events: usize,
-    ) {
-        let mut status = self.maintenance_status.write();
-        status.quarantined_pending_messages_total = status
-            .quarantined_pending_messages_total
-            .saturating_add(u64::try_from(pending_messages).unwrap_or(u64::MAX));
-        status.quarantined_expired_notifications_total = status
-            .quarantined_expired_notifications_total
-            .saturating_add(u64::try_from(expired_notifications).unwrap_or(u64::MAX));
-        status.quarantine_events_removed_total = status
-            .quarantine_events_removed_total
-            .saturating_add(u64::try_from(removed_events).unwrap_or(u64::MAX));
-        status.quarantine_events_retained = u64::try_from(retained_events).unwrap_or(u64::MAX);
-        status.last_quarantine_at = Some(now);
-    }
-
     /// Stores a pending offline message for a receiver that is not currently online.
     ///
     /// # Errors
@@ -2113,7 +2051,7 @@ impl ChatRelayService {
         else {
             return;
         };
-        self.record_pull_quarantine(
+        self.maintenance_telemetry.record_quarantine(
             quarantined_at,
             quarantined_rows,
             0,
@@ -2302,7 +2240,7 @@ impl ChatRelayService {
             )?;
             drop(conn);
 
-            self.record_pull_quarantine(
+            self.maintenance_telemetry.record_quarantine(
                 quarantine_now,
                 0,
                 outcome.quarantined_rows,
@@ -2374,68 +2312,13 @@ impl ChatRelayService {
         let cleanup_now = i64::try_from(now).unwrap_or(i64::MAX);
         let (summary, failure) = self.run_cleanup_at(cleanup_now, max_batches);
 
-        self.record_cleanup_run(now, summary, failure.as_ref());
+        self.maintenance_telemetry
+            .record_cleanup(now, summary, failure.as_ref());
 
         let Some(error) = failure else {
             return Ok((summary.expired_messages, summary.expired_blobs));
         };
         Err(error)
-    }
-
-    fn record_cleanup_run(
-        &self,
-        now: u64,
-        summary: CleanupRunSummary,
-        failure: Option<&ChatRelayError>,
-    ) {
-        let mut status = self.maintenance_status.write();
-        status.cleanup_runs_total = status.cleanup_runs_total.saturating_add(1);
-        status.cleanup_batches_total = status
-            .cleanup_batches_total
-            .saturating_add(u64::try_from(summary.successful_batches).unwrap_or(u64::MAX));
-        if summary.backlog_deferred {
-            status.cleanup_backlog_deferred_total =
-                status.cleanup_backlog_deferred_total.saturating_add(1);
-        }
-        status.expired_messages_total = status
-            .expired_messages_total
-            .saturating_add(u64::try_from(summary.expired_messages).unwrap_or(u64::MAX));
-        status.expired_blobs_total = status
-            .expired_blobs_total
-            .saturating_add(u64::try_from(summary.expired_blobs).unwrap_or(u64::MAX));
-        status.expired_notifications_removed_total = status
-            .expired_notifications_removed_total
-            .saturating_add(u64::try_from(summary.removed_notifications).unwrap_or(u64::MAX));
-        status.quarantined_pending_messages_total =
-            status.quarantined_pending_messages_total.saturating_add(
-                u64::try_from(summary.quarantined_pending_messages).unwrap_or(u64::MAX),
-            );
-        status.quarantine_events_removed_total = status
-            .quarantine_events_removed_total
-            .saturating_add(u64::try_from(summary.removed_quarantine_events).unwrap_or(u64::MAX));
-        if summary.successful_batches > 0 {
-            status.quarantine_events_retained =
-                u64::try_from(summary.retained_quarantine_events).unwrap_or(u64::MAX);
-        }
-        if summary.quarantined_pending_messages > 0 {
-            status.last_quarantine_at = Some(now);
-        }
-        status.last_cleanup_at = Some(now);
-        status.last_cleanup_batches = u64::try_from(summary.successful_batches).unwrap_or(u64::MAX);
-        status.last_cleanup_backlog_deferred = summary.backlog_deferred;
-        status.last_cleanup_quarantined_pending_messages =
-            u64::try_from(summary.quarantined_pending_messages).unwrap_or(u64::MAX);
-        match failure {
-            None => {
-                status.last_cleanup_status = Some("succeeded".to_string());
-                status.last_cleanup_failure_reason = None;
-            }
-            Some(error) => {
-                status.cleanup_failures_total = status.cleanup_failures_total.saturating_add(1);
-                status.last_cleanup_status = Some("failed".to_string());
-                status.last_cleanup_failure_reason = Some(error.reason_bucket().to_string());
-            }
-        }
     }
 
     fn run_cleanup_at(
@@ -2775,7 +2658,7 @@ impl ChatRelayService {
     /// Returns aggregate TTL cleanup execution evidence.
     #[must_use]
     pub fn maintenance_status(&self) -> ChatRelayMaintenanceStatus {
-        self.maintenance_status.read().clone()
+        self.maintenance_telemetry.snapshot()
     }
 
     /// Records a blocking-worker failure that occurred outside `run_cleanup`.
@@ -2783,14 +2666,8 @@ impl ChatRelayService {
     /// Tokio join failures are deliberately converted to stable buckets so a
     /// heartbeat never exposes panic payloads or other runtime internals.
     pub(crate) fn record_maintenance_worker_failure(&self, reason: &'static str) {
-        let mut status = self.maintenance_status.write();
-        status.cleanup_runs_total = status.cleanup_runs_total.saturating_add(1);
-        status.cleanup_failures_total = status.cleanup_failures_total.saturating_add(1);
-        status.last_cleanup_at = Some(now_secs());
-        status.last_cleanup_status = Some("failed".to_string());
-        status.last_cleanup_failure_reason = Some(reason.to_string());
-        status.last_cleanup_batches = 0;
-        status.last_cleanup_backlog_deferred = false;
+        self.maintenance_telemetry
+            .record_worker_failure(now_secs(), reason);
     }
 
     /// Returns aggregate durable queue usage maintained by `SQLite` triggers.
