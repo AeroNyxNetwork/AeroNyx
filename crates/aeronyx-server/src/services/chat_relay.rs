@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.37.0-BackupArtifactDomain
+// Version: 3.38.0-BackupCopyRetryDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -90,6 +90,9 @@
 //   [CHAT-RELAY-BACKUP-ARTIFACT-DOMAIN 2026-08-27 by Codex] Extracted
 //   immutable artifact snapshots, exact identity states, and checked byte
 //   accounting while retaining all filesystem and SQLite I/O in this service.
+//   [CHAT-RELAY-BACKUP-COPY-RETRY-DOMAIN 2026-08-27 by Codex] Extracted the
+//   consecutive Busy/Locked timeout state machine and explicit copy actions
+//   while retaining SQLite steps and sleeping in this service.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -334,6 +337,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.38.0-BackupCopyRetryDomain - Typed bounded SQLite copy retries
 //   v3.37.0-BackupArtifactDomain - Typed artifact identity and accounting
 //   v3.36.0-BackupNamespaceDomain — Trait-based private artifact namespace
 //   v3.35.0-AuditVerificationDomain — Trait-based verification state machine
@@ -460,6 +464,10 @@ use crate::services::chat_relay_backup_audit_verification::{
 use crate::services::chat_relay_backup_artifact::{
     BackupArtifactAccountingError, BackupArtifactIdentityState, BackupArtifactSnapshot,
     BackupStorageIdentity,
+};
+use crate::services::chat_relay_backup_copy::{
+    BackupCopyAction, BackupCopyPolicyError, BackupCopyProgress, BackupCopyRetryPolicy,
+    BackupCopyRetryState, BoundedBackupCopyRetryPolicy,
 };
 use crate::services::chat_relay_backup_namespace::{
     BackupArtifactKind, BackupArtifactNamespace, BackupNamespaceError,
@@ -3858,32 +3866,57 @@ impl ChatRelayService {
         Ok(())
     }
 
+    fn backup_copy_retry_policy() -> BoundedBackupCopyRetryPolicy {
+        BoundedBackupCopyRetryPolicy::new(
+            CHAT_RELAY_BACKUP_BUSY_TIMEOUT,
+            CHAT_RELAY_BACKUP_BUSY_RETRY_DELAY,
+        )
+    }
+
+    fn backup_copy_progress(step: StepResult) -> BackupCopyProgress {
+        match step {
+            StepResult::Done => BackupCopyProgress::Complete,
+            StepResult::More => BackupCopyProgress::More,
+            StepResult::Busy => BackupCopyProgress::Busy,
+            StepResult::Locked => BackupCopyProgress::Locked,
+            _ => BackupCopyProgress::Unsupported,
+        }
+    }
+
+    fn map_backup_copy_policy_error(error: BackupCopyPolicyError) -> ChatRelayError {
+        match error {
+            BackupCopyPolicyError::BusyTimeout => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_BUSY,
+                "relay backup remained busy",
+            ),
+            BackupCopyPolicyError::ObservationTimeRegressed => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_ABORT,
+                "relay backup retry observation time regressed",
+            ),
+            BackupCopyPolicyError::UnsupportedProgress => Self::backup_io_error(
+                rusqlite::ffi::SQLITE_ERROR,
+                "unsupported relay backup step result",
+            ),
+        }
+    }
+
     fn copy_sqlite_backup(
         source: &Connection,
         destination: &mut Connection,
     ) -> ChatRelayResult<()> {
         let backup = Backup::new(source, destination)?;
-        let mut busy_since = None;
+        let retry_policy = Self::backup_copy_retry_policy();
+        let mut retry_state = BackupCopyRetryState::default();
         loop {
-            match backup.step(CHAT_RELAY_BACKUP_PAGES_PER_STEP)? {
-                StepResult::Done => return Ok(()),
-                StepResult::More => busy_since = None,
-                StepResult::Busy | StepResult::Locked => {
-                    let started = busy_since.get_or_insert_with(Instant::now);
-                    if started.elapsed() >= CHAT_RELAY_BACKUP_BUSY_TIMEOUT {
-                        return Err(Self::backup_io_error(
-                            rusqlite::ffi::SQLITE_BUSY,
-                            "relay backup remained busy",
-                        ));
-                    }
-                    std::thread::sleep(CHAT_RELAY_BACKUP_BUSY_RETRY_DELAY);
-                }
-                _ => {
-                    return Err(Self::backup_io_error(
-                        rusqlite::ffi::SQLITE_ERROR,
-                        "unsupported relay backup step result",
-                    ));
-                }
+            let progress =
+                Self::backup_copy_progress(backup.step(CHAT_RELAY_BACKUP_PAGES_PER_STEP)?);
+            let action = retry_policy
+                .transition(&mut retry_state, progress, Instant::now())
+                .map_err(Self::map_backup_copy_policy_error)?;
+            match action {
+                BackupCopyAction::Complete => return Ok(()),
+                BackupCopyAction::Continue => {}
+                BackupCopyAction::RetryAfter(delay) => std::thread::sleep(delay),
             }
         }
     }

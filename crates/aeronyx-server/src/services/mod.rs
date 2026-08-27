@@ -55,8 +55,11 @@
 //   canonical private recovery artifact namespace capability.
 //   [CHAT-RELAY-BACKUP-ARTIFACT-DOMAIN 2026-08-27 by Codex] Registered the
 //   immutable private artifact identity and accounting capability.
+//   [CHAT-RELAY-BACKUP-COPY-RETRY-DOMAIN 2026-08-27 by Codex] Registered the
+//   bounded SQLite-independent backup-copy retry state machine.
 //
 // Last Modified:
+//   v0.41.0-BackupCopyRetryDomain - Registered backup-copy retry policy
 //   v0.40.0-BackupArtifactDomain - Registered backup artifact snapshots
 //   v0.39.0-BackupNamespaceDomain - Registered backup namespace policy
 //   v0.38.0-AuditVerificationDomain - Registered verification state policy
@@ -123,6 +126,7 @@ mod chat_relay_backup_audit_catalog;
 mod chat_relay_backup_audit_checkpoint;
 mod chat_relay_backup_audit_rotation;
 mod chat_relay_backup_audit_verification;
+mod chat_relay_backup_copy;
 mod chat_relay_backup_namespace;
 mod chat_relay_backup_retention;
 mod chat_relay_blind_route;
