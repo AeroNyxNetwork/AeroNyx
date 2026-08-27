@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.58.0-StorageUsageDomain
+// Version: 3.59.0-PendingContractDomain
 //
 // Modification Reason:
+//   [CHAT-PENDING-CONTRACT-DOMAIN 2026-08-28 by Codex] Re-exported pending
+//   delivery contracts from a dependency-neutral module.
 //   [CHAT-STORAGE-USAGE-DOMAIN 2026-08-28 by Codex] Moved aggregate usage
 //   snapshot, SQLite reads, and fail-closed counter decoding into a repository.
 //   [CHAT-ONLINE-DEDUP-DOMAIN 2026-08-28 by Codex] Moved concurrent bounded
@@ -401,6 +403,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.59.0-PendingContractDomain - Decoupled pending delivery models
 //   v3.58.0-StorageUsageDomain - Composed aggregate usage repository
 //   v3.57.0-OnlineDedupDomain - Composed process-local duplicate admission
 //   v3.56.0-CleanupExecutionDomain - Composed bounded cleanup execution
@@ -620,6 +623,7 @@ use crate::services::chat_relay_pending_custody::allocate_queue_sequence;
 use crate::services::chat_relay_pending_custody::{
     PendingMessageCustodyDomain, PendingMessageStoreOutcome,
 };
+pub use crate::services::chat_relay_pending_contract::{PendingMessage, PendingMessagePageV2};
 use crate::services::chat_relay_pending_delivery::{
     PendingMessageDeliveryDomain, PendingPullQuarantineSummary,
 };
@@ -796,30 +800,6 @@ pub struct ChatRelayMaintenanceStatus {
     pub last_cleanup_backlog_deferred: bool,
     /// Corrupt pending-message rows isolated by the latest cleanup run.
     pub last_cleanup_quarantined_pending_messages: u64,
-}
-
-// ============================================
-// Pending message row (returned from pull)
-// ============================================
-
-/// A pending offline message retrieved from the store.
-#[derive(Debug)]
-pub struct PendingMessage {
-    /// Opaque client-generated message identifier used for ACK pagination.
-    pub message_id: [u8; 16],
-    /// Signed end-to-end encrypted envelope; relay code must not inspect its ciphertext.
-    pub envelope: ChatEnvelope,
-}
-
-/// One stable ChatPullV2 page and the opaque continuation state for it.
-#[derive(Debug)]
-pub struct PendingMessagePageV2 {
-    /// Valid signed envelopes returned to the authenticated receiver.
-    pub messages: Vec<PendingMessage>,
-    /// AEAD-protected continuation cursor. An empty request cursor starts a new snapshot.
-    pub next_cursor: Vec<u8>,
-    /// Whether the caller should continue the current snapshot with `next_cursor`.
-    pub has_more: bool,
 }
 
 // ============================================

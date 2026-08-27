@@ -1,11 +1,15 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pending_delivery.rs
 // ============================================
-// Version: 1.0.0-PendingDeliveryDomain
+// Version: 1.1.0-PendingContractDependency
 //
 // Creation Reason:
 //   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Extract complete legacy
 //   and snapshot pull use cases from the oversized relay orchestration service.
+//
+// Modification Reason:
+//   [CHAT-PENDING-CONTRACT-DOMAIN 2026-08-28 by Codex] Depend directly on the
+//   pending delivery contract instead of the central relay orchestrator.
 //
 // Main Functionality:
 //   - Composes pending-row validation with authenticated cursor protection.
@@ -18,7 +22,8 @@
 //   - `chat_relay_pending_pull.rs` owns ordered reads and row authentication.
 //   - `chat_relay_pull_cursor.rs` owns the stable encrypted cursor wire format.
 //   - `chat_relay_quarantine.rs` owns atomic poison-row replacement.
-//   - `chat_relay.rs` owns public API models, logging, and aggregate status.
+//   - `chat_relay_pending_contract.rs` owns public delivery models.
+//   - `chat_relay.rs` owns logging, aggregate status, and API re-exports.
 //
 // Main Logical Flow:
 //   1. Clamp the requested page size to the existing protocol bounds.
@@ -35,6 +40,7 @@
 //   - Keep final pagination outside the connection-lock scope.
 //
 // Last Modified:
+//   v1.1.0-PendingContractDependency - Removed orchestrator dependency
 //   v1.0.0-PendingDeliveryDomain - Initial pull use-case composition
 // ============================================
 
@@ -43,8 +49,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use super::chat_relay::{PendingMessage, PendingMessagePageV2};
 use super::chat_relay_error::ChatRelayResult;
+use super::chat_relay_pending_contract::{PendingMessage, PendingMessagePageV2};
 use super::chat_relay_pending_pull::PendingMessagePullDomain;
 use super::chat_relay_pull_cursor::{ChatPullCursorCodec, PullCursorV2};
 use super::chat_relay_quarantine::{

@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pending_pull.rs
 // ============================================
-// Version: 1.2.0-PendingDeliveryComposition
+// Version: 1.3.0-PendingContractDependency
 //
 // Creation Reason:
 //   [CHAT-PENDING-PULL-DOMAIN 2026-08-25 by Codex] Extract pending-message
@@ -9,6 +9,8 @@
 //   preserving both pull protocols, SQLite ordering, and quarantine behavior.
 //
 // Modification Reason:
+//   [CHAT-PENDING-CONTRACT-DOMAIN 2026-08-28 by Codex] Depend directly on the
+//   pending delivery contract instead of the central relay orchestrator.
 //   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Updated ownership after
 //   connection locking, quarantine, and final pagination moved to a coordinator.
 //
@@ -38,6 +40,7 @@
 //   - Replacement repositories must preserve limits and deterministic order.
 //
 // Last Modified:
+//   v1.3.0-PendingContractDependency - Removed orchestrator dependency
 //   v1.2.0-PendingDeliveryComposition - Documented coordinator ownership
 //   [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex]
 //   v1.1.0-DurableQuarantineBoundary - Consume shared typed corruption model
@@ -47,10 +50,10 @@
 use aeronyx_core::protocol::chat::decode_envelope;
 use rusqlite::{params, Connection};
 
-use super::chat_relay::PendingMessage;
 // [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Pull repositories consume the
-// typed failure boundary directly while pending row models remain service-owned.
+// typed failure boundary directly while pending row models remain contract-owned.
 use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
+use super::chat_relay_pending_contract::PendingMessage;
 use super::chat_relay_quarantine::{CorruptDurableRow, QUARANTINE_SOURCE_PENDING_MESSAGE};
 
 #[derive(Debug, Clone)]
