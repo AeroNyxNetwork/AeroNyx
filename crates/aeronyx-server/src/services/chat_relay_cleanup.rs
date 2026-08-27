@@ -47,9 +47,11 @@ use rusqlite::{params, Transaction};
 use crate::config::ChatRelayConfig;
 
 use super::chat_relay::{
-    ChatRelayError, ChatRelayResult, MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION,
-    MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES,
+    MAX_EXPIRED_MESSAGE_IDS_PER_NOTIFICATION, MAX_EXPIRED_NOTIFICATION_ENCODED_BYTES,
 };
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Cleanup depends directly on
+// the typed failure boundary while protocol limits remain service-owned.
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 use super::chat_relay_quarantine::{
     CorruptDurableRow, DurableQuarantineDomain, QUARANTINE_SOURCE_PENDING_MESSAGE,
 };

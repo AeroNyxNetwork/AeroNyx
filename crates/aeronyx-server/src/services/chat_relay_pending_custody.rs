@@ -42,7 +42,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 
 use crate::config::ChatRelayConfig;
 
-use super::chat_relay::{ChatRelayError, ChatRelayResult, MAX_CHAT_ACK_MESSAGE_IDS};
+use super::chat_relay::MAX_CHAT_ACK_MESSAGE_IDS;
+// [CHAT-RELAY-ERROR-DOMAIN 2026-08-27 by Codex] Custody repositories consume
+// typed failures directly while the public ACK ceiling stays service-owned.
+use super::chat_relay_error::{ChatRelayError, ChatRelayResult};
 
 /// Immutable limits governing one node's pending-message custody.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
