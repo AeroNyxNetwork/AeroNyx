@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.56.0-BlindRouteDurableStoreDomain
+// Version: 0.57.0-PendingDeliveryDomain
 //
 // Modification Reason:
+//   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Registered the composed
+//   pending pull, cursor, quarantine, and pagination use-case domain.
 //   [BLIND-ROUTE-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Registered the
 //   private blind-route SQLite lease and completion repository.
 //   [VERIFIED-SUBMIT-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Registered the
@@ -89,6 +91,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.57.0-PendingDeliveryDomain - Registered pull use-case composition
 //   v0.56.0-BlindRouteDurableStoreDomain - Registered route repository
 //   v0.55.0-VerifiedSubmitDurableStoreDomain - Registered replay repository
 //   v0.54.0-ChatRelayCustodySchemaDomains - Registered custody schema domains
@@ -191,6 +194,7 @@ mod chat_relay_error;
 mod chat_relay_expired_delivery;
 mod chat_relay_peer_telemetry;
 mod chat_relay_pending_custody;
+mod chat_relay_pending_delivery;
 mod chat_relay_pending_pull;
 mod chat_relay_pending_schema;
 mod chat_relay_pull_cursor;

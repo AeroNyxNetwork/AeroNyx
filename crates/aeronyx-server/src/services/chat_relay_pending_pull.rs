@@ -1,12 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pending_pull.rs
 // ============================================
-// Version: 1.1.0-DurableQuarantineBoundary
+// Version: 1.2.0-PendingDeliveryComposition
 //
 // Creation Reason:
 //   [CHAT-PENDING-PULL-DOMAIN 2026-08-25 by Codex] Extract pending-message
 //   reads and durable-row validation from the oversized relay service while
 //   preserving both pull protocols, SQLite ordering, and quarantine behavior.
+//
+// Modification Reason:
+//   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Updated ownership after
+//   connection locking, quarantine, and final pagination moved to a coordinator.
 //
 // Main Functionality:
 //   - Defines a replaceable pending-pull repository trait.
@@ -15,8 +19,7 @@
 //   - Returns typed valid/corrupt page results without performing side effects.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns the connection lock, telemetry, cursor protection,
-//     and final pagination decisions.
+//   - `chat_relay_pending_delivery.rs` owns lock scope and final pagination.
 //   - `chat_relay_quarantine.rs` owns typed corrupt-row evidence and isolation.
 //   - `aeronyx-core` owns the bounded envelope codec and signature contract.
 //
@@ -24,17 +27,18 @@
 //   1. Read a bounded raw page using the protocol-specific stable ordering.
 //   2. Reconstruct and authenticate each opaque encrypted envelope.
 //   3. Split valid messages from privacy-minimised corrupt-row evidence.
-//   4. Return both sets while the caller still owns the connection lock.
+//   4. Return both sets to the delivery coordinator under its connection lock.
 //
 // Important Note for Next Developer:
 //   - V1 must remain ordered by `message_id`; v2 must remain ordered by the
 //     monotonic `queue_sequence` captured under a fixed snapshot ceiling.
-//   - This domain intentionally does not delete or quarantine rows. The relay
-//     service commits that side effect atomically on its owned connection.
+//   - This domain intentionally does not delete or quarantine rows. The
+//     delivery coordinator commits that side effect on the same connection.
 //   - Never log row contents, message IDs, wallet keys, envelopes, or queries.
 //   - Replacement repositories must preserve limits and deterministic order.
 //
 // Last Modified:
+//   v1.2.0-PendingDeliveryComposition - Documented coordinator ownership
 //   [CHAT-DURABLE-QUARANTINE-DOMAIN 2026-08-25 by Codex]
 //   v1.1.0-DurableQuarantineBoundary - Consume shared typed corruption model
 //   v1.0.0-PendingPullDomain - Initial repository/validation composition

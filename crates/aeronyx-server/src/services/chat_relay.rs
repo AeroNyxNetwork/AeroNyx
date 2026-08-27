@@ -1,9 +1,12 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.54.0-BlindRouteDurableStoreDomain
+// Version: 3.55.0-PendingDeliveryDomain
 //
 // Modification Reason:
+//   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Composed legacy and v2
+//   pending pulls, cursor protection, bounded lock scope, quarantine, and final
+//   pagination behind one delivery use-case domain.
 //   [BLIND-ROUTE-DURABLE-STORE-DOMAIN 2026-08-27 by Codex] Extracted route
 //   replay admission, effect arming, lease takeover, release, and atomic
 //   completion behind a composed SQLite repository capability.
@@ -391,6 +394,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.55.0-PendingDeliveryDomain - Composed pending pull use cases
 //   v3.54.0-BlindRouteDurableStoreDomain - Composed route replay repository
 //   v3.53.0-VerifiedSubmitDurableStoreDomain - Composed replay repository
 //   v3.52.0-CustodySchemaDomains - Composed custody schema migrations
@@ -605,16 +609,17 @@ use crate::services::chat_relay_pending_custody::allocate_queue_sequence;
 use crate::services::chat_relay_pending_custody::{
     PendingMessageCustodyDomain, PendingMessageStoreOutcome,
 };
-use crate::services::chat_relay_pending_pull::PendingMessagePullDomain;
+use crate::services::chat_relay_pending_delivery::{
+    PendingMessageDeliveryDomain, PendingPullQuarantineSummary,
+};
 use crate::services::chat_relay_pending_schema::{
     ChatRelayPendingSchemaMigration, SqliteChatRelayPendingSchemaMigrator,
 };
 #[cfg(test)]
 use crate::services::chat_relay_pull_cursor::ENCODED_CURSOR_BYTES as CHAT_PULL_CURSOR_V2_BYTES;
-use crate::services::chat_relay_pull_cursor::{ChatPullCursorCodec, PullCursorV2};
-use crate::services::chat_relay_quarantine::{
-    CorruptDurableRow, DurableQuarantineDomain, QuarantineRowTarget,
-};
+#[cfg(test)]
+use crate::services::chat_relay_pull_cursor::PullCursorV2;
+use crate::services::chat_relay_quarantine::{DurableQuarantineDomain, QuarantineRowTarget};
 #[cfg(test)]
 use crate::services::chat_relay_quarantine::{
     MAX_QUARANTINE_EVENTS, QUARANTINE_SOURCE_EXPIRED_NOTIFICATION,
@@ -934,16 +939,12 @@ pub struct ChatRelayService {
     #[cfg(unix)]
     _runtime_fence: Option<ChatRelayRuntimeFence>,
     node_secret: [u8; 32],
-    /// Receiver/filter-bound opaque snapshot cursor capability.
+    /// Complete legacy and snapshot pending-message delivery use cases.
     ///
-    /// [CHAT-PULL-CURSOR-DOMAIN 2026-08-25 by Codex] The service owns paging;
-    /// this composed object owns the stable wire and cryptographic mechanism.
-    pull_cursor_codec: ChatPullCursorCodec,
-    /// Bounded pending-message reads and durable-row authentication.
-    ///
-    /// [CHAT-PENDING-PULL-DOMAIN 2026-08-25 by Codex] The repository is
-    /// replaceable; the service retains connection locking and side effects.
-    pending_pull: PendingMessagePullDomain,
+    /// [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Ordered reads,
+    /// authenticated cursors, bounded lock scope, quarantine, and pagination
+    /// are composed while public API telemetry remains service-owned.
+    pending_delivery: PendingMessageDeliveryDomain,
     /// Offline-message idempotence, quota, sequence, and ACK capability.
     ///
     /// [CHAT-PENDING-CUSTODY-DOMAIN 2026-08-25 by Codex] The service retains
@@ -1720,8 +1721,7 @@ impl ChatRelayService {
 
         let dedup_capacity = config.dedup_lru_capacity;
         let relay_enabled = config.enabled;
-        let pull_cursor_codec = ChatPullCursorCodec::new(&node_secret)?;
-        let pending_pull = PendingMessagePullDomain::new();
+        let pending_delivery = PendingMessageDeliveryDomain::new(&node_secret)?;
         let pending_custody = PendingMessageCustodyDomain::new(&config);
         let expired_notification_delivery = ExpiredNotificationDelivery::new();
         let blob_custody = EncryptedBlobCustodyDomain::new(node_secret, &config);
@@ -1754,8 +1754,7 @@ impl ChatRelayService {
             #[cfg(unix)]
             _runtime_fence: runtime_fence,
             node_secret,
-            pull_cursor_codec,
-            pending_pull,
+            pending_delivery,
             pending_custody,
             expired_notification_delivery,
             blob_custody,
@@ -1832,24 +1831,15 @@ impl ChatRelayService {
     // Opaque ChatPullV2 cursor protection
     // ============================================
 
-    fn encode_pull_cursor_v2(
-        &self,
-        receiver: &[u8; 32],
-        after_timestamp: u64,
-        cursor: PullCursorV2,
-    ) -> ChatRelayResult<Vec<u8>> {
-        self.pull_cursor_codec
-            .encode(receiver, after_timestamp, cursor)
-    }
-
+    #[cfg(test)]
     fn decode_pull_cursor_v2(
         &self,
         receiver: &[u8; 32],
         after_timestamp: u64,
         encoded: &[u8],
     ) -> ChatRelayResult<PullCursorV2> {
-        self.pull_cursor_codec
-            .decode(receiver, after_timestamp, encoded)
+        self.pending_delivery
+            .decode_cursor(receiver, after_timestamp, encoded)
     }
 
     // ============================================
@@ -2191,35 +2181,27 @@ impl ChatRelayService {
         Ok(())
     }
 
-    fn quarantine_pending_pull_rows(
-        &self,
-        conn: &mut Connection,
-        corrupt_rows: &[CorruptDurableRow],
-    ) -> ChatRelayResult<()> {
-        if corrupt_rows.is_empty() {
-            return Ok(());
-        }
-
-        let quarantine_now = now_secs();
-        let outcome = self.durable_quarantine.replace_rows(
-            conn,
-            QuarantineRowTarget::PendingMessage,
-            corrupt_rows,
-            quarantine_now,
-        )?;
-
+    fn record_pending_pull_quarantine(&self, summary: PendingPullQuarantineSummary) {
+        let PendingPullQuarantineSummary::Replaced {
+            quarantined_at,
+            quarantined_rows,
+            removed_events,
+            retained_events,
+        } = summary
+        else {
+            return;
+        };
         self.record_pull_quarantine(
-            quarantine_now,
-            outcome.quarantined_rows,
+            quarantined_at,
+            quarantined_rows,
             0,
-            outcome.removed_events,
-            outcome.retained_events,
+            removed_events,
+            retained_events,
         );
         warn!(
-            quarantined_pending_messages = outcome.quarantined_rows,
+            quarantined_pending_messages = quarantined_rows,
             "[CHAT_RELAY] Corrupt pending rows isolated during pull"
         );
-        Ok(())
     }
 
     /// Retrieves a page of pending messages for the given receiver wallet.
@@ -2240,22 +2222,16 @@ impl ChatRelayService {
         cursor: &[u8; 16],
         limit: u32,
     ) -> ChatRelayResult<(Vec<PendingMessage>, bool)> {
-        let page_limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
-        let mut conn = self.conn.lock();
-        let page = self.pending_pull.read_legacy_page(
-            &conn,
+        let delivery = self.pending_delivery.pull_legacy(
+            &self.conn,
+            &self.durable_quarantine,
             receiver,
             after_timestamp,
             cursor,
-            page_limit,
+            limit,
         )?;
-        self.quarantine_pending_pull_rows(&mut conn, &page.corrupt_rows)?;
-        drop(conn);
-
-        let mut messages = page.messages;
-        let has_more = page.raw_has_more || messages.len() > page_limit;
-        messages.truncate(page_limit);
-        Ok((messages, has_more))
+        self.record_pending_pull_quarantine(delivery.quarantine);
+        Ok((delivery.messages, delivery.has_more))
     }
 
     /// Retrieves one stable monotonic snapshot page for ChatPullV2.
@@ -2277,63 +2253,16 @@ impl ChatRelayService {
         encoded_cursor: &[u8],
         limit: u32,
     ) -> ChatRelayResult<PendingMessagePageV2> {
-        let page_limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(100);
-        let mut conn = self.conn.lock();
-        let cursor = if encoded_cursor.is_empty() {
-            PullCursorV2 {
-                position: 0,
-                ceiling: self.pending_pull.capture_snapshot_ceiling(
-                    &conn,
-                    receiver,
-                    after_timestamp,
-                )?,
-            }
-        } else {
-            self.decode_pull_cursor_v2(receiver, after_timestamp, encoded_cursor)?
-        };
-        let page = self.pending_pull.read_snapshot_page(
-            &conn,
+        let delivery = self.pending_delivery.pull_snapshot(
+            &self.conn,
+            &self.durable_quarantine,
             receiver,
             after_timestamp,
-            cursor.position,
-            cursor.ceiling,
-            page_limit,
+            encoded_cursor,
+            limit,
         )?;
-        self.quarantine_pending_pull_rows(&mut conn, &page.corrupt_rows)?;
-        drop(conn);
-
-        let mut valid_messages = page.messages;
-        let valid_overflow = valid_messages.len() > page_limit;
-        let has_more = page.raw_has_more || valid_overflow;
-        let next_position = if valid_overflow {
-            valid_messages
-                .get(page_limit.saturating_sub(1))
-                .map(|(sequence, _)| *sequence)
-                .unwrap_or(cursor.position)
-        } else if has_more {
-            page.raw_max_sequence.unwrap_or(cursor.position)
-        } else {
-            cursor.ceiling
-        };
-        valid_messages.truncate(page_limit);
-        let messages = valid_messages
-            .into_iter()
-            .map(|(_, message)| message)
-            .collect();
-        let next_cursor = self.encode_pull_cursor_v2(
-            receiver,
-            after_timestamp,
-            PullCursorV2 {
-                position: next_position,
-                ceiling: cursor.ceiling,
-            },
-        )?;
-
-        Ok(PendingMessagePageV2 {
-            messages,
-            next_cursor,
-            has_more,
-        })
+        self.record_pending_pull_quarantine(delivery.quarantine);
+        Ok(delivery.page)
     }
 
     /// Acknowledges delivery of a batch of messages, deleting them from the store.

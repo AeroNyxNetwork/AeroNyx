@@ -1,12 +1,16 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_pull_cursor.rs
 // ============================================
-// Version: 1.0.0-PullCursorDomain
+// Version: 1.1.0-PendingDeliveryComposition
 //
 // Creation Reason:
 //   [CHAT-PULL-CURSOR-DOMAIN 2026-08-25 by Codex] Extract the authenticated
 //   ChatPullV2 cursor model and protection mechanism from the oversized relay
 //   service without changing its wire bytes, binding, or error contract.
+//
+// Modification Reason:
+//   [CHAT-PENDING-DELIVERY-DOMAIN 2026-08-28 by Codex] Updated ownership after
+//   cursor protection became part of the composed pending-delivery use case.
 //
 // Main Functionality:
 //   - Models stable snapshot progress as a bounded domain struct.
@@ -15,7 +19,7 @@
 //   - Preserves the existing receiver/filter-bound 57-byte cursor format.
 //
 // Dependencies:
-//   - `chat_relay.rs` owns SQLite snapshot queries and composes this codec.
+//   - `chat_relay_pending_delivery.rs` composes snapshot reads with this codec.
 //   - `chat_relay_error.rs` owns the stable service-facing error boundary.
 //
 // Main Logical Flow:
@@ -28,10 +32,11 @@
 //   - The encoded version, length, byte order, HKDF domains, and AAD are wire
 //     compatibility contracts; changing any of them invalidates live cursors.
 //   - Never log receiver keys, cursor bytes, counters, nonces, or AEAD errors.
-//   - SQLite snapshot capture and paging remain atomic service concerns.
+//   - SQLite snapshot capture and paging belong to the delivery coordinator.
 //   - Replacement protectors must preserve binding and fail closed.
 //
 // Last Modified:
+//   v1.1.0-PendingDeliveryComposition - Documented coordinator ownership
 //   v1.0.0-PullCursorDomain - Initial trait/composition extraction
 // ============================================
 
