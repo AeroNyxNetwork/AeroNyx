@@ -53,8 +53,11 @@
 //   private bounded verification state machine and public aggregate receipt.
 //   [CHAT-RELAY-BACKUP-NAMESPACE-DOMAIN 2026-08-27 by Codex] Registered the
 //   canonical private recovery artifact namespace capability.
+//   [CHAT-RELAY-BACKUP-ARTIFACT-DOMAIN 2026-08-27 by Codex] Registered the
+//   immutable private artifact identity and accounting capability.
 //
 // Last Modified:
+//   v0.40.0-BackupArtifactDomain - Registered backup artifact snapshots
 //   v0.39.0-BackupNamespaceDomain - Registered backup namespace policy
 //   v0.38.0-AuditVerificationDomain - Registered verification state policy
 //   v0.37.0-AuditCatalogDomain - Registered bounded artifact catalog
@@ -114,6 +117,7 @@
 
 pub mod blind_vault;
 pub mod chat_relay;
+mod chat_relay_backup_artifact;
 mod chat_relay_backup_audit;
 mod chat_relay_backup_audit_catalog;
 mod chat_relay_backup_audit_checkpoint;

@@ -1,7 +1,7 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.36.0-BackupNamespaceDomain
+// Version: 3.37.0-BackupArtifactDomain
 //
 // Modification Reason:
 //   [RELAY-HEALTH-REASON-BOUNDARY 2026-08-21 by Codex] Added typed,
@@ -87,6 +87,9 @@
 //   [CHAT-RELAY-BACKUP-NAMESPACE-DOMAIN 2026-08-27 by Codex] Extracted
 //   canonical recovery-image naming, opaque operation-key derivation, and
 //   fail-closed private-directory entry classification.
+//   [CHAT-RELAY-BACKUP-ARTIFACT-DOMAIN 2026-08-27 by Codex] Extracted
+//   immutable artifact snapshots, exact identity states, and checked byte
+//   accounting while retaining all filesystem and SQLite I/O in this service.
 //   [CUSTODY-WITNESS-RECEIPT-IMPORT 2026-08-17 by Codex] Added an RAII
 //   current-anchor guard so producer receipt import cannot race checkpoint
 //   publication after validating the exact signed anchor.
@@ -331,6 +334,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.37.0-BackupArtifactDomain - Typed artifact identity and accounting
 //   v3.36.0-BackupNamespaceDomain — Trait-based private artifact namespace
 //   v3.35.0-AuditVerificationDomain — Trait-based verification state machine
 //   v3.34.0-AuditCatalogDomain — Trait-based path-free segment catalog
@@ -453,13 +457,17 @@ use crate::services::chat_relay_backup_audit_verification::{
     BackupAuditVerificationError, BackupAuditVerificationLimits, BackupAuditVerificationPolicy,
     BoundedBackupAuditVerificationPolicy, ChatRelayBackupAuditVerificationState,
 };
+use crate::services::chat_relay_backup_artifact::{
+    BackupArtifactAccountingError, BackupArtifactIdentityState, BackupArtifactSnapshot,
+    BackupStorageIdentity,
+};
 use crate::services::chat_relay_backup_namespace::{
     BackupArtifactKind, BackupArtifactNamespace, BackupNamespaceError,
     HmacBackupArtifactNamespace,
 };
 use crate::services::chat_relay_backup_retention::{
-    BackupRetentionArtifact, BackupRetentionLimits, BackupRetentionPlanner,
-    BackupRetentionPolicyError, BoundedBackupRetentionPlanner,
+    BackupRetentionLimits, BackupRetentionPlanner, BackupRetentionPolicyError,
+    BoundedBackupRetentionPlanner,
 };
 pub(crate) use crate::services::chat_relay_blind_route::BlindRelayRouteAdmission;
 use crate::services::chat_relay_blind_route::BlindRouteReplay;
@@ -1466,38 +1474,11 @@ pub struct ChatRelayRestoreReadinessReceipt {
     pub blocker: Option<&'static str>,
 }
 
-/// Private filesystem metadata used only while enforcing backup retention.
-#[derive(Clone)]
-struct ChatRelayBackupArtifact {
-    path: PathBuf,
-    file_name: String,
-    size_bytes: u64,
-    modified_at: SystemTime,
-    #[cfg(unix)]
-    device_id: u64,
-    #[cfg(unix)]
-    inode: u64,
-}
-
-impl BackupRetentionArtifact for ChatRelayBackupArtifact {
-    fn size_bytes(&self) -> u64 {
-        self.size_bytes
-    }
-
-    fn modified_at(&self) -> SystemTime {
-        self.modified_at
-    }
-
-    fn stable_name(&self) -> &str {
-        &self.file_name
-    }
-}
-
 struct ChatRelayBackupRetentionInspection {
     receipt: ChatRelayBackupRetentionReceipt,
-    newest_backup: Option<ChatRelayBackupArtifact>,
-    excess_backups: Vec<ChatRelayBackupArtifact>,
-    stale_partials: Vec<ChatRelayBackupArtifact>,
+    newest_backup: Option<BackupArtifactSnapshot>,
+    excess_backups: Vec<BackupArtifactSnapshot>,
+    stale_partials: Vec<BackupArtifactSnapshot>,
 }
 
 /// Private active-custody metadata included in restore-plan commitments.
@@ -3077,7 +3058,7 @@ impl ChatRelayService {
     fn inspect_private_backup_entry(
         path: PathBuf,
         file_name: String,
-    ) -> ChatRelayResult<ChatRelayBackupArtifact> {
+    ) -> ChatRelayResult<BackupArtifactSnapshot> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
 
@@ -3106,21 +3087,27 @@ impl ChatRelayService {
             }
         }
 
-        Ok(ChatRelayBackupArtifact {
+        let modified_at = metadata.modified().map_err(|_| {
+            Self::backup_io_error(
+                rusqlite::ffi::SQLITE_IOERR,
+                "unable to inspect relay backup retention age",
+            )
+        })?;
+        #[cfg(unix)]
+        let storage_identity = BackupStorageIdentity::Unix {
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        #[cfg(not(unix))]
+        let storage_identity = BackupStorageIdentity::Portable;
+
+        Ok(BackupArtifactSnapshot::new(
             path,
             file_name,
-            size_bytes: metadata.len(),
-            modified_at: metadata.modified().map_err(|_| {
-                Self::backup_io_error(
-                    rusqlite::ffi::SQLITE_IOERR,
-                    "unable to inspect relay backup retention age",
-                )
-            })?,
-            #[cfg(unix)]
-            device_id: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-        })
+            metadata.len(),
+            modified_at,
+            storage_identity,
+        ))
     }
 
     fn inspect_verified_backup_retention(
@@ -3165,7 +3152,7 @@ impl ChatRelayService {
             let inspected = Self::inspect_private_backup_entry(entry.path(), file_name.clone())?;
             match namespace.classify(&file_name) {
                 BackupArtifactKind::RecoveryImage => {
-                    if inspected.size_bytes == 0 {
+                    if inspected.size_bytes() == 0 {
                         return Err(Self::backup_io_error(
                             rusqlite::ffi::SQLITE_CORRUPT,
                             "relay backup retention artifact is empty",
@@ -3184,19 +3171,14 @@ impl ChatRelayService {
         }
 
         for artifact in &artifacts {
-            let verified_size = Self::verify_existing_backup_artifact(&artifact.path)?;
+            let verified_size = Self::verify_existing_backup_artifact(artifact.path())?;
             let rechecked = Self::inspect_private_backup_entry(
-                artifact.path.clone(),
-                artifact.file_name.clone(),
+                artifact.path_buf(),
+                artifact.file_name_owned(),
             )?;
-            let identity_changed = verified_size != artifact.size_bytes
-                || rechecked.size_bytes != artifact.size_bytes
-                || rechecked.modified_at != artifact.modified_at;
-            #[cfg(unix)]
-            let identity_changed = identity_changed
-                || rechecked.device_id != artifact.device_id
-                || rechecked.inode != artifact.inode;
-            if identity_changed {
+            if !artifact.verified_size_matches(verified_size)
+                || artifact.identity_state(&rechecked) != BackupArtifactIdentityState::Stable
+            {
                 return Err(Self::backup_io_error(
                     rusqlite::ffi::SQLITE_CORRUPT,
                     "relay backup retention artifact changed during verification",
@@ -3252,6 +3234,25 @@ impl ChatRelayService {
                 "relay backup partial grace cutoff is out of range",
             ),
         }
+    }
+
+    fn backup_artifact_accounting_error(
+        error: BackupArtifactAccountingError,
+        reason: &'static str,
+    ) -> ChatRelayError {
+        match error {
+            BackupArtifactAccountingError::BytesOverflow => {
+                Self::backup_io_error(rusqlite::ffi::SQLITE_FULL, reason)
+            }
+        }
+    }
+
+    fn checked_backup_artifact_bytes(
+        artifacts: &[BackupArtifactSnapshot],
+        reason: &'static str,
+    ) -> ChatRelayResult<u64> {
+        BackupArtifactSnapshot::checked_total_bytes(artifacts)
+            .map_err(|error| Self::backup_artifact_accounting_error(error, reason))
     }
 
     fn inspect_active_restore_boundary(
@@ -3351,22 +3352,16 @@ impl ChatRelayService {
     // only canonical policy and cryptography.
     fn restore_plan_private_boundary<'a>(
         config: &'a ChatRelayConfig,
-        backup: &'a ChatRelayBackupArtifact,
+        backup: &'a BackupArtifactSnapshot,
         active: &ChatRelayActiveRestoreBoundary,
     ) -> RestorePlanPrivateBoundary<'a> {
         RestorePlanPrivateBoundary {
             configured_database_path: &config.db_path,
-            selected_backup_name: &backup.file_name,
-            selected_backup_modified_at: backup.modified_at,
+            selected_backup_name: backup.file_name(),
+            selected_backup_modified_at: backup.modified_at(),
             active_database_modified_at: active.modified_at,
-            #[cfg(unix)]
-            selected_backup_device_id: backup.device_id,
-            #[cfg(not(unix))]
-            selected_backup_device_id: 0,
-            #[cfg(unix)]
-            selected_backup_inode: backup.inode,
-            #[cfg(not(unix))]
-            selected_backup_inode: 0,
+            selected_backup_device_id: backup.device_id(),
+            selected_backup_inode: backup.inode(),
             active_database_device_id: active.device_id,
             active_database_inode: active.inode,
         }
@@ -3397,39 +3392,26 @@ impl ChatRelayService {
         }
     }
 
-    fn backup_artifact_identity_matches(
-        expected: &ChatRelayBackupArtifact,
-        actual: &ChatRelayBackupArtifact,
-    ) -> bool {
-        let matches = expected.file_name == actual.file_name
-            && expected.size_bytes == actual.size_bytes
-            && expected.modified_at == actual.modified_at;
-        #[cfg(unix)]
-        let matches =
-            matches && expected.device_id == actual.device_id && expected.inode == actual.inode;
-        matches
-    }
-
     fn reverify_planned_backup_artifact(
-        artifact: &ChatRelayBackupArtifact,
+        artifact: &BackupArtifactSnapshot,
         verify_sqlite: bool,
     ) -> ChatRelayResult<()> {
         let before =
-            Self::inspect_private_backup_entry(artifact.path.clone(), artifact.file_name.clone())?;
-        if !Self::backup_artifact_identity_matches(artifact, &before) {
+            Self::inspect_private_backup_entry(artifact.path_buf(), artifact.file_name_owned())?;
+        if artifact.identity_state(&before) != BackupArtifactIdentityState::Stable {
             return Err(Self::backup_io_error(
                 rusqlite::ffi::SQLITE_CORRUPT,
                 "relay backup prune candidate changed after planning",
             ));
         }
         if verify_sqlite {
-            let verified_size = Self::verify_existing_backup_artifact(&artifact.path)?;
+            let verified_size = Self::verify_existing_backup_artifact(artifact.path())?;
             let after = Self::inspect_private_backup_entry(
-                artifact.path.clone(),
-                artifact.file_name.clone(),
+                artifact.path_buf(),
+                artifact.file_name_owned(),
             )?;
-            if verified_size != artifact.size_bytes
-                || !Self::backup_artifact_identity_matches(artifact, &after)
+            if !artifact.verified_size_matches(verified_size)
+                || artifact.identity_state(&after) != BackupArtifactIdentityState::Stable
             {
                 return Err(Self::backup_io_error(
                     rusqlite::ffi::SQLITE_CORRUPT,
@@ -3438,17 +3420,6 @@ impl ChatRelayService {
             }
         }
         Ok(())
-    }
-
-    fn checked_backup_artifact_bytes(
-        artifacts: &[ChatRelayBackupArtifact],
-        reason: &'static str,
-    ) -> ChatRelayResult<u64> {
-        artifacts.iter().try_fold(0u64, |total, artifact| {
-            total
-                .checked_add(artifact.size_bytes)
-                .ok_or_else(|| Self::backup_io_error(rusqlite::ffi::SQLITE_FULL, reason))
-        })
     }
 
     fn sync_backup_directory(backup_directory: &Path) -> ChatRelayResult<()> {
@@ -3537,7 +3508,7 @@ impl ChatRelayService {
         let deletion_result = (|| -> ChatRelayResult<()> {
             for artifact in &inspection.excess_backups {
                 Self::reverify_planned_backup_artifact(artifact, true)?;
-                std::fs::remove_file(&artifact.path).map_err(|_| {
+                std::fs::remove_file(artifact.path()).map_err(|_| {
                     Self::backup_io_error(
                         rusqlite::ffi::SQLITE_IOERR_DELETE,
                         "unable to remove verified relay backup artifact",
@@ -3545,7 +3516,7 @@ impl ChatRelayService {
                 })?;
                 deleted_backup_count += 1;
                 deleted_backup_bytes = deleted_backup_bytes
-                    .checked_add(artifact.size_bytes)
+                    .checked_add(artifact.size_bytes())
                     .ok_or_else(|| {
                         Self::backup_io_error(
                             rusqlite::ffi::SQLITE_FULL,
@@ -3555,7 +3526,7 @@ impl ChatRelayService {
             }
             for partial in &inspection.stale_partials {
                 Self::reverify_planned_backup_artifact(partial, false)?;
-                std::fs::remove_file(&partial.path).map_err(|_| {
+                std::fs::remove_file(partial.path()).map_err(|_| {
                     Self::backup_io_error(
                         rusqlite::ffi::SQLITE_IOERR_DELETE,
                         "unable to remove grace-expired relay backup partial",
@@ -3563,7 +3534,7 @@ impl ChatRelayService {
                 })?;
                 deleted_partial_count += 1;
                 deleted_partial_bytes = deleted_partial_bytes
-                    .checked_add(partial.size_bytes)
+                    .checked_add(partial.size_bytes())
                     .ok_or_else(|| {
                         Self::backup_io_error(
                             rusqlite::ffi::SQLITE_FULL,
@@ -6882,7 +6853,7 @@ impl ChatRelayService {
         let selected_backup_bytes = inspection
             .newest_backup
             .as_ref()
-            .map(|artifact| artifact.size_bytes)
+            .map(BackupArtifactSnapshot::size_bytes)
             .unwrap_or_default();
         let active = Self::inspect_active_restore_boundary(config)?;
         let blocker = if inspection.newest_backup.is_none() {
@@ -6956,7 +6927,7 @@ impl ChatRelayService {
                         "relay restore-plan backup count exceeds wire format",
                     )
                 })?,
-            selected_backup_bytes: backup.size_bytes,
+            selected_backup_bytes: backup.size_bytes(),
             active_database_present: active.present,
             active_database_bytes: active.size_bytes,
         };
@@ -7022,7 +6993,7 @@ impl ChatRelayService {
         }
         let aggregate = RestorePlanAggregate {
             verified_backup_count: current_count,
-            selected_backup_bytes: backup.size_bytes,
+            selected_backup_bytes: backup.size_bytes(),
             active_database_present: active.present,
             active_database_bytes: active.size_bytes,
         };
