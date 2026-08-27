@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.64.0-BackupSqliteDomain
+// Version: 0.65.0-NodeSecretDomain
 //
 // Modification Reason:
+//   [CHAT-NODE-SECRET-DOMAIN 2026-08-28 by Codex] Registered versioned relay
+//   node-secret HKDF derivation.
 //   [CHAT-BACKUP-SQLITE-DOMAIN 2026-08-28 by Codex] Registered the live SQLite
 //   backup, durability, certification, and private-file adapter.
 //   [CHAT-CUSTODY-ANCHOR-GUARD-DOMAIN 2026-08-28 by Codex] Registered the
@@ -105,6 +107,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.65.0-NodeSecretDomain - Registered relay node-secret derivation
 //   v0.64.0-BackupSqliteDomain - Registered SQLite backup adapter
 //   v0.63.0-CustodyAnchorGuardDomain - Registered custody anchor guard
 //   v0.62.0-MaintenanceTelemetryDomain - Registered maintenance state machine
@@ -218,6 +221,7 @@ mod chat_relay_error;
 mod chat_relay_expired_delivery;
 mod chat_relay_maintenance_telemetry;
 mod chat_relay_message_dedup;
+mod chat_relay_node_secret;
 mod chat_relay_peer_telemetry;
 mod chat_relay_pending_contract;
 mod chat_relay_pending_custody;

@@ -1,9 +1,11 @@
 // ============================================================================
 // File: crates/aeronyx-server/src/services/chat_relay.rs
 // ============================================================================
-// Version: 3.62.0-BackupSqliteDomain
+// Version: 3.63.0-NodeSecretDomain
 //
 // Modification Reason:
+//   [CHAT-NODE-SECRET-DOMAIN 2026-08-28 by Codex] Re-exported versioned HKDF
+//   node-secret derivation from a focused cryptographic boundary.
 //   [CHAT-BACKUP-SQLITE-DOMAIN 2026-08-28 by Codex] Moved SQLite online copy,
 //   retry mapping, durability activation, and private file mode into an adapter.
 //   [CHAT-CUSTODY-ANCHOR-GUARD-DOMAIN 2026-08-28 by Codex] Moved the signed
@@ -409,6 +411,7 @@
 //     sender/receiver keys, ciphertext, endpoints, or raw durable rows there.
 //
 // Last Modified:
+//   v3.63.0-NodeSecretDomain - Decoupled node-secret HKDF derivation
 //   v3.62.0-BackupSqliteDomain - Composed SQLite backup adapter
 //   v3.61.0-CustodyAnchorGuardDomain - Composed custody anchor RAII contract
 //   v3.60.0-MaintenanceTelemetryDomain - Composed maintenance state machine
@@ -616,6 +619,7 @@ use crate::services::chat_relay_expired_delivery::ExpiredNotificationDelivery;
 use crate::services::chat_relay_message_dedup::{
     BoundedOnlineMessageDedup as MessageDedup, OnlineMessageDeduplication,
 };
+pub use crate::services::chat_relay_node_secret::derive_node_secret;
 pub use crate::services::chat_relay_maintenance_telemetry::ChatRelayMaintenanceStatus;
 use crate::services::chat_relay_maintenance_telemetry::RelayMaintenanceTelemetry;
 use crate::services::chat_relay_peer_telemetry::{
@@ -2930,16 +2934,6 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-/// Derives a stable 32-byte node secret from the node's Ed25519 private key.
-pub fn derive_node_secret(ed25519_sk_bytes: &[u8; 32]) -> [u8; 32] {
-    use hkdf::Hkdf;
-    let hk = Hkdf::<Sha256>::new(Some(b"aeronyx-chat-relay-v1"), ed25519_sk_bytes);
-    let mut okm = [0u8; 32];
-    hk.expand(b"", &mut okm)
-        .expect("HKDF expand with 32-byte output always succeeds");
-    okm
 }
 
 // ============================================
