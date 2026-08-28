@@ -32,7 +32,9 @@
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //!
-//! Last Modified: v1.2.0-BlindVaultReplacementRetirement - Required verified
+//! Last Modified: v1.3.0-BlindVaultTerminalAttemptBoundary - Removed retry
+//! schedule requirements from exhausted terminal attempts.
+//! v1.2.0-BlindVaultReplacementRetirement - Required verified
 //! terminal retirement evidence before a replacement action can complete.
 //! v1.1.0-BlindVaultFailureDisposition - Mapped authenticated
 //! terminal failures into explicit retryable and permanent workflow states.

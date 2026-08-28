@@ -263,15 +263,20 @@ impl BlindVaultReplicaExecution {
                 failed_at_ms,
                 failure,
             }
-        } else if retry_not_before_ms < failed_at_ms {
-            return Err(BlindVaultReplicaWorkflowError::TimestampOutOfRange);
         } else if attempt >= maximum_attempts {
+            // [BLIND-VAULT-TERMINAL-ATTEMPT-BOUNDARY 2026-08-28 by Codex]
+            // Exhaustion has no future retry transition, so an absent or
+            // overflowing retry schedule must not prevent recording the final
+            // failure. This branch intentionally precedes backoff validation.
             BlindVaultReplicaWorkState::Exhausted {
                 attempt,
                 failed_at_ms,
                 failure,
             }
         } else {
+            if retry_not_before_ms < failed_at_ms {
+                return Err(BlindVaultReplicaWorkflowError::TimestampOutOfRange);
+            }
             BlindVaultReplicaWorkState::RetryableFailure {
                 attempt,
                 failed_at_ms,
@@ -289,10 +294,28 @@ impl BlindVaultReplicaExecution {
         retry_delay_ms: u64,
     ) -> Result<usize, BlindVaultReplicaWorkflowError> {
         self.validate_event_time(now_ms)?;
-        let retry_not_before_ms = now_ms
-            .checked_add(retry_delay_ms)
-            .ok_or(BlindVaultReplicaWorkflowError::TimestampOutOfRange)?;
         let maximum_attempts = self.policy.maximum_attempts;
+        // Validate the one shared backoff boundary before mutating any item.
+        // This preserves all-or-nothing expiry if time arithmetic overflows.
+        let has_retryable_expiry = self.items.iter().any(|item| {
+            matches!(
+                item.state,
+                BlindVaultReplicaWorkState::AwaitingEvidence {
+                    attempt,
+                    evidence_deadline_ms,
+                    ..
+                } if now_ms > evidence_deadline_ms && attempt < maximum_attempts
+            )
+        });
+        let retry_not_before_ms = if has_retryable_expiry {
+            now_ms
+                .checked_add(retry_delay_ms)
+                .ok_or(BlindVaultReplicaWorkflowError::TimestampOutOfRange)?
+        } else {
+            // No retryable item will consume this value; keeping it bounded
+            // avoids an impossible-state panic inside the mutation loop.
+            now_ms
+        };
         let mut expired = 0;
         for item in &mut self.items {
             let BlindVaultReplicaWorkState::AwaitingEvidence {
@@ -314,6 +337,9 @@ impl BlindVaultReplicaExecution {
                     failure: BlindVaultReplicaDispatchFailure::EvidenceTimeout,
                 }
             } else {
+                // Only a state that can actually retry needs a representable
+                // future boundary. A batch containing only final attempts does
+                // not evaluate `now_ms + retry_delay_ms` at all.
                 BlindVaultReplicaWorkState::RetryableFailure {
                     attempt,
                     failed_at_ms: now_ms,
