@@ -625,6 +625,21 @@ fn onion_terminal_required_capabilities(purpose: Option<OnionRoutePurpose>) -> V
     capabilities
 }
 
+/// Signed SemVer build-metadata tokens required from the selected terminal.
+///
+/// [ONION-TERMINAL-FEATURE-CONTRACT 2026-08-28 by Codex] Non-Rust Apps, SDKs,
+/// and agents receive the same fail-closed protocol contract used by this
+/// server instead of reconstructing purpose-specific feature requirements.
+fn onion_terminal_required_protocol_features(purpose: Option<OnionRoutePurpose>) -> Vec<String> {
+    purpose.map_or_else(Vec::new, |purpose| {
+        purpose
+            .required_terminal_protocol_features()
+            .iter()
+            .map(|feature| feature.semver_build_token().to_string())
+            .collect()
+    })
+}
+
 /// Signed terminal requirements for one onion workload.
 ///
 /// [ONION-TERMINAL-CONTRACT 2026-08-28 by Codex] Coarse capabilities describe
@@ -722,6 +737,13 @@ pub struct OnionCandidatesResponse {
     /// Middle relays need only `required_capabilities`.
     #[serde(default = "onion_required_capabilities")]
     pub terminal_required_capabilities: Vec<NodeCapability>,
+    /// Signed SemVer build-metadata feature tokens required from the terminal.
+    ///
+    /// Clients must verify the original signed descriptor and require every
+    /// token in this list. An empty list means the requested purpose has no
+    /// additional fine-grained terminal feature beyond its capabilities.
+    #[serde(default)]
+    pub terminal_required_protocol_features: Vec<String>,
     /// Number of returned candidates whose original signed descriptor satisfies
     /// the complete terminal capability contract.
     #[serde(default)]
@@ -2972,6 +2994,9 @@ async fn onion_candidates_handler(
         requested_purpose: onion_route_purpose_name(requested_purpose).to_string(),
         requested_purpose_supported: requested_purpose.is_some(),
         terminal_required_capabilities: onion_terminal_required_capabilities(requested_purpose),
+        terminal_required_protocol_features: onion_terminal_required_protocol_features(
+            requested_purpose,
+        ),
         terminal_candidate_count,
         requested_terminal_capability_ready,
         count: candidates.len(),
