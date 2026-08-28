@@ -117,6 +117,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.71.0-BlindVaultPullFailureClass - Exported recovery retry semantics
 //   v0.70.0-BackupAuditMaintenanceCoordinator - Registered audit maintenance
 //   v0.69.0-BackupAuditAnchorDomain - Registered anchor digest derivation
 //   v0.68.0-ExpiredNotificationContract - Registered expiry contract
@@ -282,9 +283,9 @@ pub mod wallet_routes;
 // the service-owned coarse class instead of matching storage internals twice.
 pub use blind_vault::{
     BlindVaultCleanupReport, BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus,
-    BlindVaultLeaseProvisionOutcome, BlindVaultPullPage, BlindVaultPutFailureClass,
-    BlindVaultService, BlindVaultServiceError, BlindVaultStatus, BlindVaultStoredObject,
-    SharedBlindVaultService,
+    BlindVaultLeaseProvisionOutcome, BlindVaultPullFailureClass, BlindVaultPullPage,
+    BlindVaultPutFailureClass, BlindVaultService, BlindVaultServiceError, BlindVaultStatus,
+    BlindVaultStoredObject, SharedBlindVaultService,
 };
 // [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Expose only aggregate,
 // host-local maintenance contracts and authenticated path-free plans; artifact

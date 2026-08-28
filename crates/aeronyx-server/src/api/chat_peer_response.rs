@@ -37,11 +37,14 @@
 //!   explicitly changes the wire contract.
 //!
 //! ## Last Modified
+//! v2.8.38-OnionReplyValidation - Validate fixed-size opaque reply envelopes.
 //! v2.8.37-ChatPeerResponseDomain - Initial trait-based response policy.
 //! ============================================================================
 
 use std::time::Duration;
 
+use aeronyx_core::protocol::{decode_onion_sealed_response, ONION_REPLY_RESPONSE_SIZE_CLASSES};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::StatusCode;
 
 use super::chat_peer::{PeerBlindRelayRequest, PeerBlindRelayResponse};
@@ -73,6 +76,7 @@ pub(super) enum BlindRelayResponseSource {
 pub(super) enum BlindRelayInvalidResponseKind {
     SuccessAck,
     DeliveryReceipt,
+    OpaqueTerminalResponse,
     FailureReceipt,
 }
 
@@ -152,20 +156,30 @@ fn evaluate_success_status(
     context: &BlindRelayResponseContext<'_>,
 ) -> BlindRelayResponseDecision {
     match response {
-        Ok(response) if response.accepted => match validate_downstream_delivery_receipt(
-            &response,
-            &context.request.envelope.route_id,
-            &context.next_hop,
-            context.observed_at,
-        ) {
-            Ok(()) => BlindRelayResponseDecision::Accepted(response),
-            Err(diagnostic) => BlindRelayResponseDecision::InvalidResponse {
-                kind: BlindRelayInvalidResponseKind::DeliveryReceipt,
-                diagnostic,
-                health_reason: "delivery_receipt_invalid",
-                counts_as_retry_exhaustion: false,
-            },
-        },
+        Ok(response) if response.accepted => {
+            if let Err(diagnostic) = validate_downstream_delivery_receipt(
+                &response,
+                &context.request.envelope.route_id,
+                &context.next_hop,
+                context.observed_at,
+            ) {
+                return BlindRelayResponseDecision::InvalidResponse {
+                    kind: BlindRelayInvalidResponseKind::DeliveryReceipt,
+                    diagnostic,
+                    health_reason: "delivery_receipt_invalid",
+                    counts_as_retry_exhaustion: false,
+                };
+            }
+            if let Err(diagnostic) = validate_opaque_terminal_response(&response) {
+                return BlindRelayResponseDecision::InvalidResponse {
+                    kind: BlindRelayInvalidResponseKind::OpaqueTerminalResponse,
+                    diagnostic,
+                    health_reason: "opaque_terminal_response_invalid",
+                    counts_as_retry_exhaustion: false,
+                };
+            }
+            BlindRelayResponseDecision::Accepted(response)
+        }
         Ok(_) => BlindRelayResponseDecision::InvalidResponse {
             kind: BlindRelayInvalidResponseKind::SuccessAck,
             diagnostic: "ack_not_accepted",
@@ -179,6 +193,33 @@ fn evaluate_success_status(
             counts_as_retry_exhaustion: true,
         },
     }
+}
+
+/// Validates only the public, payload-blind envelope of an inline response.
+///
+/// The source remains responsible for decryption and terminal-signature
+/// verification. Immediate hops enforce the fixed v1 size class so a peer
+/// cannot smuggle a variable or oversized response through the ACK channel.
+fn validate_opaque_terminal_response(ack: &PeerBlindRelayResponse) -> Result<(), &'static str> {
+    let Some(encoded) = ack.opaque_terminal_response_b64.as_deref() else {
+        return Ok(());
+    };
+    if ack.delivery_receipt.is_none() {
+        return Err("opaque_response_receipt_missing");
+    }
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| "opaque_response_base64_invalid")?;
+    let response =
+        decode_onion_sealed_response(&bytes).map_err(|_| "opaque_response_envelope_invalid")?;
+    if response
+        .validate()
+        .map_err(|_| "opaque_response_envelope_invalid")?
+        != ONION_REPLY_RESPONSE_SIZE_CLASSES[0]
+    {
+        return Err("opaque_response_size_class_invalid");
+    }
+    Ok(())
 }
 
 fn evaluate_rejected_status(
@@ -311,6 +352,9 @@ pub(super) fn validate_downstream_failure_receipt(
     observed_at: u64,
     receipt_required: bool,
 ) -> Result<bool, &'static str> {
+    if ack.opaque_terminal_response_b64.is_some() {
+        return Err("unexpected_opaque_terminal_response");
+    }
     let Some(receipt) = ack.failure_receipt.as_ref() else {
         return if receipt_required {
             Err("failure_receipt_required")

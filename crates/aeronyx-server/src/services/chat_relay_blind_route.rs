@@ -61,7 +61,12 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub(crate) const RESPONSE_NONCE_BYTES: usize = 24;
 const RESPONSE_TAG_BYTES: usize = 16;
-const MAX_RESPONSE_BYTES: usize = 2048;
+// [ONION-REPLY-DURABLE-ACK 2026-08-28 by Codex] Keep the private sealed replay
+// ceiling aligned with the public peer ACK ceiling. This remains a hard bound:
+// an 8 KiB fixed reply plus base64, receipts, and response metadata fits, while
+// larger reply classes must use the future binary response path. Persisting the
+// complete ACK in one owner-fenced transaction avoids split response state.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const RESPONSE_HKDF_SALT: &[u8] = b"AeroNyx-BlindRelay-RouteResponse-v1-key";
 const RESPONSE_HKDF_INFO: &[u8] = b"XChaCha20-Poly1305";
 const RESPONSE_AAD_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-RouteResponse-v1";

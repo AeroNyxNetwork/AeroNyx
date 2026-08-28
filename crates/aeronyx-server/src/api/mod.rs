@@ -45,6 +45,7 @@
 //! - `chat_peer_retry`: private payload-blind forwarding retry policy domain
 //! - `chat_peer_response`: private receipt and response decision domain
 //! - `chat_peer_transport`: private bounded blind-relay HTTP transport domain
+//! - `chat_peer_terminal_reply`: private fixed-size terminal response domain
 //! - [`blind_vault`]: node-blind encrypted object lease/store/recovery routes
 //! - [`memchain_peer`]: v2.7.0 signed node-to-node commitment block ranges
 //!
@@ -489,6 +490,7 @@ mod chat_peer_observer;
 mod chat_peer_replay;
 mod chat_peer_response;
 mod chat_peer_retry;
+mod chat_peer_terminal_reply;
 mod chat_peer_transport;
 pub mod directory_chain_peer;
 pub mod directory_replica_status;

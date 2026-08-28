@@ -254,6 +254,7 @@ mod tests {
             reason: Some(reason.to_string()),
             delivery_receipt: None,
             failure_receipt: None,
+            opaque_terminal_response_b64: None,
         }
     }
 

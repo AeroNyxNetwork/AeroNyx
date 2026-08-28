@@ -60,7 +60,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.9.0-BlindVaultPutFailureClass - Separated permanent
+//! Last Modified: v1.10.0-BlindVaultPullFailureClass - Added exhaustive,
+//! privacy-safe anonymous recovery retry classification.
+//! v1.9.0-BlindVaultPutFailureClass - Separated permanent
 //! request rejection, replica capacity, and retryable service availability
 //! without exposing lease or object state.
 //! v1.8.0-BlindVaultAuthPipeline - Moved client signature
@@ -341,6 +343,15 @@ pub enum BlindVaultPutFailureClass {
     Unavailable,
 }
 
+/// Privacy-safe retry class for an anonymous ciphertext Pull failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultPullFailureClass {
+    /// The same capability-bound request cannot succeed unchanged.
+    Rejected,
+    /// Replica storage, cursor sealing, or local runtime is unavailable.
+    Unavailable,
+}
+
 impl BlindVaultServiceError {
     /// Returns the coarse retry class for a Put failure.
     #[must_use]
@@ -377,6 +388,45 @@ impl BlindVaultServiceError {
             | Self::IssuerDirectoryNoActiveEpoch
             | Self::IssuerDirectoryGenerationOutOfRange
             | Self::CorruptState => BlindVaultPutFailureClass::Unavailable,
+        }
+    }
+
+    /// Returns the coarse retry class for a Pull failure.
+    #[must_use]
+    pub const fn pull_failure_class(&self) -> BlindVaultPullFailureClass {
+        // [BLIND-VAULT-PULL-RETRY-CLASS 2026-08-28 by Codex] Keep this match
+        // exhaustive. New storage errors must receive an explicit privacy and
+        // retry decision instead of silently becoming a remote state oracle.
+        match self {
+            Self::Protocol(_)
+            | Self::LeaseNotFound
+            | Self::LeaseExpired
+            | Self::LeaseConflict
+            | Self::ObjectConflict
+            | Self::RequestConflict
+            | Self::ObjectDeleted
+            | Self::QuotaExceeded
+            | Self::ReadUnauthorized
+            | Self::InvalidPullCursor
+            | Self::AdmissionIssuerRejected
+            | Self::AdmissionProofRejected
+            | Self::AdmissionSpent
+            | Self::ObjectNotFound => BlindVaultPullFailureClass::Rejected,
+            Self::Disabled
+            | Self::Sqlite(_)
+            | Self::Filesystem
+            | Self::PullCursorEncryptionFailed
+            | Self::AdmissionUnavailable
+            | Self::AdmissionConfigurationInvalid
+            | Self::IssuerDirectoryAuthorityRejected
+            | Self::IssuerDirectoryUpdateRejected
+            | Self::IssuerDirectoryRollback
+            | Self::IssuerDirectoryGenerationConflict
+            | Self::IssuerDirectoryContinuity
+            | Self::IssuerDirectoryNoActiveEpoch
+            | Self::IssuerDirectoryGenerationOutOfRange
+            | Self::CorruptState
+            | Self::TimestampOutOfRange => BlindVaultPullFailureClass::Unavailable,
         }
     }
 }

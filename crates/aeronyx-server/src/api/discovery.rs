@@ -143,6 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.50.0-OnionReplyTerminalContract - Require signed reply-protocol support
+//! when selecting anonymous Blind Vault recovery terminals
 //! v0.49.0-RecoveryAnchorStatus - Added exact-generation recovery observability
 //! and closed the post-persistence stale-witness readiness window
 //! v0.48.0-PurposeBoundReceiptNegotiation - Advertise v2 receipt semantics
@@ -226,8 +228,8 @@ use aeronyx_core::protocol::discovery::{
     MAX_ROUTE_DOMAIN_ATTESTATION_CERTIFICATE_FRAME_BYTES,
 };
 use aeronyx_core::protocol::{
-    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, OnionRoutePurpose,
-    SignedNodeDescriptor, ONION_ROUTE_PURPOSE_VALUES,
+    NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, NodeProtocolFeature,
+    OnionRoutePurpose, SignedNodeDescriptor, ONION_ROUTE_PURPOSE_VALUES,
 };
 use axum::{
     body::Bytes,
@@ -605,6 +607,43 @@ fn onion_terminal_required_capabilities(purpose: Option<OnionRoutePurpose>) -> V
     capabilities
 }
 
+/// Signed terminal requirements for one onion workload.
+///
+/// [ONION-TERMINAL-CONTRACT 2026-08-28 by Codex] Coarse capabilities describe
+/// the node role while signed protocol features describe the exact response
+/// contract. Keeping both in one value prevents candidate filtering, bounded
+/// pool preservation, and route-readiness checks from drifting apart.
+#[derive(Clone, Copy, Default)]
+struct OnionTerminalRequirement {
+    capability: Option<NodeCapability>,
+    protocol_feature: Option<NodeProtocolFeature>,
+}
+
+impl OnionTerminalRequirement {
+    fn for_purpose(purpose: Option<OnionRoutePurpose>) -> Self {
+        Self {
+            capability: purpose.and_then(OnionRoutePurpose::specialized_terminal_capability),
+            protocol_feature: match purpose {
+                Some(OnionRoutePurpose::BlindVaultPull) => Some(NodeProtocolFeature::OnionReplyV1),
+                _ => None,
+            },
+        }
+    }
+
+    const fn is_specialized(self) -> bool {
+        self.capability.is_some() || self.protocol_feature.is_some()
+    }
+
+    fn matches(self, candidate: &OnionRelayCandidate) -> bool {
+        let descriptor = &candidate.signed_descriptor.descriptor;
+        self.capability
+            .map_or(true, |required| descriptor.capabilities.contains(&required))
+            && self.protocol_feature.map_or(true, |required| {
+                descriptor.advertises_protocol_feature(required)
+            })
+    }
+}
+
 fn onion_terminal_candidate_matches(
     purpose: Option<OnionRoutePurpose>,
     candidate: &OnionRelayCandidate,
@@ -617,15 +656,7 @@ fn onion_terminal_candidate_matches(
                 .capabilities
                 .contains(required)
         })
-        && purpose
-            .and_then(OnionRoutePurpose::specialized_terminal_capability)
-            .map_or(true, |required| {
-                candidate
-                    .signed_descriptor
-                    .descriptor
-                    .capabilities
-                    .contains(&required)
-            })
+        && OnionTerminalRequirement::for_purpose(purpose).matches(candidate)
 }
 
 fn default_onion_route_purpose() -> String {
@@ -2584,8 +2615,7 @@ async fn onion_candidates_handler(
     let now = now_secs();
     let limit = state.policy.snapshot_limit(query.limit);
     let requested_purpose = onion_route_purpose_from_query(query.purpose.as_deref());
-    let specialized_terminal_capability =
-        requested_purpose.and_then(OnionRoutePurpose::specialized_terminal_capability);
+    let terminal_requirement = OnionTerminalRequirement::for_purpose(requested_purpose);
     let requested_privacy_mode = OnionPrivacyMode::from_query(query.privacy_mode.as_deref());
     let requested_hops = normalize_requested_hops(requested_privacy_mode, query.hops);
     let pinned_route_domain_required =
@@ -2679,7 +2709,7 @@ async fn onion_candidates_handler(
         requested_hops as usize,
         &state.policy,
         pinned_route_domain_required,
-        specialized_terminal_capability,
+        terminal_requirement,
     );
     let two_hop_ready = candidates.len() >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES;
     let min_candidates_for_requested_hops = requested_hops as usize;
@@ -2694,7 +2724,7 @@ async fn onion_candidates_handler(
     // with an additional signed terminal capability uses the new terminal
     // readiness gate.
     let terminal_capability_gate_ready =
-        specialized_terminal_capability.is_none() || requested_terminal_capability_ready;
+        !terminal_requirement.is_specialized() || requested_terminal_capability_ready;
     let purpose_admission = OnionPurposeAdmission {
         supported: requested_purpose.is_some(),
         terminal_capability_ready: terminal_capability_gate_ready,
@@ -2710,7 +2740,7 @@ async fn onion_candidates_handler(
             min_candidates_for_requested_hops,
             &DiscoveryApiPolicy::default(),
             false,
-            specialized_terminal_capability,
+            terminal_requirement,
         );
     let local_entry_pinned_route_domain_enforced =
         state.local_node_id.is_some() && local_pinned_route_domain.is_some();
@@ -2721,7 +2751,7 @@ async fn onion_candidates_handler(
                 min_candidates_for_requested_hops,
                 &state.policy,
                 true,
-                specialized_terminal_capability,
+                terminal_requirement,
             ));
     let peer_status = state.peer_store.status(now);
     let requested_path_gates = onion_requested_path_gates(
@@ -2745,7 +2775,7 @@ async fn onion_candidates_handler(
             ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
             &DiscoveryApiPolicy::default(),
             false,
-            specialized_terminal_capability,
+            terminal_requirement,
         );
     let two_hop_fallback_ready = requested_hops > 2
         && onion_requested_path_gates(
@@ -2765,7 +2795,7 @@ async fn onion_candidates_handler(
                                 ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
                                 &state.policy,
                                 true,
-                                specialized_terminal_capability,
+                                terminal_requirement,
                             )),
                 },
             },
@@ -2971,28 +3001,22 @@ fn onion_candidate_route_diverse_subset_indices(
         required_hops,
         policy,
         require_pinned_route_domains,
-        None,
+        OnionTerminalRequirement::default(),
     )
 }
 
 fn onion_candidate_supports_specialized_terminal(
     candidate: &OnionRelayCandidate,
-    specialized_terminal_capability: Option<NodeCapability>,
+    terminal_requirement: OnionTerminalRequirement,
 ) -> bool {
-    specialized_terminal_capability.map_or(true, |required| {
-        candidate
-            .signed_descriptor
-            .descriptor
-            .capabilities
-            .contains(&required)
-    })
+    terminal_requirement.matches(candidate)
 }
 
 #[derive(Clone, Copy)]
 struct OnionTerminalSubsetPolicy<'a> {
     route_policy: &'a DiscoveryApiPolicy,
     require_pinned_route_domains: bool,
-    specialized_terminal_capability: Option<NodeCapability>,
+    terminal_requirement: OnionTerminalRequirement,
 }
 
 /// Finds a diverse candidate subset that includes the required terminal role.
@@ -3006,7 +3030,7 @@ fn onion_candidate_route_diverse_subset_indices_for_terminal(
     required_hops: usize,
     policy: &DiscoveryApiPolicy,
     require_pinned_route_domains: bool,
-    specialized_terminal_capability: Option<NodeCapability>,
+    terminal_requirement: OnionTerminalRequirement,
 ) -> Option<Vec<usize>> {
     fn search(
         candidates: &[OnionRelayCandidate],
@@ -3026,7 +3050,7 @@ fn onion_candidate_route_diverse_subset_indices_for_terminal(
             && !candidates[start..].iter().any(|candidate| {
                 onion_candidate_supports_specialized_terminal(
                     candidate,
-                    subset_policy.specialized_terminal_capability,
+                    subset_policy.terminal_requirement,
                 )
             })
         {
@@ -3055,7 +3079,7 @@ fn onion_candidate_route_diverse_subset_indices_for_terminal(
             }
             let candidate_satisfies_terminal = onion_candidate_supports_specialized_terminal(
                 candidate,
-                subset_policy.specialized_terminal_capability,
+                subset_policy.terminal_requirement,
             );
             selected.push(index);
             if search(
@@ -3076,10 +3100,10 @@ fn onion_candidate_route_diverse_subset_indices_for_terminal(
     let subset_policy = OnionTerminalSubsetPolicy {
         route_policy: policy,
         require_pinned_route_domains,
-        specialized_terminal_capability,
+        terminal_requirement,
     };
     if required_hops == 0 {
-        return specialized_terminal_capability.is_none().then(Vec::new);
+        return (!terminal_requirement.is_specialized()).then(Vec::new);
     }
     if candidates.len() < required_hops {
         return None;
@@ -3091,7 +3115,7 @@ fn onion_candidate_route_diverse_subset_indices_for_terminal(
         required_hops,
         &mut selected,
         subset_policy,
-        specialized_terminal_capability.is_none(),
+        !terminal_requirement.is_specialized(),
     ) {
         Some(selected)
     } else {
@@ -3125,14 +3149,14 @@ fn onion_candidate_route_diversity_ready_for_terminal(
     required_hops: usize,
     policy: &DiscoveryApiPolicy,
     require_pinned_route_domains: bool,
-    specialized_terminal_capability: Option<NodeCapability>,
+    terminal_requirement: OnionTerminalRequirement,
 ) -> bool {
     onion_candidate_route_diverse_subset_indices_for_terminal(
         candidates,
         required_hops,
         policy,
         require_pinned_route_domains,
-        specialized_terminal_capability,
+        terminal_requirement,
     )
     .is_some()
 }
@@ -3175,7 +3199,7 @@ fn select_onion_candidate_response_pool_with_policy(
         requested_hops,
         policy,
         require_pinned_route_domains,
-        None,
+        OnionTerminalRequirement::default(),
     )
 }
 
@@ -3185,7 +3209,7 @@ fn select_onion_candidate_response_pool_with_policy_and_terminal(
     requested_hops: usize,
     policy: &DiscoveryApiPolicy,
     require_pinned_route_domains: bool,
-    specialized_terminal_capability: Option<NodeCapability>,
+    terminal_requirement: OnionTerminalRequirement,
 ) -> Vec<OnionRelayCandidate> {
     if limit == 0 {
         return Vec::new();
@@ -3194,7 +3218,7 @@ fn select_onion_candidate_response_pool_with_policy_and_terminal(
         return candidates;
     }
 
-    let requested_subset = ((requested_hops >= 2 || specialized_terminal_capability.is_some())
+    let requested_subset = ((requested_hops >= 2 || terminal_requirement.is_specialized())
         && limit >= requested_hops)
         .then(|| {
             onion_candidate_route_diverse_subset_indices_for_terminal(
@@ -3202,7 +3226,7 @@ fn select_onion_candidate_response_pool_with_policy_and_terminal(
                 requested_hops,
                 policy,
                 require_pinned_route_domains,
-                specialized_terminal_capability,
+                terminal_requirement,
             )
         })
         .flatten();
@@ -3214,7 +3238,7 @@ fn select_onion_candidate_response_pool_with_policy_and_terminal(
                 ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
                 policy,
                 require_pinned_route_domains,
-                specialized_terminal_capability,
+                terminal_requirement,
             )
         })
         .flatten();
@@ -3222,20 +3246,21 @@ fn select_onion_candidate_response_pool_with_policy_and_terminal(
     // specialized terminal even when the requested multi-hop subset is not
     // yet mature. This keeps purpose readiness observable under a small client
     // limit; route gates still defer delivery until the requested path is safe.
-    let terminal_fallback = specialized_terminal_capability.and_then(|_| {
-        candidates
-            .iter()
-            .position(|candidate| {
-                onion_candidate_supports_specialized_terminal(
-                    candidate,
-                    specialized_terminal_capability,
-                ) && (!require_pinned_route_domains
-                    || policy
-                        .pinned_route_domain(&candidate.signed_descriptor.node_id())
-                        .is_some())
-            })
-            .map(|index| vec![index])
-    });
+    let terminal_fallback = terminal_requirement
+        .is_specialized()
+        .then(|| {
+            candidates
+                .iter()
+                .position(|candidate| {
+                    onion_candidate_supports_specialized_terminal(candidate, terminal_requirement)
+                        && (!require_pinned_route_domains
+                            || policy
+                                .pinned_route_domain(&candidate.signed_descriptor.node_id())
+                                .is_some())
+                })
+                .map(|index| vec![index])
+        })
+        .flatten();
     let preferred_indices = requested_subset
         .or(fallback_subset)
         .or(terminal_fallback)
@@ -4654,7 +4679,10 @@ mod tests {
             2,
             &DiscoveryApiPolicy::default(),
             false,
-            Some(NodeCapability::BlindVaultReplica),
+            OnionTerminalRequirement {
+                capability: Some(NodeCapability::BlindVaultReplica),
+                protocol_feature: None,
+            },
         );
 
         // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] A healthier generic pair
@@ -5785,7 +5813,7 @@ mod tests {
         );
         assert_eq!(
             parsed["protocol_features"]["onion_route_purposes"],
-            serde_json::json!(["message_relay", "blind_vault_put"])
+            serde_json::json!(["message_relay", "blind_vault_put", "blind_vault_pull"])
         );
         assert_eq!(
             parsed["recovery_anchor"]["contract_version"].as_str(),

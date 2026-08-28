@@ -13411,6 +13411,7 @@ impl Server {
             NodeProtocolFeature::DirectPeerRelayAuthV2,
             NodeProtocolFeature::DirectPeerRelayReceiptV2,
             NodeProtocolFeature::DirectPeerRelayTargetBindingV3,
+            NodeProtocolFeature::OnionReplyV1,
         ]);
 
         descriptor.public_endpoint = config
@@ -18723,6 +18724,7 @@ mod tests {
                             reason: Some("onion_forwarded".to_string()),
                             delivery_receipt: Some(receipt),
                             failure_receipt: None,
+                            opaque_terminal_response_b64: None,
                         })
                     }
                 }),
@@ -19410,6 +19412,7 @@ mod tests {
                             &terminal_receipt_identity,
                         )),
                         failure_receipt: None,
+                        opaque_terminal_response_b64: None,
                     })
                 }
             }),
@@ -19588,6 +19591,7 @@ mod tests {
                     reason: Some("onion_forwarded".to_string()),
                     delivery_receipt: None,
                     failure_receipt: None,
+                    opaque_terminal_response_b64: None,
                 })
             }),
         );
@@ -19734,6 +19738,7 @@ mod tests {
                             &terminal_receipt_identity,
                         )),
                         failure_receipt: None,
+                        opaque_terminal_response_b64: None,
                     })
                 }
             }),
@@ -20679,6 +20684,7 @@ mod tests {
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
                         failure_receipt: None,
+                        opaque_terminal_response_b64: None,
                     })
                 }
             }),
@@ -20804,6 +20810,7 @@ mod tests {
                             reason: (!legacy_fallback).then(|| "legacy_only".to_string()),
                             delivery_receipt: None,
                             failure_receipt: None,
+                            opaque_terminal_response_b64: None,
                         })
                     }
                 }),
@@ -20861,6 +20868,7 @@ mod tests {
                             reason: None,
                             delivery_receipt: Some(receipt),
                             failure_receipt: None,
+                            opaque_terminal_response_b64: None,
                         })
                     }
                 }),

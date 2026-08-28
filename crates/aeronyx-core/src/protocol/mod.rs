@@ -98,7 +98,8 @@ pub use auth::{
 pub use blind_vault::{
     decode_blind_vault_frame, encode_blind_vault_frame, is_blind_vault_frame,
     BlindVaultDeleteRequest, BlindVaultDeletedReceipt, BlindVaultError, BlindVaultFrame,
-    BlindVaultLeaseCreateRequest, BlindVaultPutRequest, BlindVaultStoredReceipt,
+    BlindVaultLeaseCreateRequest, BlindVaultPullRequest, BlindVaultPullResponse,
+    BlindVaultPutRequest, BlindVaultRecoveredObject, BlindVaultStoredReceipt,
     BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_PROTOCOL_VERSION, MAX_BLIND_VAULT_FRAME_BYTES,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};

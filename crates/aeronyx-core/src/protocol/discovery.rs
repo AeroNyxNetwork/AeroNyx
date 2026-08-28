@@ -165,6 +165,8 @@
 //!   targets because the selected target identity is part of the signature.
 //!
 //! ## Last Modified
+//! v0.28.0-OnionReplyNegotiation - Added signed rolling-upgrade negotiation
+//! for fixed-size encrypted onion terminal responses
 //! v0.27.0-DirectRelayTargetBindingV3 - Added signed negotiation for direct
 //! relay requests bound to one selected target node identity
 //! v0.26.0-DirectRelayReceiptV2 - Added signed negotiation for target-authored
@@ -421,16 +423,24 @@ pub enum NodeProtocolFeature {
     /// nodes. It remains separately negotiated so v1/v2 peers keep working
     /// during a rolling fleet upgrade.
     DirectPeerRelayTargetBindingV3,
+    /// The node supports fixed-size encrypted terminal responses propagated
+    /// through blind relay acknowledgements.
+    ///
+    /// [ONION-REPLY-NEGOTIATION 2026-08-28 by Codex] This token gates the
+    /// additive response surface during rolling upgrades; it does not reveal
+    /// whether any route carries a request/response workload.
+    OnionReplyV1,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::BlindRelayFailureReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
         Self::DirectPeerRelayAuthV2,
         Self::DirectPeerRelayReceiptV2,
         Self::DirectPeerRelayTargetBindingV3,
+        Self::OnionReplyV1,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -442,6 +452,7 @@ impl NodeProtocolFeature {
             Self::DirectPeerRelayAuthV2 => "anpf1-dpra2",
             Self::DirectPeerRelayReceiptV2 => "anpf1-dprr2",
             Self::DirectPeerRelayTargetBindingV3 => "anpf1-dprtb3",
+            Self::OnionReplyV1 => "anpf1-or1",
         }
     }
 }
@@ -4005,25 +4016,28 @@ mod tests {
         let direct_relay_auth = NodeProtocolFeature::DirectPeerRelayAuthV2;
         let direct_relay_receipt = NodeProtocolFeature::DirectPeerRelayReceiptV2;
         let direct_relay_target_binding = NodeProtocolFeature::DirectPeerRelayTargetBindingV3;
+        let onion_reply = NodeProtocolFeature::OnionReplyV1;
         let descriptor = descriptor_for(&identity).with_protocol_features([
             purpose_receipt,
             failure_receipt,
             direct_relay_auth,
             direct_relay_receipt,
             direct_relay_target_binding,
+            onion_reply,
             purpose_receipt,
         ]);
 
         assert_eq!(descriptor.schema_version, NODE_DESCRIPTOR_SCHEMA_VERSION);
         assert_eq!(
             descriptor.software_version,
-            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-dprtb3.anpf1-pbdr2"
+            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-dprtb3.anpf1-or1.anpf1-pbdr2"
         );
         assert!(descriptor.advertises_protocol_feature(failure_receipt));
         assert!(descriptor.advertises_protocol_feature(purpose_receipt));
         assert!(descriptor.advertises_protocol_feature(direct_relay_auth));
         assert!(descriptor.advertises_protocol_feature(direct_relay_receipt));
         assert!(descriptor.advertises_protocol_feature(direct_relay_target_binding));
+        assert!(descriptor.advertises_protocol_feature(onion_reply));
 
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
         let encoded = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {
@@ -4050,6 +4064,9 @@ mod tests {
         assert!(descriptor
             .descriptor
             .advertises_protocol_feature(direct_relay_target_binding));
+        assert!(descriptor
+            .descriptor
+            .advertises_protocol_feature(onion_reply));
 
         let mut stripped = signed;
         stripped.descriptor.software_version = "test".to_string();
