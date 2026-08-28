@@ -94,7 +94,8 @@ impl BlindVaultReplicaExecution {
         if self.items.iter().any(|item| {
             matches!(
                 item.state,
-                BlindVaultReplicaWorkState::Exhausted { .. }
+                BlindVaultReplicaWorkState::PermanentFailure { .. }
+                    | BlindVaultReplicaWorkState::Exhausted { .. }
                     | BlindVaultReplicaWorkState::Cancelled { .. }
             )
         }) {
@@ -227,8 +228,11 @@ impl BlindVaultReplicaExecution {
         Ok(())
     }
 
-    /// Records one bounded failure. Once the attempt budget is exhausted the
-    /// generation becomes blocked instead of silently retrying forever.
+    /// Records one typed failure without retrying permanent outcomes.
+    ///
+    /// `retry_not_before_ms` is required only for retryable failures. It is
+    /// ignored for permanent failures so callers never need to invent a retry
+    /// schedule for a request that must stop immediately.
     pub fn record_failure(
         &mut self,
         id: BlindVaultReplicaWorkId,
@@ -247,10 +251,21 @@ impl BlindVaultReplicaExecution {
             } => (attempt, dispatched_at_ms),
             _ => return Err(BlindVaultReplicaWorkflowError::InvalidTransition),
         };
-        if failed_at_ms < dispatched_at_ms || retry_not_before_ms < failed_at_ms {
+        if failed_at_ms < dispatched_at_ms {
             return Err(BlindVaultReplicaWorkflowError::TimestampOutOfRange);
         }
-        item.state = if attempt >= maximum_attempts {
+        item.state = if !failure.is_retryable() {
+            // [BLIND-VAULT-PERMANENT-FAILURE 2026-08-28 by Codex] Rejection,
+            // stale plans, local policy denials, and unsupported response
+            // classes are terminal for this immutable generation.
+            BlindVaultReplicaWorkState::PermanentFailure {
+                attempt,
+                failed_at_ms,
+                failure,
+            }
+        } else if retry_not_before_ms < failed_at_ms {
+            return Err(BlindVaultReplicaWorkflowError::TimestampOutOfRange);
+        } else if attempt >= maximum_attempts {
             BlindVaultReplicaWorkState::Exhausted {
                 attempt,
                 failed_at_ms,
@@ -321,6 +336,7 @@ impl BlindVaultReplicaExecution {
         if matches!(
             item.state,
             BlindVaultReplicaWorkState::EvidenceAccepted { .. }
+                | BlindVaultReplicaWorkState::PermanentFailure { .. }
                 | BlindVaultReplicaWorkState::Exhausted { .. }
                 | BlindVaultReplicaWorkState::Cancelled { .. }
         ) {

@@ -32,7 +32,9 @@
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //!
-//! Last Modified: v1.0.0-BlindVaultReplicaWorkflow - Initial client-authorized,
+//! Last Modified: v1.1.0-BlindVaultFailureDisposition - Mapped authenticated
+//! terminal failures into explicit retryable and permanent workflow states.
+//! v1.0.0-BlindVaultReplicaWorkflow - Initial client-authorized,
 //! evidence-gated replica execution state machine.
 //! ============================================
 
@@ -43,7 +45,7 @@ use thiserror::Error;
 
 use super::blind_vault::{
     BlindVaultError, BlindVaultReplicaAction, BlindVaultReplicaPlanHealth,
-    MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
+    BlindVaultTerminalFailureCode, MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
 };
 
 /// At most two per-member actions plus one aggregate provisioning action can
@@ -109,6 +111,8 @@ impl BlindVaultReplicaWorkId {
 pub enum BlindVaultReplicaDispatchFailure {
     /// No usable route or terminal connection was available.
     TransportUnavailable,
+    /// An authenticated terminal reported temporary local unavailability.
+    TerminalUnavailable,
     /// The selected terminal rejected the authenticated operation.
     TerminalRejected,
     /// The terminal did not return acceptable evidence before the deadline.
@@ -119,6 +123,38 @@ pub enum BlindVaultReplicaDispatchFailure {
     CapacityUnavailable,
     /// Local privacy, routing, or replica policy rejected dispatch.
     PolicyRejected,
+    /// The inline response class cannot carry the requested recovery result.
+    InlineResponseUnsupported,
+}
+
+impl BlindVaultReplicaDispatchFailure {
+    /// Whether the exact immutable action may be dispatched again.
+    ///
+    /// [BLIND-VAULT-FAILURE-DISPOSITION 2026-08-28 by Codex] Permanent
+    /// protocol, policy, and stale-plan failures never consume repeated
+    /// network attempts. Temporary transport, terminal, timeout, and capacity
+    /// failures remain bounded by the workflow attempt budget.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::TransportUnavailable
+                | Self::TerminalUnavailable
+                | Self::EvidenceTimeout
+                | Self::CapacityUnavailable
+        )
+    }
+}
+
+impl From<BlindVaultTerminalFailureCode> for BlindVaultReplicaDispatchFailure {
+    fn from(value: BlindVaultTerminalFailureCode) -> Self {
+        match value {
+            BlindVaultTerminalFailureCode::Rejected => Self::TerminalRejected,
+            BlindVaultTerminalFailureCode::Capacity => Self::CapacityUnavailable,
+            BlindVaultTerminalFailureCode::Unavailable => Self::TerminalUnavailable,
+            BlindVaultTerminalFailureCode::ResponseTooLarge => Self::InlineResponseUnsupported,
+        }
+    }
 }
 
 /// Monotonic state of one immutable planner action.
@@ -141,6 +177,12 @@ pub enum BlindVaultReplicaWorkState {
         attempt: u8,
         failed_at_ms: u64,
         retry_not_before_ms: u64,
+        failure: BlindVaultReplicaDispatchFailure,
+    },
+    /// A verified permanent failure blocked this immutable plan generation.
+    PermanentFailure {
+        attempt: u8,
+        failed_at_ms: u64,
         failure: BlindVaultReplicaDispatchFailure,
     },
     /// The attempt budget is exhausted and the generation is blocked.
