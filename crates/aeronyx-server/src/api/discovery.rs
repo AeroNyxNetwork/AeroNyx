@@ -143,6 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.58.0-BlindVaultRuntimeAdvertisement - Added aggregate runtime readiness
+//! and signed capability consistency for anonymous storage replicas
 //! v0.57.0-OnionLeaseInventoryTerminalContract - Added feature-gated private
 //! encrypted-object inventory commitments
 //! v0.56.0-OnionLeaseStatusTerminalContract - Added feature-gated private
@@ -1054,6 +1056,19 @@ struct DiscoveryPolicyStatus {
     private_descriptors_hidden_by_default: bool,
 }
 
+/// [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Typed aggregate
+/// observation used to avoid order-dependent boolean parameters at the
+/// discovery/Blind Vault boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscoveryBlindVaultCapabilityObservation {
+    /// Whether the operator enabled signed replica advertisement.
+    pub configured: bool,
+    /// Whether current policy, issuer, and capacity admission is ready.
+    pub runtime_ready: bool,
+    /// Whether the signed self descriptor carries the replica capability.
+    pub advertised: bool,
+}
+
 /// Privacy-safe local protocol capability readiness.
 ///
 /// This object is intentionally small and aggregate-only. It tells operators
@@ -1078,6 +1093,22 @@ pub struct DiscoveryLocalCapabilityStatus {
     pub advertised_chat_relay_capability: bool,
     /// Whether it is safe for this node to advertise `ChatRelay`.
     pub safe_to_advertise_chat_relay: bool,
+    /// [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Whether the
+    /// operator configured this node to advertise anonymous storage.
+    pub blind_vault_replica_configured: bool,
+    /// Whether current policy, issuer state, and logical/physical capacity can
+    /// admit a new anonymous lease.
+    pub blind_vault_runtime_ready: bool,
+    /// Whether the signed self descriptor currently carries the replica
+    /// capability.
+    pub advertised_blind_vault_replica_capability: bool,
+    /// Whether the complete relay, endpoint, configuration, and storage
+    /// runtime surface can safely advertise the replica capability.
+    pub safe_to_advertise_blind_vault_replica: bool,
+    /// Whether actual Blind Vault advertisement equals runtime expectation.
+    pub blind_vault_capability_consistent: bool,
+    /// Stable aggregate blockers for anonymous storage advertisement.
+    pub blind_vault_advertisement_blockers: Vec<&'static str>,
     /// Whether config, endpoint readiness, and advertised capability agree.
     pub capability_config_consistent: bool,
     /// Stable privacy-safe reason buckets that block ChatRelay advertisement.
@@ -1097,6 +1128,29 @@ impl DiscoveryLocalCapabilityStatus {
         chat_relay_runtime_ready: bool,
         advertised_chat_relay_capability: bool,
     ) -> Self {
+        Self::new_with_blind_vault(
+            chat_relay_configured,
+            blind_relay_endpoint_ready,
+            chat_relay_runtime_ready,
+            advertised_chat_relay_capability,
+            DiscoveryBlindVaultCapabilityObservation::default(),
+        )
+    }
+
+    /// Builds local capability status with observed anonymous-storage state.
+    #[must_use]
+    pub fn new_with_blind_vault(
+        chat_relay_configured: bool,
+        blind_relay_endpoint_ready: bool,
+        chat_relay_runtime_ready: bool,
+        advertised_chat_relay_capability: bool,
+        blind_vault: DiscoveryBlindVaultCapabilityObservation,
+    ) -> Self {
+        let DiscoveryBlindVaultCapabilityObservation {
+            configured: blind_vault_replica_configured,
+            runtime_ready: blind_vault_runtime_ready,
+            advertised: advertised_blind_vault_replica_capability,
+        } = blind_vault;
         let safe_to_advertise_chat_relay =
             chat_relay_configured && blind_relay_endpoint_ready && chat_relay_runtime_ready;
         let expected_advertisement = safe_to_advertise_chat_relay;
@@ -1111,6 +1165,25 @@ impl DiscoveryLocalCapabilityStatus {
         }
         if chat_relay_configured && !chat_relay_runtime_ready {
             advertisement_blockers.push("chat_relay_runtime_not_ready");
+        }
+        let safe_to_advertise_blind_vault_replica = blind_vault_replica_configured
+            && safe_to_advertise_chat_relay
+            && blind_vault_runtime_ready;
+        let blind_vault_capability_consistent =
+            advertised_blind_vault_replica_capability == safe_to_advertise_blind_vault_replica;
+        let mut blind_vault_advertisement_blockers = Vec::new();
+        if !blind_vault_replica_configured {
+            blind_vault_advertisement_blockers.push("blind_vault_replica_disabled");
+        } else {
+            if !blind_relay_endpoint_ready {
+                blind_vault_advertisement_blockers.push("public_peer_api_not_ready");
+            }
+            if !chat_relay_configured || !chat_relay_runtime_ready {
+                blind_vault_advertisement_blockers.push("chat_relay_runtime_not_ready");
+            }
+            if !blind_vault_runtime_ready {
+                blind_vault_advertisement_blockers.push("blind_vault_admission_not_ready");
+            }
         }
         let (status, detail) = if !capability_config_consistent {
             (
@@ -1145,6 +1218,12 @@ impl DiscoveryLocalCapabilityStatus {
             chat_relay_runtime_ready,
             advertised_chat_relay_capability,
             safe_to_advertise_chat_relay,
+            blind_vault_replica_configured,
+            blind_vault_runtime_ready,
+            advertised_blind_vault_replica_capability,
+            safe_to_advertise_blind_vault_replica,
+            blind_vault_capability_consistent,
+            blind_vault_advertisement_blockers,
             capability_config_consistent,
             advertisement_blockers,
             status,
@@ -1778,6 +1857,17 @@ pub fn discovery_readiness_status_value(
             "advertisement_blockers": &local_capabilities.advertisement_blockers,
             "detail": local_capabilities.detail,
         },
+        // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Keep
+        // anonymous storage readiness independent from the required chat relay
+        // foundation so an optional full replica does not distort relay SLOs.
+        "blind_vault_replica_capability": {
+            "configured": local_capabilities.blind_vault_replica_configured,
+            "runtime_ready": local_capabilities.blind_vault_runtime_ready,
+            "advertised": local_capabilities.advertised_blind_vault_replica_capability,
+            "safe_to_advertise": local_capabilities.safe_to_advertise_blind_vault_replica,
+            "capability_consistent": local_capabilities.blind_vault_capability_consistent,
+            "advertisement_blockers": &local_capabilities.blind_vault_advertisement_blockers,
+        },
         "peer_quorum": {
             "status": &peer_quorum.status,
             "quorum_ready": peer_quorum.quorum_ready,
@@ -2320,6 +2410,12 @@ pub fn discovery_summary_response(
             "safe_to_advertise_chat_relay": local_capabilities.safe_to_advertise_chat_relay,
             "capability_config_consistent": local_capabilities.capability_config_consistent,
             "advertisement_blockers": &local_capabilities.advertisement_blockers,
+            "blind_vault_replica_configured": local_capabilities.blind_vault_replica_configured,
+            "blind_vault_runtime_ready": local_capabilities.blind_vault_runtime_ready,
+            "advertised_blind_vault_replica_capability": local_capabilities.advertised_blind_vault_replica_capability,
+            "safe_to_advertise_blind_vault_replica": local_capabilities.safe_to_advertise_blind_vault_replica,
+            "blind_vault_capability_consistent": local_capabilities.blind_vault_capability_consistent,
+            "blind_vault_advertisement_blockers": &local_capabilities.blind_vault_advertisement_blockers,
         }),
         peer_mesh: serde_json::json!({
             "status": &peer_quorum.status,

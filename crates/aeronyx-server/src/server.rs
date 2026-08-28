@@ -4,6 +4,8 @@
 // Version: 1.0.0-Membership
 //
 // Modification Reason:
+//   [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Bound startup,
+//   gossip, and heartbeat replica advertisement to live admission readiness.
 //   Wired TrafficTracker into PacketHandler and HeartbeatReporter.
 //   spawn_cleanup_task() now accepts + calls traffic_tracker.remove_wallet().
 //   HeartbeatReporter receives sessions, traffic, udp via builder methods
@@ -620,6 +622,9 @@
 //     route, peer, receipt, endpoint, ciphertext, or payload dimensions.
 //
 // Last Modified:
+//   [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Suppressed the
+//     signed replica capability whenever policy, issuer, logical capacity, or
+//     physical disk readiness cannot safely admit a new anonymous lease.
 //   [BLIND-VAULT-LEASE-INVENTORY 2026-08-28 by Codex] Advertised private,
 //     terminal-signed encrypted-object inventory commitments.
 //   [BLIND-VAULT-LEASE-STATUS 2026-08-28 by Codex] Advertised private,
@@ -996,7 +1001,7 @@ use crate::api::directory_replica_sync::{
 use crate::api::discovery::{
     blind_relay_runtime_status_value, build_discovery_router_with_local_entry,
     discovery_readiness_status_value, recovery_anchor_status_value, DiscoveryApiPolicy,
-    DiscoveryLocalCapabilityStatus, GossipResponse,
+    DiscoveryBlindVaultCapabilityObservation, DiscoveryLocalCapabilityStatus, GossipResponse,
 };
 use crate::api::memchain_peer::{
     announce_current_record_commitment_tip, build_memchain_peer_router_with_runtime,
@@ -4314,9 +4319,21 @@ impl Server {
             None
         };
         let chat_relay_runtime_ready = chat_relay.is_some();
+        // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] Admission
+        // readiness is an observed service state, not a config synonym. Run
+        // the SQLite/filesystem observation off the async startup worker.
+        let blind_vault_runtime_ready = Self::observe_blind_vault_admission_readiness(
+            blind_vault.clone(),
+            unix_now_secs(),
+        )
+        .await;
 
         let peer_store = self
-            .init_peer_store(chat_relay_runtime_ready, peer_http_clients.control.as_ref())
+            .init_peer_store_with_storage_runtime(
+                chat_relay_runtime_ready,
+                blind_vault_runtime_ready,
+                peer_http_clients.control.as_ref(),
+            )
             .await?;
         if self.config.discovery.custody_audit_witness_runtime_required {
             // [CUSTODY-WITNESS-AUTO-RENEWAL 2026-08-21 by Codex] Runtime
@@ -4402,6 +4419,7 @@ impl Server {
             Arc::clone(&peer_store),
             directory_replica_store.clone(),
             chat_relay_runtime_ready,
+            blind_vault.clone(),
             Arc::clone(&peer_http_clients.gossip),
         ) {
             tasks.push(("discovery-gossip", task));
@@ -7339,16 +7357,22 @@ impl Server {
         let discovery_status_config = self.config.clone();
         let discovery_status_peer_store = Arc::clone(&peer_store);
         let discovery_chat_relay_runtime_ready = chat_relay.is_some();
+        let discovery_status_blind_vault = blind_vault.clone();
         heartbeat = heartbeat.with_discovery_status(Box::new(move || {
             let config = discovery_status_config.clone();
             let peer_store = Arc::clone(&discovery_status_peer_store);
+            let blind_vault = discovery_status_blind_vault.clone();
             Box::pin(async move {
                 let now = unix_now_secs();
                 let status = peer_store.status(now);
-                let local_capabilities = Self::discovery_local_capability_status_for_runtime(
-                    &config,
-                    discovery_chat_relay_runtime_ready,
-                );
+                let blind_vault_runtime_ready =
+                    Self::observe_blind_vault_admission_readiness(blind_vault, now).await;
+                let local_capabilities =
+                    Self::discovery_local_capability_status_for_runtime_state(
+                        &config,
+                        discovery_chat_relay_runtime_ready,
+                        blind_vault_runtime_ready,
+                    );
                 let signed_peer_records = peer_store.export_signed_peer_records_for_heartbeat(
                     now,
                     Some(
@@ -7524,6 +7548,26 @@ impl Server {
     async fn init_peer_store(
         &self,
         chat_relay_runtime_ready: bool,
+        control_http_client: &reqwest::Client,
+    ) -> Result<Arc<PeerStore>> {
+        self.init_peer_store_with_storage_runtime(
+            chat_relay_runtime_ready,
+            self.config
+                .blind_vault
+                .replica_advertisement_configured(),
+            control_http_client,
+        )
+        .await
+    }
+
+    /// Initializes discovery with explicitly observed storage readiness.
+    ///
+    /// The compatibility wrapper above remains for focused tests and embedded
+    /// callers that do not own a running Blind Vault service.
+    async fn init_peer_store_with_storage_runtime(
+        &self,
+        chat_relay_runtime_ready: bool,
+        blind_vault_runtime_ready: bool,
         control_http_client: &reqwest::Client,
     ) -> Result<Arc<PeerStore>> {
         let peer_store = Arc::new(PeerStore::new());
@@ -7706,7 +7750,11 @@ impl Server {
 
         if self.config.discovery.advertise_self {
             crate::services::onion_keys::tick_rotation(now);
-            match self.build_self_discovery_descriptor_with_runtime(now, chat_relay_runtime_ready) {
+            match self.build_self_discovery_descriptor_with_runtime_state(
+                now,
+                chat_relay_runtime_ready,
+                blind_vault_runtime_ready,
+            ) {
                 Ok(descriptor) => match peer_store
                     .upsert_verified_from_source(descriptor, now, "self")
                 {
@@ -10080,6 +10128,7 @@ impl Server {
         peer_store: Arc<PeerStore>,
         directory_replica_store: Option<Arc<DirectoryReplicaStore>>,
         chat_relay_runtime_ready: bool,
+        blind_vault: Option<Arc<BlindVaultService>>,
         gossip_http_client: Arc<reqwest::Client>,
     ) -> Option<JoinHandle<()>> {
         if !self.config.discovery.enabled || !self.config.discovery.gossip_enabled {
@@ -10132,12 +10181,21 @@ impl Server {
                 // Rotate the onion key on the discovery cadence (no-op until the
                 // rotation period elapses). Forward secrecy — see onion_keys.
                 crate::services::onion_keys::tick_rotation(now);
-                let Ok(self_descriptor) = Self::build_self_discovery_descriptor_for_runtime(
-                    &config,
-                    &identity,
-                    now,
-                    chat_relay_runtime_ready,
-                ) else {
+                // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex]
+                // Refresh physical/logical admission readiness every gossip
+                // round. A stale `BlindVaultReplica` claim could otherwise
+                // route fresh replicas to a node that is already fail-closed.
+                let blind_vault_runtime_ready =
+                    Self::observe_blind_vault_admission_readiness(blind_vault.clone(), now).await;
+                let Ok(self_descriptor) =
+                    Self::build_self_discovery_descriptor_for_runtime_state(
+                        &config,
+                        &identity,
+                        now,
+                        chat_relay_runtime_ready,
+                        blind_vault_runtime_ready,
+                    )
+                else {
                     warn!("[DISCOVERY] Skipping outbound gossip; self descriptor build failed");
                     peer_store.record_gossip_round(
                         now,
@@ -10148,6 +10206,26 @@ impl Server {
                     );
                     continue;
                 };
+                // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex]
+                // Keep local route selection aligned with the descriptor sent
+                // to peers. Otherwise this process could retain its startup
+                // capability after the physical or logical gate closed.
+                if peer_store
+                    .upsert_verified_from_source(self_descriptor.clone(), now, "self")
+                    .is_err()
+                {
+                    warn!(
+                        "[DISCOVERY] Skipping outbound gossip; refreshed self descriptor rejected"
+                    );
+                    peer_store.record_gossip_round(
+                        now,
+                        0,
+                        0,
+                        0,
+                        Some("self_descriptor_refresh_rejected".to_string()),
+                    );
+                    continue;
+                }
 
                 let consecutive_failures = peer_store.consecutive_gossip_failures();
                 let backpressure_active = Self::discovery_gossip_backpressure_active(
@@ -13367,6 +13445,29 @@ impl Server {
         document.descriptor_snapshot.verified_count_at(now) > 0
     }
 
+    /// Observes aggregate Blind Vault admission readiness away from an async
+    /// executor worker. Any missing service, storage error, probe error, or
+    /// worker failure is not ready.
+    async fn observe_blind_vault_admission_readiness(
+        blind_vault: Option<Arc<BlindVaultService>>,
+        now_secs: u64,
+    ) -> bool {
+        let Some(blind_vault) = blind_vault else {
+            return false;
+        };
+        // [BLIND-VAULT-RUNTIME-ADVERTISEMENT 2026-08-28 by Codex] SQLite and
+        // statvfs are synchronous capabilities. Never block Tokio's discovery
+        // or heartbeat worker while deriving a signed advertisement decision.
+        tokio::task::spawn_blocking(move || {
+            blind_vault
+                .admission_readiness(now_secs.saturating_mul(1_000))
+                .map(|readiness| readiness.is_ready())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     fn build_self_discovery_descriptor(&self, now: u64) -> Result<SignedNodeDescriptor> {
         Self::build_self_discovery_descriptor_for(&self.config, &self.identity, now)
     }
@@ -13376,11 +13477,27 @@ impl Server {
         now: u64,
         chat_relay_runtime_ready: bool,
     ) -> Result<SignedNodeDescriptor> {
-        Self::build_self_discovery_descriptor_for_runtime(
+        self.build_self_discovery_descriptor_with_runtime_state(
+            now,
+            chat_relay_runtime_ready,
+            self.config
+                .blind_vault
+                .replica_advertisement_configured(),
+        )
+    }
+
+    fn build_self_discovery_descriptor_with_runtime_state(
+        &self,
+        now: u64,
+        chat_relay_runtime_ready: bool,
+        blind_vault_runtime_ready: bool,
+    ) -> Result<SignedNodeDescriptor> {
+        Self::build_self_discovery_descriptor_for_runtime_state(
             &self.config,
             &self.identity,
             now,
             chat_relay_runtime_ready,
+            blind_vault_runtime_ready,
         )
     }
 
@@ -13402,6 +13519,22 @@ impl Server {
         identity: &IdentityKeyPair,
         now: u64,
         chat_relay_runtime_ready: bool,
+    ) -> Result<SignedNodeDescriptor> {
+        Self::build_self_discovery_descriptor_for_runtime_state(
+            config,
+            identity,
+            now,
+            chat_relay_runtime_ready,
+            config.blind_vault.replica_advertisement_configured(),
+        )
+    }
+
+    fn build_self_discovery_descriptor_for_runtime_state(
+        config: &ServerConfig,
+        identity: &IdentityKeyPair,
+        now: u64,
+        chat_relay_runtime_ready: bool,
+        blind_vault_runtime_ready: bool,
     ) -> Result<SignedNodeDescriptor> {
         let ttl = config.discovery.descriptor_ttl_secs;
         let expires_at = now.saturating_add(ttl);
@@ -13438,8 +13571,11 @@ impl Server {
             .map(|endpoint| endpoint.trim().to_string())
             .filter(|endpoint| !endpoint.is_empty());
 
-        descriptor.capabilities =
-            Self::discovery_capabilities_for_runtime(config, chat_relay_runtime_ready);
+        descriptor.capabilities = Self::discovery_capabilities_for_runtime_state(
+            config,
+            chat_relay_runtime_ready,
+            blind_vault_runtime_ready,
+        );
         descriptor.capacity = NodeCapacity {
             max_sessions: u32::try_from(config.max_sessions()).unwrap_or(u32::MAX),
             max_bps: None,
@@ -13468,6 +13604,18 @@ impl Server {
     fn discovery_capabilities_for_runtime(
         config: &ServerConfig,
         chat_relay_runtime_ready: bool,
+    ) -> Vec<NodeCapability> {
+        Self::discovery_capabilities_for_runtime_state(
+            config,
+            chat_relay_runtime_ready,
+            config.blind_vault.replica_advertisement_configured(),
+        )
+    }
+
+    fn discovery_capabilities_for_runtime_state(
+        config: &ServerConfig,
+        chat_relay_runtime_ready: bool,
+        blind_vault_runtime_ready: bool,
     ) -> Vec<NodeCapability> {
         let mut capabilities = vec![NodeCapability::PrivacyRelay];
         let advertises_peer_api = Self::discovery_peer_api_ready_for(config);
@@ -13501,6 +13649,7 @@ impl Server {
         if config.blind_vault.replica_advertisement_configured()
             && config.memchain.is_chat_relay_enabled()
             && chat_relay_runtime_ready
+            && blind_vault_runtime_ready
             && advertises_peer_api
         {
             capabilities.push(NodeCapability::BlindVaultReplica);
@@ -13539,13 +13688,33 @@ impl Server {
         config: &ServerConfig,
         chat_relay_runtime_ready: bool,
     ) -> DiscoveryLocalCapabilityStatus {
-        let capabilities =
-            Self::discovery_capabilities_for_runtime(config, chat_relay_runtime_ready);
-        DiscoveryLocalCapabilityStatus::new(
+        Self::discovery_local_capability_status_for_runtime_state(
+            config,
+            chat_relay_runtime_ready,
+            config.blind_vault.replica_advertisement_configured(),
+        )
+    }
+
+    fn discovery_local_capability_status_for_runtime_state(
+        config: &ServerConfig,
+        chat_relay_runtime_ready: bool,
+        blind_vault_runtime_ready: bool,
+    ) -> DiscoveryLocalCapabilityStatus {
+        let capabilities = Self::discovery_capabilities_for_runtime_state(
+            config,
+            chat_relay_runtime_ready,
+            blind_vault_runtime_ready,
+        );
+        DiscoveryLocalCapabilityStatus::new_with_blind_vault(
             config.memchain.is_chat_relay_enabled(),
             Self::discovery_peer_api_ready_for(config),
             chat_relay_runtime_ready,
             capabilities.contains(&NodeCapability::ChatRelay),
+            DiscoveryBlindVaultCapabilityObservation {
+                configured: config.blind_vault.replica_advertisement_configured(),
+                runtime_ready: blind_vault_runtime_ready,
+                advertised: capabilities.contains(&NodeCapability::BlindVaultReplica),
+            },
         )
     }
 
