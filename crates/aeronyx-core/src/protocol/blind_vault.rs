@@ -21,6 +21,8 @@
 //! - Defines an authority-signed issuer update for storage-node rotation.
 //! - Defines bounded recovery request/page frames with node-signed ciphertext
 //!   commitments and opaque continuation cursors.
+//! - Prepares and verifies single-use onion recovery sessions without exposing
+//!   read capabilities to entry or middle nodes.
 //! - Provides deterministic signing bytes and bounded binary wire framing.
 //! - Enforces coarse ciphertext size classes to reduce content-size leakage.
 //! - Keeps application domain separation inside client ciphertext and keys.
@@ -59,7 +61,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.6.0-BlindVaultIssuerUpdate - Added a transport-independent
+//! Last Modified: v1.7.0-BlindVaultOnionPull - Added client-owned anonymous
+//! recovery session preparation and response verification.
+//! v1.6.0-BlindVaultIssuerUpdate - Added a transport-independent
 //! authority-signed runtime issuer update contract.
 //! v1.5.0-BlindVaultIssuerDirectory - Added signed public
 //! issuer-epoch discovery for safe blind-signing key rotation.
@@ -80,6 +84,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
+
+use super::onion_reply::{
+    encode_onion_reply_request, OnionReplyError, OnionReplySession,
+    ONION_REPLY_RESPONSE_SIZE_CLASSES,
+};
 
 /// [BLIND-VAULT-WIRE 2026-07-22 by Codex]
 /// Domain separation prevents a valid chat/directory signature from being
@@ -1013,6 +1022,93 @@ impl BlindVaultPullResponse {
         }
         Ok(())
     }
+}
+
+/// Source-owned state for one anonymous inline Blind Vault recovery request.
+///
+/// [BLIND-VAULT-ONION-PULL-SESSION 2026-08-28 by Codex] Capability bytes are
+/// retained only inside the encoded final onion payload; the session keeps a
+/// request commitment and single-use reply key rather than a plaintext copy.
+///
+/// The encoded request returned by [`Self::prepare`] is the final payload for
+/// `build_onion_envelope`; it must never be sent directly to a storage node.
+/// The retained state contains the single-use reply private key and is consumed
+/// when opening one response.
+pub struct BlindVaultOnionPullSession {
+    lease_id: [u8; 32],
+    reply_session: OnionReplySession,
+}
+
+impl BlindVaultOnionPullSession {
+    /// Encodes one capability-bearing pull for the final onion layer.
+    pub fn prepare(
+        route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        request: BlindVaultPullRequest,
+    ) -> Result<(Vec<u8>, Self), BlindVaultOnionPullError> {
+        request.validate()?;
+        if request.limit != 1 {
+            return Err(BlindVaultOnionPullError::UnsupportedInlinePullLimit);
+        }
+        let lease_id = request.lease_id;
+        let encoded_pull = encode_blind_vault_frame(&BlindVaultFrame::PullRequest(request))?;
+        let (reply_request, reply_session) = OnionReplySession::prepare(
+            route_id,
+            expected_terminal_node_id,
+            ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
+            encoded_pull,
+        )?;
+        let encoded_request = encode_onion_reply_request(&reply_request)?;
+        Ok((
+            encoded_request,
+            Self {
+                lease_id,
+                reply_session,
+            },
+        ))
+    }
+
+    /// Opens the terminal response and verifies the inner signed recovery page.
+    pub fn open(
+        self,
+        encoded_response: &[u8],
+    ) -> Result<BlindVaultPullResponse, BlindVaultOnionPullError> {
+        let reply = self.reply_session.open(encoded_response)?;
+        let BlindVaultFrame::PullResponse(response) = decode_blind_vault_frame(&reply.payload)?
+        else {
+            return Err(BlindVaultOnionPullError::UnexpectedResponseFrame);
+        };
+        let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
+            .map_err(|_| BlindVaultOnionPullError::InvalidTerminalIdentity)?;
+        response.validate_and_verify(&terminal_key)?;
+        if response.lease_id != self.lease_id {
+            return Err(BlindVaultOnionPullError::LeaseMismatch);
+        }
+        Ok(response)
+    }
+}
+
+/// Fail-closed source errors for anonymous inline Blind Vault recovery.
+#[derive(Debug, Error)]
+pub enum BlindVaultOnionPullError {
+    /// The Blind Vault request or signed response violated its wire contract.
+    #[error("blind vault onion pull frame rejected")]
+    BlindVault(#[from] BlindVaultError),
+    /// The reply carrier failed key, route, identity, size, or signature checks.
+    #[error("blind vault onion reply rejected")]
+    OnionReply(#[from] OnionReplyError),
+    /// Inline v1 deliberately returns at most one ciphertext object.
+    #[error("blind vault onion pull requires limit 1")]
+    UnsupportedInlinePullLimit,
+    /// The decrypted workload response was not a Blind Vault pull page.
+    #[error("unexpected blind vault onion response frame")]
+    UnexpectedResponseFrame,
+    /// The verified page belongs to another replica-local lease.
+    #[error("blind vault onion pull lease mismatch")]
+    LeaseMismatch,
+    /// The verified outer terminal identity could not be reconstructed.
+    #[error("invalid blind vault onion terminal identity")]
+    InvalidTerminalIdentity,
 }
 
 /// Immutable encrypted object submitted to one blind-vault replica.

@@ -10,11 +10,13 @@
 //!
 //! ## Main Functionality
 //! - Wraps one terminal request with an ephemeral client reply key.
+//! - Owns one single-use source session so the reply private key cannot be
+//!   accidentally reused across routes.
 //! - Seals one fixed-size response with X25519, HKDF-SHA256, and
 //!   XChaCha20-Poly1305.
 //! - Keeps the terminal identity and terminal signature inside ciphertext.
-//! - Binds every response to the exact route, reply key, terminal ephemeral
-//!   key, response size class, and payload commitment.
+//! - Binds every response to the exact route, request commitment, reply key,
+//!   terminal ephemeral key, response size class, and payload commitment.
 //! - Provides explicit, language-neutral request and response wire codecs.
 //!
 //! ## Dependencies
@@ -39,7 +41,11 @@
 //! - Keep this carrier workload-neutral. Blind Vault, mailbox, and Agent RPC
 //!   parsing belongs at the terminal dispatch boundary.
 //!
-//! Last Modified: v1.0.0-OnionReply - Added the bounded encrypted return path.
+//! Last Modified: v1.2.0-RequestBoundReply - Bound key derivation, encrypted
+//! response metadata, and terminal signatures to the exact request payload.
+//! v1.1.0-OnionReplySession - Added single-use source request
+//! preparation and response verification.
+//! v1.0.0-OnionReply - Added the bounded encrypted return path.
 //! ============================================
 
 use hkdf::Hkdf;
@@ -61,7 +67,7 @@ const AEAD_TAG_BYTES: usize = 16;
 const SIGNATURE_BYTES: usize = 64;
 const REQUEST_HEADER_BYTES: usize = 4 + 1 + 32 + 4 + 4;
 const RESPONSE_HEADER_BYTES: usize = 4 + 1 + 32 + AEAD_NONCE_BYTES + 4;
-const PLAINTEXT_HEADER_BYTES: usize = 4 + 1 + 4 + 16 + 32 + 4;
+const PLAINTEXT_HEADER_BYTES: usize = 4 + 1 + 4 + 16 + 32 + 32 + 4;
 
 /// Maximum workload request carried inside one reply-capable terminal frame.
 pub const MAX_ONION_REPLY_REQUEST_PAYLOAD_BYTES: usize = 16 * 1024;
@@ -175,6 +181,59 @@ pub struct OnionReplyPayload {
     pub payload: Vec<u8>,
 }
 
+/// Source-owned single-use state for one encrypted terminal response.
+///
+/// [ONION-REPLY-SESSION 2026-08-28 by Codex] The ephemeral private key never
+/// enters the request or a node API. Consuming `self` on open makes key reuse
+/// and accepting two responses for one logical route impossible by type.
+pub struct OnionReplySession {
+    route_id: [u8; 16],
+    expected_terminal_node_id: [u8; 32],
+    response_size_class: usize,
+    request_payload_commitment: [u8; 32],
+    reply_key: EphemeralKeyPair,
+}
+
+impl OnionReplySession {
+    /// Creates one request and retains the corresponding private reply state.
+    pub fn prepare(
+        route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        response_size_class: usize,
+        payload: Vec<u8>,
+    ) -> Result<(OnionReplyRequest, Self), OnionReplyError> {
+        IdentityPublicKey::from_bytes(&expected_terminal_node_id)
+            .map_err(|_| OnionReplyError::InvalidTerminalIdentity)?;
+        let reply_key = EphemeralKeyPair::generate();
+        let request =
+            OnionReplyRequest::new(reply_key.public_key_bytes(), response_size_class, payload)?;
+        let request_payload_commitment = payload_commitment(&request.payload);
+        Ok((
+            request,
+            Self {
+                route_id,
+                expected_terminal_node_id,
+                response_size_class,
+                request_payload_commitment,
+                reply_key,
+            },
+        ))
+    }
+
+    /// Decodes, decrypts, and verifies the one response bound to this session.
+    pub fn open(self, encoded_response: &[u8]) -> Result<OnionReplyPayload, OnionReplyError> {
+        let response = decode_onion_sealed_response(encoded_response)?;
+        open_onion_reply_with_context(
+            self.route_id,
+            &response,
+            self.reply_key,
+            self.expected_terminal_node_id,
+            self.response_size_class,
+            self.request_payload_commitment,
+        )
+    }
+}
+
 /// Encodes one request with an explicit stable byte layout.
 pub fn encode_onion_reply_request(request: &OnionReplyRequest) -> Result<Vec<u8>, OnionReplyError> {
     request.validate()?;
@@ -241,6 +300,7 @@ pub fn seal_onion_reply(
 
     let ephemeral = EphemeralKeyPair::generate();
     let ephemeral_public_key = ephemeral.public_key_bytes();
+    let request_payload_commitment = payload_commitment(&request.payload);
     let mut shared_secret = ephemeral.exchange(&request.reply_public_key);
     if let Err(error) = reject_low_order_shared_secret(&shared_secret) {
         shared_secret.zeroize();
@@ -251,6 +311,7 @@ pub fn seal_onion_reply(
         &route_id,
         &request.reply_public_key,
         &ephemeral_public_key,
+        &request_payload_commitment,
     );
     shared_secret.zeroize();
     let mut session_key = session_key_result?;
@@ -261,6 +322,7 @@ pub fn seal_onion_reply(
         request.reply_public_key,
         ephemeral_public_key,
         response_size_class,
+        request_payload_commitment,
         terminal_node_id,
         payload,
     ));
@@ -276,6 +338,7 @@ pub fn seal_onion_reply(
         &request.response_size_class.to_be_bytes(),
     )?;
     write_part(&mut plaintext, &mut offset, &route_id)?;
+    write_part(&mut plaintext, &mut offset, &request_payload_commitment)?;
     write_part(&mut plaintext, &mut offset, &terminal_node_id)?;
     write_part(&mut plaintext, &mut offset, &payload_len.to_be_bytes())?;
     write_part(&mut plaintext, &mut offset, payload)?;
@@ -305,9 +368,35 @@ pub fn open_onion_reply(
     route_id: [u8; 16],
     response: &OnionSealedResponse,
     reply_key: EphemeralKeyPair,
+    request: &OnionReplyRequest,
     expected_terminal_node_id: [u8; 32],
 ) -> Result<OnionReplyPayload, OnionReplyError> {
-    let expected_size_class = response.validate()?;
+    request.validate()?;
+    let reply_public_key = reply_key.public_key_bytes();
+    if request.reply_public_key != reply_public_key {
+        return Err(OnionReplyError::InvalidReplyKey);
+    }
+    open_onion_reply_with_context(
+        route_id,
+        response,
+        reply_key,
+        expected_terminal_node_id,
+        response_size_class(request.response_size_class)?,
+        payload_commitment(&request.payload),
+    )
+}
+
+fn open_onion_reply_with_context(
+    route_id: [u8; 16],
+    response: &OnionSealedResponse,
+    reply_key: EphemeralKeyPair,
+    expected_terminal_node_id: [u8; 32],
+    expected_size_class: usize,
+    expected_request_payload_commitment: [u8; 32],
+) -> Result<OnionReplyPayload, OnionReplyError> {
+    if response.validate()? != expected_size_class {
+        return Err(OnionReplyError::InvalidSizeClass);
+    }
     let reply_public_key = reply_key.public_key_bytes();
     let mut shared_secret = reply_key.exchange(&response.ephemeral_public_key);
     if let Err(error) = reject_low_order_shared_secret(&shared_secret) {
@@ -319,6 +408,7 @@ pub fn open_onion_reply(
         &route_id,
         &reply_public_key,
         &response.ephemeral_public_key,
+        &expected_request_payload_commitment,
     );
     shared_secret.zeroize();
     let mut session_key = session_key_result?;
@@ -334,6 +424,7 @@ pub fn open_onion_reply(
         reply_public_key,
         response.ephemeral_public_key,
         expected_size_class,
+        expected_request_payload_commitment,
         expected_terminal_node_id,
     );
     plaintext.zeroize();
@@ -391,6 +482,7 @@ fn decode_reply_plaintext(
     reply_public_key: [u8; 32],
     ephemeral_public_key: [u8; 32],
     expected_size_class: usize,
+    expected_request_payload_commitment: [u8; 32],
     expected_terminal_node_id: [u8; 32],
 ) -> Result<OnionReplyPayload, OnionReplyError> {
     if plaintext.len() != expected_size_class {
@@ -413,6 +505,10 @@ fn decode_reply_plaintext(
     let route_id = cursor.take_array::<16>()?;
     if route_id != expected_route_id {
         return Err(OnionReplyError::RouteMismatch);
+    }
+    let request_payload_commitment = cursor.take_array::<32>()?;
+    if request_payload_commitment != expected_request_payload_commitment {
+        return Err(OnionReplyError::RequestMismatch);
     }
     let terminal_node_id = cursor.take_array::<32>()?;
     if terminal_node_id != expected_terminal_node_id {
@@ -437,6 +533,7 @@ fn decode_reply_plaintext(
                 reply_public_key,
                 ephemeral_public_key,
                 expected_size_class,
+                request_payload_commitment,
                 terminal_node_id,
                 &payload,
             ),
@@ -455,10 +552,11 @@ fn response_signing_bytes(
     reply_public_key: [u8; 32],
     ephemeral_public_key: [u8; 32],
     response_size_class: usize,
+    request_payload_commitment: [u8; 32],
     terminal_node_id: [u8; 32],
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(RESPONSE_SIGNING_DOMAIN.len() + 157);
+    let mut bytes = Vec::with_capacity(RESPONSE_SIGNING_DOMAIN.len() + 189);
     bytes.extend_from_slice(RESPONSE_SIGNING_DOMAIN);
     bytes.push(RESPONSE_VERSION);
     bytes.extend_from_slice(&route_id);
@@ -469,6 +567,7 @@ fn response_signing_bytes(
             .unwrap_or(u32::MAX)
             .to_be_bytes(),
     );
+    bytes.extend_from_slice(&request_payload_commitment);
     bytes.extend_from_slice(&terminal_node_id);
     bytes.extend_from_slice(
         &u32::try_from(payload.len())
@@ -484,16 +583,24 @@ fn derive_response_key(
     route_id: &[u8; 16],
     reply_public_key: &[u8; 32],
     ephemeral_public_key: &[u8; 32],
+    request_payload_commitment: &[u8; 32],
 ) -> Result<[u8; 32], OnionReplyError> {
     let hkdf = Hkdf::<Sha256>::new(Some(RESPONSE_KEY_SALT), shared_secret);
-    let mut info = Vec::with_capacity(16 + 32 + 32);
+    let mut info = Vec::with_capacity(16 + 32 + 32 + 32);
     info.extend_from_slice(route_id);
     info.extend_from_slice(reply_public_key);
     info.extend_from_slice(ephemeral_public_key);
+    info.extend_from_slice(request_payload_commitment);
     let mut key = [0u8; 32];
     hkdf.expand(&info, &mut key)
         .map_err(|_| OnionReplyError::KeyDerivationFailed)?;
     Ok(key)
+}
+
+fn payload_commitment(payload: &[u8]) -> [u8; 32] {
+    let mut commitment = [0u8; 32];
+    commitment.copy_from_slice(&Sha256::digest(payload));
+    commitment
 }
 
 fn reject_low_order_shared_secret(shared_secret: &[u8; 32]) -> Result<(), OnionReplyError> {
@@ -637,6 +744,9 @@ pub enum OnionReplyError {
     /// The decrypted response was bound to another route.
     #[error("onion reply route mismatch")]
     RouteMismatch,
+    /// The response was not bound to the exact source request payload.
+    #[error("onion reply request commitment mismatch")]
+    RequestMismatch,
     /// The response signer was not the source-selected terminal.
     #[error("onion reply terminal mismatch")]
     TerminalMismatch,
