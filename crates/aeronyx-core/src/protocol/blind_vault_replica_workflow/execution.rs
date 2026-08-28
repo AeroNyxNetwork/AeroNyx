@@ -9,10 +9,11 @@
 
 use super::{
     require_timestamp, BlindVaultReplicaActionEvidence, BlindVaultReplicaConvergence,
-    BlindVaultReplicaDispatchFailure, BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase,
-    BlindVaultReplicaExecutionPolicy, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
-    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
-    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
+    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
+    BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
+    BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
+    BlindVaultReplicaWorkflowError, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+    MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 use crate::protocol::blind_vault::{BlindVaultReplicaPlan, BlindVaultReplicaPlanHealth};
 
@@ -205,13 +206,54 @@ impl BlindVaultReplicaExecution {
         id: BlindVaultReplicaWorkId,
         dispatched_at_ms: u64,
     ) -> Result<u8, BlindVaultReplicaWorkflowError> {
-        self.validate_event_time(dispatched_at_ms)?;
-        let policy = self.policy;
+        let (attempt, evidence_deadline_ms) = match self.dispatch_readiness(id, dispatched_at_ms)? {
+            BlindVaultReplicaDispatchReadiness::Ready {
+                attempt,
+                evidence_deadline_ms,
+            } => (attempt, evidence_deadline_ms),
+            BlindVaultReplicaDispatchReadiness::RetryBackoff { .. } => {
+                return Err(BlindVaultReplicaWorkflowError::RetryNotReady)
+            }
+            BlindVaultReplicaDispatchReadiness::TargetInFlight => {
+                return Err(BlindVaultReplicaWorkflowError::TargetInFlight)
+            }
+            BlindVaultReplicaDispatchReadiness::TargetDependencyPending => {
+                return Err(BlindVaultReplicaWorkflowError::TargetDependencyPending)
+            }
+            BlindVaultReplicaDispatchReadiness::CapacityReached { .. } => {
+                return Err(BlindVaultReplicaWorkflowError::DispatchCapacityReached)
+            }
+            BlindVaultReplicaDispatchReadiness::AwaitingAuthorization
+            | BlindVaultReplicaDispatchReadiness::AlreadyInFlight { .. }
+            | BlindVaultReplicaDispatchReadiness::TerminalState => {
+                return Err(BlindVaultReplicaWorkflowError::InvalidTransition)
+            }
+        };
+        let item_index = self.item_index(id)?;
+        self.items[item_index].state = BlindVaultReplicaWorkState::AwaitingEvidence {
+            attempt,
+            dispatched_at_ms,
+            evidence_deadline_ms,
+        };
+        Ok(attempt)
+    }
+
+    /// Returns whether one exact action can be dispatched without mutation.
+    #[must_use]
+    pub fn dispatch_readiness(
+        &self,
+        id: BlindVaultReplicaWorkId,
+        now_ms: u64,
+    ) -> Result<BlindVaultReplicaDispatchReadiness, BlindVaultReplicaWorkflowError> {
+        self.validate_event_time(now_ms)?;
         let item_index = self.item_index(id)?;
         let item = self.items[item_index];
         let attempt = match item.state {
+            BlindVaultReplicaWorkState::AwaitingAuthorization => {
+                return Ok(BlindVaultReplicaDispatchReadiness::AwaitingAuthorization)
+            }
             BlindVaultReplicaWorkState::Authorized { authorized_at_ms } => {
-                if dispatched_at_ms < authorized_at_ms {
+                if now_ms < authorized_at_ms {
                     return Err(BlindVaultReplicaWorkflowError::TimestampOutOfRange);
                 }
                 1
@@ -222,31 +264,35 @@ impl BlindVaultReplicaExecution {
                 retry_not_before_ms,
                 ..
             } => {
-                if dispatched_at_ms < failed_at_ms || dispatched_at_ms < retry_not_before_ms {
-                    return Err(BlindVaultReplicaWorkflowError::RetryNotReady);
+                if now_ms < failed_at_ms || now_ms < retry_not_before_ms {
+                    return Ok(BlindVaultReplicaDispatchReadiness::RetryBackoff {
+                        retry_not_before_ms,
+                    });
                 }
                 attempt
                     .checked_add(1)
                     .ok_or(BlindVaultReplicaWorkflowError::AttemptOverflow)?
             }
-            _ => return Err(BlindVaultReplicaWorkflowError::InvalidTransition),
+            BlindVaultReplicaWorkState::AwaitingEvidence {
+                evidence_deadline_ms,
+                ..
+            } => {
+                return Ok(BlindVaultReplicaDispatchReadiness::AlreadyInFlight {
+                    evidence_deadline_ms,
+                })
+            }
+            BlindVaultReplicaWorkState::EvidenceAccepted { .. }
+            | BlindVaultReplicaWorkState::PermanentFailure { .. }
+            | BlindVaultReplicaWorkState::Exhausted { .. }
+            | BlindVaultReplicaWorkState::Cancelled { .. } => {
+                return Ok(BlindVaultReplicaDispatchReadiness::TerminalState)
+            }
         };
-        if attempt > policy.maximum_attempts {
+        if attempt > self.policy.maximum_attempts {
             return Err(BlindVaultReplicaWorkflowError::AttemptBudgetExhausted);
         }
-        if self.in_flight_count() >= usize::from(self.maximum_in_flight) {
-            return Err(BlindVaultReplicaWorkflowError::DispatchCapacityReached);
-        }
+
         if let Some(target) = item.action.target() {
-            if self.items[..item_index].iter().any(|prior| {
-                prior.action.target() == Some(target)
-                    && !matches!(
-                        prior.state,
-                        BlindVaultReplicaWorkState::EvidenceAccepted { .. }
-                    )
-            }) {
-                return Err(BlindVaultReplicaWorkflowError::TargetDependencyPending);
-            }
             if self.items.iter().enumerate().any(|(index, active)| {
                 index != item_index
                     && active.action.target() == Some(target)
@@ -255,18 +301,34 @@ impl BlindVaultReplicaExecution {
                         BlindVaultReplicaWorkState::AwaitingEvidence { .. }
                     )
             }) {
-                return Err(BlindVaultReplicaWorkflowError::TargetInFlight);
+                return Ok(BlindVaultReplicaDispatchReadiness::TargetInFlight);
+            }
+            if self.items[..item_index].iter().any(|prior| {
+                prior.action.target() == Some(target)
+                    && !matches!(
+                        prior.state,
+                        BlindVaultReplicaWorkState::EvidenceAccepted { .. }
+                    )
+            }) {
+                return Ok(BlindVaultReplicaDispatchReadiness::TargetDependencyPending);
             }
         }
-        let evidence_deadline_ms = dispatched_at_ms
-            .checked_add(policy.evidence_timeout_ms)
+
+        let in_flight = self.in_flight_count();
+        if in_flight >= usize::from(self.maximum_in_flight) {
+            return Ok(BlindVaultReplicaDispatchReadiness::CapacityReached {
+                in_flight: u8::try_from(in_flight)
+                    .map_err(|_| BlindVaultReplicaWorkflowError::InconsistentPlan)?,
+                maximum: self.maximum_in_flight,
+            });
+        }
+        let evidence_deadline_ms = now_ms
+            .checked_add(self.policy.evidence_timeout_ms)
             .ok_or(BlindVaultReplicaWorkflowError::TimestampOutOfRange)?;
-        self.items[item_index].state = BlindVaultReplicaWorkState::AwaitingEvidence {
+        Ok(BlindVaultReplicaDispatchReadiness::Ready {
             attempt,
-            dispatched_at_ms,
             evidence_deadline_ms,
-        };
-        Ok(attempt)
+        })
     }
 
     /// Accepts only verified evidence matching both the action kind and target.

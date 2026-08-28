@@ -32,7 +32,9 @@
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //!
-//! Last Modified: v1.5.0-BlindVaultBoundedDispatch - Added source-owned global
+//! Last Modified: v1.6.0-BlindVaultDispatchReadiness - Added one typed,
+//! side-effect-free readiness contract shared with the dispatch transition.
+//! v1.5.0-BlindVaultBoundedDispatch - Added source-owned global
 //! dispatch limits, per-target single-flight, and ordered target dependencies.
 //! v1.4.0-BlindVaultPlanShape - Reused the core plan invariant
 //! at workflow creation and mandatory replan boundaries.
@@ -254,6 +256,34 @@ pub enum BlindVaultReplicaExecutionPhase {
     AwaitingReplan,
     /// At least one action exhausted attempts or was cancelled.
     Blocked,
+}
+
+/// Side-effect-free dispatch readiness for one source-local work item.
+///
+/// [BLIND-VAULT-DISPATCH-READINESS 2026-08-29 by Codex] Product and agent
+/// adapters can render or schedule work without invoking a mutating transition
+/// merely to discover backoff, dependency, target, or capacity state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultReplicaDispatchReadiness {
+    /// The exact immutable action may be dispatched now.
+    Ready {
+        attempt: u8,
+        evidence_deadline_ms: u64,
+    },
+    /// The source has not explicitly authorized this action.
+    AwaitingAuthorization,
+    /// Retry is valid only at or after this source-local boundary.
+    RetryBackoff { retry_not_before_ms: u64 },
+    /// This action is already waiting for terminal evidence.
+    AlreadyInFlight { evidence_deadline_ms: u64 },
+    /// Another operation for the same terminal/lease is in flight.
+    TargetInFlight,
+    /// An earlier operation for the same terminal/lease lacks evidence.
+    TargetDependencyPending,
+    /// Unrelated work currently occupies the bounded dispatch capacity.
+    CapacityReached { in_flight: u8, maximum: u8 },
+    /// This work item is complete, cancelled, or permanently blocked.
+    TerminalState,
 }
 
 /// Outcome of comparing an evidence-complete generation with a fresh plan.
