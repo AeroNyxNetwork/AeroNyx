@@ -285,8 +285,9 @@ pub mod wallet_routes;
 pub use blind_vault::{
     BlindVaultAdmissionFailureClass, BlindVaultCleanupReport, BlindVaultDeleteFailureClass,
     BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus, BlindVaultLeaseProvisionOutcome,
-    BlindVaultPullFailureClass, BlindVaultPullPage, BlindVaultPutFailureClass, BlindVaultService,
-    BlindVaultServiceError, BlindVaultStatus, BlindVaultStoredObject, SharedBlindVaultService,
+    BlindVaultLeaseRetireFailureClass, BlindVaultPullFailureClass, BlindVaultPullPage,
+    BlindVaultPutFailureClass, BlindVaultService, BlindVaultServiceError, BlindVaultStatus,
+    BlindVaultStoredObject, SharedBlindVaultService,
 };
 // [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Expose only aggregate,
 // host-local maintenance contracts and authenticated path-free plans; artifact

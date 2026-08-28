@@ -20,6 +20,7 @@
 //!   revalidation for contention-safe write admission.
 //! - Capability-gated bounded recovery pages with encrypted snapshot cursors.
 //! - Administration-key object deletion with signed node receipts.
+//! - Complete administration-key lease retirement with exact-retry receipts.
 //! - Transactional per-lease count/byte quotas and bounded expiry cleanup.
 //! - Stable privacy-safe mutation failure classes for multi-hop retry policy.
 //!
@@ -38,6 +39,8 @@
 //!    bounded page of still-live opaque objects.
 //! 5. Validate deletion with the separate administration key, retain a bounded
 //!    commitment-only tombstone, and sign a deletion receipt.
+//! 6. Retire a complete lease atomically, retain only bounded request evidence,
+//!    and return an encrypted-path-safe aggregate receipt.
 //!
 //! ## Privacy Invariant
 //! This service has no account, wallet, sender, receiver, conversation,
@@ -60,7 +63,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.12.0-BlindVaultAdmissionFailureClass - Added exhaustive,
+//! Last Modified: v1.13.0-BlindVaultLeaseRetirement - Added atomic complete
+//! lease deletion with exact request commitments and bounded retry evidence.
+//! v1.12.0-BlindVaultAdmissionFailureClass - Added exhaustive,
 //! privacy-safe anonymous admission retry classification.
 //! v1.11.0-BlindVaultDeleteFailureClass - Added exhaustive,
 //! privacy-safe anonymous deletion retry classification.
@@ -100,7 +105,8 @@ use aeronyx_core::protocol::blind_vault::{
     BlindVaultBlindIssuerDirectory, BlindVaultBlindIssuerEpoch, BlindVaultBlindIssuerUpdate,
     BlindVaultBlindLeaseAdmissionRequest, BlindVaultDeleteRequest, BlindVaultDeletedReceipt,
     BlindVaultError, BlindVaultLeaseAdmissionRequest, BlindVaultLeaseCreateRequest,
-    BlindVaultPutRequest, BlindVaultStoredReceipt,
+    BlindVaultLeaseRetireRequest, BlindVaultLeaseRetiredReceipt, BlindVaultPutRequest,
+    BlindVaultStoredReceipt,
 };
 use blind_rsa_signatures::{MessageRandomizer, PublicKeySha384PSSRandomized, Signature};
 use chacha20poly1305::{
@@ -218,6 +224,8 @@ pub struct BlindVaultCleanupReport {
     pub leases_removed: u64,
     /// Expired commitment-only tombstones removed in this bounded run.
     pub tombstones_removed: u64,
+    /// Expired complete-lease retirement tombstones removed in this run.
+    pub lease_tombstones_removed: u64,
     /// Expired one-time admission spend markers removed in this bounded run.
     pub admission_spends_removed: u64,
 }
@@ -235,6 +243,8 @@ pub struct BlindVaultStatus {
     pub live_ciphertext_bytes: u64,
     /// Number of retained commitment-only deletion tombstones.
     pub tombstones: u64,
+    /// Number of unexpired complete-lease retirement tombstones.
+    pub lease_tombstones: u64,
     /// Unexpired one-time admission spend markers retained for replay defence.
     pub retained_admission_spends: u64,
 }
@@ -371,6 +381,15 @@ pub enum BlindVaultAdmissionFailureClass {
     /// The same credential and signed lease cannot succeed unchanged.
     Rejected,
     /// Admission policy, replica storage, or local runtime is unavailable.
+    Unavailable,
+}
+
+/// Privacy-safe retry class for complete anonymous lease retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultLeaseRetireFailureClass {
+    /// The same signed retirement cannot succeed unchanged.
+    Rejected,
+    /// Replica storage or local runtime is unavailable.
     Unavailable,
 }
 
@@ -527,6 +546,45 @@ impl BlindVaultServiceError {
             | Self::IssuerDirectoryGenerationOutOfRange
             | Self::CorruptState
             | Self::TimestampOutOfRange => BlindVaultAdmissionFailureClass::Unavailable,
+        }
+    }
+
+    /// Returns the coarse retry class for complete lease retirement.
+    #[must_use]
+    pub const fn lease_retire_failure_class(&self) -> BlindVaultLeaseRetireFailureClass {
+        // [BLIND-VAULT-LEASE-RETIRE-FAILURE 2026-08-28 by Codex] Keep this
+        // exhaustive so upstream relays never learn whether a lease was live,
+        // already retired, expired, conflicting, or signed by the wrong key.
+        match self {
+            Self::Protocol(_)
+            | Self::LeaseNotFound
+            | Self::LeaseExpired
+            | Self::LeaseConflict
+            | Self::ObjectConflict
+            | Self::RequestConflict
+            | Self::ObjectDeleted
+            | Self::QuotaExceeded
+            | Self::ReadUnauthorized
+            | Self::InvalidPullCursor
+            | Self::AdmissionIssuerRejected
+            | Self::AdmissionProofRejected
+            | Self::AdmissionSpent
+            | Self::ObjectNotFound => BlindVaultLeaseRetireFailureClass::Rejected,
+            Self::Disabled
+            | Self::Sqlite(_)
+            | Self::Filesystem
+            | Self::PullCursorEncryptionFailed
+            | Self::AdmissionUnavailable
+            | Self::AdmissionConfigurationInvalid
+            | Self::IssuerDirectoryAuthorityRejected
+            | Self::IssuerDirectoryUpdateRejected
+            | Self::IssuerDirectoryRollback
+            | Self::IssuerDirectoryGenerationConflict
+            | Self::IssuerDirectoryContinuity
+            | Self::IssuerDirectoryNoActiveEpoch
+            | Self::IssuerDirectoryGenerationOutOfRange
+            | Self::CorruptState
+            | Self::TimestampOutOfRange => BlindVaultLeaseRetireFailureClass::Unavailable,
         }
     }
 }
@@ -860,6 +918,26 @@ impl BlindVaultService {
         if let Some(outcome) = existing_lease_outcome(&transaction, lease, &read_tag)? {
             return Ok(outcome);
         }
+        // [BLIND-VAULT-LEASE-RETIRE-REPLAY 2026-08-28 by Codex] A retired
+        // random lease identifier cannot be resurrected while its bounded
+        // retirement proof remains valid. Expired markers are removed before
+        // allowing a genuinely new admission transaction.
+        let retired: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM blind_vault_lease_tombstones
+                WHERE lease_id = ?1 AND expires_at_ms > ?2
+             )",
+            params![&lease.lease_id[..], now],
+            |row| row.get(0),
+        )?;
+        if retired {
+            return Err(BlindVaultServiceError::LeaseConflict);
+        }
+        transaction.execute(
+            "DELETE FROM blind_vault_lease_tombstones
+             WHERE lease_id = ?1 AND expires_at_ms <= ?2",
+            params![&lease.lease_id[..], now],
+        )?;
         let spent: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM blind_vault_admission_spends WHERE token_id = ?1
@@ -929,6 +1007,57 @@ impl BlindVaultService {
             .map_err(|_| BlindVaultServiceError::CorruptState)?;
         request.validate_and_verify(now_ms, self.config.mutation_clock_skew_ms(), &admin_key)?;
         Ok(lease.admin_verifying_key)
+    }
+
+    /// Authenticates a complete lease retirement before acquiring the WAL
+    /// writer. Exact retained retries use their tombstone authority and do not
+    /// become invalid merely because the original freshness window elapsed.
+    fn authenticate_lease_retire_request(
+        &self,
+        request: &BlindVaultLeaseRetireRequest,
+        now_ms: u64,
+    ) -> Result<[u8; 32], BlindVaultServiceError> {
+        let authority = {
+            let connection = self.connection.lock();
+            if let Some(lease) = load_lease_runtime(&connection, &request.lease_id)? {
+                LeaseRetirementAuthoritySnapshot::Live {
+                    admin_verifying_key: lease.admin_verifying_key,
+                }
+            } else if let Some(retired) =
+                load_active_lease_retirement(&connection, &request.lease_id, now_ms)?
+            {
+                LeaseRetirementAuthoritySnapshot::Retired(retired)
+            } else {
+                return Err(BlindVaultServiceError::LeaseNotFound);
+            }
+        };
+
+        let admin_verifying_key = match &authority {
+            LeaseRetirementAuthoritySnapshot::Live {
+                admin_verifying_key,
+            } => *admin_verifying_key,
+            LeaseRetirementAuthoritySnapshot::Retired(retired) => {
+                if retired.request_id != request.request_id
+                    || retired.request_commitment != request.commitment()
+                {
+                    return Err(BlindVaultServiceError::RequestConflict);
+                }
+                retired.admin_verifying_key
+            }
+        };
+        let admin_key = IdentityPublicKey::from_bytes(&admin_verifying_key)
+            .map_err(|_| BlindVaultServiceError::CorruptState)?;
+        match authority {
+            LeaseRetirementAuthoritySnapshot::Live { .. } => request.validate_and_verify(
+                now_ms,
+                self.config.mutation_clock_skew_ms(),
+                &admin_key,
+            )?,
+            LeaseRetirementAuthoritySnapshot::Retired(_) => {
+                request.validate_and_verify_signature(&admin_key)?
+            }
+        }
+        Ok(admin_verifying_key)
     }
 
     /// Stores one immutable ciphertext and returns a node-signed acceptance
@@ -1239,6 +1368,104 @@ impl BlindVaultService {
         Ok(receipt)
     }
 
+    /// Retires one complete anonymous lease and returns a node-signed receipt.
+    ///
+    /// The transaction inserts a bounded idempotency tombstone before deleting
+    /// the lease row; foreign-key cascades then remove every ciphertext object
+    /// and object tombstone atomically. Exact retries return the original
+    /// aggregate result and retirement time.
+    pub fn retire_lease(
+        &self,
+        request: &BlindVaultLeaseRetireRequest,
+        now_ms: u64,
+    ) -> Result<BlindVaultLeaseRetiredReceipt, BlindVaultServiceError> {
+        let authenticated_admin_key = self.authenticate_lease_retire_request(request, now_ms)?;
+        let request_commitment = request.commitment();
+        let now = sqlite_i64(now_ms)?;
+        let tombstone_expiry_ms = now_ms
+            .checked_add(self.config.tombstone_ttl_secs.saturating_mul(1_000))
+            .ok_or(BlindVaultServiceError::TimestampOutOfRange)?;
+        let tombstone_expiry = sqlite_i64(tombstone_expiry_ms)?;
+
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let retirement = if let Some(lease) = load_lease_runtime(&transaction, &request.lease_id)? {
+            if lease.admin_verifying_key != authenticated_admin_key {
+                return Err(BlindVaultServiceError::LeaseConflict);
+            }
+            if load_active_lease_retirement(&transaction, &request.lease_id, now_ms)?.is_some() {
+                return Err(BlindVaultServiceError::CorruptState);
+            }
+            // [BLIND-VAULT-LEASE-RETIRE-USAGE 2026-08-28 by Codex] A signed
+            // aggregate receipt must describe rows removed by this exact
+            // transaction. Refuse to sign if cached quota counters drifted.
+            let deleted_usage = load_lease_object_usage(&transaction, &request.lease_id)?;
+            if lease.object_count != deleted_usage.object_count
+                || lease.byte_count != deleted_usage.ciphertext_bytes
+            {
+                return Err(BlindVaultServiceError::CorruptState);
+            }
+            transaction.execute(
+                "DELETE FROM blind_vault_lease_tombstones
+                 WHERE lease_id = ?1 AND expires_at_ms <= ?2",
+                params![&request.lease_id[..], now],
+            )?;
+            transaction.execute(
+                "INSERT INTO blind_vault_lease_tombstones
+                 (lease_id, request_id, admin_verifying_key, retired_at_ms,
+                  request_commitment, deleted_object_count,
+                  deleted_ciphertext_bytes, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &request.lease_id[..],
+                    &request.request_id[..],
+                    &authenticated_admin_key[..],
+                    now,
+                    &request_commitment[..],
+                    sqlite_i64(deleted_usage.object_count)?,
+                    sqlite_i64(deleted_usage.ciphertext_bytes)?,
+                    tombstone_expiry,
+                ],
+            )?;
+            let deleted = transaction.execute(
+                "DELETE FROM blind_vault_leases WHERE lease_id = ?1",
+                params![&request.lease_id[..]],
+            )?;
+            if deleted != 1 {
+                return Err(BlindVaultServiceError::LeaseConflict);
+            }
+            LeaseRetirementRow {
+                request_id: request.request_id,
+                admin_verifying_key: authenticated_admin_key,
+                request_commitment,
+                retired_at_ms: now_ms,
+                deleted_object_count: deleted_usage.object_count,
+                deleted_ciphertext_bytes: deleted_usage.ciphertext_bytes,
+            }
+        } else {
+            let retired = load_active_lease_retirement(&transaction, &request.lease_id, now_ms)?
+                .ok_or(BlindVaultServiceError::LeaseNotFound)?;
+            if retired.admin_verifying_key != authenticated_admin_key
+                || retired.request_id != request.request_id
+                || retired.request_commitment != request_commitment
+            {
+                return Err(BlindVaultServiceError::RequestConflict);
+            }
+            retired
+        };
+        transaction.commit()?;
+
+        let mut receipt = BlindVaultLeaseRetiredReceipt::new(
+            request,
+            retirement.retired_at_ms,
+            retirement.deleted_object_count,
+            retirement.deleted_ciphertext_bytes,
+            self.node_identity.public_key_bytes(),
+        );
+        receipt.sign(&self.node_identity)?;
+        Ok(receipt)
+    }
+
     /// Removes a bounded number of expired rows and repairs lease usage inside
     /// one immediate transaction.
     pub fn run_cleanup(
@@ -1297,6 +1524,14 @@ impl BlindVaultService {
              )",
             params![now, CLEANUP_TOMBSTONE_BATCH as i64],
         )?;
+        let expired_lease_tombstones = transaction.execute(
+            "DELETE FROM blind_vault_lease_tombstones
+             WHERE lease_id IN (
+                SELECT lease_id FROM blind_vault_lease_tombstones
+                WHERE expires_at_ms <= ?1 LIMIT ?2
+             )",
+            params![now, CLEANUP_TOMBSTONE_BATCH as i64],
+        )?;
         let expired_admission_spends = transaction.execute(
             "DELETE FROM blind_vault_admission_spends
              WHERE token_id IN (
@@ -1311,6 +1546,7 @@ impl BlindVaultService {
             objects_removed: expired_objects.len() as u64,
             leases_removed: expired_leases.len() as u64,
             tombstones_removed: expired_tombstones as u64,
+            lease_tombstones_removed: expired_lease_tombstones as u64,
             admission_spends_removed: expired_admission_spends as u64,
         })
     }
@@ -1335,6 +1571,11 @@ impl BlindVaultService {
             params![now],
             |row| row.get(0),
         )?;
+        let lease_tombstones: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM blind_vault_lease_tombstones WHERE expires_at_ms > ?1",
+            params![now],
+            |row| row.get(0),
+        )?;
         let retained_admission_spends: i64 = connection.query_row(
             "SELECT COUNT(*) FROM blind_vault_admission_spends WHERE expires_at_ms > ?1",
             params![now],
@@ -1346,6 +1587,7 @@ impl BlindVaultService {
             live_objects: non_negative_u64(live_objects)?,
             live_ciphertext_bytes: non_negative_u64(live_bytes)?,
             tombstones: non_negative_u64(tombstones)?,
+            lease_tombstones: non_negative_u64(lease_tombstones)?,
             retained_admission_spends: non_negative_u64(retained_admission_spends)?,
         })
     }
@@ -1712,6 +1954,12 @@ struct LeaseRuntimeRow {
     byte_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeaseObjectUsage {
+    object_count: u64,
+    ciphertext_bytes: u64,
+}
+
 #[derive(Debug)]
 struct ExistingObjectRow {
     request_id: [u8; 16],
@@ -1727,6 +1975,22 @@ struct ExpiredObjectRow {
     object_id: Vec<u8>,
     ciphertext_commitment: Vec<u8>,
     ciphertext_bytes: i64,
+}
+
+/// Bounded durable state retained only for exact retirement retries.
+#[derive(Debug)]
+struct LeaseRetirementRow {
+    request_id: [u8; 16],
+    admin_verifying_key: [u8; 32],
+    request_commitment: [u8; 32],
+    retired_at_ms: u64,
+    deleted_object_count: u64,
+    deleted_ciphertext_bytes: u64,
+}
+
+enum LeaseRetirementAuthoritySnapshot {
+    Live { admin_verifying_key: [u8; 32] },
+    Retired(LeaseRetirementRow),
 }
 
 fn init_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -1773,6 +2037,19 @@ fn init_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_blind_vault_tombstones_expiry
           ON blind_vault_tombstones(expires_at_ms);
+
+        CREATE TABLE IF NOT EXISTS blind_vault_lease_tombstones (
+            lease_id                 BLOB PRIMARY KEY CHECK(length(lease_id) = 32),
+            request_id               BLOB NOT NULL CHECK(length(request_id) = 16),
+            admin_verifying_key      BLOB NOT NULL CHECK(length(admin_verifying_key) = 32),
+            retired_at_ms            INTEGER NOT NULL CHECK(retired_at_ms >= 0),
+            request_commitment       BLOB NOT NULL CHECK(length(request_commitment) = 32),
+            deleted_object_count     INTEGER NOT NULL CHECK(deleted_object_count >= 0),
+            deleted_ciphertext_bytes INTEGER NOT NULL CHECK(deleted_ciphertext_bytes >= 0),
+            expires_at_ms            INTEGER NOT NULL CHECK(expires_at_ms > retired_at_ms)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_blind_vault_lease_tombstones_expiry
+          ON blind_vault_lease_tombstones(expires_at_ms);
 
         CREATE TABLE IF NOT EXISTS blind_vault_admission_spends (
             token_id       BLOB PRIMARY KEY CHECK(length(token_id) = 32),
@@ -1925,6 +2202,69 @@ fn load_lease_runtime(
             byte_count: non_negative_u64(bytes)?,
         })
     })
+    .transpose()
+}
+
+fn load_lease_object_usage(
+    connection: &Connection,
+    lease_id: &[u8; 32],
+) -> Result<LeaseObjectUsage, BlindVaultServiceError> {
+    let (object_count, ciphertext_bytes): (i64, i64) = connection.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(length(ciphertext)), 0)
+         FROM blind_vault_objects WHERE lease_id = ?1",
+        params![&lease_id[..]],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(LeaseObjectUsage {
+        object_count: non_negative_u64(object_count)?,
+        ciphertext_bytes: non_negative_u64(ciphertext_bytes)?,
+    })
+}
+
+fn load_active_lease_retirement(
+    connection: &Connection,
+    lease_id: &[u8; 32],
+    now_ms: u64,
+) -> Result<Option<LeaseRetirementRow>, BlindVaultServiceError> {
+    let now = sqlite_i64(now_ms)?;
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64)> = connection
+        .query_row(
+            "SELECT request_id, admin_verifying_key, request_commitment, retired_at_ms,
+                    deleted_object_count, deleted_ciphertext_bytes
+             FROM blind_vault_lease_tombstones
+             WHERE lease_id = ?1 AND expires_at_ms > ?2",
+            params![&lease_id[..], now],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(
+            request_id,
+            admin_key,
+            request_commitment,
+            retired_at,
+            object_count,
+            ciphertext_bytes,
+        )| {
+            Ok(LeaseRetirementRow {
+                request_id: fixed_array(&request_id)?,
+                admin_verifying_key: fixed_array(&admin_key)?,
+                request_commitment: fixed_array(&request_commitment)?,
+                retired_at_ms: non_negative_u64(retired_at)?,
+                deleted_object_count: non_negative_u64(object_count)?,
+                deleted_ciphertext_bytes: non_negative_u64(ciphertext_bytes)?,
+            })
+        },
+    )
     .transpose()
 }
 

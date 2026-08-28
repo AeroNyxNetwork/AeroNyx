@@ -165,6 +165,8 @@
 //!   targets because the selected target identity is part of the signature.
 //!
 //! ## Last Modified
+//! v0.31.0-OnionBlindVaultLeaseRetire - Added signed negotiation for complete
+//! administration-key lease retirement over fixed-size onion replies
 //! v0.30.0-OnionBlindVaultPutReceipt - Added signed negotiation for anonymous
 //! ciphertext writes returning request-bound storage receipts
 //! v0.29.0-OnionBlindLeaseAdmission - Added signed negotiation for RFC 9474
@@ -448,11 +450,18 @@ pub enum NodeProtocolFeature {
     /// remains available under its existing purpose; clients request this
     /// feature only when they require cryptographic custody evidence.
     OnionBlindVaultPutReceiptV1,
+    /// The node accepts administration-key retirement of a complete Blind
+    /// Vault lease and returns a request-bound signed aggregate receipt.
+    ///
+    /// [ONION-BLIND-VAULT-LEASE-RETIRE 2026-08-28 by Codex] This token gates
+    /// destructive lease-wide mutation independently from generic reply and
+    /// object-deletion support during rolling upgrades.
+    OnionBlindVaultLeaseRetireV1,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::BlindRelayFailureReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
         Self::DirectPeerRelayAuthV2,
@@ -461,6 +470,7 @@ impl NodeProtocolFeature {
         Self::OnionReplyV1,
         Self::OnionBlindLeaseAdmissionV1,
         Self::OnionBlindVaultPutReceiptV1,
+        Self::OnionBlindVaultLeaseRetireV1,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -475,6 +485,7 @@ impl NodeProtocolFeature {
             Self::OnionReplyV1 => "anpf1-or1",
             Self::OnionBlindLeaseAdmissionV1 => "anpf1-obla1",
             Self::OnionBlindVaultPutReceiptV1 => "anpf1-obpr1",
+            Self::OnionBlindVaultLeaseRetireV1 => "anpf1-oblr1",
         }
     }
 }
@@ -4041,6 +4052,7 @@ mod tests {
         let onion_reply = NodeProtocolFeature::OnionReplyV1;
         let onion_blind_admission = NodeProtocolFeature::OnionBlindLeaseAdmissionV1;
         let onion_put_receipt = NodeProtocolFeature::OnionBlindVaultPutReceiptV1;
+        let onion_lease_retire = NodeProtocolFeature::OnionBlindVaultLeaseRetireV1;
         let descriptor = descriptor_for(&identity).with_protocol_features([
             purpose_receipt,
             failure_receipt,
@@ -4050,13 +4062,14 @@ mod tests {
             onion_reply,
             onion_blind_admission,
             onion_put_receipt,
+            onion_lease_retire,
             purpose_receipt,
         ]);
 
         assert_eq!(descriptor.schema_version, NODE_DESCRIPTOR_SCHEMA_VERSION);
         assert_eq!(
             descriptor.software_version,
-            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-dprtb3.anpf1-obla1.anpf1-obpr1.anpf1-or1.anpf1-pbdr2"
+            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-dprtb3.anpf1-obla1.anpf1-oblr1.anpf1-obpr1.anpf1-or1.anpf1-pbdr2"
         );
         assert!(descriptor.advertises_protocol_feature(failure_receipt));
         assert!(descriptor.advertises_protocol_feature(purpose_receipt));
@@ -4066,6 +4079,7 @@ mod tests {
         assert!(descriptor.advertises_protocol_feature(onion_reply));
         assert!(descriptor.advertises_protocol_feature(onion_blind_admission));
         assert!(descriptor.advertises_protocol_feature(onion_put_receipt));
+        assert!(descriptor.advertises_protocol_feature(onion_lease_retire));
 
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
         let encoded = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {

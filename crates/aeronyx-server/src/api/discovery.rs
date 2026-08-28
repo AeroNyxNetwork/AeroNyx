@@ -143,6 +143,12 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.54.0-OnionLeaseRetireTerminalContract - Added feature-gated complete
+//! lease retirement through encrypted terminal replies
+//! v0.53.0-OnionPutReceiptTerminalContract - Added feature-gated anonymous
+//! writes with terminal-signed encrypted receipts
+//! v0.52.0-OnionBlindAdmissionTerminalContract - Added feature-gated blind
+//! lease admission through encrypted terminal replies
 //! v0.51.0-OnionDeleteTerminalContract - Added signed reply-capable anonymous
 //! deletion terminal admission
 //! v0.50.0-OnionReplyTerminalContract - Require signed reply-protocol support
@@ -654,6 +660,15 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
+                    ]
+                }
+                Some(OnionRoutePurpose::BlindVaultLeaseRetire) => {
+                    // [ONION-BLIND-VAULT-LEASE-RETIRE 2026-08-28 by Codex]
+                    // Destructive lease-wide mutation requires an exact signed
+                    // workload feature in addition to the generic reply path.
+                    &[
+                        NodeProtocolFeature::OnionReplyV1,
+                        NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,
                     ]
                 }
                 _ => &[],

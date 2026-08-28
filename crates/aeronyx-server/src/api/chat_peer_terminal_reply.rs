@@ -11,8 +11,8 @@
 //! - Accepts one decoded onion reply carrier at a terminal node.
 //! - Restricts inline v1 recovery to one 4 KiB-class Blind Vault object page.
 //! - Executes immutable writes, capability-authenticated recovery, signed
-//!   administration-key deletion, or blind-issued lease admission without
-//!   exposing any request to middle relays.
+//!   object deletion or complete lease retirement, and blind-issued admission
+//!   without exposing any request to middle relays.
 //! - Signs the recovery page, seals it to the source reply key, and returns
 //!   only fixed-size opaque base64 bytes to the relay orchestrator.
 //! - Maps internal failures to coarse retry classes without retaining secrets.
@@ -36,7 +36,9 @@
 //! - Keep node fan-out out of this module; clients choose unrelated replicas
 //!   and routes so one node cannot reconstruct a logical replica set.
 //!
-//! Last Modified: v1.3.0-BlindVaultInlinePutReceipt - Added anonymous writes
+//! Last Modified: v1.4.0-BlindVaultLeaseRetirement - Added complete anonymous
+//! lease retirement with encrypted terminal-signed aggregate receipts.
+//! v1.3.0-BlindVaultInlinePutReceipt - Added anonymous writes
 //! with encrypted terminal-signed storage receipts and capacity classification.
 //! v1.2.0-BlindVaultInlineAdmission - Added RFC 9474 blind-issued
 //! lease admission with a terminal-signed, request-bound encrypted receipt.
@@ -55,8 +57,9 @@ use aeronyx_core::protocol::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::services::{
-    BlindVaultAdmissionFailureClass, BlindVaultDeleteFailureClass, BlindVaultPullFailureClass,
-    BlindVaultPutFailureClass, BlindVaultService, BlindVaultServiceError,
+    BlindVaultAdmissionFailureClass, BlindVaultDeleteFailureClass,
+    BlindVaultLeaseRetireFailureClass, BlindVaultPullFailureClass, BlindVaultPutFailureClass,
+    BlindVaultService, BlindVaultServiceError,
 };
 
 /// Coarse terminal-reply failure class consumed by blind-relay orchestration.
@@ -136,6 +139,14 @@ pub(super) fn execute_blind_vault_inline_reply(
             let encoded = encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseAccepted(receipt))
                 .map_err(|_| TerminalReplyFailure::Unavailable)?;
             (OnionRoutePurpose::BlindVaultLeaseAdmission, encoded)
+        }
+        BlindVaultFrame::LeaseRetire(retire_request) => {
+            let receipt = vault
+                .retire_lease(&retire_request, now_ms)
+                .map_err(classify_lease_retire_failure)?;
+            let encoded = encode_blind_vault_frame(&BlindVaultFrame::LeaseRetiredReceipt(receipt))
+                .map_err(|_| TerminalReplyFailure::Unavailable)?;
+            (OnionRoutePurpose::BlindVaultLeaseRetire, encoded)
         }
         _ => return Err(TerminalReplyFailure::Rejected),
     };
@@ -246,5 +257,15 @@ fn classify_admission_failure(error: BlindVaultServiceError) -> TerminalReplyFai
     match error.admission_failure_class() {
         BlindVaultAdmissionFailureClass::Rejected => TerminalReplyFailure::Rejected,
         BlindVaultAdmissionFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
+    }
+}
+
+fn classify_lease_retire_failure(error: BlindVaultServiceError) -> TerminalReplyFailure {
+    // [BLIND-VAULT-LEASE-RETIRE-FAILURE 2026-08-28 by Codex] Lease existence,
+    // expiry, prior retirement, authority, and request conflicts collapse into
+    // one permanent rejection outside the encrypted terminal boundary.
+    match error.lease_retire_failure_class() {
+        BlindVaultLeaseRetireFailureClass::Rejected => TerminalReplyFailure::Rejected,
+        BlindVaultLeaseRetireFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
     }
 }
