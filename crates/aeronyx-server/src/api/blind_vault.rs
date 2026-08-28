@@ -39,7 +39,9 @@
 //!   handler; that would apply backpressure after attacker-controlled buffering.
 //! - V1 admission is a signed one-time bearer credential, not blind issuance.
 //!
-//! Last Modified: v1.5.0-BlindVaultNodeCapacity - Maps node-wide and per-lease
+//! Last Modified: v1.6.0-BlindVaultDiskReserve - Keeps a failed local physical
+//! capacity probe inside the stable service-unavailable response.
+//! v1.5.0-BlindVaultNodeCapacity - Maps node-wide and per-lease
 //! capacity failures to the same stable public response.
 //! v1.4.0-BlindVaultIssuerAuthority - Kept authority-update
 //! failures inside the coarse non-client service bucket.
@@ -423,8 +425,11 @@ fn binary_response(status: StatusCode, frame: BlindVaultFrame) -> Result<Respons
 
 fn map_service_error(error: BlindVaultServiceError) -> ApiFailure {
     match error {
+        // [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] A failed host probe
+        // reveals no client-actionable state and must remain a coarse outage.
         BlindVaultServiceError::Disabled
         | BlindVaultServiceError::AdmissionUnavailable
+        | BlindVaultServiceError::FilesystemCapacityUnavailable
         | BlindVaultServiceError::IssuerDirectoryAuthorityRejected
         | BlindVaultServiceError::IssuerDirectoryUpdateRejected
         | BlindVaultServiceError::IssuerDirectoryRollback

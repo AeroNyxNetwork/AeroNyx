@@ -326,6 +326,10 @@ max_bytes_per_lease = 268435456
 # new ciphertext. Size them below the dedicated volume's operational budget.
 max_live_leases = 100000
 max_total_ciphertext_bytes = 68719476736
+# [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Preserve 2 GiB on the
+# filesystem containing this database. Probe failures reject new admissions
+# and puts, while pull/delete/retire/cleanup remain available for recovery.
+min_free_disk_bytes = 2147483648
 max_pull_objects = 64
 tombstone_ttl_secs = 604800
 mutation_clock_skew_secs = 300

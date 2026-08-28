@@ -26,6 +26,8 @@
 //! - Streaming private inventory commitments over still-live ciphertext rows.
 //! - Transactional per-lease count/byte quotas and bounded expiry cleanup.
 //! - Atomic node-wide live-lease and aggregate ciphertext capacity admission.
+//! - Fail-closed physical disk reserve enforcement through a replaceable host
+//!   capacity probe.
 //! - Stable privacy-safe mutation failure classes for multi-hop retry policy.
 //!
 //! ## Dependencies
@@ -53,6 +55,8 @@
 //!    return only its encrypted terminal-signed aggregate receipt.
 //! 10. Reject new leases or ciphertext before token spend/write when the
 //!    operator's node-wide capacity commitment has been reached.
+//! 11. Preserve the configured database-filesystem reserve while leaving
+//!    recovery, deletion, retirement, and cleanup available under pressure.
 //!
 //! ## Privacy Invariant
 //! This service has no account, wallet, sender, receiver, conversation,
@@ -75,7 +79,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.17.0-BlindVaultNodeCapacity - Added atomic node-wide live
+//! Last Modified: v1.18.0-BlindVaultDiskReserve - Added replaceable physical
+//! capacity observation and fail-closed write watermarks.
+//! v1.17.0-BlindVaultNodeCapacity - Added atomic node-wide live
 //! lease and aggregate ciphertext capacity enforcement and status.
 //! v1.16.0-BlindVaultLeaseInventory - Added streaming,
 //! administration-authorized private encrypted-object inventory commitments.
@@ -116,7 +122,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -146,6 +152,10 @@ use zeroize::Zeroizing;
 
 use crate::config::BlindVaultConfig;
 
+use super::blind_vault_capacity::{
+    BlindVaultFilesystemCapacityProbe, SystemBlindVaultFilesystemCapacityProbe,
+};
+
 type HmacSha256 = Hmac<Sha256>;
 
 const READ_AUTH_KEY_DOMAIN: &[u8] = b"AeroNyx-BlindVault-ReadAuth-Key-v1";
@@ -163,6 +173,10 @@ const CLEANUP_OBJECT_BATCH: usize = 512;
 const CLEANUP_LEASE_BATCH: usize = 128;
 const CLEANUP_TOMBSTONE_BATCH: usize = 512;
 const CLEANUP_ADMISSION_SPEND_BATCH: usize = 512;
+// [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Leave room for SQLite pages,
+// indexes, and transaction metadata in addition to transient WAL/main-file
+// duplication of a newly accepted ciphertext.
+const FILESYSTEM_WRITE_OVERHEAD_BYTES: u64 = 64 * 1024;
 
 /// Common authentication capability for private administration observations.
 ///
@@ -337,6 +351,15 @@ pub struct BlindVaultStatus {
     pub max_total_ciphertext_bytes: u64,
     /// Remaining aggregate ciphertext capacity.
     pub remaining_ciphertext_bytes: u64,
+    /// [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Operator-configured
+    /// physical reserve. Zero means the backward-compatible probe policy is
+    /// disabled.
+    pub min_free_disk_bytes: u64,
+    /// Latest bytes available to this process on the database filesystem.
+    /// `None` means the policy is disabled or the probe could not observe it.
+    pub available_disk_bytes: Option<u64>,
+    /// Whether the physical reserve is disabled or currently satisfied.
+    pub physical_capacity_ready: bool,
     /// Number of retained commitment-only deletion tombstones.
     pub tombstones: u64,
     /// Number of unexpired complete-lease retirement tombstones.
@@ -363,6 +386,9 @@ pub enum BlindVaultServiceError {
     /// Database directory could not be created.
     #[error("blind vault database directory could not be created")]
     Filesystem,
+    /// The enabled filesystem reserve could not be observed safely.
+    #[error("blind vault filesystem capacity is unavailable")]
+    FilesystemCapacityUnavailable,
     /// Lease does not exist.
     #[error("blind vault lease not found")]
     LeaseNotFound,
@@ -549,6 +575,7 @@ impl BlindVaultServiceError {
             Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
+            | Self::FilesystemCapacityUnavailable
             | Self::PullCursorEncryptionFailed
             | Self::AdmissionUnavailable
             | Self::AdmissionConfigurationInvalid
@@ -588,6 +615,7 @@ impl BlindVaultServiceError {
             | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
+            | Self::FilesystemCapacityUnavailable
             | Self::PullCursorEncryptionFailed
             | Self::AdmissionUnavailable
             | Self::AdmissionConfigurationInvalid
@@ -628,6 +656,7 @@ impl BlindVaultServiceError {
             | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
+            | Self::FilesystemCapacityUnavailable
             | Self::PullCursorEncryptionFailed
             | Self::AdmissionUnavailable
             | Self::AdmissionConfigurationInvalid
@@ -668,6 +697,7 @@ impl BlindVaultServiceError {
             Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
+            | Self::FilesystemCapacityUnavailable
             | Self::PullCursorEncryptionFailed
             | Self::AdmissionUnavailable
             | Self::AdmissionConfigurationInvalid
@@ -708,6 +738,7 @@ impl BlindVaultServiceError {
             | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
+            | Self::FilesystemCapacityUnavailable
             | Self::PullCursorEncryptionFailed
             | Self::AdmissionUnavailable
             | Self::AdmissionConfigurationInvalid
@@ -748,6 +779,7 @@ impl BlindVaultServiceError {
             | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
+            | Self::FilesystemCapacityUnavailable
             | Self::PullCursorEncryptionFailed
             | Self::AdmissionUnavailable
             | Self::AdmissionConfigurationInvalid
@@ -788,6 +820,7 @@ impl BlindVaultServiceError {
             | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
+            | Self::FilesystemCapacityUnavailable
             | Self::PullCursorEncryptionFailed
             | Self::AdmissionUnavailable
             | Self::AdmissionConfigurationInvalid
@@ -828,6 +861,7 @@ impl BlindVaultServiceError {
             | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
+            | Self::FilesystemCapacityUnavailable
             | Self::PullCursorEncryptionFailed
             | Self::AdmissionUnavailable
             | Self::AdmissionConfigurationInvalid
@@ -848,6 +882,8 @@ impl BlindVaultServiceError {
 pub struct BlindVaultService {
     config: BlindVaultConfig,
     connection: Mutex<Connection>,
+    filesystem_capacity_probe: Arc<dyn BlindVaultFilesystemCapacityProbe>,
+    filesystem_capacity_path: PathBuf,
     node_identity: IdentityKeyPair,
     read_auth_key: Zeroizing<[u8; 32]>,
     pull_cursor_key: Zeroizing<[u8; 32]>,
@@ -863,14 +899,39 @@ impl BlindVaultService {
         config: BlindVaultConfig,
         node_identity: IdentityKeyPair,
     ) -> Result<Self, BlindVaultServiceError> {
+        Self::new_with_filesystem_capacity_probe(
+            config,
+            node_identity,
+            Arc::new(SystemBlindVaultFilesystemCapacityProbe),
+        )
+    }
+
+    /// Opens the service with an explicit physical-capacity capability.
+    ///
+    /// This constructor keeps production policy testable and permits a future
+    /// container-volume probe without changing Blind Vault transaction logic.
+    pub fn new_with_filesystem_capacity_probe(
+        config: BlindVaultConfig,
+        node_identity: IdentityKeyPair,
+        filesystem_capacity_probe: Arc<dyn BlindVaultFilesystemCapacityProbe>,
+    ) -> Result<Self, BlindVaultServiceError> {
         if !config.enabled {
             return Err(BlindVaultServiceError::Disabled);
         }
-        if let Some(parent) = Path::new(&config.db_path).parent() {
+        let database_path = Path::new(&config.db_path);
+        if let Some(parent) = database_path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|_| BlindVaultServiceError::Filesystem)?;
             }
         }
+        // [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Probe the containing
+        // filesystem, never the database file itself: a first startup may not
+        // have created that file yet. Relative leaf paths belong to `.`.
+        let filesystem_capacity_path = database_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         let connection = Connection::open(&config.db_path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -940,6 +1001,8 @@ impl BlindVaultService {
         Ok(Self {
             config,
             connection: Mutex::new(connection),
+            filesystem_capacity_probe,
+            filesystem_capacity_path,
             node_identity,
             read_auth_key,
             pull_cursor_key,
@@ -947,6 +1010,53 @@ impl BlindVaultService {
             blind_issuer_update_authorities,
             blind_admission_issuers: RwLock::new(blind_admission_issuers),
         })
+    }
+
+    /// Enforces the physical reserve for a capacity-consuming transition.
+    /// Probe errors are unavailable rather than capacity: callers may retry a
+    /// different healthy replica, while this node remains fail-closed.
+    fn ensure_filesystem_capacity(
+        &self,
+        additional_bytes: u64,
+    ) -> Result<(), BlindVaultServiceError> {
+        if self.config.min_free_disk_bytes == 0 {
+            return Ok(());
+        }
+        let transient_payload_bytes = additional_bytes
+            .checked_mul(2)
+            .ok_or(BlindVaultServiceError::NodeCapacityExceeded)?;
+        let required_available = self
+            .config
+            .min_free_disk_bytes
+            .checked_add(transient_payload_bytes)
+            .and_then(|bytes| bytes.checked_add(FILESYSTEM_WRITE_OVERHEAD_BYTES))
+            .ok_or(BlindVaultServiceError::NodeCapacityExceeded)?;
+        let available = self
+            .filesystem_capacity_probe
+            .available_bytes(&self.filesystem_capacity_path)
+            .map_err(|_| BlindVaultServiceError::FilesystemCapacityUnavailable)?;
+        if available < required_available {
+            return Err(BlindVaultServiceError::NodeCapacityExceeded);
+        }
+        Ok(())
+    }
+
+    /// Returns aggregate-only physical capacity state without turning a local
+    /// probe outage into a status-endpoint failure.
+    fn filesystem_capacity_status(&self) -> (Option<u64>, bool) {
+        if self.config.min_free_disk_bytes == 0 {
+            return (None, true);
+        }
+        match self
+            .filesystem_capacity_probe
+            .available_bytes(&self.filesystem_capacity_path)
+        {
+            Ok(available) => (
+                Some(available),
+                available >= self.config.min_free_disk_bytes,
+            ),
+            Err(_) => (None, false),
+        }
     }
 
     /// Returns deterministic, public, non-expired V2 issuer epochs.
@@ -1225,6 +1335,10 @@ impl BlindVaultService {
             self.config.max_live_leases,
             self.config.max_total_ciphertext_bytes,
         )?;
+        // [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] A lease row consumes
+        // little space but admission still stops once the safety watermark is
+        // crossed. Keep this after exact-retry handling and before token spend.
+        self.ensure_filesystem_capacity(0)?;
 
         // [BLIND-VAULT-ADMISSION 2026-07-23 by Codex] V1 raw token IDs and
         // V2 domain-separated spend IDs share one transaction and replay table.
@@ -1446,6 +1560,10 @@ impl BlindVaultService {
             object_bytes,
             self.config.max_total_ciphertext_bytes,
         )?;
+        // [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Preserve the physical
+        // reserve after this ciphertext write. Exact retries returned above,
+        // so a full node can still acknowledge already durable objects.
+        self.ensure_filesystem_capacity(object_bytes)?;
 
         transaction.execute(
             "INSERT INTO blind_vault_objects
@@ -2100,6 +2218,7 @@ impl BlindVaultService {
     /// Returns only node-wide aggregate health information.
     pub fn status(&self, now_ms: u64) -> Result<BlindVaultStatus, BlindVaultServiceError> {
         let now = sqlite_i64(now_ms)?;
+        let (available_disk_bytes, physical_capacity_ready) = self.filesystem_capacity_status();
         let connection = self.connection.lock();
         let live_leases: i64 = connection.query_row(
             "SELECT COUNT(*) FROM blind_vault_leases WHERE expires_at_ms > ?1",
@@ -2157,6 +2276,9 @@ impl BlindVaultService {
                 .config
                 .max_total_ciphertext_bytes
                 .saturating_sub(committed_bytes),
+            min_free_disk_bytes: self.config.min_free_disk_bytes,
+            available_disk_bytes,
+            physical_capacity_ready,
             tombstones: non_negative_u64(tombstones)?,
             lease_tombstones: non_negative_u64(lease_tombstones)?,
             lease_renewals: non_negative_u64(lease_renewals)?,

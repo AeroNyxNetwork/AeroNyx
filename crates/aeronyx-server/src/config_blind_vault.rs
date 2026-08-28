@@ -13,6 +13,8 @@
 //!   admission lifetime, deletion tombstones, and maintenance work.
 //! - Bounds node-wide live lease count and aggregate ciphertext capacity so
 //!   valid anonymous credentials cannot overcommit one replica.
+//! - Optionally preserves an operator-defined physical disk reserve before
+//!   accepting any capacity-consuming write.
 //! - Keeps public routes fail-closed unless at least one V1 Ed25519 issuer,
 //!   static V2 RSA epoch, or V2 update authority is explicitly pinned.
 //! - Keeps signed replica discovery advertisement behind a separate staged
@@ -37,7 +39,9 @@
 //!   replace them with account, wallet, device, or application allowlists.
 //! - Keep byte/count limits finite even on official nodes.
 //!
-//! Last Modified: v1.5.0-BlindVaultNodeCapacity - Added backward-compatible
+//! Last Modified: v1.6.0-BlindVaultDiskReserve - Added backward-compatible,
+//! fail-closed physical disk reserve policy.
+//! v1.5.0-BlindVaultNodeCapacity - Added backward-compatible
 //! node-wide live lease and aggregate ciphertext capacity policy.
 //! v1.4.0-BlindVaultReplicaCapability - Added a default-off
 //! signed discovery rollout gate with fail-closed prerequisite validation.
@@ -69,6 +73,7 @@ const MAX_OBJECTS_PER_LEASE_HARD: u64 = 1_000_000;
 const MAX_BYTES_PER_LEASE_HARD: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_LIVE_LEASES_HARD: u64 = 10_000_000;
 const MAX_TOTAL_CIPHERTEXT_BYTES_HARD: u64 = 16 * 1024 * 1024 * 1024 * 1024;
+const MAX_MIN_FREE_DISK_BYTES_HARD: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const MAX_PULL_OBJECTS_HARD: usize = 256;
 const LARGEST_PROTOCOL_OBJECT_BYTES: u64 = 256 * 1024;
 const MAX_ADMISSION_ISSUERS: usize = 16;
@@ -155,6 +160,12 @@ pub struct BlindVaultConfig {
     /// Maximum aggregate ciphertext bytes retained by lease objects.
     #[serde(default = "BlindVaultConfig::default_max_total_ciphertext_bytes")]
     pub max_total_ciphertext_bytes: u64,
+    /// [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Minimum filesystem bytes
+    /// that must remain available after a new lease or ciphertext write. Zero
+    /// preserves compatibility by disabling the physical probe; production
+    /// operators should set an explicit reserve for the database volume.
+    #[serde(default)]
+    pub min_free_disk_bytes: u64,
     /// Maximum objects returned by one internal pull page.
     #[serde(default = "BlindVaultConfig::default_max_pull_objects")]
     pub max_pull_objects: usize,
@@ -279,6 +290,15 @@ impl BlindVaultConfig {
             return Err(invalid(
                 "max_total_ciphertext_bytes",
                 "must cover one complete lease and not exceed 16 TiB",
+            ));
+        }
+        if self.min_free_disk_bytes != 0
+            && (self.min_free_disk_bytes < LARGEST_PROTOCOL_OBJECT_BYTES
+                || self.min_free_disk_bytes > MAX_MIN_FREE_DISK_BYTES_HARD)
+        {
+            return Err(invalid(
+                "min_free_disk_bytes",
+                "must be zero (disabled) or between 256 KiB and 16 TiB",
             ));
         }
         if self.max_pull_objects == 0 || self.max_pull_objects > MAX_PULL_OBJECTS_HARD {
@@ -499,6 +519,7 @@ impl Default for BlindVaultConfig {
             max_bytes_per_lease: Self::default_max_bytes_per_lease(),
             max_live_leases: Self::default_max_live_leases(),
             max_total_ciphertext_bytes: Self::default_max_total_ciphertext_bytes(),
+            min_free_disk_bytes: 0,
             max_pull_objects: Self::default_max_pull_objects(),
             tombstone_ttl_secs: Self::default_tombstone_ttl_secs(),
             mutation_clock_skew_secs: Self::default_mutation_clock_skew_secs(),

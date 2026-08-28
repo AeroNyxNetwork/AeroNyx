@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.70.0-BackupAuditMaintenanceCoordinator
+// Version: 0.73.0-BlindVaultFilesystemCapacity
 //
 // Modification Reason:
+//   [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Registered and re-exported
+//   the replaceable Blind Vault filesystem-capacity capability.
 //   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Registered the
 //   composed audit verification, recovery, rotation, and append coordinator.
 //   [CHAT-BACKUP-AUDIT-ANCHOR-DOMAIN 2026-08-28 by Codex] Registered the pure
@@ -117,6 +119,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.73.0-BlindVaultFilesystemCapacity - Registered physical capacity probe
 //   v0.72.0-BlindVaultDeleteFailureClass - Exported deletion retry semantics
 //   v0.71.0-BlindVaultPullFailureClass - Exported recovery retry semantics
 //   v0.70.0-BackupAuditMaintenanceCoordinator - Registered audit maintenance
@@ -208,6 +211,10 @@
 //   v1.0.0-BlindVaultService - Added anonymous encrypted-object storage
 
 pub mod blind_vault;
+// [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Keep host filesystem
+// inspection behind a replaceable capability instead of embedding platform
+// calls in the storage transaction service.
+mod blind_vault_capacity;
 pub mod chat_relay;
 mod chat_relay_backup_artifact;
 mod chat_relay_backup_audit;
@@ -290,6 +297,10 @@ pub use blind_vault::{
     BlindVaultLeaseStatusFailureClass, BlindVaultPullFailureClass, BlindVaultPullPage,
     BlindVaultPutFailureClass, BlindVaultService, BlindVaultServiceError, BlindVaultStatus,
     BlindVaultStoredObject, SharedBlindVaultService,
+};
+pub use blind_vault_capacity::{
+    BlindVaultFilesystemCapacityProbe, BlindVaultFilesystemCapacityProbeError,
+    SystemBlindVaultFilesystemCapacityProbe,
 };
 // [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Expose only aggregate,
 // host-local maintenance contracts and authenticated path-free plans; artifact
