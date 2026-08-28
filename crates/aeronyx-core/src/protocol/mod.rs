@@ -28,6 +28,9 @@
 //!   backward-compatible node wire-feature negotiation.
 //! - [ONION-REPLY 2026-08-28 by Codex] Added a workload-neutral, fixed-size
 //!   encrypted return carrier for anonymous terminal recovery responses.
+//! - [BLIND-VAULT-REPLICA-WORKFLOW 2026-08-28 by Codex] Added source-owned,
+//!   client-authorized replica execution with verified evidence and bounded
+//!   retries; this local state is never a discovery or ledger payload.
 //!
 //! ## Main Functionality
 //!
@@ -39,6 +42,7 @@
 //! - [`chat`]: 🌟 Chat Relay E2E envelope and media pointer types
 //! - [`discovery`]: Signed node descriptors and public capability hints
 //! - [`blind_vault`]: Anonymous durable ciphertext objects and node receipts
+//! - [`blind_vault_replica_workflow`]: Source-owned replica execution state
 //!
 //! ### Message Types
 //! - `ClientHello`: Initial handshake from client
@@ -64,6 +68,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.5.0-BlindVaultReplicaWorkflow - Re-exported source-owned, evidence-gated
+//! replica execution domain types without changing the public wire protocol
 //! v1.4.0-OnionBlindVaultLifecycle - Re-exported single-use anonymous recovery
 //! and deletion sessions with request-bound encrypted reply verification
 //! v0.1.0 - Initial protocol definitions
@@ -81,6 +87,7 @@
 
 pub mod auth;
 pub mod blind_vault;
+pub mod blind_vault_replica_workflow;
 pub mod chat;
 pub mod codec;
 pub mod discovery;
@@ -121,6 +128,13 @@ pub use blind_vault::{
     BlindVaultStoredReceipt, BlindVaultVerifiedReplicaInventory,
     BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_PROTOCOL_VERSION, MAX_BLIND_VAULT_FRAME_BYTES,
     MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
+};
+pub use blind_vault_replica_workflow::{
+    BlindVaultReplicaActionEvidence, BlindVaultReplicaConvergence,
+    BlindVaultReplicaDispatchFailure, BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase,
+    BlindVaultReplicaExecutionPolicy, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
+    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultVerifiedProvisionedReplica, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
 pub use codec::{Codec, ProtocolCodec};

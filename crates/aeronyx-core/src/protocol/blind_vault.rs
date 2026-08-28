@@ -67,7 +67,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.15.0-BlindVaultReplicaPlanner - Added source-owned,
+//! Last Modified: v1.16.0-BlindVaultReplicaWorkflow - Exposed local-only
+//! manifest expectation fields for exact, stale-plan-safe execution evidence.
+//! v1.15.0-BlindVaultReplicaPlanner - Added source-owned,
 //! manifest-bound replica evidence verification and lifecycle planning.
 //! v1.14.0-BlindVaultOnionLeaseInventory - Added streaming,
 //! private terminal-signed encrypted-object inventory commitments.
@@ -2962,6 +2964,28 @@ impl BlindVaultVerifiedReplicaInventory {
     #[must_use]
     pub const fn matches_expected_manifest(&self) -> bool {
         self.matches_expected_manifest
+    }
+
+    /// Source-owned expected live object count used to bind repair evidence to
+    /// the exact planner generation.
+    #[must_use]
+    pub const fn expected_object_count(&self) -> u64 {
+        self.expected_object_count
+    }
+
+    /// Source-owned expected padded ciphertext bytes for this replica only.
+    #[must_use]
+    pub const fn expected_ciphertext_bytes(&self) -> u64 {
+        self.expected_ciphertext_bytes
+    }
+
+    /// Source-owned per-replica manifest root. This remains local-only and is
+    /// never serialized into discovery or public ledger state.
+    // [BLIND-VAULT-REPLICA-WORKFLOW 2026-08-28 by Codex] Reconciliation must
+    // bind to the planner's exact expectation, not merely the node and lease.
+    #[must_use]
+    pub const fn expected_inventory_commitment(&self) -> [u8; 32] {
+        self.expected_inventory_commitment
     }
 }
 
