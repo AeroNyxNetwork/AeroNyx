@@ -32,7 +32,9 @@
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //!
-//! Last Modified: v1.1.0-BlindVaultFailureDisposition - Mapped authenticated
+//! Last Modified: v1.2.0-BlindVaultReplacementRetirement - Required verified
+//! terminal retirement evidence before a replacement action can complete.
+//! v1.1.0-BlindVaultFailureDisposition - Mapped authenticated
 //! terminal failures into explicit retryable and permanent workflow states.
 //! v1.0.0-BlindVaultReplicaWorkflow - Initial client-authorized,
 //! evidence-gated replica execution state machine.
@@ -265,6 +267,38 @@ pub struct BlindVaultVerifiedProvisionedReplica {
     pub(super) observed_at_ms: u64,
 }
 
+/// Verified terminal retirement of one complete old replica lease.
+///
+/// Private fields prevent a caller from marking replacement complete using a
+/// locally invented node or lease identifier. Construction is available only
+/// through the receipt-verifying implementation in `evidence.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultVerifiedRetiredReplica {
+    pub(super) node_id: [u8; 32],
+    pub(super) lease_id: [u8; 32],
+    pub(super) retired_at_ms: u64,
+}
+
+impl BlindVaultVerifiedRetiredReplica {
+    /// Descriptor identity that signed the complete retirement receipt.
+    #[must_use]
+    pub const fn node_id(&self) -> [u8; 32] {
+        self.node_id
+    }
+
+    /// Replica-local lease proven retired by the terminal.
+    #[must_use]
+    pub const fn lease_id(&self) -> [u8; 32] {
+        self.lease_id
+    }
+
+    /// Terminal-signed durable retirement time.
+    #[must_use]
+    pub const fn retired_at_ms(&self) -> u64 {
+        self.retired_at_ms
+    }
+}
+
 impl BlindVaultVerifiedProvisionedReplica {
     /// Newly provisioned terminal descriptor identity.
     #[must_use]
@@ -388,6 +422,9 @@ pub enum BlindVaultReplicaWorkflowError {
     /// Terminal evidence exceeded the allowed future clock skew.
     #[error("blind vault replica evidence is from the future")]
     EvidenceFromFuture,
+    /// Replacement completion omitted a verified old-lease retirement receipt.
+    #[error("blind vault replica replacement requires terminal retirement evidence")]
+    RetirementEvidenceRequired,
     /// Receipt terminal descriptor identity was not valid Ed25519.
     #[error("blind vault replica terminal identity is invalid")]
     InvalidTerminalIdentity,

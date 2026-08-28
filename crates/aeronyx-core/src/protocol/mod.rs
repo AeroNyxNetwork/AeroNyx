@@ -135,7 +135,8 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaDispatchFailure, BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase,
     BlindVaultReplicaExecutionPolicy, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
     BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
-    BlindVaultVerifiedProvisionedReplica, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
+    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
+    MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
 pub use codec::{Codec, ProtocolCodec};

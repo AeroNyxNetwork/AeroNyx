@@ -15,12 +15,13 @@ use crate::crypto::keys::IdentityPublicKey;
 use super::{
     require_timestamp, BlindVaultReplicaActionEvidence, BlindVaultReplicaActionEvidenceKind,
     BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
+    BlindVaultVerifiedRetiredReplica,
 };
 use crate::protocol::blind_vault::{
     BlindVaultBlindLeaseAcceptedReceipt, BlindVaultBlindLeaseAdmissionRequest,
     BlindVaultBlindLeaseRenewalRequest, BlindVaultBlindLeaseRenewedReceipt,
-    BlindVaultReplicaAction, BlindVaultVerifiedReplicaInventory,
-    MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
+    BlindVaultLeaseRetireRequest, BlindVaultLeaseRetiredReceipt, BlindVaultReplicaAction,
+    BlindVaultVerifiedReplicaInventory, MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
 };
 
 impl BlindVaultVerifiedProvisionedReplica {
@@ -65,6 +66,43 @@ impl BlindVaultVerifiedProvisionedReplica {
             lease_id: receipt.lease_id,
             accepted_at_ms: receipt.accepted_at_ms,
             observed_at_ms: inventory.observed_at_ms(),
+        })
+    }
+}
+
+impl BlindVaultVerifiedRetiredReplica {
+    /// Verifies one exact old-lease retirement against the intended terminal.
+    ///
+    /// [BLIND-VAULT-REPLACEMENT-RETIREMENT 2026-08-28 by Codex] A replacement
+    /// is not complete merely because a new replica exists. The old terminal
+    /// must sign an exact-request receipt proving its complete lease was
+    /// durably retired before the workflow accepts replacement evidence.
+    pub fn verify(
+        expected_node_id: [u8; 32],
+        request: &BlindVaultLeaseRetireRequest,
+        receipt: &BlindVaultLeaseRetiredReceipt,
+        now_ms: u64,
+        maximum_future_clock_skew_ms: u64,
+    ) -> Result<Self, BlindVaultReplicaWorkflowError> {
+        require_timestamp(now_ms)?;
+        let terminal_key = IdentityPublicKey::from_bytes(&expected_node_id)
+            .map_err(|_| BlindVaultReplicaWorkflowError::InvalidTerminalIdentity)?;
+        receipt.validate_and_verify(&terminal_key)?;
+        if receipt.node_id != expected_node_id
+            || receipt.lease_id != request.lease_id
+            || !receipt.matches_retire(request)
+            || receipt
+                .retired_at_ms
+                .saturating_add(maximum_future_clock_skew_ms)
+                < request.requested_at_ms
+        {
+            return Err(BlindVaultReplicaWorkflowError::EvidenceRequestMismatch);
+        }
+        require_not_too_far_in_future(receipt.retired_at_ms, now_ms, maximum_future_clock_skew_ms)?;
+        Ok(Self {
+            node_id: receipt.node_id,
+            lease_id: receipt.lease_id,
+            retired_at_ms: receipt.retired_at_ms,
         })
     }
 }
@@ -134,8 +172,13 @@ impl BlindVaultReplicaActionEvidence {
         })
     }
 
-    /// Confirms replacement only after the new independently wrapped replica
-    /// has verified admission and a matching live manifest.
+    /// Legacy source-compatible replacement entry point.
+    ///
+    /// [BLIND-VAULT-REPLACEMENT-RETIREMENT 2026-08-28 by Codex] The previous
+    /// contract could mark replacement complete after provisioning the new
+    /// replica while leaving the old lease live. Existing callers continue to
+    /// compile, but this unsafe half-complete transition now fails closed. Use
+    /// [`Self::replica_replaced_with_retirement`] with verified terminal proof.
     pub fn replica_replaced(
         replaced_node_id: [u8; 32],
         replaced_lease_id: [u8; 32],
@@ -143,18 +186,32 @@ impl BlindVaultReplicaActionEvidence {
         now_ms: u64,
     ) -> Result<Self, BlindVaultReplicaWorkflowError> {
         require_timestamp(now_ms)?;
-        if replaced_node_id == [0; 32]
-            || replaced_lease_id == [0; 32]
-            || replacement.node_id == replaced_node_id
-            || replacement.lease_id == replaced_lease_id
+        let _ = (replaced_node_id, replaced_lease_id, replacement);
+        Err(BlindVaultReplicaWorkflowError::RetirementEvidenceRequired)
+    }
+
+    /// Confirms replacement only after both sides of the lifecycle transition.
+    ///
+    /// The new independently wrapped replica must have verified admission and
+    /// a matching live manifest, while the old terminal must have signed an
+    /// exact-request complete lease-retirement receipt.
+    pub fn replica_replaced_with_retirement(
+        replacement: BlindVaultVerifiedProvisionedReplica,
+        retirement: BlindVaultVerifiedRetiredReplica,
+        now_ms: u64,
+    ) -> Result<Self, BlindVaultReplicaWorkflowError> {
+        require_timestamp(now_ms)?;
+        if replacement.node_id == retirement.node_id
+            || replacement.lease_id == retirement.lease_id
             || replacement.observed_at_ms > now_ms
+            || retirement.retired_at_ms > now_ms
         {
             return Err(BlindVaultReplicaWorkflowError::EvidenceActionMismatch);
         }
         Ok(Self {
             kind: BlindVaultReplicaActionEvidenceKind::ReplicaReplaced {
-                replaced_node_id,
-                replaced_lease_id,
+                replaced_node_id: retirement.node_id,
+                replaced_lease_id: retirement.lease_id,
             },
             verified_at_ms: now_ms,
         })
