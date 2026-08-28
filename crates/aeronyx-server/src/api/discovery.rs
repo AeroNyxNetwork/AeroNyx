@@ -143,6 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.51.0-OnionDeleteTerminalContract - Added signed reply-capable anonymous
+//! deletion terminal admission
 //! v0.50.0-OnionReplyTerminalContract - Require signed reply-protocol support
 //! when selecting anonymous Blind Vault recovery terminals
 //! v0.49.0-RecoveryAnchorStatus - Added exact-generation recovery observability
@@ -624,7 +626,9 @@ impl OnionTerminalRequirement {
         Self {
             capability: purpose.and_then(OnionRoutePurpose::specialized_terminal_capability),
             protocol_feature: match purpose {
-                Some(OnionRoutePurpose::BlindVaultPull) => Some(NodeProtocolFeature::OnionReplyV1),
+                Some(OnionRoutePurpose::BlindVaultPull | OnionRoutePurpose::BlindVaultDelete) => {
+                    Some(NodeProtocolFeature::OnionReplyV1)
+                }
                 _ => None,
             },
         }
@@ -5813,7 +5817,12 @@ mod tests {
         );
         assert_eq!(
             parsed["protocol_features"]["onion_route_purposes"],
-            serde_json::json!(["message_relay", "blind_vault_put", "blind_vault_pull"])
+            serde_json::json!([
+                "message_relay",
+                "blind_vault_put",
+                "blind_vault_pull",
+                "blind_vault_delete"
+            ])
         );
         assert_eq!(
             parsed["recovery_anchor"]["contract_version"].as_str(),

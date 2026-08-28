@@ -323,6 +323,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.68.0-OnionDeleteReply - Dispatch signed Blind Vault deletion requests
+//! and propagate their fixed-size encrypted terminal receipts
 //! v0.67.0-OnionTerminalReply - Propagate fixed-size encrypted terminal
 //! responses through durable blind-relay acknowledgements
 //! v0.66.0-BlindForwardObserver - Compose aggregate forwarding observations
@@ -504,7 +506,7 @@ use super::chat_peer_retry::{
     BlindRelayDownstreamFailure, BlindRelayRetryContext, BlindRelayRetryDomain,
     BlindRelayRetryPolicy,
 };
-use super::chat_peer_terminal_reply::{execute_blind_vault_inline_pull, TerminalReplyFailure};
+use super::chat_peer_terminal_reply::{execute_blind_vault_inline_reply, TerminalReplyFailure};
 use super::chat_peer_transport::{BlindRelayTransport, ReqwestBlindRelayTransport};
 use crate::api::{canonical_peer_http_url, peer_endpoint_is_public_ip, InFlightRequestGuard};
 use crate::config_chat_relay::{
@@ -2581,7 +2583,7 @@ async fn deliver_onion_terminal_payload(
         let encoded_request = payload.to_vec();
         let now_ms = now_secs.saturating_mul(1_000);
         let reply = tokio::task::spawn_blocking(move || {
-            execute_blind_vault_inline_pull(
+            execute_blind_vault_inline_reply(
                 vault.as_ref(),
                 terminal_identity.as_ref(),
                 route_id,
@@ -2598,7 +2600,7 @@ async fn deliver_onion_terminal_payload(
             TerminalReplyFailure::Unavailable => BlindRelayError::ForwardFailed,
         })?;
         return Ok(OnionTerminalDelivery {
-            purpose: OnionRoutePurpose::BlindVaultPull,
+            purpose: reply.purpose,
             opaque_response_b64: Some(reply.opaque_response_b64),
         });
     }

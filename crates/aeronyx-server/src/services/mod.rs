@@ -117,6 +117,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.72.0-BlindVaultDeleteFailureClass - Exported deletion retry semantics
 //   v0.71.0-BlindVaultPullFailureClass - Exported recovery retry semantics
 //   v0.70.0-BackupAuditMaintenanceCoordinator - Registered audit maintenance
 //   v0.69.0-BackupAuditAnchorDomain - Registered anchor digest derivation
@@ -211,8 +212,8 @@ pub mod chat_relay;
 mod chat_relay_backup_artifact;
 mod chat_relay_backup_audit;
 mod chat_relay_backup_audit_anchor;
-mod chat_relay_backup_audit_chain;
 mod chat_relay_backup_audit_catalog;
+mod chat_relay_backup_audit_chain;
 mod chat_relay_backup_audit_checkpoint;
 mod chat_relay_backup_audit_io;
 mod chat_relay_backup_audit_maintenance;
@@ -222,8 +223,8 @@ mod chat_relay_backup_certification;
 mod chat_relay_backup_contract;
 mod chat_relay_backup_copy;
 mod chat_relay_backup_create;
-mod chat_relay_backup_io;
 mod chat_relay_backup_inventory;
+mod chat_relay_backup_io;
 mod chat_relay_backup_namespace;
 mod chat_relay_backup_prune;
 mod chat_relay_backup_retention;
@@ -282,10 +283,10 @@ pub mod wallet_routes;
 // [BLIND-VAULT-RETRY-CLASS 2026-08-10 by Codex] Relay/API boundaries consume
 // the service-owned coarse class instead of matching storage internals twice.
 pub use blind_vault::{
-    BlindVaultCleanupReport, BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus,
-    BlindVaultLeaseProvisionOutcome, BlindVaultPullFailureClass, BlindVaultPullPage,
-    BlindVaultPutFailureClass, BlindVaultService, BlindVaultServiceError, BlindVaultStatus,
-    BlindVaultStoredObject, SharedBlindVaultService,
+    BlindVaultCleanupReport, BlindVaultDeleteFailureClass, BlindVaultIssuerInstallOutcome,
+    BlindVaultIssuerRuntimeStatus, BlindVaultLeaseProvisionOutcome, BlindVaultPullFailureClass,
+    BlindVaultPullPage, BlindVaultPutFailureClass, BlindVaultService, BlindVaultServiceError,
+    BlindVaultStatus, BlindVaultStoredObject, SharedBlindVaultService,
 };
 // [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Expose only aggregate,
 // host-local maintenance contracts and authenticated path-free plans; artifact

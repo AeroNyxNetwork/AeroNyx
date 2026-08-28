@@ -64,6 +64,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.4.0-OnionBlindVaultLifecycle - Re-exported single-use anonymous recovery
+//! and deletion sessions with request-bound encrypted reply verification
 //! v0.1.0 - Initial protocol definitions
 //! v0.2.0 - Added memchain submodule for MemChain P2P memory sync
 //! v0.5.0 - 🌟 BlockAnnounce variant added to MemChainMessage
@@ -98,8 +100,9 @@ pub use auth::{
 pub use blind_vault::{
     decode_blind_vault_frame, encode_blind_vault_frame, is_blind_vault_frame,
     BlindVaultDeleteRequest, BlindVaultDeletedReceipt, BlindVaultError, BlindVaultFrame,
-    BlindVaultLeaseCreateRequest, BlindVaultOnionPullError, BlindVaultOnionPullSession,
-    BlindVaultPullRequest, BlindVaultPullResponse, BlindVaultPutRequest, BlindVaultRecoveredObject,
+    BlindVaultLeaseCreateRequest, BlindVaultOnionDeleteError, BlindVaultOnionDeleteSession,
+    BlindVaultOnionPullError, BlindVaultOnionPullSession, BlindVaultPullRequest,
+    BlindVaultPullResponse, BlindVaultPutRequest, BlindVaultRecoveredObject,
     BlindVaultStoredReceipt, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_PROTOCOL_VERSION,
     MAX_BLIND_VAULT_FRAME_BYTES,
 };

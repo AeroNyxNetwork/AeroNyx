@@ -60,7 +60,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.10.0-BlindVaultPullFailureClass - Added exhaustive,
+//! Last Modified: v1.11.0-BlindVaultDeleteFailureClass - Added exhaustive,
+//! privacy-safe anonymous deletion retry classification.
+//! v1.10.0-BlindVaultPullFailureClass - Added exhaustive,
 //! privacy-safe anonymous recovery retry classification.
 //! v1.9.0-BlindVaultPutFailureClass - Separated permanent
 //! request rejection, replica capacity, and retryable service availability
@@ -352,6 +354,15 @@ pub enum BlindVaultPullFailureClass {
     Unavailable,
 }
 
+/// Privacy-safe retry class for an anonymous ciphertext Delete failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultDeleteFailureClass {
+    /// The same signed administration request cannot succeed unchanged.
+    Rejected,
+    /// Replica storage or local runtime is unavailable.
+    Unavailable,
+}
+
 impl BlindVaultServiceError {
     /// Returns the coarse retry class for a Put failure.
     #[must_use]
@@ -427,6 +438,45 @@ impl BlindVaultServiceError {
             | Self::IssuerDirectoryGenerationOutOfRange
             | Self::CorruptState
             | Self::TimestampOutOfRange => BlindVaultPullFailureClass::Unavailable,
+        }
+    }
+
+    /// Returns the coarse retry class for a Delete failure.
+    #[must_use]
+    pub const fn delete_failure_class(&self) -> BlindVaultDeleteFailureClass {
+        // [BLIND-VAULT-DELETE-RETRY-CLASS 2026-08-28 by Codex] Keep this match
+        // exhaustive so new storage errors cannot silently expose replica
+        // object state or receive an accidental cross-node retry policy.
+        match self {
+            Self::Protocol(_)
+            | Self::LeaseNotFound
+            | Self::LeaseExpired
+            | Self::LeaseConflict
+            | Self::ObjectConflict
+            | Self::RequestConflict
+            | Self::ObjectDeleted
+            | Self::QuotaExceeded
+            | Self::ReadUnauthorized
+            | Self::InvalidPullCursor
+            | Self::AdmissionIssuerRejected
+            | Self::AdmissionProofRejected
+            | Self::AdmissionSpent
+            | Self::ObjectNotFound => BlindVaultDeleteFailureClass::Rejected,
+            Self::Disabled
+            | Self::Sqlite(_)
+            | Self::Filesystem
+            | Self::PullCursorEncryptionFailed
+            | Self::AdmissionUnavailable
+            | Self::AdmissionConfigurationInvalid
+            | Self::IssuerDirectoryAuthorityRejected
+            | Self::IssuerDirectoryUpdateRejected
+            | Self::IssuerDirectoryRollback
+            | Self::IssuerDirectoryGenerationConflict
+            | Self::IssuerDirectoryContinuity
+            | Self::IssuerDirectoryNoActiveEpoch
+            | Self::IssuerDirectoryGenerationOutOfRange
+            | Self::CorruptState
+            | Self::TimestampOutOfRange => BlindVaultDeleteFailureClass::Unavailable,
         }
     }
 }

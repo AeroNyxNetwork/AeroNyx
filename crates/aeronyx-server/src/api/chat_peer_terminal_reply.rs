@@ -10,7 +10,8 @@
 //! ## Main Functionality
 //! - Accepts one decoded onion reply carrier at a terminal node.
 //! - Restricts inline v1 recovery to one 4 KiB-class Blind Vault object page.
-//! - Executes capability-authenticated Blind Vault recovery.
+//! - Executes capability-authenticated recovery or signed administration-key
+//!   deletion without exposing either request to middle relays.
 //! - Signs the recovery page, seals it to the source reply key, and returns
 //!   only fixed-size opaque base64 bytes to the relay orchestrator.
 //! - Maps internal failures to coarse retry classes without retaining secrets.
@@ -34,18 +35,23 @@
 //! - Keep node fan-out out of this module; clients choose unrelated replicas
 //!   and routes so one node cannot reconstruct a logical replica set.
 //!
-//! Last Modified: v1.0.0-BlindVaultInlinePull - Initial anonymous pull reply.
+//! Last Modified: v1.1.0-BlindVaultInlineDelete - Added anonymous deletion and
+//! terminal-signed receipt replies through the same fixed-size carrier.
+//! v1.0.0-BlindVaultInlinePull - Initial anonymous pull reply.
 //! ============================================================================
 
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::{
     decode_blind_vault_frame, decode_onion_reply_request, encode_blind_vault_frame,
     encode_onion_sealed_response, seal_onion_reply, BlindVaultFrame, BlindVaultPullResponse,
-    BlindVaultRecoveredObject, ONION_REPLY_RESPONSE_SIZE_CLASSES,
+    BlindVaultRecoveredObject, OnionRoutePurpose, ONION_REPLY_RESPONSE_SIZE_CLASSES,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-use crate::services::{BlindVaultPullFailureClass, BlindVaultService, BlindVaultServiceError};
+use crate::services::{
+    BlindVaultDeleteFailureClass, BlindVaultPullFailureClass, BlindVaultService,
+    BlindVaultServiceError,
+};
 
 /// Coarse terminal-reply failure class consumed by blind-relay orchestration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,11 +67,12 @@ pub(super) enum TerminalReplyFailure {
 /// Successfully sealed terminal reply with no plaintext metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TerminalReply {
+    pub(super) purpose: OnionRoutePurpose,
     pub(super) opaque_response_b64: String,
 }
 
-/// Executes one inline Blind Vault pull and returns a fixed-size sealed reply.
-pub(super) fn execute_blind_vault_inline_pull(
+/// Executes one reply-capable Blind Vault request and seals its fixed-size ACK.
+pub(super) fn execute_blind_vault_inline_reply(
     vault: &BlindVaultService,
     terminal_identity: &IdentityKeyPair,
     route_id: [u8; 16],
@@ -80,12 +87,50 @@ pub(super) fn execute_blind_vault_inline_pull(
         return Err(TerminalReplyFailure::Rejected);
     }
 
-    let BlindVaultFrame::PullRequest(pull_request) =
-        decode_blind_vault_frame(&reply_request.payload)
-            .map_err(|_| TerminalReplyFailure::Rejected)?
-    else {
-        return Err(TerminalReplyFailure::Rejected);
+    let (purpose, encoded_response) = match decode_blind_vault_frame(&reply_request.payload)
+        .map_err(|_| TerminalReplyFailure::Rejected)?
+    {
+        BlindVaultFrame::PullRequest(pull_request) => (
+            OnionRoutePurpose::BlindVaultPull,
+            execute_pull_response(vault, terminal_identity, pull_request, now_ms)?,
+        ),
+        BlindVaultFrame::Delete(delete_request) => {
+            let receipt = vault
+                .delete(&delete_request, now_ms)
+                .map_err(classify_delete_failure)?;
+            let encoded = encode_blind_vault_frame(&BlindVaultFrame::DeletedReceipt(receipt))
+                .map_err(|_| TerminalReplyFailure::Unavailable)?;
+            (OnionRoutePurpose::BlindVaultDelete, encoded)
+        }
+        _ => return Err(TerminalReplyFailure::Rejected),
     };
+
+    let sealed = seal_onion_reply(
+        route_id,
+        &reply_request,
+        &encoded_response,
+        terminal_identity,
+    )
+    .map_err(|error| match error {
+        aeronyx_core::protocol::OnionReplyError::ResponsePayloadTooLarge => {
+            TerminalReplyFailure::ResponseTooLarge
+        }
+        _ => TerminalReplyFailure::Unavailable,
+    })?;
+    let encoded_sealed =
+        encode_onion_sealed_response(&sealed).map_err(|_| TerminalReplyFailure::Unavailable)?;
+    Ok(TerminalReply {
+        purpose,
+        opaque_response_b64: BASE64.encode(encoded_sealed),
+    })
+}
+
+fn execute_pull_response(
+    vault: &BlindVaultService,
+    terminal_identity: &IdentityKeyPair,
+    pull_request: aeronyx_core::protocol::BlindVaultPullRequest,
+    now_ms: u64,
+) -> Result<Vec<u8>, TerminalReplyFailure> {
     pull_request
         .validate()
         .map_err(|_| TerminalReplyFailure::Rejected)?;
@@ -124,26 +169,8 @@ pub(super) fn execute_blind_vault_inline_pull(
     pull_response
         .sign(terminal_identity)
         .map_err(|_| TerminalReplyFailure::Unavailable)?;
-    let encoded_pull_response =
-        encode_blind_vault_frame(&BlindVaultFrame::PullResponse(pull_response))
-            .map_err(|_| TerminalReplyFailure::ResponseTooLarge)?;
-    let sealed = seal_onion_reply(
-        route_id,
-        &reply_request,
-        &encoded_pull_response,
-        terminal_identity,
-    )
-    .map_err(|error| match error {
-        aeronyx_core::protocol::OnionReplyError::ResponsePayloadTooLarge => {
-            TerminalReplyFailure::ResponseTooLarge
-        }
-        _ => TerminalReplyFailure::Unavailable,
-    })?;
-    let encoded_sealed =
-        encode_onion_sealed_response(&sealed).map_err(|_| TerminalReplyFailure::Unavailable)?;
-    Ok(TerminalReply {
-        opaque_response_b64: BASE64.encode(encoded_sealed),
-    })
+    encode_blind_vault_frame(&BlindVaultFrame::PullResponse(pull_response))
+        .map_err(|_| TerminalReplyFailure::ResponseTooLarge)
 }
 
 fn classify_pull_failure(error: BlindVaultServiceError) -> TerminalReplyFailure {
@@ -153,5 +180,15 @@ fn classify_pull_failure(error: BlindVaultServiceError) -> TerminalReplyFailure 
     match error.pull_failure_class() {
         BlindVaultPullFailureClass::Rejected => TerminalReplyFailure::Rejected,
         BlindVaultPullFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
+    }
+}
+
+fn classify_delete_failure(error: BlindVaultServiceError) -> TerminalReplyFailure {
+    // [BLIND-VAULT-DELETE-FAILURE-CLASS 2026-08-28 by Codex] Upstream relays
+    // learn only whether the signed request is final or this replica is
+    // unavailable; object existence and tombstone state remain indistinct.
+    match error.delete_failure_class() {
+        BlindVaultDeleteFailureClass::Rejected => TerminalReplyFailure::Rejected,
+        BlindVaultDeleteFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
     }
 }

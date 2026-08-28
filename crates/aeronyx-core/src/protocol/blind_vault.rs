@@ -61,7 +61,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.7.0-BlindVaultOnionPull - Added client-owned anonymous
+//! Last Modified: v1.8.0-BlindVaultOnionDelete - Added request-bound anonymous
+//! deletion sessions with terminal-signed receipt verification.
+//! v1.7.0-BlindVaultOnionPull - Added client-owned anonymous
 //! recovery session preparation and response verification.
 //! v1.6.0-BlindVaultIssuerUpdate - Added a transport-independent
 //! authority-signed runtime issuer update contract.
@@ -1499,6 +1501,111 @@ impl BlindVaultDeletedReceipt {
             && self.object_id == delete.object_id
             && self.request_id == delete.request_id
     }
+}
+
+/// Source-owned state for one anonymous Blind Vault deletion request.
+///
+/// [BLIND-VAULT-ONION-DELETE-SESSION 2026-08-28 by Codex] The administration
+/// key remains client-side. Only its signed request enters the final onion
+/// layer, while the consumed session retains non-secret receipt expectations
+/// and the single-use encrypted reply state.
+pub struct BlindVaultOnionDeleteSession {
+    expected_version: u16,
+    expected_lease_id: [u8; 32],
+    expected_object_id: [u8; 32],
+    expected_request_id: [u8; 16],
+    expected_ciphertext_commitment: [u8; 32],
+    reply_session: OnionReplySession,
+}
+
+impl BlindVaultOnionDeleteSession {
+    /// Encodes one signed delete request for the final onion layer.
+    ///
+    /// `expected_ciphertext_commitment` comes from the client's accepted store
+    /// receipt and prevents a terminal from proving deletion of different
+    /// bytes under the same opaque object identifier.
+    pub fn prepare(
+        route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        expected_ciphertext_commitment: [u8; 32],
+        request: BlindVaultDeleteRequest,
+    ) -> Result<(Vec<u8>, Self), BlindVaultOnionDeleteError> {
+        require_version(request.version)?;
+        require_non_zero("lease_id", &request.lease_id)?;
+        require_non_zero("object_id", &request.object_id)?;
+        require_non_zero("request_id", &request.request_id)?;
+        require_non_zero(
+            "expected_ciphertext_commitment",
+            &expected_ciphertext_commitment,
+        )?;
+        let expected_version = request.version;
+        let expected_lease_id = request.lease_id;
+        let expected_object_id = request.object_id;
+        let expected_request_id = request.request_id;
+        let encoded_delete = encode_blind_vault_frame(&BlindVaultFrame::Delete(request))?;
+        let (reply_request, reply_session) = OnionReplySession::prepare(
+            route_id,
+            expected_terminal_node_id,
+            ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
+            encoded_delete,
+        )?;
+        let encoded_request = encode_onion_reply_request(&reply_request)?;
+        Ok((
+            encoded_request,
+            Self {
+                expected_version,
+                expected_lease_id,
+                expected_object_id,
+                expected_request_id,
+                expected_ciphertext_commitment,
+                reply_session,
+            },
+        ))
+    }
+
+    /// Opens and verifies the exact terminal-signed deletion receipt.
+    pub fn open(
+        self,
+        encoded_response: &[u8],
+    ) -> Result<BlindVaultDeletedReceipt, BlindVaultOnionDeleteError> {
+        let reply = self.reply_session.open(encoded_response)?;
+        let BlindVaultFrame::DeletedReceipt(receipt) = decode_blind_vault_frame(&reply.payload)?
+        else {
+            return Err(BlindVaultOnionDeleteError::UnexpectedResponseFrame);
+        };
+        let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
+            .map_err(|_| BlindVaultOnionDeleteError::InvalidTerminalIdentity)?;
+        receipt.validate_and_verify(&terminal_key)?;
+        if receipt.version != self.expected_version
+            || receipt.lease_id != self.expected_lease_id
+            || receipt.object_id != self.expected_object_id
+            || receipt.request_id != self.expected_request_id
+            || receipt.previous_ciphertext_commitment != self.expected_ciphertext_commitment
+        {
+            return Err(BlindVaultOnionDeleteError::RequestMismatch);
+        }
+        Ok(receipt)
+    }
+}
+
+/// Fail-closed source errors for anonymous Blind Vault deletion.
+#[derive(Debug, Error)]
+pub enum BlindVaultOnionDeleteError {
+    /// The Blind Vault request or signed receipt violated its wire contract.
+    #[error("blind vault onion delete frame rejected")]
+    BlindVault(#[from] BlindVaultError),
+    /// The reply carrier failed key, route, request, identity, or signature checks.
+    #[error("blind vault onion delete reply rejected")]
+    OnionReply(#[from] OnionReplyError),
+    /// The decrypted workload response was not a deletion receipt.
+    #[error("unexpected blind vault onion delete response frame")]
+    UnexpectedResponseFrame,
+    /// The verified receipt did not answer the exact signed request.
+    #[error("blind vault onion delete request mismatch")]
+    RequestMismatch,
+    /// The verified outer terminal identity could not be reconstructed.
+    #[error("invalid blind vault onion delete terminal identity")]
+    InvalidTerminalIdentity,
 }
 
 /// Stable, bounded binary encoding with an explicit frame kind outside bincode.

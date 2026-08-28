@@ -73,6 +73,7 @@
 //!   Unknown values must fail closed instead of silently becoming chat routes.
 //!
 //! ## Last Modified
+//! v1.3.0-BlindVaultDeletePurpose — Added a distinct anonymous deletion purpose
 //! v1.2.0-BlindVaultPullPurpose — Added a distinct anonymous recovery purpose
 //! v1.1.0-RoutePurposeContract — Added stable, capability-aware route purposes
 //! v1.0.0-OnionV1 — Initial layered onion construction over the blind relay frame
@@ -113,8 +114,12 @@ pub const KEM_ALG_XWING: u8 = 2;
 /// The order is stable for deterministic capability responses. Compatibility
 /// aliases accepted by [`OnionRoutePurpose::from_wire_value`] are deliberately
 /// absent so new integrations emit only canonical values.
-pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 3] =
-    ["message_relay", "blind_vault_put", "blind_vault_pull"];
+pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 4] = [
+    "message_relay",
+    "blind_vault_put",
+    "blind_vault_pull",
+    "blind_vault_delete",
+];
 
 /// Fixed layer header length: magic(2) + eph_pub(32) + nonce(24).
 const LAYER_HEADER_LEN: usize = 2 + 32 + 24;
@@ -142,6 +147,8 @@ pub enum OnionRoutePurpose {
     BlindVaultPut,
     /// Anonymous bounded ciphertext recovery from a Blind Vault replica.
     BlindVaultPull,
+    /// Anonymous capability-authorized deletion at a Blind Vault terminal.
+    BlindVaultDelete,
 }
 
 impl OnionRoutePurpose {
@@ -157,6 +164,7 @@ impl OnionRoutePurpose {
                 Some(Self::BlindVaultPut)
             }
             "blind_vault_pull" | "blind-vault-pull" => Some(Self::BlindVaultPull),
+            "blind_vault_delete" | "blind-vault-delete" => Some(Self::BlindVaultDelete),
             _ => None,
         }
     }
@@ -168,6 +176,7 @@ impl OnionRoutePurpose {
             Self::MessageRelay => ONION_ROUTE_PURPOSE_VALUES[0],
             Self::BlindVaultPut => ONION_ROUTE_PURPOSE_VALUES[1],
             Self::BlindVaultPull => ONION_ROUTE_PURPOSE_VALUES[2],
+            Self::BlindVaultDelete => ONION_ROUTE_PURPOSE_VALUES[3],
         }
     }
 
@@ -180,7 +189,9 @@ impl OnionRoutePurpose {
     pub const fn specialized_terminal_capability(self) -> Option<NodeCapability> {
         match self {
             Self::MessageRelay => None,
-            Self::BlindVaultPut | Self::BlindVaultPull => Some(NodeCapability::BlindVaultReplica),
+            Self::BlindVaultPut | Self::BlindVaultPull | Self::BlindVaultDelete => {
+                Some(NodeCapability::BlindVaultReplica)
+            }
         }
     }
 }
@@ -517,8 +528,17 @@ mod tests {
             Some(NodeCapability::BlindVaultReplica)
         );
         assert_eq!(
+            OnionRoutePurpose::BlindVaultDelete.specialized_terminal_capability(),
+            Some(NodeCapability::BlindVaultReplica)
+        );
+        assert_eq!(
             ONION_ROUTE_PURPOSE_VALUES,
-            ["message_relay", "blind_vault_put", "blind_vault_pull"]
+            [
+                "message_relay",
+                "blind_vault_put",
+                "blind_vault_pull",
+                "blind_vault_delete"
+            ]
         );
     }
 
