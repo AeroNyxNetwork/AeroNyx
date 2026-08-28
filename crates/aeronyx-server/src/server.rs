@@ -13561,6 +13561,10 @@ impl Server {
             NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
             NodeProtocolFeature::OnionBlindVaultLeaseStatusV1,
             NodeProtocolFeature::OnionBlindVaultLeaseInventoryV1,
+            // [ONION-BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex]
+            // Signed negotiation prevents upgraded sources from assuming the
+            // source-only failure contract during a rolling fleet upgrade.
+            NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
         ]);
 
         descriptor.public_endpoint = config

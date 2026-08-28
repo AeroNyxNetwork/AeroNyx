@@ -165,6 +165,8 @@
 //!   targets because the selected target identity is part of the signature.
 //!
 //! ## Last Modified
+//! v0.35.0-OnionBlindVaultEncryptedFailure - Added signed negotiation for
+//! source-only authenticated terminal failure replies
 //! v0.34.0-OnionBlindVaultLeaseInventory - Added signed negotiation for
 //! private streaming encrypted-object inventory commitments
 //! v0.33.0-OnionBlindVaultLeaseStatus - Added signed negotiation for private
@@ -472,11 +474,18 @@ pub enum NodeProtocolFeature {
     /// The node returns an encrypted terminal-signed commitment to the live
     /// object inventory of one administration-key-controlled lease.
     OnionBlindVaultLeaseInventoryV1,
+    /// Valid Blind Vault workload failures are sealed into the same fixed-size
+    /// source-only reply instead of escaping through relay-visible status.
+    ///
+    /// [ONION-BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex] This token is
+    /// separate from generic `OnionReplyV1` so upgraded sources never assume
+    /// typed encrypted failures from a mixed-version terminal.
+    OnionBlindVaultEncryptedFailureV1,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::BlindRelayFailureReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
         Self::DirectPeerRelayAuthV2,
@@ -489,6 +498,7 @@ impl NodeProtocolFeature {
         Self::OnionBlindVaultLeaseRenewalV1,
         Self::OnionBlindVaultLeaseStatusV1,
         Self::OnionBlindVaultLeaseInventoryV1,
+        Self::OnionBlindVaultEncryptedFailureV1,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -507,6 +517,7 @@ impl NodeProtocolFeature {
             Self::OnionBlindVaultLeaseRenewalV1 => "anpf1-oblw1",
             Self::OnionBlindVaultLeaseStatusV1 => "anpf1-obls1",
             Self::OnionBlindVaultLeaseInventoryV1 => "anpf1-obli1",
+            Self::OnionBlindVaultEncryptedFailureV1 => "anpf1-obef1",
         }
     }
 }

@@ -143,6 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.59.0-BlindVaultEncryptedFailureNegotiation - Required signed support for
+//! source-only terminal failures across every reply-capable vault purpose
 //! v0.58.0-BlindVaultRuntimeAdvertisement - Added aggregate runtime readiness
 //! and signed capability consistency for anonymous storage replicas
 //! v0.57.0-OnionLeaseInventoryTerminalContract - Added feature-gated private
@@ -650,7 +652,13 @@ impl OnionTerminalRequirement {
             capability: purpose.and_then(OnionRoutePurpose::specialized_terminal_capability),
             protocol_features: match purpose {
                 Some(OnionRoutePurpose::BlindVaultPull | OnionRoutePurpose::BlindVaultDelete) => {
-                    &[NodeProtocolFeature::OnionReplyV1]
+                    // [ONION-BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex]
+                    // A generic reply carrier alone does not promise that
+                    // workload failures remain hidden from upstream relays.
+                    &[
+                        NodeProtocolFeature::OnionReplyV1,
+                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+                    ]
                 }
                 Some(OnionRoutePurpose::BlindVaultLeaseAdmission) => {
                     // [ONION-BLIND-LEASE-ADMISSION 2026-08-28 by Codex] Both
@@ -659,6 +667,7 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
+                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
                     ]
                 }
                 Some(OnionRoutePurpose::BlindVaultPutReceipt) => {
@@ -668,6 +677,7 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
+                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
                     ]
                 }
                 Some(OnionRoutePurpose::BlindVaultLeaseRetire) => {
@@ -677,6 +687,7 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,
+                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
                     ]
                 }
                 Some(OnionRoutePurpose::BlindVaultLeaseRenewal) => {
@@ -686,6 +697,7 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
+                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
                     ]
                 }
                 Some(OnionRoutePurpose::BlindVaultLeaseStatus) => {
@@ -695,6 +707,7 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindVaultLeaseStatusV1,
+                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
                     ]
                 }
                 Some(OnionRoutePurpose::BlindVaultLeaseInventory) => {
@@ -704,6 +717,7 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindVaultLeaseInventoryV1,
+                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
                     ]
                 }
                 _ => &[],
@@ -2398,6 +2412,9 @@ pub fn discovery_summary_response(
             // from aeronyx-core so all implementations negotiate one contract.
             "onion_route_purpose_v1": true,
             "onion_route_purposes": ONION_ROUTE_PURPOSE_VALUES,
+            // Operational hint only; route selection trusts the matching
+            // token in each terminal's signed descriptor.
+            "blind_vault_encrypted_terminal_failure_v1": true,
         }),
         status: status_bucket,
         stage: stage_bucket,
