@@ -620,6 +620,9 @@
 //     route, peer, receipt, endpoint, ciphertext, or payload dimensions.
 //
 // Last Modified:
+//   [BLIND-VAULT-LEASE-RENEWAL 2026-08-28 by Codex] Advertised blind-authorized
+//     lease renewal and included bounded renewal-marker cleanup in aggregate
+//     maintenance telemetry.
 //   [BLIND-VAULT-LEASE-RETIRE 2026-08-28 by Codex] Advertised exact anonymous
 //     lease-retirement support and included bounded retry-marker cleanup in
 //     aggregate-only maintenance telemetry.
@@ -13418,6 +13421,7 @@ impl Server {
             NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
             NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
             NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,
+            NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
         ]);
 
         descriptor.public_endpoint = config
@@ -15727,6 +15731,7 @@ impl Server {
                                     || report.leases_removed > 0
                                     || report.tombstones_removed > 0
                                     || report.lease_tombstones_removed > 0
+                                    || report.lease_renewals_removed > 0
                                     || report.admission_spends_removed > 0
                                 {
                                     info!(
@@ -15734,6 +15739,7 @@ impl Server {
                                         leases_removed = report.leases_removed,
                                         tombstones_removed = report.tombstones_removed,
                                         lease_tombstones_removed = report.lease_tombstones_removed,
+                                        lease_renewals_removed = report.lease_renewals_removed,
                                         admission_spends_removed = report.admission_spends_removed,
                                         "[BLIND_VAULT] Bounded cleanup completed"
                                     );
@@ -20035,6 +20041,9 @@ mod tests {
         assert!(signed
             .descriptor
             .advertises_protocol_feature(NodeProtocolFeature::OnionBlindVaultLeaseRetireV1));
+        assert!(signed
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1));
         assert_eq!(
             signed.descriptor.capacity.max_sessions,
             server.config.max_sessions() as u32

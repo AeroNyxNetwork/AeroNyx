@@ -36,7 +36,9 @@
 //! - Keep node fan-out out of this module; clients choose unrelated replicas
 //!   and routes so one node cannot reconstruct a logical replica set.
 //!
-//! Last Modified: v1.4.0-BlindVaultLeaseRetirement - Added complete anonymous
+//! Last Modified: v1.5.0-BlindVaultLeaseRenewal - Added blind-authorized
+//! lease renewal with encrypted terminal-signed transition receipts.
+//! v1.4.0-BlindVaultLeaseRetirement - Added complete anonymous
 //! lease retirement with encrypted terminal-signed aggregate receipts.
 //! v1.3.0-BlindVaultInlinePutReceipt - Added anonymous writes
 //! with encrypted terminal-signed storage receipts and capacity classification.
@@ -58,8 +60,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::services::{
     BlindVaultAdmissionFailureClass, BlindVaultDeleteFailureClass,
-    BlindVaultLeaseRetireFailureClass, BlindVaultPullFailureClass, BlindVaultPutFailureClass,
-    BlindVaultService, BlindVaultServiceError,
+    BlindVaultLeaseRenewFailureClass, BlindVaultLeaseRetireFailureClass,
+    BlindVaultPullFailureClass, BlindVaultPutFailureClass, BlindVaultService,
+    BlindVaultServiceError,
 };
 
 /// Coarse terminal-reply failure class consumed by blind-relay orchestration.
@@ -139,6 +142,14 @@ pub(super) fn execute_blind_vault_inline_reply(
             let encoded = encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseAccepted(receipt))
                 .map_err(|_| TerminalReplyFailure::Unavailable)?;
             (OnionRoutePurpose::BlindVaultLeaseAdmission, encoded)
+        }
+        BlindVaultFrame::BlindLeaseRenewal(renewal_request) => {
+            let receipt = vault
+                .renew_lease_with_blind_admission(&renewal_request, now_ms)
+                .map_err(classify_lease_renew_failure)?;
+            let encoded = encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseRenewed(receipt))
+                .map_err(|_| TerminalReplyFailure::Unavailable)?;
+            (OnionRoutePurpose::BlindVaultLeaseRenewal, encoded)
         }
         BlindVaultFrame::LeaseRetire(retire_request) => {
             let receipt = vault
@@ -267,5 +278,15 @@ fn classify_lease_retire_failure(error: BlindVaultServiceError) -> TerminalReply
     match error.lease_retire_failure_class() {
         BlindVaultLeaseRetireFailureClass::Rejected => TerminalReplyFailure::Rejected,
         BlindVaultLeaseRetireFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
+    }
+}
+
+fn classify_lease_renew_failure(error: BlindVaultServiceError) -> TerminalReplyFailure {
+    // [BLIND-VAULT-LEASE-RENEW-FAILURE 2026-08-28 by Codex] Credential,
+    // generation, expiry, and lease-authority failures remain one permanent
+    // rejection outside the encrypted terminal response boundary.
+    match error.lease_renew_failure_class() {
+        BlindVaultLeaseRenewFailureClass::Rejected => TerminalReplyFailure::Rejected,
+        BlindVaultLeaseRenewFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
     }
 }

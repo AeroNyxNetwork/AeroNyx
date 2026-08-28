@@ -143,6 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.55.0-OnionLeaseRenewalTerminalContract - Added feature-gated blind
+//! lease renewal through encrypted terminal replies
 //! v0.54.0-OnionLeaseRetireTerminalContract - Added feature-gated complete
 //! lease retirement through encrypted terminal replies
 //! v0.53.0-OnionPutReceiptTerminalContract - Added feature-gated anonymous
@@ -669,6 +671,15 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,
+                    ]
+                }
+                Some(OnionRoutePurpose::BlindVaultLeaseRenewal) => {
+                    // [ONION-BLIND-VAULT-LEASE-RENEWAL 2026-08-28 by Codex]
+                    // Capacity-authorized expiry mutation is separately
+                    // negotiated so mixed-version routes fail closed.
+                    &[
+                        NodeProtocolFeature::OnionReplyV1,
+                        NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
                     ]
                 }
                 _ => &[],

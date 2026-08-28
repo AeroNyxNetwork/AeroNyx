@@ -21,6 +21,7 @@
 //! - Capability-gated bounded recovery pages with encrypted snapshot cursors.
 //! - Administration-key object deletion with signed node receipts.
 //! - Complete administration-key lease retirement with exact-retry receipts.
+//! - Blind-authorized administration-key lease renewal with atomic token spend.
 //! - Transactional per-lease count/byte quotas and bounded expiry cleanup.
 //! - Stable privacy-safe mutation failure classes for multi-hop retry policy.
 //!
@@ -41,6 +42,8 @@
 //!    commitment-only tombstone, and sign a deletion receipt.
 //! 6. Retire a complete lease atomically, retain only bounded request evidence,
 //!    and return an encrypted-path-safe aggregate receipt.
+//! 7. Spend a fresh blind credential and extend one live lease in the same
+//!    transaction, preserving exact retry evidence without an account index.
 //!
 //! ## Privacy Invariant
 //! This service has no account, wallet, sender, receiver, conversation,
@@ -63,7 +66,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.13.0-BlindVaultLeaseRetirement - Added atomic complete
+//! Last Modified: v1.14.0-BlindVaultLeaseRenewal - Added blind-authorized,
+//! atomic live-lease renewal with exact request commitments and signed receipts.
+//! v1.13.0-BlindVaultLeaseRetirement - Added atomic complete
 //! lease deletion with exact request commitments and bounded retry evidence.
 //! v1.12.0-BlindVaultAdmissionFailureClass - Added exhaustive,
 //! privacy-safe anonymous admission retry classification.
@@ -102,11 +107,12 @@ use std::time::Duration;
 
 use aeronyx_core::crypto::keys::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::blind_vault::{
-    BlindVaultBlindIssuerDirectory, BlindVaultBlindIssuerEpoch, BlindVaultBlindIssuerUpdate,
-    BlindVaultBlindLeaseAdmissionRequest, BlindVaultDeleteRequest, BlindVaultDeletedReceipt,
-    BlindVaultError, BlindVaultLeaseAdmissionRequest, BlindVaultLeaseCreateRequest,
-    BlindVaultLeaseRetireRequest, BlindVaultLeaseRetiredReceipt, BlindVaultPutRequest,
-    BlindVaultStoredReceipt,
+    BlindVaultBlindAdmissionToken, BlindVaultBlindIssuerDirectory, BlindVaultBlindIssuerEpoch,
+    BlindVaultBlindIssuerUpdate, BlindVaultBlindLeaseAdmissionRequest,
+    BlindVaultBlindLeaseRenewalRequest, BlindVaultBlindLeaseRenewedReceipt,
+    BlindVaultDeleteRequest, BlindVaultDeletedReceipt, BlindVaultError,
+    BlindVaultLeaseAdmissionRequest, BlindVaultLeaseCreateRequest, BlindVaultLeaseRetireRequest,
+    BlindVaultLeaseRetiredReceipt, BlindVaultPutRequest, BlindVaultStoredReceipt,
 };
 use blind_rsa_signatures::{MessageRandomizer, PublicKeySha384PSSRandomized, Signature};
 use chacha20poly1305::{
@@ -226,6 +232,8 @@ pub struct BlindVaultCleanupReport {
     pub tombstones_removed: u64,
     /// Expired complete-lease retirement tombstones removed in this run.
     pub lease_tombstones_removed: u64,
+    /// Expired exact-retry renewal markers removed in this bounded run.
+    pub lease_renewals_removed: u64,
     /// Expired one-time admission spend markers removed in this bounded run.
     pub admission_spends_removed: u64,
 }
@@ -245,6 +253,8 @@ pub struct BlindVaultStatus {
     pub tombstones: u64,
     /// Number of unexpired complete-lease retirement tombstones.
     pub lease_tombstones: u64,
+    /// Number of unexpired exact-retry lease-renewal markers.
+    pub lease_renewals: u64,
     /// Unexpired one-time admission spend markers retained for replay defence.
     pub retained_admission_spends: u64,
 }
@@ -390,6 +400,15 @@ pub enum BlindVaultLeaseRetireFailureClass {
     /// The same signed retirement cannot succeed unchanged.
     Rejected,
     /// Replica storage or local runtime is unavailable.
+    Unavailable,
+}
+
+/// Privacy-safe retry class for blind-authorized lease renewal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultLeaseRenewFailureClass {
+    /// The same credential and signed transition cannot succeed unchanged.
+    Rejected,
+    /// Admission policy, replica storage, or local runtime is unavailable.
     Unavailable,
 }
 
@@ -585,6 +604,45 @@ impl BlindVaultServiceError {
             | Self::IssuerDirectoryGenerationOutOfRange
             | Self::CorruptState
             | Self::TimestampOutOfRange => BlindVaultLeaseRetireFailureClass::Unavailable,
+        }
+    }
+
+    /// Returns the coarse retry class for blind-authorized lease renewal.
+    #[must_use]
+    pub const fn lease_renew_failure_class(&self) -> BlindVaultLeaseRenewFailureClass {
+        // [BLIND-VAULT-LEASE-RENEW-FAILURE 2026-08-28 by Codex] Keep this
+        // exhaustive so the relay cannot distinguish credential, lease,
+        // expiry-generation, or administration-authority rejection.
+        match self {
+            Self::Protocol(_)
+            | Self::LeaseNotFound
+            | Self::LeaseExpired
+            | Self::LeaseConflict
+            | Self::ObjectConflict
+            | Self::RequestConflict
+            | Self::ObjectDeleted
+            | Self::QuotaExceeded
+            | Self::ReadUnauthorized
+            | Self::InvalidPullCursor
+            | Self::AdmissionIssuerRejected
+            | Self::AdmissionProofRejected
+            | Self::AdmissionSpent
+            | Self::ObjectNotFound => BlindVaultLeaseRenewFailureClass::Rejected,
+            Self::Disabled
+            | Self::Sqlite(_)
+            | Self::Filesystem
+            | Self::PullCursorEncryptionFailed
+            | Self::AdmissionUnavailable
+            | Self::AdmissionConfigurationInvalid
+            | Self::IssuerDirectoryAuthorityRejected
+            | Self::IssuerDirectoryUpdateRejected
+            | Self::IssuerDirectoryRollback
+            | Self::IssuerDirectoryGenerationConflict
+            | Self::IssuerDirectoryContinuity
+            | Self::IssuerDirectoryNoActiveEpoch
+            | Self::IssuerDirectoryGenerationOutOfRange
+            | Self::CorruptState
+            | Self::TimestampOutOfRange => BlindVaultLeaseRenewFailureClass::Unavailable,
         }
     }
 }
@@ -867,27 +925,7 @@ impl BlindVaultService {
         if !self.config.public_api_enabled {
             return Err(BlindVaultServiceError::AdmissionUnavailable);
         }
-        request.admission.validate_shape()?;
-        let issuer = self
-            .blind_admission_issuers
-            .read()
-            .issuers
-            .get(&request.admission.issuer_key_id)
-            .cloned()
-            .ok_or(BlindVaultServiceError::AdmissionIssuerRejected)?;
-        if now_ms < issuer.not_before_ms || now_ms >= issuer.expires_at_ms {
-            return Err(BlindVaultServiceError::AdmissionIssuerRejected);
-        }
-        let signature = Signature::new(request.admission.signature.clone());
-        let randomizer = MessageRandomizer::new(request.admission.message_randomizer);
-        issuer
-            .public_key
-            .verify(
-                &signature,
-                Some(randomizer),
-                request.admission.message_bytes(),
-            )
-            .map_err(|_| BlindVaultServiceError::AdmissionProofRejected)?;
+        let issuer = self.verify_blind_admission_token(&request.admission, now_ms)?;
         request.lease.validate_and_verify(
             now_ms,
             self.config.max_lease_ttl_ms().min(issuer.max_lease_ttl_ms),
@@ -899,6 +937,37 @@ impl BlindVaultService {
             issuer.expires_at_ms,
             now_ms,
         )
+    }
+
+    /// Verifies one RFC 9474 credential against an active pinned issuer epoch.
+    ///
+    /// [BLIND-VAULT-BLIND-ADMISSION-VERIFY 2026-08-28 by Codex] Provisioning
+    /// and renewal share this cryptographic boundary so token shape, epoch
+    /// activity, randomized-message verification, and failure semantics cannot
+    /// drift between two capacity-consuming state transitions.
+    fn verify_blind_admission_token(
+        &self,
+        token: &BlindVaultBlindAdmissionToken,
+        now_ms: u64,
+    ) -> Result<BlindAdmissionIssuer, BlindVaultServiceError> {
+        token.validate_shape()?;
+        let issuer = self
+            .blind_admission_issuers
+            .read()
+            .issuers
+            .get(&token.issuer_key_id)
+            .cloned()
+            .ok_or(BlindVaultServiceError::AdmissionIssuerRejected)?;
+        if now_ms < issuer.not_before_ms || now_ms >= issuer.expires_at_ms {
+            return Err(BlindVaultServiceError::AdmissionIssuerRejected);
+        }
+        let signature = Signature::new(token.signature.clone());
+        let randomizer = MessageRandomizer::new(token.message_randomizer);
+        issuer
+            .public_key
+            .verify(&signature, Some(randomizer), token.message_bytes())
+            .map_err(|_| BlindVaultServiceError::AdmissionProofRejected)?;
+        Ok(issuer)
     }
 
     fn provision_validated_admission(
@@ -1368,6 +1437,145 @@ impl BlindVaultService {
         Ok(receipt)
     }
 
+    /// Consumes one blind credential and extends one live anonymous lease.
+    ///
+    /// [BLIND-VAULT-LEASE-RENEWAL-TX 2026-08-28 by Codex] Exact retained
+    /// retries are resolved before the spend table is consulted. A first-time
+    /// renewal then consumes its credential, compare-and-swaps the expected
+    /// lease generation, and records reply evidence in one immediate
+    /// transaction; a crash commits all three effects or none.
+    pub fn renew_lease_with_blind_admission(
+        &self,
+        request: &BlindVaultBlindLeaseRenewalRequest,
+        now_ms: u64,
+    ) -> Result<BlindVaultBlindLeaseRenewedReceipt, BlindVaultServiceError> {
+        if !self.config.public_api_enabled {
+            return Err(BlindVaultServiceError::AdmissionUnavailable);
+        }
+        request.admission.validate_shape()?;
+        let spend_id = request.admission.spend_id();
+        let request_commitment = request.renewal.commitment();
+
+        // A retained exact retry remains valid after the original mutation
+        // freshness window and issuer epoch have elapsed. The marker exists
+        // only because the credential and signature were verified at commit.
+        {
+            let connection = self.connection.lock();
+            if let Some(existing) = load_active_lease_renewal(
+                &connection,
+                &request.renewal.lease_id,
+                &request.renewal.request_id,
+                now_ms,
+            )? {
+                let lease = load_lease_runtime(&connection, &request.renewal.lease_id)?
+                    .ok_or(BlindVaultServiceError::CorruptState)?;
+                ensure_exact_lease_renewal(&existing, request)?;
+                let admin_key = IdentityPublicKey::from_bytes(&lease.admin_verifying_key)
+                    .map_err(|_| BlindVaultServiceError::CorruptState)?;
+                request.renewal.validate_and_verify_signature(&admin_key)?;
+                return self.sign_lease_renewal_receipt(request, existing.renewed_at_ms);
+            }
+        }
+
+        let issuer = self.verify_blind_admission_token(&request.admission, now_ms)?;
+        let authenticated_admin_key = {
+            let lease = self.lease_runtime_snapshot(&request.renewal.lease_id)?;
+            let admin_key = IdentityPublicKey::from_bytes(&lease.admin_verifying_key)
+                .map_err(|_| BlindVaultServiceError::CorruptState)?;
+            request.renewal.validate_and_verify(
+                now_ms,
+                self.config.max_lease_ttl_ms().min(issuer.max_lease_ttl_ms),
+                self.config.mutation_clock_skew_ms(),
+                &admin_key,
+            )?;
+            lease.admin_verifying_key
+        };
+        let now = sqlite_i64(now_ms)?;
+        let requested_expiry = sqlite_i64(request.renewal.requested_expires_at_ms)?;
+        let spend_expiry = sqlite_i64(issuer.expires_at_ms)?;
+        let marker_expiry_ms = now_ms
+            .checked_add(self.config.tombstone_ttl_secs.saturating_mul(1_000))
+            .ok_or(BlindVaultServiceError::TimestampOutOfRange)?;
+        let marker_expiry = sqlite_i64(marker_expiry_ms)?;
+
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let renewal = if let Some(existing) = load_active_lease_renewal(
+            &transaction,
+            &request.renewal.lease_id,
+            &request.renewal.request_id,
+            now_ms,
+        )? {
+            ensure_exact_lease_renewal(&existing, request)?;
+            existing
+        } else {
+            let lease = load_lease_runtime(&transaction, &request.renewal.lease_id)?
+                .ok_or(BlindVaultServiceError::LeaseNotFound)?;
+            if lease.admin_verifying_key != authenticated_admin_key {
+                return Err(BlindVaultServiceError::LeaseConflict);
+            }
+            if lease.expires_at_ms <= now_ms {
+                return Err(BlindVaultServiceError::LeaseExpired);
+            }
+            if lease.expires_at_ms != request.renewal.expected_expires_at_ms {
+                return Err(BlindVaultServiceError::LeaseConflict);
+            }
+            let spent: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM blind_vault_admission_spends WHERE token_id = ?1
+                 )",
+                params![&spend_id[..]],
+                |row| row.get(0),
+            )?;
+            if spent {
+                return Err(BlindVaultServiceError::AdmissionSpent);
+            }
+            transaction.execute(
+                "INSERT INTO blind_vault_admission_spends
+                 (token_id, consumed_at_ms, expires_at_ms) VALUES (?1, ?2, ?3)",
+                params![&spend_id[..], now, spend_expiry],
+            )?;
+            let updated = transaction.execute(
+                "UPDATE blind_vault_leases SET expires_at_ms = ?2
+                 WHERE lease_id = ?1 AND expires_at_ms = ?3",
+                params![
+                    &request.renewal.lease_id[..],
+                    requested_expiry,
+                    sqlite_i64(request.renewal.expected_expires_at_ms)?,
+                ],
+            )?;
+            if updated != 1 {
+                return Err(BlindVaultServiceError::LeaseConflict);
+            }
+            transaction.execute(
+                "INSERT INTO blind_vault_lease_renewals
+                 (lease_id, request_id, admission_spend_id, request_commitment,
+                  previous_expires_at_ms, renewed_expires_at_ms, renewed_at_ms,
+                  expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &request.renewal.lease_id[..],
+                    &request.renewal.request_id[..],
+                    &spend_id[..],
+                    &request_commitment[..],
+                    sqlite_i64(request.renewal.expected_expires_at_ms)?,
+                    requested_expiry,
+                    now,
+                    marker_expiry,
+                ],
+            )?;
+            LeaseRenewalRow {
+                admission_spend_id: spend_id,
+                request_commitment,
+                previous_expires_at_ms: request.renewal.expected_expires_at_ms,
+                renewed_expires_at_ms: request.renewal.requested_expires_at_ms,
+                renewed_at_ms: now_ms,
+            }
+        };
+        transaction.commit()?;
+        self.sign_lease_renewal_receipt(request, renewal.renewed_at_ms)
+    }
+
     /// Retires one complete anonymous lease and returns a node-signed receipt.
     ///
     /// The transaction inserts a bounded idempotency tombstone before deleting
@@ -1532,6 +1740,14 @@ impl BlindVaultService {
              )",
             params![now, CLEANUP_TOMBSTONE_BATCH as i64],
         )?;
+        let expired_lease_renewals = transaction.execute(
+            "DELETE FROM blind_vault_lease_renewals
+             WHERE (lease_id, request_id) IN (
+                SELECT lease_id, request_id FROM blind_vault_lease_renewals
+                WHERE expires_at_ms <= ?1 LIMIT ?2
+             )",
+            params![now, CLEANUP_TOMBSTONE_BATCH as i64],
+        )?;
         let expired_admission_spends = transaction.execute(
             "DELETE FROM blind_vault_admission_spends
              WHERE token_id IN (
@@ -1547,6 +1763,7 @@ impl BlindVaultService {
             leases_removed: expired_leases.len() as u64,
             tombstones_removed: expired_tombstones as u64,
             lease_tombstones_removed: expired_lease_tombstones as u64,
+            lease_renewals_removed: expired_lease_renewals as u64,
             admission_spends_removed: expired_admission_spends as u64,
         })
     }
@@ -1576,6 +1793,11 @@ impl BlindVaultService {
             params![now],
             |row| row.get(0),
         )?;
+        let lease_renewals: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM blind_vault_lease_renewals WHERE expires_at_ms > ?1",
+            params![now],
+            |row| row.get(0),
+        )?;
         let retained_admission_spends: i64 = connection.query_row(
             "SELECT COUNT(*) FROM blind_vault_admission_spends WHERE expires_at_ms > ?1",
             params![now],
@@ -1588,6 +1810,7 @@ impl BlindVaultService {
             live_ciphertext_bytes: non_negative_u64(live_bytes)?,
             tombstones: non_negative_u64(tombstones)?,
             lease_tombstones: non_negative_u64(lease_tombstones)?,
+            lease_renewals: non_negative_u64(lease_renewals)?,
             retained_admission_spends: non_negative_u64(retained_admission_spends)?,
         })
     }
@@ -1601,6 +1824,20 @@ impl BlindVaultService {
             request,
             accepted_at_ms,
             request.expires_at_ms,
+            self.node_identity.public_key_bytes(),
+        );
+        receipt.sign(&self.node_identity)?;
+        Ok(receipt)
+    }
+
+    fn sign_lease_renewal_receipt(
+        &self,
+        request: &BlindVaultBlindLeaseRenewalRequest,
+        renewed_at_ms: u64,
+    ) -> Result<BlindVaultBlindLeaseRenewedReceipt, BlindVaultServiceError> {
+        let mut receipt = BlindVaultBlindLeaseRenewedReceipt::new(
+            request,
+            renewed_at_ms,
             self.node_identity.public_key_bytes(),
         );
         receipt.sign(&self.node_identity)?;
@@ -1988,6 +2225,16 @@ struct LeaseRetirementRow {
     deleted_ciphertext_bytes: u64,
 }
 
+/// Bounded durable state retained only for exact lease-renewal retries.
+#[derive(Debug, Clone, Copy)]
+struct LeaseRenewalRow {
+    admission_spend_id: [u8; 32],
+    request_commitment: [u8; 32],
+    previous_expires_at_ms: u64,
+    renewed_expires_at_ms: u64,
+    renewed_at_ms: u64,
+}
+
 enum LeaseRetirementAuthoritySnapshot {
     Live { admin_verifying_key: [u8; 32] },
     Retired(LeaseRetirementRow),
@@ -2050,6 +2297,21 @@ fn init_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_blind_vault_lease_tombstones_expiry
           ON blind_vault_lease_tombstones(expires_at_ms);
+
+        CREATE TABLE IF NOT EXISTS blind_vault_lease_renewals (
+            lease_id               BLOB NOT NULL CHECK(length(lease_id) = 32),
+            request_id             BLOB NOT NULL CHECK(length(request_id) = 16),
+            admission_spend_id     BLOB NOT NULL CHECK(length(admission_spend_id) = 32),
+            request_commitment     BLOB NOT NULL CHECK(length(request_commitment) = 32),
+            previous_expires_at_ms INTEGER NOT NULL CHECK(previous_expires_at_ms >= 0),
+            renewed_expires_at_ms  INTEGER NOT NULL CHECK(renewed_expires_at_ms > previous_expires_at_ms),
+            renewed_at_ms          INTEGER NOT NULL CHECK(renewed_at_ms < previous_expires_at_ms),
+            expires_at_ms          INTEGER NOT NULL CHECK(expires_at_ms > renewed_at_ms),
+            PRIMARY KEY(lease_id, request_id),
+            FOREIGN KEY(lease_id) REFERENCES blind_vault_leases(lease_id) ON DELETE CASCADE
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_blind_vault_lease_renewals_expiry
+          ON blind_vault_lease_renewals(expires_at_ms);
 
         CREATE TABLE IF NOT EXISTS blind_vault_admission_spends (
             token_id       BLOB PRIMARY KEY CHECK(length(token_id) = 32),
@@ -2266,6 +2528,59 @@ fn load_active_lease_retirement(
         },
     )
     .transpose()
+}
+
+fn load_active_lease_renewal(
+    connection: &Connection,
+    lease_id: &[u8; 32],
+    request_id: &[u8; 16],
+    now_ms: u64,
+) -> Result<Option<LeaseRenewalRow>, BlindVaultServiceError> {
+    let now = sqlite_i64(now_ms)?;
+    let row: Option<(Vec<u8>, Vec<u8>, i64, i64, i64)> = connection
+        .query_row(
+            "SELECT admission_spend_id, request_commitment,
+                    previous_expires_at_ms, renewed_expires_at_ms, renewed_at_ms
+             FROM blind_vault_lease_renewals
+             WHERE lease_id = ?1 AND request_id = ?2 AND expires_at_ms > ?3",
+            params![&lease_id[..], &request_id[..], now],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(spend_id, commitment, previous_expires, renewed_expires, renewed_at)| {
+            Ok(LeaseRenewalRow {
+                admission_spend_id: fixed_array(&spend_id)?,
+                request_commitment: fixed_array(&commitment)?,
+                previous_expires_at_ms: non_negative_u64(previous_expires)?,
+                renewed_expires_at_ms: non_negative_u64(renewed_expires)?,
+                renewed_at_ms: non_negative_u64(renewed_at)?,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn ensure_exact_lease_renewal(
+    existing: &LeaseRenewalRow,
+    request: &BlindVaultBlindLeaseRenewalRequest,
+) -> Result<(), BlindVaultServiceError> {
+    if existing.admission_spend_id != request.admission.spend_id()
+        || existing.request_commitment != request.renewal.commitment()
+        || existing.previous_expires_at_ms != request.renewal.expected_expires_at_ms
+        || existing.renewed_expires_at_ms != request.renewal.requested_expires_at_ms
+    {
+        return Err(BlindVaultServiceError::RequestConflict);
+    }
+    Ok(())
 }
 
 fn load_existing_object(

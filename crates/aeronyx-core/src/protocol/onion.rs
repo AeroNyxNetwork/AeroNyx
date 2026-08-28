@@ -73,6 +73,7 @@
 //!   Unknown values must fail closed instead of silently becoming chat routes.
 //!
 //! ## Last Modified
+//! v1.7.0-BlindVaultLeaseRenewalPurpose — Added blind-authorized lease renewal
 //! v1.6.0-BlindVaultLeaseRetirePurpose — Added anonymous complete lease retirement
 //! v1.5.0-BlindVaultPutReceiptPurpose — Added receipt-capable anonymous writes
 //! v1.4.0-BlindVaultLeaseAdmissionPurpose — Added blind-issued lease admission
@@ -117,7 +118,7 @@ pub const KEM_ALG_XWING: u8 = 2;
 /// The order is stable for deterministic capability responses. Compatibility
 /// aliases accepted by [`OnionRoutePurpose::from_wire_value`] are deliberately
 /// absent so new integrations emit only canonical values.
-pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 7] = [
+pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 8] = [
     "message_relay",
     "blind_vault_put",
     "blind_vault_pull",
@@ -125,6 +126,7 @@ pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 7] = [
     "blind_vault_lease_admission",
     "blind_vault_put_receipt",
     "blind_vault_lease_retire",
+    "blind_vault_lease_renewal",
 ];
 
 /// Fixed layer header length: magic(2) + eph_pub(32) + nonce(24).
@@ -161,6 +163,8 @@ pub enum OnionRoutePurpose {
     BlindVaultPutReceipt,
     /// Anonymous administration-key retirement of one complete replica lease.
     BlindVaultLeaseRetire,
+    /// Blind-authorized administration-key renewal of one live replica lease.
+    BlindVaultLeaseRenewal,
 }
 
 impl OnionRoutePurpose {
@@ -186,6 +190,9 @@ impl OnionRoutePurpose {
             "blind_vault_lease_retire" | "blind-vault-lease-retire" => {
                 Some(Self::BlindVaultLeaseRetire)
             }
+            "blind_vault_lease_renewal" | "blind-vault-lease-renewal" => {
+                Some(Self::BlindVaultLeaseRenewal)
+            }
             _ => None,
         }
     }
@@ -201,6 +208,7 @@ impl OnionRoutePurpose {
             Self::BlindVaultLeaseAdmission => ONION_ROUTE_PURPOSE_VALUES[4],
             Self::BlindVaultPutReceipt => ONION_ROUTE_PURPOSE_VALUES[5],
             Self::BlindVaultLeaseRetire => ONION_ROUTE_PURPOSE_VALUES[6],
+            Self::BlindVaultLeaseRenewal => ONION_ROUTE_PURPOSE_VALUES[7],
         }
     }
 
@@ -218,7 +226,8 @@ impl OnionRoutePurpose {
             | Self::BlindVaultDelete
             | Self::BlindVaultLeaseAdmission
             | Self::BlindVaultPutReceipt
-            | Self::BlindVaultLeaseRetire => Some(NodeCapability::BlindVaultReplica),
+            | Self::BlindVaultLeaseRetire
+            | Self::BlindVaultLeaseRenewal => Some(NodeCapability::BlindVaultReplica),
         }
     }
 }
@@ -548,6 +557,10 @@ mod tests {
             OnionRoutePurpose::from_wire_value("blind-vault-lease-retire"),
             Some(OnionRoutePurpose::BlindVaultLeaseRetire)
         );
+        assert_eq!(
+            OnionRoutePurpose::from_wire_value("blind-vault-lease-renewal"),
+            Some(OnionRoutePurpose::BlindVaultLeaseRenewal)
+        );
     }
 
     #[test]
@@ -583,6 +596,10 @@ mod tests {
             Some(NodeCapability::BlindVaultReplica)
         );
         assert_eq!(
+            OnionRoutePurpose::BlindVaultLeaseRenewal.specialized_terminal_capability(),
+            Some(NodeCapability::BlindVaultReplica)
+        );
+        assert_eq!(
             ONION_ROUTE_PURPOSE_VALUES,
             [
                 "message_relay",
@@ -591,7 +608,8 @@ mod tests {
                 "blind_vault_delete",
                 "blind_vault_lease_admission",
                 "blind_vault_put_receipt",
-                "blind_vault_lease_retire"
+                "blind_vault_lease_retire",
+                "blind_vault_lease_renewal"
             ]
         );
     }
