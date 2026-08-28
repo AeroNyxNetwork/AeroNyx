@@ -75,6 +75,7 @@ pub(super) enum BlindRelayResponseSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BlindRelayInvalidResponseKind {
     SuccessAck,
+    SuccessReceipt,
     DeliveryReceipt,
     OpaqueTerminalResponse,
     FailureReceipt,
@@ -113,6 +114,8 @@ pub(super) struct BlindRelayResponseContext<'a> {
     pub(super) next_hop: [u8; 32],
     pub(super) observed_at: u64,
     pub(super) failure_receipt_required: bool,
+    pub(super) success_receipt_required: bool,
+    pub(super) source_sealed_terminal_proof_allowed: bool,
     pub(super) retry_context: BlindRelayRetryContext,
     pub(super) retry_policy: &'a dyn BlindRelayRetryPolicy,
 }
@@ -157,6 +160,24 @@ fn evaluate_success_status(
 ) -> BlindRelayResponseDecision {
     match response {
         Ok(response) if response.accepted => {
+            if let Err(diagnostic) = validate_downstream_success_receipt(
+                &response,
+                context.request,
+                &context.next_hop,
+                context.observed_at,
+                context.success_receipt_required,
+            ) {
+                return BlindRelayResponseDecision::InvalidResponse {
+                    kind: BlindRelayInvalidResponseKind::SuccessReceipt,
+                    diagnostic,
+                    health_reason: if diagnostic == "success_receipt_required" {
+                        "success_receipt_downgrade"
+                    } else {
+                        "success_receipt_invalid"
+                    },
+                    counts_as_retry_exhaustion: false,
+                };
+            }
             if let Err(diagnostic) = validate_downstream_delivery_receipt(
                 &response,
                 &context.request.envelope.route_id,
@@ -170,7 +191,10 @@ fn evaluate_success_status(
                     counts_as_retry_exhaustion: false,
                 };
             }
-            if let Err(diagnostic) = validate_opaque_terminal_response(&response) {
+            if let Err(diagnostic) = validate_opaque_terminal_response(
+                &response,
+                context.source_sealed_terminal_proof_allowed,
+            ) {
                 return BlindRelayResponseDecision::InvalidResponse {
                     kind: BlindRelayInvalidResponseKind::OpaqueTerminalResponse,
                     diagnostic,
@@ -200,11 +224,14 @@ fn evaluate_success_status(
 /// The source remains responsible for decryption and terminal-signature
 /// verification. Immediate hops enforce the fixed v1 size class so a peer
 /// cannot smuggle a variable or oversized response through the ACK channel.
-fn validate_opaque_terminal_response(ack: &PeerBlindRelayResponse) -> Result<(), &'static str> {
+fn validate_opaque_terminal_response(
+    ack: &PeerBlindRelayResponse,
+    source_sealed_terminal_proof_allowed: bool,
+) -> Result<(), &'static str> {
     let Some(encoded) = ack.opaque_terminal_response_b64.as_deref() else {
         return Ok(());
     };
-    if ack.delivery_receipt.is_none() {
+    if ack.delivery_receipt.is_none() && !source_sealed_terminal_proof_allowed {
         return Err("opaque_response_receipt_missing");
     }
     let bytes = BASE64
@@ -220,6 +247,51 @@ fn validate_opaque_terminal_response(ack: &PeerBlindRelayResponse) -> Result<(),
         return Err("opaque_response_size_class_invalid");
     }
     Ok(())
+}
+
+/// Verifies the success signature from only the directly contacted peer.
+///
+/// [BLIND-RELAY-SUCCESS-RECEIPT 2026-08-29 by Codex] A valid receipt proves
+/// this immediate response and any returned opaque bytes. It intentionally
+/// says nothing about a deeper terminal, so every forwarding node can replace
+/// downstream evidence without widening route topology.
+fn validate_downstream_success_receipt(
+    ack: &PeerBlindRelayResponse,
+    request: &PeerBlindRelayRequest,
+    immediate_next_hop: &[u8; 32],
+    observed_at: u64,
+    receipt_required: bool,
+) -> Result<bool, &'static str> {
+    let Some(receipt) = ack.success_receipt.as_ref() else {
+        return if receipt_required {
+            Err("success_receipt_required")
+        } else {
+            Ok(false)
+        };
+    };
+    if receipt.accepted_at
+        > observed_at.saturating_add(BLIND_RELAY_DELIVERY_RECEIPT_MAX_FUTURE_SKEW_SECS)
+    {
+        return Err("success_receipt_timestamp_in_future");
+    }
+    if observed_at.saturating_sub(receipt.accepted_at) > BLIND_RELAY_DELIVERY_RECEIPT_MAX_AGE_SECS {
+        return Err("success_receipt_timestamp_expired");
+    }
+    receipt
+        .verify_expected(
+            &request.envelope,
+            ack.terminal,
+            ack.forwarded,
+            ack.ttl_remaining,
+            ack.reason.as_deref(),
+            ack.delivery_receipt.as_ref(),
+            ack.opaque_terminal_response_b64
+                .as_deref()
+                .map(str::as_bytes),
+            immediate_next_hop,
+        )
+        .map_err(|_| "success_receipt_binding_invalid")?;
+    Ok(true)
 }
 
 fn evaluate_rejected_status(
@@ -354,6 +426,9 @@ pub(super) fn validate_downstream_failure_receipt(
 ) -> Result<bool, &'static str> {
     if ack.opaque_terminal_response_b64.is_some() {
         return Err("unexpected_opaque_terminal_response");
+    }
+    if ack.success_receipt.is_some() {
+        return Err("unexpected_success_receipt");
     }
     let Some(receipt) = ack.failure_receipt.as_ref() else {
         return if receipt_required {

@@ -640,6 +640,17 @@ fn onion_terminal_required_protocol_features(purpose: Option<OnionRoutePurpose>)
     })
 }
 
+/// Signed feature tokens required from every hop in the selected path.
+fn onion_path_required_protocol_features(purpose: Option<OnionRoutePurpose>) -> Vec<String> {
+    purpose.map_or_else(Vec::new, |purpose| {
+        purpose
+            .required_path_protocol_features()
+            .iter()
+            .map(|feature| feature.semver_build_token().to_string())
+            .collect()
+    })
+}
+
 /// Signed terminal requirements for one onion workload.
 ///
 /// [ONION-TERMINAL-CONTRACT 2026-08-28 by Codex] Coarse capabilities describe
@@ -744,6 +755,14 @@ pub struct OnionCandidatesResponse {
     /// additional fine-grained terminal feature beyond its capabilities.
     #[serde(default)]
     pub terminal_required_protocol_features: Vec<String>,
+    /// Signed SemVer feature tokens required from every selected route hop.
+    ///
+    /// [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Clients must verify
+    /// these tokens on original signed descriptors before building a path.
+    /// Missing support must fail closed or fall back to a legacy one-way mode;
+    /// it must never silently expose a v2 terminal identity.
+    #[serde(default)]
+    pub path_required_protocol_features: Vec<String>,
     /// Number of returned candidates whose original signed descriptor satisfies
     /// the complete terminal capability contract.
     #[serde(default)]
@@ -2363,6 +2382,10 @@ pub fn discovery_summary_response(
             // separate from v1 so a legacy relay cannot be selected for a
             // workload-bound proof merely because it understands ACK framing.
             "purpose_bound_delivery_receipt_v2": true,
+            // Hop-local signatures replace deeper success evidence before an
+            // ACK travels upstream, keeping terminal topology private.
+            "blind_relay_success_receipt_v1": true,
+            "source_sealed_terminal_proof_v1": true,
             // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Canonical values come
             // from aeronyx-core so all implementations negotiate one contract.
             "onion_route_purpose_v1": true,
@@ -2764,6 +2787,8 @@ async fn onion_candidates_handler(
     let limit = state.policy.snapshot_limit(query.limit);
     let requested_purpose = onion_route_purpose_from_query(query.purpose.as_deref());
     let terminal_requirement = OnionTerminalRequirement::for_purpose(requested_purpose);
+    let path_protocol_features =
+        requested_purpose.map_or(&[][..], OnionRoutePurpose::required_path_protocol_features);
     let requested_privacy_mode = OnionPrivacyMode::from_query(query.privacy_mode.as_deref());
     let requested_hops = normalize_requested_hops(requested_privacy_mode, query.hops);
     let pinned_route_domain_required =
@@ -2795,6 +2820,12 @@ async fn onion_candidates_handler(
                 .descriptor
                 .capabilities
                 .contains(&NodeCapability::OnionMiddle)
+            {
+                return None;
+            }
+            if !path_protocol_features
+                .iter()
+                .all(|required| descriptor.descriptor.advertises_protocol_feature(*required))
             {
                 return None;
             }
@@ -2882,6 +2913,12 @@ async fn onion_candidates_handler(
     // builders inject an id and fail multi-hop readiness closed until its
     // signed descriptor can be resolved and used for entry anti-affinity.
     let local_entry_context_ready = state.local_node_id.is_none() || local_descriptor.is_some();
+    let local_path_protocol_ready = state.local_node_id.is_none()
+        || local_descriptor.as_ref().is_some_and(|descriptor| {
+            path_protocol_features
+                .iter()
+                .all(|required| descriptor.descriptor.advertises_protocol_feature(*required))
+        });
     let requested_network_diversity_ready = local_entry_context_ready
         && onion_candidate_route_diversity_ready_for_terminal(
             &candidates,
@@ -2907,7 +2944,8 @@ async fn onion_candidates_handler(
         requested_hops,
         OnionCandidateAdmissionInput {
             purpose: purpose_admission,
-            candidate_pool_ready: limit >= min_candidates_for_requested_hops
+            candidate_pool_ready: local_path_protocol_ready
+                && limit >= min_candidates_for_requested_hops
                 && eligible_candidate_count >= min_candidates_for_requested_hops,
             network_diversity_ready: requested_network_diversity_ready,
             pinned_route_domain: OnionRequirementGate {
@@ -2931,7 +2969,8 @@ async fn onion_candidates_handler(
             2,
             OnionCandidateAdmissionInput {
                 purpose: purpose_admission,
-                candidate_pool_ready: limit >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
+                candidate_pool_ready: local_path_protocol_ready
+                    && limit >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES
                     && eligible_candidate_count >= ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES,
                 network_diversity_ready: two_hop_network_diversity_ready,
                 pinned_route_domain: OnionRequirementGate {
@@ -2997,6 +3036,7 @@ async fn onion_candidates_handler(
         terminal_required_protocol_features: onion_terminal_required_protocol_features(
             requested_purpose,
         ),
+        path_required_protocol_features: onion_path_required_protocol_features(requested_purpose),
         terminal_candidate_count,
         requested_terminal_capability_ready,
         count: candidates.len(),

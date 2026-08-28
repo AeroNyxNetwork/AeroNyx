@@ -411,6 +411,14 @@ pub enum NodeProtocolFeature {
     /// Handled blind-relay protocol failures carry an immediate-hop signed
     /// `BlindRelayFailureReceipt` bound to the exact request and reason.
     BlindRelayFailureReceiptV1,
+    /// Successful blind-relay responses carry an immediate-hop signed receipt
+    /// bound to the exact opaque request and returned evidence surface.
+    ///
+    /// [BLIND-RELAY-SUCCESS-RECEIPT 2026-08-29 by Codex] Unlike a terminal
+    /// delivery receipt, this proves only what the directly contacted peer
+    /// accepted. Each relay replaces the downstream receipt with its own, so
+    /// no upstream hop learns the final terminal identity.
+    BlindRelaySuccessReceiptV1,
     /// The node can return purpose-bound version-2 terminal delivery receipts.
     /// This claim authorizes a probe only; route authority still requires a
     /// successfully verified receipt from the selected terminal.
@@ -444,6 +452,13 @@ pub enum NodeProtocolFeature {
     /// additive response surface during rolling upgrades; it does not reveal
     /// whether any route carries a request/response workload.
     OnionReplyV1,
+    /// Reply-capable routes may keep terminal identity and terminal proof
+    /// exclusively inside the source-sealed fixed-size response.
+    ///
+    /// [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] This feature is
+    /// path-wide: every selected hop must also support immediate-hop success
+    /// receipts before a source opts into the topology-hiding response mode.
+    OnionSourceSealedTerminalProofV1,
     /// The node accepts RFC 9474 blind-issued lease admission inside the final
     /// onion layer and returns a request-bound terminal-signed receipt.
     ///
@@ -485,13 +500,15 @@ pub enum NodeProtocolFeature {
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::BlindRelayFailureReceiptV1,
+        Self::BlindRelaySuccessReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
         Self::DirectPeerRelayAuthV2,
         Self::DirectPeerRelayReceiptV2,
         Self::DirectPeerRelayTargetBindingV3,
         Self::OnionReplyV1,
+        Self::OnionSourceSealedTerminalProofV1,
         Self::OnionBlindLeaseAdmissionV1,
         Self::OnionBlindVaultPutReceiptV1,
         Self::OnionBlindVaultLeaseRetireV1,
@@ -506,11 +523,13 @@ impl NodeProtocolFeature {
     pub const fn semver_build_token(self) -> &'static str {
         match self {
             Self::BlindRelayFailureReceiptV1 => "anpf1-brfr1",
+            Self::BlindRelaySuccessReceiptV1 => "anpf1-brsr1",
             Self::PurposeBoundDeliveryReceiptV2 => "anpf1-pbdr2",
             Self::DirectPeerRelayAuthV2 => "anpf1-dpra2",
             Self::DirectPeerRelayReceiptV2 => "anpf1-dprr2",
             Self::DirectPeerRelayTargetBindingV3 => "anpf1-dprtb3",
             Self::OnionReplyV1 => "anpf1-or1",
+            Self::OnionSourceSealedTerminalProofV1 => "anpf1-osstp1",
             Self::OnionBlindLeaseAdmissionV1 => "anpf1-obla1",
             Self::OnionBlindVaultPutReceiptV1 => "anpf1-obpr1",
             Self::OnionBlindVaultLeaseRetireV1 => "anpf1-oblr1",

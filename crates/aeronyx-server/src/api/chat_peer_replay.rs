@@ -45,7 +45,9 @@ use std::{
     sync::Mutex,
 };
 
-use aeronyx_core::protocol::chat::{BlindRelayDeliveryReceipt, BlindRelayFailureReceipt};
+use aeronyx_core::protocol::chat::{
+    BlindRelayDeliveryReceipt, BlindRelayFailureReceipt, BlindRelaySuccessReceipt,
+};
 use serde::{Deserialize, Serialize};
 
 use super::chat_peer::PeerBlindRelayResponse;
@@ -56,9 +58,11 @@ use crate::services::chat_relay::{
 /// Maximum live and stale generations retained by the replay eviction queue.
 const MAX_REPLAY_QUEUE_GENERATIONS: usize = BLIND_RELAY_ROUTE_REPLAY_CAPACITY * 2;
 const LEGACY_DURABLE_RESPONSE_MAGIC: &[u8; 5] = b"ANBR\x01";
-const DURABLE_RESPONSE_MAGIC: &[u8; 5] = b"ANBR\x02";
+const LEGACY_DURABLE_RESPONSE_V2_MAGIC: &[u8; 5] = b"ANBR\x02";
+const DURABLE_RESPONSE_MAGIC: &[u8; 5] = b"ANBR\x03";
 const LEGACY_DURABLE_RESPONSE_VERSION: u8 = 1;
-const DURABLE_RESPONSE_VERSION: u8 = 2;
+const LEGACY_DURABLE_RESPONSE_V2_VERSION: u8 = 2;
+const DURABLE_RESPONSE_VERSION: u8 = 3;
 
 /// Failure class for the private restart-durable response representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +92,7 @@ struct DurableBlindRelayResponseV1 {
     failure_receipt: Option<BlindRelayFailureReceipt>,
 }
 
-/// Current storage-only response frame including the optional opaque reply.
+/// Legacy storage-only response frame including the optional opaque reply.
 #[derive(Debug, Serialize, Deserialize)]
 struct DurableBlindRelayResponseV2 {
     version: u8,
@@ -98,6 +102,25 @@ struct DurableBlindRelayResponseV2 {
     ttl_remaining: u8,
     reason: Option<String>,
     delivery_receipt: Option<BlindRelayDeliveryReceipt>,
+    failure_receipt: Option<BlindRelayFailureReceipt>,
+    opaque_terminal_response_b64: Option<String>,
+}
+
+/// Current response frame including hop-local success authentication.
+///
+/// [BLIND-RELAY-SUCCESS-RECEIPT 2026-08-29 by Codex] A separate v3 frame is
+/// required because bincode positional decoding cannot treat a newly appended
+/// field as optional. V1/v2 readers below remain exact and read-only.
+#[derive(Debug, Serialize, Deserialize)]
+struct DurableBlindRelayResponseV3 {
+    version: u8,
+    accepted: bool,
+    terminal: bool,
+    forwarded: bool,
+    ttl_remaining: u8,
+    reason: Option<String>,
+    delivery_receipt: Option<BlindRelayDeliveryReceipt>,
+    success_receipt: Option<BlindRelaySuccessReceipt>,
     failure_receipt: Option<BlindRelayFailureReceipt>,
     opaque_terminal_response_b64: Option<String>,
 }
@@ -122,7 +145,7 @@ type LegacyResponseWithOpaqueReply = (
     Option<String>,
 );
 
-impl From<&PeerBlindRelayResponse> for DurableBlindRelayResponseV2 {
+impl From<&PeerBlindRelayResponse> for DurableBlindRelayResponseV3 {
     fn from(response: &PeerBlindRelayResponse) -> Self {
         Self {
             version: DURABLE_RESPONSE_VERSION,
@@ -132,8 +155,25 @@ impl From<&PeerBlindRelayResponse> for DurableBlindRelayResponseV2 {
             ttl_remaining: response.ttl_remaining,
             reason: response.reason.clone(),
             delivery_receipt: response.delivery_receipt.clone(),
+            success_receipt: response.success_receipt.clone(),
             failure_receipt: response.failure_receipt.clone(),
             opaque_terminal_response_b64: response.opaque_terminal_response_b64.clone(),
+        }
+    }
+}
+
+impl From<DurableBlindRelayResponseV3> for PeerBlindRelayResponse {
+    fn from(response: DurableBlindRelayResponseV3) -> Self {
+        Self {
+            accepted: response.accepted,
+            terminal: response.terminal,
+            forwarded: response.forwarded,
+            ttl_remaining: response.ttl_remaining,
+            reason: response.reason,
+            delivery_receipt: response.delivery_receipt,
+            success_receipt: response.success_receipt,
+            failure_receipt: response.failure_receipt,
+            opaque_terminal_response_b64: response.opaque_terminal_response_b64,
         }
     }
 }
@@ -147,6 +187,7 @@ impl From<DurableBlindRelayResponseV2> for PeerBlindRelayResponse {
             ttl_remaining: response.ttl_remaining,
             reason: response.reason,
             delivery_receipt: response.delivery_receipt,
+            success_receipt: None,
             failure_receipt: response.failure_receipt,
             opaque_terminal_response_b64: response.opaque_terminal_response_b64,
         }
@@ -162,6 +203,7 @@ impl From<DurableBlindRelayResponseV1> for PeerBlindRelayResponse {
             ttl_remaining: response.ttl_remaining,
             reason: response.reason,
             delivery_receipt: response.delivery_receipt,
+            success_receipt: None,
             failure_receipt: response.failure_receipt,
             opaque_terminal_response_b64: None,
         }
@@ -171,7 +213,7 @@ impl From<DurableBlindRelayResponseV1> for PeerBlindRelayResponse {
 pub(super) fn encode_durable_blind_relay_response(
     response: &PeerBlindRelayResponse,
 ) -> Result<Vec<u8>, BlindRelayReplayCodecError> {
-    let frame = DurableBlindRelayResponseV2::from(response);
+    let frame = DurableBlindRelayResponseV3::from(response);
     let body = bincode::serialize(&frame).map_err(|_| BlindRelayReplayCodecError::Encode)?;
     let mut encoded = Vec::with_capacity(DURABLE_RESPONSE_MAGIC.len() + body.len());
     encoded.extend_from_slice(DURABLE_RESPONSE_MAGIC);
@@ -183,9 +225,17 @@ pub(super) fn decode_durable_blind_relay_response(
     encoded: &[u8],
 ) -> Result<PeerBlindRelayResponse, BlindRelayReplayCodecError> {
     if let Some(body) = encoded.strip_prefix(DURABLE_RESPONSE_MAGIC) {
-        let frame: DurableBlindRelayResponseV2 =
+        let frame: DurableBlindRelayResponseV3 =
             bincode::deserialize(body).map_err(|_| BlindRelayReplayCodecError::Decode)?;
         if frame.version != DURABLE_RESPONSE_VERSION {
+            return Err(BlindRelayReplayCodecError::UnsupportedVersion);
+        }
+        return Ok(frame.into());
+    }
+    if let Some(body) = encoded.strip_prefix(LEGACY_DURABLE_RESPONSE_V2_MAGIC) {
+        let frame: DurableBlindRelayResponseV2 =
+            bincode::deserialize(body).map_err(|_| BlindRelayReplayCodecError::Decode)?;
+        if frame.version != LEGACY_DURABLE_RESPONSE_V2_VERSION {
             return Err(BlindRelayReplayCodecError::UnsupportedVersion);
         }
         return Ok(frame.into());
@@ -221,6 +271,7 @@ pub(super) fn decode_durable_blind_relay_response(
             ttl_remaining,
             reason,
             delivery_receipt,
+            success_receipt: None,
             failure_receipt,
             opaque_terminal_response_b64,
         });
@@ -236,6 +287,7 @@ pub(super) fn decode_durable_blind_relay_response(
             ttl_remaining,
             reason,
             delivery_receipt,
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         });
@@ -251,6 +303,7 @@ pub(super) fn decode_durable_blind_relay_response(
         ttl_remaining,
         reason,
         delivery_receipt: None,
+        success_receipt: None,
         failure_receipt: None,
         opaque_terminal_response_b64: None,
     })
@@ -272,7 +325,6 @@ pub(super) fn validate_completed_blind_relay_response(
     if !response.accepted
         || response.terminal == response.forwarded
         || response.failure_receipt.is_some()
-        || (response.opaque_terminal_response_b64.is_some() && response.delivery_receipt.is_none())
         || !valid_reason
     {
         return Err(BlindRelayReplayCodecError::InvalidCompletedState);

@@ -448,7 +448,7 @@ use aeronyx_core::crypto::transport::{
 use aeronyx_core::crypto::{IdentityKeyPair, IdentityPublicKey};
 use aeronyx_core::protocol::chat::{
     decode_envelope, encode_blind_relay_envelope, encode_envelope, BlindRelayDeliveryReceipt,
-    BlindRelayEnvelope, BlindRelayFailureReceipt, ChatEnvelope,
+    BlindRelayEnvelope, BlindRelayFailureReceipt, BlindRelaySuccessReceipt, ChatEnvelope,
 };
 use aeronyx_core::protocol::codec::encode_data_packet;
 use aeronyx_core::protocol::discovery::{NodeProtocolFeature, SignedNodeDescriptor};
@@ -456,7 +456,7 @@ use aeronyx_core::protocol::memchain::{encode_memchain, MemChainMessage};
 use aeronyx_core::protocol::onion::{is_onion_blob, try_open_onion_layer, OnionRoutePurpose};
 use aeronyx_core::protocol::{
     decode_blind_vault_frame, is_blind_vault_frame, is_onion_reply_request, BlindVaultFrame,
-    DataPacket, NodeCapability,
+    DataPacket, NodeCapability, OnionReplyProofMode,
 };
 use aeronyx_transport::traits::Transport;
 use aeronyx_transport::UdpTransport;
@@ -1257,6 +1257,14 @@ pub struct PeerBlindRelayResponse {
     /// must not infer sender, receiver, online state, or payload contents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_receipt: Option<BlindRelayDeliveryReceipt>,
+    /// Optional immediate-hop success proof bound to this exact response.
+    ///
+    /// [BLIND-RELAY-SUCCESS-RECEIPT 2026-08-29 by Codex] Each forwarding node
+    /// replaces the downstream value with its own signature. Upstream peers
+    /// can therefore authenticate their direct hop without learning which
+    /// deeper node produced a source-sealed terminal response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_receipt: Option<BlindRelaySuccessReceipt>,
     /// Optional immediate-hop signature over a coarse failure response.
     ///
     /// The receipt authenticates this responder and exact opaque request only;
@@ -1682,6 +1690,7 @@ fn rejected_blind_relay_response_with_status(status: StatusCode, reason: &'stati
             ttl_remaining: 0,
             reason: Some(reason.to_string()),
             delivery_receipt: None,
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         }),
@@ -2096,6 +2105,50 @@ fn build_forwarded_onion_envelope(
     .sign_with(node_identity)
 }
 
+/// Attaches one immediate-hop success proof to an already accepted response.
+///
+/// [BLIND-RELAY-SUCCESS-RECEIPT 2026-08-29 by Codex] This is the only helper
+/// allowed to sign outbound success ACKs. It binds the exact request envelope,
+/// response shape, TTL, legacy delivery evidence, and opaque response while
+/// ensuring a relay never propagates a deeper hop's success signature.
+fn attach_blind_relay_success_receipt(
+    envelope: &BlindRelayEnvelope,
+    mut response: PeerBlindRelayResponse,
+    accepted_at: u64,
+    responder: &IdentityKeyPair,
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    if !response.accepted || response.failure_receipt.is_some() {
+        return Err(BlindRelayError::ForwardFailed);
+    }
+    let opaque_response = response
+        .opaque_terminal_response_b64
+        .as_deref()
+        .map(str::as_bytes);
+    let receipt = match (response.terminal, response.forwarded) {
+        (true, false) => BlindRelaySuccessReceipt::terminal(
+            envelope,
+            response.ttl_remaining,
+            response.reason.as_deref(),
+            response.delivery_receipt.as_ref(),
+            opaque_response,
+            accepted_at,
+            responder,
+        ),
+        (false, true) => BlindRelaySuccessReceipt::forwarded(
+            envelope,
+            response.ttl_remaining,
+            response.reason.as_deref(),
+            response.delivery_receipt.as_ref(),
+            opaque_response,
+            accepted_at,
+            responder,
+        ),
+        _ => return Err(BlindRelayError::ForwardFailed),
+    };
+    response.success_receipt = Some(receipt);
+    Ok(response)
+}
+
 #[cfg(test)]
 async fn process_peer_blind_relay(
     state: ChatPeerState,
@@ -2182,18 +2235,31 @@ async fn process_authenticated_peer_blind_relay(
             now,
         )? {
             BlindRelayRouteStart::Acquired(lease) => lease,
-            BlindRelayRouteStart::Completed(response) => return Ok(response),
+            BlindRelayRouteStart::Completed(response) => {
+                return attach_blind_relay_success_receipt(
+                    &envelope,
+                    response,
+                    now,
+                    state.node_identity.as_ref(),
+                )
+            }
         };
-        let response = PeerBlindRelayResponse {
-            accepted: true,
-            terminal: true,
-            forwarded: false,
-            ttl_remaining: envelope.ttl,
-            reason: Some("terminal_next_hop".to_string()),
-            delivery_receipt: None,
-            failure_receipt: None,
-            opaque_terminal_response_b64: None,
-        };
+        let response = attach_blind_relay_success_receipt(
+            &envelope,
+            PeerBlindRelayResponse {
+                accepted: true,
+                terminal: true,
+                forwarded: false,
+                ttl_remaining: envelope.ttl,
+                reason: Some("terminal_next_hop".to_string()),
+                delivery_receipt: None,
+                success_receipt: None,
+                failure_receipt: None,
+                opaque_terminal_response_b64: None,
+            },
+            now,
+            state.node_identity.as_ref(),
+        )?;
         complete_blind_relay_route(&state, route_lease, now, response.clone())?;
         record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
         state.peer_store.record_blind_relay_terminal(
@@ -2263,7 +2329,14 @@ async fn process_authenticated_peer_blind_relay(
         now,
     )? {
         BlindRelayRouteStart::Acquired(lease) => lease,
-        BlindRelayRouteStart::Completed(response) => return Ok(response),
+        BlindRelayRouteStart::Completed(response) => {
+            return attach_blind_relay_success_receipt(
+                &envelope,
+                response,
+                now,
+                state.node_identity.as_ref(),
+            )
+        }
     };
 
     let forwarded_envelope = envelope
@@ -2298,16 +2371,22 @@ async fn process_authenticated_peer_blind_relay(
         Err(error) => return Err(error),
     };
 
-    let response = PeerBlindRelayResponse {
-        accepted: true,
-        terminal: false,
-        forwarded: true,
-        ttl_remaining,
-        reason: Some("forwarded".to_string()),
-        delivery_receipt: None,
-        failure_receipt: None,
-        opaque_terminal_response_b64: None,
-    };
+    let response = attach_blind_relay_success_receipt(
+        &envelope,
+        PeerBlindRelayResponse {
+            accepted: true,
+            terminal: false,
+            forwarded: true,
+            ttl_remaining,
+            reason: Some("forwarded".to_string()),
+            delivery_receipt: None,
+            success_receipt: None,
+            failure_receipt: None,
+            opaque_terminal_response_b64: None,
+        },
+        observed_at,
+        state.node_identity.as_ref(),
+    )?;
     complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
     let _ = state
         .peer_store
@@ -2349,7 +2428,14 @@ async fn process_onion_blind_relay(
         now,
     )? {
         BlindRelayRouteStart::Acquired(lease) => lease,
-        BlindRelayRouteStart::Completed(response) => return Ok(response),
+        BlindRelayRouteStart::Completed(response) => {
+            return attach_blind_relay_success_receipt(
+                &envelope,
+                response,
+                now,
+                state.node_identity.as_ref(),
+            )
+        }
     };
 
     // Peel exactly one onion layer with the node's rotating onion key(s): the
@@ -2405,23 +2491,39 @@ async fn process_onion_blind_relay(
             // the selected terminal workload has crossed its durable acceptance
             // boundary. The purpose is committed with the opaque payload hash,
             // not returned as relay-visible metadata.
-            let delivery_receipt = BlindRelayDeliveryReceipt::accepted_for_purpose(
-                envelope.route_id,
-                &peel.inner,
-                route_purpose,
+            let delivery_receipt = match terminal_delivery.proof_mode {
+                OnionReplyProofMode::RelayVisibleTerminalReceipt => {
+                    Some(BlindRelayDeliveryReceipt::accepted_for_purpose(
+                        envelope.route_id,
+                        &peel.inner,
+                        route_purpose,
+                        accepted_at,
+                        state.node_identity.as_ref(),
+                    ))
+                }
+                // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] The
+                // terminal identity and signed workload result are already
+                // authenticated inside this fixed-size ciphertext. Omitting
+                // the clear terminal receipt prevents every middle hop from
+                // reconstructing the final route endpoint.
+                OnionReplyProofMode::SourceSealedTerminalProof => None,
+            };
+            let response = attach_blind_relay_success_receipt(
+                &envelope,
+                PeerBlindRelayResponse {
+                    accepted: true,
+                    terminal: true,
+                    forwarded: false,
+                    ttl_remaining: envelope.ttl,
+                    reason: Some("onion_terminal_delivered".to_string()),
+                    delivery_receipt,
+                    success_receipt: None,
+                    failure_receipt: None,
+                    opaque_terminal_response_b64: terminal_delivery.opaque_response_b64,
+                },
                 accepted_at,
                 state.node_identity.as_ref(),
-            );
-            let response = PeerBlindRelayResponse {
-                accepted: true,
-                terminal: true,
-                forwarded: false,
-                ttl_remaining: envelope.ttl,
-                reason: Some("onion_terminal_delivered".to_string()),
-                delivery_receipt: Some(delivery_receipt),
-                failure_receipt: None,
-                opaque_terminal_response_b64: terminal_delivery.opaque_response_b64,
-            };
+            )?;
             complete_blind_relay_route(&state, route_lease, accepted_at, response.clone())?;
             record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
             state.peer_store.record_blind_relay_terminal(
@@ -2533,16 +2635,22 @@ async fn process_onion_blind_relay(
             let observed_at = next_hop_forward.observed_at;
             let next_hop_ack = next_hop_forward.response;
 
-            let response = PeerBlindRelayResponse {
-                accepted: true,
-                terminal: false,
-                forwarded: true,
-                ttl_remaining,
-                reason: Some("onion_forwarded".to_string()),
-                delivery_receipt: next_hop_ack.delivery_receipt,
-                failure_receipt: None,
-                opaque_terminal_response_b64: next_hop_ack.opaque_terminal_response_b64,
-            };
+            let response = attach_blind_relay_success_receipt(
+                &envelope,
+                PeerBlindRelayResponse {
+                    accepted: true,
+                    terminal: false,
+                    forwarded: true,
+                    ttl_remaining,
+                    reason: Some("onion_forwarded".to_string()),
+                    delivery_receipt: next_hop_ack.delivery_receipt,
+                    success_receipt: None,
+                    failure_receipt: None,
+                    opaque_terminal_response_b64: next_hop_ack.opaque_terminal_response_b64,
+                },
+                observed_at,
+                state.node_identity.as_ref(),
+            )?;
             complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
             let _ = state
                 .peer_store
@@ -2563,6 +2671,7 @@ async fn process_onion_blind_relay(
 /// ciphertext plaintext exists in the Put frame.
 struct OnionTerminalDelivery {
     purpose: OnionRoutePurpose,
+    proof_mode: OnionReplyProofMode,
     opaque_response_b64: Option<String>,
 }
 
@@ -2605,6 +2714,7 @@ async fn deliver_onion_terminal_payload(
         })?;
         return Ok(OnionTerminalDelivery {
             purpose: reply.purpose,
+            proof_mode: reply.proof_mode,
             opaque_response_b64: Some(reply.opaque_response_b64),
         });
     }
@@ -2626,6 +2736,7 @@ async fn deliver_onion_terminal_payload(
             .map_err(|error| map_blind_vault_put_error(&error))?;
         return Ok(OnionTerminalDelivery {
             purpose: OnionRoutePurpose::BlindVaultPut,
+            proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
             opaque_response_b64: None,
         });
     }
@@ -2636,6 +2747,7 @@ async fn deliver_onion_terminal_payload(
         .await
         .map(|_| OnionTerminalDelivery {
             purpose: OnionRoutePurpose::MessageRelay,
+            proof_mode: OnionReplyProofMode::RelayVisibleTerminalReceipt,
             opaque_response_b64: None,
         })
         .map_err(|_| BlindRelayError::ForwardFailed)
@@ -2731,7 +2843,14 @@ async fn process_onion_middle_blind_relay(
         now,
     )? {
         BlindRelayRouteStart::Acquired(lease) => lease,
-        BlindRelayRouteStart::Completed(response) => return Ok(response),
+        BlindRelayRouteStart::Completed(response) => {
+            return attach_blind_relay_success_receipt(
+                &outer_envelope,
+                response,
+                now,
+                state.node_identity.as_ref(),
+            )
+        }
     };
 
     let forwarded_envelope = onward_envelope
@@ -2764,16 +2883,22 @@ async fn process_onion_middle_blind_relay(
     let observed_at = next_hop_forward.observed_at;
     let next_hop_ack = next_hop_forward.response;
 
-    let response = PeerBlindRelayResponse {
-        accepted: true,
-        terminal: false,
-        forwarded: true,
-        ttl_remaining,
-        reason: Some("onion_middle_forwarded".to_string()),
-        delivery_receipt: next_hop_ack.delivery_receipt,
-        failure_receipt: None,
-        opaque_terminal_response_b64: next_hop_ack.opaque_terminal_response_b64,
-    };
+    let response = attach_blind_relay_success_receipt(
+        &outer_envelope,
+        PeerBlindRelayResponse {
+            accepted: true,
+            terminal: false,
+            forwarded: true,
+            ttl_remaining,
+            reason: Some("onion_middle_forwarded".to_string()),
+            delivery_receipt: next_hop_ack.delivery_receipt,
+            success_receipt: None,
+            failure_receipt: None,
+            opaque_terminal_response_b64: next_hop_ack.opaque_terminal_response_b64,
+        },
+        observed_at,
+        state.node_identity.as_ref(),
+    )?;
     complete_blind_relay_route(&state, route_lease, observed_at, response.clone())?;
     let _ = state
         .peer_store
@@ -3108,6 +3233,9 @@ async fn forward_blind_relay_with_components(
 ) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
     let next_hop = descriptor.node_id();
     let failure_receipt_required = blind_relay_failure_receipt_required(descriptor);
+    let success_receipt_required = blind_relay_success_receipt_required(descriptor);
+    let source_sealed_terminal_proof_allowed =
+        onion_source_sealed_terminal_proof_allowed(descriptor);
     let request_started_at = Instant::now();
     for attempt in 1..=components.retry_policy.max_attempts().get() {
         let retry_context = blind_relay_retry_context(&request, next_hop, attempt)?;
@@ -3120,6 +3248,8 @@ async fn forward_blind_relay_with_components(
                 next_hop,
                 observed_at,
                 failure_receipt_required,
+                success_receipt_required,
+                source_sealed_terminal_proof_allowed,
                 retry_context,
                 retry_policy: components.retry_policy,
             },
@@ -3221,6 +3351,23 @@ fn blind_relay_failure_receipt_required(descriptor: &SignedNodeDescriptor) -> bo
         .advertises_protocol_feature(NodeProtocolFeature::BlindRelayFailureReceiptV1)
 }
 
+fn blind_relay_success_receipt_required(descriptor: &SignedNodeDescriptor) -> bool {
+    descriptor
+        .descriptor
+        .advertises_protocol_feature(NodeProtocolFeature::BlindRelaySuccessReceiptV1)
+}
+
+fn onion_source_sealed_terminal_proof_allowed(descriptor: &SignedNodeDescriptor) -> bool {
+    // Both tokens are required because an opaque-only response is safe to
+    // accept only when the immediate peer authenticates the exact bytes it
+    // returned. Signed descriptor negotiation prevents downgrade by gossip or
+    // an endpoint that does not own the advertised identity.
+    blind_relay_success_receipt_required(descriptor)
+        && descriptor
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::OnionSourceSealedTerminalProofV1)
+}
+
 fn complete_blind_relay_forward(
     observer: &dyn BlindRelayForwardObserver,
     response: PeerBlindRelayResponse,
@@ -3273,6 +3420,11 @@ fn log_invalid_blind_relay_response(
             attempt,
             reason = diagnostic,
             "[BLIND_RELAY] Next-hop ACK invalid"
+        ),
+        BlindRelayInvalidResponseKind::SuccessReceipt => debug!(
+            attempt,
+            reason = diagnostic,
+            "[BLIND_RELAY] Next-hop hop-local success receipt verification failed"
         ),
         BlindRelayInvalidResponseKind::DeliveryReceipt => debug!(
             attempt,
@@ -3604,6 +3756,7 @@ mod tests {
                 started_at + 31,
                 &terminal,
             )),
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         };
@@ -3644,6 +3797,7 @@ mod tests {
                 now,
                 &downstream_terminal,
             )),
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         };
@@ -3675,6 +3829,7 @@ mod tests {
                 now,
                 &wrong_terminal,
             )),
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         };
@@ -3706,6 +3861,7 @@ mod tests {
             ttl_remaining: 1,
             reason: None,
             delivery_receipt: None,
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         };
@@ -3790,6 +3946,7 @@ mod tests {
             ttl_remaining: 0,
             reason: Some("forward_failed".to_string()),
             delivery_receipt: None,
+            success_receipt: None,
             failure_receipt: receipt,
             opaque_terminal_response_b64: None,
         };
@@ -3917,6 +4074,7 @@ mod tests {
             ttl_remaining: 1,
             reason: Some("onion_forwarded".to_string()),
             delivery_receipt: Some(receipt),
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         };
@@ -5959,6 +6117,7 @@ mod tests {
                         ttl_remaining: 2,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        success_receipt: None,
                         failure_receipt: None,
                         opaque_terminal_response_b64: None,
                     })
@@ -6160,6 +6319,7 @@ mod tests {
                         ttl_remaining: request.envelope.ttl,
                         reason: Some("onion_terminal_delivered".to_string()),
                         delivery_receipt: Some(delivery_receipt),
+                        success_receipt: None,
                         failure_receipt: None,
                         opaque_terminal_response_b64: None,
                     })
@@ -6501,6 +6661,7 @@ mod tests {
             ttl_remaining: 1,
             reason: Some("forwarded".to_string()),
             delivery_receipt: None,
+            success_receipt: None,
             failure_receipt: None,
             opaque_terminal_response_b64: None,
         };
@@ -6874,6 +7035,7 @@ mod tests {
                             ttl_remaining: 1,
                             reason: Some("terminal_next_hop".to_string()),
                             delivery_receipt: None,
+                            success_receipt: None,
                             failure_receipt: None,
                             opaque_terminal_response_b64: None,
                         })
@@ -6972,6 +7134,7 @@ mod tests {
                         ttl_remaining: 0,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        success_receipt: None,
                         failure_receipt: None,
                         opaque_terminal_response_b64: None,
                     })
@@ -7100,6 +7263,7 @@ mod tests {
                         ttl_remaining: 1,
                         reason: Some("relay_unavailable".to_string()),
                         delivery_receipt: None,
+                        success_receipt: None,
                         failure_receipt: None,
                         opaque_terminal_response_b64: None,
                     })
@@ -7363,6 +7527,7 @@ mod tests {
                         ttl_remaining: 1,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        success_receipt: None,
                         failure_receipt: None,
                         opaque_terminal_response_b64: None,
                     })
@@ -7480,6 +7645,7 @@ mod tests {
                             ttl_remaining: 0,
                             reason: Some("forward_failed".to_string()),
                             delivery_receipt: None,
+                            success_receipt: None,
                             failure_receipt: Some(failure_receipt),
                             opaque_terminal_response_b64: None,
                         }),
@@ -7592,6 +7758,7 @@ mod tests {
                             ttl_remaining: 0,
                             reason: Some("forward_failed".to_string()),
                             delivery_receipt: None,
+                            success_receipt: None,
                             failure_receipt: None,
                             opaque_terminal_response_b64: None,
                         }),
@@ -7709,6 +7876,7 @@ mod tests {
                             ttl_remaining: 0,
                             reason: Some("forward_failed".to_string()),
                             delivery_receipt: None,
+                            success_receipt: None,
                             failure_receipt: Some(receipt),
                             opaque_terminal_response_b64: None,
                         }),
@@ -7900,6 +8068,7 @@ mod tests {
                         ttl_remaining: 1,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        success_receipt: None,
                         failure_receipt: None,
                         opaque_terminal_response_b64: None,
                     })

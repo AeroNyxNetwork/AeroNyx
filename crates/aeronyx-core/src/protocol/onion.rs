@@ -135,52 +135,72 @@ pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 10] = [
     "blind_vault_lease_inventory",
 ];
 
-/// Generic reply support plus encrypted workload failures.
-const BLIND_VAULT_REPLY_FEATURES: [NodeProtocolFeature; 2] = [
+/// Path-wide proof contract for topology-hiding terminal replies.
+const SOURCE_SEALED_REPLY_PATH_FEATURES: [NodeProtocolFeature; 2] = [
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+];
+
+/// Generic reply support plus encrypted workload failures and sealed proof.
+const BLIND_VAULT_REPLY_FEATURES: [NodeProtocolFeature; 4] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
 ];
 
 /// Reply contract for blind-issued lease admission.
-const BLIND_VAULT_LEASE_ADMISSION_FEATURES: [NodeProtocolFeature; 3] = [
+const BLIND_VAULT_LEASE_ADMISSION_FEATURES: [NodeProtocolFeature; 5] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
 ];
 
 /// Reply contract for receipt-capable immutable writes.
-const BLIND_VAULT_PUT_RECEIPT_FEATURES: [NodeProtocolFeature; 3] = [
+const BLIND_VAULT_PUT_RECEIPT_FEATURES: [NodeProtocolFeature; 5] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
 ];
 
 /// Reply contract for administration-key lease retirement.
-const BLIND_VAULT_LEASE_RETIRE_FEATURES: [NodeProtocolFeature; 3] = [
+const BLIND_VAULT_LEASE_RETIRE_FEATURES: [NodeProtocolFeature; 5] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
 ];
 
 /// Reply contract for blind-authorized lease renewal.
-const BLIND_VAULT_LEASE_RENEWAL_FEATURES: [NodeProtocolFeature; 3] = [
+const BLIND_VAULT_LEASE_RENEWAL_FEATURES: [NodeProtocolFeature; 5] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
 ];
 
 /// Reply contract for private lease-status observations.
-const BLIND_VAULT_LEASE_STATUS_FEATURES: [NodeProtocolFeature; 3] = [
+const BLIND_VAULT_LEASE_STATUS_FEATURES: [NodeProtocolFeature; 5] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindVaultLeaseStatusV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
 ];
 
 /// Reply contract for private lease-inventory commitments.
-const BLIND_VAULT_LEASE_INVENTORY_FEATURES: [NodeProtocolFeature; 3] = [
+const BLIND_VAULT_LEASE_INVENTORY_FEATURES: [NodeProtocolFeature; 5] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindVaultLeaseInventoryV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
 ];
 
 /// Fixed layer header length: magic(2) + eph_pub(32) + nonce(24).
@@ -318,6 +338,28 @@ impl OnionRoutePurpose {
             Self::BlindVaultLeaseRenewal => &BLIND_VAULT_LEASE_RENEWAL_FEATURES,
             Self::BlindVaultLeaseStatus => &BLIND_VAULT_LEASE_STATUS_FEATURES,
             Self::BlindVaultLeaseInventory => &BLIND_VAULT_LEASE_INVENTORY_FEATURES,
+        }
+    }
+
+    /// Returns signed features required from every selected path hop.
+    ///
+    /// [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] A v2 reply cannot
+    /// safely traverse a legacy middle: that node expects a relay-visible
+    /// terminal receipt and cannot authenticate an opaque-only response.
+    /// Sources must therefore verify these tokens on the entry, every middle,
+    /// and the terminal before constructing a reply-capable path.
+    #[must_use]
+    pub const fn required_path_protocol_features(self) -> &'static [NodeProtocolFeature] {
+        match self {
+            Self::MessageRelay | Self::BlindVaultPut => &[],
+            Self::BlindVaultPull
+            | Self::BlindVaultDelete
+            | Self::BlindVaultLeaseAdmission
+            | Self::BlindVaultPutReceipt
+            | Self::BlindVaultLeaseRetire
+            | Self::BlindVaultLeaseRenewal
+            | Self::BlindVaultLeaseStatus
+            | Self::BlindVaultLeaseInventory => &SOURCE_SEALED_REPLY_PATH_FEATURES,
         }
     }
 }

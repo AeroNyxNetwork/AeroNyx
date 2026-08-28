@@ -61,8 +61,8 @@ use aeronyx_core::protocol::{
     decode_blind_vault_frame, decode_onion_reply_request, encode_blind_vault_frame,
     encode_onion_sealed_response, seal_onion_reply, BlindVaultBlindLeaseAcceptedReceipt,
     BlindVaultFrame, BlindVaultPullResponse, BlindVaultRecoveredObject, BlindVaultTerminalFailure,
-    BlindVaultTerminalFailureCode, BlindVaultTerminalOperation, OnionRoutePurpose,
-    BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, ONION_REPLY_RESPONSE_SIZE_CLASSES,
+    BlindVaultTerminalFailureCode, BlindVaultTerminalOperation, OnionReplyProofMode,
+    OnionRoutePurpose, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, ONION_REPLY_RESPONSE_SIZE_CLASSES,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
@@ -106,6 +106,7 @@ impl TerminalReplyFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TerminalReply {
     pub(super) purpose: OnionRoutePurpose,
+    pub(super) proof_mode: OnionReplyProofMode,
     pub(super) opaque_response_b64: String,
 }
 
@@ -275,6 +276,7 @@ pub(super) fn execute_blind_vault_inline_reply(
         encode_onion_sealed_response(&sealed).map_err(|_| TerminalReplyFailure::Unavailable)?;
     Ok(TerminalReply {
         purpose,
+        proof_mode: reply_request.proof_mode(),
         opaque_response_b64: BASE64.encode(encoded_sealed),
     })
 }

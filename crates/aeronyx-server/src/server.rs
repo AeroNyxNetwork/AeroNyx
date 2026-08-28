@@ -13550,11 +13550,16 @@ impl Server {
         )
         .with_protocol_features([
             NodeProtocolFeature::BlindRelayFailureReceiptV1,
+            // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] These two
+            // signed tokens activate hop-local success authentication and the
+            // topology-hiding v2 reply contract only on upgraded paths.
+            NodeProtocolFeature::BlindRelaySuccessReceiptV1,
             NodeProtocolFeature::PurposeBoundDeliveryReceiptV2,
             NodeProtocolFeature::DirectPeerRelayAuthV2,
             NodeProtocolFeature::DirectPeerRelayReceiptV2,
             NodeProtocolFeature::DirectPeerRelayTargetBindingV3,
             NodeProtocolFeature::OnionReplyV1,
+            NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
             NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
             NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
             NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,
@@ -18916,6 +18921,7 @@ mod tests {
                             ttl_remaining: 1,
                             reason: Some("onion_forwarded".to_string()),
                             delivery_receipt: Some(receipt),
+                            success_receipt: None,
                             failure_receipt: None,
                             opaque_terminal_response_b64: None,
                         })
@@ -19604,6 +19610,7 @@ mod tests {
                             unix_now_secs(),
                             &terminal_receipt_identity,
                         )),
+                        success_receipt: None,
                         failure_receipt: None,
                         opaque_terminal_response_b64: None,
                     })
@@ -19783,6 +19790,7 @@ mod tests {
                     ttl_remaining: 1,
                     reason: Some("onion_forwarded".to_string()),
                     delivery_receipt: None,
+                    success_receipt: None,
                     failure_receipt: None,
                     opaque_terminal_response_b64: None,
                 })
@@ -19930,6 +19938,7 @@ mod tests {
                             unix_now_secs(),
                             &terminal_receipt_identity,
                         )),
+                        success_receipt: None,
                         failure_receipt: None,
                         opaque_terminal_response_b64: None,
                     })
@@ -20897,6 +20906,7 @@ mod tests {
                         ttl_remaining: 1,
                         reason: Some("terminal_next_hop".to_string()),
                         delivery_receipt: None,
+                        success_receipt: None,
                         failure_receipt: None,
                         opaque_terminal_response_b64: None,
                     })
@@ -21023,6 +21033,7 @@ mod tests {
                             ttl_remaining: 1,
                             reason: (!legacy_fallback).then(|| "legacy_only".to_string()),
                             delivery_receipt: None,
+                            success_receipt: None,
                             failure_receipt: None,
                             opaque_terminal_response_b64: None,
                         })
@@ -21081,6 +21092,7 @@ mod tests {
                             ttl_remaining: 1,
                             reason: None,
                             delivery_receipt: Some(receipt),
+                            success_receipt: None,
                             failure_receipt: None,
                             opaque_terminal_response_b64: None,
                         })

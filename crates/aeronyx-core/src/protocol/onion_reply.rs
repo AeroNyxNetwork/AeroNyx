@@ -61,11 +61,15 @@ const RESPONSE_MAGIC: [u8; 4] = *b"ANRS";
 const PLAINTEXT_MAGIC: [u8; 4] = *b"ANRP";
 const RESPONSE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-Onion-Reply-Response-v1";
 const RESPONSE_KEY_SALT: &[u8] = b"AeroNyx-Onion-Reply-Key-v1";
+const REQUEST_CONTEXT_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx-Onion-Reply-RequestContext-v2";
+const LEGACY_REQUEST_VERSION: u8 = 1;
+const SOURCE_SEALED_REQUEST_VERSION: u8 = 2;
 const RESPONSE_VERSION: u8 = 1;
 const AEAD_NONCE_BYTES: usize = 24;
 const AEAD_TAG_BYTES: usize = 16;
 const SIGNATURE_BYTES: usize = 64;
-const REQUEST_HEADER_BYTES: usize = 4 + 1 + 32 + 4 + 4;
+const LEGACY_REQUEST_HEADER_BYTES: usize = 4 + 1 + 32 + 4 + 4;
+const SOURCE_SEALED_REQUEST_HEADER_BYTES: usize = LEGACY_REQUEST_HEADER_BYTES + 1;
 const RESPONSE_HEADER_BYTES: usize = 4 + 1 + 32 + AEAD_NONCE_BYTES + 4;
 const PLAINTEXT_HEADER_BYTES: usize = 4 + 1 + 4 + 16 + 32 + 32 + 4;
 
@@ -86,11 +90,40 @@ pub const MAX_ONION_SEALED_RESPONSE_BYTES: usize = RESPONSE_HEADER_BYTES
     + ONION_REPLY_RESPONSE_SIZE_CLASSES[ONION_REPLY_RESPONSE_SIZE_CLASSES.len() - 1]
     + AEAD_TAG_BYTES;
 
+/// Relay-visible terminal-proof behavior requested by the source.
+///
+/// [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Version 1 preserves the
+/// historical clear terminal receipt for rolling compatibility. Version 2
+/// asks every upgraded hop to rely on its immediate-hop success receipt while
+/// the final identity and result remain inside the encrypted reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OnionReplyProofMode {
+    /// Preserve the historical relay-visible terminal delivery receipt.
+    RelayVisibleTerminalReceipt = 0,
+    /// Return terminal proof only inside the source-sealed response.
+    SourceSealedTerminalProof = 1,
+}
+
+impl TryFrom<u8> for OnionReplyProofMode {
+    type Error = OnionReplyError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::RelayVisibleTerminalReceipt),
+            1 => Ok(Self::SourceSealedTerminalProof),
+            _ => Err(OnionReplyError::InvalidProofMode(value)),
+        }
+    }
+}
+
 /// Reply-capable terminal request carried as the final onion payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnionReplyRequest {
     /// Independent reply-carrier protocol version.
     pub version: u8,
+    /// Requested terminal-proof visibility. V1 is always relay-visible.
+    proof_mode: OnionReplyProofMode,
     /// Source-generated, single-use X25519 public key.
     pub reply_public_key: [u8; 32],
     /// Exact padded plaintext size requested for the sealed response.
@@ -106,10 +139,42 @@ impl OnionReplyRequest {
         response_size_class: usize,
         payload: Vec<u8>,
     ) -> Result<Self, OnionReplyError> {
+        Self::new_with_proof_mode(
+            LEGACY_REQUEST_VERSION,
+            OnionReplyProofMode::RelayVisibleTerminalReceipt,
+            reply_public_key,
+            response_size_class,
+            payload,
+        )
+    }
+
+    /// Creates a v2 request whose terminal proof remains source-sealed.
+    pub fn new_source_sealed(
+        reply_public_key: [u8; 32],
+        response_size_class: usize,
+        payload: Vec<u8>,
+    ) -> Result<Self, OnionReplyError> {
+        Self::new_with_proof_mode(
+            SOURCE_SEALED_REQUEST_VERSION,
+            OnionReplyProofMode::SourceSealedTerminalProof,
+            reply_public_key,
+            response_size_class,
+            payload,
+        )
+    }
+
+    fn new_with_proof_mode(
+        version: u8,
+        proof_mode: OnionReplyProofMode,
+        reply_public_key: [u8; 32],
+        response_size_class: usize,
+        payload: Vec<u8>,
+    ) -> Result<Self, OnionReplyError> {
         let response_size_class =
             u32::try_from(response_size_class).map_err(|_| OnionReplyError::InvalidSizeClass)?;
         let request = Self {
-            version: RESPONSE_VERSION,
+            version,
+            proof_mode,
             reply_public_key,
             response_size_class,
             payload,
@@ -120,8 +185,18 @@ impl OnionReplyRequest {
 
     /// Validates version, key, response class, and request allocation bounds.
     pub fn validate(&self) -> Result<(), OnionReplyError> {
-        if self.version != RESPONSE_VERSION {
-            return Err(OnionReplyError::UnsupportedVersion(self.version));
+        match (self.version, self.proof_mode) {
+            (LEGACY_REQUEST_VERSION, OnionReplyProofMode::RelayVisibleTerminalReceipt)
+            | (SOURCE_SEALED_REQUEST_VERSION, OnionReplyProofMode::SourceSealedTerminalProof) => {}
+            (version, _)
+                if matches!(
+                    version,
+                    LEGACY_REQUEST_VERSION | SOURCE_SEALED_REQUEST_VERSION
+                ) =>
+            {
+                return Err(OnionReplyError::InvalidProofMode(self.proof_mode as u8))
+            }
+            _ => return Err(OnionReplyError::UnsupportedVersion(self.version)),
         }
         if self.reply_public_key.iter().all(|byte| *byte == 0) {
             return Err(OnionReplyError::InvalidReplyKey);
@@ -133,6 +208,12 @@ impl OnionReplyRequest {
             });
         }
         Ok(())
+    }
+
+    /// Returns the validated terminal-proof visibility requested by the source.
+    #[must_use]
+    pub const fn proof_mode(&self) -> OnionReplyProofMode {
+        self.proof_mode
     }
 }
 
@@ -190,7 +271,7 @@ pub struct OnionReplySession {
     route_id: [u8; 16],
     expected_terminal_node_id: [u8; 32],
     response_size_class: usize,
-    request_payload_commitment: [u8; 32],
+    request_context_commitment: [u8; 32],
     reply_key: EphemeralKeyPair,
 }
 
@@ -202,19 +283,59 @@ impl OnionReplySession {
         response_size_class: usize,
         payload: Vec<u8>,
     ) -> Result<(OnionReplyRequest, Self), OnionReplyError> {
+        Self::prepare_with_mode(
+            route_id,
+            expected_terminal_node_id,
+            response_size_class,
+            payload,
+            OnionReplyProofMode::RelayVisibleTerminalReceipt,
+        )
+    }
+
+    /// Creates one v2 request that keeps final proof private to the source.
+    pub fn prepare_source_sealed(
+        route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        response_size_class: usize,
+        payload: Vec<u8>,
+    ) -> Result<(OnionReplyRequest, Self), OnionReplyError> {
+        Self::prepare_with_mode(
+            route_id,
+            expected_terminal_node_id,
+            response_size_class,
+            payload,
+            OnionReplyProofMode::SourceSealedTerminalProof,
+        )
+    }
+
+    fn prepare_with_mode(
+        route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        response_size_class: usize,
+        payload: Vec<u8>,
+        proof_mode: OnionReplyProofMode,
+    ) -> Result<(OnionReplyRequest, Self), OnionReplyError> {
         IdentityPublicKey::from_bytes(&expected_terminal_node_id)
             .map_err(|_| OnionReplyError::InvalidTerminalIdentity)?;
         let reply_key = EphemeralKeyPair::generate();
-        let request =
-            OnionReplyRequest::new(reply_key.public_key_bytes(), response_size_class, payload)?;
-        let request_payload_commitment = payload_commitment(&request.payload);
+        let request = match proof_mode {
+            OnionReplyProofMode::RelayVisibleTerminalReceipt => {
+                OnionReplyRequest::new(reply_key.public_key_bytes(), response_size_class, payload)?
+            }
+            OnionReplyProofMode::SourceSealedTerminalProof => OnionReplyRequest::new_source_sealed(
+                reply_key.public_key_bytes(),
+                response_size_class,
+                payload,
+            )?,
+        };
+        let request_context_commitment = request_context_commitment(&request);
         Ok((
             request,
             Self {
                 route_id,
                 expected_terminal_node_id,
                 response_size_class,
-                request_payload_commitment,
+                request_context_commitment,
                 reply_key,
             },
         ))
@@ -229,7 +350,7 @@ impl OnionReplySession {
             self.reply_key,
             self.expected_terminal_node_id,
             self.response_size_class,
-            self.request_payload_commitment,
+            self.request_context_commitment,
         )
     }
 }
@@ -239,9 +360,17 @@ pub fn encode_onion_reply_request(request: &OnionReplyRequest) -> Result<Vec<u8>
     request.validate()?;
     let payload_len =
         u32::try_from(request.payload.len()).map_err(|_| OnionReplyError::FrameTooLarge)?;
-    let mut encoded = Vec::with_capacity(REQUEST_HEADER_BYTES + request.payload.len());
+    let header_bytes = match request.version {
+        LEGACY_REQUEST_VERSION => LEGACY_REQUEST_HEADER_BYTES,
+        SOURCE_SEALED_REQUEST_VERSION => SOURCE_SEALED_REQUEST_HEADER_BYTES,
+        _ => return Err(OnionReplyError::UnsupportedVersion(request.version)),
+    };
+    let mut encoded = Vec::with_capacity(header_bytes + request.payload.len());
     encoded.extend_from_slice(&REQUEST_MAGIC);
     encoded.push(request.version);
+    if request.version == SOURCE_SEALED_REQUEST_VERSION {
+        encoded.push(request.proof_mode as u8);
+    }
     encoded.extend_from_slice(&request.reply_public_key);
     encoded.extend_from_slice(&request.response_size_class.to_be_bytes());
     encoded.extend_from_slice(&payload_len.to_be_bytes());
@@ -251,7 +380,7 @@ pub fn encode_onion_reply_request(request: &OnionReplyRequest) -> Result<Vec<u8>
 
 /// Decodes one bounded reply-capable request and rejects trailing bytes.
 pub fn decode_onion_reply_request(encoded: &[u8]) -> Result<OnionReplyRequest, OnionReplyError> {
-    if encoded.len() > REQUEST_HEADER_BYTES + MAX_ONION_REPLY_REQUEST_PAYLOAD_BYTES {
+    if encoded.len() > SOURCE_SEALED_REQUEST_HEADER_BYTES + MAX_ONION_REPLY_REQUEST_PAYLOAD_BYTES {
         return Err(OnionReplyError::FrameTooLarge);
     }
     let mut cursor = WireCursor::new(encoded);
@@ -259,6 +388,11 @@ pub fn decode_onion_reply_request(encoded: &[u8]) -> Result<OnionReplyRequest, O
         return Err(OnionReplyError::InvalidMagic);
     }
     let version = cursor.take_u8()?;
+    let proof_mode = match version {
+        LEGACY_REQUEST_VERSION => OnionReplyProofMode::RelayVisibleTerminalReceipt,
+        SOURCE_SEALED_REQUEST_VERSION => OnionReplyProofMode::try_from(cursor.take_u8()?)?,
+        _ => return Err(OnionReplyError::UnsupportedVersion(version)),
+    };
     let reply_public_key = cursor.take_array::<32>()?;
     let response_size_class = cursor.take_u32()?;
     let payload_len = cursor.take_u32()? as usize;
@@ -267,6 +401,7 @@ pub fn decode_onion_reply_request(encoded: &[u8]) -> Result<OnionReplyRequest, O
 
     let request = OnionReplyRequest {
         version,
+        proof_mode,
         reply_public_key,
         response_size_class,
         payload,
@@ -300,7 +435,7 @@ pub fn seal_onion_reply(
 
     let ephemeral = EphemeralKeyPair::generate();
     let ephemeral_public_key = ephemeral.public_key_bytes();
-    let request_payload_commitment = payload_commitment(&request.payload);
+    let request_context_commitment = request_context_commitment(request);
     let mut shared_secret = ephemeral.exchange(&request.reply_public_key);
     if let Err(error) = reject_low_order_shared_secret(&shared_secret) {
         shared_secret.zeroize();
@@ -311,7 +446,7 @@ pub fn seal_onion_reply(
         &route_id,
         &request.reply_public_key,
         &ephemeral_public_key,
-        &request_payload_commitment,
+        &request_context_commitment,
     );
     shared_secret.zeroize();
     let mut session_key = session_key_result?;
@@ -322,7 +457,7 @@ pub fn seal_onion_reply(
         request.reply_public_key,
         ephemeral_public_key,
         response_size_class,
-        request_payload_commitment,
+        request_context_commitment,
         terminal_node_id,
         payload,
     ));
@@ -338,7 +473,7 @@ pub fn seal_onion_reply(
         &request.response_size_class.to_be_bytes(),
     )?;
     write_part(&mut plaintext, &mut offset, &route_id)?;
-    write_part(&mut plaintext, &mut offset, &request_payload_commitment)?;
+    write_part(&mut plaintext, &mut offset, &request_context_commitment)?;
     write_part(&mut plaintext, &mut offset, &terminal_node_id)?;
     write_part(&mut plaintext, &mut offset, &payload_len.to_be_bytes())?;
     write_part(&mut plaintext, &mut offset, payload)?;
@@ -382,7 +517,7 @@ pub fn open_onion_reply(
         reply_key,
         expected_terminal_node_id,
         response_size_class(request.response_size_class)?,
-        payload_commitment(&request.payload),
+        request_context_commitment(request),
     )
 }
 
@@ -392,7 +527,7 @@ fn open_onion_reply_with_context(
     reply_key: EphemeralKeyPair,
     expected_terminal_node_id: [u8; 32],
     expected_size_class: usize,
-    expected_request_payload_commitment: [u8; 32],
+    expected_request_context_commitment: [u8; 32],
 ) -> Result<OnionReplyPayload, OnionReplyError> {
     if response.validate()? != expected_size_class {
         return Err(OnionReplyError::InvalidSizeClass);
@@ -408,7 +543,7 @@ fn open_onion_reply_with_context(
         &route_id,
         &reply_public_key,
         &response.ephemeral_public_key,
-        &expected_request_payload_commitment,
+        &expected_request_context_commitment,
     );
     shared_secret.zeroize();
     let mut session_key = session_key_result?;
@@ -424,7 +559,7 @@ fn open_onion_reply_with_context(
         reply_public_key,
         response.ephemeral_public_key,
         expected_size_class,
-        expected_request_payload_commitment,
+        expected_request_context_commitment,
         expected_terminal_node_id,
     );
     plaintext.zeroize();
@@ -482,7 +617,7 @@ fn decode_reply_plaintext(
     reply_public_key: [u8; 32],
     ephemeral_public_key: [u8; 32],
     expected_size_class: usize,
-    expected_request_payload_commitment: [u8; 32],
+    expected_request_context_commitment: [u8; 32],
     expected_terminal_node_id: [u8; 32],
 ) -> Result<OnionReplyPayload, OnionReplyError> {
     if plaintext.len() != expected_size_class {
@@ -506,8 +641,8 @@ fn decode_reply_plaintext(
     if route_id != expected_route_id {
         return Err(OnionReplyError::RouteMismatch);
     }
-    let request_payload_commitment = cursor.take_array::<32>()?;
-    if request_payload_commitment != expected_request_payload_commitment {
+    let request_context_commitment = cursor.take_array::<32>()?;
+    if request_context_commitment != expected_request_context_commitment {
         return Err(OnionReplyError::RequestMismatch);
     }
     let terminal_node_id = cursor.take_array::<32>()?;
@@ -533,7 +668,7 @@ fn decode_reply_plaintext(
                 reply_public_key,
                 ephemeral_public_key,
                 expected_size_class,
-                request_payload_commitment,
+                request_context_commitment,
                 terminal_node_id,
                 &payload,
             ),
@@ -595,6 +730,26 @@ fn derive_response_key(
     hkdf.expand(&info, &mut key)
         .map_err(|_| OnionReplyError::KeyDerivationFailed)?;
     Ok(key)
+}
+
+fn request_context_commitment(request: &OnionReplyRequest) -> [u8; 32] {
+    // Preserve the deployed v1 response cryptographic transcript byte for
+    // byte. V2 additionally authenticates proof visibility and frame shape so
+    // a source-sealed request cannot be reinterpreted under the legacy mode.
+    if request.version == LEGACY_REQUEST_VERSION {
+        return payload_commitment(&request.payload);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(REQUEST_CONTEXT_COMMITMENT_DOMAIN);
+    hasher.update([request.version, request.proof_mode as u8]);
+    hasher.update(request.response_size_class.to_be_bytes());
+    hasher.update(
+        u64::try_from(request.payload.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(payload_commitment(&request.payload));
+    hasher.finalize().into()
 }
 
 fn payload_commitment(payload: &[u8]) -> [u8; 32] {
@@ -699,6 +854,9 @@ pub enum OnionReplyError {
     /// The frame declares a version this implementation cannot interpret.
     #[error("unsupported onion reply version {0}")]
     UnsupportedVersion(u8),
+    /// Request version and terminal-proof visibility were not a valid pair.
+    #[error("invalid onion reply proof mode {0}")]
+    InvalidProofMode(u8),
     /// The fixed request or response magic did not match.
     #[error("invalid onion reply magic")]
     InvalidMagic,

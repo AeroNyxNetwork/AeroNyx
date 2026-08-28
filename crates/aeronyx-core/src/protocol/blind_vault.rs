@@ -922,7 +922,10 @@ impl BlindVaultOnionLeaseAdmissionSession {
         let expected_lease_expires_at_ms = request.lease.expires_at_ms;
         let encoded_admission =
             encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseAdmission(request))?;
-        let (reply_request, reply_session) = OnionReplySession::prepare(
+        // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Keep final
+        // node identity and signed result inside the source-only reply; route
+        // selection requires the matching path-wide descriptor features.
+        let (reply_request, reply_session) = OnionReplySession::prepare_source_sealed(
             route_id,
             expected_terminal_node_id,
             ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
@@ -1521,7 +1524,10 @@ impl BlindVaultOnionPullSession {
         }
         let lease_id = request.lease_id;
         let encoded_pull = encode_blind_vault_frame(&BlindVaultFrame::PullRequest(request))?;
-        let (reply_request, reply_session) = OnionReplySession::prepare(
+        // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Keep final
+        // node identity and signed result inside the source-only reply; route
+        // selection requires the matching path-wide descriptor features.
+        let (reply_request, reply_session) = OnionReplySession::prepare_source_sealed(
             route_id,
             expected_terminal_node_id,
             ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
@@ -1836,7 +1842,10 @@ impl BlindVaultOnionPutSession {
         let expected_ciphertext_commitment = request.ciphertext_commitment;
         let expected_expires_at_ms = request.expires_at_ms;
         let encoded_put = encode_blind_vault_frame(&BlindVaultFrame::Put(request))?;
-        let (reply_request, reply_session) = OnionReplySession::prepare(
+        // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Keep final
+        // node identity and signed result inside the source-only reply; route
+        // selection requires the matching path-wide descriptor features.
+        let (reply_request, reply_session) = OnionReplySession::prepare_source_sealed(
             route_id,
             expected_terminal_node_id,
             ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
@@ -3863,7 +3872,10 @@ impl BlindVaultOnionDeleteSession {
         let expected_object_id = request.object_id;
         let expected_request_id = request.request_id;
         let encoded_delete = encode_blind_vault_frame(&BlindVaultFrame::Delete(request))?;
-        let (reply_request, reply_session) = OnionReplySession::prepare(
+        // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Keep final
+        // node identity and signed result inside the source-only reply; route
+        // selection requires the matching path-wide descriptor features.
+        let (reply_request, reply_session) = OnionReplySession::prepare_source_sealed(
             route_id,
             expected_terminal_node_id,
             ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
@@ -3966,7 +3978,10 @@ impl BlindVaultOnionLeaseRetireSession {
         let expected_request_id = request.request_id;
         let expected_request_commitment = request.commitment();
         let encoded_retire = encode_blind_vault_frame(&BlindVaultFrame::LeaseRetire(request))?;
-        let (reply_request, reply_session) = OnionReplySession::prepare(
+        // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Keep final
+        // node identity and signed result inside the source-only reply; route
+        // selection requires the matching path-wide descriptor features.
+        let (reply_request, reply_session) = OnionReplySession::prepare_source_sealed(
             route_id,
             expected_terminal_node_id,
             ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
@@ -4079,7 +4094,10 @@ impl BlindVaultOnionLeaseRenewalSession {
         let expected_renewed_expires_at_ms = request.renewal.requested_expires_at_ms;
         let encoded_renewal =
             encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseRenewal(request))?;
-        let (reply_request, reply_session) = OnionReplySession::prepare(
+        // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Keep final
+        // node identity and signed result inside the source-only reply; route
+        // selection requires the matching path-wide descriptor features.
+        let (reply_request, reply_session) = OnionReplySession::prepare_source_sealed(
             route_id,
             expected_terminal_node_id,
             ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
@@ -4188,7 +4206,10 @@ impl BlindVaultOnionLeaseStatusSession {
         let expected_request_id = request.request_id;
         let expected_request_commitment = request.commitment();
         let encoded_status = encode_blind_vault_frame(&BlindVaultFrame::LeaseStatus(request))?;
-        let (reply_request, reply_session) = OnionReplySession::prepare(
+        // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Keep final
+        // node identity and signed result inside the source-only reply; route
+        // selection requires the matching path-wide descriptor features.
+        let (reply_request, reply_session) = OnionReplySession::prepare_source_sealed(
             route_id,
             expected_terminal_node_id,
             ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
@@ -4292,7 +4313,10 @@ impl BlindVaultOnionLeaseInventorySession {
         let expected_request_commitment = request.commitment();
         let encoded_inventory =
             encode_blind_vault_frame(&BlindVaultFrame::LeaseInventory(request))?;
-        let (reply_request, reply_session) = OnionReplySession::prepare(
+        // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Keep final
+        // node identity and signed result inside the source-only reply; route
+        // selection requires the matching path-wide descriptor features.
+        let (reply_request, reply_session) = OnionReplySession::prepare_source_sealed(
             route_id,
             expected_terminal_node_id,
             ONION_REPLY_RESPONSE_SIZE_CLASSES[0],

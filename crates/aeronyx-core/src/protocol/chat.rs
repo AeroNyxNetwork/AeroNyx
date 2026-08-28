@@ -134,6 +134,11 @@ const BLIND_RELAY_FAILURE_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-F
 const BLIND_RELAY_FAILURE_REQUEST_COMMITMENT_DOMAIN: &[u8] =
     b"AeroNyx-BlindRelay-FailureRequest-v1";
 const BLIND_RELAY_FAILURE_REASON_COMMITMENT_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-FailureReason-v1";
+const BLIND_RELAY_SUCCESS_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindRelay-SuccessReceipt-v1";
+const BLIND_RELAY_SUCCESS_REQUEST_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx-BlindRelay-SuccessRequest-v1";
+const BLIND_RELAY_SUCCESS_RESPONSE_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx-BlindRelay-SuccessResponse-v1";
 const CUSTODY_AUDIT_ANCHOR_SIGNING_DOMAIN: &[u8] = b"AeroNyx-CustodyAuditAnchor-v1";
 const CUSTODY_AUDIT_WITNESS_RECEIPT_SIGNING_DOMAIN: &[u8] =
     b"AeroNyx-CustodyAuditWitnessReceipt-v1";
@@ -144,6 +149,12 @@ pub const BLIND_RELAY_DELIVERY_RECEIPT_VERSION: u8 = 1;
 pub const BLIND_RELAY_PURPOSE_BOUND_DELIVERY_RECEIPT_VERSION: u8 = 2;
 /// Initial hop-local signed blind-relay failure receipt version.
 pub const BLIND_RELAY_FAILURE_RECEIPT_VERSION: u8 = 1;
+/// Initial immediate-hop signed blind-relay success receipt version.
+pub const BLIND_RELAY_SUCCESS_RECEIPT_VERSION: u8 = 1;
+/// The immediate responder accepted the opaque request as its terminal hop.
+pub const BLIND_RELAY_SUCCESS_TERMINAL: u8 = 1;
+/// The immediate responder accepted and forwarded the opaque request.
+pub const BLIND_RELAY_SUCCESS_FORWARDED: u8 = 2;
 /// Initial portable relay-custody checkpoint anchor version.
 pub const CUSTODY_AUDIT_ANCHOR_VERSION: u8 = 1;
 /// Exact upper bound for one canonical custody audit anchor frame.
@@ -663,6 +674,260 @@ impl BlindRelayDeliveryReceipt {
             &Self::payload_commitment_for_purpose(payload, purpose),
             terminal_node_id,
         )
+    }
+}
+
+// ============================================
+// BlindRelaySuccessReceipt
+// ============================================
+
+/// Immediate-hop proof for one successful blind-relay response.
+///
+/// [BLIND-RELAY-SUCCESS-RECEIPT 2026-08-29 by Codex] Every relay verifies the
+/// receipt from its directly contacted peer, then replaces it before replying
+/// upstream. The receipt therefore proves hop-local acceptance without
+/// carrying a deeper terminal identity through the route. Its response
+/// commitment binds any legacy terminal receipt and any opaque source-sealed
+/// response exactly as returned, while revealing neither payload contents nor
+/// a response purpose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindRelaySuccessReceipt {
+    /// Receipt schema version.
+    pub version: u8,
+    /// Random route correlation id from the exact request envelope.
+    pub route_id: [u8; 16],
+    /// Commitment to the immediate request's signed opaque envelope fields.
+    pub request_commitment: [u8; 32],
+    /// Ed25519 identity of the immediate node returning this success.
+    pub responder_node_id: [u8; 32],
+    /// Unix timestamp when the immediate node completed its accepted action.
+    pub accepted_at: u64,
+    /// Terminal or forwarded response shape, using the stable constants above.
+    pub disposition: u8,
+    /// Remaining TTL returned by the immediate responder.
+    pub ttl_remaining: u8,
+    /// Commitment to optional delivery evidence and opaque terminal response.
+    pub response_commitment: [u8; 32],
+    /// Ed25519 signature over [`Self::signing_data`].
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindRelaySuccessReceipt {
+    /// Creates one terminal-hop success receipt.
+    #[must_use]
+    pub fn terminal(
+        envelope: &BlindRelayEnvelope,
+        ttl_remaining: u8,
+        reason: Option<&str>,
+        delivery_receipt: Option<&BlindRelayDeliveryReceipt>,
+        opaque_terminal_response: Option<&[u8]>,
+        accepted_at: u64,
+        responder: &IdentityKeyPair,
+    ) -> Self {
+        Self::accepted(
+            envelope,
+            BLIND_RELAY_SUCCESS_TERMINAL,
+            ttl_remaining,
+            reason,
+            delivery_receipt,
+            opaque_terminal_response,
+            accepted_at,
+            responder,
+        )
+    }
+
+    /// Creates one forwarded-hop success receipt.
+    #[must_use]
+    pub fn forwarded(
+        envelope: &BlindRelayEnvelope,
+        ttl_remaining: u8,
+        reason: Option<&str>,
+        delivery_receipt: Option<&BlindRelayDeliveryReceipt>,
+        opaque_terminal_response: Option<&[u8]>,
+        accepted_at: u64,
+        responder: &IdentityKeyPair,
+    ) -> Self {
+        Self::accepted(
+            envelope,
+            BLIND_RELAY_SUCCESS_FORWARDED,
+            ttl_remaining,
+            reason,
+            delivery_receipt,
+            opaque_terminal_response,
+            accepted_at,
+            responder,
+        )
+    }
+
+    fn accepted(
+        envelope: &BlindRelayEnvelope,
+        disposition: u8,
+        ttl_remaining: u8,
+        reason: Option<&str>,
+        delivery_receipt: Option<&BlindRelayDeliveryReceipt>,
+        opaque_terminal_response: Option<&[u8]>,
+        accepted_at: u64,
+        responder: &IdentityKeyPair,
+    ) -> Self {
+        let mut receipt = Self {
+            version: BLIND_RELAY_SUCCESS_RECEIPT_VERSION,
+            route_id: envelope.route_id,
+            request_commitment: Self::request_commitment(envelope),
+            responder_node_id: responder.public_key_bytes(),
+            accepted_at,
+            disposition,
+            ttl_remaining,
+            response_commitment: Self::response_commitment(
+                disposition,
+                ttl_remaining,
+                reason,
+                delivery_receipt,
+                opaque_terminal_response,
+            ),
+            signature: [0u8; 64],
+        };
+        receipt.signature = responder.sign(&receipt.signing_data());
+        receipt
+    }
+
+    /// Commits to the exact signed opaque request accepted by this hop.
+    #[must_use]
+    pub fn request_commitment(envelope: &BlindRelayEnvelope) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(BLIND_RELAY_SUCCESS_REQUEST_COMMITMENT_DOMAIN);
+        hasher.update(envelope.signing_data());
+        hasher.finalize().into()
+    }
+
+    /// Commits to the success shape and optional evidence returned upstream.
+    #[must_use]
+    pub fn response_commitment(
+        disposition: u8,
+        ttl_remaining: u8,
+        reason: Option<&str>,
+        delivery_receipt: Option<&BlindRelayDeliveryReceipt>,
+        opaque_terminal_response: Option<&[u8]>,
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(BLIND_RELAY_SUCCESS_RESPONSE_COMMITMENT_DOMAIN);
+        hasher.update([disposition, ttl_remaining]);
+        match reason {
+            Some(reason) => {
+                hasher.update([1]);
+                hasher.update(
+                    u64::try_from(reason.len())
+                        .unwrap_or(u64::MAX)
+                        .to_be_bytes(),
+                );
+                hasher.update(reason.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        match delivery_receipt {
+            Some(receipt) => {
+                let signing_data = receipt.signing_data();
+                hasher.update([1]);
+                hasher.update(
+                    u64::try_from(signing_data.len())
+                        .unwrap_or(u64::MAX)
+                        .to_be_bytes(),
+                );
+                hasher.update(signing_data);
+                hasher.update(receipt.signature);
+            }
+            None => hasher.update([0]),
+        }
+        match opaque_terminal_response {
+            Some(response) => {
+                hasher.update([1]);
+                hasher.update(
+                    u64::try_from(response.len())
+                        .unwrap_or(u64::MAX)
+                        .to_be_bytes(),
+                );
+                hasher.update(response);
+            }
+            None => hasher.update([0]),
+        }
+        hasher.finalize().into()
+    }
+
+    /// Builds canonical fixed-width receipt signing bytes.
+    #[must_use]
+    pub fn signing_data(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(
+            BLIND_RELAY_SUCCESS_RECEIPT_SIGNING_DOMAIN.len() + 1 + 16 + 32 + 32 + 8 + 1 + 1 + 32,
+        );
+        data.extend_from_slice(BLIND_RELAY_SUCCESS_RECEIPT_SIGNING_DOMAIN);
+        data.push(self.version);
+        data.extend_from_slice(&self.route_id);
+        data.extend_from_slice(&self.request_commitment);
+        data.extend_from_slice(&self.responder_node_id);
+        data.extend_from_slice(&self.accepted_at.to_le_bytes());
+        data.push(self.disposition);
+        data.push(self.ttl_remaining);
+        data.extend_from_slice(&self.response_commitment);
+        data
+    }
+
+    /// Verifies version, disposition, and the immediate responder signature.
+    pub fn verify_signature(&self) -> Result<(), CoreError> {
+        if self.version != BLIND_RELAY_SUCCESS_RECEIPT_VERSION
+            || !matches!(
+                self.disposition,
+                BLIND_RELAY_SUCCESS_TERMINAL | BLIND_RELAY_SUCCESS_FORWARDED
+            )
+        {
+            return Err(CoreError::malformed(
+                "blind relay success receipt: invalid structural state",
+            ));
+        }
+        IdentityPublicKey::from_bytes(&self.responder_node_id)?
+            .verify(&self.signing_data(), &self.signature)
+    }
+
+    /// Verifies signature plus exact request, response, and immediate-hop binding.
+    pub fn verify_expected(
+        &self,
+        envelope: &BlindRelayEnvelope,
+        terminal: bool,
+        forwarded: bool,
+        ttl_remaining: u8,
+        reason: Option<&str>,
+        delivery_receipt: Option<&BlindRelayDeliveryReceipt>,
+        opaque_terminal_response: Option<&[u8]>,
+        responder_node_id: &[u8; 32],
+    ) -> Result<(), CoreError> {
+        self.verify_signature()?;
+        let disposition = match (terminal, forwarded) {
+            (true, false) => BLIND_RELAY_SUCCESS_TERMINAL,
+            (false, true) => BLIND_RELAY_SUCCESS_FORWARDED,
+            _ => {
+                return Err(CoreError::malformed(
+                    "blind relay success receipt: invalid response shape",
+                ))
+            }
+        };
+        if self.route_id != envelope.route_id
+            || self.request_commitment != Self::request_commitment(envelope)
+            || &self.responder_node_id != responder_node_id
+            || self.disposition != disposition
+            || self.ttl_remaining != ttl_remaining
+            || self.response_commitment
+                != Self::response_commitment(
+                    disposition,
+                    ttl_remaining,
+                    reason,
+                    delivery_receipt,
+                    opaque_terminal_response,
+                )
+        {
+            return Err(CoreError::malformed(
+                "blind relay success receipt: response binding mismatch",
+            ));
+        }
+        Ok(())
     }
 }
 
