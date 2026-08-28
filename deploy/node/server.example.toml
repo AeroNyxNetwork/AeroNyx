@@ -321,6 +321,11 @@ max_lease_ttl_secs = 7776000
 max_object_ttl_secs = 2592000
 max_objects_per_lease = 16384
 max_bytes_per_lease = 268435456
+# [BLIND-VAULT-NODE-CAPACITY 2026-08-28 by Codex] These node-wide floors are
+# enforced atomically before consuming an admission credential or accepting a
+# new ciphertext. Size them below the dedicated volume's operational budget.
+max_live_leases = 100000
+max_total_ciphertext_bytes = 68719476736
 max_pull_objects = 64
 tombstone_ttl_secs = 604800
 mutation_clock_skew_secs = 300

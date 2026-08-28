@@ -25,6 +25,7 @@
 //! - Administration-authorized coherent live-lease status receipts.
 //! - Streaming private inventory commitments over still-live ciphertext rows.
 //! - Transactional per-lease count/byte quotas and bounded expiry cleanup.
+//! - Atomic node-wide live-lease and aggregate ciphertext capacity admission.
 //! - Stable privacy-safe mutation failure classes for multi-hop retry policy.
 //!
 //! ## Dependencies
@@ -50,6 +51,8 @@
 //!    then return a terminal-signed private status receipt.
 //! 9. Stream the canonical live object set into a per-replica commitment and
 //!    return only its encrypted terminal-signed aggregate receipt.
+//! 10. Reject new leases or ciphertext before token spend/write when the
+//!    operator's node-wide capacity commitment has been reached.
 //!
 //! ## Privacy Invariant
 //! This service has no account, wallet, sender, receiver, conversation,
@@ -72,7 +75,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.16.0-BlindVaultLeaseInventory - Added streaming,
+//! Last Modified: v1.17.0-BlindVaultNodeCapacity - Added atomic node-wide live
+//! lease and aggregate ciphertext capacity enforcement and status.
+//! v1.16.0-BlindVaultLeaseInventory - Added streaming,
 //! administration-authorized private encrypted-object inventory commitments.
 //! v1.15.0-BlindVaultLeaseStatus - Added coherent,
 //! administration-authorized live-lease status observations and receipts.
@@ -314,10 +319,24 @@ pub struct BlindVaultStatus {
     pub enabled: bool,
     /// Number of live anonymous replica leases.
     pub live_leases: u64,
+    /// [BLIND-VAULT-NODE-CAPACITY 2026-08-28 by Codex] Leases still consuming
+    /// capacity, including expired rows awaiting bounded cleanup.
+    pub committed_leases: u64,
     /// Number of live opaque objects.
     pub live_objects: u64,
     /// Total live ciphertext bytes.
     pub live_ciphertext_bytes: u64,
+    /// Bytes still committed by live lease counters, including expired objects
+    /// awaiting the next bounded cleanup pass.
+    pub committed_ciphertext_bytes: u64,
+    /// Operator-configured maximum simultaneous live leases.
+    pub max_live_leases: u64,
+    /// Remaining live lease admission capacity.
+    pub remaining_live_leases: u64,
+    /// Operator-configured aggregate ciphertext capacity.
+    pub max_total_ciphertext_bytes: u64,
+    /// Remaining aggregate ciphertext capacity.
+    pub remaining_ciphertext_bytes: u64,
     /// Number of retained commitment-only deletion tombstones.
     pub tombstones: u64,
     /// Number of unexpired complete-lease retirement tombstones.
@@ -365,6 +384,9 @@ pub enum BlindVaultServiceError {
     /// Per-lease object or byte quota would be exceeded.
     #[error("blind vault lease quota exceeded")]
     QuotaExceeded,
+    /// Node-wide live lease or aggregate ciphertext capacity was reached.
+    #[error("blind vault node capacity exhausted")]
+    NodeCapacityExceeded,
     /// Read capability did not authorise this lease.
     #[error("blind vault read capability rejected")]
     ReadUnauthorized,
@@ -459,6 +481,9 @@ pub enum BlindVaultDeleteFailureClass {
 pub enum BlindVaultAdmissionFailureClass {
     /// The same credential and signed lease cannot succeed unchanged.
     Rejected,
+    /// [BLIND-VAULT-NODE-CAPACITY 2026-08-28 by Codex] This replica has
+    /// reached its operator-configured storage capacity.
+    Capacity,
     /// Admission policy, replica storage, or local runtime is unavailable.
     Unavailable,
 }
@@ -520,7 +545,7 @@ impl BlindVaultServiceError {
             | Self::AdmissionSpent
             | Self::ObjectNotFound
             | Self::TimestampOutOfRange => BlindVaultPutFailureClass::Rejected,
-            Self::QuotaExceeded => BlindVaultPutFailureClass::Capacity,
+            Self::QuotaExceeded | Self::NodeCapacityExceeded => BlindVaultPutFailureClass::Capacity,
             Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
@@ -559,7 +584,8 @@ impl BlindVaultServiceError {
             | Self::AdmissionProofRejected
             | Self::AdmissionSpent
             | Self::ObjectNotFound => BlindVaultPullFailureClass::Rejected,
-            Self::Disabled
+            Self::NodeCapacityExceeded
+            | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
             | Self::PullCursorEncryptionFailed
@@ -598,7 +624,8 @@ impl BlindVaultServiceError {
             | Self::AdmissionProofRejected
             | Self::AdmissionSpent
             | Self::ObjectNotFound => BlindVaultDeleteFailureClass::Rejected,
-            Self::Disabled
+            Self::NodeCapacityExceeded
+            | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
             | Self::PullCursorEncryptionFailed
@@ -637,6 +664,7 @@ impl BlindVaultServiceError {
             | Self::AdmissionProofRejected
             | Self::AdmissionSpent
             | Self::ObjectNotFound => BlindVaultAdmissionFailureClass::Rejected,
+            Self::NodeCapacityExceeded => BlindVaultAdmissionFailureClass::Capacity,
             Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
@@ -676,7 +704,8 @@ impl BlindVaultServiceError {
             | Self::AdmissionProofRejected
             | Self::AdmissionSpent
             | Self::ObjectNotFound => BlindVaultLeaseRetireFailureClass::Rejected,
-            Self::Disabled
+            Self::NodeCapacityExceeded
+            | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
             | Self::PullCursorEncryptionFailed
@@ -715,7 +744,8 @@ impl BlindVaultServiceError {
             | Self::AdmissionProofRejected
             | Self::AdmissionSpent
             | Self::ObjectNotFound => BlindVaultLeaseRenewFailureClass::Rejected,
-            Self::Disabled
+            Self::NodeCapacityExceeded
+            | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
             | Self::PullCursorEncryptionFailed
@@ -754,7 +784,8 @@ impl BlindVaultServiceError {
             | Self::AdmissionProofRejected
             | Self::AdmissionSpent
             | Self::ObjectNotFound => BlindVaultLeaseStatusFailureClass::Rejected,
-            Self::Disabled
+            Self::NodeCapacityExceeded
+            | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
             | Self::PullCursorEncryptionFailed
@@ -793,7 +824,8 @@ impl BlindVaultServiceError {
             | Self::AdmissionProofRejected
             | Self::AdmissionSpent
             | Self::ObjectNotFound => BlindVaultLeaseInventoryFailureClass::Rejected,
-            Self::Disabled
+            Self::NodeCapacityExceeded
+            | Self::Disabled
             | Self::Sqlite(_)
             | Self::Filesystem
             | Self::PullCursorEncryptionFailed
@@ -1183,6 +1215,16 @@ impl BlindVaultService {
             return Err(BlindVaultServiceError::AdmissionSpent);
         }
         ensure_lease_request_available(&transaction, &lease.request_id)?;
+        // [BLIND-VAULT-NODE-CAPACITY 2026-08-28 by Codex] Capacity is checked
+        // after exact-retry/conflict handling but before consuming the blind
+        // credential. The immediate transaction serializes anonymous lease
+        // admissions, so concurrent valid credentials cannot oversubscribe the
+        // operator's retained-lease commitment.
+        ensure_node_admission_capacity(
+            &transaction,
+            self.config.max_live_leases,
+            self.config.max_total_ciphertext_bytes,
+        )?;
 
         // [BLIND-VAULT-ADMISSION 2026-07-23 by Codex] V1 raw token IDs and
         // V2 domain-separated spend IDs share one transaction and replay table.
@@ -1393,6 +1435,17 @@ impl BlindVaultService {
         {
             return Err(BlindVaultServiceError::QuotaExceeded);
         }
+        // [BLIND-VAULT-NODE-CAPACITY 2026-08-28 by Codex] Exact retries have
+        // already returned above. This global check and the write share one
+        // immediate transaction, preventing concurrent writes from passing on
+        // the same remaining capacity. Cached lease bytes may conservatively
+        // include objects awaiting bounded expiry cleanup; fail closed until
+        // maintenance releases that commitment.
+        ensure_node_ciphertext_capacity(
+            &transaction,
+            object_bytes,
+            self.config.max_total_ciphertext_bytes,
+        )?;
 
         transaction.execute(
             "INSERT INTO blind_vault_objects
@@ -2053,6 +2106,12 @@ impl BlindVaultService {
             params![now],
             |row| row.get(0),
         )?;
+        let (committed_leases, committed_bytes): (i64, i64) = connection.query_row(
+            "SELECT committed_lease_count, committed_ciphertext_bytes
+             FROM blind_vault_capacity_state WHERE state_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         let (live_objects, live_bytes): (i64, i64) = connection.query_row(
             "SELECT COUNT(*), COALESCE(SUM(length(ciphertext)), 0)
              FROM blind_vault_objects WHERE expires_at_ms > ?1",
@@ -2079,11 +2138,25 @@ impl BlindVaultService {
             params![now],
             |row| row.get(0),
         )?;
+        let live_leases = non_negative_u64(live_leases)?;
+        let live_objects = non_negative_u64(live_objects)?;
+        let live_bytes = non_negative_u64(live_bytes)?;
+        let committed_leases = non_negative_u64(committed_leases)?;
+        let committed_bytes = non_negative_u64(committed_bytes)?;
         Ok(BlindVaultStatus {
             enabled: true,
-            live_leases: non_negative_u64(live_leases)?,
-            live_objects: non_negative_u64(live_objects)?,
-            live_ciphertext_bytes: non_negative_u64(live_bytes)?,
+            live_leases,
+            committed_leases,
+            live_objects,
+            live_ciphertext_bytes: live_bytes,
+            committed_ciphertext_bytes: committed_bytes,
+            max_live_leases: self.config.max_live_leases,
+            remaining_live_leases: self.config.max_live_leases.saturating_sub(committed_leases),
+            max_total_ciphertext_bytes: self.config.max_total_ciphertext_bytes,
+            remaining_ciphertext_bytes: self
+                .config
+                .max_total_ciphertext_bytes
+                .saturating_sub(committed_bytes),
             tombstones: non_negative_u64(tombstones)?,
             lease_tombstones: non_negative_u64(lease_tombstones)?,
             lease_renewals: non_negative_u64(lease_renewals)?,
@@ -2558,6 +2631,44 @@ fn init_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_blind_vault_objects_expiry
           ON blind_vault_objects(expires_at_ms, sequence);
 
+        CREATE TABLE IF NOT EXISTS blind_vault_capacity_state (
+            state_id                    INTEGER PRIMARY KEY CHECK(state_id = 1),
+            committed_lease_count       INTEGER NOT NULL CHECK(committed_lease_count >= 0),
+            committed_ciphertext_bytes  INTEGER NOT NULL CHECK(committed_ciphertext_bytes >= 0)
+        );
+        INSERT OR IGNORE INTO blind_vault_capacity_state
+          (state_id, committed_lease_count, committed_ciphertext_bytes)
+          VALUES (1, 0, 0);
+
+        CREATE TRIGGER IF NOT EXISTS blind_vault_capacity_lease_insert
+        AFTER INSERT ON blind_vault_leases
+        BEGIN
+          UPDATE blind_vault_capacity_state
+          SET committed_lease_count = committed_lease_count + 1
+          WHERE state_id = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS blind_vault_capacity_lease_delete
+        AFTER DELETE ON blind_vault_leases
+        BEGIN
+          UPDATE blind_vault_capacity_state
+          SET committed_lease_count = committed_lease_count - 1
+          WHERE state_id = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS blind_vault_capacity_object_insert
+        AFTER INSERT ON blind_vault_objects
+        BEGIN
+          UPDATE blind_vault_capacity_state
+          SET committed_ciphertext_bytes = committed_ciphertext_bytes + length(NEW.ciphertext)
+          WHERE state_id = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS blind_vault_capacity_object_delete
+        AFTER DELETE ON blind_vault_objects
+        BEGIN
+          UPDATE blind_vault_capacity_state
+          SET committed_ciphertext_bytes = committed_ciphertext_bytes - length(OLD.ciphertext)
+          WHERE state_id = 1;
+        END;
+
         CREATE TABLE IF NOT EXISTS blind_vault_tombstones (
             lease_id              BLOB NOT NULL CHECK(length(lease_id) = 32),
             object_id             BLOB NOT NULL CHECK(length(object_id) = 32),
@@ -2620,7 +2731,17 @@ fn init_schema(connection: &Connection) -> Result<(), rusqlite::Error> {
             not_before_ms       INTEGER NOT NULL CHECK(not_before_ms >= 0),
             expires_at_ms       INTEGER NOT NULL CHECK(expires_at_ms > not_before_ms),
             max_lease_ttl_ms    INTEGER NOT NULL CHECK(max_lease_ttl_ms > 0)
-        ) WITHOUT ROWID;",
+        ) WITHOUT ROWID;
+
+        -- [BLIND-VAULT-NODE-CAPACITY 2026-08-28 by Codex] Rebuild the compact
+        -- ledger from durable truth on every process start. Runtime mutations
+        -- then stay O(1) and transactionally coherent through triggers,
+        -- including foreign-key cascades during lease cleanup or retirement.
+        UPDATE blind_vault_capacity_state
+        SET committed_lease_count = (SELECT COUNT(*) FROM blind_vault_leases),
+            committed_ciphertext_bytes =
+              (SELECT COALESCE(SUM(length(ciphertext)), 0) FROM blind_vault_objects)
+        WHERE state_id = 1;",
     )
 }
 
@@ -2658,6 +2779,49 @@ fn ensure_lease_request_available(
     } else {
         Ok(())
     }
+}
+
+fn ensure_node_admission_capacity(
+    transaction: &Transaction<'_>,
+    max_live_leases: u64,
+    max_total_ciphertext_bytes: u64,
+) -> Result<(), BlindVaultServiceError> {
+    // [BLIND-VAULT-NODE-CAPACITY 2026-08-28 by Codex] Read one trigger-backed
+    // singleton instead of scanning every lease on each anonymous admission.
+    let (committed_leases, committed_bytes): (i64, i64) = transaction.query_row(
+        "SELECT committed_lease_count, committed_ciphertext_bytes
+         FROM blind_vault_capacity_state WHERE state_id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if non_negative_u64(committed_leases)? >= max_live_leases
+        || non_negative_u64(committed_bytes)? >= max_total_ciphertext_bytes
+    {
+        return Err(BlindVaultServiceError::NodeCapacityExceeded);
+    }
+    Ok(())
+}
+
+fn ensure_node_ciphertext_capacity(
+    transaction: &Transaction<'_>,
+    additional_bytes: u64,
+    max_total_ciphertext_bytes: u64,
+) -> Result<(), BlindVaultServiceError> {
+    // [BLIND-VAULT-NODE-CAPACITY 2026-08-28 by Codex] The immediate writer
+    // transaction makes this O(1) check and the following insert indivisible.
+    let committed_bytes: i64 = transaction.query_row(
+        "SELECT committed_ciphertext_bytes
+         FROM blind_vault_capacity_state WHERE state_id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let next_bytes = non_negative_u64(committed_bytes)?
+        .checked_add(additional_bytes)
+        .ok_or(BlindVaultServiceError::NodeCapacityExceeded)?;
+    if next_bytes > max_total_ciphertext_bytes {
+        return Err(BlindVaultServiceError::NodeCapacityExceeded);
+    }
+    Ok(())
 }
 
 fn insert_lease_row(

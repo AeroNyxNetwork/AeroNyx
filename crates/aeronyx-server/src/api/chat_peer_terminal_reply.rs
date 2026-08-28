@@ -284,11 +284,13 @@ fn classify_delete_failure(error: BlindVaultServiceError) -> TerminalReplyFailur
 }
 
 fn classify_admission_failure(error: BlindVaultServiceError) -> TerminalReplyFailure {
-    // [BLIND-VAULT-ADMISSION-FAILURE-CLASS 2026-08-28 by Codex] Credential,
-    // issuer, replay, and lease state remain indistinguishable outside the
-    // encrypted terminal response boundary.
+    // [BLIND-VAULT-ADMISSION-CAPACITY 2026-08-28 by Codex] Credential, issuer,
+    // replay, and lease state remain one rejection. Only node-wide capacity is
+    // actionable so an entry can select another terminal without learning any
+    // lease-local state.
     match error.admission_failure_class() {
         BlindVaultAdmissionFailureClass::Rejected => TerminalReplyFailure::Rejected,
+        BlindVaultAdmissionFailureClass::Capacity => TerminalReplyFailure::Capacity,
         BlindVaultAdmissionFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
     }
 }

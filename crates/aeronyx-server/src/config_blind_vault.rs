@@ -11,6 +11,8 @@
 //! - Keeps the service disabled by default for backward compatibility.
 //! - Bounds lease lifetime, object lifetime, per-lease count/bytes, page size,
 //!   admission lifetime, deletion tombstones, and maintenance work.
+//! - Bounds node-wide live lease count and aggregate ciphertext capacity so
+//!   valid anonymous credentials cannot overcommit one replica.
 //! - Keeps public routes fail-closed unless at least one V1 Ed25519 issuer,
 //!   static V2 RSA epoch, or V2 update authority is explicitly pinned.
 //! - Keeps signed replica discovery advertisement behind a separate staged
@@ -35,7 +37,9 @@
 //!   replace them with account, wallet, device, or application allowlists.
 //! - Keep byte/count limits finite even on official nodes.
 //!
-//! Last Modified: v1.4.0-BlindVaultReplicaCapability - Added a default-off
+//! Last Modified: v1.5.0-BlindVaultNodeCapacity - Added backward-compatible
+//! node-wide live lease and aggregate ciphertext capacity policy.
+//! v1.4.0-BlindVaultReplicaCapability - Added a default-off
 //! signed discovery rollout gate with fail-closed prerequisite validation.
 //! v1.3.0-BlindVaultIssuerAuthority - Added pinned Ed25519
 //! authorities and bounded freshness for authenticated runtime issuer updates.
@@ -63,6 +67,8 @@ use crate::error::{Result, ServerError};
 const MAX_LEASE_TTL_SECS_HARD: u64 = 365 * 24 * 60 * 60;
 const MAX_OBJECTS_PER_LEASE_HARD: u64 = 1_000_000;
 const MAX_BYTES_PER_LEASE_HARD: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_LIVE_LEASES_HARD: u64 = 10_000_000;
+const MAX_TOTAL_CIPHERTEXT_BYTES_HARD: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const MAX_PULL_OBJECTS_HARD: usize = 256;
 const LARGEST_PROTOCOL_OBJECT_BYTES: u64 = 256 * 1024;
 const MAX_ADMISSION_ISSUERS: usize = 16;
@@ -141,6 +147,14 @@ pub struct BlindVaultConfig {
     /// Maximum live ciphertext bytes retained by one lease.
     #[serde(default = "BlindVaultConfig::default_max_bytes_per_lease")]
     pub max_bytes_per_lease: u64,
+    /// [BLIND-VAULT-NODE-CAPACITY 2026-08-28 by Codex] Maximum anonymous
+    /// leases retained on this node. Expired rows release capacity after the
+    /// next bounded cleanup pass.
+    #[serde(default = "BlindVaultConfig::default_max_live_leases")]
+    pub max_live_leases: u64,
+    /// Maximum aggregate ciphertext bytes retained by lease objects.
+    #[serde(default = "BlindVaultConfig::default_max_total_ciphertext_bytes")]
+    pub max_total_ciphertext_bytes: u64,
     /// Maximum objects returned by one internal pull page.
     #[serde(default = "BlindVaultConfig::default_max_pull_objects")]
     pub max_pull_objects: usize,
@@ -182,6 +196,14 @@ impl BlindVaultConfig {
 
     const fn default_max_bytes_per_lease() -> u64 {
         256 * 1024 * 1024
+    }
+
+    const fn default_max_live_leases() -> u64 {
+        100_000
+    }
+
+    const fn default_max_total_ciphertext_bytes() -> u64 {
+        64 * 1024 * 1024 * 1024
     }
 
     const fn default_max_pull_objects() -> usize {
@@ -246,6 +268,17 @@ impl BlindVaultConfig {
             return Err(invalid(
                 "max_bytes_per_lease",
                 "must fit one 256 KiB object and not exceed 64 GiB",
+            ));
+        }
+        if self.max_live_leases == 0 || self.max_live_leases > MAX_LIVE_LEASES_HARD {
+            return Err(invalid("max_live_leases", "must be between 1 and 10000000"));
+        }
+        if self.max_total_ciphertext_bytes < self.max_bytes_per_lease
+            || self.max_total_ciphertext_bytes > MAX_TOTAL_CIPHERTEXT_BYTES_HARD
+        {
+            return Err(invalid(
+                "max_total_ciphertext_bytes",
+                "must cover one complete lease and not exceed 16 TiB",
             ));
         }
         if self.max_pull_objects == 0 || self.max_pull_objects > MAX_PULL_OBJECTS_HARD {
@@ -464,6 +497,8 @@ impl Default for BlindVaultConfig {
             max_object_ttl_secs: Self::default_max_object_ttl_secs(),
             max_objects_per_lease: Self::default_max_objects_per_lease(),
             max_bytes_per_lease: Self::default_max_bytes_per_lease(),
+            max_live_leases: Self::default_max_live_leases(),
+            max_total_ciphertext_bytes: Self::default_max_total_ciphertext_bytes(),
             max_pull_objects: Self::default_max_pull_objects(),
             tombstone_ttl_secs: Self::default_tombstone_ttl_secs(),
             mutation_clock_skew_secs: Self::default_mutation_clock_skew_secs(),
