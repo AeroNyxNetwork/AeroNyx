@@ -650,78 +650,11 @@ impl OnionTerminalRequirement {
     fn for_purpose(purpose: Option<OnionRoutePurpose>) -> Self {
         Self {
             capability: purpose.and_then(OnionRoutePurpose::specialized_terminal_capability),
-            protocol_features: match purpose {
-                Some(OnionRoutePurpose::BlindVaultPull | OnionRoutePurpose::BlindVaultDelete) => {
-                    // [ONION-BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex]
-                    // A generic reply carrier alone does not promise that
-                    // workload failures remain hidden from upstream relays.
-                    &[
-                        NodeProtocolFeature::OnionReplyV1,
-                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
-                    ]
-                }
-                Some(OnionRoutePurpose::BlindVaultLeaseAdmission) => {
-                    // [ONION-BLIND-LEASE-ADMISSION 2026-08-28 by Codex] Both
-                    // signed tokens are required: the generic reply carrier
-                    // and explicit execution of this sensitive workload.
-                    &[
-                        NodeProtocolFeature::OnionReplyV1,
-                        NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
-                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
-                    ]
-                }
-                Some(OnionRoutePurpose::BlindVaultPutReceipt) => {
-                    // [ONION-BLIND-VAULT-PUT-RECEIPT 2026-08-28 by Codex]
-                    // Keep receipt-capable writes distinct from the compatible
-                    // one-way Put path during rolling fleet upgrades.
-                    &[
-                        NodeProtocolFeature::OnionReplyV1,
-                        NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
-                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
-                    ]
-                }
-                Some(OnionRoutePurpose::BlindVaultLeaseRetire) => {
-                    // [ONION-BLIND-VAULT-LEASE-RETIRE 2026-08-28 by Codex]
-                    // Destructive lease-wide mutation requires an exact signed
-                    // workload feature in addition to the generic reply path.
-                    &[
-                        NodeProtocolFeature::OnionReplyV1,
-                        NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,
-                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
-                    ]
-                }
-                Some(OnionRoutePurpose::BlindVaultLeaseRenewal) => {
-                    // [ONION-BLIND-VAULT-LEASE-RENEWAL 2026-08-28 by Codex]
-                    // Capacity-authorized expiry mutation is separately
-                    // negotiated so mixed-version routes fail closed.
-                    &[
-                        NodeProtocolFeature::OnionReplyV1,
-                        NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
-                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
-                    ]
-                }
-                Some(OnionRoutePurpose::BlindVaultLeaseStatus) => {
-                    // [ONION-BLIND-VAULT-LEASE-STATUS 2026-08-28 by Codex]
-                    // Private status observations require an exact terminal
-                    // feature so older nodes cannot be selected speculatively.
-                    &[
-                        NodeProtocolFeature::OnionReplyV1,
-                        NodeProtocolFeature::OnionBlindVaultLeaseStatusV1,
-                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
-                    ]
-                }
-                Some(OnionRoutePurpose::BlindVaultLeaseInventory) => {
-                    // [ONION-BLIND-VAULT-INVENTORY 2026-08-28 by Codex]
-                    // Inventory commitments require exact support because a
-                    // status-only terminal cannot prove an object set.
-                    &[
-                        NodeProtocolFeature::OnionReplyV1,
-                        NodeProtocolFeature::OnionBlindVaultLeaseInventoryV1,
-                        NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
-                    ]
-                }
-                _ => &[],
-            },
+            // [ONION-TERMINAL-FEATURE-CONTRACT 2026-08-28 by Codex] The exact
+            // signed wire contract is owned by the core purpose model; this
+            // server adapter only applies it to discovered candidates.
+            protocol_features: purpose
+                .map_or(&[], |purpose| purpose.required_terminal_protocol_features()),
         }
     }
 

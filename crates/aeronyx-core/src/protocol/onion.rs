@@ -73,6 +73,8 @@
 //!   Unknown values must fail closed instead of silently becoming chat routes.
 //!
 //! ## Last Modified
+//! v1.10.0-TerminalFeatureContract — Centralized purpose-specific signed
+//! terminal feature requirements for node, App, SDK, and agent route builders
 //! v1.9.0-BlindVaultLeaseInventoryPurpose — Added private inventory commitment
 //! v1.8.0-BlindVaultLeaseStatusPurpose — Added private signed lease observation
 //! v1.7.0-BlindVaultLeaseRenewalPurpose — Added blind-authorized lease renewal
@@ -94,7 +96,7 @@ use zeroize::Zeroize;
 use crate::crypto::keys::{E2eSession, EphemeralKeyPair, IdentityKeyPair};
 use crate::error::CoreError;
 use crate::protocol::chat::BlindRelayEnvelope;
-use crate::protocol::discovery::NodeCapability;
+use crate::protocol::discovery::{NodeCapability, NodeProtocolFeature};
 
 // ============================================
 // Constants
@@ -131,6 +133,54 @@ pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 10] = [
     "blind_vault_lease_renewal",
     "blind_vault_lease_status",
     "blind_vault_lease_inventory",
+];
+
+/// Generic reply support plus encrypted workload failures.
+const BLIND_VAULT_REPLY_FEATURES: [NodeProtocolFeature; 2] = [
+    NodeProtocolFeature::OnionReplyV1,
+    NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+];
+
+/// Reply contract for blind-issued lease admission.
+const BLIND_VAULT_LEASE_ADMISSION_FEATURES: [NodeProtocolFeature; 3] = [
+    NodeProtocolFeature::OnionReplyV1,
+    NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
+    NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+];
+
+/// Reply contract for receipt-capable immutable writes.
+const BLIND_VAULT_PUT_RECEIPT_FEATURES: [NodeProtocolFeature; 3] = [
+    NodeProtocolFeature::OnionReplyV1,
+    NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
+    NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+];
+
+/// Reply contract for administration-key lease retirement.
+const BLIND_VAULT_LEASE_RETIRE_FEATURES: [NodeProtocolFeature; 3] = [
+    NodeProtocolFeature::OnionReplyV1,
+    NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,
+    NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+];
+
+/// Reply contract for blind-authorized lease renewal.
+const BLIND_VAULT_LEASE_RENEWAL_FEATURES: [NodeProtocolFeature; 3] = [
+    NodeProtocolFeature::OnionReplyV1,
+    NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
+    NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+];
+
+/// Reply contract for private lease-status observations.
+const BLIND_VAULT_LEASE_STATUS_FEATURES: [NodeProtocolFeature; 3] = [
+    NodeProtocolFeature::OnionReplyV1,
+    NodeProtocolFeature::OnionBlindVaultLeaseStatusV1,
+    NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+];
+
+/// Reply contract for private lease-inventory commitments.
+const BLIND_VAULT_LEASE_INVENTORY_FEATURES: [NodeProtocolFeature; 3] = [
+    NodeProtocolFeature::OnionReplyV1,
+    NodeProtocolFeature::OnionBlindVaultLeaseInventoryV1,
+    NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
 ];
 
 /// Fixed layer header length: magic(2) + eph_pub(32) + nonce(24).
@@ -246,6 +296,28 @@ impl OnionRoutePurpose {
             | Self::BlindVaultLeaseRenewal
             | Self::BlindVaultLeaseStatus
             | Self::BlindVaultLeaseInventory => Some(NodeCapability::BlindVaultReplica),
+        }
+    }
+
+    /// Returns the signed protocol features required from the terminal.
+    ///
+    /// [ONION-TERMINAL-FEATURE-CONTRACT 2026-08-28 by Codex] This mapping is
+    /// part of the core route-purpose domain model so nodes, Apps, SDKs, and AI
+    /// agents cannot silently choose different rolling-upgrade requirements.
+    /// Coarse role admission remains in [`Self::specialized_terminal_capability`].
+    /// A caller must require every returned feature from the terminal's signed
+    /// descriptor and fail closed when any feature is absent.
+    #[must_use]
+    pub const fn required_terminal_protocol_features(self) -> &'static [NodeProtocolFeature] {
+        match self {
+            Self::MessageRelay | Self::BlindVaultPut => &[],
+            Self::BlindVaultPull | Self::BlindVaultDelete => &BLIND_VAULT_REPLY_FEATURES,
+            Self::BlindVaultLeaseAdmission => &BLIND_VAULT_LEASE_ADMISSION_FEATURES,
+            Self::BlindVaultPutReceipt => &BLIND_VAULT_PUT_RECEIPT_FEATURES,
+            Self::BlindVaultLeaseRetire => &BLIND_VAULT_LEASE_RETIRE_FEATURES,
+            Self::BlindVaultLeaseRenewal => &BLIND_VAULT_LEASE_RENEWAL_FEATURES,
+            Self::BlindVaultLeaseStatus => &BLIND_VAULT_LEASE_STATUS_FEATURES,
+            Self::BlindVaultLeaseInventory => &BLIND_VAULT_LEASE_INVENTORY_FEATURES,
         }
     }
 }
