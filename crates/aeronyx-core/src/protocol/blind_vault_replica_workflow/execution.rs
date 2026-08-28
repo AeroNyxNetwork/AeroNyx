@@ -33,9 +33,8 @@ impl BlindVaultReplicaExecution {
                 actual: plan.actions.len(),
             });
         }
-        if plan.actions.is_empty() && plan.health != BlindVaultReplicaPlanHealth::Healthy {
-            return Err(BlindVaultReplicaWorkflowError::InconsistentPlan);
-        }
+        plan.validate_shape()
+            .map_err(|_| BlindVaultReplicaWorkflowError::InconsistentPlan)?;
 
         let mut items = Vec::with_capacity(plan.actions.len());
         for (sequence, action) in plan.actions.iter().copied().enumerate() {
@@ -386,10 +385,10 @@ impl BlindVaultReplicaExecution {
                 actual: next_plan.actions.len(),
             });
         }
+        next_plan
+            .validate_shape()
+            .map_err(|_| BlindVaultReplicaWorkflowError::InconsistentPlan)?;
         if next_plan.actions.is_empty() {
-            if next_plan.health != BlindVaultReplicaPlanHealth::Healthy {
-                return Err(BlindVaultReplicaWorkflowError::InconsistentPlan);
-            }
             return Ok(BlindVaultReplicaConvergence::Converged);
         }
         let action_count = u16::try_from(next_plan.actions.len()).map_err(|_| {

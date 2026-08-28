@@ -32,7 +32,9 @@
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //!
-//! Last Modified: v1.3.0-BlindVaultTerminalAttemptBoundary - Removed retry
+//! Last Modified: v1.4.0-BlindVaultPlanShape - Reused the core plan invariant
+//! at workflow creation and mandatory replan boundaries.
+//! v1.3.0-BlindVaultTerminalAttemptBoundary - Removed retry
 //! schedule requirements from exhausted terminal attempts.
 //! v1.2.0-BlindVaultReplacementRetirement - Required verified
 //! terminal retirement evidence before a replacement action can complete.
@@ -49,13 +51,12 @@ use thiserror::Error;
 
 use super::blind_vault::{
     BlindVaultError, BlindVaultReplicaAction, BlindVaultReplicaPlanHealth,
-    BlindVaultTerminalFailureCode, MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
+    BlindVaultTerminalFailureCode, MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS,
 };
 
 /// At most two per-member actions plus one aggregate provisioning action can
 /// be emitted by the current deterministic planner.
-pub const MAX_BLIND_VAULT_REPLICA_WORK_ITEMS: usize =
-    (MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS * 2) + 1;
+pub const MAX_BLIND_VAULT_REPLICA_WORK_ITEMS: usize = MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS;
 
 /// Source-side retry and evidence timing policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

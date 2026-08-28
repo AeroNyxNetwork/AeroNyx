@@ -207,6 +207,10 @@ pub const MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS: usize = 16;
 /// Maximum replica members accepted by one local lifecycle plan.
 pub const MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS: usize = 16;
 
+/// Maximum deterministic actions emitted for one bounded replica plan.
+pub const MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS: usize =
+    (MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS * 2) + 1;
+
 /// Maximum canonical RSA public-key DER accepted in an issuer directory.
 pub const MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES: usize = 800;
 
@@ -3318,6 +3322,70 @@ pub struct BlindVaultReplicaPlan {
     pub actions: Vec<BlindVaultReplicaAction>,
 }
 
+impl BlindVaultReplicaPlan {
+    /// Validates the internally consistent shape of one declarative plan.
+    ///
+    /// [BLIND-VAULT-PLAN-SHAPE 2026-08-28 by Codex] Plan fields remain public
+    /// for language-neutral adapters, so every execution boundary must reject
+    /// impossible count relationships, contradictory health/action states,
+    /// oversized action sets, and unusable action targets before authorizing
+    /// any network work.
+    pub fn validate_shape(&self) -> Result<(), BlindVaultReplicaPlanError> {
+        if usize::from(self.configured_replicas) > MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS {
+            return Err(BlindVaultReplicaPlanError::TooManyReplicas {
+                actual: usize::from(self.configured_replicas),
+            });
+        }
+        if self.actions.len() > MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS {
+            return Err(BlindVaultReplicaPlanError::TooManyActions {
+                actual: self.actions.len(),
+            });
+        }
+        if self.live_verified_replicas > self.configured_replicas
+            || self.live_matching_replicas > self.live_verified_replicas
+        {
+            return Err(BlindVaultReplicaPlanError::InconsistentPlan);
+        }
+
+        let has_actions = !self.actions.is_empty();
+        let only_renewals = has_actions
+            && self
+                .actions
+                .iter()
+                .all(|action| matches!(action, BlindVaultReplicaAction::RenewLease { .. }));
+        let health_matches_actions = match self.health {
+            BlindVaultReplicaPlanHealth::Healthy => !has_actions,
+            BlindVaultReplicaPlanHealth::MaintenanceDue => only_renewals,
+            BlindVaultReplicaPlanHealth::Degraded
+            | BlindVaultReplicaPlanHealth::QuorumUnavailable => has_actions && !only_renewals,
+        };
+        if !health_matches_actions || self.actions.iter().any(replica_action_has_invalid_target) {
+            return Err(BlindVaultReplicaPlanError::InconsistentPlan);
+        }
+        Ok(())
+    }
+}
+
+fn replica_action_has_invalid_target(action: &BlindVaultReplicaAction) -> bool {
+    match action {
+        BlindVaultReplicaAction::RenewLease {
+            node_id,
+            lease_id,
+            expected_expires_at_ms,
+        } => *node_id == [0; 32] || *lease_id == [0; 32] || *expected_expires_at_ms == 0,
+        BlindVaultReplicaAction::ReconcileInventory {
+            node_id, lease_id, ..
+        }
+        | BlindVaultReplicaAction::RetryObservation { node_id, lease_id }
+        | BlindVaultReplicaAction::ReplaceReplica { node_id, lease_id } => {
+            *node_id == [0; 32] || *lease_id == [0; 32]
+        }
+        BlindVaultReplicaAction::ProvisionReplicas { count } => {
+            *count == 0 || usize::from(*count) > MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS
+        }
+    }
+}
+
 /// Replaceable capability for source-owned replica lifecycle planning.
 pub trait BlindVaultReplicaPlanner {
     /// Produces a deterministic plan from already verified or unavailable
@@ -3479,7 +3547,7 @@ impl BlindVaultReplicaPlanner for BlindVaultManifestReplicaPlanner {
             BlindVaultReplicaPlanHealth::Degraded
         };
 
-        Ok(BlindVaultReplicaPlan {
+        let plan = BlindVaultReplicaPlan {
             health,
             configured_replicas: u8::try_from(evidence.len()).map_err(|_| {
                 BlindVaultReplicaPlanError::TooManyReplicas {
@@ -3489,7 +3557,9 @@ impl BlindVaultReplicaPlanner for BlindVaultManifestReplicaPlanner {
             live_verified_replicas,
             live_matching_replicas,
             actions,
-        })
+        };
+        plan.validate_shape()?;
+        Ok(plan)
     }
 }
 
@@ -3531,6 +3601,12 @@ pub enum BlindVaultReplicaPlanError {
     /// Evidence exceeded the bounded local planning set.
     #[error("blind vault replica set contains too many members: {actual}")]
     TooManyReplicas { actual: usize },
+    /// Declarative actions exceeded the bounded planner output.
+    #[error("blind vault replica plan contains too many actions: {actual}")]
+    TooManyActions { actual: usize },
+    /// Counts, health, actions, or action targets contradicted one another.
+    #[error("blind vault replica plan is internally inconsistent")]
+    InconsistentPlan,
     /// Two evidence entries declared the same terminal descriptor identity.
     #[error("blind vault replica set contains a duplicate node")]
     DuplicateNode,
