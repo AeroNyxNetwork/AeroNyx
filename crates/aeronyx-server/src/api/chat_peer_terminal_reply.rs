@@ -36,7 +36,9 @@
 //! - Keep node fan-out out of this module; clients choose unrelated replicas
 //!   and routes so one node cannot reconstruct a logical replica set.
 //!
-//! Last Modified: v1.6.0-BlindVaultLeaseStatus - Added private
+//! Last Modified: v1.7.0-BlindVaultLeaseInventory - Added private streaming
+//! inventory commitments with encrypted terminal-signed receipts.
+//! v1.6.0-BlindVaultLeaseStatus - Added private
 //! administration-authorized status observations with encrypted signed receipts.
 //! v1.5.0-BlindVaultLeaseRenewal - Added blind-authorized
 //! lease renewal with encrypted terminal-signed transition receipts.
@@ -62,9 +64,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::services::{
     BlindVaultAdmissionFailureClass, BlindVaultDeleteFailureClass,
-    BlindVaultLeaseRenewFailureClass, BlindVaultLeaseRetireFailureClass,
-    BlindVaultLeaseStatusFailureClass, BlindVaultPullFailureClass, BlindVaultPutFailureClass,
-    BlindVaultService, BlindVaultServiceError,
+    BlindVaultLeaseInventoryFailureClass, BlindVaultLeaseRenewFailureClass,
+    BlindVaultLeaseRetireFailureClass, BlindVaultLeaseStatusFailureClass,
+    BlindVaultPullFailureClass, BlindVaultPutFailureClass, BlindVaultService,
+    BlindVaultServiceError,
 };
 
 /// Coarse terminal-reply failure class consumed by blind-relay orchestration.
@@ -160,6 +163,15 @@ pub(super) fn execute_blind_vault_inline_reply(
             let encoded = encode_blind_vault_frame(&BlindVaultFrame::LeaseStatusReceipt(receipt))
                 .map_err(|_| TerminalReplyFailure::Unavailable)?;
             (OnionRoutePurpose::BlindVaultLeaseStatus, encoded)
+        }
+        BlindVaultFrame::LeaseInventory(inventory_request) => {
+            let receipt = vault
+                .lease_inventory(&inventory_request, now_ms)
+                .map_err(classify_lease_inventory_failure)?;
+            let encoded =
+                encode_blind_vault_frame(&BlindVaultFrame::LeaseInventoryReceipt(receipt))
+                    .map_err(|_| TerminalReplyFailure::Unavailable)?;
+            (OnionRoutePurpose::BlindVaultLeaseInventory, encoded)
         }
         BlindVaultFrame::LeaseRetire(retire_request) => {
             let receipt = vault
@@ -308,5 +320,15 @@ fn classify_lease_status_failure(error: BlindVaultServiceError) -> TerminalReply
     match error.lease_status_failure_class() {
         BlindVaultLeaseStatusFailureClass::Rejected => TerminalReplyFailure::Rejected,
         BlindVaultLeaseStatusFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
+    }
+}
+
+fn classify_lease_inventory_failure(error: BlindVaultServiceError) -> TerminalReplyFailure {
+    // [BLIND-VAULT-INVENTORY-FAILURE 2026-08-28 by Codex] Relays learn only
+    // permanent rejection versus local unavailability; the inventory root,
+    // usage counters, lease state, and authority result stay encrypted.
+    match error.lease_inventory_failure_class() {
+        BlindVaultLeaseInventoryFailureClass::Rejected => TerminalReplyFailure::Rejected,
+        BlindVaultLeaseInventoryFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
     }
 }

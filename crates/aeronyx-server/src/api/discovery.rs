@@ -143,6 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.57.0-OnionLeaseInventoryTerminalContract - Added feature-gated private
+//! encrypted-object inventory commitments
 //! v0.56.0-OnionLeaseStatusTerminalContract - Added feature-gated private
 //! administration-authorized lease status observations
 //! v0.55.0-OnionLeaseRenewalTerminalContract - Added feature-gated blind
@@ -691,6 +693,15 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindVaultLeaseStatusV1,
+                    ]
+                }
+                Some(OnionRoutePurpose::BlindVaultLeaseInventory) => {
+                    // [ONION-BLIND-VAULT-INVENTORY 2026-08-28 by Codex]
+                    // Inventory commitments require exact support because a
+                    // status-only terminal cannot prove an object set.
+                    &[
+                        NodeProtocolFeature::OnionReplyV1,
+                        NodeProtocolFeature::OnionBlindVaultLeaseInventoryV1,
                     ]
                 }
                 _ => &[],

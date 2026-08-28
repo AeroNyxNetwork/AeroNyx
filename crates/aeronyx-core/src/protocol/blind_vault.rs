@@ -25,6 +25,8 @@
 //!   read capabilities to entry or middle nodes.
 //! - Defines administration-authorized, terminal-signed lease status proofs
 //!   for private replica repair and renewal decisions.
+//! - Defines streaming, per-replica inventory commitments so a source can
+//!   verify its own manifest without linking independently wrapped replicas.
 //! - Provides deterministic signing bytes and bounded binary wire framing.
 //! - Enforces coarse ciphertext size classes to reduce content-size leakage.
 //! - Keeps application domain separation inside client ciphertext and keys.
@@ -63,7 +65,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.13.0-BlindVaultOnionLeaseStatus - Added
+//! Last Modified: v1.14.0-BlindVaultOnionLeaseInventory - Added streaming,
+//! private terminal-signed encrypted-object inventory commitments.
+//! v1.13.0-BlindVaultOnionLeaseStatus - Added
 //! administration-authorized, encrypted terminal-signed lease status observations.
 //! v1.12.0-BlindVaultOnionLeaseRenewal - Added blind-authorized,
 //! administration-key lease renewal with encrypted signed receipts.
@@ -131,6 +135,14 @@ const LEASE_STATUS_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-LeaseStatus-v1";
 const LEASE_STATUS_REQUEST_COMMITMENT_DOMAIN: &[u8] =
     b"AeroNyx-BlindVault-LeaseStatus-RequestCommitment-v1";
 const LEASE_STATUS_RECEIPT_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-LeaseStatusReceipt-v1";
+const LEASE_INVENTORY_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-LeaseInventory-v1";
+const LEASE_INVENTORY_REQUEST_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx-BlindVault-LeaseInventory-RequestCommitment-v1";
+const LEASE_INVENTORY_SET_COMMITMENT_DOMAIN: &[u8] =
+    b"AeroNyx-BlindVault-LeaseInventory-SetCommitment-v1";
+const LEASE_INVENTORY_SET_END_DOMAIN: &[u8] = b"AeroNyx-BlindVault-LeaseInventory-SetEnd-v1";
+const LEASE_INVENTORY_RECEIPT_SIGNING_DOMAIN: &[u8] =
+    b"AeroNyx-BlindVault-LeaseInventoryReceipt-v1";
 const FRAME_MAGIC: [u8; 4] = *b"ANBV";
 const FRAME_HEADER_BYTES: usize = 7;
 const FRAME_KIND_PUT: u8 = 1;
@@ -150,6 +162,8 @@ const FRAME_KIND_BLIND_LEASE_RENEWAL: u8 = 14;
 const FRAME_KIND_BLIND_LEASE_RENEWED: u8 = 15;
 const FRAME_KIND_LEASE_STATUS: u8 = 16;
 const FRAME_KIND_LEASE_STATUS_RECEIPT: u8 = 17;
+const FRAME_KIND_LEASE_INVENTORY: u8 = 18;
+const FRAME_KIND_LEASE_INVENTORY_RECEIPT: u8 = 19;
 
 /// Returns whether an opaque payload declares the Blind Vault wire format.
 ///
@@ -247,6 +261,10 @@ pub enum BlindVaultFrame {
     LeaseStatus(BlindVaultLeaseStatusRequest),
     /// Terminal-signed proof of one coherent lease status observation.
     LeaseStatusReceipt(BlindVaultLeaseStatusReceipt),
+    /// Administration-key request for one private live-set commitment.
+    LeaseInventory(BlindVaultLeaseInventoryRequest),
+    /// Terminal-signed proof of one coherent encrypted-object inventory.
+    LeaseInventoryReceipt(BlindVaultLeaseInventoryReceipt),
 }
 
 /// Anonymous lease metadata signed by its independent administration key.
@@ -2440,6 +2458,325 @@ impl BlindVaultLeaseStatusReceipt {
     }
 }
 
+/// One canonical encrypted-object entry committed by a private inventory.
+///
+/// This type is deliberately not serializable as a protocol frame. It exists
+/// only to let a source and terminal independently derive the same per-replica
+/// commitment without publishing an object list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultInventoryCommitmentEntry {
+    /// Replica-local random object identifier.
+    pub object_id: [u8; 32],
+    /// SHA-256 commitment to the exact padded ciphertext bytes.
+    pub ciphertext_commitment: [u8; 32],
+    /// Object retention deadline committed by this inventory generation.
+    pub expires_at_ms: u64,
+    /// Exact padded ciphertext byte length.
+    pub ciphertext_bytes: u64,
+}
+
+/// Aggregate result of one canonical inventory commitment pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultInventoryCommitmentSummary {
+    /// Number of entries committed by the builder.
+    pub object_count: u64,
+    /// Total padded ciphertext bytes committed by the builder.
+    pub ciphertext_bytes: u64,
+    /// Domain-separated commitment to the ordered live object set.
+    pub commitment: [u8; 32],
+}
+
+/// Streaming canonical inventory commitment builder.
+///
+/// [BLIND-VAULT-INVENTORY-COMMITMENT 2026-08-28 by Codex] Entries must arrive
+/// in strict object-id order. Fixed-width framing plus an explicit end marker,
+/// count, and byte total prevents ambiguity without retaining the full set in
+/// memory. Different replicas remain unlinkable because their object IDs and
+/// ciphertext wrappers are independently randomized.
+pub struct BlindVaultInventoryCommitmentBuilder {
+    hasher: Sha256,
+    previous_object_id: Option<[u8; 32]>,
+    object_count: u64,
+    ciphertext_bytes: u64,
+}
+
+impl BlindVaultInventoryCommitmentBuilder {
+    /// Starts one commitment for a replica-local lease.
+    pub fn new(lease_id: [u8; 32]) -> Result<Self, BlindVaultError> {
+        require_non_zero("lease_id", &lease_id)?;
+        let mut hasher = Sha256::new();
+        hasher.update(LEASE_INVENTORY_SET_COMMITMENT_DOMAIN);
+        hasher.update(BLIND_VAULT_PROTOCOL_VERSION.to_be_bytes());
+        hasher.update(lease_id);
+        Ok(Self {
+            hasher,
+            previous_object_id: None,
+            object_count: 0,
+            ciphertext_bytes: 0,
+        })
+    }
+
+    /// Commits one strictly ordered live object without retaining its metadata.
+    pub fn push(
+        &mut self,
+        entry: BlindVaultInventoryCommitmentEntry,
+    ) -> Result<(), BlindVaultError> {
+        require_non_zero("object_id", &entry.object_id)?;
+        require_non_zero("ciphertext_commitment", &entry.ciphertext_commitment)?;
+        if entry.expires_at_ms == 0
+            || !BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES.contains(
+                &usize::try_from(entry.ciphertext_bytes)
+                    .map_err(|_| BlindVaultError::InvalidInventoryEntry)?,
+            )
+        {
+            return Err(BlindVaultError::InvalidInventoryEntry);
+        }
+        if self
+            .previous_object_id
+            .is_some_and(|previous| previous >= entry.object_id)
+        {
+            return Err(BlindVaultError::InvalidInventoryOrder);
+        }
+        self.object_count = self
+            .object_count
+            .checked_add(1)
+            .ok_or(BlindVaultError::InventoryOverflow)?;
+        self.ciphertext_bytes = self
+            .ciphertext_bytes
+            .checked_add(entry.ciphertext_bytes)
+            .ok_or(BlindVaultError::InventoryOverflow)?;
+        self.hasher.update(entry.object_id);
+        self.hasher.update(entry.ciphertext_commitment);
+        self.hasher.update(entry.expires_at_ms.to_be_bytes());
+        self.hasher.update(entry.ciphertext_bytes.to_be_bytes());
+        self.previous_object_id = Some(entry.object_id);
+        Ok(())
+    }
+
+    /// Finalizes the exact ordered-set commitment and aggregate counters.
+    #[must_use]
+    pub fn finish(mut self) -> BlindVaultInventoryCommitmentSummary {
+        self.hasher.update(LEASE_INVENTORY_SET_END_DOMAIN);
+        self.hasher.update(self.object_count.to_be_bytes());
+        self.hasher.update(self.ciphertext_bytes.to_be_bytes());
+        BlindVaultInventoryCommitmentSummary {
+            object_count: self.object_count,
+            ciphertext_bytes: self.ciphertext_bytes,
+            commitment: self.hasher.finalize().into(),
+        }
+    }
+}
+
+/// Administration-key request for one private replica inventory commitment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultLeaseInventoryRequest {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Replica-local lease whose live set is committed.
+    pub lease_id: [u8; 32],
+    /// Random request identifier binding the response to this observation.
+    pub request_id: [u8; 16],
+    /// Client request time in Unix milliseconds for bounded replay rejection.
+    pub requested_at_ms: u64,
+    /// Signature by the lease administration key.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultLeaseInventoryRequest {
+    /// Builds an unsigned lease-inventory request.
+    #[must_use]
+    pub fn new(lease_id: [u8; 32], request_id: [u8; 16], requested_at_ms: u64) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            lease_id,
+            request_id,
+            requested_at_ms,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical lease-inventory signing input.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(LEASE_INVENTORY_SIGNING_DOMAIN.len() + 58);
+        bytes.extend_from_slice(LEASE_INVENTORY_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.lease_id);
+        bytes.extend_from_slice(&self.request_id);
+        bytes.extend_from_slice(&self.requested_at_ms.to_be_bytes());
+        bytes
+    }
+
+    /// Domain-separated commitment to the exact signed inventory request.
+    #[must_use]
+    pub fn commitment(&self) -> [u8; 32] {
+        let signing_bytes = self.signing_bytes();
+        let mut bytes = Vec::with_capacity(
+            LEASE_INVENTORY_REQUEST_COMMITMENT_DOMAIN.len() + signing_bytes.len(),
+        );
+        bytes.extend_from_slice(LEASE_INVENTORY_REQUEST_COMMITMENT_DOMAIN);
+        bytes.extend_from_slice(&signing_bytes);
+        sha256(&bytes)
+    }
+
+    /// Signs the request with the lease administration key.
+    pub fn sign(&mut self, admin_key: &IdentityKeyPair) {
+        self.signature = admin_key.sign(&self.signing_bytes());
+    }
+
+    /// Validates freshness and verifies the lease administration signature.
+    pub fn validate_and_verify(
+        &self,
+        now_ms: u64,
+        maximum_clock_skew_ms: u64,
+        admin_key: &IdentityPublicKey,
+    ) -> Result<(), BlindVaultError> {
+        self.validate_freshness(now_ms, maximum_clock_skew_ms)?;
+        admin_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+
+    /// Validates non-secret fields before constructing an onion route.
+    pub fn validate_freshness(
+        &self,
+        now_ms: u64,
+        maximum_clock_skew_ms: u64,
+    ) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("lease_id", &self.lease_id)?;
+        require_non_zero("request_id", &self.request_id)?;
+        let skew = if now_ms >= self.requested_at_ms {
+            now_ms - self.requested_at_ms
+        } else {
+            self.requested_at_ms - now_ms
+        };
+        if maximum_clock_skew_ms == 0 || skew > maximum_clock_skew_ms {
+            return Err(BlindVaultError::RequestTimestampOutsideWindow);
+        }
+        Ok(())
+    }
+}
+
+/// Terminal-signed commitment to one coherent still-live replica inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultLeaseInventoryReceipt {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Replica-local lease observed by the terminal.
+    pub lease_id: [u8; 32],
+    /// Request identifier copied from the signed query.
+    pub request_id: [u8; 16],
+    /// Commitment to the complete inventory-request semantics.
+    pub request_commitment: [u8; 32],
+    /// Current lease expiry observed with the inventory snapshot.
+    pub expires_at_ms: u64,
+    /// Number of still-live opaque objects in the committed set.
+    pub live_object_count: u64,
+    /// Total padded ciphertext bytes in the committed set.
+    pub live_ciphertext_bytes: u64,
+    /// Domain-separated commitment to the ordered live object set.
+    pub inventory_commitment: [u8; 32],
+    /// Terminal observation time in Unix milliseconds.
+    pub observed_at_ms: u64,
+    /// Descriptor identity of the observing terminal node.
+    pub node_id: [u8; 32],
+    /// Ed25519 signature by `node_id` over the canonical receipt fields.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultLeaseInventoryReceipt {
+    /// Builds an unsigned inventory receipt from one coherent node snapshot.
+    #[must_use]
+    pub fn new(
+        request: &BlindVaultLeaseInventoryRequest,
+        expires_at_ms: u64,
+        summary: BlindVaultInventoryCommitmentSummary,
+        observed_at_ms: u64,
+        node_id: [u8; 32],
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            lease_id: request.lease_id,
+            request_id: request.request_id,
+            request_commitment: request.commitment(),
+            expires_at_ms,
+            live_object_count: summary.object_count,
+            live_ciphertext_bytes: summary.ciphertext_bytes,
+            inventory_commitment: summary.commitment,
+            observed_at_ms,
+            node_id,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical terminal-signing input for the inventory receipt.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(LEASE_INVENTORY_RECEIPT_SIGNING_DOMAIN.len() + 178);
+        bytes.extend_from_slice(LEASE_INVENTORY_RECEIPT_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.lease_id);
+        bytes.extend_from_slice(&self.request_id);
+        bytes.extend_from_slice(&self.request_commitment);
+        bytes.extend_from_slice(&self.expires_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.live_object_count.to_be_bytes());
+        bytes.extend_from_slice(&self.live_ciphertext_bytes.to_be_bytes());
+        bytes.extend_from_slice(&self.inventory_commitment);
+        bytes.extend_from_slice(&self.observed_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.node_id);
+        bytes
+    }
+
+    /// Signs the receipt with the terminal descriptor identity.
+    pub fn sign(&mut self, node_key: &IdentityKeyPair) -> Result<(), BlindVaultError> {
+        self.validate_fields()?;
+        if self.node_id != node_key.public_key_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        self.signature = node_key.sign(&self.signing_bytes());
+        Ok(())
+    }
+
+    /// Validates summary invariants, terminal identity, and signature.
+    pub fn validate_and_verify(&self, node_key: &IdentityPublicKey) -> Result<(), BlindVaultError> {
+        self.validate_fields()?;
+        if self.node_id != node_key.to_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        node_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+
+    /// Confirms that this receipt answers the exact signed inventory request.
+    #[must_use]
+    pub fn matches_inventory(&self, request: &BlindVaultLeaseInventoryRequest) -> bool {
+        self.version == request.version
+            && self.lease_id == request.lease_id
+            && self.request_id == request.request_id
+            && self.request_commitment == request.commitment()
+    }
+
+    fn validate_fields(&self) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("lease_id", &self.lease_id)?;
+        require_non_zero("request_id", &self.request_id)?;
+        require_non_zero("request_commitment", &self.request_commitment)?;
+        require_non_zero("inventory_commitment", &self.inventory_commitment)?;
+        require_non_zero("node_id", &self.node_id)?;
+        if self.observed_at_ms == 0
+            || self.expires_at_ms <= self.observed_at_ms
+            || (self.live_object_count == 0) != (self.live_ciphertext_bytes == 0)
+        {
+            return Err(BlindVaultError::InvalidInventorySummary);
+        }
+        Ok(())
+    }
+}
+
 /// Signed node proof that an opaque object was deleted or had already been
 /// deleted under the same tombstone commitment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2935,6 +3272,100 @@ pub enum BlindVaultOnionLeaseStatusError {
     InvalidTerminalIdentity,
 }
 
+/// Source-owned state for one private replica inventory commitment.
+///
+/// [BLIND-VAULT-ONION-LEASE-INVENTORY 2026-08-28 by Codex] The object-set
+/// commitment returns only through the single-use encrypted reply. Middle
+/// relays never receive the lease ID, per-object commitments, aggregate usage,
+/// or resulting inventory root.
+pub struct BlindVaultOnionLeaseInventorySession {
+    expected_version: u16,
+    expected_lease_id: [u8; 32],
+    expected_request_id: [u8; 16],
+    expected_request_commitment: [u8; 32],
+    reply_session: OnionReplySession,
+}
+
+impl BlindVaultOnionLeaseInventorySession {
+    /// Encodes one administration-authorized inventory query for the terminal.
+    pub fn prepare(
+        route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        request: BlindVaultLeaseInventoryRequest,
+        now_ms: u64,
+        maximum_clock_skew_ms: u64,
+    ) -> Result<(Vec<u8>, Self), BlindVaultOnionLeaseInventoryError> {
+        request.validate_freshness(now_ms, maximum_clock_skew_ms)?;
+        let expected_version = request.version;
+        let expected_lease_id = request.lease_id;
+        let expected_request_id = request.request_id;
+        let expected_request_commitment = request.commitment();
+        let encoded_inventory =
+            encode_blind_vault_frame(&BlindVaultFrame::LeaseInventory(request))?;
+        let (reply_request, reply_session) = OnionReplySession::prepare(
+            route_id,
+            expected_terminal_node_id,
+            ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
+            encoded_inventory,
+        )?;
+        let encoded_request = encode_onion_reply_request(&reply_request)?;
+        Ok((
+            encoded_request,
+            Self {
+                expected_version,
+                expected_lease_id,
+                expected_request_id,
+                expected_request_commitment,
+                reply_session,
+            },
+        ))
+    }
+
+    /// Opens and verifies the exact terminal-signed inventory receipt.
+    pub fn open(
+        self,
+        encoded_response: &[u8],
+    ) -> Result<BlindVaultLeaseInventoryReceipt, BlindVaultOnionLeaseInventoryError> {
+        let reply = self.reply_session.open(encoded_response)?;
+        let BlindVaultFrame::LeaseInventoryReceipt(receipt) =
+            decode_blind_vault_frame(&reply.payload)?
+        else {
+            return Err(BlindVaultOnionLeaseInventoryError::UnexpectedResponseFrame);
+        };
+        let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
+            .map_err(|_| BlindVaultOnionLeaseInventoryError::InvalidTerminalIdentity)?;
+        receipt.validate_and_verify(&terminal_key)?;
+        if receipt.version != self.expected_version
+            || receipt.lease_id != self.expected_lease_id
+            || receipt.request_id != self.expected_request_id
+            || receipt.request_commitment != self.expected_request_commitment
+        {
+            return Err(BlindVaultOnionLeaseInventoryError::RequestMismatch);
+        }
+        Ok(receipt)
+    }
+}
+
+/// Fail-closed source errors for private replica inventory commitments.
+#[derive(Debug, Error)]
+pub enum BlindVaultOnionLeaseInventoryError {
+    /// The Blind Vault request or signed receipt violated its wire contract.
+    #[error("blind vault onion lease inventory frame rejected")]
+    BlindVault(#[from] BlindVaultError),
+    /// The reply carrier failed key, route, request, identity, or signature checks.
+    #[error("blind vault onion lease inventory reply rejected")]
+    OnionReply(#[from] OnionReplyError),
+    /// The decrypted workload response was not an inventory receipt.
+    #[error("unexpected blind vault onion lease inventory response frame")]
+    UnexpectedResponseFrame,
+    /// The verified receipt did not answer the exact signed inventory request.
+    #[error("blind vault onion lease inventory request mismatch")]
+    RequestMismatch,
+    /// The verified outer terminal identity could not be reconstructed.
+    #[error("invalid blind vault onion lease inventory terminal identity")]
+    InvalidTerminalIdentity,
+}
+
 /// Stable, bounded binary encoding with an explicit frame kind outside bincode.
 /// This avoids depending on serde enum discriminants for future evolution.
 pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, BlindVaultError> {
@@ -3005,6 +3436,14 @@ pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, Blin
         ),
         BlindVaultFrame::LeaseStatusReceipt(value) => (
             FRAME_KIND_LEASE_STATUS_RECEIPT,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::LeaseInventory(value) => (
+            FRAME_KIND_LEASE_INVENTORY,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::LeaseInventoryReceipt(value) => (
+            FRAME_KIND_LEASE_INVENTORY_RECEIPT,
             serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
         ),
     };
@@ -3105,6 +3544,13 @@ pub fn decode_blind_vault_frame(bytes: &[u8]) -> Result<BlindVaultFrame, BlindVa
         FRAME_KIND_LEASE_STATUS_RECEIPT => Ok(BlindVaultFrame::LeaseStatusReceipt(
             deserialize_body(body, frame_limit)?,
         )),
+        FRAME_KIND_LEASE_INVENTORY => Ok(BlindVaultFrame::LeaseInventory(deserialize_body(
+            body,
+            frame_limit,
+        )?)),
+        FRAME_KIND_LEASE_INVENTORY_RECEIPT => Ok(BlindVaultFrame::LeaseInventoryReceipt(
+            deserialize_body(body, frame_limit)?,
+        )),
         kind => Err(BlindVaultError::UnknownFrameKind(kind)),
     }
 }
@@ -3157,6 +3603,18 @@ pub enum BlindVaultError {
     /// A signed lease-status receipt carried impossible live-usage data.
     #[error("lease status receipt summary is inconsistent")]
     InvalidLeaseStatusSummary,
+    /// A private inventory entry violated its fixed-width commitment contract.
+    #[error("blind vault inventory entry is invalid")]
+    InvalidInventoryEntry,
+    /// Inventory entries were duplicated or not in canonical object-id order.
+    #[error("blind vault inventory entries are not in strict object-id order")]
+    InvalidInventoryOrder,
+    /// Inventory aggregate counters exceeded their fixed-width representation.
+    #[error("blind vault inventory aggregate overflowed")]
+    InventoryOverflow,
+    /// A signed inventory receipt carried impossible aggregate data.
+    #[error("blind vault inventory receipt summary is inconsistent")]
+    InvalidInventorySummary,
     /// Receipt signer did not match the declared descriptor identity.
     #[error("receipt node identity does not match its signing key")]
     NodeIdentityMismatch,
@@ -3292,7 +3750,9 @@ fn frame_limit_for_kind(kind: u8) -> Result<u64, BlindVaultError> {
         | FRAME_KIND_BLIND_LEASE_RENEWAL
         | FRAME_KIND_BLIND_LEASE_RENEWED
         | FRAME_KIND_LEASE_STATUS
-        | FRAME_KIND_LEASE_STATUS_RECEIPT => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
+        | FRAME_KIND_LEASE_STATUS_RECEIPT
+        | FRAME_KIND_LEASE_INVENTORY
+        | FRAME_KIND_LEASE_INVENTORY_RECEIPT => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
         FRAME_KIND_PULL_RESPONSE => Ok(MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES),
         unknown => Err(BlindVaultError::UnknownFrameKind(unknown)),
     }

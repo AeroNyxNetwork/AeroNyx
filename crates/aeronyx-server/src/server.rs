@@ -620,6 +620,8 @@
 //     route, peer, receipt, endpoint, ciphertext, or payload dimensions.
 //
 // Last Modified:
+//   [BLIND-VAULT-LEASE-INVENTORY 2026-08-28 by Codex] Advertised private,
+//     terminal-signed encrypted-object inventory commitments.
 //   [BLIND-VAULT-LEASE-STATUS 2026-08-28 by Codex] Advertised private,
 //     administration-authorized terminal-signed lease status observations.
 //   [BLIND-VAULT-LEASE-RENEWAL 2026-08-28 by Codex] Advertised blind-authorized
@@ -13425,6 +13427,7 @@ impl Server {
             NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,
             NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
             NodeProtocolFeature::OnionBlindVaultLeaseStatusV1,
+            NodeProtocolFeature::OnionBlindVaultLeaseInventoryV1,
         ]);
 
         descriptor.public_endpoint = config
@@ -20050,6 +20053,9 @@ mod tests {
         assert!(signed
             .descriptor
             .advertises_protocol_feature(NodeProtocolFeature::OnionBlindVaultLeaseStatusV1));
+        assert!(signed
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::OnionBlindVaultLeaseInventoryV1));
         assert_eq!(
             signed.descriptor.capacity.max_sessions,
             server.config.max_sessions() as u32

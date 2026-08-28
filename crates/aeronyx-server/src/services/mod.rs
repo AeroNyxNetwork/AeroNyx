@@ -284,7 +284,8 @@ pub mod wallet_routes;
 // the service-owned coarse class instead of matching storage internals twice.
 pub use blind_vault::{
     BlindVaultAdmissionFailureClass, BlindVaultCleanupReport, BlindVaultDeleteFailureClass,
-    BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus, BlindVaultLeaseProvisionOutcome,
+    BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus,
+    BlindVaultLeaseInventoryFailureClass, BlindVaultLeaseProvisionOutcome,
     BlindVaultLeaseRenewFailureClass, BlindVaultLeaseRetireFailureClass,
     BlindVaultLeaseStatusFailureClass, BlindVaultPullFailureClass, BlindVaultPullPage,
     BlindVaultPutFailureClass, BlindVaultService, BlindVaultServiceError, BlindVaultStatus,
