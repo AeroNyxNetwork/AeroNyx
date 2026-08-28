@@ -125,7 +125,8 @@ pub use blind_vault::{
     BlindVaultReplicaAction, BlindVaultReplicaEvidence, BlindVaultReplicaEvidenceError,
     BlindVaultReplicaManifestExpectation, BlindVaultReplicaPlan, BlindVaultReplicaPlanError,
     BlindVaultReplicaPlanHealth, BlindVaultReplicaPlanner, BlindVaultReplicaPolicy,
-    BlindVaultStoredReceipt, BlindVaultVerifiedReplicaInventory,
+    BlindVaultStoredReceipt, BlindVaultTerminalFailure, BlindVaultTerminalFailureCode,
+    BlindVaultTerminalOperation, BlindVaultVerifiedReplicaInventory,
     BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_PROTOCOL_VERSION, MAX_BLIND_VAULT_FRAME_BYTES,
     MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
 };

@@ -2597,8 +2597,9 @@ async fn deliver_onion_terminal_payload(
             TerminalReplyFailure::Rejected | TerminalReplyFailure::ResponseTooLarge => {
                 BlindRelayError::OnionTerminalPayloadRejected
             }
-            // [BLIND-VAULT-PUT-RECEIPT-CAPACITY 2026-08-28 by Codex] Preserve
-            // the existing privacy-safe capacity retry path for inline writes.
+            // [BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex] Valid
+            // workload failures are sealed inside opaque replies. This branch
+            // remains fail-closed for any pre-sealing capacity failure.
             TerminalReplyFailure::Capacity => BlindRelayError::OnionTerminalCapacityExhausted,
             TerminalReplyFailure::Unavailable => BlindRelayError::ForwardFailed,
         })?;

@@ -67,7 +67,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.16.0-BlindVaultReplicaWorkflow - Exposed local-only
+//! Last Modified: v1.17.0-BlindVaultEncryptedFailure - Added typed,
+//! source-only terminal failure replies inside the fixed-size onion carrier.
+//! v1.16.0-BlindVaultReplicaWorkflow - Exposed local-only
 //! manifest expectation fields for exact, stale-plan-safe execution evidence.
 //! v1.15.0-BlindVaultReplicaPlanner - Added source-owned,
 //! manifest-bound replica evidence verification and lifecycle planning.
@@ -172,6 +174,7 @@ const FRAME_KIND_LEASE_STATUS: u8 = 16;
 const FRAME_KIND_LEASE_STATUS_RECEIPT: u8 = 17;
 const FRAME_KIND_LEASE_INVENTORY: u8 = 18;
 const FRAME_KIND_LEASE_INVENTORY_RECEIPT: u8 = 19;
+const FRAME_KIND_TERMINAL_FAILURE: u8 = 20;
 
 /// Returns whether an opaque payload declares the Blind Vault wire format.
 ///
@@ -276,6 +279,177 @@ pub enum BlindVaultFrame {
     LeaseInventory(BlindVaultLeaseInventoryRequest),
     /// Terminal-signed proof of one coherent encrypted-object inventory.
     LeaseInventoryReceipt(BlindVaultLeaseInventoryReceipt),
+    /// Coarse workload failure visible only after source-side reply decryption.
+    TerminalFailure(BlindVaultTerminalFailure),
+}
+
+/// Blind Vault operation answered by one encrypted terminal failure.
+///
+/// [BLIND-VAULT-ENCRYPTED-FAILURE 2026-08-28 by Codex] Stable one-byte
+/// operation values keep the bincode body independent from Rust enum ordering.
+/// They identify only the operation already bound into the signed onion reply;
+/// lease, object, route, endpoint, and application metadata remain absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlindVaultTerminalOperation {
+    /// Immutable ciphertext write.
+    Put = 1,
+    /// Capability-authenticated ciphertext recovery.
+    Pull = 2,
+    /// Administration-authorized object deletion.
+    Delete = 3,
+    /// Blind-issued anonymous lease admission.
+    LeaseAdmission = 4,
+    /// Blind-authorized lease renewal.
+    LeaseRenewal = 5,
+    /// Private lease status observation.
+    LeaseStatus = 6,
+    /// Private encrypted-object inventory observation.
+    LeaseInventory = 7,
+    /// Complete anonymous lease retirement.
+    LeaseRetire = 8,
+}
+
+impl TryFrom<u8> for BlindVaultTerminalOperation {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Put),
+            2 => Ok(Self::Pull),
+            3 => Ok(Self::Delete),
+            4 => Ok(Self::LeaseAdmission),
+            5 => Ok(Self::LeaseRenewal),
+            6 => Ok(Self::LeaseStatus),
+            7 => Ok(Self::LeaseInventory),
+            8 => Ok(Self::LeaseRetire),
+            _ => Err("unknown blind vault terminal operation"),
+        }
+    }
+}
+
+impl Serialize for BlindVaultTerminalOperation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+impl<'de> Deserialize<'de> for BlindVaultTerminalOperation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Stable source-action class for an encrypted terminal failure.
+///
+/// Codes are deliberately coarse. In particular, every capability, lease,
+/// signature, cursor, object-state, and replay rejection collapses to
+/// [`Self::Rejected`] so a client cannot turn the storage node into an oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlindVaultTerminalFailureCode {
+    /// The request is invalid or permanently unauthorized; do not retry it.
+    Rejected = 1,
+    /// The selected replica lacks capacity; choose another audited terminal.
+    Capacity = 2,
+    /// The terminal is temporarily unavailable; bounded retry is permitted.
+    Unavailable = 3,
+    /// The selected inline response class cannot carry the requested result.
+    ResponseTooLarge = 4,
+}
+
+impl BlindVaultTerminalFailureCode {
+    /// Stable operator-safe label without request or storage details.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::Capacity => "capacity",
+            Self::Unavailable => "unavailable",
+            Self::ResponseTooLarge => "response_too_large",
+        }
+    }
+}
+
+impl std::fmt::Display for BlindVaultTerminalFailureCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<u8> for BlindVaultTerminalFailureCode {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Rejected),
+            2 => Ok(Self::Capacity),
+            3 => Ok(Self::Unavailable),
+            4 => Ok(Self::ResponseTooLarge),
+            _ => Err("unknown blind vault terminal failure code"),
+        }
+    }
+}
+
+impl Serialize for BlindVaultTerminalFailureCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+impl<'de> Deserialize<'de> for BlindVaultTerminalFailureCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Authenticated workload failure carried inside a sealed onion reply.
+///
+/// The outer [`OnionReplySession`] verifies the terminal signature and binds
+/// this body to the exact request commitment before a caller can inspect it.
+/// No separate inner signature or request identifier is needed, and adding
+/// either would create unnecessary correlation material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultTerminalFailure {
+    operation: BlindVaultTerminalOperation,
+    code: BlindVaultTerminalFailureCode,
+}
+
+impl BlindVaultTerminalFailure {
+    /// Creates one minimal encrypted terminal failure.
+    #[must_use]
+    pub const fn new(
+        operation: BlindVaultTerminalOperation,
+        code: BlindVaultTerminalFailureCode,
+    ) -> Self {
+        Self { operation, code }
+    }
+
+    /// Operation already bound into the encrypted request and signed reply.
+    #[must_use]
+    pub const fn operation(&self) -> BlindVaultTerminalOperation {
+        self.operation
+    }
+
+    /// Coarse source action; never a storage-engine or authorization detail.
+    #[must_use]
+    pub const fn code(&self) -> BlindVaultTerminalFailureCode {
+        self.code
+    }
 }
 
 /// Anonymous lease metadata signed by its independent administration key.
@@ -770,9 +944,16 @@ impl BlindVaultOnionLeaseAdmissionSession {
         encoded_response: &[u8],
     ) -> Result<BlindVaultBlindLeaseAcceptedReceipt, BlindVaultOnionLeaseAdmissionError> {
         let reply = self.reply_session.open(encoded_response)?;
-        let BlindVaultFrame::BlindLeaseAccepted(receipt) =
-            decode_blind_vault_frame(&reply.payload)?
-        else {
+        let frame = decode_blind_vault_frame(&reply.payload)?;
+        if let BlindVaultFrame::TerminalFailure(failure) = &frame {
+            if failure.operation() != BlindVaultTerminalOperation::LeaseAdmission {
+                return Err(BlindVaultOnionLeaseAdmissionError::UnexpectedResponseFrame);
+            }
+            return Err(BlindVaultOnionLeaseAdmissionError::TerminalFailure(
+                failure.code(),
+            ));
+        }
+        let BlindVaultFrame::BlindLeaseAccepted(receipt) = frame else {
             return Err(BlindVaultOnionLeaseAdmissionError::UnexpectedResponseFrame);
         };
         let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
@@ -799,6 +980,9 @@ pub enum BlindVaultOnionLeaseAdmissionError {
     /// The reply carrier failed key, route, request, identity, or signature checks.
     #[error("blind vault onion lease admission reply rejected")]
     OnionReply(#[from] OnionReplyError),
+    /// The authenticated terminal returned a coarse encrypted failure.
+    #[error("blind vault onion lease admission terminal failure: {0}")]
+    TerminalFailure(BlindVaultTerminalFailureCode),
     /// The decrypted workload response was not an admission receipt.
     #[error("unexpected blind vault onion lease admission response frame")]
     UnexpectedResponseFrame,
@@ -1355,8 +1539,14 @@ impl BlindVaultOnionPullSession {
         encoded_response: &[u8],
     ) -> Result<BlindVaultPullResponse, BlindVaultOnionPullError> {
         let reply = self.reply_session.open(encoded_response)?;
-        let BlindVaultFrame::PullResponse(response) = decode_blind_vault_frame(&reply.payload)?
-        else {
+        let frame = decode_blind_vault_frame(&reply.payload)?;
+        if let BlindVaultFrame::TerminalFailure(failure) = &frame {
+            if failure.operation() != BlindVaultTerminalOperation::Pull {
+                return Err(BlindVaultOnionPullError::UnexpectedResponseFrame);
+            }
+            return Err(BlindVaultOnionPullError::TerminalFailure(failure.code()));
+        }
+        let BlindVaultFrame::PullResponse(response) = frame else {
             return Err(BlindVaultOnionPullError::UnexpectedResponseFrame);
         };
         let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
@@ -1378,6 +1568,9 @@ pub enum BlindVaultOnionPullError {
     /// The reply carrier failed key, route, identity, size, or signature checks.
     #[error("blind vault onion reply rejected")]
     OnionReply(#[from] OnionReplyError),
+    /// The authenticated terminal returned a coarse encrypted failure.
+    #[error("blind vault onion pull terminal failure: {0}")]
+    TerminalFailure(BlindVaultTerminalFailureCode),
     /// Inline v1 deliberately returns at most one ciphertext object.
     #[error("blind vault onion pull requires limit 1")]
     UnsupportedInlinePullLimit,
@@ -1666,8 +1859,14 @@ impl BlindVaultOnionPutSession {
         encoded_response: &[u8],
     ) -> Result<BlindVaultStoredReceipt, BlindVaultOnionPutError> {
         let reply = self.reply_session.open(encoded_response)?;
-        let BlindVaultFrame::StoredReceipt(receipt) = decode_blind_vault_frame(&reply.payload)?
-        else {
+        let frame = decode_blind_vault_frame(&reply.payload)?;
+        if let BlindVaultFrame::TerminalFailure(failure) = &frame {
+            if failure.operation() != BlindVaultTerminalOperation::Put {
+                return Err(BlindVaultOnionPutError::UnexpectedResponseFrame);
+            }
+            return Err(BlindVaultOnionPutError::TerminalFailure(failure.code()));
+        }
+        let BlindVaultFrame::StoredReceipt(receipt) = frame else {
             return Err(BlindVaultOnionPutError::UnexpectedResponseFrame);
         };
         let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
@@ -1695,6 +1894,9 @@ pub enum BlindVaultOnionPutError {
     /// The reply carrier failed key, route, request, identity, or signature checks.
     #[error("blind vault onion put reply rejected")]
     OnionReply(#[from] OnionReplyError),
+    /// The authenticated terminal returned a coarse encrypted failure.
+    #[error("blind vault onion put terminal failure: {0}")]
+    TerminalFailure(BlindVaultTerminalFailureCode),
     /// Inline v1 deliberately accepts only the 4 KiB ciphertext class.
     #[error("blind vault onion put requires the 4 KiB ciphertext class")]
     UnsupportedInlineCiphertextSize,
@@ -3508,8 +3710,14 @@ impl BlindVaultOnionDeleteSession {
         encoded_response: &[u8],
     ) -> Result<BlindVaultDeletedReceipt, BlindVaultOnionDeleteError> {
         let reply = self.reply_session.open(encoded_response)?;
-        let BlindVaultFrame::DeletedReceipt(receipt) = decode_blind_vault_frame(&reply.payload)?
-        else {
+        let frame = decode_blind_vault_frame(&reply.payload)?;
+        if let BlindVaultFrame::TerminalFailure(failure) = &frame {
+            if failure.operation() != BlindVaultTerminalOperation::Delete {
+                return Err(BlindVaultOnionDeleteError::UnexpectedResponseFrame);
+            }
+            return Err(BlindVaultOnionDeleteError::TerminalFailure(failure.code()));
+        }
+        let BlindVaultFrame::DeletedReceipt(receipt) = frame else {
             return Err(BlindVaultOnionDeleteError::UnexpectedResponseFrame);
         };
         let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
@@ -3536,6 +3744,9 @@ pub enum BlindVaultOnionDeleteError {
     /// The reply carrier failed key, route, request, identity, or signature checks.
     #[error("blind vault onion delete reply rejected")]
     OnionReply(#[from] OnionReplyError),
+    /// The authenticated terminal returned a coarse encrypted failure.
+    #[error("blind vault onion delete terminal failure: {0}")]
+    TerminalFailure(BlindVaultTerminalFailureCode),
     /// The decrypted workload response was not a deletion receipt.
     #[error("unexpected blind vault onion delete response frame")]
     UnexpectedResponseFrame,
@@ -3601,9 +3812,16 @@ impl BlindVaultOnionLeaseRetireSession {
         encoded_response: &[u8],
     ) -> Result<BlindVaultLeaseRetiredReceipt, BlindVaultOnionLeaseRetireError> {
         let reply = self.reply_session.open(encoded_response)?;
-        let BlindVaultFrame::LeaseRetiredReceipt(receipt) =
-            decode_blind_vault_frame(&reply.payload)?
-        else {
+        let frame = decode_blind_vault_frame(&reply.payload)?;
+        if let BlindVaultFrame::TerminalFailure(failure) = &frame {
+            if failure.operation() != BlindVaultTerminalOperation::LeaseRetire {
+                return Err(BlindVaultOnionLeaseRetireError::UnexpectedResponseFrame);
+            }
+            return Err(BlindVaultOnionLeaseRetireError::TerminalFailure(
+                failure.code(),
+            ));
+        }
+        let BlindVaultFrame::LeaseRetiredReceipt(receipt) = frame else {
             return Err(BlindVaultOnionLeaseRetireError::UnexpectedResponseFrame);
         };
         let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
@@ -3629,6 +3847,9 @@ pub enum BlindVaultOnionLeaseRetireError {
     /// The reply carrier failed key, route, request, identity, or signature checks.
     #[error("blind vault onion lease retirement reply rejected")]
     OnionReply(#[from] OnionReplyError),
+    /// The authenticated terminal returned a coarse encrypted failure.
+    #[error("blind vault onion lease retirement terminal failure: {0}")]
+    TerminalFailure(BlindVaultTerminalFailureCode),
     /// The decrypted workload response was not a retirement receipt.
     #[error("unexpected blind vault onion lease retirement response frame")]
     UnexpectedResponseFrame,
@@ -3707,8 +3928,16 @@ impl BlindVaultOnionLeaseRenewalSession {
         encoded_response: &[u8],
     ) -> Result<BlindVaultBlindLeaseRenewedReceipt, BlindVaultOnionLeaseRenewalError> {
         let reply = self.reply_session.open(encoded_response)?;
-        let BlindVaultFrame::BlindLeaseRenewed(receipt) = decode_blind_vault_frame(&reply.payload)?
-        else {
+        let frame = decode_blind_vault_frame(&reply.payload)?;
+        if let BlindVaultFrame::TerminalFailure(failure) = &frame {
+            if failure.operation() != BlindVaultTerminalOperation::LeaseRenewal {
+                return Err(BlindVaultOnionLeaseRenewalError::UnexpectedResponseFrame);
+            }
+            return Err(BlindVaultOnionLeaseRenewalError::TerminalFailure(
+                failure.code(),
+            ));
+        }
+        let BlindVaultFrame::BlindLeaseRenewed(receipt) = frame else {
             return Err(BlindVaultOnionLeaseRenewalError::UnexpectedResponseFrame);
         };
         let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
@@ -3737,6 +3966,9 @@ pub enum BlindVaultOnionLeaseRenewalError {
     /// The reply carrier failed key, route, request, identity, or signature checks.
     #[error("blind vault onion lease renewal reply rejected")]
     OnionReply(#[from] OnionReplyError),
+    /// The authenticated terminal returned a coarse encrypted failure.
+    #[error("blind vault onion lease renewal terminal failure: {0}")]
+    TerminalFailure(BlindVaultTerminalFailureCode),
     /// The decrypted workload response was not a renewal receipt.
     #[error("unexpected blind vault onion lease renewal response frame")]
     UnexpectedResponseFrame,
@@ -3802,9 +4034,16 @@ impl BlindVaultOnionLeaseStatusSession {
         encoded_response: &[u8],
     ) -> Result<BlindVaultLeaseStatusReceipt, BlindVaultOnionLeaseStatusError> {
         let reply = self.reply_session.open(encoded_response)?;
-        let BlindVaultFrame::LeaseStatusReceipt(receipt) =
-            decode_blind_vault_frame(&reply.payload)?
-        else {
+        let frame = decode_blind_vault_frame(&reply.payload)?;
+        if let BlindVaultFrame::TerminalFailure(failure) = &frame {
+            if failure.operation() != BlindVaultTerminalOperation::LeaseStatus {
+                return Err(BlindVaultOnionLeaseStatusError::UnexpectedResponseFrame);
+            }
+            return Err(BlindVaultOnionLeaseStatusError::TerminalFailure(
+                failure.code(),
+            ));
+        }
+        let BlindVaultFrame::LeaseStatusReceipt(receipt) = frame else {
             return Err(BlindVaultOnionLeaseStatusError::UnexpectedResponseFrame);
         };
         let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
@@ -3830,6 +4069,9 @@ pub enum BlindVaultOnionLeaseStatusError {
     /// The reply carrier failed key, route, request, identity, or signature checks.
     #[error("blind vault onion lease status reply rejected")]
     OnionReply(#[from] OnionReplyError),
+    /// The authenticated terminal returned a coarse encrypted failure.
+    #[error("blind vault onion lease status terminal failure: {0}")]
+    TerminalFailure(BlindVaultTerminalFailureCode),
     /// The decrypted workload response was not a status receipt.
     #[error("unexpected blind vault onion lease status response frame")]
     UnexpectedResponseFrame,
@@ -3896,9 +4138,16 @@ impl BlindVaultOnionLeaseInventorySession {
         encoded_response: &[u8],
     ) -> Result<BlindVaultLeaseInventoryReceipt, BlindVaultOnionLeaseInventoryError> {
         let reply = self.reply_session.open(encoded_response)?;
-        let BlindVaultFrame::LeaseInventoryReceipt(receipt) =
-            decode_blind_vault_frame(&reply.payload)?
-        else {
+        let frame = decode_blind_vault_frame(&reply.payload)?;
+        if let BlindVaultFrame::TerminalFailure(failure) = &frame {
+            if failure.operation() != BlindVaultTerminalOperation::LeaseInventory {
+                return Err(BlindVaultOnionLeaseInventoryError::UnexpectedResponseFrame);
+            }
+            return Err(BlindVaultOnionLeaseInventoryError::TerminalFailure(
+                failure.code(),
+            ));
+        }
+        let BlindVaultFrame::LeaseInventoryReceipt(receipt) = frame else {
             return Err(BlindVaultOnionLeaseInventoryError::UnexpectedResponseFrame);
         };
         let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
@@ -3924,6 +4173,9 @@ pub enum BlindVaultOnionLeaseInventoryError {
     /// The reply carrier failed key, route, request, identity, or signature checks.
     #[error("blind vault onion lease inventory reply rejected")]
     OnionReply(#[from] OnionReplyError),
+    /// The authenticated terminal returned a coarse encrypted failure.
+    #[error("blind vault onion lease inventory terminal failure: {0}")]
+    TerminalFailure(BlindVaultTerminalFailureCode),
     /// The decrypted workload response was not an inventory receipt.
     #[error("unexpected blind vault onion lease inventory response frame")]
     UnexpectedResponseFrame,
@@ -4013,6 +4265,10 @@ pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, Blin
         ),
         BlindVaultFrame::LeaseInventoryReceipt(value) => (
             FRAME_KIND_LEASE_INVENTORY_RECEIPT,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
+        BlindVaultFrame::TerminalFailure(value) => (
+            FRAME_KIND_TERMINAL_FAILURE,
             serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
         ),
     };
@@ -4120,6 +4376,10 @@ pub fn decode_blind_vault_frame(bytes: &[u8]) -> Result<BlindVaultFrame, BlindVa
         FRAME_KIND_LEASE_INVENTORY_RECEIPT => Ok(BlindVaultFrame::LeaseInventoryReceipt(
             deserialize_body(body, frame_limit)?,
         )),
+        FRAME_KIND_TERMINAL_FAILURE => Ok(BlindVaultFrame::TerminalFailure(deserialize_body(
+            body,
+            frame_limit,
+        )?)),
         kind => Err(BlindVaultError::UnknownFrameKind(kind)),
     }
 }
@@ -4321,7 +4581,8 @@ fn frame_limit_for_kind(kind: u8) -> Result<u64, BlindVaultError> {
         | FRAME_KIND_LEASE_STATUS
         | FRAME_KIND_LEASE_STATUS_RECEIPT
         | FRAME_KIND_LEASE_INVENTORY
-        | FRAME_KIND_LEASE_INVENTORY_RECEIPT => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
+        | FRAME_KIND_LEASE_INVENTORY_RECEIPT
+        | FRAME_KIND_TERMINAL_FAILURE => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
         FRAME_KIND_PULL_RESPONSE => Ok(MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES),
         unknown => Err(BlindVaultError::UnknownFrameKind(unknown)),
     }
