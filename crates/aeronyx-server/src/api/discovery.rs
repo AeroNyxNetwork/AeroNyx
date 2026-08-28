@@ -647,6 +647,15 @@ impl OnionTerminalRequirement {
                         NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
                     ]
                 }
+                Some(OnionRoutePurpose::BlindVaultPutReceipt) => {
+                    // [ONION-BLIND-VAULT-PUT-RECEIPT 2026-08-28 by Codex]
+                    // Keep receipt-capable writes distinct from the compatible
+                    // one-way Put path during rolling fleet upgrades.
+                    &[
+                        NodeProtocolFeature::OnionReplyV1,
+                        NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
+                    ]
+                }
                 _ => &[],
             },
         }

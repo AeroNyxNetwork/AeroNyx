@@ -10,9 +10,9 @@
 //! ## Main Functionality
 //! - Accepts one decoded onion reply carrier at a terminal node.
 //! - Restricts inline v1 recovery to one 4 KiB-class Blind Vault object page.
-//! - Executes capability-authenticated recovery or signed administration-key
-//!   deletion, plus blind-issued lease admission, without exposing any request
-//!   to middle relays.
+//! - Executes immutable writes, capability-authenticated recovery, signed
+//!   administration-key deletion, or blind-issued lease admission without
+//!   exposing any request to middle relays.
 //! - Signs the recovery page, seals it to the source reply key, and returns
 //!   only fixed-size opaque base64 bytes to the relay orchestrator.
 //! - Maps internal failures to coarse retry classes without retaining secrets.
@@ -36,7 +36,9 @@
 //! - Keep node fan-out out of this module; clients choose unrelated replicas
 //!   and routes so one node cannot reconstruct a logical replica set.
 //!
-//! Last Modified: v1.2.0-BlindVaultInlineAdmission - Added RFC 9474 blind-issued
+//! Last Modified: v1.3.0-BlindVaultInlinePutReceipt - Added anonymous writes
+//! with encrypted terminal-signed storage receipts and capacity classification.
+//! v1.2.0-BlindVaultInlineAdmission - Added RFC 9474 blind-issued
 //! lease admission with a terminal-signed, request-bound encrypted receipt.
 //! v1.1.0-BlindVaultInlineDelete - Added anonymous deletion and
 //! terminal-signed receipt replies through the same fixed-size carrier.
@@ -48,13 +50,13 @@ use aeronyx_core::protocol::{
     decode_blind_vault_frame, decode_onion_reply_request, encode_blind_vault_frame,
     encode_onion_sealed_response, seal_onion_reply, BlindVaultBlindLeaseAcceptedReceipt,
     BlindVaultFrame, BlindVaultPullResponse, BlindVaultRecoveredObject, OnionRoutePurpose,
-    ONION_REPLY_RESPONSE_SIZE_CLASSES,
+    BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, ONION_REPLY_RESPONSE_SIZE_CLASSES,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::services::{
     BlindVaultAdmissionFailureClass, BlindVaultDeleteFailureClass, BlindVaultPullFailureClass,
-    BlindVaultService, BlindVaultServiceError,
+    BlindVaultPutFailureClass, BlindVaultService, BlindVaultServiceError,
 };
 
 /// Coarse terminal-reply failure class consumed by blind-relay orchestration.
@@ -64,6 +66,8 @@ pub(super) enum TerminalReplyFailure {
     Rejected,
     /// The selected inline response class cannot carry the recovered page.
     ResponseTooLarge,
+    /// The selected replica cannot accept more ciphertext under this lease.
+    Capacity,
     /// Replica storage or response sealing is temporarily unavailable.
     Unavailable,
 }
@@ -94,6 +98,17 @@ pub(super) fn execute_blind_vault_inline_reply(
     let (purpose, encoded_response) = match decode_blind_vault_frame(&reply_request.payload)
         .map_err(|_| TerminalReplyFailure::Rejected)?
     {
+        BlindVaultFrame::Put(put_request) => {
+            if put_request.ciphertext.len() != BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[0] {
+                return Err(TerminalReplyFailure::Rejected);
+            }
+            let receipt = vault
+                .put(&put_request, now_ms)
+                .map_err(classify_put_failure)?;
+            let encoded = encode_blind_vault_frame(&BlindVaultFrame::StoredReceipt(receipt))
+                .map_err(|_| TerminalReplyFailure::Unavailable)?;
+            (OnionRoutePurpose::BlindVaultPutReceipt, encoded)
+        }
         BlindVaultFrame::PullRequest(pull_request) => (
             OnionRoutePurpose::BlindVaultPull,
             execute_pull_response(vault, terminal_identity, pull_request, now_ms)?,
@@ -200,6 +215,17 @@ fn classify_pull_failure(error: BlindVaultServiceError) -> TerminalReplyFailure 
     match error.pull_failure_class() {
         BlindVaultPullFailureClass::Rejected => TerminalReplyFailure::Rejected,
         BlindVaultPullFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
+    }
+}
+
+fn classify_put_failure(error: BlindVaultServiceError) -> TerminalReplyFailure {
+    // [BLIND-VAULT-PUT-RECEIPT-FAILURE-CLASS 2026-08-28 by Codex] Preserve
+    // capacity as an actionable route-selection signal while hiding every
+    // lease, signature, object, and database detail from upstream relays.
+    match error.put_failure_class() {
+        BlindVaultPutFailureClass::Rejected => TerminalReplyFailure::Rejected,
+        BlindVaultPutFailureClass::Capacity => TerminalReplyFailure::Capacity,
+        BlindVaultPutFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
     }
 }
 

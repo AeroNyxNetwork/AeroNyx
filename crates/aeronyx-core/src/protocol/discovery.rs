@@ -165,6 +165,10 @@
 //!   targets because the selected target identity is part of the signature.
 //!
 //! ## Last Modified
+//! v0.30.0-OnionBlindVaultPutReceipt - Added signed negotiation for anonymous
+//! ciphertext writes returning request-bound storage receipts
+//! v0.29.0-OnionBlindLeaseAdmission - Added signed negotiation for RFC 9474
+//! blind-issued lease admission through the final onion layer
 //! v0.28.0-OnionReplyNegotiation - Added signed rolling-upgrade negotiation
 //! for fixed-size encrypted onion terminal responses
 //! v0.27.0-DirectRelayTargetBindingV3 - Added signed negotiation for direct
@@ -437,11 +441,18 @@ pub enum NodeProtocolFeature {
     /// from `OnionReplyV1`: supporting the generic carrier never implies that a
     /// rolling-upgrade peer executes this sensitive workload.
     OnionBlindLeaseAdmissionV1,
+    /// The node accepts an immutable Blind Vault Put inside the final onion
+    /// layer and returns a request-bound signed storage receipt.
+    ///
+    /// [ONION-BLIND-VAULT-PUT-RECEIPT 2026-08-28 by Codex] Legacy one-way Put
+    /// remains available under its existing purpose; clients request this
+    /// feature only when they require cryptographic custody evidence.
+    OnionBlindVaultPutReceiptV1,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::BlindRelayFailureReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
         Self::DirectPeerRelayAuthV2,
@@ -449,6 +460,7 @@ impl NodeProtocolFeature {
         Self::DirectPeerRelayTargetBindingV3,
         Self::OnionReplyV1,
         Self::OnionBlindLeaseAdmissionV1,
+        Self::OnionBlindVaultPutReceiptV1,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -462,6 +474,7 @@ impl NodeProtocolFeature {
             Self::DirectPeerRelayTargetBindingV3 => "anpf1-dprtb3",
             Self::OnionReplyV1 => "anpf1-or1",
             Self::OnionBlindLeaseAdmissionV1 => "anpf1-obla1",
+            Self::OnionBlindVaultPutReceiptV1 => "anpf1-obpr1",
         }
     }
 }
@@ -4027,6 +4040,7 @@ mod tests {
         let direct_relay_target_binding = NodeProtocolFeature::DirectPeerRelayTargetBindingV3;
         let onion_reply = NodeProtocolFeature::OnionReplyV1;
         let onion_blind_admission = NodeProtocolFeature::OnionBlindLeaseAdmissionV1;
+        let onion_put_receipt = NodeProtocolFeature::OnionBlindVaultPutReceiptV1;
         let descriptor = descriptor_for(&identity).with_protocol_features([
             purpose_receipt,
             failure_receipt,
@@ -4035,13 +4049,14 @@ mod tests {
             direct_relay_target_binding,
             onion_reply,
             onion_blind_admission,
+            onion_put_receipt,
             purpose_receipt,
         ]);
 
         assert_eq!(descriptor.schema_version, NODE_DESCRIPTOR_SCHEMA_VERSION);
         assert_eq!(
             descriptor.software_version,
-            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-dprtb3.anpf1-obla1.anpf1-or1.anpf1-pbdr2"
+            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-dprtb3.anpf1-obla1.anpf1-obpr1.anpf1-or1.anpf1-pbdr2"
         );
         assert!(descriptor.advertises_protocol_feature(failure_receipt));
         assert!(descriptor.advertises_protocol_feature(purpose_receipt));
@@ -4050,6 +4065,7 @@ mod tests {
         assert!(descriptor.advertises_protocol_feature(direct_relay_target_binding));
         assert!(descriptor.advertises_protocol_feature(onion_reply));
         assert!(descriptor.advertises_protocol_feature(onion_blind_admission));
+        assert!(descriptor.advertises_protocol_feature(onion_put_receipt));
 
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
         let encoded = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {

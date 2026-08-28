@@ -61,7 +61,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.9.0-BlindVaultOnionAdmission - Added single-use anonymous
+//! Last Modified: v1.10.0-BlindVaultOnionPutReceipt - Added bounded anonymous
+//! 4 KiB writes with encrypted terminal-signed storage receipts.
+//! v1.9.0-BlindVaultOnionAdmission - Added single-use anonymous
 //! blind-issued lease admission with encrypted terminal-signed receipts.
 //! v1.8.0-BlindVaultOnionDelete - Added request-bound anonymous
 //! deletion sessions with terminal-signed receipt verification.
@@ -1532,6 +1534,112 @@ impl BlindVaultStoredReceipt {
             && self.ciphertext_commitment == put.ciphertext_commitment
             && self.stored_until_ms <= put.expires_at_ms
     }
+}
+
+/// Source-owned state for one anonymous Blind Vault write with a receipt.
+///
+/// [BLIND-VAULT-ONION-PUT-RECEIPT 2026-08-28 by Codex] The ciphertext and
+/// lease write signature are moved into the encrypted final onion payload.
+/// The retained session contains only receipt expectations and a single-use
+/// reply key, so opening one response cannot disclose or replay the object.
+pub struct BlindVaultOnionPutSession {
+    expected_version: u16,
+    expected_lease_id: [u8; 32],
+    expected_object_id: [u8; 32],
+    expected_request_id: [u8; 16],
+    expected_ciphertext_commitment: [u8; 32],
+    expected_expires_at_ms: u64,
+    reply_session: OnionReplySession,
+}
+
+impl BlindVaultOnionPutSession {
+    /// Encodes one signed immutable Put for the final onion layer.
+    pub fn prepare(
+        route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        request: BlindVaultPutRequest,
+        now_ms: u64,
+        maximum_object_ttl_ms: u64,
+    ) -> Result<(Vec<u8>, Self), BlindVaultOnionPutError> {
+        request.validate(now_ms, maximum_object_ttl_ms)?;
+        if request.ciphertext.len() != BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES[0] {
+            return Err(BlindVaultOnionPutError::UnsupportedInlineCiphertextSize);
+        }
+        let expected_version = request.version;
+        let expected_lease_id = request.lease_id;
+        let expected_object_id = request.object_id;
+        let expected_request_id = request.request_id;
+        let expected_ciphertext_commitment = request.ciphertext_commitment;
+        let expected_expires_at_ms = request.expires_at_ms;
+        let encoded_put = encode_blind_vault_frame(&BlindVaultFrame::Put(request))?;
+        let (reply_request, reply_session) = OnionReplySession::prepare(
+            route_id,
+            expected_terminal_node_id,
+            ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
+            encoded_put,
+        )?;
+        let encoded_request = encode_onion_reply_request(&reply_request)?;
+        Ok((
+            encoded_request,
+            Self {
+                expected_version,
+                expected_lease_id,
+                expected_object_id,
+                expected_request_id,
+                expected_ciphertext_commitment,
+                expected_expires_at_ms,
+                reply_session,
+            },
+        ))
+    }
+
+    /// Opens and verifies the exact terminal-signed storage receipt.
+    pub fn open(
+        self,
+        encoded_response: &[u8],
+    ) -> Result<BlindVaultStoredReceipt, BlindVaultOnionPutError> {
+        let reply = self.reply_session.open(encoded_response)?;
+        let BlindVaultFrame::StoredReceipt(receipt) = decode_blind_vault_frame(&reply.payload)?
+        else {
+            return Err(BlindVaultOnionPutError::UnexpectedResponseFrame);
+        };
+        let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
+            .map_err(|_| BlindVaultOnionPutError::InvalidTerminalIdentity)?;
+        receipt.validate_and_verify(&terminal_key)?;
+        if receipt.version != self.expected_version
+            || receipt.lease_id != self.expected_lease_id
+            || receipt.object_id != self.expected_object_id
+            || receipt.request_id != self.expected_request_id
+            || receipt.ciphertext_commitment != self.expected_ciphertext_commitment
+            || receipt.stored_until_ms > self.expected_expires_at_ms
+        {
+            return Err(BlindVaultOnionPutError::RequestMismatch);
+        }
+        Ok(receipt)
+    }
+}
+
+/// Fail-closed source errors for anonymous Blind Vault writes with receipts.
+#[derive(Debug, Error)]
+pub enum BlindVaultOnionPutError {
+    /// The Blind Vault request or signed receipt violated its wire contract.
+    #[error("blind vault onion put frame rejected")]
+    BlindVault(#[from] BlindVaultError),
+    /// The reply carrier failed key, route, request, identity, or signature checks.
+    #[error("blind vault onion put reply rejected")]
+    OnionReply(#[from] OnionReplyError),
+    /// Inline v1 deliberately accepts only the 4 KiB ciphertext class.
+    #[error("blind vault onion put requires the 4 KiB ciphertext class")]
+    UnsupportedInlineCiphertextSize,
+    /// The decrypted workload response was not a storage receipt.
+    #[error("unexpected blind vault onion put response frame")]
+    UnexpectedResponseFrame,
+    /// The verified receipt did not answer the exact immutable Put request.
+    #[error("blind vault onion put request mismatch")]
+    RequestMismatch,
+    /// The verified outer terminal identity could not be reconstructed.
+    #[error("invalid blind vault onion put terminal identity")]
+    InvalidTerminalIdentity,
 }
 
 /// Administration-key request to delete one opaque object.

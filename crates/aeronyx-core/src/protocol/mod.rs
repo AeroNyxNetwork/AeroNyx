@@ -104,7 +104,8 @@ pub use blind_vault::{
     BlindVaultError, BlindVaultFrame, BlindVaultLeaseCreateRequest, BlindVaultOnionDeleteError,
     BlindVaultOnionDeleteSession, BlindVaultOnionLeaseAdmissionError,
     BlindVaultOnionLeaseAdmissionSession, BlindVaultOnionPullError, BlindVaultOnionPullSession,
-    BlindVaultPullRequest, BlindVaultPullResponse, BlindVaultPutRequest, BlindVaultRecoveredObject,
+    BlindVaultOnionPutError, BlindVaultOnionPutSession, BlindVaultPullRequest,
+    BlindVaultPullResponse, BlindVaultPutRequest, BlindVaultRecoveredObject,
     BlindVaultStoredReceipt, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_PROTOCOL_VERSION,
     MAX_BLIND_VAULT_FRAME_BYTES,
 };

@@ -13413,6 +13413,7 @@ impl Server {
             NodeProtocolFeature::DirectPeerRelayTargetBindingV3,
             NodeProtocolFeature::OnionReplyV1,
             NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
+            NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
         ]);
 
         descriptor.public_endpoint = config
@@ -20022,6 +20023,9 @@ mod tests {
         assert!(signed
             .descriptor
             .advertises_protocol_feature(NodeProtocolFeature::OnionBlindLeaseAdmissionV1));
+        assert!(signed
+            .descriptor
+            .advertises_protocol_feature(NodeProtocolFeature::OnionBlindVaultPutReceiptV1));
         assert_eq!(
             signed.descriptor.capacity.max_sessions,
             server.config.max_sessions() as u32
