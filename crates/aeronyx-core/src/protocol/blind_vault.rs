@@ -61,7 +61,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.8.0-BlindVaultOnionDelete - Added request-bound anonymous
+//! Last Modified: v1.9.0-BlindVaultOnionAdmission - Added single-use anonymous
+//! blind-issued lease admission with encrypted terminal-signed receipts.
+//! v1.8.0-BlindVaultOnionDelete - Added request-bound anonymous
 //! deletion sessions with terminal-signed receipt verification.
 //! v1.7.0-BlindVaultOnionPull - Added client-owned anonymous
 //! recovery session preparation and response verification.
@@ -101,6 +103,7 @@ const LEASE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Lease-v1";
 const ADMISSION_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-Admission-v1";
 const BLIND_ADMISSION_MESSAGE_DOMAIN: &[u8] = b"AeroNyx-BlindVault-BlindAdmission-v2";
 const BLIND_ADMISSION_SPEND_DOMAIN: &[u8] = b"AeroNyx-BlindVault-BlindSpend-v2";
+const BLIND_LEASE_ACCEPTED_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-BlindLeaseAccepted-v1";
 const BLIND_ISSUER_DIRECTORY_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-IssuerDirectory-v1";
 const BLIND_ISSUER_UPDATE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-IssuerUpdate-v1";
 const PULL_RESPONSE_SIGNING_DOMAIN: &[u8] = b"AeroNyx-BlindVault-PullResponse-v1";
@@ -118,6 +121,7 @@ const FRAME_KIND_PULL_REQUEST: u8 = 7;
 const FRAME_KIND_PULL_RESPONSE: u8 = 8;
 const FRAME_KIND_BLIND_LEASE_ADMISSION: u8 = 9;
 const FRAME_KIND_BLIND_ISSUER_DIRECTORY: u8 = 10;
+const FRAME_KIND_BLIND_LEASE_ACCEPTED: u8 = 11;
 
 /// Returns whether an opaque payload declares the Blind Vault wire format.
 ///
@@ -201,6 +205,8 @@ pub enum BlindVaultFrame {
     BlindLeaseAdmission(BlindVaultBlindLeaseAdmissionRequest),
     /// Node-signed public blind-admission key epochs and coarse policy.
     BlindIssuerDirectory(BlindVaultBlindIssuerDirectory),
+    /// Terminal-signed proof that one blind-issued lease was accepted.
+    BlindLeaseAccepted(BlindVaultBlindLeaseAcceptedReceipt),
 }
 
 /// Anonymous lease metadata signed by its independent administration key.
@@ -529,6 +535,210 @@ pub struct BlindVaultBlindLeaseAdmissionRequest {
     pub admission: BlindVaultBlindAdmissionToken,
     /// Self-authenticating random replica lease requested by the bearer.
     pub lease: BlindVaultLeaseCreateRequest,
+}
+
+/// Terminal-signed proof that one blind-issued lease request was accepted.
+///
+/// [BLIND-VAULT-ONION-ADMISSION 2026-08-28 by Codex] The receipt binds the
+/// opaque credential spend marker and exact self-authenticating lease without
+/// exposing the issuer key, token id, or lease authority to middle relays. It
+/// is returned only inside a fixed-size encrypted onion response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlindVaultBlindLeaseAcceptedReceipt {
+    /// Independent Blind Vault protocol version.
+    pub version: u16,
+    /// Domain-separated hash of the redeemed blind credential.
+    pub admission_spend_id: [u8; 32],
+    /// Replica-local lease accepted by the terminal.
+    pub lease_id: [u8; 32],
+    /// Original idempotency identifier from the signed lease request.
+    pub request_id: [u8; 16],
+    /// Exact bounded lease expiry accepted by the terminal.
+    pub lease_expires_at_ms: u64,
+    /// Acceptance time in Unix milliseconds.
+    pub accepted_at_ms: u64,
+    /// Descriptor identity of the accepting terminal node.
+    pub node_id: [u8; 32],
+    /// Ed25519 signature by `node_id` over the canonical receipt fields.
+    #[serde(with = "serde_bytes64")]
+    pub signature: [u8; 64],
+}
+
+impl BlindVaultBlindLeaseAcceptedReceipt {
+    /// Builds an unsigned receipt for one exact blind admission request.
+    #[must_use]
+    pub fn new(
+        request: &BlindVaultBlindLeaseAdmissionRequest,
+        accepted_at_ms: u64,
+        node_id: [u8; 32],
+    ) -> Self {
+        Self {
+            version: BLIND_VAULT_PROTOCOL_VERSION,
+            admission_spend_id: request.admission.spend_id(),
+            lease_id: request.lease.lease_id,
+            request_id: request.lease.request_id,
+            lease_expires_at_ms: request.lease.expires_at_ms,
+            accepted_at_ms,
+            node_id,
+            signature: [0; 64],
+        }
+    }
+
+    /// Canonical terminal-signing input for the admission receipt.
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(BLIND_LEASE_ACCEPTED_SIGNING_DOMAIN.len() + 130);
+        bytes.extend_from_slice(BLIND_LEASE_ACCEPTED_SIGNING_DOMAIN);
+        bytes.extend_from_slice(&self.version.to_be_bytes());
+        bytes.extend_from_slice(&self.admission_spend_id);
+        bytes.extend_from_slice(&self.lease_id);
+        bytes.extend_from_slice(&self.request_id);
+        bytes.extend_from_slice(&self.lease_expires_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.accepted_at_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.node_id);
+        bytes
+    }
+
+    /// Signs the receipt with the terminal descriptor identity.
+    pub fn sign(&mut self, node_identity: &IdentityKeyPair) -> Result<(), BlindVaultError> {
+        if self.node_id != node_identity.public_key_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        self.signature = node_identity.sign(&self.signing_bytes());
+        Ok(())
+    }
+
+    /// Validates the receipt and verifies the accepting terminal signature.
+    pub fn validate_and_verify(
+        &self,
+        terminal_key: &IdentityPublicKey,
+    ) -> Result<(), BlindVaultError> {
+        require_version(self.version)?;
+        require_non_zero("admission_spend_id", &self.admission_spend_id)?;
+        require_non_zero("lease_id", &self.lease_id)?;
+        require_non_zero("request_id", &self.request_id)?;
+        require_non_zero("node_id", &self.node_id)?;
+        if self.lease_expires_at_ms <= self.accepted_at_ms {
+            return Err(BlindVaultError::InvalidReceiptWindow);
+        }
+        if self.node_id != terminal_key.to_bytes() {
+            return Err(BlindVaultError::NodeIdentityMismatch);
+        }
+        terminal_key
+            .verify(&self.signing_bytes(), &self.signature)
+            .map_err(|_| BlindVaultError::InvalidSignature)
+    }
+
+    /// Confirms that the receipt answers the exact blind admission request.
+    #[must_use]
+    pub fn matches_admission(&self, request: &BlindVaultBlindLeaseAdmissionRequest) -> bool {
+        self.version == request.lease.version
+            && self.admission_spend_id == request.admission.spend_id()
+            && self.lease_id == request.lease.lease_id
+            && self.request_id == request.lease.request_id
+            && self.lease_expires_at_ms == request.lease.expires_at_ms
+    }
+}
+
+/// Source-owned state for one anonymous blind-issued lease admission.
+///
+/// The finalized token and lease authorities exist only in the encrypted final
+/// onion layer. Consuming the session on [`Self::open`] also consumes the
+/// single-use reply private key, preventing a second response from being
+/// accepted for the same route.
+pub struct BlindVaultOnionLeaseAdmissionSession {
+    expected_version: u16,
+    expected_admission_spend_id: [u8; 32],
+    expected_lease_id: [u8; 32],
+    expected_request_id: [u8; 16],
+    expected_lease_expires_at_ms: u64,
+    reply_session: OnionReplySession,
+}
+
+impl BlindVaultOnionLeaseAdmissionSession {
+    /// Encodes one V2 blind-issued admission for the selected terminal.
+    pub fn prepare(
+        route_id: [u8; 16],
+        expected_terminal_node_id: [u8; 32],
+        request: BlindVaultBlindLeaseAdmissionRequest,
+        now_ms: u64,
+        maximum_lease_ttl_ms: u64,
+    ) -> Result<(Vec<u8>, Self), BlindVaultOnionLeaseAdmissionError> {
+        request.admission.validate_shape()?;
+        request
+            .lease
+            .validate_and_verify(now_ms, maximum_lease_ttl_ms)?;
+        let expected_version = request.lease.version;
+        let expected_admission_spend_id = request.admission.spend_id();
+        let expected_lease_id = request.lease.lease_id;
+        let expected_request_id = request.lease.request_id;
+        let expected_lease_expires_at_ms = request.lease.expires_at_ms;
+        let encoded_admission =
+            encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseAdmission(request))?;
+        let (reply_request, reply_session) = OnionReplySession::prepare(
+            route_id,
+            expected_terminal_node_id,
+            ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
+            encoded_admission,
+        )?;
+        let encoded_request = encode_onion_reply_request(&reply_request)?;
+        Ok((
+            encoded_request,
+            Self {
+                expected_version,
+                expected_admission_spend_id,
+                expected_lease_id,
+                expected_request_id,
+                expected_lease_expires_at_ms,
+                reply_session,
+            },
+        ))
+    }
+
+    /// Opens and verifies the exact terminal-signed admission receipt.
+    pub fn open(
+        self,
+        encoded_response: &[u8],
+    ) -> Result<BlindVaultBlindLeaseAcceptedReceipt, BlindVaultOnionLeaseAdmissionError> {
+        let reply = self.reply_session.open(encoded_response)?;
+        let BlindVaultFrame::BlindLeaseAccepted(receipt) =
+            decode_blind_vault_frame(&reply.payload)?
+        else {
+            return Err(BlindVaultOnionLeaseAdmissionError::UnexpectedResponseFrame);
+        };
+        let terminal_key = IdentityPublicKey::from_bytes(&reply.terminal_node_id)
+            .map_err(|_| BlindVaultOnionLeaseAdmissionError::InvalidTerminalIdentity)?;
+        receipt.validate_and_verify(&terminal_key)?;
+        if receipt.version != self.expected_version
+            || receipt.admission_spend_id != self.expected_admission_spend_id
+            || receipt.lease_id != self.expected_lease_id
+            || receipt.request_id != self.expected_request_id
+            || receipt.lease_expires_at_ms != self.expected_lease_expires_at_ms
+        {
+            return Err(BlindVaultOnionLeaseAdmissionError::RequestMismatch);
+        }
+        Ok(receipt)
+    }
+}
+
+/// Fail-closed source errors for anonymous blind-issued lease admission.
+#[derive(Debug, Error)]
+pub enum BlindVaultOnionLeaseAdmissionError {
+    /// The Blind Vault request or signed receipt violated its wire contract.
+    #[error("blind vault onion lease admission frame rejected")]
+    BlindVault(#[from] BlindVaultError),
+    /// The reply carrier failed key, route, request, identity, or signature checks.
+    #[error("blind vault onion lease admission reply rejected")]
+    OnionReply(#[from] OnionReplyError),
+    /// The decrypted workload response was not an admission receipt.
+    #[error("unexpected blind vault onion lease admission response frame")]
+    UnexpectedResponseFrame,
+    /// The verified receipt did not answer the exact admission request.
+    #[error("blind vault onion lease admission request mismatch")]
+    RequestMismatch,
+    /// The verified outer terminal identity could not be reconstructed.
+    #[error("invalid blind vault onion lease admission terminal identity")]
+    InvalidTerminalIdentity,
 }
 
 /// One public RFC 9474 issuer key and its node-enforced coarse policy.
@@ -1652,6 +1862,10 @@ pub fn encode_blind_vault_frame(frame: &BlindVaultFrame) -> Result<Vec<u8>, Blin
             FRAME_KIND_BLIND_ISSUER_DIRECTORY,
             serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
         ),
+        BlindVaultFrame::BlindLeaseAccepted(value) => (
+            FRAME_KIND_BLIND_LEASE_ACCEPTED,
+            serialize_body(value, MAX_BLIND_VAULT_MUTATION_FRAME_BYTES)?,
+        ),
     };
 
     let total = FRAME_HEADER_BYTES
@@ -1723,6 +1937,9 @@ pub fn decode_blind_vault_frame(bytes: &[u8]) -> Result<BlindVaultFrame, BlindVa
             deserialize_body(body, frame_limit)?,
         )),
         FRAME_KIND_BLIND_ISSUER_DIRECTORY => Ok(BlindVaultFrame::BlindIssuerDirectory(
+            deserialize_body(body, frame_limit)?,
+        )),
+        FRAME_KIND_BLIND_LEASE_ACCEPTED => Ok(BlindVaultFrame::BlindLeaseAccepted(
             deserialize_body(body, frame_limit)?,
         )),
         kind => Err(BlindVaultError::UnknownFrameKind(kind)),
@@ -1896,7 +2113,8 @@ fn frame_limit_for_kind(kind: u8) -> Result<u64, BlindVaultError> {
         | FRAME_KIND_LEASE_ADMISSION
         | FRAME_KIND_PULL_REQUEST
         | FRAME_KIND_BLIND_LEASE_ADMISSION
-        | FRAME_KIND_BLIND_ISSUER_DIRECTORY => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
+        | FRAME_KIND_BLIND_ISSUER_DIRECTORY
+        | FRAME_KIND_BLIND_LEASE_ACCEPTED => Ok(MAX_BLIND_VAULT_MUTATION_FRAME_BYTES),
         FRAME_KIND_PULL_RESPONSE => Ok(MAX_BLIND_VAULT_PULL_RESPONSE_FRAME_BYTES),
         unknown => Err(BlindVaultError::UnknownFrameKind(unknown)),
     }

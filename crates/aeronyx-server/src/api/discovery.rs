@@ -615,36 +615,55 @@ fn onion_terminal_required_capabilities(purpose: Option<OnionRoutePurpose>) -> V
 /// the node role while signed protocol features describe the exact response
 /// contract. Keeping both in one value prevents candidate filtering, bounded
 /// pool preservation, and route-readiness checks from drifting apart.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct OnionTerminalRequirement {
     capability: Option<NodeCapability>,
-    protocol_feature: Option<NodeProtocolFeature>,
+    protocol_features: &'static [NodeProtocolFeature],
+}
+
+impl Default for OnionTerminalRequirement {
+    fn default() -> Self {
+        Self {
+            capability: None,
+            protocol_features: &[],
+        }
+    }
 }
 
 impl OnionTerminalRequirement {
     fn for_purpose(purpose: Option<OnionRoutePurpose>) -> Self {
         Self {
             capability: purpose.and_then(OnionRoutePurpose::specialized_terminal_capability),
-            protocol_feature: match purpose {
+            protocol_features: match purpose {
                 Some(OnionRoutePurpose::BlindVaultPull | OnionRoutePurpose::BlindVaultDelete) => {
-                    Some(NodeProtocolFeature::OnionReplyV1)
+                    &[NodeProtocolFeature::OnionReplyV1]
                 }
-                _ => None,
+                Some(OnionRoutePurpose::BlindVaultLeaseAdmission) => {
+                    // [ONION-BLIND-LEASE-ADMISSION 2026-08-28 by Codex] Both
+                    // signed tokens are required: the generic reply carrier
+                    // and explicit execution of this sensitive workload.
+                    &[
+                        NodeProtocolFeature::OnionReplyV1,
+                        NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
+                    ]
+                }
+                _ => &[],
             },
         }
     }
 
-    const fn is_specialized(self) -> bool {
-        self.capability.is_some() || self.protocol_feature.is_some()
+    fn is_specialized(self) -> bool {
+        self.capability.is_some() || !self.protocol_features.is_empty()
     }
 
     fn matches(self, candidate: &OnionRelayCandidate) -> bool {
         let descriptor = &candidate.signed_descriptor.descriptor;
         self.capability
             .map_or(true, |required| descriptor.capabilities.contains(&required))
-            && self.protocol_feature.map_or(true, |required| {
-                descriptor.advertises_protocol_feature(required)
-            })
+            && self
+                .protocol_features
+                .iter()
+                .all(|required| descriptor.advertises_protocol_feature(*required))
     }
 }
 
@@ -4685,7 +4704,7 @@ mod tests {
             false,
             OnionTerminalRequirement {
                 capability: Some(NodeCapability::BlindVaultReplica),
-                protocol_feature: None,
+                protocol_features: &[],
             },
         );
 

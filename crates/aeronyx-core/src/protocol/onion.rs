@@ -114,11 +114,12 @@ pub const KEM_ALG_XWING: u8 = 2;
 /// The order is stable for deterministic capability responses. Compatibility
 /// aliases accepted by [`OnionRoutePurpose::from_wire_value`] are deliberately
 /// absent so new integrations emit only canonical values.
-pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 4] = [
+pub const ONION_ROUTE_PURPOSE_VALUES: [&str; 5] = [
     "message_relay",
     "blind_vault_put",
     "blind_vault_pull",
     "blind_vault_delete",
+    "blind_vault_lease_admission",
 ];
 
 /// Fixed layer header length: magic(2) + eph_pub(32) + nonce(24).
@@ -149,6 +150,8 @@ pub enum OnionRoutePurpose {
     BlindVaultPull,
     /// Anonymous capability-authorized deletion at a Blind Vault terminal.
     BlindVaultDelete,
+    /// Anonymous blind-issued lease admission at a Blind Vault terminal.
+    BlindVaultLeaseAdmission,
 }
 
 impl OnionRoutePurpose {
@@ -165,6 +168,9 @@ impl OnionRoutePurpose {
             }
             "blind_vault_pull" | "blind-vault-pull" => Some(Self::BlindVaultPull),
             "blind_vault_delete" | "blind-vault-delete" => Some(Self::BlindVaultDelete),
+            "blind_vault_lease_admission" | "blind-vault-lease-admission" => {
+                Some(Self::BlindVaultLeaseAdmission)
+            }
             _ => None,
         }
     }
@@ -177,6 +183,7 @@ impl OnionRoutePurpose {
             Self::BlindVaultPut => ONION_ROUTE_PURPOSE_VALUES[1],
             Self::BlindVaultPull => ONION_ROUTE_PURPOSE_VALUES[2],
             Self::BlindVaultDelete => ONION_ROUTE_PURPOSE_VALUES[3],
+            Self::BlindVaultLeaseAdmission => ONION_ROUTE_PURPOSE_VALUES[4],
         }
     }
 
@@ -189,9 +196,10 @@ impl OnionRoutePurpose {
     pub const fn specialized_terminal_capability(self) -> Option<NodeCapability> {
         match self {
             Self::MessageRelay => None,
-            Self::BlindVaultPut | Self::BlindVaultPull | Self::BlindVaultDelete => {
-                Some(NodeCapability::BlindVaultReplica)
-            }
+            Self::BlindVaultPut
+            | Self::BlindVaultPull
+            | Self::BlindVaultDelete
+            | Self::BlindVaultLeaseAdmission => Some(NodeCapability::BlindVaultReplica),
         }
     }
 }
@@ -509,6 +517,10 @@ mod tests {
             OnionRoutePurpose::BlindVaultPull.as_str(),
             "blind_vault_pull"
         );
+        assert_eq!(
+            OnionRoutePurpose::from_wire_value("blind-vault-lease-admission"),
+            Some(OnionRoutePurpose::BlindVaultLeaseAdmission)
+        );
     }
 
     #[test]
@@ -532,12 +544,17 @@ mod tests {
             Some(NodeCapability::BlindVaultReplica)
         );
         assert_eq!(
+            OnionRoutePurpose::BlindVaultLeaseAdmission.specialized_terminal_capability(),
+            Some(NodeCapability::BlindVaultReplica)
+        );
+        assert_eq!(
             ONION_ROUTE_PURPOSE_VALUES,
             [
                 "message_relay",
                 "blind_vault_put",
                 "blind_vault_pull",
-                "blind_vault_delete"
+                "blind_vault_delete",
+                "blind_vault_lease_admission"
             ]
         );
     }

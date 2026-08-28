@@ -99,10 +99,12 @@ pub use auth::{
 };
 pub use blind_vault::{
     decode_blind_vault_frame, encode_blind_vault_frame, is_blind_vault_frame,
-    BlindVaultDeleteRequest, BlindVaultDeletedReceipt, BlindVaultError, BlindVaultFrame,
-    BlindVaultLeaseCreateRequest, BlindVaultOnionDeleteError, BlindVaultOnionDeleteSession,
-    BlindVaultOnionPullError, BlindVaultOnionPullSession, BlindVaultPullRequest,
-    BlindVaultPullResponse, BlindVaultPutRequest, BlindVaultRecoveredObject,
+    BlindVaultBlindAdmissionToken, BlindVaultBlindLeaseAcceptedReceipt,
+    BlindVaultBlindLeaseAdmissionRequest, BlindVaultDeleteRequest, BlindVaultDeletedReceipt,
+    BlindVaultError, BlindVaultFrame, BlindVaultLeaseCreateRequest, BlindVaultOnionDeleteError,
+    BlindVaultOnionDeleteSession, BlindVaultOnionLeaseAdmissionError,
+    BlindVaultOnionLeaseAdmissionSession, BlindVaultOnionPullError, BlindVaultOnionPullSession,
+    BlindVaultPullRequest, BlindVaultPullResponse, BlindVaultPutRequest, BlindVaultRecoveredObject,
     BlindVaultStoredReceipt, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_PROTOCOL_VERSION,
     MAX_BLIND_VAULT_FRAME_BYTES,
 };

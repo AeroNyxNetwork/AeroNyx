@@ -283,10 +283,10 @@ pub mod wallet_routes;
 // [BLIND-VAULT-RETRY-CLASS 2026-08-10 by Codex] Relay/API boundaries consume
 // the service-owned coarse class instead of matching storage internals twice.
 pub use blind_vault::{
-    BlindVaultCleanupReport, BlindVaultDeleteFailureClass, BlindVaultIssuerInstallOutcome,
-    BlindVaultIssuerRuntimeStatus, BlindVaultLeaseProvisionOutcome, BlindVaultPullFailureClass,
-    BlindVaultPullPage, BlindVaultPutFailureClass, BlindVaultService, BlindVaultServiceError,
-    BlindVaultStatus, BlindVaultStoredObject, SharedBlindVaultService,
+    BlindVaultAdmissionFailureClass, BlindVaultCleanupReport, BlindVaultDeleteFailureClass,
+    BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus, BlindVaultLeaseProvisionOutcome,
+    BlindVaultPullFailureClass, BlindVaultPullPage, BlindVaultPutFailureClass, BlindVaultService,
+    BlindVaultServiceError, BlindVaultStatus, BlindVaultStoredObject, SharedBlindVaultService,
 };
 // [CHAT-RELAY-AUDIT-VERIFY 2026-08-16 by Codex] Expose only aggregate,
 // host-local maintenance contracts and authenticated path-free plans; artifact

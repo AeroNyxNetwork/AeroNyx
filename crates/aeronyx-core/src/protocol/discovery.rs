@@ -430,17 +430,25 @@ pub enum NodeProtocolFeature {
     /// additive response surface during rolling upgrades; it does not reveal
     /// whether any route carries a request/response workload.
     OnionReplyV1,
+    /// The node accepts RFC 9474 blind-issued lease admission inside the final
+    /// onion layer and returns a request-bound terminal-signed receipt.
+    ///
+    /// [ONION-BLIND-LEASE-ADMISSION 2026-08-28 by Codex] This remains separate
+    /// from `OnionReplyV1`: supporting the generic carrier never implies that a
+    /// rolling-upgrade peer executes this sensitive workload.
+    OnionBlindLeaseAdmissionV1,
 }
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::BlindRelayFailureReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
         Self::DirectPeerRelayAuthV2,
         Self::DirectPeerRelayReceiptV2,
         Self::DirectPeerRelayTargetBindingV3,
         Self::OnionReplyV1,
+        Self::OnionBlindLeaseAdmissionV1,
     ];
 
     /// Exact SemVer build-metadata identifier used on the signed wire.
@@ -453,6 +461,7 @@ impl NodeProtocolFeature {
             Self::DirectPeerRelayReceiptV2 => "anpf1-dprr2",
             Self::DirectPeerRelayTargetBindingV3 => "anpf1-dprtb3",
             Self::OnionReplyV1 => "anpf1-or1",
+            Self::OnionBlindLeaseAdmissionV1 => "anpf1-obla1",
         }
     }
 }
@@ -4017,6 +4026,7 @@ mod tests {
         let direct_relay_receipt = NodeProtocolFeature::DirectPeerRelayReceiptV2;
         let direct_relay_target_binding = NodeProtocolFeature::DirectPeerRelayTargetBindingV3;
         let onion_reply = NodeProtocolFeature::OnionReplyV1;
+        let onion_blind_admission = NodeProtocolFeature::OnionBlindLeaseAdmissionV1;
         let descriptor = descriptor_for(&identity).with_protocol_features([
             purpose_receipt,
             failure_receipt,
@@ -4024,13 +4034,14 @@ mod tests {
             direct_relay_receipt,
             direct_relay_target_binding,
             onion_reply,
+            onion_blind_admission,
             purpose_receipt,
         ]);
 
         assert_eq!(descriptor.schema_version, NODE_DESCRIPTOR_SCHEMA_VERSION);
         assert_eq!(
             descriptor.software_version,
-            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-dprtb3.anpf1-or1.anpf1-pbdr2"
+            "test+anpf1-brfr1.anpf1-dpra2.anpf1-dprr2.anpf1-dprtb3.anpf1-obla1.anpf1-or1.anpf1-pbdr2"
         );
         assert!(descriptor.advertises_protocol_feature(failure_receipt));
         assert!(descriptor.advertises_protocol_feature(purpose_receipt));
@@ -4038,6 +4049,7 @@ mod tests {
         assert!(descriptor.advertises_protocol_feature(direct_relay_receipt));
         assert!(descriptor.advertises_protocol_feature(direct_relay_target_binding));
         assert!(descriptor.advertises_protocol_feature(onion_reply));
+        assert!(descriptor.advertises_protocol_feature(onion_blind_admission));
 
         let signed = SignedNodeDescriptor::sign(descriptor, &identity).unwrap();
         let encoded = encode_discovery_message(&NodeDiscoveryMessage::DescriptorAnnounce {

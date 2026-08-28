@@ -60,7 +60,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.11.0-BlindVaultDeleteFailureClass - Added exhaustive,
+//! Last Modified: v1.12.0-BlindVaultAdmissionFailureClass - Added exhaustive,
+//! privacy-safe anonymous admission retry classification.
+//! v1.11.0-BlindVaultDeleteFailureClass - Added exhaustive,
 //! privacy-safe anonymous deletion retry classification.
 //! v1.10.0-BlindVaultPullFailureClass - Added exhaustive,
 //! privacy-safe anonymous recovery retry classification.
@@ -363,6 +365,15 @@ pub enum BlindVaultDeleteFailureClass {
     Unavailable,
 }
 
+/// Privacy-safe retry class for blind-issued anonymous lease admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultAdmissionFailureClass {
+    /// The same credential and signed lease cannot succeed unchanged.
+    Rejected,
+    /// Admission policy, replica storage, or local runtime is unavailable.
+    Unavailable,
+}
+
 impl BlindVaultServiceError {
     /// Returns the coarse retry class for a Put failure.
     #[must_use]
@@ -477,6 +488,45 @@ impl BlindVaultServiceError {
             | Self::IssuerDirectoryGenerationOutOfRange
             | Self::CorruptState
             | Self::TimestampOutOfRange => BlindVaultDeleteFailureClass::Unavailable,
+        }
+    }
+
+    /// Returns the coarse retry class for a blind-issued admission failure.
+    #[must_use]
+    pub const fn admission_failure_class(&self) -> BlindVaultAdmissionFailureClass {
+        // [BLIND-VAULT-ADMISSION-RETRY-CLASS 2026-08-28 by Codex] Keep this
+        // exhaustive. An upstream relay must never learn whether rejection was
+        // caused by a credential, issuer epoch, lease conflict, or replay.
+        match self {
+            Self::Protocol(_)
+            | Self::LeaseNotFound
+            | Self::LeaseExpired
+            | Self::LeaseConflict
+            | Self::ObjectConflict
+            | Self::RequestConflict
+            | Self::ObjectDeleted
+            | Self::QuotaExceeded
+            | Self::ReadUnauthorized
+            | Self::InvalidPullCursor
+            | Self::AdmissionIssuerRejected
+            | Self::AdmissionProofRejected
+            | Self::AdmissionSpent
+            | Self::ObjectNotFound => BlindVaultAdmissionFailureClass::Rejected,
+            Self::Disabled
+            | Self::Sqlite(_)
+            | Self::Filesystem
+            | Self::PullCursorEncryptionFailed
+            | Self::AdmissionUnavailable
+            | Self::AdmissionConfigurationInvalid
+            | Self::IssuerDirectoryAuthorityRejected
+            | Self::IssuerDirectoryUpdateRejected
+            | Self::IssuerDirectoryRollback
+            | Self::IssuerDirectoryGenerationConflict
+            | Self::IssuerDirectoryContinuity
+            | Self::IssuerDirectoryNoActiveEpoch
+            | Self::IssuerDirectoryGenerationOutOfRange
+            | Self::CorruptState
+            | Self::TimestampOutOfRange => BlindVaultAdmissionFailureClass::Unavailable,
         }
     }
 }

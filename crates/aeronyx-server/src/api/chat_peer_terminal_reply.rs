@@ -11,7 +11,8 @@
 //! - Accepts one decoded onion reply carrier at a terminal node.
 //! - Restricts inline v1 recovery to one 4 KiB-class Blind Vault object page.
 //! - Executes capability-authenticated recovery or signed administration-key
-//!   deletion without exposing either request to middle relays.
+//!   deletion, plus blind-issued lease admission, without exposing any request
+//!   to middle relays.
 //! - Signs the recovery page, seals it to the source reply key, and returns
 //!   only fixed-size opaque base64 bytes to the relay orchestrator.
 //! - Maps internal failures to coarse retry classes without retaining secrets.
@@ -35,7 +36,9 @@
 //! - Keep node fan-out out of this module; clients choose unrelated replicas
 //!   and routes so one node cannot reconstruct a logical replica set.
 //!
-//! Last Modified: v1.1.0-BlindVaultInlineDelete - Added anonymous deletion and
+//! Last Modified: v1.2.0-BlindVaultInlineAdmission - Added RFC 9474 blind-issued
+//! lease admission with a terminal-signed, request-bound encrypted receipt.
+//! v1.1.0-BlindVaultInlineDelete - Added anonymous deletion and
 //! terminal-signed receipt replies through the same fixed-size carrier.
 //! v1.0.0-BlindVaultInlinePull - Initial anonymous pull reply.
 //! ============================================================================
@@ -43,14 +46,15 @@
 use aeronyx_core::crypto::IdentityKeyPair;
 use aeronyx_core::protocol::{
     decode_blind_vault_frame, decode_onion_reply_request, encode_blind_vault_frame,
-    encode_onion_sealed_response, seal_onion_reply, BlindVaultFrame, BlindVaultPullResponse,
-    BlindVaultRecoveredObject, OnionRoutePurpose, ONION_REPLY_RESPONSE_SIZE_CLASSES,
+    encode_onion_sealed_response, seal_onion_reply, BlindVaultBlindLeaseAcceptedReceipt,
+    BlindVaultFrame, BlindVaultPullResponse, BlindVaultRecoveredObject, OnionRoutePurpose,
+    ONION_REPLY_RESPONSE_SIZE_CLASSES,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::services::{
-    BlindVaultDeleteFailureClass, BlindVaultPullFailureClass, BlindVaultService,
-    BlindVaultServiceError,
+    BlindVaultAdmissionFailureClass, BlindVaultDeleteFailureClass, BlindVaultPullFailureClass,
+    BlindVaultService, BlindVaultServiceError,
 };
 
 /// Coarse terminal-reply failure class consumed by blind-relay orchestration.
@@ -101,6 +105,22 @@ pub(super) fn execute_blind_vault_inline_reply(
             let encoded = encode_blind_vault_frame(&BlindVaultFrame::DeletedReceipt(receipt))
                 .map_err(|_| TerminalReplyFailure::Unavailable)?;
             (OnionRoutePurpose::BlindVaultDelete, encoded)
+        }
+        BlindVaultFrame::BlindLeaseAdmission(admission_request) => {
+            vault
+                .provision_lease_with_blind_admission(&admission_request, now_ms)
+                .map_err(classify_admission_failure)?;
+            let mut receipt = BlindVaultBlindLeaseAcceptedReceipt::new(
+                &admission_request,
+                now_ms,
+                terminal_identity.public_key_bytes(),
+            );
+            receipt
+                .sign(terminal_identity)
+                .map_err(|_| TerminalReplyFailure::Unavailable)?;
+            let encoded = encode_blind_vault_frame(&BlindVaultFrame::BlindLeaseAccepted(receipt))
+                .map_err(|_| TerminalReplyFailure::Unavailable)?;
+            (OnionRoutePurpose::BlindVaultLeaseAdmission, encoded)
         }
         _ => return Err(TerminalReplyFailure::Rejected),
     };
@@ -190,5 +210,15 @@ fn classify_delete_failure(error: BlindVaultServiceError) -> TerminalReplyFailur
     match error.delete_failure_class() {
         BlindVaultDeleteFailureClass::Rejected => TerminalReplyFailure::Rejected,
         BlindVaultDeleteFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
+    }
+}
+
+fn classify_admission_failure(error: BlindVaultServiceError) -> TerminalReplyFailure {
+    // [BLIND-VAULT-ADMISSION-FAILURE-CLASS 2026-08-28 by Codex] Credential,
+    // issuer, replay, and lease state remain indistinguishable outside the
+    // encrypted terminal response boundary.
+    match error.admission_failure_class() {
+        BlindVaultAdmissionFailureClass::Rejected => TerminalReplyFailure::Rejected,
+        BlindVaultAdmissionFailureClass::Unavailable => TerminalReplyFailure::Unavailable,
     }
 }
