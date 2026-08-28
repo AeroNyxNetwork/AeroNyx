@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.73.0-BlindVaultFilesystemCapacity
+// Version: 0.74.0-BlindVaultAdmissionReadiness
 //
 // Modification Reason:
+//   [BLIND-VAULT-ADMISSION-READINESS 2026-08-28 by Codex] Re-exported the
+//   privacy-safe runtime admission state consumed by discovery and operations.
 //   [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Registered and re-exported
 //   the replaceable Blind Vault filesystem-capacity capability.
 //   [CHAT-BACKUP-AUDIT-MAINTENANCE-DOMAIN 2026-08-28 by Codex] Registered the
@@ -119,6 +121,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.74.0-BlindVaultAdmissionReadiness - Exported admission runtime state
 //   v0.73.0-BlindVaultFilesystemCapacity - Registered physical capacity probe
 //   v0.72.0-BlindVaultDeleteFailureClass - Exported deletion retry semantics
 //   v0.71.0-BlindVaultPullFailureClass - Exported recovery retry semantics
@@ -290,8 +293,8 @@ pub mod wallet_routes;
 // [BLIND-VAULT-RETRY-CLASS 2026-08-10 by Codex] Relay/API boundaries consume
 // the service-owned coarse class instead of matching storage internals twice.
 pub use blind_vault::{
-    BlindVaultAdmissionFailureClass, BlindVaultCleanupReport, BlindVaultDeleteFailureClass,
-    BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus,
+    BlindVaultAdmissionFailureClass, BlindVaultAdmissionReadiness, BlindVaultCleanupReport,
+    BlindVaultDeleteFailureClass, BlindVaultIssuerInstallOutcome, BlindVaultIssuerRuntimeStatus,
     BlindVaultLeaseInventoryFailureClass, BlindVaultLeaseProvisionOutcome,
     BlindVaultLeaseRenewFailureClass, BlindVaultLeaseRetireFailureClass,
     BlindVaultLeaseStatusFailureClass, BlindVaultPullFailureClass, BlindVaultPullPage,

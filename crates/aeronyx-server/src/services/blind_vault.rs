@@ -79,7 +79,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.18.0-BlindVaultDiskReserve - Added replaceable physical
+//! Last Modified: v1.19.0-BlindVaultAdmissionReadiness - Added one aggregate,
+//! fail-closed admission-readiness state for discovery and operations.
+//! v1.18.0-BlindVaultDiskReserve - Added replaceable physical
 //! capacity observation and fail-closed write watermarks.
 //! v1.17.0-BlindVaultNodeCapacity - Added atomic node-wide live
 //! lease and aggregate ciphertext capacity enforcement and status.
@@ -368,6 +370,34 @@ pub struct BlindVaultStatus {
     pub lease_renewals: u64,
     /// Unexpired one-time admission spend markers retained for replay defence.
     pub retained_admission_spends: u64,
+}
+
+/// Aggregate reason a replica can or cannot accept a new anonymous lease.
+///
+/// The state intentionally carries no issuer, lease, object, path, or storage
+/// amount. Discovery and operations may consume it without becoming a private
+/// storage-state oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultAdmissionReadiness {
+    /// Public admission policy, issuer material, and both capacity layers are
+    /// currently ready.
+    Ready,
+    /// Public admission is disabled or no V1/V2 issuer is currently usable.
+    PolicyUnavailable,
+    /// The operator's retained lease or ciphertext commitment is exhausted.
+    LogicalCapacityExhausted,
+    /// The configured physical disk reserve cannot survive another admission.
+    PhysicalCapacityExhausted,
+    /// The enabled physical capacity probe could not establish a safe state.
+    PhysicalCapacityUnknown,
+}
+
+impl BlindVaultAdmissionReadiness {
+    /// Returns whether the node may advertise anonymous lease admission.
+    #[must_use]
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
 }
 
 /// Fail-closed service errors. API handlers should map these to coarse public
@@ -1056,6 +1086,57 @@ impl BlindVaultService {
                 available >= self.config.min_free_disk_bytes,
             ),
             Err(_) => (None, false),
+        }
+    }
+
+    /// Returns a single privacy-safe admission decision for discovery,
+    /// heartbeat, and local operations.
+    ///
+    /// # Errors
+    /// Returns a storage error when the durable logical-capacity singleton
+    /// cannot be read. Callers must treat errors as not ready.
+    pub fn admission_readiness(
+        &self,
+        now_ms: u64,
+    ) -> Result<BlindVaultAdmissionReadiness, BlindVaultServiceError> {
+        // [BLIND-VAULT-ADMISSION-READINESS 2026-08-28 by Codex] Authority-only
+        // bootstrap is intentionally not ready until an authenticated active
+        // V2 generation arrives. A configured V1 issuer remains compatible.
+        if !self.config.public_api_enabled {
+            return Ok(BlindVaultAdmissionReadiness::PolicyUnavailable);
+        }
+        let has_v1_issuer = !self.admission_issuers.is_empty();
+        let has_active_v2_issuer = self
+            .blind_admission_issuers
+            .read()
+            .epochs
+            .iter()
+            .any(|epoch| epoch.not_before_ms <= now_ms && now_ms < epoch.expires_at_ms);
+        if !has_v1_issuer && !has_active_v2_issuer {
+            return Ok(BlindVaultAdmissionReadiness::PolicyUnavailable);
+        }
+
+        let (committed_leases, committed_bytes): (i64, i64) = self.connection.lock().query_row(
+            "SELECT committed_lease_count, committed_ciphertext_bytes
+                 FROM blind_vault_capacity_state WHERE state_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if non_negative_u64(committed_leases)? >= self.config.max_live_leases
+            || non_negative_u64(committed_bytes)? >= self.config.max_total_ciphertext_bytes
+        {
+            return Ok(BlindVaultAdmissionReadiness::LogicalCapacityExhausted);
+        }
+
+        match self.ensure_filesystem_capacity(0) {
+            Ok(()) => Ok(BlindVaultAdmissionReadiness::Ready),
+            Err(BlindVaultServiceError::NodeCapacityExceeded) => {
+                Ok(BlindVaultAdmissionReadiness::PhysicalCapacityExhausted)
+            }
+            Err(BlindVaultServiceError::FilesystemCapacityUnavailable) => {
+                Ok(BlindVaultAdmissionReadiness::PhysicalCapacityUnknown)
+            }
+            Err(error) => Err(error),
         }
     }
 
