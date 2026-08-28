@@ -3307,6 +3307,53 @@ pub enum BlindVaultReplicaAction {
     ProvisionReplicas { count: u8 },
 }
 
+/// Replica-local terminal target shared by lifecycle actions.
+///
+/// [BLIND-VAULT-REPLICA-TARGET 2026-08-29 by Codex] Keeping this identity in
+/// the domain model lets workflow schedulers enforce per-lease single-flight
+/// without duplicating action matching or exposing any user-level identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlindVaultReplicaTarget {
+    node_id: [u8; 32],
+    lease_id: [u8; 32],
+}
+
+impl BlindVaultReplicaTarget {
+    /// Terminal descriptor identity.
+    #[must_use]
+    pub const fn node_id(self) -> [u8; 32] {
+        self.node_id
+    }
+
+    /// Replica-local lease identity.
+    #[must_use]
+    pub const fn lease_id(self) -> [u8; 32] {
+        self.lease_id
+    }
+}
+
+impl BlindVaultReplicaAction {
+    /// Returns the exact terminal/lease target, if the action has one.
+    ///
+    /// Aggregate anonymous provisioning has no existing target and returns
+    /// `None`; the resulting admitted replicas are verified separately.
+    #[must_use]
+    pub const fn target(self) -> Option<BlindVaultReplicaTarget> {
+        let (node_id, lease_id) = match self {
+            Self::RenewLease {
+                node_id, lease_id, ..
+            }
+            | Self::ReconcileInventory {
+                node_id, lease_id, ..
+            }
+            | Self::RetryObservation { node_id, lease_id }
+            | Self::ReplaceReplica { node_id, lease_id } => (node_id, lease_id),
+            Self::ProvisionReplicas { .. } => return None,
+        };
+        Some(BlindVaultReplicaTarget { node_id, lease_id })
+    }
+}
+
 /// Deterministic, declarative result of one replica lifecycle evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlindVaultReplicaPlan {
@@ -3429,6 +3476,7 @@ fn replica_actions_are_consistent(actions: &[BlindVaultReplicaAction]) -> bool {
             || entry.1 & action_flag != 0
             || entry.1 & EXCLUSIVE != 0
             || (action_flag & EXCLUSIVE != 0 && entry.1 != 0)
+            || (action_flag == RENEW && entry.1 & RECONCILE != 0)
         {
             return false;
         }
@@ -3535,6 +3583,17 @@ impl BlindVaultReplicaPlanner for BlindVaultManifestReplicaPlanner {
                         continue;
                     }
                     live_verified_replicas += 1;
+                    // [BLIND-VAULT-RENEW-BEFORE-REPAIR 2026-08-29 by Codex]
+                    // A near-expiry lease is extended before source-owned
+                    // reconciliation starts, preventing a valid repair from
+                    // crossing the old lease deadline midway through work.
+                    if inventory.expires_at_ms <= renewal_deadline {
+                        actions.push(BlindVaultReplicaAction::RenewLease {
+                            node_id: inventory.node_id,
+                            lease_id: inventory.lease_id,
+                            expected_expires_at_ms: inventory.expires_at_ms,
+                        });
+                    }
                     if inventory.matches_expected_manifest {
                         live_matching_replicas += 1;
                     } else {
@@ -3547,13 +3606,6 @@ impl BlindVaultReplicaPlanner for BlindVaultManifestReplicaPlanner {
                             observed_ciphertext_bytes: inventory.observed_ciphertext_bytes,
                             expected_inventory_commitment: inventory.expected_inventory_commitment,
                             observed_inventory_commitment: inventory.observed_inventory_commitment,
-                        });
-                    }
-                    if inventory.expires_at_ms <= renewal_deadline {
-                        actions.push(BlindVaultReplicaAction::RenewLease {
-                            node_id: inventory.node_id,
-                            lease_id: inventory.lease_id,
-                            expected_expires_at_ms: inventory.expires_at_ms,
                         });
                     }
                 }

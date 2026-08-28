@@ -11,7 +11,8 @@ use super::{
     require_timestamp, BlindVaultReplicaActionEvidence, BlindVaultReplicaConvergence,
     BlindVaultReplicaDispatchFailure, BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase,
     BlindVaultReplicaExecutionPolicy, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
-    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
+    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 use crate::protocol::blind_vault::{BlindVaultReplicaPlan, BlindVaultReplicaPlanHealth};
 
@@ -23,8 +24,35 @@ impl BlindVaultReplicaExecution {
         policy: BlindVaultReplicaExecutionPolicy,
         plan: &BlindVaultReplicaPlan,
     ) -> Result<Self, BlindVaultReplicaWorkflowError> {
+        Self::new_with_maximum_in_flight(
+            workflow_id,
+            created_at_ms,
+            policy,
+            DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+            plan,
+        )
+    }
+
+    /// Creates one generation with an explicit bounded dispatch limit.
+    ///
+    /// [BLIND-VAULT-BOUNDED-DISPATCH 2026-08-29 by Codex] The default remains
+    /// sequential to reduce timing correlation across unrelated replicas.
+    /// Higher limits are opt-in, bounded by the maximum work set, and never
+    /// permit concurrent operations against the same terminal/lease.
+    pub fn new_with_maximum_in_flight(
+        workflow_id: [u8; 16],
+        created_at_ms: u64,
+        policy: BlindVaultReplicaExecutionPolicy,
+        maximum_in_flight: u8,
+        plan: &BlindVaultReplicaPlan,
+    ) -> Result<Self, BlindVaultReplicaWorkflowError> {
         require_timestamp(created_at_ms)?;
         policy.validate()?;
+        if maximum_in_flight == 0
+            || usize::from(maximum_in_flight) > MAX_BLIND_VAULT_REPLICA_WORK_ITEMS
+        {
+            return Err(BlindVaultReplicaWorkflowError::InvalidDispatchLimit);
+        }
         if workflow_id == [0; 16] {
             return Err(BlindVaultReplicaWorkflowError::InvalidWorkflowId);
         }
@@ -56,6 +84,7 @@ impl BlindVaultReplicaExecution {
             created_at_ms,
             source_plan_health: plan.health,
             policy,
+            maximum_in_flight,
             items,
         })
     }
@@ -76,6 +105,26 @@ impl BlindVaultReplicaExecution {
     #[must_use]
     pub const fn source_plan_health(&self) -> BlindVaultReplicaPlanHealth {
         self.source_plan_health
+    }
+
+    /// Maximum unrelated actions permitted to await evidence concurrently.
+    #[must_use]
+    pub const fn maximum_in_flight(&self) -> u8 {
+        self.maximum_in_flight
+    }
+
+    /// Current number of dispatched actions awaiting cryptographic evidence.
+    #[must_use]
+    pub fn in_flight_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.state,
+                    BlindVaultReplicaWorkState::AwaitingEvidence { .. }
+                )
+            })
+            .count()
     }
 
     /// Read-only work items for orchestration and user confirmation UI.
@@ -158,7 +207,8 @@ impl BlindVaultReplicaExecution {
     ) -> Result<u8, BlindVaultReplicaWorkflowError> {
         self.validate_event_time(dispatched_at_ms)?;
         let policy = self.policy;
-        let item = self.item_mut(id)?;
+        let item_index = self.item_index(id)?;
+        let item = self.items[item_index];
         let attempt = match item.state {
             BlindVaultReplicaWorkState::Authorized { authorized_at_ms } => {
                 if dispatched_at_ms < authorized_at_ms {
@@ -184,10 +234,34 @@ impl BlindVaultReplicaExecution {
         if attempt > policy.maximum_attempts {
             return Err(BlindVaultReplicaWorkflowError::AttemptBudgetExhausted);
         }
+        if self.in_flight_count() >= usize::from(self.maximum_in_flight) {
+            return Err(BlindVaultReplicaWorkflowError::DispatchCapacityReached);
+        }
+        if let Some(target) = item.action.target() {
+            if self.items[..item_index].iter().any(|prior| {
+                prior.action.target() == Some(target)
+                    && !matches!(
+                        prior.state,
+                        BlindVaultReplicaWorkState::EvidenceAccepted { .. }
+                    )
+            }) {
+                return Err(BlindVaultReplicaWorkflowError::TargetDependencyPending);
+            }
+            if self.items.iter().enumerate().any(|(index, active)| {
+                index != item_index
+                    && active.action.target() == Some(target)
+                    && matches!(
+                        active.state,
+                        BlindVaultReplicaWorkState::AwaitingEvidence { .. }
+                    )
+            }) {
+                return Err(BlindVaultReplicaWorkflowError::TargetInFlight);
+            }
+        }
         let evidence_deadline_ms = dispatched_at_ms
             .checked_add(policy.evidence_timeout_ms)
             .ok_or(BlindVaultReplicaWorkflowError::TimestampOutOfRange)?;
-        item.state = BlindVaultReplicaWorkState::AwaitingEvidence {
+        self.items[item_index].state = BlindVaultReplicaWorkState::AwaitingEvidence {
             attempt,
             dispatched_at_ms,
             evidence_deadline_ms,
@@ -417,12 +491,21 @@ impl BlindVaultReplicaExecution {
         &mut self,
         id: BlindVaultReplicaWorkId,
     ) -> Result<&mut BlindVaultReplicaWorkItem, BlindVaultReplicaWorkflowError> {
+        let index = self.item_index(id)?;
+        Ok(&mut self.items[index])
+    }
+
+    fn item_index(
+        &self,
+        id: BlindVaultReplicaWorkId,
+    ) -> Result<usize, BlindVaultReplicaWorkflowError> {
         if id.workflow_id != self.workflow_id {
             return Err(BlindVaultReplicaWorkflowError::WorkItemNotFound);
         }
         self.items
-            .get_mut(usize::from(id.sequence))
+            .get(usize::from(id.sequence))
             .filter(|item| item.id == id)
+            .map(|_| usize::from(id.sequence))
             .ok_or(BlindVaultReplicaWorkflowError::WorkItemNotFound)
     }
 }

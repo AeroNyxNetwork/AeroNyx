@@ -32,7 +32,9 @@
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //!
-//! Last Modified: v1.4.0-BlindVaultPlanShape - Reused the core plan invariant
+//! Last Modified: v1.5.0-BlindVaultBoundedDispatch - Added source-owned global
+//! dispatch limits, per-target single-flight, and ordered target dependencies.
+//! v1.4.0-BlindVaultPlanShape - Reused the core plan invariant
 //! at workflow creation and mandatory replan boundaries.
 //! v1.3.0-BlindVaultTerminalAttemptBoundary - Removed retry
 //! schedule requirements from exhausted terminal attempts.
@@ -57,6 +59,12 @@ use super::blind_vault::{
 /// At most two per-member actions plus one aggregate provisioning action can
 /// be emitted by the current deterministic planner.
 pub const MAX_BLIND_VAULT_REPLICA_WORK_ITEMS: usize = MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS;
+
+/// Privacy-conservative default: one cross-replica operation in flight.
+///
+/// Apps that explicitly accept the timing-correlation and resource tradeoff
+/// may choose a larger bounded value through `new_with_maximum_in_flight`.
+pub const DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT: u8 = 1;
 
 /// Source-side retry and evidence timing policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +382,7 @@ pub struct BlindVaultReplicaExecution {
     pub(super) created_at_ms: u64,
     pub(super) source_plan_health: BlindVaultReplicaPlanHealth,
     pub(super) policy: BlindVaultReplicaExecutionPolicy,
+    pub(super) maximum_in_flight: u8,
     pub(super) items: Vec<BlindVaultReplicaWorkItem>,
 }
 
@@ -386,6 +395,9 @@ pub enum BlindVaultReplicaWorkflowError {
     /// Retry count or evidence timeout was zero.
     #[error("blind vault replica workflow policy is invalid")]
     InvalidPolicy,
+    /// Dispatch concurrency was zero or exceeded the bounded work set.
+    #[error("blind vault replica workflow dispatch limit is invalid")]
+    InvalidDispatchLimit,
     /// Workflow generation identity was all zero.
     #[error("blind vault replica workflow id is invalid")]
     InvalidWorkflowId,
@@ -413,6 +425,15 @@ pub enum BlindVaultReplicaWorkflowError {
     /// Dispatch exceeded the configured attempt budget.
     #[error("blind vault replica work item attempt budget is exhausted")]
     AttemptBudgetExhausted,
+    /// The workflow already has its configured number of in-flight actions.
+    #[error("blind vault replica workflow dispatch capacity is reached")]
+    DispatchCapacityReached,
+    /// Another operation for the same terminal/lease is currently in flight.
+    #[error("blind vault replica target already has an in-flight action")]
+    TargetInFlight,
+    /// An earlier action for the same terminal/lease lacks accepted evidence.
+    #[error("blind vault replica target dependency is not complete")]
+    TargetDependencyPending,
     /// Terminal evidence did not answer the exact request.
     #[error("blind vault replica evidence request mismatch")]
     EvidenceRequestMismatch,
