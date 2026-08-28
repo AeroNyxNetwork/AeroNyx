@@ -73,6 +73,8 @@
 //!   Unknown values must fail closed instead of silently becoming chat routes.
 //!
 //! ## Last Modified
+//! v1.11.0-VerifiedRoutePlan — Added descriptor-authenticated, purpose-aware
+//! source route admission with exact path-derived TTL
 //! v1.10.0-TerminalFeatureContract — Centralized purpose-specific signed
 //! terminal feature requirements for node, App, SDK, and agent route builders
 //! v1.9.0-BlindVaultLeaseInventoryPurpose — Added private inventory commitment
@@ -90,13 +92,14 @@ use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
+use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use crate::crypto::keys::{E2eSession, EphemeralKeyPair, IdentityKeyPair};
 use crate::error::CoreError;
 use crate::protocol::chat::BlindRelayEnvelope;
-use crate::protocol::discovery::{NodeCapability, NodeProtocolFeature};
+use crate::protocol::discovery::{NodeCapability, NodeProtocolFeature, SignedNodeDescriptor};
 
 // ============================================
 // Constants
@@ -209,6 +212,19 @@ const LAYER_HEADER_LEN: usize = 2 + 32 + 24;
 /// Upper bound for a decoded `OnionHopPayload` inner field (matches the blind
 /// relay frame cap).
 const MAX_ONION_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// Maximum remote hops accepted by the descriptor-verified route planner.
+///
+/// This matches the public candidate contract. The legacy raw builder remains
+/// available for wire compatibility and controlled protocol experiments.
+pub const MAX_VERIFIED_ONION_ROUTE_HOPS: usize = 3;
+
+/// Signed capabilities required from a relay that forwards another onion layer.
+pub const ONION_FORWARD_HOP_REQUIRED_CAPABILITIES: [NodeCapability; 2] =
+    [NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+
+/// Signed capabilities required from the terminal before purpose-specific roles.
+pub const ONION_TERMINAL_REQUIRED_CAPABILITIES: [NodeCapability; 1] = [NodeCapability::ChatRelay];
 
 // ============================================
 // Types
@@ -371,6 +387,267 @@ pub struct OnionHop {
     pub node_id: [u8; 32],
     /// Relay KEM public key (X25519 for v1; from `NodeDescriptor::kem_public`).
     pub kem_pub: [u8; 32],
+}
+
+/// Fail-closed descriptor and construction errors for a verified onion route.
+///
+/// No variant contains a node id, endpoint, payload, route id, or key. These
+/// errors are safe to aggregate as coarse local diagnostics without publishing
+/// route topology.
+#[derive(Debug, Error)]
+pub enum OnionRoutePlanError {
+    /// A route needs at least one remote terminal.
+    #[error("onion route must contain at least one hop")]
+    EmptyPath,
+    /// The public protocol currently supports at most three remote hops.
+    #[error("onion route exceeds the supported maximum of {max_hops} hops")]
+    TooManyHops {
+        /// Maximum remote hops accepted by this protocol version.
+        max_hops: usize,
+    },
+    /// Signature, schema, or validity-window verification failed.
+    #[error("onion route descriptor at hop {hop_number} is not authentic and current")]
+    DescriptorRejected {
+        /// One-based hop position; no node identity is exposed.
+        hop_number: usize,
+    },
+    /// A route cannot pass through the same node more than once.
+    #[error("onion route repeats a node at hop {hop_number}")]
+    DuplicateNode {
+        /// One-based position of the repeated node.
+        hop_number: usize,
+    },
+    /// A source cannot also appear as one of its own remote hops.
+    #[error("onion route includes its source at hop {hop_number}")]
+    SourceIncluded {
+        /// One-based position of the source-node loop.
+        hop_number: usize,
+    },
+    /// A selected descriptor does not advertise a required relay role.
+    #[error("onion route hop {hop_number} is missing required capability {capability:?}")]
+    MissingCapability {
+        /// One-based hop position.
+        hop_number: usize,
+        /// Missing public capability.
+        capability: NodeCapability,
+    },
+    /// A selected descriptor cannot execute the negotiated wire contract.
+    #[error("onion route hop {hop_number} is missing required protocol feature {feature:?}")]
+    MissingProtocolFeature {
+        /// One-based hop position.
+        hop_number: usize,
+        /// Missing signed protocol feature.
+        feature: NodeProtocolFeature,
+    },
+    /// A relay has no compatible, non-zero per-hop X25519 public key.
+    #[error("onion route hop {hop_number} has no compatible X25519 KEM key")]
+    MissingX25519Kem {
+        /// One-based hop position.
+        hop_number: usize,
+    },
+    /// A descriptor cannot be contacted by the entry or preceding relay.
+    #[error("onion route hop {hop_number} has no public peer endpoint")]
+    MissingPublicEndpoint {
+        /// One-based hop position.
+        hop_number: usize,
+    },
+    /// The signing identity supplied at construction differs from the plan.
+    #[error("onion route source identity does not match the verified plan")]
+    SourceIdentityMismatch,
+    /// The plan was built from descriptors that are no longer current.
+    #[error("onion route plan is outside its verified validity window")]
+    OutsideValidityWindow,
+    /// A verified route passed admission but cryptographic wrapping failed.
+    #[error("failed to construct the verified onion envelope")]
+    EnvelopeConstruction {
+        /// Underlying safe core error.
+        #[source]
+        source: CoreError,
+    },
+}
+
+/// Descriptor-authenticated onion route ready for source-side construction.
+///
+/// [VERIFIED-ONION-ROUTE 2026-08-29 by Codex] This domain object closes the
+/// gap between discovery and encryption: callers cannot derive onion hops
+/// until every original signed descriptor passes schema/signature/freshness,
+/// node uniqueness, capability, purpose-feature, endpoint, and KEM checks.
+/// The exact minimum TTL is derived from the admitted path, eliminating a
+/// caller-controlled TTL/path mismatch.
+///
+/// This object proves static descriptor eligibility only. Endpoint liveness,
+/// recent relay evidence, network/operator diversity, capacity, and route
+/// weighting remain policy inputs and must be checked before constructing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOnionRoute {
+    source_node_id: [u8; 32],
+    purpose: OnionRoutePurpose,
+    verified_at: u64,
+    valid_until: u64,
+    hops: Vec<OnionHop>,
+}
+
+impl VerifiedOnionRoute {
+    /// Verifies a bounded sequence of signed descriptors into one route plan.
+    ///
+    /// `descriptors` are ordered entry to terminal. The terminal needs the
+    /// base terminal role plus the purpose-specific capability/features;
+    /// preceding hops additionally need the `OnionMiddle` forwarding role.
+    ///
+    /// # Errors
+    /// Returns [`OnionRoutePlanError`] on the first unsafe or unsupported hop.
+    pub fn from_signed_descriptors<'a>(
+        source_node_id: [u8; 32],
+        descriptors: impl IntoIterator<Item = &'a SignedNodeDescriptor>,
+        purpose: OnionRoutePurpose,
+        now: u64,
+    ) -> Result<Self, OnionRoutePlanError> {
+        let mut bounded = Vec::with_capacity(MAX_VERIFIED_ONION_ROUTE_HOPS);
+        for descriptor in descriptors {
+            if bounded.len() == MAX_VERIFIED_ONION_ROUTE_HOPS {
+                return Err(OnionRoutePlanError::TooManyHops {
+                    max_hops: MAX_VERIFIED_ONION_ROUTE_HOPS,
+                });
+            }
+            bounded.push(descriptor);
+        }
+        if bounded.is_empty() {
+            return Err(OnionRoutePlanError::EmptyPath);
+        }
+
+        let mut hops = Vec::with_capacity(bounded.len());
+        let mut valid_until = u64::MAX;
+        for (index, signed) in bounded.iter().enumerate() {
+            let hop_number = index + 1;
+            signed
+                .verify_at(now)
+                .map_err(|_| OnionRoutePlanError::DescriptorRejected { hop_number })?;
+            let descriptor = &signed.descriptor;
+            if descriptor.node_id == source_node_id {
+                return Err(OnionRoutePlanError::SourceIncluded { hop_number });
+            }
+            if hops
+                .iter()
+                .any(|hop: &OnionHop| hop.node_id == descriptor.node_id)
+            {
+                return Err(OnionRoutePlanError::DuplicateNode { hop_number });
+            }
+
+            let is_terminal = index + 1 == bounded.len();
+            let required_capabilities = if is_terminal {
+                &ONION_TERMINAL_REQUIRED_CAPABILITIES[..]
+            } else {
+                &ONION_FORWARD_HOP_REQUIRED_CAPABILITIES[..]
+            };
+            for capability in required_capabilities {
+                if !descriptor.capabilities.contains(capability) {
+                    return Err(OnionRoutePlanError::MissingCapability {
+                        hop_number,
+                        capability: *capability,
+                    });
+                }
+            }
+            if is_terminal {
+                if let Some(capability) = purpose.specialized_terminal_capability() {
+                    if !descriptor.capabilities.contains(&capability) {
+                        return Err(OnionRoutePlanError::MissingCapability {
+                            hop_number,
+                            capability,
+                        });
+                    }
+                }
+                for feature in purpose.required_terminal_protocol_features() {
+                    if !descriptor.advertises_protocol_feature(*feature) {
+                        return Err(OnionRoutePlanError::MissingProtocolFeature {
+                            hop_number,
+                            feature: *feature,
+                        });
+                    }
+                }
+            }
+            for feature in purpose.required_path_protocol_features() {
+                if !descriptor.advertises_protocol_feature(*feature) {
+                    return Err(OnionRoutePlanError::MissingProtocolFeature {
+                        hop_number,
+                        feature: *feature,
+                    });
+                }
+            }
+
+            if descriptor
+                .public_endpoint
+                .as_deref()
+                .map_or(true, |endpoint| endpoint.trim().is_empty())
+            {
+                return Err(OnionRoutePlanError::MissingPublicEndpoint { hop_number });
+            }
+            let kem_pub = descriptor
+                .x25519_kem_public()
+                .ok_or(OnionRoutePlanError::MissingX25519Kem { hop_number })?;
+            valid_until = valid_until.min(descriptor.expires_at);
+            hops.push(OnionHop {
+                node_id: descriptor.node_id,
+                kem_pub,
+            });
+        }
+
+        Ok(Self {
+            source_node_id,
+            purpose,
+            verified_at: now,
+            valid_until,
+            hops,
+        })
+    }
+
+    /// Returns the workload contract used to admit this route.
+    #[must_use]
+    pub const fn purpose(&self) -> OnionRoutePurpose {
+        self.purpose
+    }
+
+    /// Returns the number of admitted remote hops.
+    #[must_use]
+    pub fn hop_count(&self) -> usize {
+        self.hops.len()
+    }
+
+    /// Returns the entry node id without exposing any endpoint or key material.
+    #[must_use]
+    pub fn entry_node_id(&self) -> [u8; 32] {
+        self.hops[0].node_id
+    }
+
+    /// Returns when the first selected signed descriptor expires.
+    #[must_use]
+    pub const fn valid_until(&self) -> u64 {
+        self.valid_until
+    }
+
+    /// Builds an onion envelope with an exact, path-derived TTL.
+    ///
+    /// # Errors
+    /// Fails closed if the source identity changed, time moved backwards, any
+    /// descriptor expired, or cryptographic envelope construction fails.
+    pub fn build_envelope(
+        &self,
+        final_payload: &[u8],
+        route_id: [u8; 16],
+        now: u64,
+        source: &IdentityKeyPair,
+    ) -> Result<BlindRelayEnvelope, OnionRoutePlanError> {
+        if source.public_key_bytes() != self.source_node_id {
+            return Err(OnionRoutePlanError::SourceIdentityMismatch);
+        }
+        if now < self.verified_at || now >= self.valid_until {
+            return Err(OnionRoutePlanError::OutsideValidityWindow);
+        }
+        let ttl = u8::try_from(self.hops.len()).map_err(|_| OnionRoutePlanError::TooManyHops {
+            max_hops: MAX_VERIFIED_ONION_ROUTE_HOPS,
+        })?;
+        build_onion_envelope(&self.hops, final_payload, route_id, ttl, now, source)
+            .map_err(|source| OnionRoutePlanError::EnvelopeConstruction { source })
+    }
 }
 
 /// Result of peeling exactly one onion layer at a relay.

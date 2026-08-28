@@ -968,9 +968,9 @@ use aeronyx_core::protocol::memchain::{
 };
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
-    build_onion_envelope, DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability,
-    NodeCapacity, NodeDescriptor, NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature, OnionHop,
-    OnionRoutePurpose, SignedNodeDescriptor,
+    DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor,
+    NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature, OnionRoutePurpose, SignedNodeDescriptor,
+    VerifiedOnionRoute,
 };
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
@@ -11445,7 +11445,7 @@ impl Server {
                     peer_store.record_blind_relay_two_hop_probe_result_with_context(
                         now,
                         false,
-                        "onion_kem_unavailable",
+                        "onion_route_contract_rejected",
                         middle_candidate_count,
                         terminal_candidate_count,
                         2,
@@ -11791,7 +11791,7 @@ impl Server {
                         peer_store.record_blind_relay_three_hop_probe_result_with_context(
                             now,
                             false,
-                            "onion_kem_unavailable",
+                            "onion_route_contract_rejected",
                             effective_middle_candidate_count,
                             terminal_candidate_count,
                             3,
@@ -12067,12 +12067,13 @@ impl Server {
         )
     }
 
-    /// Builds one onion request for a validated descriptor path.
+    /// Builds one onion request from a descriptor-authenticated route plan.
     ///
     /// [THREE-HOP-RUNTIME-PROOF 2026-08-01 by Codex] The builder is shared by
-    /// two-hop and three-hop probes so TTL, payload commitment, KEM admission,
-    /// and outer-envelope signing stay identical. Callers remain responsible
-    /// for distinct-node and network anti-affinity policy before construction.
+    /// two-hop and three-hop probes so descriptor verification, node
+    /// uniqueness, signed capabilities/features, exact TTL, payload commitment,
+    /// KEM admission, and outer-envelope signing stay identical. Callers remain
+    /// responsible for liveness and network/operator anti-affinity policy.
     fn build_onion_request(
         identity: &IdentityKeyPair,
         self_node_id: &[u8; 32],
@@ -12081,10 +12082,6 @@ impl Server {
         route_id: [u8; 16],
         now: u64,
     ) -> Option<(PeerBlindRelayRequest, [u8; 32])> {
-        let ttl = u8::try_from(path_descriptors.len()).ok()?;
-        if ttl == 0 {
-            return None;
-        }
         let encoded_chat = encode_envelope(chat_envelope).ok()?;
         // [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] The source computes the
         // same opaque v2 commitment as the terminal. The purpose is not sent as
@@ -12094,17 +12091,19 @@ impl Server {
             &encoded_chat,
             OnionRoutePurpose::MessageRelay,
         );
-        let path = path_descriptors
-            .iter()
-            .map(|descriptor| {
-                Some(OnionHop {
-                    node_id: descriptor.node_id(),
-                    kem_pub: descriptor.descriptor.x25519_kem_public()?,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let envelope =
-            build_onion_envelope(&path, &encoded_chat, route_id, ttl, now, identity).ok()?;
+        // [VERIFIED-ONION-ROUTE 2026-08-29 by Codex] Never derive raw hops
+        // directly from candidate projections. The core plan authenticates the
+        // original signed descriptors and derives the only admissible TTL.
+        let route = VerifiedOnionRoute::from_signed_descriptors(
+            *self_node_id,
+            path_descriptors.iter().copied(),
+            OnionRoutePurpose::MessageRelay,
+            now,
+        )
+        .ok()?;
+        let envelope = route
+            .build_envelope(&encoded_chat, route_id, now, identity)
+            .ok()?;
 
         Some((
             PeerBlindRelayRequest {
@@ -18716,14 +18715,14 @@ mod tests {
             "http://198.51.100.10:8422".to_string(),
             now,
             now + 300,
-            vec![NodeCapability::OnionMiddle],
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x31; 32],
         );
         let second_middle = signed_probe_peer_descriptor(
             "http://203.0.113.20:8422".to_string(),
             now + 1,
             now + 300,
-            vec![NodeCapability::OnionMiddle],
+            vec![NodeCapability::OnionMiddle, NodeCapability::ChatRelay],
             [0x32; 32],
         );
         let terminal = signed_probe_peer_descriptor(

@@ -31,6 +31,8 @@
 //! - [BLIND-VAULT-REPLICA-WORKFLOW 2026-08-28 by Codex] Added source-owned,
 //!   client-authorized replica execution with verified evidence and bounded
 //!   retries; this local state is never a discovery or ledger payload.
+//! - [VERIFIED-ONION-ROUTE 2026-08-29 by Codex] Added source-side route plans
+//!   derived only from authentic, current, capability-compatible descriptors.
 //!
 //! ## Main Functionality
 //!
@@ -68,6 +70,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.6.0-VerifiedOnionRoute - Re-exported descriptor-authenticated route
+//! planning with bounded hops and path-derived TTL
 //! v1.5.0-BlindVaultReplicaWorkflow - Re-exported source-owned, evidence-gated
 //! replica execution domain types without changing the public wire protocol
 //! v1.4.0-OnionBlindVaultLifecycle - Re-exported single-use anonymous recovery
@@ -152,8 +156,10 @@ pub use memchain::{
 };
 pub use messages::{ClientHello, DataPacket, MessageType, ServerHello};
 pub use onion::{
-    build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel, OnionRoutePurpose,
-    KEM_ALG_X25519, KEM_ALG_XWING, ONION_MAGIC, ONION_ROUTE_PURPOSE_VALUES, ONION_SALT,
+    build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel,
+    OnionRoutePlanError, OnionRoutePurpose, VerifiedOnionRoute, KEM_ALG_X25519, KEM_ALG_XWING,
+    MAX_VERIFIED_ONION_ROUTE_HOPS, ONION_FORWARD_HOP_REQUIRED_CAPABILITIES, ONION_MAGIC,
+    ONION_ROUTE_PURPOSE_VALUES, ONION_SALT, ONION_TERMINAL_REQUIRED_CAPABILITIES,
 };
 pub use onion_reply::{
     decode_onion_reply_request, decode_onion_sealed_response, encode_onion_reply_request,

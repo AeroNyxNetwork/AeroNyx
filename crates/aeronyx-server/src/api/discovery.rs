@@ -143,6 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.60.0-CoreVerifiedRouteContract - Shared the core route hop ceiling and
+//! forwarding-capability contract with source-side onion construction
 //! v0.59.0-BlindVaultEncryptedFailureNegotiation - Required signed support for
 //! source-only terminal failures across every reply-capable vault purpose
 //! v0.58.0-BlindVaultRuntimeAdvertisement - Added aggregate runtime readiness
@@ -247,7 +249,8 @@ use aeronyx_core::protocol::discovery::{
 };
 use aeronyx_core::protocol::{
     NodeBootstrapSnapshot, NodeCapability, NodeDiscoveryMessage, NodeProtocolFeature,
-    OnionRoutePurpose, SignedNodeDescriptor, ONION_ROUTE_PURPOSE_VALUES,
+    OnionRoutePurpose, SignedNodeDescriptor, MAX_VERIFIED_ONION_ROUTE_HOPS,
+    ONION_FORWARD_HOP_REQUIRED_CAPABILITIES, ONION_ROUTE_PURPOSE_VALUES,
 };
 use axum::{
     body::Bytes,
@@ -282,12 +285,13 @@ const ROUTE_DOMAIN_CERTIFICATE_RATE_LIMIT_PER_MINUTE: u32 = 60;
 const ONION_CANDIDATES_SOURCE: &str = "rust_discovery_onion_candidates";
 const ONION_CANDIDATES_SELECTION_POLICY: &str =
     "fresh_routeable_signed_chat_relays_with_kem_public_key";
-const ONION_REQUIRED_CAPABILITIES: [NodeCapability; 2] =
-    [NodeCapability::ChatRelay, NodeCapability::OnionMiddle];
+// [VERIFIED-ONION-ROUTE 2026-08-29 by Codex] Candidate JSON and the core
+// source-side planner share one forwarding-role and maximum-hop contract.
+const ONION_REQUIRED_CAPABILITIES: [NodeCapability; 2] = ONION_FORWARD_HOP_REQUIRED_CAPABILITIES;
 const ONION_CANDIDATES_REFRESH_AFTER_SECONDS: u64 = 300;
 const ONION_CANDIDATES_ROUTEABILITY_STALE_AFTER_SECONDS: u64 = 1_800;
 const ONION_CANDIDATES_MIN_TWO_HOP_CANDIDATES: usize = 2;
-const ONION_CANDIDATES_MAX_CLIENT_HOPS: u8 = 3;
+const ONION_CANDIDATES_MAX_CLIENT_HOPS: u8 = MAX_VERIFIED_ONION_ROUTE_HOPS as u8;
 const ONION_RELAY_ADMISSION_STABILITY_MIN_PROOFS: u64 = 3;
 const ONION_RELAY_ADMISSION_STABILITY_SUCCESS_PERCENT: u8 = 80;
 const DISCOVERY_PUBLIC_CARD_CONTRACT_VERSION: &str = "discovery_public_card.v1";
