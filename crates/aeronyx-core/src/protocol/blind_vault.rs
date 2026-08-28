@@ -104,7 +104,7 @@
 //! v1.0.0-BlindVaultWire - Initial durable object and signed receipt contract.
 //! ============================================
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bincode::Options;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -3359,7 +3359,10 @@ impl BlindVaultReplicaPlan {
             BlindVaultReplicaPlanHealth::Degraded
             | BlindVaultReplicaPlanHealth::QuorumUnavailable => has_actions && !only_renewals,
         };
-        if !health_matches_actions || self.actions.iter().any(replica_action_has_invalid_target) {
+        if !health_matches_actions
+            || self.actions.iter().any(replica_action_has_invalid_target)
+            || !replica_actions_are_consistent(&self.actions)
+        {
             return Err(BlindVaultReplicaPlanError::InconsistentPlan);
         }
         Ok(())
@@ -3384,6 +3387,54 @@ fn replica_action_has_invalid_target(action: &BlindVaultReplicaAction) -> bool {
             *count == 0 || usize::from(*count) > MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS
         }
     }
+}
+
+fn replica_actions_are_consistent(actions: &[BlindVaultReplicaAction]) -> bool {
+    // [BLIND-VAULT-PLAN-ACTION-CONSISTENCY 2026-08-28 by Codex] One member
+    // may reconcile and renew in the same generation. Retry and replacement
+    // are exclusive, and provisioning is one aggregate planner instruction.
+    const RENEW: u8 = 1 << 0;
+    const RECONCILE: u8 = 1 << 1;
+    const RETRY: u8 = 1 << 2;
+    const REPLACE: u8 = 1 << 3;
+    const EXCLUSIVE: u8 = RETRY | REPLACE;
+
+    let mut targets = BTreeMap::<[u8; 32], ([u8; 32], u8)>::new();
+    let mut provision_seen = false;
+    for action in actions {
+        let (node_id, lease_id, action_flag) = match action {
+            BlindVaultReplicaAction::RenewLease {
+                node_id, lease_id, ..
+            } => (*node_id, *lease_id, RENEW),
+            BlindVaultReplicaAction::ReconcileInventory {
+                node_id, lease_id, ..
+            } => (*node_id, *lease_id, RECONCILE),
+            BlindVaultReplicaAction::RetryObservation { node_id, lease_id } => {
+                (*node_id, *lease_id, RETRY)
+            }
+            BlindVaultReplicaAction::ReplaceReplica { node_id, lease_id } => {
+                (*node_id, *lease_id, REPLACE)
+            }
+            BlindVaultReplicaAction::ProvisionReplicas { .. } => {
+                if provision_seen {
+                    return false;
+                }
+                provision_seen = true;
+                continue;
+            }
+        };
+
+        let entry = targets.entry(node_id).or_insert((lease_id, 0));
+        if entry.0 != lease_id
+            || entry.1 & action_flag != 0
+            || entry.1 & EXCLUSIVE != 0
+            || (action_flag & EXCLUSIVE != 0 && entry.1 != 0)
+        {
+            return false;
+        }
+        entry.1 |= action_flag;
+    }
+    true
 }
 
 /// Replaceable capability for source-owned replica lifecycle planning.
