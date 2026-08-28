@@ -22,6 +22,7 @@
 //! - Administration-key object deletion with signed node receipts.
 //! - Complete administration-key lease retirement with exact-retry receipts.
 //! - Blind-authorized administration-key lease renewal with atomic token spend.
+//! - Administration-authorized coherent live-lease status receipts.
 //! - Transactional per-lease count/byte quotas and bounded expiry cleanup.
 //! - Stable privacy-safe mutation failure classes for multi-hop retry policy.
 //!
@@ -44,6 +45,8 @@
 //!    and return an encrypted-path-safe aggregate receipt.
 //! 7. Spend a fresh blind credential and extend one live lease in the same
 //!    transaction, preserving exact retry evidence without an account index.
+//! 8. Observe expiry and still-live ciphertext usage under one storage lock,
+//!    then return a terminal-signed private status receipt.
 //!
 //! ## Privacy Invariant
 //! This service has no account, wallet, sender, receiver, conversation,
@@ -66,7 +69,9 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.14.0-BlindVaultLeaseRenewal - Added blind-authorized,
+//! Last Modified: v1.15.0-BlindVaultLeaseStatus - Added coherent,
+//! administration-authorized live-lease status observations and receipts.
+//! v1.14.0-BlindVaultLeaseRenewal - Added blind-authorized,
 //! atomic live-lease renewal with exact request commitments and signed receipts.
 //! v1.13.0-BlindVaultLeaseRetirement - Added atomic complete
 //! lease deletion with exact request commitments and bounded retry evidence.
@@ -112,7 +117,8 @@ use aeronyx_core::protocol::blind_vault::{
     BlindVaultBlindLeaseRenewalRequest, BlindVaultBlindLeaseRenewedReceipt,
     BlindVaultDeleteRequest, BlindVaultDeletedReceipt, BlindVaultError,
     BlindVaultLeaseAdmissionRequest, BlindVaultLeaseCreateRequest, BlindVaultLeaseRetireRequest,
-    BlindVaultLeaseRetiredReceipt, BlindVaultPutRequest, BlindVaultStoredReceipt,
+    BlindVaultLeaseRetiredReceipt, BlindVaultLeaseStatusReceipt, BlindVaultLeaseStatusRequest,
+    BlindVaultPutRequest, BlindVaultStoredReceipt,
 };
 use blind_rsa_signatures::{MessageRandomizer, PublicKeySha384PSSRandomized, Signature};
 use chacha20poly1305::{
@@ -412,6 +418,15 @@ pub enum BlindVaultLeaseRenewFailureClass {
     Unavailable,
 }
 
+/// Privacy-safe retry class for private lease-status observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultLeaseStatusFailureClass {
+    /// The same signed status request cannot succeed unchanged.
+    Rejected,
+    /// Replica storage or local runtime is unavailable.
+    Unavailable,
+}
+
 impl BlindVaultServiceError {
     /// Returns the coarse retry class for a Put failure.
     #[must_use]
@@ -643,6 +658,45 @@ impl BlindVaultServiceError {
             | Self::IssuerDirectoryGenerationOutOfRange
             | Self::CorruptState
             | Self::TimestampOutOfRange => BlindVaultLeaseRenewFailureClass::Unavailable,
+        }
+    }
+
+    /// Returns the coarse retry class for private lease-status observation.
+    #[must_use]
+    pub const fn lease_status_failure_class(&self) -> BlindVaultLeaseStatusFailureClass {
+        // [BLIND-VAULT-LEASE-STATUS-FAILURE 2026-08-28 by Codex] Keep lease
+        // existence, expiry, authority, and request validity indistinguishable
+        // outside the encrypted terminal response boundary.
+        match self {
+            Self::Protocol(_)
+            | Self::LeaseNotFound
+            | Self::LeaseExpired
+            | Self::LeaseConflict
+            | Self::ObjectConflict
+            | Self::RequestConflict
+            | Self::ObjectDeleted
+            | Self::QuotaExceeded
+            | Self::ReadUnauthorized
+            | Self::InvalidPullCursor
+            | Self::AdmissionIssuerRejected
+            | Self::AdmissionProofRejected
+            | Self::AdmissionSpent
+            | Self::ObjectNotFound => BlindVaultLeaseStatusFailureClass::Rejected,
+            Self::Disabled
+            | Self::Sqlite(_)
+            | Self::Filesystem
+            | Self::PullCursorEncryptionFailed
+            | Self::AdmissionUnavailable
+            | Self::AdmissionConfigurationInvalid
+            | Self::IssuerDirectoryAuthorityRejected
+            | Self::IssuerDirectoryUpdateRejected
+            | Self::IssuerDirectoryRollback
+            | Self::IssuerDirectoryGenerationConflict
+            | Self::IssuerDirectoryContinuity
+            | Self::IssuerDirectoryNoActiveEpoch
+            | Self::IssuerDirectoryGenerationOutOfRange
+            | Self::CorruptState
+            | Self::TimestampOutOfRange => BlindVaultLeaseStatusFailureClass::Unavailable,
         }
     }
 }
@@ -1576,6 +1630,60 @@ impl BlindVaultService {
         self.sign_lease_renewal_receipt(request, renewal.renewed_at_ms)
     }
 
+    /// Returns one administration-authorized, terminal-signed live-lease view.
+    ///
+    /// [BLIND-VAULT-LEASE-STATUS-SNAPSHOT 2026-08-28 by Codex] Signature
+    /// verification happens before querying aggregate usage. The second
+    /// authority check and all returned counters come from one SQLite
+    /// statement, so retirement, reprovisioning, cleanup, or renewal cannot
+    /// produce a receipt assembled from different lease generations.
+    pub fn lease_status(
+        &self,
+        request: &BlindVaultLeaseStatusRequest,
+        now_ms: u64,
+    ) -> Result<BlindVaultLeaseStatusReceipt, BlindVaultServiceError> {
+        if !self.config.public_api_enabled {
+            return Err(BlindVaultServiceError::AdmissionUnavailable);
+        }
+        let authenticated_admin_key = {
+            let lease = self.lease_runtime_snapshot(&request.lease_id)?;
+            if lease.expires_at_ms <= now_ms {
+                return Err(BlindVaultServiceError::LeaseExpired);
+            }
+            let admin_key = IdentityPublicKey::from_bytes(&lease.admin_verifying_key)
+                .map_err(|_| BlindVaultServiceError::CorruptState)?;
+            request.validate_and_verify(
+                now_ms,
+                self.config.mutation_clock_skew_ms(),
+                &admin_key,
+            )?;
+            lease.admin_verifying_key
+        };
+
+        let observation = {
+            let connection = self.connection.lock();
+            load_live_lease_status(&connection, &request.lease_id, now_ms)?
+                .ok_or(BlindVaultServiceError::LeaseNotFound)?
+        };
+        if observation.admin_verifying_key != authenticated_admin_key {
+            return Err(BlindVaultServiceError::LeaseConflict);
+        }
+        if observation.expires_at_ms <= now_ms {
+            return Err(BlindVaultServiceError::LeaseExpired);
+        }
+
+        let mut receipt = BlindVaultLeaseStatusReceipt::new(
+            request,
+            observation.expires_at_ms,
+            observation.live_object_count,
+            observation.live_ciphertext_bytes,
+            now_ms,
+            self.node_identity.public_key_bytes(),
+        );
+        receipt.sign(&self.node_identity)?;
+        Ok(receipt)
+    }
+
     /// Retires one complete anonymous lease and returns a node-signed receipt.
     ///
     /// The transaction inserts a bounded idempotency tombstone before deleting
@@ -2191,6 +2299,15 @@ struct LeaseRuntimeRow {
     byte_count: u64,
 }
 
+/// One coherent live-usage observation returned by a single SQLite statement.
+#[derive(Debug, Clone, Copy)]
+struct LeaseStatusObservation {
+    admin_verifying_key: [u8; 32],
+    expires_at_ms: u64,
+    live_object_count: u64,
+    live_ciphertext_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LeaseObjectUsage {
     object_count: u64,
@@ -2462,6 +2579,36 @@ fn load_lease_runtime(
             expires_at_ms: non_negative_u64(expires)?,
             object_count: non_negative_u64(count)?,
             byte_count: non_negative_u64(bytes)?,
+        })
+    })
+    .transpose()
+}
+
+fn load_live_lease_status(
+    connection: &Connection,
+    lease_id: &[u8; 32],
+    now_ms: u64,
+) -> Result<Option<LeaseStatusObservation>, BlindVaultServiceError> {
+    let now = sqlite_i64(now_ms)?;
+    let row: Option<(Vec<u8>, i64, i64, i64)> = connection
+        .query_row(
+            "SELECT l.admin_verifying_key, l.expires_at_ms,
+                    COUNT(o.sequence), COALESCE(SUM(length(o.ciphertext)), 0)
+             FROM blind_vault_leases AS l
+             LEFT JOIN blind_vault_objects AS o
+               ON o.lease_id = l.lease_id AND o.expires_at_ms > ?2
+             WHERE l.lease_id = ?1
+             GROUP BY l.lease_id, l.admin_verifying_key, l.expires_at_ms",
+            params![&lease_id[..], now],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    row.map(|(admin_key, expires_at, object_count, ciphertext_bytes)| {
+        Ok(LeaseStatusObservation {
+            admin_verifying_key: fixed_array(&admin_key)?,
+            expires_at_ms: non_negative_u64(expires_at)?,
+            live_object_count: non_negative_u64(object_count)?,
+            live_ciphertext_bytes: non_negative_u64(ciphertext_bytes)?,
         })
     })
     .transpose()

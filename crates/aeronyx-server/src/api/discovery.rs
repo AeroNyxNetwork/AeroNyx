@@ -143,6 +143,8 @@
 //!   even during the short interval between local persistence and witnessing.
 //!
 //! ## Last Modified
+//! v0.56.0-OnionLeaseStatusTerminalContract - Added feature-gated private
+//! administration-authorized lease status observations
 //! v0.55.0-OnionLeaseRenewalTerminalContract - Added feature-gated blind
 //! lease renewal through encrypted terminal replies
 //! v0.54.0-OnionLeaseRetireTerminalContract - Added feature-gated complete
@@ -680,6 +682,15 @@ impl OnionTerminalRequirement {
                     &[
                         NodeProtocolFeature::OnionReplyV1,
                         NodeProtocolFeature::OnionBlindVaultLeaseRenewalV1,
+                    ]
+                }
+                Some(OnionRoutePurpose::BlindVaultLeaseStatus) => {
+                    // [ONION-BLIND-VAULT-LEASE-STATUS 2026-08-28 by Codex]
+                    // Private status observations require an exact terminal
+                    // feature so older nodes cannot be selected speculatively.
+                    &[
+                        NodeProtocolFeature::OnionReplyV1,
+                        NodeProtocolFeature::OnionBlindVaultLeaseStatusV1,
                     ]
                 }
                 _ => &[],
