@@ -106,8 +106,8 @@ pub use blind_vault::{
     BlindVaultInventoryCommitmentEntry, BlindVaultInventoryCommitmentSummary,
     BlindVaultLeaseCreateRequest, BlindVaultLeaseInventoryReceipt, BlindVaultLeaseInventoryRequest,
     BlindVaultLeaseRenewRequest, BlindVaultLeaseRetireRequest, BlindVaultLeaseRetiredReceipt,
-    BlindVaultLeaseStatusReceipt, BlindVaultLeaseStatusRequest, BlindVaultOnionDeleteError,
-    BlindVaultOnionDeleteSession, BlindVaultOnionLeaseAdmissionError,
+    BlindVaultLeaseStatusReceipt, BlindVaultLeaseStatusRequest, BlindVaultManifestReplicaPlanner,
+    BlindVaultOnionDeleteError, BlindVaultOnionDeleteSession, BlindVaultOnionLeaseAdmissionError,
     BlindVaultOnionLeaseAdmissionSession, BlindVaultOnionLeaseInventoryError,
     BlindVaultOnionLeaseInventorySession, BlindVaultOnionLeaseRenewalError,
     BlindVaultOnionLeaseRenewalSession, BlindVaultOnionLeaseRetireError,
@@ -115,8 +115,12 @@ pub use blind_vault::{
     BlindVaultOnionLeaseStatusSession, BlindVaultOnionPullError, BlindVaultOnionPullSession,
     BlindVaultOnionPutError, BlindVaultOnionPutSession, BlindVaultPullRequest,
     BlindVaultPullResponse, BlindVaultPutRequest, BlindVaultRecoveredObject,
-    BlindVaultStoredReceipt, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_PROTOCOL_VERSION,
-    MAX_BLIND_VAULT_FRAME_BYTES,
+    BlindVaultReplicaAction, BlindVaultReplicaEvidence, BlindVaultReplicaEvidenceError,
+    BlindVaultReplicaManifestExpectation, BlindVaultReplicaPlan, BlindVaultReplicaPlanError,
+    BlindVaultReplicaPlanHealth, BlindVaultReplicaPlanner, BlindVaultReplicaPolicy,
+    BlindVaultStoredReceipt, BlindVaultVerifiedReplicaInventory,
+    BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_PROTOCOL_VERSION, MAX_BLIND_VAULT_FRAME_BYTES,
+    MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
 pub use codec::{Codec, ProtocolCodec};

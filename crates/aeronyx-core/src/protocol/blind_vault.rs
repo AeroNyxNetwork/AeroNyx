@@ -27,6 +27,8 @@
 //!   for private replica repair and renewal decisions.
 //! - Defines streaming, per-replica inventory commitments so a source can
 //!   verify its own manifest without linking independently wrapped replicas.
+//! - Plans fail-closed replica renewal, reconciliation, retry, replacement,
+//!   and provisioning from source-owned per-replica manifest expectations.
 //! - Provides deterministic signing bytes and bounded binary wire framing.
 //! - Enforces coarse ciphertext size classes to reduce content-size leakage.
 //! - Keeps application domain separation inside client ciphertext and keys.
@@ -65,7 +67,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.14.0-BlindVaultOnionLeaseInventory - Added streaming,
+//! Last Modified: v1.15.0-BlindVaultReplicaPlanner - Added source-owned,
+//! manifest-bound replica evidence verification and lifecycle planning.
+//! v1.14.0-BlindVaultOnionLeaseInventory - Added streaming,
 //! private terminal-signed encrypted-object inventory commitments.
 //! v1.13.0-BlindVaultOnionLeaseStatus - Added
 //! administration-authorized, encrypted terminal-signed lease status observations.
@@ -95,6 +99,8 @@
 //! administration-key deletion, and signed deletion receipts.
 //! v1.0.0-BlindVaultWire - Initial durable object and signed receipt contract.
 //! ============================================
+
+use std::collections::BTreeSet;
 
 use bincode::Options;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -192,6 +198,9 @@ pub const MAX_BLIND_VAULT_BLIND_SIGNATURE_BYTES: usize = 512;
 
 /// Maximum rotating blind-admission keys advertised by one storage node.
 pub const MAX_BLIND_VAULT_BLIND_ISSUER_EPOCHS: usize = 16;
+
+/// Maximum replica members accepted by one local lifecycle plan.
+pub const MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS: usize = 16;
 
 /// Maximum canonical RSA public-key DER accepted in an issuer directory.
 pub const MAX_BLIND_VAULT_BLIND_ISSUER_DER_BYTES: usize = 800;
@@ -2775,6 +2784,542 @@ impl BlindVaultLeaseInventoryReceipt {
         }
         Ok(())
     }
+}
+
+/// Source-owned expected state for one independently wrapped replica.
+///
+/// This type is deliberately not serializable. Replica object identifiers and
+/// commitments are local repair material and must never become public-chain,
+/// discovery, or cross-replica correlation metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultReplicaManifestExpectation {
+    node_id: [u8; 32],
+    lease_id: [u8; 32],
+    object_count: u64,
+    ciphertext_bytes: u64,
+    inventory_commitment: [u8; 32],
+}
+
+impl BlindVaultReplicaManifestExpectation {
+    /// Creates one validated source-side replica expectation.
+    pub fn new(
+        node_id: [u8; 32],
+        lease_id: [u8; 32],
+        object_count: u64,
+        ciphertext_bytes: u64,
+        inventory_commitment: [u8; 32],
+    ) -> Result<Self, BlindVaultReplicaEvidenceError> {
+        require_non_zero("node_id", &node_id)?;
+        require_non_zero("lease_id", &lease_id)?;
+        require_non_zero("inventory_commitment", &inventory_commitment)?;
+        if (object_count == 0) != (ciphertext_bytes == 0) {
+            return Err(BlindVaultReplicaEvidenceError::InvalidExpectation);
+        }
+        Ok(Self {
+            node_id,
+            lease_id,
+            object_count,
+            ciphertext_bytes,
+            inventory_commitment,
+        })
+    }
+
+    /// Descriptor identity expected to sign this replica's observation.
+    #[must_use]
+    pub const fn node_id(&self) -> [u8; 32] {
+        self.node_id
+    }
+
+    /// Replica-local lease identifier.
+    #[must_use]
+    pub const fn lease_id(&self) -> [u8; 32] {
+        self.lease_id
+    }
+
+    /// Expected number of still-live encrypted objects.
+    #[must_use]
+    pub const fn object_count(&self) -> u64 {
+        self.object_count
+    }
+
+    /// Expected total padded ciphertext bytes.
+    #[must_use]
+    pub const fn ciphertext_bytes(&self) -> u64 {
+        self.ciphertext_bytes
+    }
+
+    /// Expected domain-separated root for this replica's own manifest.
+    #[must_use]
+    pub const fn inventory_commitment(&self) -> [u8; 32] {
+        self.inventory_commitment
+    }
+}
+
+/// Verified, freshness-bounded inventory evidence for one replica.
+///
+/// Construction requires the exact request, expected terminal identity, and
+/// source-owned manifest. A valid but divergent receipt remains evidence: the
+/// planner classifies it for reconciliation instead of confusing divergence
+/// with an invalid signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultVerifiedReplicaInventory {
+    node_id: [u8; 32],
+    lease_id: [u8; 32],
+    expires_at_ms: u64,
+    observed_at_ms: u64,
+    expected_object_count: u64,
+    observed_object_count: u64,
+    expected_ciphertext_bytes: u64,
+    observed_ciphertext_bytes: u64,
+    expected_inventory_commitment: [u8; 32],
+    observed_inventory_commitment: [u8; 32],
+    matches_expected_manifest: bool,
+}
+
+impl BlindVaultVerifiedReplicaInventory {
+    /// Verifies one terminal receipt against its exact request and local
+    /// per-replica expectation.
+    ///
+    /// `maximum_receipt_age_ms` must be non-zero. Future observations are
+    /// accepted only within `maximum_future_clock_skew_ms`. Lease expiry is not
+    /// rejected here because the planner must convert signed expired evidence
+    /// into an explicit replacement action.
+    pub fn verify(
+        receipt: &BlindVaultLeaseInventoryReceipt,
+        request: &BlindVaultLeaseInventoryRequest,
+        expectation: &BlindVaultReplicaManifestExpectation,
+        now_ms: u64,
+        maximum_receipt_age_ms: u64,
+        maximum_future_clock_skew_ms: u64,
+    ) -> Result<Self, BlindVaultReplicaEvidenceError> {
+        if now_ms == 0 || maximum_receipt_age_ms == 0 {
+            return Err(BlindVaultReplicaEvidenceError::InvalidFreshnessPolicy);
+        }
+        if request.lease_id != expectation.lease_id {
+            return Err(BlindVaultReplicaEvidenceError::RequestMismatch);
+        }
+        if receipt.node_id != expectation.node_id {
+            return Err(BlindVaultReplicaEvidenceError::TerminalIdentityMismatch);
+        }
+        let terminal_key = IdentityPublicKey::from_bytes(&expectation.node_id)
+            .map_err(|_| BlindVaultReplicaEvidenceError::InvalidTerminalIdentity)?;
+        receipt.validate_and_verify(&terminal_key)?;
+        if !receipt.matches_inventory(request) {
+            return Err(BlindVaultReplicaEvidenceError::RequestMismatch);
+        }
+
+        if receipt.observed_at_ms > now_ms {
+            if receipt.observed_at_ms - now_ms > maximum_future_clock_skew_ms {
+                return Err(BlindVaultReplicaEvidenceError::ReceiptFromFuture);
+            }
+        } else if now_ms - receipt.observed_at_ms > maximum_receipt_age_ms {
+            return Err(BlindVaultReplicaEvidenceError::ReceiptStale);
+        }
+
+        let matches_expected_manifest = receipt.live_object_count == expectation.object_count
+            && receipt.live_ciphertext_bytes == expectation.ciphertext_bytes
+            && receipt.inventory_commitment == expectation.inventory_commitment;
+        Ok(Self {
+            node_id: expectation.node_id,
+            lease_id: expectation.lease_id,
+            expires_at_ms: receipt.expires_at_ms,
+            observed_at_ms: receipt.observed_at_ms,
+            expected_object_count: expectation.object_count,
+            observed_object_count: receipt.live_object_count,
+            expected_ciphertext_bytes: expectation.ciphertext_bytes,
+            observed_ciphertext_bytes: receipt.live_ciphertext_bytes,
+            expected_inventory_commitment: expectation.inventory_commitment,
+            observed_inventory_commitment: receipt.inventory_commitment,
+            matches_expected_manifest,
+        })
+    }
+
+    /// Descriptor identity that signed the evidence.
+    #[must_use]
+    pub const fn node_id(&self) -> [u8; 32] {
+        self.node_id
+    }
+
+    /// Replica-local lease identifier.
+    #[must_use]
+    pub const fn lease_id(&self) -> [u8; 32] {
+        self.lease_id
+    }
+
+    /// Signed lease expiry observed at the terminal.
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+
+    /// Signed terminal observation time.
+    #[must_use]
+    pub const fn observed_at_ms(&self) -> u64 {
+        self.observed_at_ms
+    }
+
+    /// Whether all signed aggregate fields match this replica's expectation.
+    #[must_use]
+    pub const fn matches_expected_manifest(&self) -> bool {
+        self.matches_expected_manifest
+    }
+}
+
+/// Most recent source-owned evidence for one intended replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultReplicaEvidence {
+    /// A terminal-signed, request-bound, freshness-checked inventory.
+    Observed(BlindVaultVerifiedReplicaInventory),
+    /// No valid inventory could be obtained for this intended member.
+    Unavailable {
+        /// Expected descriptor identity.
+        node_id: [u8; 32],
+        /// Replica-local lease identifier.
+        lease_id: [u8; 32],
+        /// Consecutive completed observation attempts that failed.
+        consecutive_failures: u16,
+    },
+}
+
+impl BlindVaultReplicaEvidence {
+    /// Expected descriptor identity for deterministic planning and deduplication.
+    #[must_use]
+    pub const fn node_id(&self) -> [u8; 32] {
+        match self {
+            Self::Observed(inventory) => inventory.node_id,
+            Self::Unavailable { node_id, .. } => *node_id,
+        }
+    }
+
+    /// Replica-local lease identifier for duplicate detection.
+    #[must_use]
+    pub const fn lease_id(&self) -> [u8; 32] {
+        match self {
+            Self::Observed(inventory) => inventory.lease_id,
+            Self::Unavailable { lease_id, .. } => *lease_id,
+        }
+    }
+}
+
+/// Source policy for maintaining independently wrapped replicas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultReplicaPolicy {
+    /// Desired replica floor. Transitional extra replicas are permitted.
+    pub target_replicas: u8,
+    /// Minimum live replicas whose signed inventory matches local expectations.
+    pub minimum_healthy_replicas: u8,
+    /// Lead time before expiry at which a live lease should be renewed.
+    pub renewal_lead_ms: u64,
+    /// Consecutive failed observations before replacing a replica.
+    pub replace_after_consecutive_failures: u16,
+}
+
+impl BlindVaultReplicaPolicy {
+    fn validate(self) -> Result<(), BlindVaultReplicaPlanError> {
+        let target_replicas = usize::from(self.target_replicas);
+        if target_replicas == 0
+            || target_replicas > MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS
+            || self.minimum_healthy_replicas == 0
+            || self.minimum_healthy_replicas > self.target_replicas
+            || self.renewal_lead_ms == 0
+            || self.replace_after_consecutive_failures == 0
+        {
+            return Err(BlindVaultReplicaPlanError::InvalidPolicy);
+        }
+        Ok(())
+    }
+}
+
+/// Aggregate safety state of a source's current replica set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultReplicaPlanHealth {
+    /// Matching live evidence meets policy and no action is due.
+    Healthy,
+    /// Matching live evidence meets policy and only lease renewal is due.
+    MaintenanceDue,
+    /// Matching live evidence meets policy but repair or membership work is due.
+    Degraded,
+    /// Too few live, matching replicas exist to satisfy the configured quorum.
+    QuorumUnavailable,
+}
+
+/// One declarative source-side lifecycle action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultReplicaAction {
+    /// Renew one still-live lease before its current generation expires.
+    RenewLease {
+        node_id: [u8; 32],
+        lease_id: [u8; 32],
+        expected_expires_at_ms: u64,
+    },
+    /// Rebuild one divergent replica from this source's private manifest.
+    ReconcileInventory {
+        node_id: [u8; 32],
+        lease_id: [u8; 32],
+        expected_object_count: u64,
+        observed_object_count: u64,
+        expected_ciphertext_bytes: u64,
+        observed_ciphertext_bytes: u64,
+        expected_inventory_commitment: [u8; 32],
+        observed_inventory_commitment: [u8; 32],
+    },
+    /// Retry a temporarily unavailable member without changing membership.
+    RetryObservation {
+        node_id: [u8; 32],
+        lease_id: [u8; 32],
+    },
+    /// Replace an expired or repeatedly unreachable member.
+    ReplaceReplica {
+        node_id: [u8; 32],
+        lease_id: [u8; 32],
+    },
+    /// Provision anonymous replicas until the configured floor is restored.
+    ProvisionReplicas { count: u8 },
+}
+
+/// Deterministic, declarative result of one replica lifecycle evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindVaultReplicaPlan {
+    /// Safety state after evaluating the supplied evidence.
+    pub health: BlindVaultReplicaPlanHealth,
+    /// Number of intended members represented by the supplied evidence.
+    pub configured_replicas: u8,
+    /// Number of verified observations for leases that have not expired.
+    pub live_verified_replicas: u8,
+    /// Number of live observations matching their own expected manifests.
+    pub live_matching_replicas: u8,
+    /// Deterministic local actions; no repair source is selected here.
+    pub actions: Vec<BlindVaultReplicaAction>,
+}
+
+/// Replaceable capability for source-owned replica lifecycle planning.
+pub trait BlindVaultReplicaPlanner {
+    /// Produces a deterministic plan from already verified or unavailable
+    /// per-replica evidence.
+    fn plan(
+        &self,
+        now_ms: u64,
+        evidence: &[BlindVaultReplicaEvidence],
+    ) -> Result<BlindVaultReplicaPlan, BlindVaultReplicaPlanError>;
+}
+
+/// Manifest-bound planner that never infers truth from a replica majority.
+///
+/// [BLIND-VAULT-REPLICA-PLANNER 2026-08-28 by Codex] Each node is checked only
+/// against its own independently randomized expected manifest. The planner
+/// intentionally does not select a repair source: if matching live evidence
+/// falls below policy, callers receive `QuorumUnavailable` and must not treat
+/// another replica's object identifiers as authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultManifestReplicaPlanner {
+    policy: BlindVaultReplicaPolicy,
+}
+
+impl BlindVaultManifestReplicaPlanner {
+    /// Creates a planner after validating all policy invariants.
+    pub fn new(policy: BlindVaultReplicaPolicy) -> Result<Self, BlindVaultReplicaPlanError> {
+        policy.validate()?;
+        Ok(Self { policy })
+    }
+
+    /// Returns the immutable policy used for planning.
+    #[must_use]
+    pub const fn policy(&self) -> BlindVaultReplicaPolicy {
+        self.policy
+    }
+}
+
+impl BlindVaultReplicaPlanner for BlindVaultManifestReplicaPlanner {
+    fn plan(
+        &self,
+        now_ms: u64,
+        evidence: &[BlindVaultReplicaEvidence],
+    ) -> Result<BlindVaultReplicaPlan, BlindVaultReplicaPlanError> {
+        self.policy.validate()?;
+        if now_ms == 0 {
+            return Err(BlindVaultReplicaPlanError::TimestampOutOfRange);
+        }
+        if evidence.len() > MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS {
+            return Err(BlindVaultReplicaPlanError::TooManyReplicas {
+                actual: evidence.len(),
+            });
+        }
+        let renewal_deadline = now_ms
+            .checked_add(self.policy.renewal_lead_ms)
+            .ok_or(BlindVaultReplicaPlanError::TimestampOutOfRange)?;
+
+        let mut node_ids = BTreeSet::new();
+        let mut lease_ids = BTreeSet::new();
+        for member in evidence {
+            let node_id = member.node_id();
+            let lease_id = member.lease_id();
+            if node_id == [0; 32] || lease_id == [0; 32] {
+                return Err(BlindVaultReplicaPlanError::InvalidEvidenceIdentity);
+            }
+            if !node_ids.insert(node_id) {
+                return Err(BlindVaultReplicaPlanError::DuplicateNode);
+            }
+            if !lease_ids.insert(lease_id) {
+                return Err(BlindVaultReplicaPlanError::DuplicateLease);
+            }
+            if matches!(
+                member,
+                BlindVaultReplicaEvidence::Unavailable {
+                    consecutive_failures: 0,
+                    ..
+                }
+            ) {
+                return Err(BlindVaultReplicaPlanError::InvalidUnavailableEvidence);
+            }
+        }
+
+        let mut ordered = evidence.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|member| member.node_id());
+        let mut live_verified_replicas = 0_u8;
+        let mut live_matching_replicas = 0_u8;
+        let mut actions = Vec::new();
+
+        for member in ordered {
+            match member {
+                BlindVaultReplicaEvidence::Observed(inventory) => {
+                    if inventory.expires_at_ms <= now_ms {
+                        actions.push(BlindVaultReplicaAction::ReplaceReplica {
+                            node_id: inventory.node_id,
+                            lease_id: inventory.lease_id,
+                        });
+                        continue;
+                    }
+                    live_verified_replicas += 1;
+                    if inventory.matches_expected_manifest {
+                        live_matching_replicas += 1;
+                    } else {
+                        actions.push(BlindVaultReplicaAction::ReconcileInventory {
+                            node_id: inventory.node_id,
+                            lease_id: inventory.lease_id,
+                            expected_object_count: inventory.expected_object_count,
+                            observed_object_count: inventory.observed_object_count,
+                            expected_ciphertext_bytes: inventory.expected_ciphertext_bytes,
+                            observed_ciphertext_bytes: inventory.observed_ciphertext_bytes,
+                            expected_inventory_commitment: inventory.expected_inventory_commitment,
+                            observed_inventory_commitment: inventory.observed_inventory_commitment,
+                        });
+                    }
+                    if inventory.expires_at_ms <= renewal_deadline {
+                        actions.push(BlindVaultReplicaAction::RenewLease {
+                            node_id: inventory.node_id,
+                            lease_id: inventory.lease_id,
+                            expected_expires_at_ms: inventory.expires_at_ms,
+                        });
+                    }
+                }
+                BlindVaultReplicaEvidence::Unavailable {
+                    node_id,
+                    lease_id,
+                    consecutive_failures,
+                } => {
+                    if *consecutive_failures >= self.policy.replace_after_consecutive_failures {
+                        actions.push(BlindVaultReplicaAction::ReplaceReplica {
+                            node_id: *node_id,
+                            lease_id: *lease_id,
+                        });
+                    } else {
+                        actions.push(BlindVaultReplicaAction::RetryObservation {
+                            node_id: *node_id,
+                            lease_id: *lease_id,
+                        });
+                    }
+                }
+            }
+        }
+
+        if evidence.len() < usize::from(self.policy.target_replicas) {
+            let missing = usize::from(self.policy.target_replicas) - evidence.len();
+            actions.push(BlindVaultReplicaAction::ProvisionReplicas {
+                count: u8::try_from(missing)
+                    .map_err(|_| BlindVaultReplicaPlanError::TooManyReplicas { actual: missing })?,
+            });
+        }
+
+        let health = if live_matching_replicas < self.policy.minimum_healthy_replicas {
+            BlindVaultReplicaPlanHealth::QuorumUnavailable
+        } else if actions.is_empty() {
+            BlindVaultReplicaPlanHealth::Healthy
+        } else if actions
+            .iter()
+            .all(|action| matches!(action, BlindVaultReplicaAction::RenewLease { .. }))
+        {
+            BlindVaultReplicaPlanHealth::MaintenanceDue
+        } else {
+            BlindVaultReplicaPlanHealth::Degraded
+        };
+
+        Ok(BlindVaultReplicaPlan {
+            health,
+            configured_replicas: u8::try_from(evidence.len()).map_err(|_| {
+                BlindVaultReplicaPlanError::TooManyReplicas {
+                    actual: evidence.len(),
+                }
+            })?,
+            live_verified_replicas,
+            live_matching_replicas,
+            actions,
+        })
+    }
+}
+
+/// Fail-closed verification errors for private replica evidence.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BlindVaultReplicaEvidenceError {
+    /// The underlying inventory contract was malformed or unauthenticated.
+    #[error("blind vault replica evidence violated the inventory protocol")]
+    BlindVault(#[from] BlindVaultError),
+    /// Expected object and byte aggregates were internally inconsistent.
+    #[error("blind vault replica manifest expectation is invalid")]
+    InvalidExpectation,
+    /// Receipt terminal identity did not match the intended replica member.
+    #[error("blind vault replica terminal identity mismatch")]
+    TerminalIdentityMismatch,
+    /// The expected terminal identity could not be reconstructed as Ed25519.
+    #[error("invalid blind vault replica terminal identity")]
+    InvalidTerminalIdentity,
+    /// Receipt did not answer the exact request and replica-local lease.
+    #[error("blind vault replica inventory request mismatch")]
+    RequestMismatch,
+    /// Caller supplied an unusable local freshness policy.
+    #[error("blind vault replica evidence freshness policy is invalid")]
+    InvalidFreshnessPolicy,
+    /// Receipt observation exceeded allowed future clock skew.
+    #[error("blind vault replica inventory receipt is from the future")]
+    ReceiptFromFuture,
+    /// Receipt observation was older than the configured evidence lifetime.
+    #[error("blind vault replica inventory receipt is stale")]
+    ReceiptStale,
+}
+
+/// Invalid policy or evidence-set errors for replica lifecycle planning.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BlindVaultReplicaPlanError {
+    /// Policy quorum, target, renewal, or replacement values were invalid.
+    #[error("blind vault replica policy is invalid")]
+    InvalidPolicy,
+    /// Evidence exceeded the bounded local planning set.
+    #[error("blind vault replica set contains too many members: {actual}")]
+    TooManyReplicas { actual: usize },
+    /// Two evidence entries declared the same terminal descriptor identity.
+    #[error("blind vault replica set contains a duplicate node")]
+    DuplicateNode,
+    /// Two evidence entries declared the same replica-local lease.
+    #[error("blind vault replica set contains a duplicate lease")]
+    DuplicateLease,
+    /// An evidence member used an all-zero terminal or lease identity.
+    #[error("blind vault replica evidence identity is invalid")]
+    InvalidEvidenceIdentity,
+    /// Unavailable evidence must represent at least one completed failure.
+    #[error("blind vault unavailable replica evidence is invalid")]
+    InvalidUnavailableEvidence,
+    /// Planning time or renewal-window arithmetic was not representable.
+    #[error("blind vault replica planning timestamp is out of range")]
+    TimestampOutOfRange,
 }
 
 /// Signed node proof that an opaque object was deleted or had already been
