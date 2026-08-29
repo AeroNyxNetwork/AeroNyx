@@ -60,7 +60,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.28.0-TerminalAttemptRuntime - Aligned durable effects,
+//! Last Modified: v1.29.0-OwnedTerminalRuntime - Added direct live/recovery
+//! ownership transfer without self-referential integration state.
+//! v1.28.0-TerminalAttemptRuntime - Aligned durable effects,
 //! one-time reply sessions, and workload verification under one cursor.
 //! v1.27.0-VerifiedOnionEffectTransport - Composed ordered
 //! effects with purpose-bound verified routes and opaque envelope I/O.
@@ -152,15 +154,16 @@ pub use bound_continuation::{
     BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaBoundContinuationError,
 };
 pub use bound_dispatch::{
-    BlindVaultReplicaCommittedBoundAttemptDispatch, BlindVaultReplicaDurableBoundAttemptDispatch,
-    BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
-    BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaPersistedBoundAttemptJournal,
-    BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaTerminalAttemptError,
-    BlindVaultReplicaTerminalAttemptRuntime, BlindVaultReplicaTerminalAttemptRuntimeBuildError,
-    BlindVaultReplicaTerminalAttemptState, BlindVaultReplicaTerminalEffectTransport,
-    BlindVaultReplicaTerminalReplyVerifier, BlindVaultReplicaTerminalSendContext,
-    BlindVaultReplicaTerminalSendError, BlindVaultReplicaTerminalSendSequence,
-    BlindVaultReplicaVerifiedOnionTransport, BlindVaultReplicaVerifiedOnionTransportError,
+    BlindVaultReplicaBoundRuntimeError, BlindVaultReplicaCommittedBoundAttemptDispatch,
+    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaOnionDispatchPlan,
+    BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
+    BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
+    BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalAttemptRuntime,
+    BlindVaultReplicaTerminalAttemptRuntimeBuildError, BlindVaultReplicaTerminalAttemptState,
+    BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalReplyVerifier,
+    BlindVaultReplicaTerminalSendContext, BlindVaultReplicaTerminalSendError,
+    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaVerifiedOnionTransport,
+    BlindVaultReplicaVerifiedOnionTransportError,
 };
 pub use durable_dispatch::{
     BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,

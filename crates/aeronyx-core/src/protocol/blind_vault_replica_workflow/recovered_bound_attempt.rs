@@ -32,8 +32,10 @@
 //! - Terminal request IDs must remain stable across restart and retransmission.
 //! - Never expose work identity or commitments through telemetry.
 //!
-//! Last Modified: v1.0.0-RecoveredBoundAttempt - Initial committed-only
-//! restoration and ordered resend authorization.
+//! Last Modified: v1.1.0-RecoveredOwnedRuntime - Added one-step restoration
+//! into a self-contained effect/session runtime.
+//! v1.0.0-RecoveredBoundAttempt - Initial committed-only restoration and
+//! ordered resend authorization.
 //! ============================================
 
 use std::fmt;
@@ -44,7 +46,8 @@ use zeroize::Zeroize;
 use super::{
     BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaBoundContinuationError,
     BlindVaultReplicaLoadedRecovery, BlindVaultReplicaPreparedEffectSet,
-    BlindVaultReplicaRestoredExecution, BlindVaultReplicaTerminalSendSequence,
+    BlindVaultReplicaRestoredExecution, BlindVaultReplicaTerminalAttemptRuntime,
+    BlindVaultReplicaTerminalAttemptRuntimeBuildError, BlindVaultReplicaTerminalSendSequence,
     BlindVaultReplicaWorkId,
 };
 
@@ -133,6 +136,27 @@ impl BlindVaultReplicaRecoveredBoundAttempt {
     ) {
         (self.restored, self.continuation, self.send_permit)
     }
+
+    /// Restores workflow ownership and one self-contained resend runtime.
+    ///
+    /// [BLIND-VAULT-RECOVERED-OWNED-RUNTIME 2026-08-29 by Codex] The
+    /// authenticated committed-phase permit is consumed in the same operation
+    /// that transfers effect bindings and private reply-session ownership.
+    pub fn into_terminal_attempt_runtime(
+        self,
+    ) -> Result<
+        (
+            BlindVaultReplicaRestoredExecution,
+            BlindVaultReplicaTerminalAttemptRuntime<'static>,
+        ),
+        BlindVaultReplicaRecoveredBoundAttemptError,
+    > {
+        let (restored, bound, send_permit) = self.into_parts();
+        let (effect_set, continuation) = bound.into_parts();
+        let send_sequence = send_permit.into_owned_terminal_send_sequence(effect_set)?;
+        let runtime = BlindVaultReplicaTerminalAttemptRuntime::new(send_sequence, continuation)?;
+        Ok((restored, runtime))
+    }
 }
 
 impl BlindVaultReplicaRecoveredSendPermit {
@@ -144,12 +168,7 @@ impl BlindVaultReplicaRecoveredSendPermit {
         BlindVaultReplicaTerminalSendSequence<'effects>,
         BlindVaultReplicaRecoveredBoundAttemptError,
     > {
-        if self.work_id != effect_set.work_id()
-            || self.attempt != effect_set.attempt()
-            || self.dispatched_at_ms != effect_set.planned_dispatch_at_ms()
-            || self.evidence_deadline_ms != effect_set.evidence_deadline_ms()
-            || self.effect_set_commitment != effect_set.commitment()
-        {
+        if !self.matches_effect_set(effect_set) {
             return Err(BlindVaultReplicaRecoveredBoundAttemptError::BindingMismatch);
         }
         Ok(BlindVaultReplicaTerminalSendSequence::from_durable_parts(
@@ -157,6 +176,33 @@ impl BlindVaultReplicaRecoveredSendPermit {
             self.snapshot_sequence,
             self.journal_sequence,
         ))
+    }
+
+    fn into_owned_terminal_send_sequence(
+        self,
+        effect_set: BlindVaultReplicaPreparedEffectSet,
+    ) -> Result<
+        BlindVaultReplicaTerminalSendSequence<'static>,
+        BlindVaultReplicaRecoveredBoundAttemptError,
+    > {
+        if !self.matches_effect_set(&effect_set) {
+            return Err(BlindVaultReplicaRecoveredBoundAttemptError::BindingMismatch);
+        }
+        Ok(
+            BlindVaultReplicaTerminalSendSequence::<'static>::from_owned_durable_parts(
+                effect_set,
+                self.snapshot_sequence,
+                self.journal_sequence,
+            ),
+        )
+    }
+
+    fn matches_effect_set(&self, effect_set: &BlindVaultReplicaPreparedEffectSet) -> bool {
+        self.work_id == effect_set.work_id()
+            && self.attempt == effect_set.attempt()
+            && self.dispatched_at_ms == effect_set.planned_dispatch_at_ms()
+            && self.evidence_deadline_ms == effect_set.evidence_deadline_ms()
+            && self.effect_set_commitment == effect_set.commitment()
     }
 
     /// Exact durable workflow snapshot high-water accepted by the loader.
@@ -213,4 +259,7 @@ pub enum BlindVaultReplicaRecoveredBoundAttemptError {
     /// Recovered send permit did not match the supplied effect set.
     #[error("blind vault replica recovered terminal effect binding mismatched")]
     BindingMismatch,
+    /// Restored effect and private reply-session ownership was inconsistent.
+    #[error(transparent)]
+    Runtime(#[from] BlindVaultReplicaTerminalAttemptRuntimeBuildError),
 }

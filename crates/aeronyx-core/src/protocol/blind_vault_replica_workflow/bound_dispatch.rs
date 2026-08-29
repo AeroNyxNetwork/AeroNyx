@@ -33,19 +33,23 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.0.0-BoundDurableDispatch - Initial effect-bound marker
-//! pipeline from sealed journal through ordered network send capability.
+//! Last Modified: v1.1.0-OwnedTerminalRuntime - Added one-step ownership
+//! transfer from a durable bound attempt into a self-contained runtime.
+//! v1.0.0-BoundDurableDispatch - Initial effect-bound marker pipeline from
+//! sealed journal through ordered network send capability.
 //! ============================================
 
 use std::fmt;
 
+use thiserror::Error;
 use zeroize::Zeroize;
 
 use super::{
-    BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,
-    BlindVaultReplicaDurableDispatchError, BlindVaultReplicaExecution,
-    BlindVaultReplicaPersistedAttemptJournal, BlindVaultReplicaPreparedAttemptJournal,
-    BlindVaultReplicaPreparedEffectSet, BlindVaultReplicaRecoveryStore, BlindVaultReplicaWorkId,
+    BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaCommittedAttemptDispatch,
+    BlindVaultReplicaDurableAttemptDispatch, BlindVaultReplicaDurableDispatchError,
+    BlindVaultReplicaExecution, BlindVaultReplicaPersistedAttemptJournal,
+    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedEffectSet,
+    BlindVaultReplicaRecoveryStore, BlindVaultReplicaWorkId,
 };
 use crate::crypto::keys::IdentityKeyPair;
 
@@ -251,6 +255,43 @@ impl BlindVaultReplicaDurableBoundAttemptDispatch<'_, '_> {
             self.durable.journal_sequence(),
         ))
     }
+
+    /// Consumes durable authority and complete private state into one owner.
+    ///
+    /// [BLIND-VAULT-OWNED-TERMINAL-RUNTIME 2026-08-29 by Codex] This path
+    /// preserves the borrowed sequence API while giving long-lived adapters a
+    /// non-self-referential runtime that owns effect bindings and sessions.
+    pub fn into_terminal_attempt_runtime(
+        self,
+        bound: BlindVaultReplicaBoundAttemptContinuation,
+    ) -> Result<BlindVaultReplicaTerminalAttemptRuntime<'static>, BlindVaultReplicaBoundRuntimeError>
+    {
+        if !self.prepared.matches_effect_set(bound.effect_set()) {
+            return Err(BlindVaultReplicaDurableDispatchError::StateMismatch.into());
+        }
+        let snapshot_sequence = self.durable.snapshot_sequence();
+        let journal_sequence = self.durable.journal_sequence();
+        let (effect_set, continuation) = bound.into_parts();
+        let send_sequence =
+            BlindVaultReplicaTerminalSendSequence::<'static>::from_owned_durable_parts(
+                effect_set,
+                snapshot_sequence,
+                journal_sequence,
+            );
+        BlindVaultReplicaTerminalAttemptRuntime::new(send_sequence, continuation)
+            .map_err(BlindVaultReplicaBoundRuntimeError::from)
+    }
+}
+
+/// Failure while composing a durable bound attempt into one owned runtime.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum BlindVaultReplicaBoundRuntimeError {
+    /// Durable marker and supplied effect/session binding did not match.
+    #[error(transparent)]
+    Durable(#[from] BlindVaultReplicaDurableDispatchError),
+    /// Remaining effect/session ownership was internally inconsistent.
+    #[error(transparent)]
+    Runtime(#[from] BlindVaultReplicaTerminalAttemptRuntimeBuildError),
 }
 
 impl fmt::Debug for BlindVaultReplicaPreparedBoundAttemptJournal {

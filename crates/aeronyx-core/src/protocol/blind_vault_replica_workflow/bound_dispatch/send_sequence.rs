@@ -31,7 +31,9 @@
 //! - Never advance on transport error or allow caller-selected effect indexes.
 //! - Route replacement belongs inside the transport adapter, not this binding.
 //!
-//! Last Modified: v1.1.0-TerminalAttemptRuntime - Shared canonical next-effect
+//! Last Modified: v1.2.0-OwnedEffectSource - Added an internal owned binding
+//! path so complete runtimes do not require self-referential integration.
+//! v1.1.0-TerminalAttemptRuntime - Shared canonical next-effect
 //! context with the aligned reply-session runtime.
 //! v1.0.0-OrderedTerminalSend - Initial verified transport boundary and
 //! monotonic effect cursor.
@@ -93,10 +95,24 @@ pub trait BlindVaultReplicaTerminalEffectTransport {
 
 /// Single-use-in-order capability created only by a durable bound marker.
 pub struct BlindVaultReplicaTerminalSendSequence<'effects> {
-    effect_set: &'effects BlindVaultReplicaPreparedEffectSet,
+    effect_set: BlindVaultReplicaTerminalEffectSetSource<'effects>,
     next_index: usize,
     snapshot_sequence: u64,
     journal_sequence: u64,
+}
+
+enum BlindVaultReplicaTerminalEffectSetSource<'effects> {
+    Borrowed(&'effects BlindVaultReplicaPreparedEffectSet),
+    Owned(Box<BlindVaultReplicaPreparedEffectSet>),
+}
+
+impl BlindVaultReplicaTerminalEffectSetSource<'_> {
+    fn as_effect_set(&self) -> &BlindVaultReplicaPreparedEffectSet {
+        match self {
+            Self::Borrowed(effect_set) => effect_set,
+            Self::Owned(effect_set) => effect_set,
+        }
+    }
 }
 
 impl<'effects> BlindVaultReplicaTerminalSendSequence<'effects> {
@@ -106,20 +122,37 @@ impl<'effects> BlindVaultReplicaTerminalSendSequence<'effects> {
         journal_sequence: u64,
     ) -> Self {
         Self {
-            effect_set,
+            effect_set: BlindVaultReplicaTerminalEffectSetSource::Borrowed(effect_set),
             next_index: 0,
             snapshot_sequence,
             journal_sequence,
         }
     }
 
+    pub(super) fn from_owned_durable_parts(
+        effect_set: BlindVaultReplicaPreparedEffectSet,
+        snapshot_sequence: u64,
+        journal_sequence: u64,
+    ) -> BlindVaultReplicaTerminalSendSequence<'static> {
+        BlindVaultReplicaTerminalSendSequence {
+            effect_set: BlindVaultReplicaTerminalEffectSetSource::Owned(Box::new(effect_set)),
+            next_index: 0,
+            snapshot_sequence,
+            journal_sequence,
+        }
+    }
+
+    fn effect_set(&self) -> &BlindVaultReplicaPreparedEffectSet {
+        self.effect_set.as_effect_set()
+    }
+
     pub(super) fn next_context(&self) -> Option<BlindVaultReplicaTerminalSendContext> {
         let effect_index = u16::try_from(self.next_index).ok()?;
-        let effect_count = u16::try_from(self.effect_set.effects().len()).ok()?;
-        (self.next_index < self.effect_set.effects().len()).then_some(
+        let effect_count = u16::try_from(self.effect_set().effects().len()).ok()?;
+        (self.next_index < self.effect_set().effects().len()).then_some(
             BlindVaultReplicaTerminalSendContext {
-                work_id: self.effect_set.work_id(),
-                attempt: self.effect_set.attempt(),
+                work_id: self.effect_set().work_id(),
+                attempt: self.effect_set().attempt(),
                 effect_index,
                 effect_count,
             },
@@ -127,7 +160,7 @@ impl<'effects> BlindVaultReplicaTerminalSendSequence<'effects> {
     }
 
     pub(super) fn matches_next_payload(&self, purpose: OnionRoutePurpose, payload: &[u8]) -> bool {
-        self.effect_set
+        self.effect_set()
             .matches_payload(self.next_index, purpose, payload)
     }
 
@@ -145,7 +178,7 @@ impl<'effects> BlindVaultReplicaTerminalSendSequence<'effects> {
     where
         Transport: BlindVaultReplicaTerminalEffectTransport,
     {
-        if self.next_index >= self.effect_set.effects().len() {
+        if self.next_index >= self.effect_set().effects().len() {
             return Err(BlindVaultReplicaTerminalSendError::SequenceComplete);
         }
         if !self.matches_next_payload(purpose, payload) {
@@ -167,13 +200,13 @@ impl<'effects> BlindVaultReplicaTerminalSendSequence<'effects> {
     /// Whether every effect has returned transport success.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.next_index == self.effect_set.effects().len()
+        self.next_index == self.effect_set().effects().len()
     }
 
     /// Count of effects still awaiting transport success.
     #[must_use]
     pub fn remaining_effects(&self) -> usize {
-        self.effect_set
+        self.effect_set()
             .effects()
             .len()
             .saturating_sub(self.next_index)
@@ -196,9 +229,9 @@ impl fmt::Debug for BlindVaultReplicaTerminalSendSequence<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("BlindVaultReplicaTerminalSendSequence")
-            .field("attempt", &self.effect_set.attempt())
+            .field("attempt", &self.effect_set().attempt())
             .field("next_index", &self.next_index)
-            .field("effect_count", &self.effect_set.effects().len())
+            .field("effect_count", &self.effect_set().effects().len())
             .field("snapshot_sequence", &self.snapshot_sequence)
             .field("journal_sequence", &self.journal_sequence)
             .finish_non_exhaustive()
