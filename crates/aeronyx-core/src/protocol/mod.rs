@@ -55,6 +55,8 @@
 //!   durability pipeline ending in one ordered, payload-verifying transport.
 //! - [BLIND-VAULT-RECOVERED-BOUND-ATTEMPT 2026-08-29 by Codex] Added
 //!   committed-only restart authority for exact ordered retransmission.
+//! - [BLIND-VAULT-VERIFIED-ONION-TRANSPORT 2026-08-29 by Codex] Composed
+//!   ordered effects, purpose-bound verified routes, and opaque envelope I/O.
 //!
 //! ## Main Functionality
 //!
@@ -92,6 +94,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.21.0-BlindVaultVerifiedOnionTransport - Re-exported route-provider and
+//! opaque sender composition for ordered Blind Vault effects
 //! v1.20.0-BlindVaultRecoveredBoundAttempt - Re-exported committed-only
 //! payload-bound restart and resend authority
 //! v1.19.0-BlindVaultBoundDurableDispatch - Re-exported exact effect-bound
@@ -198,21 +202,24 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaDurableResolutionError, BlindVaultReplicaDurableSnapshot,
     BlindVaultReplicaDurableSnapshotError, BlindVaultReplicaExecution,
     BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
-    BlindVaultReplicaLoadedRecovery, BlindVaultReplicaPersistedAttemptJournal,
-    BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedAttemptJournal,
-    BlindVaultReplicaPreparedAttemptRecord, BlindVaultReplicaPreparedBoundAttemptJournal,
-    BlindVaultReplicaPreparedEffectError, BlindVaultReplicaPreparedEffectSet,
-    BlindVaultReplicaRecoveredBoundAttempt, BlindVaultReplicaRecoveredBoundAttemptError,
-    BlindVaultReplicaRecoveredSendPermit, BlindVaultReplicaRecoveryLoadError,
-    BlindVaultReplicaRecoveryState, BlindVaultReplicaRecoveryStore,
-    BlindVaultReplicaRestartRecoveryKind, BlindVaultReplicaRestartRecoveryTask,
-    BlindVaultReplicaRestartRecoveryTiming, BlindVaultReplicaRestoredExecution,
-    BlindVaultReplicaSnapshotRecord, BlindVaultReplicaTerminalEffect,
-    BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalSendContext,
-    BlindVaultReplicaTerminalSendError, BlindVaultReplicaTerminalSendSequence,
-    BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
-    BlindVaultVerifiedRetiredReplica, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+    BlindVaultReplicaLoadedRecovery, BlindVaultReplicaOnionDispatchPlan,
+    BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
+    BlindVaultReplicaPersistedAttemptJournal, BlindVaultReplicaPersistedBoundAttemptJournal,
+    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedAttemptRecord,
+    BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaPreparedEffectError,
+    BlindVaultReplicaPreparedEffectSet, BlindVaultReplicaRecoveredBoundAttempt,
+    BlindVaultReplicaRecoveredBoundAttemptError, BlindVaultReplicaRecoveredSendPermit,
+    BlindVaultReplicaRecoveryLoadError, BlindVaultReplicaRecoveryState,
+    BlindVaultReplicaRecoveryStore, BlindVaultReplicaRestartRecoveryKind,
+    BlindVaultReplicaRestartRecoveryTask, BlindVaultReplicaRestartRecoveryTiming,
+    BlindVaultReplicaRestoredExecution, BlindVaultReplicaSnapshotRecord,
+    BlindVaultReplicaTerminalEffect, BlindVaultReplicaTerminalEffectTransport,
+    BlindVaultReplicaTerminalSendContext, BlindVaultReplicaTerminalSendError,
+    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaVerifiedOnionTransport,
+    BlindVaultReplicaVerifiedOnionTransportError, BlindVaultReplicaWorkId,
+    BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
+    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_ADAPTER_STATE_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,

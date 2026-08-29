@@ -49,8 +49,14 @@ use super::{
 };
 use crate::crypto::keys::IdentityKeyPair;
 
+mod onion_transport;
 mod send_sequence;
 
+pub use onion_transport::{
+    BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
+    BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaVerifiedOnionTransport,
+    BlindVaultReplicaVerifiedOnionTransportError,
+};
 pub use send_sequence::{
     BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalSendContext,
     BlindVaultReplicaTerminalSendError, BlindVaultReplicaTerminalSendSequence,

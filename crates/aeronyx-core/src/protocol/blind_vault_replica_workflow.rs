@@ -59,7 +59,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.26.0-RecoveredBoundAttempt - Added committed-only restart
+//! Last Modified: v1.27.0-VerifiedOnionEffectTransport - Composed ordered
+//! effects with purpose-bound verified routes and opaque envelope I/O.
+//! v1.26.0-RecoveredBoundAttempt - Added committed-only restart
 //! authority for exact ordered terminal effect retransmission.
 //! v1.25.0-BoundDurableDispatch - Carried exact effect identity
 //! through durability markers into one ordered transport capability.
@@ -148,9 +150,12 @@ pub use bound_continuation::{
 };
 pub use bound_dispatch::{
     BlindVaultReplicaCommittedBoundAttemptDispatch, BlindVaultReplicaDurableBoundAttemptDispatch,
-    BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
-    BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalSendContext,
-    BlindVaultReplicaTerminalSendError, BlindVaultReplicaTerminalSendSequence,
+    BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
+    BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaPersistedBoundAttemptJournal,
+    BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaTerminalEffectTransport,
+    BlindVaultReplicaTerminalSendContext, BlindVaultReplicaTerminalSendError,
+    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaVerifiedOnionTransport,
+    BlindVaultReplicaVerifiedOnionTransportError,
 };
 pub use durable_dispatch::{
     BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,
