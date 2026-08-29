@@ -18,6 +18,7 @@
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
 //! - `blind_vault_replica_workflow/recovery.rs`: restart recovery decisions.
+//! - `blind_vault_replica_workflow/sealed_local.rs`: shared local AEAD container.
 //! - `blind_vault_replica_workflow/snapshot.rs`: sealed local restart state.
 //! - `protocol::blind_vault`: planner actions and terminal evidence.
 //! - `protocol::onion`: descriptor-authenticated route failure disposition.
@@ -46,7 +47,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.12.0-RestartRecoveryPlan - Classified ambiguous restored
+//! Last Modified: v1.13.0-IdentitySealedLocal - Centralized identity-bound
+//! local persistence cryptography for snapshots and private attempt journals.
+//! v1.12.0-RestartRecoveryPlan - Classified ambiguous restored
 //! attempts into read-only observation or private-journal recovery paths.
 //! v1.11.0-SealedRestartSnapshot - Added identity-bound,
 //! authenticated local workflow persistence with fail-closed restoration.
@@ -77,6 +80,7 @@
 mod evidence;
 mod execution;
 mod recovery;
+mod sealed_local;
 mod snapshot;
 
 pub use recovery::{

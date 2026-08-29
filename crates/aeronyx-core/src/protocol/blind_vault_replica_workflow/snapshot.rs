@@ -21,22 +21,18 @@
 //! - Keep the accepted sequence high-water mark in separately protected state.
 //! - Authentication failure and malformed state must remain fail-closed.
 //!
-//! Last Modified: v1.1.0-RollbackGuard - Added authenticated monotonic restore
+//! Last Modified: v1.2.0-SharedLocalSealing - Reused the identity-bound local
+//! AEAD primitive without changing the V1 snapshot bytes or error contract.
+//! v1.1.0-RollbackGuard - Added authenticated monotonic restore
 //! sequencing and explicit sensitive-buffer cleanup on every handled path.
 //! v1.0.0-SealedRestartSnapshot - Initial identity-bound V1.
 //! ============================================
 
 use bincode::Options;
-use chacha20poly1305::{
-    aead::{Aead, NewAead, Payload},
-    Key, XChaCha20Poly1305, XNonce,
-};
-use hkdf::Hkdf;
-use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use zeroize::Zeroize;
 
+use super::sealed_local::{open_identity_bound, seal_identity_bound, IdentitySealedLocalError};
 use super::{
     BlindVaultReplicaDispatchFailure, BlindVaultReplicaExecution, BlindVaultReplicaExecutionPolicy,
     BlindVaultReplicaRestoredExecution, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
@@ -50,8 +46,6 @@ use crate::protocol::blind_vault::{
 
 const RESTART_SNAPSHOT_MAGIC: [u8; 4] = *b"AXRS";
 const RESTART_SNAPSHOT_VERSION_V1: u16 = 1;
-const RESTART_SNAPSHOT_HEADER_BYTES: usize = 4 + 2 + 24;
-const RESTART_SNAPSHOT_TAG_BYTES: usize = 16;
 const RESTART_SNAPSHOT_KEY_SALT: &[u8] = b"AeroNyx-BlindVault-Replica-Restart-Key-v1";
 const RESTART_SNAPSHOT_KEY_INFO: &[u8] = b"AeroNyx-BlindVault-Replica-Restart-State-v1";
 
@@ -194,41 +188,17 @@ impl BlindVaultReplicaExecution {
         let mut plaintext = snapshot_options()
             .serialize(&body)
             .map_err(|_| BlindVaultReplicaWorkflowError::RestartSnapshotMalformed)?;
-        if plaintext
-            .len()
-            .saturating_add(RESTART_SNAPSHOT_HEADER_BYTES + RESTART_SNAPSHOT_TAG_BYTES)
-            > MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES
-        {
-            plaintext.zeroize();
-            return Err(BlindVaultReplicaWorkflowError::RestartSnapshotTooLarge);
-        }
-
-        let mut nonce = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce);
-        let header = snapshot_header(nonce);
-        let mut key = match derive_snapshot_key(identity) {
-            Ok(key) => key,
-            Err(error) => {
-                plaintext.zeroize();
-                return Err(error);
-            }
-        };
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-        let encrypted = cipher.encrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: &plaintext,
-                aad: &header,
-            },
+        let sealed = seal_identity_bound(
+            identity,
+            RESTART_SNAPSHOT_MAGIC,
+            RESTART_SNAPSHOT_VERSION_V1,
+            RESTART_SNAPSHOT_KEY_SALT,
+            RESTART_SNAPSHOT_KEY_INFO,
+            &plaintext,
+            MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES,
         );
         plaintext.zeroize();
-        key.zeroize();
-        let ciphertext = encrypted
-            .map_err(|_| BlindVaultReplicaWorkflowError::RestartSnapshotAuthenticationFailed)?;
-
-        let mut snapshot = header;
-        snapshot.extend_from_slice(&ciphertext);
-        Ok(snapshot)
+        sealed.map_err(map_sealed_local_error)
     }
 
     /// Opens and revalidates one source-local restart snapshot.
@@ -243,34 +213,16 @@ impl BlindVaultReplicaExecution {
         minimum_snapshot_sequence: u64,
         restored_at_ms: u64,
     ) -> Result<BlindVaultReplicaRestoredExecution, BlindVaultReplicaWorkflowError> {
-        if snapshot.len() > MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES {
-            return Err(BlindVaultReplicaWorkflowError::RestartSnapshotTooLarge);
-        }
-        if snapshot.len() < RESTART_SNAPSHOT_HEADER_BYTES + RESTART_SNAPSHOT_TAG_BYTES
-            || snapshot[..4] != RESTART_SNAPSHOT_MAGIC
-        {
-            return Err(BlindVaultReplicaWorkflowError::RestartSnapshotMalformed);
-        }
-        let version = u16::from_be_bytes([snapshot[4], snapshot[5]]);
-        if version != RESTART_SNAPSHOT_VERSION_V1 {
-            return Err(BlindVaultReplicaWorkflowError::RestartSnapshotVersionUnsupported);
-        }
-        let mut nonce = [0u8; 24];
-        nonce.copy_from_slice(&snapshot[6..RESTART_SNAPSHOT_HEADER_BYTES]);
-        let header = &snapshot[..RESTART_SNAPSHOT_HEADER_BYTES];
-        let ciphertext = &snapshot[RESTART_SNAPSHOT_HEADER_BYTES..];
-        let mut key = derive_snapshot_key(identity)?;
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
-        let decrypted = cipher.decrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: ciphertext,
-                aad: header,
-            },
-        );
-        key.zeroize();
-        let mut plaintext = decrypted
-            .map_err(|_| BlindVaultReplicaWorkflowError::RestartSnapshotAuthenticationFailed)?;
+        let mut plaintext = open_identity_bound(
+            identity,
+            snapshot,
+            RESTART_SNAPSHOT_MAGIC,
+            RESTART_SNAPSHOT_VERSION_V1,
+            RESTART_SNAPSHOT_KEY_SALT,
+            RESTART_SNAPSHOT_KEY_INFO,
+            MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES,
+        )
+        .map_err(map_sealed_local_error)?;
         let body = snapshot_options()
             .deserialize::<RestartSnapshotBodyV1>(&plaintext)
             .map_err(|_| BlindVaultReplicaWorkflowError::RestartSnapshotMalformed);
@@ -511,31 +463,21 @@ fn restored_target_dependencies_are_valid(items: &[BlindVaultReplicaWorkItem]) -
     true
 }
 
-fn derive_snapshot_key(
-    identity: &IdentityKeyPair,
-) -> Result<[u8; 32], BlindVaultReplicaWorkflowError> {
-    let mut identity_secret = identity.to_bytes();
-    let hkdf = Hkdf::<Sha256>::new(Some(RESTART_SNAPSHOT_KEY_SALT), &identity_secret);
-    identity_secret.zeroize();
-    let mut key = [0u8; 32];
-    let mut info = Vec::with_capacity(RESTART_SNAPSHOT_KEY_INFO.len() + 32);
-    info.extend_from_slice(RESTART_SNAPSHOT_KEY_INFO);
-    info.extend_from_slice(&identity.public_key_bytes());
-    if hkdf.expand(&info, &mut key).is_err() {
-        key.zeroize();
-        info.zeroize();
-        return Err(BlindVaultReplicaWorkflowError::RestartSnapshotAuthenticationFailed);
+fn map_sealed_local_error(error: IdentitySealedLocalError) -> BlindVaultReplicaWorkflowError {
+    match error {
+        IdentitySealedLocalError::TooLarge => {
+            BlindVaultReplicaWorkflowError::RestartSnapshotTooLarge
+        }
+        IdentitySealedLocalError::Malformed => {
+            BlindVaultReplicaWorkflowError::RestartSnapshotMalformed
+        }
+        IdentitySealedLocalError::UnsupportedVersion => {
+            BlindVaultReplicaWorkflowError::RestartSnapshotVersionUnsupported
+        }
+        IdentitySealedLocalError::AuthenticationFailed => {
+            BlindVaultReplicaWorkflowError::RestartSnapshotAuthenticationFailed
+        }
     }
-    info.zeroize();
-    Ok(key)
-}
-
-fn snapshot_header(nonce: [u8; 24]) -> Vec<u8> {
-    let mut header = Vec::with_capacity(RESTART_SNAPSHOT_HEADER_BYTES);
-    header.extend_from_slice(&RESTART_SNAPSHOT_MAGIC);
-    header.extend_from_slice(&RESTART_SNAPSHOT_VERSION_V1.to_be_bytes());
-    header.extend_from_slice(&nonce);
-    header
 }
 
 fn snapshot_options() -> impl Options {
