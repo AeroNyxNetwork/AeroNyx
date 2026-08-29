@@ -94,6 +94,19 @@ impl<'a> BlindVaultReplicaSnapshotRecord<'a> {
         })
     }
 
+    /// Builds a record from values already validated by the typed commit path.
+    pub(super) const fn from_validated_parts(
+        workflow_id: [u8; 16],
+        snapshot_sequence: u64,
+        sealed_snapshot: &'a [u8],
+    ) -> Self {
+        Self {
+            workflow_id,
+            snapshot_sequence,
+            sealed_snapshot,
+        }
+    }
+
     #[must_use]
     pub const fn workflow_id(&self) -> [u8; 16] {
         self.workflow_id
@@ -216,6 +229,20 @@ impl<'a> BlindVaultReplicaCommittedAttemptRecord<'a> {
             journal_sequence: prepared.journal_sequence(),
             journal_commitment: sealed_record_commitment(prepared.sealed_journal()),
         })
+    }
+
+    /// Binds values already validated by the typed durable-dispatch path.
+    pub(super) fn from_validated_parts(
+        snapshot: BlindVaultReplicaSnapshotRecord<'a>,
+        prepared: &BlindVaultReplicaPreparedAttemptJournal,
+    ) -> Self {
+        Self {
+            snapshot,
+            work_id: prepared.work_id(),
+            attempt: prepared.attempt(),
+            journal_sequence: prepared.journal_sequence(),
+            journal_commitment: sealed_record_commitment(prepared.sealed_journal()),
+        }
     }
 
     #[must_use]
