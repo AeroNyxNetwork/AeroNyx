@@ -39,6 +39,8 @@
 //!   shared fail-closed recovery decision for source-side route adapters.
 //! - [BLIND-VAULT-REPLACEMENT-RETIREMENT-PERMIT 2026-08-29 by Codex] Exposed
 //!   the evidence-backed gate that protects old replicas during replacement.
+//! - [BLIND-VAULT-SEALED-RESTART-SNAPSHOT 2026-08-29 by Codex] Added bounded,
+//!   identity-sealed source workflow persistence; it is not a network frame.
 //!
 //! ## Main Functionality
 //!
@@ -76,6 +78,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.10.0-BlindVaultSealedRestartSnapshot - Re-exported the local encrypted
+//! restart snapshot size contract
 //! v1.9.0-BlindVaultReplacementRetirementPermit - Re-exported the active
 //! attempt gate for safe old-lease retirement
 //! v1.8.0-OnionRouteFailureDisposition - Re-exported shared source-side route
@@ -151,9 +155,10 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
     BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
     BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
-    BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
-    BlindVaultVerifiedRetiredReplica, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+    BlindVaultReplicaRestoredExecution, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
+    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
+    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT, MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES,
     MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};

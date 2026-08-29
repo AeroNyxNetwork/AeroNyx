@@ -17,6 +17,7 @@
 //! ## Dependencies
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
+//! - `blind_vault_replica_workflow/snapshot.rs`: sealed local restart state.
 //! - `protocol::blind_vault`: planner actions and terminal evidence.
 //! - `protocol::onion`: descriptor-authenticated route failure disposition.
 //!
@@ -34,11 +35,15 @@
 //! - This module is source-owned state, not a public wire/storage format.
 //! - Never serialize it into discovery, the public ledger, or node telemetry.
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
+//! - Persist the authenticated snapshot sequence in secure monotonic storage;
+//!   accepting an older sequence can replay ambiguous network work.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.10.0-SourcePlanSummary - Retained the complete bounded
+//! Last Modified: v1.11.0-SealedRestartSnapshot - Added identity-bound,
+//! authenticated local workflow persistence with fail-closed restoration.
+//! v1.10.0-SourcePlanSummary - Retained the complete bounded
 //! planner summary required for fail-closed restart validation.
 //! v1.9.0-ReplacementRetirementPermit - Added an evidence-backed
 //! permit that gates old-lease retirement behind a verified new replica.
@@ -64,6 +69,7 @@
 
 mod evidence;
 mod execution;
+mod snapshot;
 
 use thiserror::Error;
 
@@ -82,6 +88,9 @@ pub const MAX_BLIND_VAULT_REPLICA_WORK_ITEMS: usize = MAX_BLIND_VAULT_REPLICA_PL
 /// Apps that explicitly accept the timing-correlation and resource tradeoff
 /// may choose a larger bounded value through `new_with_maximum_in_flight`.
 pub const DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT: u8 = 1;
+
+/// Maximum identity-sealed source-local restart snapshot size.
+pub const MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES: usize = 64 * 1024;
 
 /// Source-side retry and evidence timing policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,6 +619,39 @@ pub struct BlindVaultReplicaExecution {
     pub(super) items: Vec<BlindVaultReplicaWorkItem>,
 }
 
+/// Authenticated local workflow state recovered after restart.
+///
+/// [BLIND-VAULT-RESTART-ROLLBACK-GUARD 2026-08-29 by Codex] The persistence
+/// adapter must advance its separately protected high-water mark to
+/// `snapshot_sequence` after accepting this value. Keeping the sequence out of
+/// `BlindVaultReplicaExecution` avoids confusing persistence order with the
+/// immutable planner generation or network protocol state.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BlindVaultReplicaRestoredExecution {
+    pub(super) execution: BlindVaultReplicaExecution,
+    pub(super) snapshot_sequence: u64,
+}
+
+impl BlindVaultReplicaRestoredExecution {
+    /// Authenticated monotonic sequence carried by the sealed snapshot.
+    #[must_use]
+    pub const fn snapshot_sequence(&self) -> u64 {
+        self.snapshot_sequence
+    }
+
+    /// Borrows the restored source-owned workflow state.
+    #[must_use]
+    pub const fn execution(&self) -> &BlindVaultReplicaExecution {
+        &self.execution
+    }
+
+    /// Transfers the restored workflow into its runtime owner.
+    #[must_use]
+    pub fn into_execution(self) -> BlindVaultReplicaExecution {
+        self.execution
+    }
+}
+
 /// Fail-closed source workflow errors.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BlindVaultReplicaWorkflowError {
@@ -682,6 +724,27 @@ pub enum BlindVaultReplicaWorkflowError {
     /// Whole-set replanning is forbidden until all actions hold evidence.
     #[error("blind vault replica workflow is not ready for replanning")]
     ReplanNotReady,
+    /// Local restart state exceeded its bounded encrypted container.
+    #[error("blind vault replica restart snapshot is too large")]
+    RestartSnapshotTooLarge,
+    /// Local restart bytes did not match the versioned container contract.
+    #[error("blind vault replica restart snapshot is malformed")]
+    RestartSnapshotMalformed,
+    /// Local restart bytes use an unsupported container version.
+    #[error("blind vault replica restart snapshot version is unsupported")]
+    RestartSnapshotVersionUnsupported,
+    /// Snapshot sequence zero cannot participate in rollback protection.
+    #[error("blind vault replica restart snapshot sequence is invalid")]
+    RestartSnapshotSequenceInvalid,
+    /// An authenticated snapshot is older than the protected high-water mark.
+    #[error("blind vault replica restart snapshot rollback was detected")]
+    RestartSnapshotRollbackDetected,
+    /// Restart snapshot authentication or local key derivation failed.
+    #[error("blind vault replica restart snapshot authentication failed")]
+    RestartSnapshotAuthenticationFailed,
+    /// Decrypted restart state violated workflow invariants.
+    #[error("blind vault replica restart snapshot state is invalid")]
+    RestartSnapshotStateInvalid,
 }
 
 pub(super) fn require_timestamp(timestamp_ms: u64) -> Result<(), BlindVaultReplicaWorkflowError> {
