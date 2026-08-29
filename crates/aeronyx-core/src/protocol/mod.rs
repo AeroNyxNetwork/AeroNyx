@@ -61,6 +61,8 @@
 //!   bounded request/reply failure disposition and atomic journal resolution.
 //! - [BLIND-VAULT-RETIREMENT-TRANSPORT-PERMIT 2026-08-29 by Codex] Bound old
 //!   lease retirement to the active workflow and exact verified terminal.
+//! - [BLIND-VAULT-DISTILLED-ADMISSION 2026-08-29 by Codex] Added a bounded,
+//!   credential-free admission proof for sequential replica verification.
 //!
 //! ## Main Functionality
 //!
@@ -98,6 +100,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.24.0-BlindVaultDistilledAdmission - Removed one-time blind credentials
+//! from the state retained between admission and inventory verification
 //! v1.23.0-BlindVaultRetirementTransportPermit - Enforced workflow-issued
 //! retirement authority before transport and verified terminal selection
 //! v1.22.0-BlindVaultDurableTerminalOutcomes - Re-exported request-bound

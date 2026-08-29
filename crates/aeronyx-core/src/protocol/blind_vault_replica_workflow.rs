@@ -62,8 +62,12 @@
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
+//! - Distill accepted admission replies before waiting for inventory; do not
+//!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.32.0-RetirementTransportPermit - Enforced replacement
+//! Last Modified: v1.33.0-DistilledAdmissionEvidence - Added a credential-free
+//! verified admission stage for sequential replacement/provision workflows.
+//! v1.32.0-RetirementTransportPermit - Enforced replacement
 //! retirement permits through ordered send and verified route selection.
 //! v1.31.0-DurableTerminalOutcomes - Added bounded verifier
 //! failure disposition and atomic committed-journal failure resolution.
@@ -578,6 +582,58 @@ pub struct BlindVaultVerifiedProvisionedReplica {
     pub(super) lease_id: [u8; 32],
     pub(super) accepted_at_ms: u64,
     pub(super) observed_at_ms: u64,
+}
+
+/// Credential-free proof that one anonymous replica admission was accepted.
+///
+/// [BLIND-VAULT-DISTILLED-ADMISSION 2026-08-29 by Codex] Sequential terminal
+/// workflows must not retain the complete one-time blind admission credential
+/// while waiting for a matching inventory receipt. This non-serializable value
+/// keeps only signed lifecycle facts needed to finish replica verification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultVerifiedReplicaAdmission {
+    pub(super) node_id: [u8; 32],
+    pub(super) lease_id: [u8; 32],
+    pub(super) lease_expires_at_ms: u64,
+    pub(super) accepted_at_ms: u64,
+}
+
+impl std::fmt::Debug for BlindVaultVerifiedReplicaAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultVerifiedReplicaAdmission")
+            .field("lease_expires_at_ms", &self.lease_expires_at_ms)
+            .field("accepted_at_ms", &self.accepted_at_ms)
+            .field("node_id", &"[REDACTED]")
+            .field("lease_id", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl BlindVaultVerifiedReplicaAdmission {
+    /// Descriptor identity that signed the admission receipt.
+    #[must_use]
+    pub const fn node_id(&self) -> [u8; 32] {
+        self.node_id
+    }
+
+    /// Newly admitted replica-local lease.
+    #[must_use]
+    pub const fn lease_id(&self) -> [u8; 32] {
+        self.lease_id
+    }
+
+    /// Exact lease expiry accepted by the terminal.
+    #[must_use]
+    pub const fn lease_expires_at_ms(&self) -> u64 {
+        self.lease_expires_at_ms
+    }
+
+    /// Terminal-signed admission time.
+    #[must_use]
+    pub const fn accepted_at_ms(&self) -> u64 {
+        self.accepted_at_ms
+    }
 }
 
 /// Verified terminal retirement of one complete old replica lease.

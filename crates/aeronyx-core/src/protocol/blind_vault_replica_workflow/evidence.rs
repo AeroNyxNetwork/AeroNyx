@@ -7,6 +7,9 @@
 //! module are the only path to action evidence. They verify terminal identity,
 //! exact request binding, live lease state, and source-owned manifests without
 //! retaining credentials, ciphertext, object identifiers, or social metadata.
+//!
+//! Last Modified: v1.1.0-DistilledAdmissionEvidence - Split admission and
+//! inventory verification so one-time credentials can be discarded early.
 
 use std::collections::BTreeSet;
 
@@ -15,7 +18,8 @@ use crate::crypto::keys::IdentityPublicKey;
 use super::{
     require_timestamp, BlindVaultReplacementRetirementPermit, BlindVaultReplicaActionEvidence,
     BlindVaultReplicaActionEvidenceKind, BlindVaultReplicaWorkId, BlindVaultReplicaWorkflowError,
-    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
+    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedReplicaAdmission,
+    BlindVaultVerifiedRetiredReplica,
 };
 use crate::protocol::blind_vault::{
     BlindVaultBlindLeaseAcceptedReceipt, BlindVaultBlindLeaseAdmissionRequest,
@@ -24,13 +28,14 @@ use crate::protocol::blind_vault::{
     BlindVaultVerifiedReplicaInventory, MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
 };
 
-impl BlindVaultVerifiedProvisionedReplica {
-    /// Verifies the exact admission receipt and requires a matching live
-    /// manifest observation from the same terminal and lease.
+impl BlindVaultVerifiedReplicaAdmission {
+    /// Verifies and distills one exact anonymous admission request and receipt.
+    ///
+    /// The returned value deliberately excludes the admission token, token
+    /// signature, lease keys, read capability, and request identifier.
     pub fn verify(
         request: &BlindVaultBlindLeaseAdmissionRequest,
         receipt: &BlindVaultBlindLeaseAcceptedReceipt,
-        inventory: &BlindVaultVerifiedReplicaInventory,
         now_ms: u64,
         maximum_lease_ttl_ms: u64,
         maximum_future_clock_skew_ms: u64,
@@ -51,20 +56,66 @@ impl BlindVaultVerifiedProvisionedReplica {
             now_ms,
             maximum_future_clock_skew_ms,
         )?;
-        if receipt.lease_expires_at_ms <= now_ms
-            || inventory.node_id() != receipt.node_id
-            || inventory.lease_id() != receipt.lease_id
-            || inventory.expires_at_ms() != receipt.lease_expires_at_ms
-            || inventory.observed_at_ms() < receipt.accepted_at_ms
+        if receipt.lease_expires_at_ms <= now_ms {
+            return Err(BlindVaultReplicaWorkflowError::EvidenceActionMismatch);
+        }
+        Ok(Self {
+            node_id: receipt.node_id,
+            lease_id: receipt.lease_id,
+            lease_expires_at_ms: receipt.lease_expires_at_ms,
+            accepted_at_ms: receipt.accepted_at_ms,
+        })
+    }
+}
+
+impl BlindVaultVerifiedProvisionedReplica {
+    /// Verifies the exact admission receipt and requires a matching live
+    /// manifest observation from the same terminal and lease.
+    ///
+    /// This compatibility entry point now delegates through the distilled
+    /// admission model so sequential adapters can use the same invariants.
+    pub fn verify(
+        request: &BlindVaultBlindLeaseAdmissionRequest,
+        receipt: &BlindVaultBlindLeaseAcceptedReceipt,
+        inventory: &BlindVaultVerifiedReplicaInventory,
+        now_ms: u64,
+        maximum_lease_ttl_ms: u64,
+        maximum_future_clock_skew_ms: u64,
+    ) -> Result<Self, BlindVaultReplicaWorkflowError> {
+        let admission = BlindVaultVerifiedReplicaAdmission::verify(
+            request,
+            receipt,
+            now_ms,
+            maximum_lease_ttl_ms,
+            maximum_future_clock_skew_ms,
+        )?;
+        Self::verify_admitted_inventory(&admission, inventory, now_ms)
+    }
+
+    /// Completes provisioning from credential-free admission and inventory.
+    ///
+    /// [BLIND-VAULT-DISTILLED-ADMISSION 2026-08-29 by Codex] Callers may drop
+    /// the complete blind credential immediately after admission verification;
+    /// only this bounded lifecycle summary crosses the inventory wait.
+    pub fn verify_admitted_inventory(
+        admission: &BlindVaultVerifiedReplicaAdmission,
+        inventory: &BlindVaultVerifiedReplicaInventory,
+        now_ms: u64,
+    ) -> Result<Self, BlindVaultReplicaWorkflowError> {
+        require_timestamp(now_ms)?;
+        if inventory.node_id() != admission.node_id
+            || inventory.lease_id() != admission.lease_id
+            || inventory.expires_at_ms() != admission.lease_expires_at_ms
+            || inventory.observed_at_ms() < admission.accepted_at_ms
             || inventory.expires_at_ms() <= now_ms
             || !inventory.matches_expected_manifest()
         {
             return Err(BlindVaultReplicaWorkflowError::EvidenceActionMismatch);
         }
         Ok(Self {
-            node_id: receipt.node_id,
-            lease_id: receipt.lease_id,
-            accepted_at_ms: receipt.accepted_at_ms,
+            node_id: admission.node_id,
+            lease_id: admission.lease_id,
+            accepted_at_ms: admission.accepted_at_ms,
             observed_at_ms: inventory.observed_at_ms(),
         })
     }
