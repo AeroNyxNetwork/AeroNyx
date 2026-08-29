@@ -33,6 +33,8 @@
 //!   retries; this local state is never a discovery or ledger payload.
 //! - [VERIFIED-ONION-ROUTE 2026-08-29 by Codex] Added source-side route plans
 //!   derived only from authentic, current, capability-compatible descriptors.
+//! - [BLIND-VAULT-DISPATCH-CONTRACT 2026-08-29 by Codex] Exposed validated
+//!   replica work as explicit ordered onion terminal purposes.
 //!
 //! ## Main Functionality
 //!
@@ -70,6 +72,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.7.0-BlindVaultDispatchContract - Re-exported purpose-level compound
+//! replica dispatch requirements for App, SDK, and agent adapters
 //! v1.6.0-VerifiedOnionRoute - Re-exported descriptor-authenticated route
 //! planning with bounded hops and path-derived TTL
 //! v1.5.0-BlindVaultReplicaWorkflow - Re-exported source-owned, evidence-gated
@@ -136,12 +140,12 @@ pub use blind_vault::{
 };
 pub use blind_vault_replica_workflow::{
     BlindVaultReplicaActionEvidence, BlindVaultReplicaConvergence,
-    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
-    BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
-    BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
-    BlindVaultVerifiedRetiredReplica, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
-    MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
+    BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,
+    BlindVaultReplicaDispatchReadiness, BlindVaultReplicaExecution,
+    BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy, BlindVaultReplicaWorkId,
+    BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
+    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
 pub use codec::{Codec, ProtocolCodec};

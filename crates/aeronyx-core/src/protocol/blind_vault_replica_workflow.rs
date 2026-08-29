@@ -23,7 +23,8 @@
 //! ## Main Logical Flow
 //! 1. The source creates a workflow from `BlindVaultReplicaPlan`.
 //! 2. The user/client explicitly authorizes each planned action.
-//! 3. The client dispatches an encrypted terminal request and records failures.
+//! 3. The client starts one attempt and executes its typed encrypted-terminal
+//!    dispatch contract; compound repair/replacement work uses ordered stages.
 //! 4. The workflow accepts only action-matching, verified terminal evidence.
 //! 5. Fresh inventories are planned again before declaring convergence.
 //!
@@ -33,7 +34,9 @@
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //!
-//! Last Modified: v1.7.0-OnionRouteFailureDisposition - Mapped bounded route
+//! Last Modified: v1.8.0-ReplicaDispatchContract - Made each action's required
+//! onion terminal purposes and compound-stage order explicit for adapters.
+//! v1.7.0-OnionRouteFailureDisposition - Mapped bounded route
 //! admission failures into retryable discovery or permanent local outcomes.
 //! v1.6.0-BlindVaultDispatchReadiness - Added one typed,
 //! side-effect-free readiness contract shared with the dispatch transition.
@@ -267,6 +270,12 @@ impl BlindVaultReplicaWorkItem {
     pub const fn state(&self) -> BlindVaultReplicaWorkState {
         self.state
     }
+
+    /// Returns the immutable onion-purpose sequence for this action.
+    #[must_use]
+    pub const fn dispatch_contract(&self) -> BlindVaultReplicaDispatchContract {
+        self.action.dispatch_contract()
+    }
 }
 
 /// Aggregate execution phase derived from item states rather than stored as a
@@ -315,6 +324,91 @@ pub enum BlindVaultReplicaDispatchReadiness {
     CapacityReached { in_flight: u8, maximum: u8 },
     /// This work item is complete, cancelled, or permanently blocked.
     TerminalState,
+}
+
+/// Purpose-level network work required by one source-owned replica action.
+///
+/// [BLIND-VAULT-DISPATCH-CONTRACT 2026-08-29 by Codex] `dispatch()` opens one
+/// bounded workflow attempt; it does not imply that every action is one HTTP
+/// request. This contract gives Apps, SDKs, and agents the exact onion terminal
+/// purposes and stage order while leaving ciphertext selection, credentials,
+/// requests, and keys outside the workflow state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindVaultReplicaDispatchContract {
+    /// One terminal operation completes the action before evidence verification.
+    SingleTerminalRequest {
+        /// Purpose that the selected terminal's signed descriptor must support.
+        purpose: OnionRoutePurpose,
+    },
+    /// Replay the source-owned private manifest delta, then verify inventory.
+    ReconcileInventory {
+        /// Used once per source-selected immutable object write.
+        write_purpose: OnionRoutePurpose,
+        /// Used once per source-selected surplus object deletion.
+        delete_purpose: OnionRoutePurpose,
+        /// Must run after all mutation receipts verify.
+        verification_purpose: OnionRoutePurpose,
+    },
+    /// Admit, populate, and verify a new replica before retiring the old lease.
+    ReplaceReplica {
+        /// First stage: blind admission of one independently wrapped replica.
+        admission_purpose: OnionRoutePurpose,
+        /// Populate the new lease from the source-owned private manifest.
+        write_purpose: OnionRoutePurpose,
+        /// Prove the new terminal matches the complete private manifest.
+        verification_purpose: OnionRoutePurpose,
+        /// Final stage: complete retirement at the old terminal.
+        retirement_purpose: OnionRoutePurpose,
+    },
+    /// Admit an exact bounded number of independently wrapped replicas.
+    ProvisionReplicas {
+        /// Purpose repeated independently for each intended replica.
+        admission_purpose: OnionRoutePurpose,
+        /// Populate each admitted lease from the private manifest.
+        write_purpose: OnionRoutePurpose,
+        /// Prove each new terminal matches its complete private manifest.
+        verification_purpose: OnionRoutePurpose,
+        /// Exact planner-authorized number of admissions.
+        count: u8,
+    },
+}
+
+impl BlindVaultReplicaAction {
+    /// Derives the terminal-work contract after plan-shape validation.
+    #[must_use]
+    pub(super) const fn dispatch_contract(self) -> BlindVaultReplicaDispatchContract {
+        match self {
+            Self::RenewLease { .. } => BlindVaultReplicaDispatchContract::SingleTerminalRequest {
+                purpose: OnionRoutePurpose::BlindVaultLeaseRenewal,
+            },
+            Self::ReconcileInventory { .. } => {
+                BlindVaultReplicaDispatchContract::ReconcileInventory {
+                    write_purpose: OnionRoutePurpose::BlindVaultPutReceipt,
+                    delete_purpose: OnionRoutePurpose::BlindVaultDelete,
+                    verification_purpose: OnionRoutePurpose::BlindVaultLeaseInventory,
+                }
+            }
+            Self::RetryObservation { .. } => {
+                BlindVaultReplicaDispatchContract::SingleTerminalRequest {
+                    purpose: OnionRoutePurpose::BlindVaultLeaseInventory,
+                }
+            }
+            Self::ReplaceReplica { .. } => BlindVaultReplicaDispatchContract::ReplaceReplica {
+                admission_purpose: OnionRoutePurpose::BlindVaultLeaseAdmission,
+                write_purpose: OnionRoutePurpose::BlindVaultPutReceipt,
+                verification_purpose: OnionRoutePurpose::BlindVaultLeaseInventory,
+                retirement_purpose: OnionRoutePurpose::BlindVaultLeaseRetire,
+            },
+            Self::ProvisionReplicas { count } => {
+                BlindVaultReplicaDispatchContract::ProvisionReplicas {
+                    admission_purpose: OnionRoutePurpose::BlindVaultLeaseAdmission,
+                    write_purpose: OnionRoutePurpose::BlindVaultPutReceipt,
+                    verification_purpose: OnionRoutePurpose::BlindVaultLeaseInventory,
+                    count,
+                }
+            }
+        }
+    }
 }
 
 /// Outcome of comparing an evidence-complete generation with a fresh plan.
