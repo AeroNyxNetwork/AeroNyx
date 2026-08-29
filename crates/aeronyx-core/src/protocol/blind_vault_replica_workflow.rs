@@ -18,6 +18,7 @@
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
 //! - `protocol::blind_vault`: planner actions and terminal evidence.
+//! - `protocol::onion`: descriptor-authenticated route failure disposition.
 //!
 //! ## Main Logical Flow
 //! 1. The source creates a workflow from `BlindVaultReplicaPlan`.
@@ -32,7 +33,9 @@
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //!
-//! Last Modified: v1.6.0-BlindVaultDispatchReadiness - Added one typed,
+//! Last Modified: v1.7.0-OnionRouteFailureDisposition - Mapped bounded route
+//! admission failures into retryable discovery or permanent local outcomes.
+//! v1.6.0-BlindVaultDispatchReadiness - Added one typed,
 //! side-effect-free readiness contract shared with the dispatch transition.
 //! v1.5.0-BlindVaultBoundedDispatch - Added source-owned global
 //! dispatch limits, per-target single-flight, and ordered target dependencies.
@@ -57,6 +60,7 @@ use super::blind_vault::{
     BlindVaultError, BlindVaultReplicaAction, BlindVaultReplicaPlanHealth,
     BlindVaultTerminalFailureCode, MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS,
 };
+use super::onion::OnionRoutePlanError;
 
 /// At most two per-member actions plus one aggregate provisioning action can
 /// be emitted by the current deterministic planner.
@@ -138,8 +142,35 @@ pub enum BlindVaultReplicaDispatchFailure {
     CapacityUnavailable,
     /// Local privacy, routing, or replica policy rejected dispatch.
     PolicyRejected,
+    /// Local authenticated request or onion-envelope construction failed.
+    LocalConstructionFailed,
     /// The inline response class cannot carry the requested recovery result.
     InlineResponseUnsupported,
+}
+
+impl From<&OnionRoutePlanError> for BlindVaultReplicaDispatchFailure {
+    /// Converts route admission into a bounded retry disposition.
+    ///
+    /// [ONION-ROUTE-FAILURE-DISPOSITION 2026-08-29 by Codex] Refreshable
+    /// discovery surface failures remain retryable because the source may
+    /// select a different current route. Structural policy violations and
+    /// local construction failures block the immutable workflow generation.
+    fn from(value: &OnionRoutePlanError) -> Self {
+        match value {
+            OnionRoutePlanError::EmptyPath
+            | OnionRoutePlanError::DescriptorRejected { .. }
+            | OnionRoutePlanError::MissingCapability { .. }
+            | OnionRoutePlanError::MissingProtocolFeature { .. }
+            | OnionRoutePlanError::MissingX25519Kem { .. }
+            | OnionRoutePlanError::MissingPublicEndpoint { .. }
+            | OnionRoutePlanError::OutsideValidityWindow => Self::TransportUnavailable,
+            OnionRoutePlanError::TooManyHops { .. }
+            | OnionRoutePlanError::DuplicateNode { .. }
+            | OnionRoutePlanError::SourceIncluded { .. } => Self::PolicyRejected,
+            OnionRoutePlanError::SourceIdentityMismatch
+            | OnionRoutePlanError::EnvelopeConstruction { .. } => Self::LocalConstructionFailed,
+        }
+    }
 }
 
 impl BlindVaultReplicaDispatchFailure {

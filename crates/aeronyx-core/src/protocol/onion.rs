@@ -466,6 +466,31 @@ pub enum OnionRoutePlanError {
     },
 }
 
+impl OnionRoutePlanError {
+    /// Stable privacy-safe category for local recovery and aggregate metrics.
+    ///
+    /// [ONION-ROUTE-FAILURE-DISPOSITION 2026-08-29 by Codex] The bucket never
+    /// includes node identity, endpoint, route id, payload, or key material.
+    /// Adapters should persist this bounded value rather than `Display` text.
+    #[must_use]
+    pub const fn reason_bucket(&self) -> &'static str {
+        match self {
+            Self::EmptyPath => "empty_path",
+            Self::TooManyHops { .. } => "too_many_hops",
+            Self::DescriptorRejected { .. } => "descriptor_rejected",
+            Self::DuplicateNode { .. } => "duplicate_node",
+            Self::SourceIncluded { .. } => "source_included",
+            Self::MissingCapability { .. } => "missing_capability",
+            Self::MissingProtocolFeature { .. } => "missing_protocol_feature",
+            Self::MissingX25519Kem { .. } => "missing_x25519_kem",
+            Self::MissingPublicEndpoint { .. } => "missing_public_endpoint",
+            Self::SourceIdentityMismatch => "source_identity_mismatch",
+            Self::OutsideValidityWindow => "outside_validity_window",
+            Self::EnvelopeConstruction { .. } => "envelope_construction_failed",
+        }
+    }
+}
+
 /// Descriptor-authenticated onion route ready for source-side construction.
 ///
 /// [VERIFIED-ONION-ROUTE 2026-08-29 by Codex] This domain object closes the
