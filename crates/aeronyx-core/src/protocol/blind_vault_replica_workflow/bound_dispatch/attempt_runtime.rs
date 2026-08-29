@@ -36,8 +36,10 @@
 //! - Verifiers must validate workload frame, request identity, and signed result.
 //! - Do not expose adapter state, reply keys, payloads, or work ids in telemetry.
 //!
-//! Last Modified: v1.0.0-TerminalAttemptRuntime - Initial ordered send,
-//! one-time reply, and semantic verification composition.
+//! Last Modified: v1.1.0-RequestAwareVerification - Supplied the exact bound
+//! request to private workload verification without retaining another copy.
+//! v1.0.0-TerminalAttemptRuntime - Initial ordered send, one-time reply, and
+//! semantic verification composition.
 //! ============================================
 
 use std::{collections::VecDeque, error::Error as StdError, fmt};
@@ -78,6 +80,7 @@ pub trait BlindVaultReplicaTerminalReplyVerifier {
         &mut self,
         context: BlindVaultReplicaTerminalSendContext,
         purpose: OnionRoutePurpose,
+        encoded_request: &[u8],
         adapter_state: &[u8],
         reply: OnionReplyPayload,
     ) -> Result<Self::Output, Self::Error>;
@@ -196,14 +199,23 @@ impl<'effects> BlindVaultReplicaTerminalAttemptRuntime<'effects> {
                 return Err(BlindVaultReplicaTerminalAttemptError::Reply(error));
             }
         };
-        let output =
-            match verifier.verify_terminal_reply(context, purpose, &self.adapter_state, reply) {
-                Ok(output) => output,
-                Err(error) => {
-                    self.poison();
-                    return Err(BlindVaultReplicaTerminalAttemptError::Verification(error));
-                }
-            };
+        // [BLIND-VAULT-REQUEST-AWARE-REPLY-VERIFY 2026-08-29 by Codex] The
+        // verifier receives the same bytes already matched by both the effect
+        // commitment and reply session, allowing exact receipt/request checks
+        // without persisting a second plaintext request copy.
+        let output = match verifier.verify_terminal_reply(
+            context,
+            purpose,
+            payload,
+            &self.adapter_state,
+            reply,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                self.poison();
+                return Err(BlindVaultReplicaTerminalAttemptError::Verification(error));
+            }
+        };
         let send_complete = self.send_sequence.is_complete();
         let sessions_complete = self.reply_sessions.is_empty();
         if send_complete != sessions_complete {
