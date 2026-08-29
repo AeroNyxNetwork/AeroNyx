@@ -24,7 +24,7 @@
 //! - `blind_vault_replica_workflow/bound_dispatch/request_bound_verifier.rs`:
 //!   terminal request/receipt verification and private policy composition.
 //! - `blind_vault_replica_workflow/durable_dispatch.rs`: ordered durability.
-//! - `blind_vault_replica_workflow/durable_resolution.rs`: durable evidence.
+//! - `blind_vault_replica_workflow/durable_resolution.rs`: durable outcomes.
 //! - `blind_vault_replica_workflow/durable_snapshot.rs`: resolved snapshots.
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
@@ -47,7 +47,8 @@
 //!    proving a distinct replacement is live in the current attempt.
 //! 4. After restart, the source opens identity-sealed state and derives typed
 //!    recovery tasks before any ambiguous operation can be repeated.
-//! 5. The workflow accepts only action-matching, verified terminal evidence.
+//! 5. The workflow durably accepts action-matching evidence or one bounded
+//!    failure, atomically resolving the exact private attempt journal.
 //! 6. Fresh inventories are planned again before declaring convergence.
 //!
 //! ## Important Note For The Next Developer
@@ -62,7 +63,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.30.0-RequestBoundReplyVerifier - Verified exact signed
+//! Last Modified: v1.31.0-DurableTerminalOutcomes - Added bounded verifier
+//! failure disposition and atomic committed-journal failure resolution.
+//! v1.30.0-RequestBoundReplyVerifier - Verified exact signed
 //! request/receipt pairs before source-private manifest policy acceptance.
 //! v1.29.0-OwnedTerminalRuntime - Added direct live/recovery
 //! ownership transfer without self-referential integration state.
@@ -176,8 +179,8 @@ pub use durable_dispatch::{
     BlindVaultReplicaDurableDispatchError, BlindVaultReplicaPersistedAttemptJournal,
 };
 pub use durable_resolution::{
-    BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaDurableResolution,
-    BlindVaultReplicaDurableResolutionError,
+    BlindVaultReplicaAttemptFailure, BlindVaultReplicaCommittedAttemptBinding,
+    BlindVaultReplicaDurableResolution, BlindVaultReplicaDurableResolutionError,
 };
 pub use durable_snapshot::{
     BlindVaultReplicaDurableSnapshot, BlindVaultReplicaDurableSnapshotError,

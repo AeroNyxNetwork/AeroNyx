@@ -57,6 +57,8 @@
 //!   committed-only restart authority for exact ordered retransmission.
 //! - [BLIND-VAULT-VERIFIED-ONION-TRANSPORT 2026-08-29 by Codex] Composed
 //!   ordered effects, purpose-bound verified routes, and opaque envelope I/O.
+//! - [BLIND-VAULT-DURABLE-TERMINAL-OUTCOMES 2026-08-29 by Codex] Added
+//!   bounded request/reply failure disposition and atomic journal resolution.
 //!
 //! ## Main Functionality
 //!
@@ -94,6 +96,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.22.0-BlindVaultDurableTerminalOutcomes - Re-exported request-bound
+//! failure disposition and durable terminal-attempt failure resolution
 //! v1.21.0-BlindVaultVerifiedOnionTransport - Re-exported route-provider and
 //! opaque sender composition for ordered Blind Vault effects
 //! v1.20.0-BlindVaultRecoveredBoundAttempt - Re-exported committed-only
@@ -190,18 +194,19 @@ pub use blind_vault::{
 pub use blind_vault_replica_workflow::{
     load_blind_vault_replica_recovery, BlindVaultReplacementRetirementPermit,
     BlindVaultReplicaActionEvidence, BlindVaultReplicaAttemptContinuation,
-    BlindVaultReplicaAttemptDurabilityPhase, BlindVaultReplicaAttemptJournal,
-    BlindVaultReplicaAttemptJournalError, BlindVaultReplicaAuthenticatedPreparedAttempt,
-    BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaBoundContinuationError,
-    BlindVaultReplicaBoundRuntimeError, BlindVaultReplicaCommittedAttemptBinding,
-    BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaCommittedAttemptRecord,
-    BlindVaultReplicaCommittedBoundAttemptDispatch, BlindVaultReplicaConvergence,
-    BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,
-    BlindVaultReplicaDispatchReadiness, BlindVaultReplicaDurableAttemptDispatch,
-    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaDurableDispatchError,
-    BlindVaultReplicaDurableResolution, BlindVaultReplicaDurableResolutionError,
-    BlindVaultReplicaDurableSnapshot, BlindVaultReplicaDurableSnapshotError,
-    BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
+    BlindVaultReplicaAttemptDurabilityPhase, BlindVaultReplicaAttemptFailure,
+    BlindVaultReplicaAttemptJournal, BlindVaultReplicaAttemptJournalError,
+    BlindVaultReplicaAuthenticatedPreparedAttempt, BlindVaultReplicaBoundAttemptContinuation,
+    BlindVaultReplicaBoundContinuationError, BlindVaultReplicaBoundRuntimeError,
+    BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaCommittedAttemptDispatch,
+    BlindVaultReplicaCommittedAttemptRecord, BlindVaultReplicaCommittedBoundAttemptDispatch,
+    BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
+    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
+    BlindVaultReplicaDurableAttemptDispatch, BlindVaultReplicaDurableBoundAttemptDispatch,
+    BlindVaultReplicaDurableDispatchError, BlindVaultReplicaDurableResolution,
+    BlindVaultReplicaDurableResolutionError, BlindVaultReplicaDurableSnapshot,
+    BlindVaultReplicaDurableSnapshotError, BlindVaultReplicaExecution,
+    BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
     BlindVaultReplicaLoadedRecovery, BlindVaultReplicaOnionDispatchPlan,
     BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
     BlindVaultReplicaPersistedAttemptJournal, BlindVaultReplicaPersistedBoundAttemptJournal,

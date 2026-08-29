@@ -46,6 +46,7 @@ use std::fmt;
 
 use thiserror::Error;
 
+use super::super::BlindVaultReplicaDispatchFailure;
 use super::attempt_runtime::BlindVaultReplicaTerminalReplyVerifier;
 use super::send_sequence::BlindVaultReplicaTerminalSendContext;
 use crate::crypto::keys::IdentityPublicKey;
@@ -214,8 +215,13 @@ fn verify_request_bound_reply<PolicyError>(
     let expected_operation = expected_terminal_operation(purpose)
         .ok_or(BlindVaultReplicaRequestBoundReplyError::UnsupportedPurpose)?;
     let onion_request = decode_onion_reply_request(encoded_request)?;
-    let request_frame = decode_blind_vault_frame(&onion_request.payload)?;
-    let response_frame = decode_blind_vault_frame(&reply.payload)?;
+    let request_frame = decode_blind_vault_frame(&onion_request.payload)
+        .map_err(BlindVaultReplicaRequestBoundReplyError::RequestFrame)?;
+    if !request_frame_matches_purpose(purpose, &request_frame) {
+        return Err(BlindVaultReplicaRequestBoundReplyError::RequestFrameMismatch);
+    }
+    let response_frame = decode_blind_vault_frame(&reply.payload)
+        .map_err(BlindVaultReplicaRequestBoundReplyError::ResponseFrame)?;
     if let BlindVaultFrame::TerminalFailure(failure) = &response_frame {
         if failure.operation() != expected_operation {
             return Err(BlindVaultReplicaRequestBoundReplyError::TerminalOperationMismatch);
@@ -236,7 +242,9 @@ fn verify_request_bound_reply<PolicyError>(
             BlindVaultFrame::BlindLeaseAdmission(request),
             BlindVaultFrame::BlindLeaseAccepted(receipt),
         ) => {
-            receipt.validate_and_verify(&terminal_key)?;
+            receipt
+                .validate_and_verify(&terminal_key)
+                .map_err(BlindVaultReplicaRequestBoundReplyError::ResponseFrame)?;
             require_match(receipt.matches_admission(&request))?;
             Ok(BlindVaultReplicaRequestBoundReply::LeaseAccepted { request, receipt })
         }
@@ -245,7 +253,9 @@ fn verify_request_bound_reply<PolicyError>(
             BlindVaultFrame::Put(request),
             BlindVaultFrame::StoredReceipt(receipt),
         ) => {
-            receipt.validate_and_verify(&terminal_key)?;
+            receipt
+                .validate_and_verify(&terminal_key)
+                .map_err(BlindVaultReplicaRequestBoundReplyError::ResponseFrame)?;
             require_match(receipt.matches_put(&request))?;
             Ok(BlindVaultReplicaRequestBoundReply::ObjectStored { request, receipt })
         }
@@ -254,7 +264,9 @@ fn verify_request_bound_reply<PolicyError>(
             BlindVaultFrame::Delete(request),
             BlindVaultFrame::DeletedReceipt(receipt),
         ) => {
-            receipt.validate_and_verify(&terminal_key)?;
+            receipt
+                .validate_and_verify(&terminal_key)
+                .map_err(BlindVaultReplicaRequestBoundReplyError::ResponseFrame)?;
             require_match(receipt.matches_delete(&request))?;
             Ok(BlindVaultReplicaRequestBoundReply::ObjectDeleted { request, receipt })
         }
@@ -263,7 +275,9 @@ fn verify_request_bound_reply<PolicyError>(
             BlindVaultFrame::LeaseRetire(request),
             BlindVaultFrame::LeaseRetiredReceipt(receipt),
         ) => {
-            receipt.validate_and_verify(&terminal_key)?;
+            receipt
+                .validate_and_verify(&terminal_key)
+                .map_err(BlindVaultReplicaRequestBoundReplyError::ResponseFrame)?;
             require_match(receipt.matches_retire(&request))?;
             Ok(BlindVaultReplicaRequestBoundReply::LeaseRetired { request, receipt })
         }
@@ -272,7 +286,9 @@ fn verify_request_bound_reply<PolicyError>(
             BlindVaultFrame::BlindLeaseRenewal(request),
             BlindVaultFrame::BlindLeaseRenewed(receipt),
         ) => {
-            receipt.validate_and_verify(&terminal_key)?;
+            receipt
+                .validate_and_verify(&terminal_key)
+                .map_err(BlindVaultReplicaRequestBoundReplyError::ResponseFrame)?;
             require_match(receipt.matches_renewal(&request))?;
             Ok(BlindVaultReplicaRequestBoundReply::LeaseRenewed { request, receipt })
         }
@@ -281,12 +297,39 @@ fn verify_request_bound_reply<PolicyError>(
             BlindVaultFrame::LeaseInventory(request),
             BlindVaultFrame::LeaseInventoryReceipt(receipt),
         ) => {
-            receipt.validate_and_verify(&terminal_key)?;
+            receipt
+                .validate_and_verify(&terminal_key)
+                .map_err(BlindVaultReplicaRequestBoundReplyError::ResponseFrame)?;
             require_match(receipt.matches_inventory(&request))?;
             Ok(BlindVaultReplicaRequestBoundReply::InventoryObserved { request, receipt })
         }
-        _ => Err(BlindVaultReplicaRequestBoundReplyError::UnexpectedFrames),
+        _ => Err(BlindVaultReplicaRequestBoundReplyError::ResponseFrameMismatch),
     }
+}
+
+fn request_frame_matches_purpose(purpose: OnionRoutePurpose, frame: &BlindVaultFrame) -> bool {
+    matches!(
+        (purpose, frame),
+        (
+            OnionRoutePurpose::BlindVaultLeaseAdmission,
+            BlindVaultFrame::BlindLeaseAdmission(_)
+        ) | (
+            OnionRoutePurpose::BlindVaultPutReceipt,
+            BlindVaultFrame::Put(_)
+        ) | (
+            OnionRoutePurpose::BlindVaultDelete,
+            BlindVaultFrame::Delete(_)
+        ) | (
+            OnionRoutePurpose::BlindVaultLeaseRetire,
+            BlindVaultFrame::LeaseRetire(_)
+        ) | (
+            OnionRoutePurpose::BlindVaultLeaseRenewal,
+            BlindVaultFrame::BlindLeaseRenewal(_)
+        ) | (
+            OnionRoutePurpose::BlindVaultLeaseInventory,
+            BlindVaultFrame::LeaseInventory(_)
+        )
+    )
 }
 
 fn expected_terminal_operation(purpose: OnionRoutePurpose) -> Option<BlindVaultTerminalOperation> {
@@ -324,9 +367,12 @@ pub enum BlindVaultReplicaRequestBoundReplyError<PolicyError> {
     /// Encoded onion request was malformed or unsupported.
     #[error(transparent)]
     OnionReply(#[from] OnionReplyError),
-    /// Inner Blind Vault request or response frame violated the protocol.
-    #[error(transparent)]
-    BlindVault(#[from] BlindVaultError),
+    /// Persisted source request contained an invalid Blind Vault frame.
+    #[error("blind vault request-bound source frame is invalid")]
+    RequestFrame(#[source] BlindVaultError),
+    /// Authenticated terminal response contained an invalid Blind Vault frame.
+    #[error("blind vault request-bound terminal frame is invalid")]
+    ResponseFrame(#[source] BlindVaultError),
     /// The outer authenticated terminal identity was not valid Ed25519.
     #[error("blind vault request-bound reply terminal identity is invalid")]
     InvalidTerminalIdentity,
@@ -339,13 +385,39 @@ pub enum BlindVaultReplicaRequestBoundReplyError<PolicyError> {
     /// Authenticated terminal returned one coarse operation failure.
     #[error("blind vault encrypted terminal failure: {0}")]
     TerminalFailure(BlindVaultTerminalFailureCode),
-    /// Request and response frame kinds were not the canonical purpose pair.
-    #[error("blind vault request-bound reply frames mismatched")]
-    UnexpectedFrames,
+    /// Persisted source request frame did not implement its committed purpose.
+    #[error("blind vault request-bound source frame mismatched its purpose")]
+    RequestFrameMismatch,
+    /// Terminal response frame did not implement the expected request pair.
+    #[error("blind vault request-bound terminal frame mismatched its request")]
+    ResponseFrameMismatch,
     /// Signed receipt did not answer the exact committed request.
     #[error("blind vault request-bound terminal receipt mismatched")]
     RequestMismatch,
     /// Source-private manifest or lifecycle policy rejected the signed pair.
     #[error("blind vault private reply policy rejected terminal outcome")]
     Policy(PolicyError),
+}
+
+impl<PolicyError> BlindVaultReplicaRequestBoundReplyError<PolicyError> {
+    /// Maps detailed source-local verification failure into durable workflow
+    /// state without persisting request, receipt, or policy error details.
+    #[must_use]
+    pub fn dispatch_failure(&self) -> BlindVaultReplicaDispatchFailure {
+        match self {
+            Self::TerminalFailure(code) => (*code).into(),
+            Self::Policy(_) => BlindVaultReplicaDispatchFailure::PolicyRejected,
+            Self::OnionReply(_)
+            | Self::RequestFrame(_)
+            | Self::UnsupportedPurpose
+            | Self::RequestFrameMismatch => {
+                BlindVaultReplicaDispatchFailure::LocalConstructionFailed
+            }
+            Self::ResponseFrame(_)
+            | Self::InvalidTerminalIdentity
+            | Self::TerminalOperationMismatch
+            | Self::ResponseFrameMismatch
+            | Self::RequestMismatch => BlindVaultReplicaDispatchFailure::TerminalRejected,
+        }
+    }
 }
