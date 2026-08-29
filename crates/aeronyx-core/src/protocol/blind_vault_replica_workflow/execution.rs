@@ -6,6 +6,10 @@
 //! [BLIND-VAULT-REPLICA-EXECUTION 2026-08-28 by Codex] Transport success is
 //! intentionally not a terminal state. Every action must accept cryptographic
 //! evidence, then a fresh planner pass must confirm whole-set convergence.
+//!
+//! Last Modified: v1.1.0-CommittedLateEvidence - Centralized evidence
+//! admission while permitting exact committed attempts to accept late,
+//! cryptographically verified terminal evidence during durable recovery.
 
 use super::{
     require_timestamp, BlindVaultReplacementRetirementPermit, BlindVaultReplicaActionEvidence,
@@ -19,6 +23,12 @@ use super::{
 use crate::protocol::blind_vault::{
     BlindVaultReplicaAction, BlindVaultReplicaPlan, BlindVaultReplicaPlanHealth,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlindVaultReplicaEvidenceDeadlinePolicy {
+    EnforceOriginal,
+    RecoverCommittedAttempt { expected_attempt: u8 },
+}
 
 impl BlindVaultReplicaExecution {
     /// Creates one source-local execution generation from stable planner order.
@@ -416,6 +426,38 @@ impl BlindVaultReplicaExecution {
         id: BlindVaultReplicaWorkId,
         evidence: &BlindVaultReplicaActionEvidence,
     ) -> Result<(), BlindVaultReplicaWorkflowError> {
+        self.accept_evidence_with_policy(
+            id,
+            evidence,
+            BlindVaultReplicaEvidenceDeadlinePolicy::EnforceOriginal,
+        )
+    }
+
+    /// Accepts late verified evidence only for an exact durable journal.
+    ///
+    /// [BLIND-VAULT-COMMITTED-LATE-EVIDENCE 2026-08-29 by Codex] A restart or
+    /// delayed encrypted reply may cross the original scheduling deadline.
+    /// The deadline remains strict for normal callers; the durable resolution
+    /// domain supplies the exact committed attempt required by this path.
+    pub(super) fn accept_committed_attempt_evidence(
+        &mut self,
+        id: BlindVaultReplicaWorkId,
+        expected_attempt: u8,
+        evidence: &BlindVaultReplicaActionEvidence,
+    ) -> Result<(), BlindVaultReplicaWorkflowError> {
+        self.accept_evidence_with_policy(
+            id,
+            evidence,
+            BlindVaultReplicaEvidenceDeadlinePolicy::RecoverCommittedAttempt { expected_attempt },
+        )
+    }
+
+    fn accept_evidence_with_policy(
+        &mut self,
+        id: BlindVaultReplicaWorkId,
+        evidence: &BlindVaultReplicaActionEvidence,
+        deadline_policy: BlindVaultReplicaEvidenceDeadlinePolicy,
+    ) -> Result<(), BlindVaultReplicaWorkflowError> {
         self.validate_event_time(evidence.verified_at_ms)?;
         let item = self.item_mut(id)?;
         let (attempt, dispatched_at_ms, evidence_deadline_ms) = match item.state {
@@ -429,8 +471,20 @@ impl BlindVaultReplicaExecution {
         if evidence.verified_at_ms < dispatched_at_ms {
             return Err(BlindVaultReplicaWorkflowError::TimestampOutOfRange);
         }
-        if evidence.verified_at_ms > evidence_deadline_ms {
+        if matches!(
+            deadline_policy,
+            BlindVaultReplicaEvidenceDeadlinePolicy::EnforceOriginal
+        ) && evidence.verified_at_ms > evidence_deadline_ms
+        {
             return Err(BlindVaultReplicaWorkflowError::EvidenceExpired);
+        }
+        if let BlindVaultReplicaEvidenceDeadlinePolicy::RecoverCommittedAttempt {
+            expected_attempt,
+        } = deadline_policy
+        {
+            if attempt != expected_attempt {
+                return Err(BlindVaultReplicaWorkflowError::EvidenceActionMismatch);
+            }
         }
         // Permit-gated replacement evidence is generation- and attempt-bound;
         // legacy evidence retains its existing action-only compatibility path.

@@ -235,7 +235,7 @@ impl BlindVaultReplicaExecution {
             return Err(BlindVaultReplicaDurableResolutionError::StateMismatch);
         }
 
-        self.accept_evidence(binding.work_id, evidence)
+        self.accept_committed_attempt_evidence(binding.work_id, binding.attempt, evidence)
             .map_err(BlindVaultReplicaDurableResolutionError::Workflow)?;
         let sealed_snapshot = match self.seal_restart_snapshot(identity, snapshot_sequence) {
             Ok(snapshot) => Zeroizing::new(snapshot),
