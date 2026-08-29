@@ -65,6 +65,8 @@
 //!   credential-free admission proof for sequential replica verification.
 //! - [BLIND-VAULT-REPLACEMENT-REPLY-POLICY 2026-08-29 by Codex] Composed
 //!   request-bound replies into a fail-closed replacement lifecycle policy.
+//! - [BLIND-VAULT-DURABLE-REPLACEMENT 2026-08-29 by Codex] Added a typed
+//!   durable path for complete policy-issued replacement capabilities.
 //!
 //! ## Main Functionality
 //!
@@ -102,6 +104,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.26.0-BlindVaultDurableReplacement - Added a typed atomic resolution API
+//! for completed replacement-policy evidence
 //! v1.25.0-BlindVaultReplacementReplyPolicy - Added a reusable source-private
 //! replacement reply state machine and workflow-permit boundary
 //! v1.24.0-BlindVaultDistilledAdmission - Removed one-time blind credentials

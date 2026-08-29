@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.34.0-ReplacementReplyPolicy - Composed request-bound
+//! Last Modified: v1.35.0-DurableReplacementCompletion - Added a typed durable
+//! path accepting only an unforgeable completed-policy capability.
+//! v1.34.0-ReplacementReplyPolicy - Composed request-bound
 //! replies into one fail-closed replacement lifecycle state machine.
 //! v1.33.0-DistilledAdmissionEvidence - Added a credential-free
 //! verified admission stage for sequential replacement/provision workflows.
@@ -170,12 +172,12 @@ pub use bound_continuation::{
 };
 pub use bound_dispatch::{
     BlindVaultReplicaBoundRuntimeError, BlindVaultReplicaCommittedBoundAttemptDispatch,
-    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaOnionDispatchPlan,
-    BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
-    BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
-    BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaReplacementAuthorizationError,
-    BlindVaultReplicaReplacementReplyOutcome, BlindVaultReplicaReplacementReplyPolicy,
-    BlindVaultReplicaReplacementReplyPolicyBuildError,
+    BlindVaultReplicaCompletedReplacement, BlindVaultReplicaDurableBoundAttemptDispatch,
+    BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
+    BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaPersistedBoundAttemptJournal,
+    BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaPrivateReplyPolicy,
+    BlindVaultReplicaReplacementAuthorizationError, BlindVaultReplicaReplacementReplyOutcome,
+    BlindVaultReplicaReplacementReplyPolicy, BlindVaultReplicaReplacementReplyPolicyBuildError,
     BlindVaultReplicaReplacementReplyPolicyError, BlindVaultReplicaRequestBoundReply,
     BlindVaultReplicaRequestBoundReplyError, BlindVaultReplicaRequestBoundReplyVerifier,
     BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalAttemptRuntime,

@@ -16,6 +16,7 @@
 //! - Verifies replacement inventory against one source-owned manifest.
 //! - Requires a workflow-issued permit before accepting retirement evidence.
 //! - Produces typed, non-serializable lifecycle outcomes for the source.
+//! - Seals completed evidence behind an unforgeable replacement-only type.
 //!
 //! ## Dependencies
 //! - `request_bound_verifier.rs`: exact signed request/reply pairs.
@@ -35,7 +36,9 @@
 //! - Never add a transition that accepts retirement before verified inventory.
 //! - Never expose request, receipt, manifest, node, or lease values in Debug.
 //!
-//! Last Modified: v1.0.0-ReplacementReplyPolicy - Initial typed replacement
+//! Last Modified: v1.1.0-CompletedReplacementCapability - Restricted durable
+//! replacement completion to evidence emitted by the full policy state machine.
+//! v1.0.0-ReplacementReplyPolicy - Initial typed replacement
 //! reply state machine and workflow-permit composition.
 //! ============================================
 
@@ -84,7 +87,7 @@ pub enum BlindVaultReplicaReplacementReplyOutcome {
     /// Replacement admission and complete live manifest were verified.
     ReplacementVerified(BlindVaultVerifiedProvisionedReplica),
     /// Old lease was durably retired under workflow authority.
-    ReplacementCompleted(BlindVaultReplicaActionEvidence),
+    ReplacementCompleted(BlindVaultReplicaCompletedReplacement),
 }
 
 impl fmt::Debug for BlindVaultReplicaReplacementReplyOutcome {
@@ -95,6 +98,34 @@ impl fmt::Debug for BlindVaultReplicaReplacementReplyOutcome {
             Self::ReplacementVerified(_) => "ReplacementVerified([REDACTED])",
             Self::ReplacementCompleted(_) => "ReplacementCompleted([REDACTED])",
         })
+    }
+}
+
+/// Unforgeable completion capability for one fully verified replacement.
+///
+/// [BLIND-VAULT-COMPLETED-REPLACEMENT-CAPABILITY 2026-08-29 by Codex]
+/// Public construction is intentionally unavailable. The replacement policy
+/// creates this value only after matching inventory, workflow permit, exact
+/// terminal authorization, and signed old-lease retirement all succeed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BlindVaultReplicaCompletedReplacement {
+    evidence: BlindVaultReplicaActionEvidence,
+}
+
+impl BlindVaultReplicaCompletedReplacement {
+    pub(in crate::protocol::blind_vault_replica_workflow) const fn evidence(
+        &self,
+    ) -> &BlindVaultReplicaActionEvidence {
+        &self.evidence
+    }
+}
+
+impl fmt::Debug for BlindVaultReplicaCompletedReplacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaCompletedReplacement")
+            .field("evidence", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -350,7 +381,11 @@ where
                     )
                     .map_err(BlindVaultReplicaReplacementReplyPolicyError::Workflow)?;
                 self.state = BlindVaultReplicaReplacementReplyState::Complete;
-                Ok(BlindVaultReplicaReplacementReplyOutcome::ReplacementCompleted(evidence))
+                Ok(
+                    BlindVaultReplicaReplacementReplyOutcome::ReplacementCompleted(
+                        BlindVaultReplicaCompletedReplacement { evidence },
+                    ),
+                )
             }
             _ => Err(BlindVaultReplicaReplacementReplyPolicyError::StageMismatch),
         }
