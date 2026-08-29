@@ -29,6 +29,7 @@
 //! - `blind_vault_replica_workflow/prepared_effect.rs`: exact send bindings.
 //! - `blind_vault_replica_workflow/recovery.rs`: restart recovery decisions.
 //! - `blind_vault_replica_workflow/recovery_loader.rs`: durable phase loading.
+//! - `blind_vault_replica_workflow/recovered_bound_attempt.rs`: resend permit.
 //! - `blind_vault_replica_workflow/sealed_local.rs`: shared local AEAD container.
 //! - `blind_vault_replica_workflow/snapshot.rs`: sealed local restart state.
 //! - `protocol::blind_vault`: planner actions and terminal evidence.
@@ -58,7 +59,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.25.0-BoundDurableDispatch - Carried exact effect identity
+//! Last Modified: v1.26.0-RecoveredBoundAttempt - Added committed-only restart
+//! authority for exact ordered terminal effect retransmission.
+//! v1.25.0-BoundDurableDispatch - Carried exact effect identity
 //! through durability markers into one ordered transport capability.
 //! v1.24.0-BoundAttemptContinuation - Bound exact terminal
 //! effects and one-time response sessions across restart recovery.
@@ -123,6 +126,7 @@ mod evidence;
 mod execution;
 mod persistence;
 mod prepared_effect;
+mod recovered_bound_attempt;
 mod recovery;
 mod recovery_loader;
 mod sealed_local;
@@ -168,6 +172,10 @@ pub use prepared_effect::{
     BlindVaultReplicaPreparedEffectError, BlindVaultReplicaPreparedEffectSet,
     BlindVaultReplicaTerminalEffect, MAX_BLIND_VAULT_REPLICA_TERMINAL_EFFECTS,
     MAX_BLIND_VAULT_REPLICA_TERMINAL_EFFECT_BYTES,
+};
+pub use recovered_bound_attempt::{
+    BlindVaultReplicaRecoveredBoundAttempt, BlindVaultReplicaRecoveredBoundAttemptError,
+    BlindVaultReplicaRecoveredSendPermit,
 };
 pub use recovery::{
     BlindVaultReplicaRestartRecoveryKind, BlindVaultReplicaRestartRecoveryTask,

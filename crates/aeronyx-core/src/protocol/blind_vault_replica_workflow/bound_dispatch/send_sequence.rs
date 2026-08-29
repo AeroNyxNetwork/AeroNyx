@@ -98,7 +98,7 @@ pub struct BlindVaultReplicaTerminalSendSequence<'effects> {
 }
 
 impl<'effects> BlindVaultReplicaTerminalSendSequence<'effects> {
-    pub(super) fn from_durable_parts(
+    pub(in crate::protocol::blind_vault_replica_workflow) fn from_durable_parts(
         effect_set: &'effects BlindVaultReplicaPreparedEffectSet,
         snapshot_sequence: u64,
         journal_sequence: u64,
