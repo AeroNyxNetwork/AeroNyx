@@ -23,6 +23,7 @@
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
 //! - `blind_vault_replica_workflow/persistence.rs`: durable recovery boundary.
 //! - `blind_vault_replica_workflow/recovery.rs`: restart recovery decisions.
+//! - `blind_vault_replica_workflow/recovery_loader.rs`: durable phase loading.
 //! - `blind_vault_replica_workflow/sealed_local.rs`: shared local AEAD container.
 //! - `blind_vault_replica_workflow/snapshot.rs`: sealed local restart state.
 //! - `protocol::blind_vault`: planner actions and terminal evidence.
@@ -52,7 +53,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.19.0-PreparedRecoveryAuthentication - Required identity
+//! Last Modified: v1.20.0-AuthenticatedRecoveryLoad - Added exact-high-water,
+//! phase-aware loading of durable source workflow generations.
+//! v1.19.0-PreparedRecoveryAuthentication - Required identity
 //! and pre-dispatch workflow authentication before prepared-journal cleanup.
 //! v1.18.0-DurableDispatchPermit - Added typed ordering from
 //! durable prepared state through snapshot commit to network-send permission.
@@ -101,6 +104,7 @@ mod evidence;
 mod execution;
 mod persistence;
 mod recovery;
+mod recovery_loader;
 mod sealed_local;
 mod snapshot;
 
@@ -127,6 +131,10 @@ pub use persistence::{
 pub use recovery::{
     BlindVaultReplicaRestartRecoveryKind, BlindVaultReplicaRestartRecoveryTask,
     BlindVaultReplicaRestartRecoveryTiming,
+};
+pub use recovery_loader::{
+    load_blind_vault_replica_recovery, BlindVaultReplicaLoadedRecovery,
+    BlindVaultReplicaRecoveryLoadError,
 };
 
 use thiserror::Error;
