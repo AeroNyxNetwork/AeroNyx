@@ -31,11 +31,14 @@
 //! - Never add request payloads that are not required for exact continuation.
 //! - Never expose the encoded continuation or session restart bytes publicly.
 //! - Session order is adapter-owned and must match the prepared request order.
-//! - Rebuild payloads from the private manifest through `rebuild_request`;
-//!   its commitment check prevents sending a different request after restart.
+//! - Use `BlindVaultReplicaBoundAttemptContinuation` when payload identity and
+//!   send order must be verified after restart; this low-level type only owns
+//!   adapter state and reply sessions.
 //! - A continuation without a reply session must use the opaque journal path.
 //!
-//! Last Modified: v1.0.0-TypedAttemptContinuation - Initial typed recovery.
+//! Last Modified: v1.1.0-BoundAttemptComposition - Clarified this low-level
+//! session owner and exposed sibling-only restart codec composition.
+//! v1.0.0-TypedAttemptContinuation - Initial typed recovery.
 //! ============================================
 
 use std::{fmt, mem};
@@ -136,7 +139,9 @@ impl BlindVaultReplicaAttemptContinuation {
         )
     }
 
-    fn encode_restart_state(&self) -> Result<Vec<u8>, BlindVaultReplicaAttemptJournalError> {
+    pub(super) fn encode_restart_state(
+        &self,
+    ) -> Result<Vec<u8>, BlindVaultReplicaAttemptJournalError> {
         if self.reply_sessions.is_empty() {
             return Err(BlindVaultReplicaAttemptJournalError::ReplySessionsRequired);
         }
@@ -174,7 +179,9 @@ impl BlindVaultReplicaAttemptContinuation {
         Ok(encoded.into_bytes())
     }
 
-    fn decode_restart_state(encoded: &[u8]) -> Result<Self, BlindVaultReplicaAttemptJournalError> {
+    pub(super) fn decode_restart_state(
+        encoded: &[u8],
+    ) -> Result<Self, BlindVaultReplicaAttemptJournalError> {
         if encoded.len() < CONTINUATION_HEADER_BYTES || encoded[..4] != CONTINUATION_MAGIC {
             return Err(BlindVaultReplicaAttemptJournalError::ContinuationMalformed);
         }

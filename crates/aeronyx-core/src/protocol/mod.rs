@@ -49,6 +49,8 @@
 //!   resolved workflow bootstrap and ordinary-state persistence command.
 //! - [BLIND-VAULT-PREPARED-EFFECTS 2026-08-29 by Codex] Re-exported exact,
 //!   payload-blind terminal effect bindings for source-side orchestration.
+//! - [BLIND-VAULT-BOUND-CONTINUATION 2026-08-29 by Codex] Bound effect order
+//!   and one-time reply sessions inside restart-safe private journals.
 //!
 //! ## Main Functionality
 //!
@@ -86,6 +88,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.18.0-BlindVaultBoundContinuation - Re-exported exact effect/session
+//! restart composition for private compound replica attempts
 //! v1.17.0-BlindVaultPreparedEffects - Re-exported source-local ordered effect
 //! commitments that bind durable attempts to exact send-time payloads
 //! v1.16.0-BlindVaultDurableSnapshot - Re-exported resolved-state persistence
@@ -176,6 +180,7 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaActionEvidence, BlindVaultReplicaAttemptContinuation,
     BlindVaultReplicaAttemptDurabilityPhase, BlindVaultReplicaAttemptJournal,
     BlindVaultReplicaAttemptJournalError, BlindVaultReplicaAuthenticatedPreparedAttempt,
+    BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaBoundContinuationError,
     BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaCommittedAttemptDispatch,
     BlindVaultReplicaCommittedAttemptRecord, BlindVaultReplicaConvergence,
     BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,

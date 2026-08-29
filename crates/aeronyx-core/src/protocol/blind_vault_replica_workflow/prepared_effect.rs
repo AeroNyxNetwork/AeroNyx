@@ -22,6 +22,7 @@
 //! - `OnionRoutePurpose`: canonical purpose negotiation.
 //! - `prepared_effect/commitment.rs`: domain-separated commitments.
 //! - `prepared_effect/contract.rs`: compound action stage validation.
+//! - `prepared_effect/restart_codec.rs`: bounded source-local restoration.
 //!
 //! ## Main Logical Flow
 //! 1. The source constructs every encrypted terminal payload for one attempt.
@@ -55,6 +56,7 @@ use crate::protocol::onion::OnionRoutePurpose;
 
 mod commitment;
 mod contract;
+mod restart_codec;
 
 /// Maximum opaque terminal payload accepted into one effect commitment.
 pub const MAX_BLIND_VAULT_REPLICA_TERMINAL_EFFECT_BYTES: usize = 256 * 1024;
@@ -243,6 +245,15 @@ pub enum BlindVaultReplicaPreparedEffectError {
     /// Ordered effects did not implement the immutable action contract.
     #[error("blind vault replica terminal effects violate the dispatch contract")]
     ContractMismatch,
+    /// Source-local prepared-effect bytes were truncated or inconsistent.
+    #[error("blind vault replica prepared terminal effect binding is malformed")]
+    RestartBindingMalformed,
+    /// Source-local prepared-effect bytes use an unsupported version.
+    #[error("blind vault replica prepared terminal effect binding version is unsupported")]
+    RestartBindingVersionUnsupported,
+    /// Restored effect entries did not match their attempt-bound commitment.
+    #[error("blind vault replica prepared terminal effect binding commitment mismatched")]
+    RestartBindingCommitmentMismatch,
 }
 
 impl BlindVaultReplicaExecution {

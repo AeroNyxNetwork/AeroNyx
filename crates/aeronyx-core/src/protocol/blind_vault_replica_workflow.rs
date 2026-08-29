@@ -18,6 +18,7 @@
 //! ## Dependencies
 //! - `blind_vault_replica_workflow/attempt_continuation.rs`: reply sessions.
 //! - `blind_vault_replica_workflow/attempt_journal.rs`: private attempt state.
+//! - `blind_vault_replica_workflow/bound_continuation.rs`: exact effects/sessions.
 //! - `blind_vault_replica_workflow/durable_dispatch.rs`: ordered durability.
 //! - `blind_vault_replica_workflow/durable_resolution.rs`: durable evidence.
 //! - `blind_vault_replica_workflow/durable_snapshot.rs`: resolved snapshots.
@@ -56,7 +57,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.23.0-PreparedTerminalEffects - Added payload-blind,
+//! Last Modified: v1.24.0-BoundAttemptContinuation - Bound exact terminal
+//! effects and one-time response sessions across restart recovery.
+//! v1.23.0-PreparedTerminalEffects - Added payload-blind,
 //! ordered terminal-effect binding before durable dispatch authorization.
 //! v1.22.0-DurableWorkflowSnapshot - Added reusable bootstrap
 //! and resolved-state persistence with explicit durable success semantics.
@@ -108,6 +111,7 @@
 
 mod attempt_continuation;
 mod attempt_journal;
+mod bound_continuation;
 mod durable_dispatch;
 mod durable_resolution;
 mod durable_snapshot;
@@ -130,6 +134,9 @@ pub use attempt_journal::{
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES,
+};
+pub use bound_continuation::{
+    BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaBoundContinuationError,
 };
 pub use durable_dispatch::{
     BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,
