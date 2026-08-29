@@ -457,7 +457,7 @@ pub trait BlindVaultReplicaRecoveryStore {
     ) -> Result<Option<BlindVaultReplicaRecoveryState>, Self::Error>;
 }
 
-fn sealed_record_commitment(sealed: &[u8]) -> [u8; 32] {
+pub(super) fn sealed_record_commitment(sealed: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(SEALED_RECORD_COMMITMENT_DOMAIN);
     hasher.update((sealed.len() as u64).to_be_bytes());

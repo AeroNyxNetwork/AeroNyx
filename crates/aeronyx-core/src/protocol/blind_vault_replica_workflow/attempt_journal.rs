@@ -36,7 +36,9 @@
 //! - Never log, clone unnecessarily, or expose the private continuation bytes.
 //! - Delete a journal only after accepted evidence or explicit safe resolution.
 //!
-//! Last Modified: v1.2.0-TypedContinuation - Added errors shared by the
+//! Last Modified: v1.3.0-PreparedRecoveryAuthentication - Added an
+//! identity-authenticated proof that a durable journal stopped before send.
+//! v1.2.0-TypedContinuation - Added errors shared by the
 //! recoverable onion reply continuation codec.
 //! v1.1.0-PreparedAttempt - Added a typed
 //! persist-before-dispatch handle.
@@ -53,9 +55,9 @@ use zeroize::Zeroize;
 
 use super::sealed_local::{open_identity_bound, seal_identity_bound, IdentitySealedLocalError};
 use super::{
-    require_timestamp, BlindVaultReplicaDispatchReadiness, BlindVaultReplicaExecution,
-    BlindVaultReplicaRestoredExecution, BlindVaultReplicaWorkId, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError,
+    persistence::sealed_record_commitment, require_timestamp, BlindVaultReplicaDispatchReadiness,
+    BlindVaultReplicaExecution, BlindVaultReplicaRecoveryStore, BlindVaultReplicaRestoredExecution,
+    BlindVaultReplicaWorkId, BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
 };
 use crate::crypto::keys::IdentityKeyPair;
 use crate::protocol::blind_vault::BlindVaultReplicaAction;
@@ -106,6 +108,18 @@ pub struct BlindVaultReplicaAttemptJournal {
     evidence_deadline_ms: u64,
     retain_until_ms: u64,
     private_state: Vec<u8>,
+}
+
+/// Proof that one authenticated durable journal never crossed dispatch commit.
+///
+/// This value contains no private continuation bytes. It can only be created
+/// by opening the identity-sealed journal against an authenticated restored
+/// workflow whose exact work item is still dispatch-ready at the bound time.
+pub struct BlindVaultReplicaAuthenticatedPreparedAttempt {
+    work_id: BlindVaultReplicaWorkId,
+    attempt: u8,
+    journal_sequence: u64,
+    journal_commitment: [u8; 32],
 }
 
 /// Prepared journal plus immutable binding required for one dispatch commit.
@@ -179,6 +193,42 @@ impl BlindVaultReplicaAttemptJournal {
 impl Drop for BlindVaultReplicaAttemptJournal {
     fn drop(&mut self) {
         self.private_state.zeroize();
+    }
+}
+
+impl BlindVaultReplicaAuthenticatedPreparedAttempt {
+    #[must_use]
+    pub const fn work_id(&self) -> BlindVaultReplicaWorkId {
+        self.work_id
+    }
+
+    #[must_use]
+    pub const fn attempt(&self) -> u8 {
+        self.attempt
+    }
+
+    #[must_use]
+    pub const fn journal_sequence(&self) -> u64 {
+        self.journal_sequence
+    }
+
+    /// Atomically removes only this authenticated pre-dispatch journal.
+    pub fn abort_recovery<Store>(&self, store: &mut Store) -> Result<(), Store::Error>
+    where
+        Store: BlindVaultReplicaRecoveryStore,
+    {
+        store.abort_prepared_attempt(self.journal_sequence, self.journal_commitment)
+    }
+}
+
+impl fmt::Debug for BlindVaultReplicaAuthenticatedPreparedAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaAuthenticatedPreparedAttempt")
+            .field("attempt", &self.attempt)
+            .field("journal_sequence", &self.journal_sequence)
+            .field("journal_commitment", &"<redacted>")
+            .finish_non_exhaustive()
     }
 }
 
@@ -478,43 +528,8 @@ impl BlindVaultReplicaRestoredExecution {
         minimum_journal_sequence: u64,
         now_ms: u64,
     ) -> Result<BlindVaultReplicaAttemptJournal, BlindVaultReplicaAttemptJournalError> {
-        require_timestamp(now_ms)?;
-        let mut plaintext = open_identity_bound(
-            identity,
-            journal,
-            ATTEMPT_JOURNAL_MAGIC,
-            ATTEMPT_JOURNAL_VERSION_V1,
-            ATTEMPT_JOURNAL_KEY_SALT,
-            ATTEMPT_JOURNAL_KEY_INFO,
-            MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
-        )
-        .map_err(map_sealed_local_error)?;
-        let body = journal_options()
-            .deserialize::<AttemptJournalBodyV1>(&plaintext)
-            .map_err(|_| BlindVaultReplicaAttemptJournalError::Malformed);
-        plaintext.zeroize();
-        let mut body = body?;
-
-        if body.journal_sequence == 0 {
-            return Err(BlindVaultReplicaAttemptJournalError::SequenceInvalid);
-        }
-        if body.journal_sequence < minimum_journal_sequence {
-            return Err(BlindVaultReplicaAttemptJournalError::RollbackDetected);
-        }
-        if body.private_state.is_empty() {
-            return Err(BlindVaultReplicaAttemptJournalError::PrivateStateEmpty);
-        }
-        if body.private_state.len() > MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES {
-            return Err(BlindVaultReplicaAttemptJournalError::TooLarge);
-        }
-        validate_journal_lifetime(
-            body.dispatched_at_ms,
-            body.evidence_deadline_ms,
-            body.retain_until_ms,
-        )?;
-        if now_ms < body.dispatched_at_ms {
-            return Err(BlindVaultReplicaWorkflowError::TimestampOutOfRange.into());
-        }
+        let mut body =
+            decode_attempt_journal_body(identity, journal, minimum_journal_sequence, now_ms)?;
         if now_ms > body.retain_until_ms {
             return Err(BlindVaultReplicaAttemptJournalError::Expired);
         }
@@ -550,6 +565,100 @@ impl BlindVaultReplicaRestoredExecution {
             private_state: mem::take(&mut body.private_state),
         })
     }
+
+    /// Authenticates a durable journal against the pre-dispatch snapshot.
+    ///
+    /// [BLIND-VAULT-PREPARED-RECOVERY-AUTH 2026-08-29 by Codex] This path
+    /// intentionally does not expose private continuation bytes and permits
+    /// authentication after retention expiry. The typed ordering guarantees
+    /// that a matching pre-dispatch snapshot means no request was sent.
+    pub fn authenticate_prepared_attempt_journal(
+        &self,
+        identity: &IdentityKeyPair,
+        journal: &[u8],
+        minimum_journal_sequence: u64,
+        now_ms: u64,
+    ) -> Result<BlindVaultReplicaAuthenticatedPreparedAttempt, BlindVaultReplicaAttemptJournalError>
+    {
+        let body =
+            decode_attempt_journal_body(identity, journal, minimum_journal_sequence, now_ms)?;
+        let work_id = BlindVaultReplicaWorkId {
+            workflow_id: body.workflow_id,
+            sequence: body.work_sequence,
+        };
+        let item = self
+            .execution()
+            .items()
+            .iter()
+            .find(|item| item.id() == work_id)
+            .ok_or(BlindVaultReplicaAttemptJournalError::StateMismatch)?;
+        let expected_commitment = journal_action_commitment(item.action())
+            .ok_or(BlindVaultReplicaAttemptJournalError::StateMismatch)?;
+        let expected_readiness = BlindVaultReplicaDispatchReadiness::Ready {
+            attempt: body.attempt,
+            evidence_deadline_ms: body.evidence_deadline_ms,
+        };
+        if self
+            .execution()
+            .dispatch_readiness(work_id, body.dispatched_at_ms)?
+            != expected_readiness
+            || body.action_commitment != expected_commitment
+        {
+            return Err(BlindVaultReplicaAttemptJournalError::StateMismatch);
+        }
+        Ok(BlindVaultReplicaAuthenticatedPreparedAttempt {
+            work_id,
+            attempt: body.attempt,
+            journal_sequence: body.journal_sequence,
+            journal_commitment: sealed_record_commitment(journal),
+        })
+    }
+}
+
+fn decode_attempt_journal_body(
+    identity: &IdentityKeyPair,
+    journal: &[u8],
+    minimum_journal_sequence: u64,
+    now_ms: u64,
+) -> Result<AttemptJournalBodyV1, BlindVaultReplicaAttemptJournalError> {
+    require_timestamp(now_ms)?;
+    let mut plaintext = open_identity_bound(
+        identity,
+        journal,
+        ATTEMPT_JOURNAL_MAGIC,
+        ATTEMPT_JOURNAL_VERSION_V1,
+        ATTEMPT_JOURNAL_KEY_SALT,
+        ATTEMPT_JOURNAL_KEY_INFO,
+        MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
+    )
+    .map_err(map_sealed_local_error)?;
+    let body = journal_options()
+        .deserialize::<AttemptJournalBodyV1>(&plaintext)
+        .map_err(|_| BlindVaultReplicaAttemptJournalError::Malformed);
+    plaintext.zeroize();
+    let body = body?;
+
+    if body.journal_sequence == 0 {
+        return Err(BlindVaultReplicaAttemptJournalError::SequenceInvalid);
+    }
+    if body.journal_sequence < minimum_journal_sequence {
+        return Err(BlindVaultReplicaAttemptJournalError::RollbackDetected);
+    }
+    if body.private_state.is_empty() {
+        return Err(BlindVaultReplicaAttemptJournalError::PrivateStateEmpty);
+    }
+    if body.private_state.len() > MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES {
+        return Err(BlindVaultReplicaAttemptJournalError::TooLarge);
+    }
+    validate_journal_lifetime(
+        body.dispatched_at_ms,
+        body.evidence_deadline_ms,
+        body.retain_until_ms,
+    )?;
+    if now_ms < body.dispatched_at_ms {
+        return Err(BlindVaultReplicaWorkflowError::TimestampOutOfRange.into());
+    }
+    Ok(body)
 }
 
 fn validate_journal_lifetime(
