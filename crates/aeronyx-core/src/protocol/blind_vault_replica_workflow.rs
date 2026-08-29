@@ -21,6 +21,8 @@
 //! - `blind_vault_replica_workflow/bound_continuation.rs`: exact effects/sessions.
 //! - `blind_vault_replica_workflow/bound_dispatch.rs`: durable send markers.
 //! - `blind_vault_replica_workflow/bound_dispatch/attempt_runtime.rs`: replies.
+//! - `blind_vault_replica_workflow/bound_dispatch/request_bound_verifier.rs`:
+//!   terminal request/receipt verification and private policy composition.
 //! - `blind_vault_replica_workflow/durable_dispatch.rs`: ordered durability.
 //! - `blind_vault_replica_workflow/durable_resolution.rs`: durable evidence.
 //! - `blind_vault_replica_workflow/durable_snapshot.rs`: resolved snapshots.
@@ -60,7 +62,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.29.0-OwnedTerminalRuntime - Added direct live/recovery
+//! Last Modified: v1.30.0-RequestBoundReplyVerifier - Verified exact signed
+//! request/receipt pairs before source-private manifest policy acceptance.
+//! v1.29.0-OwnedTerminalRuntime - Added direct live/recovery
 //! ownership transfer without self-referential integration state.
 //! v1.28.0-TerminalAttemptRuntime - Aligned durable effects,
 //! one-time reply sessions, and workload verification under one cursor.
@@ -158,6 +162,8 @@ pub use bound_dispatch::{
     BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaOnionDispatchPlan,
     BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
     BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
+    BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaRequestBoundReply,
+    BlindVaultReplicaRequestBoundReplyError, BlindVaultReplicaRequestBoundReplyVerifier,
     BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalAttemptRuntime,
     BlindVaultReplicaTerminalAttemptRuntimeBuildError, BlindVaultReplicaTerminalAttemptState,
     BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalReplyVerifier,
