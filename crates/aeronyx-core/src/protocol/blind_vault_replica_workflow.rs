@@ -20,6 +20,7 @@
 //! - `blind_vault_replica_workflow/attempt_journal.rs`: private attempt state.
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
+//! - `blind_vault_replica_workflow/persistence.rs`: durable recovery boundary.
 //! - `blind_vault_replica_workflow/recovery.rs`: restart recovery decisions.
 //! - `blind_vault_replica_workflow/sealed_local.rs`: shared local AEAD container.
 //! - `blind_vault_replica_workflow/snapshot.rs`: sealed local restart state.
@@ -50,7 +51,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.16.0-TypedAttemptContinuation - Added restart-safe
+//! Last Modified: v1.17.0-RecoveryStoreContract - Added a storage-neutral,
+//! fail-closed durability contract for snapshots and private attempt journals.
+//! v1.16.0-TypedAttemptContinuation - Added restart-safe
 //! ownership of adapter state and exact single-use onion reply sessions.
 //! v1.15.0-PreparedAttemptJournal - Added a typed
 //! persist-before-dispatch binding for private mutating attempts.
@@ -90,6 +93,7 @@ mod attempt_continuation;
 mod attempt_journal;
 mod evidence;
 mod execution;
+mod persistence;
 mod recovery;
 mod sealed_local;
 mod snapshot;
@@ -103,6 +107,11 @@ pub use attempt_journal::{
     BlindVaultReplicaPreparedAttemptJournal, MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES,
+};
+pub use persistence::{
+    BlindVaultReplicaAttemptDurabilityPhase, BlindVaultReplicaCommittedAttemptRecord,
+    BlindVaultReplicaPreparedAttemptRecord, BlindVaultReplicaRecoveryState,
+    BlindVaultReplicaRecoveryStore, BlindVaultReplicaSnapshotRecord,
 };
 pub use recovery::{
     BlindVaultReplicaRestartRecoveryKind, BlindVaultReplicaRestartRecoveryTask,
