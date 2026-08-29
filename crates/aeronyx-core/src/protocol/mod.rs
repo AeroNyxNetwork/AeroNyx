@@ -45,6 +45,8 @@
 //!   source-only recovery decisions for ambiguous restored terminal attempts.
 //! - [BLIND-VAULT-DURABLE-RECOVERY 2026-08-29 by Codex] Re-exported exact
 //!   durable generation loading and atomic post-evidence journal resolution.
+//! - [BLIND-VAULT-DURABLE-SNAPSHOT 2026-08-29 by Codex] Re-exported the
+//!   resolved workflow bootstrap and ordinary-state persistence command.
 //!
 //! ## Main Functionality
 //!
@@ -82,6 +84,7 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.16.0-BlindVaultDurableSnapshot - Re-exported resolved-state persistence
 //! v1.15.0-BlindVaultDurableRecovery - Re-exported authenticated recovery
 //! loading plus rollback-safe committed-attempt resolution
 //! v1.14.0-BlindVaultAttemptContinuation - Re-exported typed recoverable
@@ -174,7 +177,8 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,
     BlindVaultReplicaDispatchReadiness, BlindVaultReplicaDurableAttemptDispatch,
     BlindVaultReplicaDurableDispatchError, BlindVaultReplicaDurableResolution,
-    BlindVaultReplicaDurableResolutionError, BlindVaultReplicaExecution,
+    BlindVaultReplicaDurableResolutionError, BlindVaultReplicaDurableSnapshot,
+    BlindVaultReplicaDurableSnapshotError, BlindVaultReplicaExecution,
     BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
     BlindVaultReplicaLoadedRecovery, BlindVaultReplicaPersistedAttemptJournal,
     BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedAttemptRecord,

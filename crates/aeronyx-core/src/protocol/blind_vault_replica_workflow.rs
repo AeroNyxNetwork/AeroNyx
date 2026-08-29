@@ -20,6 +20,7 @@
 //! - `blind_vault_replica_workflow/attempt_journal.rs`: private attempt state.
 //! - `blind_vault_replica_workflow/durable_dispatch.rs`: ordered durability.
 //! - `blind_vault_replica_workflow/durable_resolution.rs`: durable evidence.
+//! - `blind_vault_replica_workflow/durable_snapshot.rs`: resolved snapshots.
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
 //! - `blind_vault_replica_workflow/persistence.rs`: durable recovery boundary.
@@ -54,7 +55,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.21.0-DurableAttemptResolution - Added rollback-safe,
+//! Last Modified: v1.22.0-DurableWorkflowSnapshot - Added reusable bootstrap
+//! and resolved-state persistence with explicit durable success semantics.
+//! v1.21.0-DurableAttemptResolution - Added rollback-safe,
 //! atomic evidence acceptance and committed-journal resolution.
 //! v1.20.0-AuthenticatedRecoveryLoad - Added exact-high-water,
 //! phase-aware loading of durable source workflow generations.
@@ -104,6 +107,7 @@ mod attempt_continuation;
 mod attempt_journal;
 mod durable_dispatch;
 mod durable_resolution;
+mod durable_snapshot;
 mod evidence;
 mod execution;
 mod persistence;
@@ -130,6 +134,9 @@ pub use durable_dispatch::{
 pub use durable_resolution::{
     BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaDurableResolution,
     BlindVaultReplicaDurableResolutionError,
+};
+pub use durable_snapshot::{
+    BlindVaultReplicaDurableSnapshot, BlindVaultReplicaDurableSnapshotError,
 };
 pub use persistence::{
     BlindVaultReplicaAttemptDurabilityPhase, BlindVaultReplicaCommittedAttemptRecord,
