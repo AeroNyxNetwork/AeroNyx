@@ -36,7 +36,9 @@
 //! - Never log, clone unnecessarily, or expose the private continuation bytes.
 //! - Delete a journal only after accepted evidence or explicit safe resolution.
 //!
-//! Last Modified: v1.0.0-PrivateAttemptJournal - Initial fail-closed format.
+//! Last Modified: v1.1.0-PreparedAttempt - Added a typed
+//! persist-before-dispatch handle.
+//! v1.0.0-PrivateAttemptJournal - Initial fail-closed format.
 //! ============================================
 
 use std::{fmt, mem};
@@ -104,6 +106,24 @@ pub struct BlindVaultReplicaAttemptJournal {
     private_state: Vec<u8>,
 }
 
+/// Prepared journal plus immutable binding required for one dispatch commit.
+///
+/// [BLIND-VAULT-PREPARED-ATTEMPT 2026-08-29 by Codex] This value closes the
+/// ordering gap between sealing bytes and mutating the workflow. The caller
+/// persists `sealed_journal()` first, then passes the same handle to
+/// `commit_prepared_attempt_dispatch`. Debug output never includes bytes,
+/// work identity, target identity, lease identity, or action commitment.
+pub struct BlindVaultReplicaPreparedAttemptJournal {
+    work_id: BlindVaultReplicaWorkId,
+    attempt: u8,
+    planned_dispatch_at_ms: u64,
+    evidence_deadline_ms: u64,
+    retain_until_ms: u64,
+    journal_sequence: u64,
+    action_commitment: [u8; 32],
+    sealed_journal: Vec<u8>,
+}
+
 impl BlindVaultReplicaAttemptJournal {
     /// Authenticated sequence used by the separate rollback high-water mark.
     #[must_use]
@@ -157,6 +177,68 @@ impl BlindVaultReplicaAttemptJournal {
 impl Drop for BlindVaultReplicaAttemptJournal {
     fn drop(&mut self) {
         self.private_state.zeroize();
+    }
+}
+
+impl BlindVaultReplicaPreparedAttemptJournal {
+    /// Exact work item whose private continuation state was sealed.
+    #[must_use]
+    pub const fn work_id(&self) -> BlindVaultReplicaWorkId {
+        self.work_id
+    }
+
+    /// Exact attempt predicted by side-effect-free readiness.
+    #[must_use]
+    pub const fn attempt(&self) -> u8 {
+        self.attempt
+    }
+
+    /// Timestamp that must be used for the workflow dispatch transition.
+    #[must_use]
+    pub const fn planned_dispatch_at_ms(&self) -> u64 {
+        self.planned_dispatch_at_ms
+    }
+
+    /// Evidence deadline bound into both journal and workflow transition.
+    #[must_use]
+    pub const fn evidence_deadline_ms(&self) -> u64 {
+        self.evidence_deadline_ms
+    }
+
+    /// Last source timestamp at which recovery may open the journal.
+    #[must_use]
+    pub const fn retain_until_ms(&self) -> u64 {
+        self.retain_until_ms
+    }
+
+    /// Monotonic sequence that must advance before dispatch is committed.
+    #[must_use]
+    pub const fn journal_sequence(&self) -> u64 {
+        self.journal_sequence
+    }
+
+    /// Borrows authenticated ciphertext for atomic restrictive persistence.
+    #[must_use]
+    pub fn sealed_journal(&self) -> &[u8] {
+        &self.sealed_journal
+    }
+}
+
+impl Drop for BlindVaultReplicaPreparedAttemptJournal {
+    fn drop(&mut self) {
+        self.sealed_journal.zeroize();
+        self.action_commitment.zeroize();
+    }
+}
+
+impl fmt::Debug for BlindVaultReplicaPreparedAttemptJournal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaPreparedAttemptJournal")
+            .field("journal_sequence", &self.journal_sequence)
+            .field("attempt", &self.attempt)
+            .field("sealed_journal", &"<redacted>")
+            .finish_non_exhaustive()
     }
 }
 
@@ -216,14 +298,91 @@ pub enum BlindVaultReplicaAttemptJournalError {
 }
 
 impl BlindVaultReplicaExecution {
-    /// Seals exact private attempt material before any network side effect.
+    /// Prepares a persist-before-dispatch handle for one mutating attempt.
+    ///
+    /// Persist `sealed_journal()` and its independent sequence high-water mark
+    /// atomically before calling `commit_prepared_attempt_dispatch`. Dropping
+    /// this value before commit has no workflow or network side effect.
+    pub fn prepare_attempt_journal_for_dispatch(
+        &self,
+        identity: &IdentityKeyPair,
+        work_id: BlindVaultReplicaWorkId,
+        planned_dispatch_at_ms: u64,
+        journal_sequence: u64,
+        retain_until_ms: u64,
+        private_state: &[u8],
+    ) -> Result<BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaAttemptJournalError> {
+        let sealed_journal = self.seal_attempt_journal_for_dispatch(
+            identity,
+            work_id,
+            planned_dispatch_at_ms,
+            journal_sequence,
+            retain_until_ms,
+            private_state,
+        )?;
+        let BlindVaultReplicaDispatchReadiness::Ready {
+            attempt,
+            evidence_deadline_ms,
+        } = self.dispatch_readiness(work_id, planned_dispatch_at_ms)?
+        else {
+            return Err(BlindVaultReplicaAttemptJournalError::DispatchNotReady);
+        };
+        let action_commitment = self
+            .items()
+            .iter()
+            .find(|item| item.id() == work_id)
+            .and_then(|item| journal_action_commitment(item.action()))
+            .ok_or(BlindVaultReplicaAttemptJournalError::StateMismatch)?;
+        Ok(BlindVaultReplicaPreparedAttemptJournal {
+            work_id,
+            attempt,
+            planned_dispatch_at_ms,
+            evidence_deadline_ms,
+            retain_until_ms,
+            journal_sequence,
+            action_commitment,
+            sealed_journal,
+        })
+    }
+
+    /// Commits the in-memory dispatch transition for a persisted handle.
+    ///
+    /// After success, seal and atomically persist a fresh workflow snapshot;
+    /// only then send the exact request represented by the private journal.
+    /// Any changed readiness or action binding fails without state mutation.
+    pub fn commit_prepared_attempt_dispatch(
+        &mut self,
+        prepared: &BlindVaultReplicaPreparedAttemptJournal,
+    ) -> Result<u8, BlindVaultReplicaAttemptJournalError> {
+        let current_commitment = self
+            .items()
+            .iter()
+            .find(|item| item.id() == prepared.work_id)
+            .and_then(|item| journal_action_commitment(item.action()))
+            .ok_or(BlindVaultReplicaAttemptJournalError::StateMismatch)?;
+        if current_commitment != prepared.action_commitment {
+            return Err(BlindVaultReplicaAttemptJournalError::StateMismatch);
+        }
+        let readiness =
+            self.dispatch_readiness(prepared.work_id, prepared.planned_dispatch_at_ms)?;
+        if readiness
+            != (BlindVaultReplicaDispatchReadiness::Ready {
+                attempt: prepared.attempt,
+                evidence_deadline_ms: prepared.evidence_deadline_ms,
+            })
+        {
+            return Err(BlindVaultReplicaAttemptJournalError::DispatchNotReady);
+        }
+        self.dispatch(prepared.work_id, prepared.planned_dispatch_at_ms)
+            .map_err(BlindVaultReplicaAttemptJournalError::from)
+    }
+
+    /// Seals exact private attempt material for the typed prepared handle.
     ///
     /// [BLIND-VAULT-PRIVATE-ATTEMPT-JOURNAL 2026-08-29 by Codex] Persist the
-    /// returned bytes atomically before calling `dispatch` with the same
-    /// `planned_dispatch_at_ms`. Then persist a fresh workflow snapshot before
-    /// sending the already-prepared request. If dispatch readiness changes,
-    /// discard this orphan journal without sending the request.
-    pub fn seal_attempt_journal_for_dispatch(
+    /// This low-level helper remains private so callers cannot bypass the
+    /// persist-before-dispatch ordering enforced by the public prepared type.
+    fn seal_attempt_journal_for_dispatch(
         &self,
         identity: &IdentityKeyPair,
         work_id: BlindVaultReplicaWorkId,

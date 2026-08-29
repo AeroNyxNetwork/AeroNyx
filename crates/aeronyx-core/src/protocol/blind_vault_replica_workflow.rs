@@ -49,7 +49,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.14.0-PrivateAttemptJournal - Added action-bound sealed
+//! Last Modified: v1.15.0-PreparedAttemptJournal - Added a typed
+//! persist-before-dispatch binding for private mutating attempts.
+//! v1.14.0-PrivateAttemptJournal - Added action-bound sealed
 //! continuation state for restart-safe replacement and provisioning attempts.
 //! v1.13.0-IdentitySealedLocal - Centralized identity-bound
 //! local persistence cryptography for snapshots and private attempt journals.
@@ -90,7 +92,7 @@ mod snapshot;
 
 pub use attempt_journal::{
     BlindVaultReplicaAttemptJournal, BlindVaultReplicaAttemptJournalError,
-    MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
+    BlindVaultReplicaPreparedAttemptJournal, MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES,
 };

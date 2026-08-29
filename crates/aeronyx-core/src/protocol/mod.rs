@@ -80,6 +80,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.13.0-BlindVaultPreparedAttemptJournal - Re-exported the typed
+//! persist-before-dispatch private attempt handle
 //! v1.12.0-BlindVaultPrivateAttemptJournal - Re-exported identity-sealed,
 //! action-bound continuation state for restart-safe replica repair
 //! v1.11.0-BlindVaultRestartRecoveryPlan - Re-exported fail-closed restored
@@ -162,12 +164,12 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
     BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
     BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
-    BlindVaultReplicaRestartRecoveryKind, BlindVaultReplicaRestartRecoveryTask,
-    BlindVaultReplicaRestartRecoveryTiming, BlindVaultReplicaRestoredExecution,
-    BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
-    BlindVaultVerifiedRetiredReplica, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
-    MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
+    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaRestartRecoveryKind,
+    BlindVaultReplicaRestartRecoveryTask, BlindVaultReplicaRestartRecoveryTiming,
+    BlindVaultReplicaRestoredExecution, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
+    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
+    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT, MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES,
     MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
