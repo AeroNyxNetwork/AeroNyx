@@ -80,6 +80,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.12.0-BlindVaultPrivateAttemptJournal - Re-exported identity-sealed,
+//! action-bound continuation state for restart-safe replica repair
 //! v1.11.0-BlindVaultRestartRecoveryPlan - Re-exported fail-closed restored
 //! attempt recovery decisions
 //! v1.10.0-BlindVaultSealedRestartSnapshot - Re-exported the local encrypted
@@ -156,6 +158,7 @@ pub use blind_vault::{
 };
 pub use blind_vault_replica_workflow::{
     BlindVaultReplacementRetirementPermit, BlindVaultReplicaActionEvidence,
+    BlindVaultReplicaAttemptJournal, BlindVaultReplicaAttemptJournalError,
     BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
     BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
     BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
@@ -164,6 +167,9 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
     BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
     BlindVaultVerifiedRetiredReplica, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES,
     MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};

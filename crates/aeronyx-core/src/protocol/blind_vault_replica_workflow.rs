@@ -12,9 +12,11 @@
 //! ## Main Functionality
 //! - Defines bounded source-owned execution domain types.
 //! - Separates cryptographic evidence verification from state transitions.
+//! - Seals exact private continuation state for ambiguous mutating attempts.
 //! - Requires all work items to hold evidence before replanning.
 //!
 //! ## Dependencies
+//! - `blind_vault_replica_workflow/attempt_journal.rs`: private attempt state.
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
 //! - `blind_vault_replica_workflow/recovery.rs`: restart recovery decisions.
@@ -47,7 +49,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.13.0-IdentitySealedLocal - Centralized identity-bound
+//! Last Modified: v1.14.0-PrivateAttemptJournal - Added action-bound sealed
+//! continuation state for restart-safe replacement and provisioning attempts.
+//! v1.13.0-IdentitySealedLocal - Centralized identity-bound
 //! local persistence cryptography for snapshots and private attempt journals.
 //! v1.12.0-RestartRecoveryPlan - Classified ambiguous restored
 //! attempts into read-only observation or private-journal recovery paths.
@@ -77,12 +81,19 @@
 //! evidence-gated replica execution state machine.
 //! ============================================
 
+mod attempt_journal;
 mod evidence;
 mod execution;
 mod recovery;
 mod sealed_local;
 mod snapshot;
 
+pub use attempt_journal::{
+    BlindVaultReplicaAttemptJournal, BlindVaultReplicaAttemptJournalError,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES,
+};
 pub use recovery::{
     BlindVaultReplicaRestartRecoveryKind, BlindVaultReplicaRestartRecoveryTask,
     BlindVaultReplicaRestartRecoveryTiming,
