@@ -1,9 +1,11 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/mod.rs
 // ============================================
-// Version: 0.74.0-BlindVaultAdmissionReadiness
+// Version: 0.75.0-BlindVaultReplicaRecoveryStore
 //
 // Modification Reason:
+//   [BLIND-VAULT-REPLICA-RECOVERY-STORE 2026-08-29 by Codex] Registered the
+//   Unix-only restrictive atomic adapter for sealed source recovery state.
 //   [BLIND-VAULT-ADMISSION-READINESS 2026-08-28 by Codex] Re-exported the
 //   privacy-safe runtime admission state consumed by discovery and operations.
 //   [BLIND-VAULT-DISK-RESERVE 2026-08-28 by Codex] Registered and re-exported
@@ -121,6 +123,7 @@
 //   composed restore-readiness, plan issuance, and plan verification domain.
 //
 // Last Modified:
+//   v0.75.0-BlindVaultReplicaRecoveryStore - Registered atomic recovery I/O
 //   v0.74.0-BlindVaultAdmissionReadiness - Exported admission runtime state
 //   v0.73.0-BlindVaultFilesystemCapacity - Registered physical capacity probe
 //   v0.72.0-BlindVaultDeleteFailureClass - Exported deletion retry semantics
@@ -218,6 +221,10 @@ pub mod blind_vault;
 // inspection behind a replaceable capability instead of embedding platform
 // calls in the storage transaction service.
 mod blind_vault_capacity;
+#[cfg(unix)]
+mod blind_vault_replica_recovery_io;
+#[cfg(unix)]
+mod blind_vault_replica_recovery_store;
 pub mod chat_relay;
 mod chat_relay_backup_artifact;
 mod chat_relay_backup_audit;
