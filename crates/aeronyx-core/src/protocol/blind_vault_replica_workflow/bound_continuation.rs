@@ -45,7 +45,7 @@ use zeroize::Zeroize;
 use super::{
     BlindVaultReplicaAttemptContinuation, BlindVaultReplicaAttemptJournal,
     BlindVaultReplicaAttemptJournalError, BlindVaultReplicaExecution,
-    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedEffectError,
+    BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaPreparedEffectError,
     BlindVaultReplicaPreparedEffectSet, BlindVaultReplicaWorkState,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES,
 };
@@ -233,7 +233,7 @@ impl BlindVaultReplicaExecution {
         journal_sequence: u64,
         retain_until_ms: u64,
         bound: &BlindVaultReplicaBoundAttemptContinuation,
-    ) -> Result<BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaBoundContinuationError>
+    ) -> Result<BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaBoundContinuationError>
     {
         let mut encoded = bound.encode_restart_state()?;
         let prepared = self.prepare_attempt_journal_for_dispatch(
@@ -245,7 +245,12 @@ impl BlindVaultReplicaExecution {
             &encoded,
         );
         encoded.zeroize();
-        prepared.map_err(BlindVaultReplicaBoundContinuationError::from)
+        let journal = prepared.map_err(BlindVaultReplicaBoundContinuationError::from)?;
+        BlindVaultReplicaPreparedBoundAttemptJournal::from_validated_parts(
+            journal,
+            bound.effect_set(),
+        )
+        .ok_or(BlindVaultReplicaBoundContinuationError::StateMismatch)
     }
 }
 

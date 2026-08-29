@@ -19,6 +19,7 @@
 //! - `blind_vault_replica_workflow/attempt_continuation.rs`: reply sessions.
 //! - `blind_vault_replica_workflow/attempt_journal.rs`: private attempt state.
 //! - `blind_vault_replica_workflow/bound_continuation.rs`: exact effects/sessions.
+//! - `blind_vault_replica_workflow/bound_dispatch.rs`: durable send markers.
 //! - `blind_vault_replica_workflow/durable_dispatch.rs`: ordered durability.
 //! - `blind_vault_replica_workflow/durable_resolution.rs`: durable evidence.
 //! - `blind_vault_replica_workflow/durable_snapshot.rs`: resolved snapshots.
@@ -57,7 +58,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.24.0-BoundAttemptContinuation - Bound exact terminal
+//! Last Modified: v1.25.0-BoundDurableDispatch - Carried exact effect identity
+//! through durability markers into one ordered transport capability.
+//! v1.24.0-BoundAttemptContinuation - Bound exact terminal
 //! effects and one-time response sessions across restart recovery.
 //! v1.23.0-PreparedTerminalEffects - Added payload-blind,
 //! ordered terminal-effect binding before durable dispatch authorization.
@@ -112,6 +115,7 @@
 mod attempt_continuation;
 mod attempt_journal;
 mod bound_continuation;
+mod bound_dispatch;
 mod durable_dispatch;
 mod durable_resolution;
 mod durable_snapshot;
@@ -137,6 +141,12 @@ pub use attempt_journal::{
 };
 pub use bound_continuation::{
     BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaBoundContinuationError,
+};
+pub use bound_dispatch::{
+    BlindVaultReplicaCommittedBoundAttemptDispatch, BlindVaultReplicaDurableBoundAttemptDispatch,
+    BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
+    BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalSendContext,
+    BlindVaultReplicaTerminalSendError, BlindVaultReplicaTerminalSendSequence,
 };
 pub use durable_dispatch::{
     BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,

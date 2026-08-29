@@ -155,6 +155,10 @@ impl BlindVaultReplicaPreparedEffectSet {
             commitment,
         })
     }
+
+    pub(super) const fn commitment(&self) -> [u8; 32] {
+        self.commitment
+    }
 }
 
 fn purpose_code(purpose: OnionRoutePurpose) -> u8 {

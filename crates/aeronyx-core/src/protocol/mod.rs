@@ -51,6 +51,8 @@
 //!   payload-blind terminal effect bindings for source-side orchestration.
 //! - [BLIND-VAULT-BOUND-CONTINUATION 2026-08-29 by Codex] Bound effect order
 //!   and one-time reply sessions inside restart-safe private journals.
+//! - [BLIND-VAULT-BOUND-DURABLE-DISPATCH 2026-08-29 by Codex] Added a typed
+//!   durability pipeline ending in one ordered, payload-verifying transport.
 //!
 //! ## Main Functionality
 //!
@@ -88,6 +90,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.19.0-BlindVaultBoundDurableDispatch - Re-exported exact effect-bound
+//! durability markers and ordered terminal transport capability
 //! v1.18.0-BlindVaultBoundContinuation - Re-exported exact effect/session
 //! restart composition for private compound replica attempts
 //! v1.17.0-BlindVaultPreparedEffects - Re-exported source-local ordered effect
@@ -182,21 +186,25 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaAttemptJournalError, BlindVaultReplicaAuthenticatedPreparedAttempt,
     BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaBoundContinuationError,
     BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaCommittedAttemptDispatch,
-    BlindVaultReplicaCommittedAttemptRecord, BlindVaultReplicaConvergence,
-    BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,
-    BlindVaultReplicaDispatchReadiness, BlindVaultReplicaDurableAttemptDispatch,
+    BlindVaultReplicaCommittedAttemptRecord, BlindVaultReplicaCommittedBoundAttemptDispatch,
+    BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
+    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
+    BlindVaultReplicaDurableAttemptDispatch, BlindVaultReplicaDurableBoundAttemptDispatch,
     BlindVaultReplicaDurableDispatchError, BlindVaultReplicaDurableResolution,
     BlindVaultReplicaDurableResolutionError, BlindVaultReplicaDurableSnapshot,
     BlindVaultReplicaDurableSnapshotError, BlindVaultReplicaExecution,
     BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
     BlindVaultReplicaLoadedRecovery, BlindVaultReplicaPersistedAttemptJournal,
-    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedAttemptRecord,
+    BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedAttemptJournal,
+    BlindVaultReplicaPreparedAttemptRecord, BlindVaultReplicaPreparedBoundAttemptJournal,
     BlindVaultReplicaPreparedEffectError, BlindVaultReplicaPreparedEffectSet,
     BlindVaultReplicaRecoveryLoadError, BlindVaultReplicaRecoveryState,
     BlindVaultReplicaRecoveryStore, BlindVaultReplicaRestartRecoveryKind,
     BlindVaultReplicaRestartRecoveryTask, BlindVaultReplicaRestartRecoveryTiming,
     BlindVaultReplicaRestoredExecution, BlindVaultReplicaSnapshotRecord,
-    BlindVaultReplicaTerminalEffect, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
+    BlindVaultReplicaTerminalEffect, BlindVaultReplicaTerminalEffectTransport,
+    BlindVaultReplicaTerminalSendContext, BlindVaultReplicaTerminalSendError,
+    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
     BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
     BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
     DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
