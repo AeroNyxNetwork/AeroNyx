@@ -35,7 +35,9 @@
 //! - Keep the low-level legacy methods for compatibility, but new adapters
 //!   should use this path before every private mutating network attempt.
 //!
-//! Last Modified: v1.0.0-DurableDispatchPermit - Initial fail-closed typed
+//! Last Modified: v1.1.0-DurableResolutionBinding - Shared the exact prepared
+//! journal with the sibling resolution domain without widening public access.
+//! v1.0.0-DurableDispatchPermit - Initial fail-closed typed
 //! journal, snapshot, and network-send durability sequence.
 //! ============================================
 
@@ -60,7 +62,9 @@ pub struct BlindVaultReplicaPersistedAttemptJournal<'a> {
 
 /// Post-dispatch in-memory state plus its identity-sealed restart snapshot.
 pub struct BlindVaultReplicaCommittedAttemptDispatch<'a> {
-    prepared: &'a BlindVaultReplicaPreparedAttemptJournal,
+    // [BLIND-VAULT-DURABLE-RESOLUTION 2026-08-29 by Codex] Sibling-only
+    // visibility lets resolution derive an exact binding after store success.
+    pub(super) prepared: &'a BlindVaultReplicaPreparedAttemptJournal,
     workflow_id: [u8; 16],
     snapshot_sequence: u64,
     sealed_snapshot: Vec<u8>,
@@ -68,7 +72,9 @@ pub struct BlindVaultReplicaCommittedAttemptDispatch<'a> {
 
 /// Marker permitting the exact already-prepared network request to be sent.
 pub struct BlindVaultReplicaDurableAttemptDispatch<'a, 'b> {
-    committed: &'b BlindVaultReplicaCommittedAttemptDispatch<'a>,
+    // [BLIND-VAULT-DURABLE-RESOLUTION 2026-08-29 by Codex] This remains
+    // inaccessible outside the workflow module; callers receive a typed copy.
+    pub(super) committed: &'b BlindVaultReplicaCommittedAttemptDispatch<'a>,
 }
 
 /// Local commit failures before any durable-send permit can exist.

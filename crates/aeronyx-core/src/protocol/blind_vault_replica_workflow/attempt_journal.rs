@@ -36,7 +36,9 @@
 //! - Never log, clone unnecessarily, or expose the private continuation bytes.
 //! - Delete a journal only after accepted evidence or explicit safe resolution.
 //!
-//! Last Modified: v1.3.0-PreparedRecoveryAuthentication - Added an
+//! Last Modified: v1.4.0-DurableResolutionBinding - Retained the sealed
+//! journal commitment required for exact post-evidence resolution.
+//! v1.3.0-PreparedRecoveryAuthentication - Added an
 //! identity-authenticated proof that a durable journal stopped before send.
 //! v1.2.0-TypedContinuation - Added errors shared by the
 //! recoverable onion reply continuation codec.
@@ -107,6 +109,9 @@ pub struct BlindVaultReplicaAttemptJournal {
     dispatched_at_ms: u64,
     evidence_deadline_ms: u64,
     retain_until_ms: u64,
+    // [BLIND-VAULT-DURABLE-RESOLUTION 2026-08-29 by Codex] Retain only the
+    // domain-separated ciphertext commitment, never a second sealed copy.
+    sealed_commitment: [u8; 32],
     private_state: Vec<u8>,
 }
 
@@ -177,6 +182,11 @@ impl BlindVaultReplicaAttemptJournal {
         self.retain_until_ms
     }
 
+    /// Internal exact binding used only by the durable resolution command.
+    pub(super) const fn sealed_commitment(&self) -> [u8; 32] {
+        self.sealed_commitment
+    }
+
     /// Borrows the exact opaque adapter state without copying it.
     #[must_use]
     pub fn private_state(&self) -> &[u8] {
@@ -192,6 +202,7 @@ impl BlindVaultReplicaAttemptJournal {
 
 impl Drop for BlindVaultReplicaAttemptJournal {
     fn drop(&mut self) {
+        self.sealed_commitment.zeroize();
         self.private_state.zeroize();
     }
 }
@@ -562,6 +573,7 @@ impl BlindVaultReplicaRestoredExecution {
             dispatched_at_ms: body.dispatched_at_ms,
             evidence_deadline_ms: body.evidence_deadline_ms,
             retain_until_ms: body.retain_until_ms,
+            sealed_commitment: sealed_record_commitment(journal),
             private_state: mem::take(&mut body.private_state),
         })
     }

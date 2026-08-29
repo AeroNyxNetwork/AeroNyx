@@ -43,6 +43,8 @@
 //!   identity-sealed source workflow persistence; it is not a network frame.
 //! - [BLIND-VAULT-RESTART-RECOVERY-PLAN 2026-08-29 by Codex] Exposed typed,
 //!   source-only recovery decisions for ambiguous restored terminal attempts.
+//! - [BLIND-VAULT-DURABLE-RECOVERY 2026-08-29 by Codex] Re-exported exact
+//!   durable generation loading and atomic post-evidence journal resolution.
 //!
 //! ## Main Functionality
 //!
@@ -80,6 +82,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.15.0-BlindVaultDurableRecovery - Re-exported authenticated recovery
+//! loading plus rollback-safe committed-attempt resolution
 //! v1.14.0-BlindVaultAttemptContinuation - Re-exported typed recoverable
 //! adapter state and single-use onion reply session ownership
 //! v1.13.0-BlindVaultPreparedAttemptJournal - Re-exported the typed
@@ -161,17 +165,20 @@ pub use blind_vault::{
     MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS, MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
 };
 pub use blind_vault_replica_workflow::{
-    BlindVaultReplacementRetirementPermit, BlindVaultReplicaActionEvidence,
-    BlindVaultReplicaAttemptContinuation, BlindVaultReplicaAttemptDurabilityPhase,
-    BlindVaultReplicaAttemptJournal, BlindVaultReplicaAttemptJournalError,
-    BlindVaultReplicaAuthenticatedPreparedAttempt, BlindVaultReplicaCommittedAttemptDispatch,
+    load_blind_vault_replica_recovery, BlindVaultReplacementRetirementPermit,
+    BlindVaultReplicaActionEvidence, BlindVaultReplicaAttemptContinuation,
+    BlindVaultReplicaAttemptDurabilityPhase, BlindVaultReplicaAttemptJournal,
+    BlindVaultReplicaAttemptJournalError, BlindVaultReplicaAuthenticatedPreparedAttempt,
+    BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaCommittedAttemptDispatch,
     BlindVaultReplicaCommittedAttemptRecord, BlindVaultReplicaConvergence,
     BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,
     BlindVaultReplicaDispatchReadiness, BlindVaultReplicaDurableAttemptDispatch,
-    BlindVaultReplicaDurableDispatchError, BlindVaultReplicaExecution,
+    BlindVaultReplicaDurableDispatchError, BlindVaultReplicaDurableResolution,
+    BlindVaultReplicaDurableResolutionError, BlindVaultReplicaExecution,
     BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
-    BlindVaultReplicaPersistedAttemptJournal, BlindVaultReplicaPreparedAttemptJournal,
-    BlindVaultReplicaPreparedAttemptRecord, BlindVaultReplicaRecoveryState,
+    BlindVaultReplicaLoadedRecovery, BlindVaultReplicaPersistedAttemptJournal,
+    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedAttemptRecord,
+    BlindVaultReplicaRecoveryLoadError, BlindVaultReplicaRecoveryState,
     BlindVaultReplicaRecoveryStore, BlindVaultReplicaRestartRecoveryKind,
     BlindVaultReplicaRestartRecoveryTask, BlindVaultReplicaRestartRecoveryTiming,
     BlindVaultReplicaRestoredExecution, BlindVaultReplicaSnapshotRecord, BlindVaultReplicaWorkId,

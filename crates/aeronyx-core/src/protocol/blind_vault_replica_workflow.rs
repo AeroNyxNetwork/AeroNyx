@@ -19,6 +19,7 @@
 //! - `blind_vault_replica_workflow/attempt_continuation.rs`: reply sessions.
 //! - `blind_vault_replica_workflow/attempt_journal.rs`: private attempt state.
 //! - `blind_vault_replica_workflow/durable_dispatch.rs`: ordered durability.
+//! - `blind_vault_replica_workflow/durable_resolution.rs`: durable evidence.
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
 //! - `blind_vault_replica_workflow/persistence.rs`: durable recovery boundary.
@@ -53,7 +54,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.20.0-AuthenticatedRecoveryLoad - Added exact-high-water,
+//! Last Modified: v1.21.0-DurableAttemptResolution - Added rollback-safe,
+//! atomic evidence acceptance and committed-journal resolution.
+//! v1.20.0-AuthenticatedRecoveryLoad - Added exact-high-water,
 //! phase-aware loading of durable source workflow generations.
 //! v1.19.0-PreparedRecoveryAuthentication - Required identity
 //! and pre-dispatch workflow authentication before prepared-journal cleanup.
@@ -100,6 +103,7 @@
 mod attempt_continuation;
 mod attempt_journal;
 mod durable_dispatch;
+mod durable_resolution;
 mod evidence;
 mod execution;
 mod persistence;
@@ -122,6 +126,10 @@ pub use attempt_journal::{
 pub use durable_dispatch::{
     BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,
     BlindVaultReplicaDurableDispatchError, BlindVaultReplicaPersistedAttemptJournal,
+};
+pub use durable_resolution::{
+    BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaDurableResolution,
+    BlindVaultReplicaDurableResolutionError,
 };
 pub use persistence::{
     BlindVaultReplicaAttemptDurabilityPhase, BlindVaultReplicaCommittedAttemptRecord,
