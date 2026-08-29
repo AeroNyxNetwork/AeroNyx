@@ -13,6 +13,7 @@
 //! - Wraps the generic prepared journal with exact effect identity.
 //! - Preserves the binding through prepared and committed store operations.
 //! - Produces an ordered send sequence only after both records are durable.
+//! - Gates old-lease retirement with workflow and terminal authorization.
 //! - Redacts and zeroizes the binding commitment.
 //!
 //! ## Dependencies
@@ -28,12 +29,14 @@
 //! 4. Consume that marker into one ordered terminal send sequence.
 //!
 //! ## Important Note For The Next Developer
-//! - These markers prove local ordering, not remote node authorization.
+//! - Markers prove local ordering; retirement adds an exact terminal permit.
 //! - Do not add public constructors or accept commitment-only caller input.
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.1.0-OwnedTerminalRuntime - Added one-step ownership
+//! Last Modified: v1.2.0-RetirementPermitGate - Required workflow and route
+//! terminal authorization before old-lease retirement can reach transport.
+//! v1.1.0-OwnedTerminalRuntime - Added one-step ownership
 //! transfer from a durable bound attempt into a self-contained runtime.
 //! v1.0.0-BoundDurableDispatch - Initial effect-bound marker pipeline from
 //! sealed journal through ordered network send capability.

@@ -63,7 +63,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.31.0-DurableTerminalOutcomes - Added bounded verifier
+//! Last Modified: v1.32.0-RetirementTransportPermit - Enforced replacement
+//! retirement permits through ordered send and verified route selection.
+//! v1.31.0-DurableTerminalOutcomes - Added bounded verifier
 //! failure disposition and atomic committed-journal failure resolution.
 //! v1.30.0-RequestBoundReplyVerifier - Verified exact signed
 //! request/receipt pairs before source-private manifest policy acceptance.

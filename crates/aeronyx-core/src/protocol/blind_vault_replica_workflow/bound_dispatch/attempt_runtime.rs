@@ -13,6 +13,7 @@
 //! - Owns one reply session for every remaining ordered terminal effect.
 //! - Retains private adapter verification state without logging or cloning it.
 //! - Preserves a reply session when transport fails before a response exists.
+//! - Requires workflow authority before an old lease can be retired.
 //! - Opens and semantically verifies each response before allowing the next.
 //! - Poisons the complete runtime after any authenticated-reply failure.
 //!
@@ -25,10 +26,11 @@
 //! 1. Consume one send sequence and its exact private continuation.
 //! 2. Verify that remaining effects and sessions have equal cardinality.
 //! 3. Match the encoded request against the front session before network I/O.
-//! 4. Send the current effect without removing its reply session first.
-//! 5. On transport success, consume only the matching front session.
-//! 6. Open the sealed response and require workload-specific verification.
-//! 7. Advance to the next effect only while every invariant remains valid.
+//! 4. Require an exact workflow permit before retirement transport.
+//! 5. Send the current effect without removing its reply session first.
+//! 6. On transport success, consume only the matching front session.
+//! 7. Open the sealed response and require workload-specific verification.
+//! 8. Advance to the next effect only while every invariant remains valid.
 //!
 //! ## Important Note For The Next Developer
 //! - A successful I/O call is ambiguous even when reply verification fails.
@@ -36,7 +38,9 @@
 //! - Verifiers must validate workload frame, request identity, and signed result.
 //! - Do not expose adapter state, reply keys, payloads, or work ids in telemetry.
 //!
-//! Last Modified: v1.1.0-RequestAwareVerification - Supplied the exact bound
+//! Last Modified: v1.2.0-RetirementPermitGate - Blocked old-lease retirement
+//! before I/O unless the active workflow issued an exact permit.
+//! v1.1.0-RequestAwareVerification - Supplied the exact bound
 //! request to private workload verification without retaining another copy.
 //! v1.0.0-TerminalAttemptRuntime - Initial ordered send, one-time reply, and
 //! semantic verification composition.
@@ -51,7 +55,9 @@ use super::send_sequence::{
     BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalSendContext,
     BlindVaultReplicaTerminalSendError, BlindVaultReplicaTerminalSendSequence,
 };
-use crate::protocol::blind_vault_replica_workflow::BlindVaultReplicaAttemptContinuation;
+use crate::protocol::blind_vault_replica_workflow::{
+    BlindVaultReplacementRetirementPermit, BlindVaultReplicaAttemptContinuation,
+};
 use crate::protocol::onion::OnionRoutePurpose;
 use crate::protocol::onion_reply::{OnionReplyError, OnionReplyPayload, OnionReplySession};
 
@@ -143,6 +149,51 @@ impl<'effects> BlindVaultReplicaTerminalAttemptRuntime<'effects> {
         Transport::Response: AsRef<[u8]>,
         Verifier: BlindVaultReplicaTerminalReplyVerifier,
     {
+        self.send_next_authorized(transport, verifier, purpose, payload, None)
+    }
+
+    /// Sends one old-lease retirement under current workflow authority.
+    ///
+    /// Permit validation happens before route selection or transport. A
+    /// mismatch does not consume the reply session, so the source may supply
+    /// the correct permit while this runtime remains ready.
+    ///
+    /// [BLIND-VAULT-RUNTIME-RETIREMENT-PERMIT 2026-08-29 by Codex]
+    pub fn send_next_with_retirement_permit<Transport, Verifier>(
+        &mut self,
+        transport: &mut Transport,
+        verifier: &mut Verifier,
+        purpose: OnionRoutePurpose,
+        payload: &[u8],
+        permit: &BlindVaultReplacementRetirementPermit,
+    ) -> Result<
+        Verifier::Output,
+        BlindVaultReplicaTerminalAttemptError<Transport::Error, Verifier::Error>,
+    >
+    where
+        Transport: BlindVaultReplicaTerminalEffectTransport,
+        Transport::Response: AsRef<[u8]>,
+        Verifier: BlindVaultReplicaTerminalReplyVerifier,
+    {
+        self.send_next_authorized(transport, verifier, purpose, payload, Some(permit))
+    }
+
+    fn send_next_authorized<Transport, Verifier>(
+        &mut self,
+        transport: &mut Transport,
+        verifier: &mut Verifier,
+        purpose: OnionRoutePurpose,
+        payload: &[u8],
+        retirement_permit: Option<&BlindVaultReplacementRetirementPermit>,
+    ) -> Result<
+        Verifier::Output,
+        BlindVaultReplicaTerminalAttemptError<Transport::Error, Verifier::Error>,
+    >
+    where
+        Transport: BlindVaultReplicaTerminalEffectTransport,
+        Transport::Response: AsRef<[u8]>,
+        Verifier: BlindVaultReplicaTerminalReplyVerifier,
+    {
         if self.state != BlindVaultReplicaTerminalAttemptState::Ready {
             return Err(match self.state {
                 BlindVaultReplicaTerminalAttemptState::Complete => {
@@ -154,10 +205,6 @@ impl<'effects> BlindVaultReplicaTerminalAttemptRuntime<'effects> {
                 BlindVaultReplicaTerminalAttemptState::Ready => unreachable!(),
             });
         }
-        let Some(context) = self.send_sequence.next_context() else {
-            self.poison();
-            return Err(BlindVaultReplicaTerminalAttemptError::StateMismatch);
-        };
         if !self.send_sequence.matches_next_payload(purpose, payload) {
             return Err(BlindVaultReplicaTerminalAttemptError::PayloadMismatch);
         }
@@ -172,13 +219,27 @@ impl<'effects> BlindVaultReplicaTerminalAttemptRuntime<'effects> {
             self.poison();
             return Err(BlindVaultReplicaTerminalAttemptError::SessionRequestMismatch);
         }
-        let response = match self.send_sequence.send_next(transport, purpose, payload) {
-            Ok(response) => response,
+        let (context, response) = match self.send_sequence.send_next_authorized_with_context(
+            transport,
+            purpose,
+            payload,
+            retirement_permit,
+        ) {
+            Ok(result) => result,
             Err(BlindVaultReplicaTerminalSendError::Transport(error)) => {
                 return Err(BlindVaultReplicaTerminalAttemptError::Transport(error));
             }
             Err(BlindVaultReplicaTerminalSendError::PayloadMismatch) => {
                 return Err(BlindVaultReplicaTerminalAttemptError::PayloadMismatch);
+            }
+            Err(BlindVaultReplicaTerminalSendError::RetirementPermitRequired) => {
+                return Err(BlindVaultReplicaTerminalAttemptError::RetirementPermitRequired);
+            }
+            Err(BlindVaultReplicaTerminalSendError::RetirementPermitMismatch) => {
+                return Err(BlindVaultReplicaTerminalAttemptError::RetirementPermitMismatch);
+            }
+            Err(BlindVaultReplicaTerminalSendError::RetirementRequestInvalid) => {
+                return Err(BlindVaultReplicaTerminalAttemptError::RetirementRequestInvalid);
             }
             Err(
                 BlindVaultReplicaTerminalSendError::BindingInvalid
@@ -286,6 +347,12 @@ pub enum BlindVaultReplicaTerminalAttemptError<TransportError, VerificationError
     StateMismatch,
     /// The next reply session was not created for the committed request bytes.
     SessionRequestMismatch,
+    /// Old-lease retirement requires a current workflow-issued permit.
+    RetirementPermitRequired,
+    /// Retirement permit, request, work, attempt, lease, or target mismatched.
+    RetirementPermitMismatch,
+    /// Committed retirement payload was not one valid retirement request.
+    RetirementRequestInvalid,
     /// Transport failed before returning a response; the same effect may retry.
     Transport(TransportError),
     /// The source-only onion response failed cryptographic authentication.
@@ -313,6 +380,15 @@ impl<TransportError: fmt::Display, VerificationError: fmt::Display> fmt::Display
             }
             Self::SessionRequestMismatch => {
                 formatter.write_str("blind vault terminal reply session mismatched its request")
+            }
+            Self::RetirementPermitRequired => {
+                formatter.write_str("blind vault replacement retirement permit is required")
+            }
+            Self::RetirementPermitMismatch => {
+                formatter.write_str("blind vault replacement retirement permit mismatched")
+            }
+            Self::RetirementRequestInvalid => {
+                formatter.write_str("blind vault replacement retirement request is invalid")
             }
             Self::Transport(error) => {
                 write!(formatter, "blind vault terminal transport failed: {error}")
@@ -343,7 +419,10 @@ where
             | Self::RuntimePoisoned
             | Self::PayloadMismatch
             | Self::StateMismatch
-            | Self::SessionRequestMismatch => None,
+            | Self::SessionRequestMismatch
+            | Self::RetirementPermitRequired
+            | Self::RetirementPermitMismatch
+            | Self::RetirementRequestInvalid => None,
         }
     }
 }

@@ -59,6 +59,8 @@
 //!   ordered effects, purpose-bound verified routes, and opaque envelope I/O.
 //! - [BLIND-VAULT-DURABLE-TERMINAL-OUTCOMES 2026-08-29 by Codex] Added
 //!   bounded request/reply failure disposition and atomic journal resolution.
+//! - [BLIND-VAULT-RETIREMENT-TRANSPORT-PERMIT 2026-08-29 by Codex] Bound old
+//!   lease retirement to the active workflow and exact verified terminal.
 //!
 //! ## Main Functionality
 //!
@@ -96,6 +98,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.23.0-BlindVaultRetirementTransportPermit - Enforced workflow-issued
+//! retirement authority before transport and verified terminal selection
 //! v1.22.0-BlindVaultDurableTerminalOutcomes - Re-exported request-bound
 //! failure disposition and durable terminal-attempt failure resolution
 //! v1.21.0-BlindVaultVerifiedOnionTransport - Re-exported route-provider and

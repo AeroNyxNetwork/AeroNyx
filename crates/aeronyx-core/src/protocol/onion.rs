@@ -74,8 +74,12 @@
 //! - [ONION-ROUTE-FAILURE-DISPOSITION 2026-08-29 by Codex] Source adapters
 //!   must consume [`OnionRoutePlanError::disposition`] instead of inventing
 //!   independent retry policies for the same route-admission failure.
+//! - [VERIFIED-ONION-TERMINAL-BINDING 2026-08-29 by Codex] Lifecycle-gated
+//!   operations may inspect the authenticated terminal identity at source.
 //!
 //! ## Last Modified
+//! v1.13.0-VerifiedTerminalBinding — Exposed source-only authenticated
+//! terminal identity for lifecycle-authorized route enforcement
 //! v1.12.0-RouteFailureDisposition — Centralized fail-closed route recovery
 //! decisions for chat, vault, and operator-telemetry adapters
 //! v1.11.0-VerifiedRoutePlan — Added descriptor-authenticated, purpose-aware
@@ -681,6 +685,16 @@ impl VerifiedOnionRoute {
     #[must_use]
     pub fn entry_node_id(&self) -> [u8; 32] {
         self.hops[0].node_id
+    }
+
+    /// Returns the descriptor-authenticated terminal node identity.
+    ///
+    /// [VERIFIED-ONION-TERMINAL-BINDING 2026-08-29 by Codex] Source-side
+    /// lifecycle authorization may require one exact terminal without
+    /// exposing that identity to intermediate relays or opaque I/O adapters.
+    #[must_use]
+    pub fn terminal_node_id(&self) -> [u8; 32] {
+        self.hops[self.hops.len() - 1].node_id
     }
 
     /// Returns when the first selected signed descriptor expires.

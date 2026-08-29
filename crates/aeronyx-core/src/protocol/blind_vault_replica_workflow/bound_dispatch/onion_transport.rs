@@ -13,6 +13,7 @@
 //! - Defines replaceable route-provider and opaque-envelope sender traits.
 //! - Requires a nonzero per-send route id and source timestamp.
 //! - Rechecks route purpose at the payload/envelope construction boundary.
+//! - Enforces permit-authorized terminal identity before envelope construction.
 //! - Builds a path-derived-TTL envelope through `VerifiedOnionRoute`.
 //! - Gives the sender only entry-node identity and opaque onion bytes.
 //!
@@ -25,16 +26,20 @@
 //! ## Main Logical Flow
 //! 1. Ask the route provider for fresh material for one exact effect purpose.
 //! 2. Reject purpose mismatch before touching payload construction.
-//! 3. Build the signed onion envelope with path-derived TTL.
-//! 4. Pass only the opaque envelope to the selected transport sender.
+//! 3. Enforce any source lifecycle-authorized terminal node binding.
+//! 4. Build the signed onion envelope with path-derived TTL.
+//! 5. Pass only the opaque envelope to the selected transport sender.
 //!
 //! ## Important Note For The Next Developer
 //! - Route providers must enforce liveness, diversity, and anti-affinity policy.
 //! - Route ids must be fresh and unlinkable; never derive them from work ids.
 //! - Do not pass plaintext payload or purpose to the envelope sender.
+//! - Never ignore `context.authorized_terminal_node_id()` during selection.
 //! - Endpoint retry policy belongs to the sender and route provider composition.
 //!
-//! Last Modified: v1.0.0-VerifiedOnionEffectTransport - Initial route/provider,
+//! Last Modified: v1.1.0-AuthorizedTerminalBinding - Enforced exact terminal
+//! selection for workflow-permitted lifecycle operations.
+//! v1.0.0-VerifiedOnionEffectTransport - Initial route/provider,
 //! envelope construction, and opaque sender composition.
 //! ============================================
 
@@ -103,6 +108,10 @@ pub trait BlindVaultReplicaOnionRouteProvider {
     type Error;
 
     /// Returns fresh route material without receiving payload bytes.
+    ///
+    /// When `context.authorized_terminal_node_id()` is present, implementations
+    /// should select that exact terminal. The transport independently rejects
+    /// a returned route that does not satisfy this source authorization.
     fn route_for_terminal_effect(
         &mut self,
         context: BlindVaultReplicaTerminalSendContext,
@@ -170,13 +179,24 @@ where
         if plan.route.purpose() != purpose {
             return Err(BlindVaultReplicaVerifiedOnionTransportError::PurposeMismatch);
         }
+        if context
+            .authorized_terminal_node_id()
+            .is_some_and(|node_id| plan.route.terminal_node_id() != node_id)
+        {
+            return Err(BlindVaultReplicaVerifiedOnionTransportError::TerminalIdentityMismatch);
+        }
         let entry_node_id = plan.route.entry_node_id();
         let envelope = plan
             .route
             .build_envelope(payload, plan.route_id, plan.dispatched_at, self.identity)
             .map_err(BlindVaultReplicaVerifiedOnionTransportError::RoutePlan)?;
+        // [BLIND-VAULT-OPAQUE-SENDER-CONTEXT 2026-08-29 by Codex] Terminal
+        // authorization is source route-policy input. Strip it before handing
+        // context to the transport-only sender so onion destination remains
+        // hidden behind the opaque envelope boundary.
+        let sender_context = context.without_terminal_authorization();
         self.sender
-            .send_onion_envelope(context, entry_node_id, envelope)
+            .send_onion_envelope(sender_context, entry_node_id, envelope)
             .map_err(BlindVaultReplicaVerifiedOnionTransportError::Sender)
     }
 }
@@ -199,6 +219,8 @@ pub enum BlindVaultReplicaVerifiedOnionTransportError<RouteError, SenderError> {
     RouteProvider(RouteError),
     /// Provider returned a route admitted for a different terminal purpose.
     PurposeMismatch,
+    /// Provider selected a terminal different from workflow authorization.
+    TerminalIdentityMismatch,
     /// Verified route expired, identity changed, or encryption failed.
     RoutePlan(OnionRoutePlanError),
     /// Opaque envelope I/O failed after successful local construction.
@@ -215,6 +237,9 @@ impl<RouteError: fmt::Display, SenderError: fmt::Display> fmt::Display
             }
             Self::PurposeMismatch => {
                 formatter.write_str("blind vault onion route purpose mismatched")
+            }
+            Self::TerminalIdentityMismatch => {
+                formatter.write_str("blind vault onion route terminal identity mismatched")
             }
             Self::RoutePlan(error) => fmt::Display::fmt(error, formatter),
             Self::Sender(error) => write!(
@@ -236,7 +261,7 @@ where
             Self::RouteProvider(error) => Some(error),
             Self::RoutePlan(error) => Some(error),
             Self::Sender(error) => Some(error),
-            Self::PurposeMismatch => None,
+            Self::PurposeMismatch | Self::TerminalIdentityMismatch => None,
         }
     }
 }

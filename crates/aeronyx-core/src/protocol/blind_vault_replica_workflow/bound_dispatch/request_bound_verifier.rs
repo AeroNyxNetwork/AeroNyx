@@ -16,6 +16,7 @@
 //! - Verifies terminal signatures and exact request/receipt relationships.
 //! - Maps authenticated terminal failures without exposing storage details.
 //! - Delegates manifest, freshness, and lifecycle policy to a source adapter.
+//! - Exposes a source-only mutable policy boundary between verified stages.
 //!
 //! ## Dependencies
 //! - `attempt_runtime.rs`: semantic reply-verifier trait and private state.
@@ -38,7 +39,9 @@
 //! - Never implement a permissive default private policy.
 //! - Debug output must remain redacted because requests can contain ciphertext.
 //!
-//! Last Modified: v1.0.0-RequestBoundReplyVerification - Initial protocol and
+//! Last Modified: v1.1.0-StagedPolicyMutation - Allowed source adapters to
+//! install workflow authority between verified replacement stages.
+//! v1.0.0-RequestBoundReplyVerification - Initial protocol and
 //! private-policy composition for replica workflow terminal replies.
 //! ============================================
 
@@ -165,6 +168,18 @@ impl<Policy> BlindVaultReplicaRequestBoundReplyVerifier<Policy> {
     #[must_use]
     pub const fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    /// Mutably borrows source policy between ordered reply stages.
+    ///
+    /// Replacement adapters use this boundary to install the workflow-issued
+    /// retirement permit after matching replacement inventory is verified and
+    /// before invoking the runtime's retirement send method.
+    ///
+    /// [BLIND-VAULT-STAGED-POLICY-MUTATION 2026-08-29 by Codex]
+    #[must_use]
+    pub fn policy_mut(&mut self) -> &mut Policy {
+        &mut self.policy
     }
 
     /// Transfers the private policy back to its source adapter.
