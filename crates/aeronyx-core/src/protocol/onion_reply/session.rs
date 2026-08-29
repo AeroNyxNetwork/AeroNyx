@@ -31,7 +31,9 @@
 //! - Do not implement `Clone` for session or key ownership types.
 //! - Keep response opening delegated to the single parent verifier.
 //!
-//! Last Modified: v1.2.0-ExactRequestRebuild - Persisted proof mode and added
+//! Last Modified: v1.3.0-EncodedRequestBinding - Added a private-key-safe
+//! preflight that rejects session/request cursor mismatch before network I/O.
+//! v1.2.0-ExactRequestRebuild - Persisted proof mode and added
 //! commitment-checked request reconstruction after restart.
 //! v1.1.0-RestartState - Added a fixed, crate-private session
 //! encoding that is valid only inside an encrypted attempt journal.
@@ -249,6 +251,18 @@ impl OnionReplySession {
             return Err(OnionReplyError::RequestMismatch);
         }
         Ok(request)
+    }
+
+    /// Checks whether encoded terminal bytes belong to this exact session.
+    ///
+    /// [ONION-REPLY-ENCODED-REQUEST-BINDING 2026-08-29 by Codex] This reads
+    /// only the public request and retained commitment. It neither performs DH
+    /// nor consumes or exports the private one-time reply key.
+    pub(crate) fn matches_encoded_request(&self, encoded_request: &[u8]) -> bool {
+        super::decode_onion_reply_request(encoded_request).is_ok_and(|request| {
+            request.reply_public_key == self.reply_key.public_key_bytes()
+                && request_context_commitment(&request) == self.request_context_commitment
+        })
     }
 
     /// Encodes plaintext state solely for immediate identity-sealed journaling.

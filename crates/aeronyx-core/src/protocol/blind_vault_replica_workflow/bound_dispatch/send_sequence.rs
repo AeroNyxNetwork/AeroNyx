@@ -31,8 +31,10 @@
 //! - Never advance on transport error or allow caller-selected effect indexes.
 //! - Route replacement belongs inside the transport adapter, not this binding.
 //!
-//! Last Modified: v1.0.0-OrderedTerminalSend - Initial verified transport
-//! boundary and monotonic effect cursor.
+//! Last Modified: v1.1.0-TerminalAttemptRuntime - Shared canonical next-effect
+//! context with the aligned reply-session runtime.
+//! v1.0.0-OrderedTerminalSend - Initial verified transport boundary and
+//! monotonic effect cursor.
 //! ============================================
 
 use std::{error::Error, fmt};
@@ -111,6 +113,24 @@ impl<'effects> BlindVaultReplicaTerminalSendSequence<'effects> {
         }
     }
 
+    pub(super) fn next_context(&self) -> Option<BlindVaultReplicaTerminalSendContext> {
+        let effect_index = u16::try_from(self.next_index).ok()?;
+        let effect_count = u16::try_from(self.effect_set.effects().len()).ok()?;
+        (self.next_index < self.effect_set.effects().len()).then_some(
+            BlindVaultReplicaTerminalSendContext {
+                work_id: self.effect_set.work_id(),
+                attempt: self.effect_set.attempt(),
+                effect_index,
+                effect_count,
+            },
+        )
+    }
+
+    pub(super) fn matches_next_payload(&self, purpose: OnionRoutePurpose, payload: &[u8]) -> bool {
+        self.effect_set
+            .matches_payload(self.next_index, purpose, payload)
+    }
+
     /// Sends next exact effect and advances only after transport success.
     ///
     /// [BLIND-VAULT-ORDERED-TERMINAL-SEND 2026-08-29 by Codex] Validation and
@@ -128,22 +148,15 @@ impl<'effects> BlindVaultReplicaTerminalSendSequence<'effects> {
         if self.next_index >= self.effect_set.effects().len() {
             return Err(BlindVaultReplicaTerminalSendError::SequenceComplete);
         }
-        if !self
-            .effect_set
-            .matches_payload(self.next_index, purpose, payload)
-        {
+        if !self.matches_next_payload(purpose, payload) {
             return Err(BlindVaultReplicaTerminalSendError::PayloadMismatch);
         }
-        let effect_index = u16::try_from(self.next_index)
-            .map_err(|_| BlindVaultReplicaTerminalSendError::BindingInvalid)?;
-        let effect_count = u16::try_from(self.effect_set.effects().len())
-            .map_err(|_| BlindVaultReplicaTerminalSendError::BindingInvalid)?;
-        let context = BlindVaultReplicaTerminalSendContext {
-            work_id: self.effect_set.work_id(),
-            attempt: self.effect_set.attempt(),
-            effect_index,
-            effect_count,
-        };
+        // [BLIND-VAULT-CANONICAL-SEND-CONTEXT 2026-08-29 by Codex] Runtime
+        // reply verification and transport receive the same sequence-owned
+        // index; neither adapter can select or advance it independently.
+        let context = self
+            .next_context()
+            .ok_or(BlindVaultReplicaTerminalSendError::BindingInvalid)?;
         let response = transport
             .send_terminal_effect(context, purpose, payload)
             .map_err(BlindVaultReplicaTerminalSendError::Transport)?;
