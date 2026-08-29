@@ -36,7 +36,9 @@
 //! - Never log sealed bytes, workflow identity, target identity, or work ids.
 //! - Partial, corrupt, reordered, or unsupported state must fail closed.
 //!
-//! Last Modified: v1.0.0-RecoveryStoreContract - Initial storage-neutral
+//! Last Modified: v1.1.0-PreparedAbort - Added exact safe cleanup for journals
+//! proven to have stopped before the post-dispatch snapshot commit.
+//! v1.0.0-RecoveryStoreContract - Initial storage-neutral
 //! atomic persistence contract for restart-safe replica execution.
 //! ============================================
 
@@ -357,6 +359,14 @@ impl BlindVaultReplicaRecoveryState {
         self.sealed_attempt_journal.as_deref()
     }
 
+    /// Commitment used to bind an authenticated prepared-journal abort.
+    #[must_use]
+    pub fn sealed_attempt_journal_commitment(&self) -> Option<[u8; 32]> {
+        self.sealed_attempt_journal
+            .as_deref()
+            .map(sealed_record_commitment)
+    }
+
     /// Transfers sealed bytes to the recovery owner without cloning.
     #[must_use]
     pub fn into_sealed_records(mut self) -> (Vec<u8>, Option<Vec<u8>>) {
@@ -420,6 +430,17 @@ pub trait BlindVaultReplicaRecoveryStore {
     fn persist_committed_attempt(
         &mut self,
         committed: &BlindVaultReplicaCommittedAttemptRecord<'_>,
+    ) -> Result<(), Self::Error>;
+
+    /// Removes an exact authenticated journal that never reached commit.
+    ///
+    /// This method is valid only in `Prepared`. Implementations must preserve
+    /// the accepted journal sequence as a rollback high-water mark and reject
+    /// `Committed`: an ambiguous network effect must remain recoverable.
+    fn abort_prepared_attempt(
+        &mut self,
+        journal_sequence: u64,
+        journal_commitment: [u8; 32],
     ) -> Result<(), Self::Error>;
 
     /// Removes the exact resolved journal while atomically installing snapshot.

@@ -35,7 +35,9 @@
 //! - Never permit normal snapshots to cross unresolved attempt phases.
 //! - Never weaken exact work/attempt/sequence/commitment comparisons.
 //!
-//! Last Modified: v1.1.0-ExactCrashRetry - Made every durable transition
+//! Last Modified: v1.2.0-PreparedAbort - Added idempotent exact cleanup for a
+//! journal proven not to have reached committed dispatch state.
+//! v1.1.0-ExactCrashRetry - Made every durable transition
 //! idempotent only for the exact same sequence and sealed commitment.
 //! v1.0.0-AtomicRecoveryGeneration - Initial single-writer,
 //! versioned, fail-closed recovery-store adapter.
@@ -103,6 +105,12 @@ struct StoredAttemptV1 {
     sealed_journal: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+struct StoredResolvedAttemptV1 {
+    journal_sequence: u64,
+    journal_commitment: [u8; 32],
+}
+
 impl Drop for StoredAttemptV1 {
     fn drop(&mut self) {
         self.sealed_journal.zeroize();
@@ -116,6 +124,7 @@ struct StoredRecoveryStateV1 {
     phase: StoredAttemptPhaseV1,
     snapshot_sequence: u64,
     accepted_journal_sequence: u64,
+    last_resolved_attempt: Option<StoredResolvedAttemptV1>,
     snapshot_commitment: [u8; 32],
     sealed_snapshot: Vec<u8>,
     attempt: Option<StoredAttemptV1>,
@@ -174,7 +183,7 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
         snapshot: &BlindVaultReplicaSnapshotRecord<'_>,
     ) -> Result<(), Self::Error> {
         let next = match self.load_stored()? {
-            None => StoredRecoveryStateV1::from_snapshot(snapshot, 0),
+            None => StoredRecoveryStateV1::from_snapshot(snapshot, 0, None),
             Some(current) => {
                 current.require_workflow(snapshot.workflow_id())?;
                 if current.phase != StoredAttemptPhaseV1::Resolved || current.attempt.is_some() {
@@ -184,7 +193,11 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
                     return Ok(());
                 }
                 current.require_new_snapshot_sequence(snapshot.snapshot_sequence())?;
-                StoredRecoveryStateV1::from_snapshot(snapshot, current.accepted_journal_sequence)
+                StoredRecoveryStateV1::from_snapshot(
+                    snapshot,
+                    current.accepted_journal_sequence,
+                    current.last_resolved_attempt,
+                )
             }
         };
         self.publish(&next)
@@ -257,6 +270,46 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
         self.publish(&current)
     }
 
+    fn abort_prepared_attempt(
+        &mut self,
+        journal_sequence: u64,
+        journal_commitment: [u8; 32],
+    ) -> Result<(), Self::Error> {
+        let mut current = self
+            .load_stored()?
+            .ok_or(BlindVaultReplicaRecoveryStoreError::InvalidTransition)?;
+        if current.phase == StoredAttemptPhaseV1::Resolved
+            && current.attempt.is_none()
+            && current.last_resolved_attempt
+                == Some(StoredResolvedAttemptV1 {
+                    journal_sequence,
+                    journal_commitment,
+                })
+        {
+            return Ok(());
+        }
+        let attempt = current
+            .attempt
+            .as_ref()
+            .ok_or(BlindVaultReplicaRecoveryStoreError::InvalidTransition)?;
+        if current.phase != StoredAttemptPhaseV1::Prepared
+            || attempt.journal_sequence != journal_sequence
+            || attempt.journal_commitment != journal_commitment
+        {
+            return Err(BlindVaultReplicaRecoveryStoreError::StateConflict);
+        }
+        // [BLIND-VAULT-RECOVERY-PREPARED-ABORT 2026-08-29 by Codex] The
+        // journal high-water survives cleanup. Only the private container and
+        // its attempt metadata are removed; the prior snapshot stays current.
+        current.phase = StoredAttemptPhaseV1::Resolved;
+        current.last_resolved_attempt = Some(StoredResolvedAttemptV1 {
+            journal_sequence,
+            journal_commitment,
+        });
+        current.attempt = None;
+        self.publish(&current)
+    }
+
     fn resolve_attempt(
         &mut self,
         snapshot: &BlindVaultReplicaSnapshotRecord<'_>,
@@ -269,7 +322,11 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
         current.require_workflow(snapshot.workflow_id())?;
         if current.phase == StoredAttemptPhaseV1::Resolved
             && current.attempt.is_none()
-            && current.accepted_journal_sequence == journal_sequence
+            && current.last_resolved_attempt
+                == Some(StoredResolvedAttemptV1 {
+                    journal_sequence,
+                    journal_commitment,
+                })
             && current.snapshot_matches(snapshot)
         {
             return Ok(());
@@ -289,6 +346,10 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
         current.snapshot_sequence = snapshot.snapshot_sequence();
         current.snapshot_commitment = snapshot.sealed_commitment();
         current.sealed_snapshot = snapshot.sealed_snapshot().to_vec();
+        current.last_resolved_attempt = Some(StoredResolvedAttemptV1 {
+            journal_sequence,
+            journal_commitment,
+        });
         current.attempt = None;
         self.publish(&current)
     }
@@ -326,12 +387,14 @@ impl StoredRecoveryStateV1 {
     fn from_snapshot(
         snapshot: &BlindVaultReplicaSnapshotRecord<'_>,
         accepted_journal_sequence: u64,
+        last_resolved_attempt: Option<StoredResolvedAttemptV1>,
     ) -> Self {
         Self {
             workflow_id: snapshot.workflow_id(),
             phase: StoredAttemptPhaseV1::Resolved,
             snapshot_sequence: snapshot.snapshot_sequence(),
             accepted_journal_sequence,
+            last_resolved_attempt,
             snapshot_commitment: snapshot.sealed_commitment(),
             sealed_snapshot: snapshot.sealed_snapshot().to_vec(),
             attempt: None,
@@ -401,11 +464,22 @@ impl StoredRecoveryStateV1 {
             return Err(BlindVaultReplicaRecoveryStoreError::CorruptState);
         }
         match (self.phase, self.attempt.as_ref()) {
-            (StoredAttemptPhaseV1::Resolved, None) => Ok(()),
+            (StoredAttemptPhaseV1::Resolved, None)
+                if valid_resolved_attempt_high_water(
+                    self.accepted_journal_sequence,
+                    self.last_resolved_attempt,
+                ) =>
+            {
+                Ok(())
+            }
             (StoredAttemptPhaseV1::Prepared | StoredAttemptPhaseV1::Committed, Some(attempt))
                 if attempt.attempt > 0
                     && attempt.journal_sequence > 0
                     && attempt.journal_sequence == self.accepted_journal_sequence
+                    && valid_prior_resolved_attempt(
+                        self.accepted_journal_sequence,
+                        self.last_resolved_attempt,
+                    )
                     && attempt.retain_until_ms > 0
                     && !attempt.sealed_journal.is_empty()
                     && attempt.sealed_journal.len()
@@ -416,6 +490,30 @@ impl StoredRecoveryStateV1 {
                 Ok(())
             }
             _ => Err(BlindVaultReplicaRecoveryStoreError::CorruptState),
+        }
+    }
+}
+
+fn valid_resolved_attempt_high_water(
+    accepted_journal_sequence: u64,
+    last_resolved_attempt: Option<StoredResolvedAttemptV1>,
+) -> bool {
+    match last_resolved_attempt {
+        None => accepted_journal_sequence == 0,
+        Some(resolved) => {
+            resolved.journal_sequence > 0 && resolved.journal_sequence == accepted_journal_sequence
+        }
+    }
+}
+
+fn valid_prior_resolved_attempt(
+    accepted_journal_sequence: u64,
+    last_resolved_attempt: Option<StoredResolvedAttemptV1>,
+) -> bool {
+    match last_resolved_attempt {
+        None => true,
+        Some(resolved) => {
+            resolved.journal_sequence > 0 && resolved.journal_sequence < accepted_journal_sequence
         }
     }
 }
