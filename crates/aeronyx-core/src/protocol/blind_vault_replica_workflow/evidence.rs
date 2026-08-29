@@ -13,9 +13,9 @@ use std::collections::BTreeSet;
 use crate::crypto::keys::IdentityPublicKey;
 
 use super::{
-    require_timestamp, BlindVaultReplicaActionEvidence, BlindVaultReplicaActionEvidenceKind,
-    BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
-    BlindVaultVerifiedRetiredReplica,
+    require_timestamp, BlindVaultReplacementRetirementPermit, BlindVaultReplicaActionEvidence,
+    BlindVaultReplicaActionEvidenceKind, BlindVaultReplicaWorkId, BlindVaultReplicaWorkflowError,
+    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
 };
 use crate::protocol::blind_vault::{
     BlindVaultBlindLeaseAcceptedReceipt, BlindVaultBlindLeaseAdmissionRequest,
@@ -204,12 +204,46 @@ impl BlindVaultReplicaActionEvidence {
         if replacement.node_id == retirement.node_id
             || replacement.lease_id == retirement.lease_id
             || replacement.observed_at_ms > now_ms
+            // [BLIND-VAULT-REPLACEMENT-RETIREMENT-PERMIT 2026-08-29 by Codex]
+            // Preserve the source-compatible constructor but fail closed when
+            // the old lease was retired before the replacement became live.
+            || replacement.observed_at_ms > retirement.retired_at_ms
             || retirement.retired_at_ms > now_ms
         {
             return Err(BlindVaultReplicaWorkflowError::EvidenceActionMismatch);
         }
         Ok(Self {
             kind: BlindVaultReplicaActionEvidenceKind::ReplicaReplaced {
+                replaced_node_id: retirement.node_id,
+                replaced_lease_id: retirement.lease_id,
+            },
+            verified_at_ms: now_ms,
+        })
+    }
+
+    /// Confirms replacement through an active evidence-backed retirement gate.
+    ///
+    /// [BLIND-VAULT-REPLACEMENT-RETIREMENT-PERMIT 2026-08-29 by Codex] The
+    /// terminal retirement must occur after the source issued the permit and
+    /// must match its exact old node/lease target. The permit already proves a
+    /// distinct replacement had a fresh matching inventory in this attempt.
+    pub fn replica_replaced_with_retirement_permit(
+        permit: &BlindVaultReplacementRetirementPermit,
+        retirement: BlindVaultVerifiedRetiredReplica,
+        now_ms: u64,
+    ) -> Result<Self, BlindVaultReplicaWorkflowError> {
+        require_timestamp(now_ms)?;
+        if retirement.node_id != permit.replaced_node_id
+            || retirement.lease_id != permit.replaced_lease_id
+            || retirement.retired_at_ms < permit.authorized_at_ms
+            || retirement.retired_at_ms > now_ms
+        {
+            return Err(BlindVaultReplicaWorkflowError::EvidenceActionMismatch);
+        }
+        Ok(Self {
+            kind: BlindVaultReplicaActionEvidenceKind::ReplicaReplacedWithPermit {
+                work_id: permit.work_id,
+                attempt: permit.attempt,
                 replaced_node_id: retirement.node_id,
                 replaced_lease_id: retirement.lease_id,
             },
@@ -307,6 +341,11 @@ impl BlindVaultReplicaActionEvidence {
                 BlindVaultReplicaActionEvidenceKind::ReplicaReplaced {
                     replaced_node_id,
                     replaced_lease_id,
+                }
+                | BlindVaultReplicaActionEvidenceKind::ReplicaReplacedWithPermit {
+                    replaced_node_id,
+                    replaced_lease_id,
+                    ..
                 },
                 BlindVaultReplicaAction::ReplaceReplica { node_id, lease_id },
             ) => replaced_node_id == node_id && replaced_lease_id == lease_id,
@@ -317,6 +356,18 @@ impl BlindVaultReplicaActionEvidence {
                 },
             ) => count == expected_count,
             _ => false,
+        }
+    }
+
+    /// Binds permit-gated evidence to its exact workflow generation/attempt.
+    pub(super) fn matches_attempt(&self, id: BlindVaultReplicaWorkId, attempt: u8) -> bool {
+        match &self.kind {
+            BlindVaultReplicaActionEvidenceKind::ReplicaReplacedWithPermit {
+                work_id,
+                attempt: permitted_attempt,
+                ..
+            } => *work_id == id && *permitted_attempt == attempt,
+            _ => true,
         }
     }
 }

@@ -25,6 +25,8 @@
 //! 2. The user/client explicitly authorizes each planned action.
 //! 3. The client starts one attempt and executes its typed encrypted-terminal
 //!    dispatch contract; compound repair/replacement work uses ordered stages.
+//!    Old replica retirement additionally requires a workflow-issued permit
+//!    proving a distinct replacement is live in the current attempt.
 //! 4. The workflow accepts only action-matching, verified terminal evidence.
 //! 5. Fresh inventories are planned again before declaring convergence.
 //!
@@ -33,8 +35,12 @@
 //! - Never serialize it into discovery, the public ledger, or node telemetry.
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
+//! - Never retire an old replica from contract order alone; obtain
+//!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.8.0-ReplicaDispatchContract - Made each action's required
+//! Last Modified: v1.9.0-ReplacementRetirementPermit - Added an evidence-backed
+//! permit that gates old-lease retirement behind a verified new replica.
+//! v1.8.0-ReplicaDispatchContract - Made each action's required
 //! onion terminal purposes and compound-stage order explicit for adapters.
 //! v1.7.0-OnionRouteFailureDisposition - Mapped bounded route
 //! admission failures into retryable discovery or permanent local outcomes.
@@ -436,6 +442,67 @@ pub struct BlindVaultVerifiedRetiredReplica {
     pub(super) retired_at_ms: u64,
 }
 
+/// Evidence-backed permission to retire one replaced replica.
+///
+/// [BLIND-VAULT-REPLACEMENT-RETIREMENT-PERMIT 2026-08-29 by Codex] This value
+/// can only be issued by an active workflow attempt after a distinct new
+/// replica has produced a matching live inventory. It carries no ciphertext,
+/// object identifier, manifest, credential, route, endpoint, or user identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindVaultReplacementRetirementPermit {
+    pub(super) work_id: BlindVaultReplicaWorkId,
+    pub(super) attempt: u8,
+    pub(super) replaced_node_id: [u8; 32],
+    pub(super) replaced_lease_id: [u8; 32],
+    pub(super) replacement_node_id: [u8; 32],
+    pub(super) replacement_lease_id: [u8; 32],
+    pub(super) authorized_at_ms: u64,
+}
+
+impl BlindVaultReplacementRetirementPermit {
+    /// Workflow work item that authorized this retirement transition.
+    #[must_use]
+    pub const fn work_id(&self) -> BlindVaultReplicaWorkId {
+        self.work_id
+    }
+
+    /// Active bounded attempt that admitted the verified replacement.
+    #[must_use]
+    pub const fn attempt(&self) -> u8 {
+        self.attempt
+    }
+
+    /// Existing terminal descriptor identity authorized for retirement.
+    #[must_use]
+    pub const fn replaced_node_id(&self) -> [u8; 32] {
+        self.replaced_node_id
+    }
+
+    /// Existing replica-local lease authorized for retirement.
+    #[must_use]
+    pub const fn replaced_lease_id(&self) -> [u8; 32] {
+        self.replaced_lease_id
+    }
+
+    /// Distinct terminal that proved the live replacement.
+    #[must_use]
+    pub const fn replacement_node_id(&self) -> [u8; 32] {
+        self.replacement_node_id
+    }
+
+    /// Distinct replica-local lease that proved the live replacement.
+    #[must_use]
+    pub const fn replacement_lease_id(&self) -> [u8; 32] {
+        self.replacement_lease_id
+    }
+
+    /// Source time at which the active attempt authorized retirement.
+    #[must_use]
+    pub const fn authorized_at_ms(&self) -> u64 {
+        self.authorized_at_ms
+    }
+}
+
 impl BlindVaultVerifiedRetiredReplica {
     /// Descriptor identity that signed the complete retirement receipt.
     #[must_use]
@@ -509,6 +576,12 @@ pub(super) enum BlindVaultReplicaActionEvidenceKind {
         lease_id: [u8; 32],
     },
     ReplicaReplaced {
+        replaced_node_id: [u8; 32],
+        replaced_lease_id: [u8; 32],
+    },
+    ReplicaReplacedWithPermit {
+        work_id: BlindVaultReplicaWorkId,
+        attempt: u8,
         replaced_node_id: [u8; 32],
         replaced_lease_id: [u8; 32],
     },
@@ -595,6 +668,9 @@ pub enum BlindVaultReplicaWorkflowError {
     /// Replacement completion omitted a verified old-lease retirement receipt.
     #[error("blind vault replica replacement requires terminal retirement evidence")]
     RetirementEvidenceRequired,
+    /// Retirement was requested before a verified replacement was ready.
+    #[error("blind vault replica replacement is not ready for retirement")]
+    ReplacementRetirementNotReady,
     /// Receipt terminal descriptor identity was not valid Ed25519.
     #[error("blind vault replica terminal identity is invalid")]
     InvalidTerminalIdentity,

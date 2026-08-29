@@ -8,14 +8,17 @@
 //! evidence, then a fresh planner pass must confirm whole-set convergence.
 
 use super::{
-    require_timestamp, BlindVaultReplicaActionEvidence, BlindVaultReplicaConvergence,
-    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
-    BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
-    BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+    require_timestamp, BlindVaultReplacementRetirementPermit, BlindVaultReplicaActionEvidence,
+    BlindVaultReplicaConvergence, BlindVaultReplicaDispatchFailure,
+    BlindVaultReplicaDispatchReadiness, BlindVaultReplicaExecution,
+    BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy, BlindVaultReplicaWorkId,
+    BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultVerifiedProvisionedReplica, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
     MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
-use crate::protocol::blind_vault::{BlindVaultReplicaPlan, BlindVaultReplicaPlanHealth};
+use crate::protocol::blind_vault::{
+    BlindVaultReplicaAction, BlindVaultReplicaPlan, BlindVaultReplicaPlanHealth,
+};
 
 impl BlindVaultReplicaExecution {
     /// Creates one source-local execution generation from stable planner order.
@@ -331,6 +334,58 @@ impl BlindVaultReplicaExecution {
         })
     }
 
+    /// Authorizes old-lease retirement only after the replacement is live.
+    ///
+    /// The replacement inventory must have been observed during the current
+    /// dispatch attempt and this call must occur inside its evidence window.
+    /// A retry therefore re-verifies the replacement instead of trusting stale
+    /// process memory from an earlier failed attempt.
+    ///
+    /// [BLIND-VAULT-REPLACEMENT-RETIREMENT-PERMIT 2026-08-29 by Codex]
+    pub fn replacement_retirement_permit(
+        &self,
+        id: BlindVaultReplicaWorkId,
+        replacement: &BlindVaultVerifiedProvisionedReplica,
+        authorized_at_ms: u64,
+    ) -> Result<BlindVaultReplacementRetirementPermit, BlindVaultReplicaWorkflowError> {
+        self.validate_event_time(authorized_at_ms)?;
+        let item = self.items[self.item_index(id)?];
+        let (attempt, dispatched_at_ms, evidence_deadline_ms) = match item.state {
+            BlindVaultReplicaWorkState::AwaitingEvidence {
+                attempt,
+                dispatched_at_ms,
+                evidence_deadline_ms,
+            } => (attempt, dispatched_at_ms, evidence_deadline_ms),
+            _ => return Err(BlindVaultReplicaWorkflowError::InvalidTransition),
+        };
+        let BlindVaultReplicaAction::ReplaceReplica {
+            node_id: replaced_node_id,
+            lease_id: replaced_lease_id,
+        } = item.action
+        else {
+            return Err(BlindVaultReplicaWorkflowError::InvalidTransition);
+        };
+        if authorized_at_ms > evidence_deadline_ms
+            || replacement.observed_at_ms < dispatched_at_ms
+            || replacement.observed_at_ms > authorized_at_ms
+            || replacement.accepted_at_ms > replacement.observed_at_ms
+            || replacement.node_id == replaced_node_id
+            || replacement.lease_id == replaced_lease_id
+        {
+            return Err(BlindVaultReplicaWorkflowError::ReplacementRetirementNotReady);
+        }
+
+        Ok(BlindVaultReplacementRetirementPermit {
+            work_id: id,
+            attempt,
+            replaced_node_id,
+            replaced_lease_id,
+            replacement_node_id: replacement.node_id,
+            replacement_lease_id: replacement.lease_id,
+            authorized_at_ms,
+        })
+    }
+
     /// Accepts only verified evidence matching both the action kind and target.
     pub fn accept_evidence(
         &mut self,
@@ -353,7 +408,9 @@ impl BlindVaultReplicaExecution {
         if evidence.verified_at_ms > evidence_deadline_ms {
             return Err(BlindVaultReplicaWorkflowError::EvidenceExpired);
         }
-        if !evidence.matches(&item.action) {
+        // Permit-gated replacement evidence is generation- and attempt-bound;
+        // legacy evidence retains its existing action-only compatibility path.
+        if !evidence.matches(&item.action) || !evidence.matches_attempt(id, attempt) {
             return Err(BlindVaultReplicaWorkflowError::EvidenceActionMismatch);
         }
         item.state = BlindVaultReplicaWorkState::EvidenceAccepted {

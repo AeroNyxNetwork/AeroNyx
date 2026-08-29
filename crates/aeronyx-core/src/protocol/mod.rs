@@ -37,6 +37,8 @@
 //!   replica work as explicit ordered onion terminal purposes.
 //! - [ONION-ROUTE-FAILURE-DISPOSITION 2026-08-29 by Codex] Re-exported the
 //!   shared fail-closed recovery decision for source-side route adapters.
+//! - [BLIND-VAULT-REPLACEMENT-RETIREMENT-PERMIT 2026-08-29 by Codex] Exposed
+//!   the evidence-backed gate that protects old replicas during replacement.
 //!
 //! ## Main Functionality
 //!
@@ -74,6 +76,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.9.0-BlindVaultReplacementRetirementPermit - Re-exported the active
+//! attempt gate for safe old-lease retirement
 //! v1.8.0-OnionRouteFailureDisposition - Re-exported shared source-side route
 //! recovery semantics without changing the onion wire format
 //! v1.7.0-BlindVaultDispatchContract - Re-exported purpose-level compound
@@ -143,13 +147,14 @@ pub use blind_vault::{
     MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS, MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
 };
 pub use blind_vault_replica_workflow::{
-    BlindVaultReplicaActionEvidence, BlindVaultReplicaConvergence,
-    BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,
-    BlindVaultReplicaDispatchReadiness, BlindVaultReplicaExecution,
-    BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy, BlindVaultReplicaWorkId,
-    BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
-    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
-    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
+    BlindVaultReplacementRetirementPermit, BlindVaultReplicaActionEvidence,
+    BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
+    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
+    BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
+    BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
+    BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
+    BlindVaultVerifiedRetiredReplica, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+    MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
 pub use codec::{Codec, ProtocolCodec};
