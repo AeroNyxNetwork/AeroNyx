@@ -24,6 +24,7 @@
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
 //! - `blind_vault_replica_workflow/persistence.rs`: durable recovery boundary.
+//! - `blind_vault_replica_workflow/prepared_effect.rs`: exact send bindings.
 //! - `blind_vault_replica_workflow/recovery.rs`: restart recovery decisions.
 //! - `blind_vault_replica_workflow/recovery_loader.rs`: durable phase loading.
 //! - `blind_vault_replica_workflow/sealed_local.rs`: shared local AEAD container.
@@ -55,7 +56,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.22.0-DurableWorkflowSnapshot - Added reusable bootstrap
+//! Last Modified: v1.23.0-PreparedTerminalEffects - Added payload-blind,
+//! ordered terminal-effect binding before durable dispatch authorization.
+//! v1.22.0-DurableWorkflowSnapshot - Added reusable bootstrap
 //! and resolved-state persistence with explicit durable success semantics.
 //! v1.21.0-DurableAttemptResolution - Added rollback-safe,
 //! atomic evidence acceptance and committed-journal resolution.
@@ -111,6 +114,7 @@ mod durable_snapshot;
 mod evidence;
 mod execution;
 mod persistence;
+mod prepared_effect;
 mod recovery;
 mod recovery_loader;
 mod sealed_local;
@@ -142,6 +146,11 @@ pub use persistence::{
     BlindVaultReplicaAttemptDurabilityPhase, BlindVaultReplicaCommittedAttemptRecord,
     BlindVaultReplicaPreparedAttemptRecord, BlindVaultReplicaRecoveryState,
     BlindVaultReplicaRecoveryStore, BlindVaultReplicaSnapshotRecord,
+};
+pub use prepared_effect::{
+    BlindVaultReplicaPreparedEffectError, BlindVaultReplicaPreparedEffectSet,
+    BlindVaultReplicaTerminalEffect, MAX_BLIND_VAULT_REPLICA_TERMINAL_EFFECTS,
+    MAX_BLIND_VAULT_REPLICA_TERMINAL_EFFECT_BYTES,
 };
 pub use recovery::{
     BlindVaultReplicaRestartRecoveryKind, BlindVaultReplicaRestartRecoveryTask,

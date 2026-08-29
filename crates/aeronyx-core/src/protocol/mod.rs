@@ -47,6 +47,8 @@
 //!   durable generation loading and atomic post-evidence journal resolution.
 //! - [BLIND-VAULT-DURABLE-SNAPSHOT 2026-08-29 by Codex] Re-exported the
 //!   resolved workflow bootstrap and ordinary-state persistence command.
+//! - [BLIND-VAULT-PREPARED-EFFECTS 2026-08-29 by Codex] Re-exported exact,
+//!   payload-blind terminal effect bindings for source-side orchestration.
 //!
 //! ## Main Functionality
 //!
@@ -84,6 +86,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.17.0-BlindVaultPreparedEffects - Re-exported source-local ordered effect
+//! commitments that bind durable attempts to exact send-time payloads
 //! v1.16.0-BlindVaultDurableSnapshot - Re-exported resolved-state persistence
 //! v1.15.0-BlindVaultDurableRecovery - Re-exported authenticated recovery
 //! loading plus rollback-safe committed-attempt resolution
@@ -182,11 +186,13 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
     BlindVaultReplicaLoadedRecovery, BlindVaultReplicaPersistedAttemptJournal,
     BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedAttemptRecord,
+    BlindVaultReplicaPreparedEffectError, BlindVaultReplicaPreparedEffectSet,
     BlindVaultReplicaRecoveryLoadError, BlindVaultReplicaRecoveryState,
     BlindVaultReplicaRecoveryStore, BlindVaultReplicaRestartRecoveryKind,
     BlindVaultReplicaRestartRecoveryTask, BlindVaultReplicaRestartRecoveryTiming,
-    BlindVaultReplicaRestoredExecution, BlindVaultReplicaSnapshotRecord, BlindVaultReplicaWorkId,
-    BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultReplicaRestoredExecution, BlindVaultReplicaSnapshotRecord,
+    BlindVaultReplicaTerminalEffect, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
+    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
     BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
     DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_ADAPTER_STATE_BYTES,
@@ -194,6 +200,7 @@ pub use blind_vault_replica_workflow::{
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_REPLY_SESSIONS, MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES,
+    MAX_BLIND_VAULT_REPLICA_TERMINAL_EFFECTS, MAX_BLIND_VAULT_REPLICA_TERMINAL_EFFECT_BYTES,
     MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
