@@ -17,6 +17,7 @@
 //! ## Dependencies
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
+//! - `blind_vault_replica_workflow/recovery.rs`: restart recovery decisions.
 //! - `blind_vault_replica_workflow/snapshot.rs`: sealed local restart state.
 //! - `protocol::blind_vault`: planner actions and terminal evidence.
 //! - `protocol::onion`: descriptor-authenticated route failure disposition.
@@ -28,8 +29,10 @@
 //!    dispatch contract; compound repair/replacement work uses ordered stages.
 //!    Old replica retirement additionally requires a workflow-issued permit
 //!    proving a distinct replacement is live in the current attempt.
-//! 4. The workflow accepts only action-matching, verified terminal evidence.
-//! 5. Fresh inventories are planned again before declaring convergence.
+//! 4. After restart, the source opens identity-sealed state and derives typed
+//!    recovery tasks before any ambiguous operation can be repeated.
+//! 5. The workflow accepts only action-matching, verified terminal evidence.
+//! 6. Fresh inventories are planned again before declaring convergence.
 //!
 //! ## Important Note For The Next Developer
 //! - This module is source-owned state, not a public wire/storage format.
@@ -37,11 +40,15 @@
 //! - Never add ciphertext, capabilities, lease keys, owner IDs, or contacts.
 //! - Persist the authenticated snapshot sequence in secure monotonic storage;
 //!   accepting an older sequence can replay ambiguous network work.
+//! - Persist replacement/provisioning attempt journals separately and sealed;
+//!   their credentials do not belong in this workflow domain model.
 //! - A node receipt proves one terminal operation, not whole-set convergence.
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.11.0-SealedRestartSnapshot - Added identity-bound,
+//! Last Modified: v1.12.0-RestartRecoveryPlan - Classified ambiguous restored
+//! attempts into read-only observation or private-journal recovery paths.
+//! v1.11.0-SealedRestartSnapshot - Added identity-bound,
 //! authenticated local workflow persistence with fail-closed restoration.
 //! v1.10.0-SourcePlanSummary - Retained the complete bounded
 //! planner summary required for fail-closed restart validation.
@@ -69,7 +76,13 @@
 
 mod evidence;
 mod execution;
+mod recovery;
 mod snapshot;
+
+pub use recovery::{
+    BlindVaultReplicaRestartRecoveryKind, BlindVaultReplicaRestartRecoveryTask,
+    BlindVaultReplicaRestartRecoveryTiming,
+};
 
 use thiserror::Error;
 

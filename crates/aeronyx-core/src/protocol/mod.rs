@@ -41,6 +41,8 @@
 //!   the evidence-backed gate that protects old replicas during replacement.
 //! - [BLIND-VAULT-SEALED-RESTART-SNAPSHOT 2026-08-29 by Codex] Added bounded,
 //!   identity-sealed source workflow persistence; it is not a network frame.
+//! - [BLIND-VAULT-RESTART-RECOVERY-PLAN 2026-08-29 by Codex] Exposed typed,
+//!   source-only recovery decisions for ambiguous restored terminal attempts.
 //!
 //! ## Main Functionality
 //!
@@ -78,6 +80,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.11.0-BlindVaultRestartRecoveryPlan - Re-exported fail-closed restored
+//! attempt recovery decisions
 //! v1.10.0-BlindVaultSealedRestartSnapshot - Re-exported the local encrypted
 //! restart snapshot size contract
 //! v1.9.0-BlindVaultReplacementRetirementPermit - Re-exported the active
@@ -155,11 +159,12 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
     BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
     BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
-    BlindVaultReplicaRestoredExecution, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
-    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
-    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
-    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT, MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES,
-    MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
+    BlindVaultReplicaRestartRecoveryKind, BlindVaultReplicaRestartRecoveryTask,
+    BlindVaultReplicaRestartRecoveryTiming, BlindVaultReplicaRestoredExecution,
+    BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
+    BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
+    BlindVaultVerifiedRetiredReplica, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+    MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
 pub use codec::{Codec, ProtocolCodec};
