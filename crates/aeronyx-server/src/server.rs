@@ -969,8 +969,8 @@ use aeronyx_core::protocol::memchain::{
 use aeronyx_core::protocol::messages::CLIENT_HELLO_SIZE;
 use aeronyx_core::protocol::{
     DataPacket, MessageType, NodeBootstrapSnapshot, NodeCapability, NodeCapacity, NodeDescriptor,
-    NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature, OnionRoutePurpose, SignedNodeDescriptor,
-    VerifiedOnionRoute,
+    NodeDiscoveryMessage, NodePolicy, NodeProtocolFeature, OnionRouteFailureDisposition,
+    OnionRoutePlanError, OnionRoutePurpose, SignedNodeDescriptor, VerifiedOnionRoute,
 };
 use aeronyx_transport::traits::{Transport, TunConfig, TunDevice};
 use aeronyx_transport::UdpTransport;
@@ -1276,6 +1276,33 @@ struct AuthenticatedChatOnionRelayOutcome {
 enum OnionRouteFailureAttribution {
     FirstHop,
     EndToEnd,
+}
+
+/// Bounded local failure from authenticated onion request construction.
+///
+/// [ONION-REQUEST-BUILD-ERROR 2026-08-29 by Codex] This type preserves route
+/// admission semantics until the aggregate operator boundary. It never carries
+/// payload bytes, route ids, descriptors, endpoints, or node identities.
+#[derive(Debug)]
+enum OnionRequestBuildError {
+    PayloadEncoding,
+    RoutePlan(OnionRoutePlanError),
+}
+
+impl OnionRequestBuildError {
+    #[must_use]
+    const fn reason_bucket(&self) -> &'static str {
+        match self {
+            Self::PayloadEncoding => "onion_payload_encoding_failed",
+            Self::RoutePlan(error) => match error.disposition() {
+                OnionRouteFailureDisposition::RefreshRoute => "onion_route_refresh_required",
+                OnionRouteFailureDisposition::PolicyRejected => "onion_route_policy_rejected",
+                OnionRouteFailureDisposition::LocalConstructionFailed => {
+                    "onion_route_local_construction_failed"
+                }
+            },
+        }
+    }
 }
 
 impl AuthenticatedChatOnionRelayOutcome {
@@ -12009,6 +12036,7 @@ impl Server {
             route_id,
             now,
         )
+        .ok()
     }
 
     fn build_three_hop_onion_delivery_probe_request(
@@ -12046,6 +12074,7 @@ impl Server {
             route_id,
             now,
         )
+        .ok()
     }
 
     fn build_two_hop_onion_request(
@@ -12056,7 +12085,7 @@ impl Server {
         chat_envelope: &ChatEnvelope,
         route_id: [u8; 16],
         now: u64,
-    ) -> Option<(PeerBlindRelayRequest, [u8; 32])> {
+    ) -> std::result::Result<(PeerBlindRelayRequest, [u8; 32]), OnionRequestBuildError> {
         Self::build_onion_request(
             identity,
             self_node_id,
@@ -12081,8 +12110,9 @@ impl Server {
         chat_envelope: &ChatEnvelope,
         route_id: [u8; 16],
         now: u64,
-    ) -> Option<(PeerBlindRelayRequest, [u8; 32])> {
-        let encoded_chat = encode_envelope(chat_envelope).ok()?;
+    ) -> std::result::Result<(PeerBlindRelayRequest, [u8; 32]), OnionRequestBuildError> {
+        let encoded_chat =
+            encode_envelope(chat_envelope).map_err(|_| OnionRequestBuildError::PayloadEncoding)?;
         // [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] The source computes the
         // same opaque v2 commitment as the terminal. The purpose is not sent as
         // relay metadata, and a storage receipt cannot satisfy this message
@@ -12100,12 +12130,12 @@ impl Server {
             OnionRoutePurpose::MessageRelay,
             now,
         )
-        .ok()?;
+        .map_err(OnionRequestBuildError::RoutePlan)?;
         let envelope = route
             .build_envelope(&encoded_chat, route_id, now, identity)
-            .ok()?;
+            .map_err(OnionRequestBuildError::RoutePlan)?;
 
-        Some((
+        Ok((
             PeerBlindRelayRequest {
                 envelope,
                 previous_hop_node_id: *self_node_id,
@@ -12558,7 +12588,7 @@ impl Server {
                 rand::thread_rng().fill_bytes(&mut route_id);
                 route_id
             };
-            let Some((request, payload_commitment)) = Self::build_two_hop_onion_request(
+            let (request, payload_commitment) = match Self::build_two_hop_onion_request(
                 identity,
                 self_node_id,
                 &middle,
@@ -12566,9 +12596,12 @@ impl Server {
                 envelope,
                 route_id,
                 now,
-            ) else {
-                last_failure_reason = Some("onion_request_build_failed".to_string());
-                continue;
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    last_failure_reason = Some(error.reason_bucket().to_string());
+                    continue;
+                }
             };
 
             // Once sent, both hops are considered exposed for this envelope

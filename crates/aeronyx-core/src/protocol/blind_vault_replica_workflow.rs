@@ -63,7 +63,7 @@ use super::blind_vault::{
     BlindVaultError, BlindVaultReplicaAction, BlindVaultReplicaPlanHealth,
     BlindVaultTerminalFailureCode, MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS,
 };
-use super::onion::OnionRoutePlanError;
+use super::onion::{OnionRouteFailureDisposition, OnionRoutePlanError};
 
 /// At most two per-member actions plus one aggregate provisioning action can
 /// be emitted by the current deterministic planner.
@@ -159,19 +159,10 @@ impl From<&OnionRoutePlanError> for BlindVaultReplicaDispatchFailure {
     /// select a different current route. Structural policy violations and
     /// local construction failures block the immutable workflow generation.
     fn from(value: &OnionRoutePlanError) -> Self {
-        match value {
-            OnionRoutePlanError::EmptyPath
-            | OnionRoutePlanError::DescriptorRejected { .. }
-            | OnionRoutePlanError::MissingCapability { .. }
-            | OnionRoutePlanError::MissingProtocolFeature { .. }
-            | OnionRoutePlanError::MissingX25519Kem { .. }
-            | OnionRoutePlanError::MissingPublicEndpoint { .. }
-            | OnionRoutePlanError::OutsideValidityWindow => Self::TransportUnavailable,
-            OnionRoutePlanError::TooManyHops { .. }
-            | OnionRoutePlanError::DuplicateNode { .. }
-            | OnionRoutePlanError::SourceIncluded { .. } => Self::PolicyRejected,
-            OnionRoutePlanError::SourceIdentityMismatch
-            | OnionRoutePlanError::EnvelopeConstruction { .. } => Self::LocalConstructionFailed,
+        match value.disposition() {
+            OnionRouteFailureDisposition::RefreshRoute => Self::TransportUnavailable,
+            OnionRouteFailureDisposition::PolicyRejected => Self::PolicyRejected,
+            OnionRouteFailureDisposition::LocalConstructionFailed => Self::LocalConstructionFailed,
         }
     }
 }

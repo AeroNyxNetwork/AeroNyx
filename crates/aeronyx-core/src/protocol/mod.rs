@@ -35,6 +35,8 @@
 //!   derived only from authentic, current, capability-compatible descriptors.
 //! - [BLIND-VAULT-DISPATCH-CONTRACT 2026-08-29 by Codex] Exposed validated
 //!   replica work as explicit ordered onion terminal purposes.
+//! - [ONION-ROUTE-FAILURE-DISPOSITION 2026-08-29 by Codex] Re-exported the
+//!   shared fail-closed recovery decision for source-side route adapters.
 //!
 //! ## Main Functionality
 //!
@@ -72,6 +74,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.8.0-OnionRouteFailureDisposition - Re-exported shared source-side route
+//! recovery semantics without changing the onion wire format
 //! v1.7.0-BlindVaultDispatchContract - Re-exported purpose-level compound
 //! replica dispatch requirements for App, SDK, and agent adapters
 //! v1.6.0-VerifiedOnionRoute - Re-exported descriptor-authenticated route
@@ -161,9 +165,10 @@ pub use memchain::{
 pub use messages::{ClientHello, DataPacket, MessageType, ServerHello};
 pub use onion::{
     build_onion_envelope, is_onion_blob, open_onion_layer, OnionHop, OnionPeel,
-    OnionRoutePlanError, OnionRoutePurpose, VerifiedOnionRoute, KEM_ALG_X25519, KEM_ALG_XWING,
-    MAX_VERIFIED_ONION_ROUTE_HOPS, ONION_FORWARD_HOP_REQUIRED_CAPABILITIES, ONION_MAGIC,
-    ONION_ROUTE_PURPOSE_VALUES, ONION_SALT, ONION_TERMINAL_REQUIRED_CAPABILITIES,
+    OnionRouteFailureDisposition, OnionRoutePlanError, OnionRoutePurpose, VerifiedOnionRoute,
+    KEM_ALG_X25519, KEM_ALG_XWING, MAX_VERIFIED_ONION_ROUTE_HOPS,
+    ONION_FORWARD_HOP_REQUIRED_CAPABILITIES, ONION_MAGIC, ONION_ROUTE_PURPOSE_VALUES, ONION_SALT,
+    ONION_TERMINAL_REQUIRED_CAPABILITIES,
 };
 pub use onion_reply::{
     decode_onion_reply_request, decode_onion_sealed_response, encode_onion_reply_request,

@@ -1,7 +1,7 @@
 // ============================================
 // File: crates/aeronyx-server/src/services/chat_relay_peer_telemetry.rs
 // ============================================
-// Version: 1.1.0-StatusContractDependency
+// Version: 1.2.0-OnionRouteBuildReasons
 //
 // Creation Reason:
 //   [CHAT-PEER-TELEMETRY-DOMAIN 2026-08-26 by Codex] Extract privacy-safe
@@ -11,6 +11,8 @@
 // Modification Reason:
 //   [CHAT-RELAY-STATUS-CONTRACT-DOMAIN 2026-08-27 by Codex] Depend directly
 //   on the focused status contract and its single-source policy defaults.
+//   [ONION-ROUTE-BUILD-TELEMETRY 2026-08-29 by Codex] Accept bounded onion
+//   route-construction dispositions without exposing route topology.
 //
 // Main Functionality:
 //   - Defines validated inbound and outbound failure reason value objects.
@@ -37,6 +39,7 @@
 //   - Keep serialized field names and defaults in `chat_relay_status.rs` compatible.
 //
 // Last Modified:
+//   v1.2.0-OnionRouteBuildReasons - Added closed onion route build outcomes
 //   v1.1.0-StatusContractDependency - Consumed shared status contracts directly
 //   v1.0.0-PeerRelayTelemetryDomain - Initial trait-based composition
 // ============================================
@@ -113,6 +116,10 @@ impl ChatRelayOutboundFailureReason {
                 | "onion_middle_endpoint_missing"
                 | "onion_middle_endpoint_invalid"
                 | "onion_request_build_failed"
+                | "onion_payload_encoding_failed"
+                | "onion_route_refresh_required"
+                | "onion_route_policy_rejected"
+                | "onion_route_local_construction_failed"
                 | "onion_delivery_receipt_rejected"
                 | "onion_delivery_route_surface_changed"
                 | "onion_delivery_ack_response_too_large"

@@ -71,8 +71,13 @@
 //!   public protocol contract. Parse them through [`OnionRoutePurpose`] rather
 //!   than duplicating aliases in an App, SDK, agent, or server implementation.
 //!   Unknown values must fail closed instead of silently becoming chat routes.
+//! - [ONION-ROUTE-FAILURE-DISPOSITION 2026-08-29 by Codex] Source adapters
+//!   must consume [`OnionRoutePlanError::disposition`] instead of inventing
+//!   independent retry policies for the same route-admission failure.
 //!
 //! ## Last Modified
+//! v1.12.0-RouteFailureDisposition — Centralized fail-closed route recovery
+//! decisions for chat, vault, and operator-telemetry adapters
 //! v1.11.0-VerifiedRoutePlan — Added descriptor-authenticated, purpose-aware
 //! source route admission with exact path-derived TTL
 //! v1.10.0-TerminalFeatureContract — Centralized purpose-specific signed
@@ -466,6 +471,21 @@ pub enum OnionRoutePlanError {
     },
 }
 
+/// Recovery disposition shared by source-side onion route adapters.
+///
+/// [ONION-ROUTE-FAILURE-DISPOSITION 2026-08-29 by Codex] This keeps retry
+/// policy in the protocol domain instead of duplicating variant groupings in
+/// chat, vault, or operator-telemetry adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnionRouteFailureDisposition {
+    /// Refresh discovery state or select a different current route.
+    RefreshRoute,
+    /// The requested path shape violates a local privacy or routing policy.
+    PolicyRejected,
+    /// Local identity binding or cryptographic envelope construction failed.
+    LocalConstructionFailed,
+}
+
 impl OnionRoutePlanError {
     /// Stable privacy-safe category for local recovery and aggregate metrics.
     ///
@@ -487,6 +507,26 @@ impl OnionRoutePlanError {
             Self::SourceIdentityMismatch => "source_identity_mismatch",
             Self::OutsideValidityWindow => "outside_validity_window",
             Self::EnvelopeConstruction { .. } => "envelope_construction_failed",
+        }
+    }
+
+    /// Returns the fail-closed recovery decision for this route failure.
+    #[must_use]
+    pub const fn disposition(&self) -> OnionRouteFailureDisposition {
+        match self {
+            Self::EmptyPath
+            | Self::DescriptorRejected { .. }
+            | Self::MissingCapability { .. }
+            | Self::MissingProtocolFeature { .. }
+            | Self::MissingX25519Kem { .. }
+            | Self::MissingPublicEndpoint { .. }
+            | Self::OutsideValidityWindow => OnionRouteFailureDisposition::RefreshRoute,
+            Self::TooManyHops { .. } | Self::DuplicateNode { .. } | Self::SourceIncluded { .. } => {
+                OnionRouteFailureDisposition::PolicyRejected
+            }
+            Self::SourceIdentityMismatch | Self::EnvelopeConstruction { .. } => {
+                OnionRouteFailureDisposition::LocalConstructionFailed
+            }
         }
     }
 }
