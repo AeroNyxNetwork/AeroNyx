@@ -16,6 +16,7 @@
 //! - Requires all work items to hold evidence before replanning.
 //!
 //! ## Dependencies
+//! - `blind_vault_replica_workflow/attempt_continuation.rs`: reply sessions.
 //! - `blind_vault_replica_workflow/attempt_journal.rs`: private attempt state.
 //! - `blind_vault_replica_workflow/evidence.rs`: receipt and inventory proof.
 //! - `blind_vault_replica_workflow/execution.rs`: monotonic state machine.
@@ -49,7 +50,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.15.0-PreparedAttemptJournal - Added a typed
+//! Last Modified: v1.16.0-TypedAttemptContinuation - Added restart-safe
+//! ownership of adapter state and exact single-use onion reply sessions.
+//! v1.15.0-PreparedAttemptJournal - Added a typed
 //! persist-before-dispatch binding for private mutating attempts.
 //! v1.14.0-PrivateAttemptJournal - Added action-bound sealed
 //! continuation state for restart-safe replacement and provisioning attempts.
@@ -83,6 +86,7 @@
 //! evidence-gated replica execution state machine.
 //! ============================================
 
+mod attempt_continuation;
 mod attempt_journal;
 mod evidence;
 mod execution;
@@ -90,6 +94,10 @@ mod recovery;
 mod sealed_local;
 mod snapshot;
 
+pub use attempt_continuation::{
+    BlindVaultReplicaAttemptContinuation, MAX_BLIND_VAULT_REPLICA_ATTEMPT_ADAPTER_STATE_BYTES,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_REPLY_SESSIONS,
+};
 pub use attempt_journal::{
     BlindVaultReplicaAttemptJournal, BlindVaultReplicaAttemptJournalError,
     BlindVaultReplicaPreparedAttemptJournal, MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,

@@ -80,6 +80,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.14.0-BlindVaultAttemptContinuation - Re-exported typed recoverable
+//! adapter state and single-use onion reply session ownership
 //! v1.13.0-BlindVaultPreparedAttemptJournal - Re-exported the typed
 //! persist-before-dispatch private attempt handle
 //! v1.12.0-BlindVaultPrivateAttemptJournal - Re-exported identity-sealed,
@@ -160,19 +162,23 @@ pub use blind_vault::{
 };
 pub use blind_vault_replica_workflow::{
     BlindVaultReplacementRetirementPermit, BlindVaultReplicaActionEvidence,
-    BlindVaultReplicaAttemptJournal, BlindVaultReplicaAttemptJournalError,
-    BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
-    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
-    BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
+    BlindVaultReplicaAttemptContinuation, BlindVaultReplicaAttemptJournal,
+    BlindVaultReplicaAttemptJournalError, BlindVaultReplicaConvergence,
+    BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,
+    BlindVaultReplicaDispatchReadiness, BlindVaultReplicaExecution,
+    BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
     BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaRestartRecoveryKind,
     BlindVaultReplicaRestartRecoveryTask, BlindVaultReplicaRestartRecoveryTiming,
     BlindVaultReplicaRestoredExecution, BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem,
     BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
     BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
-    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT, MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
+    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_ADAPTER_STATE_BYTES,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_PRIVATE_STATE_BYTES,
-    MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES, MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
+    MAX_BLIND_VAULT_REPLICA_ATTEMPT_REPLY_SESSIONS, MAX_BLIND_VAULT_REPLICA_RESTART_SNAPSHOT_BYTES,
+    MAX_BLIND_VAULT_REPLICA_WORK_ITEMS,
 };
 pub use chat::{decode_envelope, encode_envelope, ChatContentType, ChatEnvelope, MediaPointer};
 pub use codec::{Codec, ProtocolCodec};

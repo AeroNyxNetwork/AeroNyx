@@ -31,16 +31,49 @@
 //! - Do not implement `Clone` for session or key ownership types.
 //! - Keep response opening delegated to the single parent verifier.
 //!
-//! Last Modified: v1.0.0-RecoverableSessionKey - Initial focused module.
+//! Last Modified: v1.2.0-ExactRequestRebuild - Persisted proof mode and added
+//! commitment-checked request reconstruction after restart.
+//! v1.1.0-RestartState - Added a fixed, crate-private session
+//! encoding that is valid only inside an encrypted attempt journal.
+//! v1.0.0-RecoverableSessionKey - Initial focused module.
 //! ============================================
 
 use rand::rngs::OsRng;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 use super::{
     open_onion_reply_with_context, request_context_commitment, OnionReplyError, OnionReplyPayload,
     OnionReplyProofMode, OnionReplyRequest, ReplyKeyAgreement,
 };
+
+const RESTART_STATE_MAGIC: [u8; 4] = *b"AXOR";
+const RESTART_STATE_VERSION_V1: u16 = 1;
+const RESTART_STATE_BYTES: usize = 4 + 2 + 16 + 32 + 4 + 1 + 32 + 32;
+
+/// Zeroizing plaintext representation accepted only by the sealed journal.
+pub(crate) struct OnionReplySessionRestartState {
+    bytes: Vec<u8>,
+}
+
+impl OnionReplySessionRestartState {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for OnionReplySessionRestartState {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnionReplySessionRestartError {
+    Malformed,
+    UnsupportedVersion,
+    InvalidSession,
+}
 
 /// Module-private serializable-key foundation with consuming DH semantics.
 ///
@@ -61,6 +94,29 @@ impl RecoverableOnionReplyKey {
             secret: Some(secret),
             public,
         }
+    }
+
+    fn persistence_secret(&self) -> Result<[u8; 32], OnionReplySessionRestartError> {
+        self.secret
+            .as_ref()
+            .map(StaticSecret::to_bytes)
+            .ok_or(OnionReplySessionRestartError::InvalidSession)
+    }
+
+    fn from_persistence_secret(
+        mut secret_bytes: [u8; 32],
+    ) -> Result<Self, OnionReplySessionRestartError> {
+        if secret_bytes == [0; 32] {
+            secret_bytes.zeroize();
+            return Err(OnionReplySessionRestartError::InvalidSession);
+        }
+        let secret = StaticSecret::from(secret_bytes);
+        secret_bytes.zeroize();
+        let public = X25519PublicKey::from(&secret);
+        Ok(Self {
+            secret: Some(secret),
+            public,
+        })
     }
 }
 
@@ -86,6 +142,7 @@ pub struct OnionReplySession {
     route_id: [u8; 16],
     expected_terminal_node_id: [u8; 32],
     response_size_class: usize,
+    proof_mode: OnionReplyProofMode,
     request_context_commitment: [u8; 32],
     reply_key: RecoverableOnionReplyKey,
 }
@@ -150,6 +207,7 @@ impl OnionReplySession {
                 route_id,
                 expected_terminal_node_id,
                 response_size_class,
+                proof_mode,
                 request_context_commitment,
                 reply_key,
             },
@@ -167,5 +225,99 @@ impl OnionReplySession {
             self.response_size_class,
             self.request_context_commitment,
         )
+    }
+
+    /// Rebuilds only the exact request originally bound to this session.
+    ///
+    /// The caller supplies payload bytes from its private manifest or durable
+    /// request store. A different payload, mode, reply key, or size class
+    /// produces a different commitment and fails closed before network I/O.
+    pub fn rebuild_request(&self, payload: Vec<u8>) -> Result<OnionReplyRequest, OnionReplyError> {
+        let request = match self.proof_mode {
+            OnionReplyProofMode::RelayVisibleTerminalReceipt => OnionReplyRequest::new(
+                self.reply_key.public_key_bytes(),
+                self.response_size_class,
+                payload,
+            )?,
+            OnionReplyProofMode::SourceSealedTerminalProof => OnionReplyRequest::new_source_sealed(
+                self.reply_key.public_key_bytes(),
+                self.response_size_class,
+                payload,
+            )?,
+        };
+        if request_context_commitment(&request) != self.request_context_commitment {
+            return Err(OnionReplyError::RequestMismatch);
+        }
+        Ok(request)
+    }
+
+    /// Encodes plaintext state solely for immediate identity-sealed journaling.
+    ///
+    /// [ONION-REPLY-SESSION-RESTART-STATE 2026-08-29 by Codex] This remains
+    /// crate-private so no App, FFI, node API, or protocol caller can export
+    /// the reply secret. The zeroizing wrapper must not be persisted directly.
+    pub(crate) fn encode_restart_state(
+        &self,
+    ) -> Result<OnionReplySessionRestartState, OnionReplySessionRestartError> {
+        let encoded_size_class = u32::try_from(self.response_size_class)
+            .map_err(|_| OnionReplySessionRestartError::InvalidSession)?;
+        super::response_size_class(encoded_size_class)
+            .map_err(|_| OnionReplySessionRestartError::InvalidSession)?;
+        let mut secret_bytes = self.reply_key.persistence_secret()?;
+        let mut bytes = Vec::with_capacity(RESTART_STATE_BYTES);
+        bytes.extend_from_slice(&RESTART_STATE_MAGIC);
+        bytes.extend_from_slice(&RESTART_STATE_VERSION_V1.to_be_bytes());
+        bytes.extend_from_slice(&self.route_id);
+        bytes.extend_from_slice(&self.expected_terminal_node_id);
+        bytes.extend_from_slice(&encoded_size_class.to_be_bytes());
+        bytes.push(self.proof_mode as u8);
+        bytes.extend_from_slice(&self.request_context_commitment);
+        bytes.extend_from_slice(&secret_bytes);
+        secret_bytes.zeroize();
+        Ok(OnionReplySessionRestartState { bytes })
+    }
+
+    /// Restores one unconsumed session from authenticated journal plaintext.
+    pub(crate) fn decode_restart_state(
+        bytes: &[u8],
+    ) -> Result<Self, OnionReplySessionRestartError> {
+        if bytes.len() != RESTART_STATE_BYTES || bytes[..4] != RESTART_STATE_MAGIC {
+            return Err(OnionReplySessionRestartError::Malformed);
+        }
+        if u16::from_be_bytes([bytes[4], bytes[5]]) != RESTART_STATE_VERSION_V1 {
+            return Err(OnionReplySessionRestartError::UnsupportedVersion);
+        }
+
+        let mut route_id = [0u8; 16];
+        route_id.copy_from_slice(&bytes[6..22]);
+        let mut expected_terminal_node_id = [0u8; 32];
+        expected_terminal_node_id.copy_from_slice(&bytes[22..54]);
+        super::IdentityPublicKey::from_bytes(&expected_terminal_node_id)
+            .map_err(|_| OnionReplySessionRestartError::InvalidSession)?;
+        let encoded_size_class = u32::from_be_bytes(
+            bytes[54..58]
+                .try_into()
+                .map_err(|_| OnionReplySessionRestartError::Malformed)?,
+        );
+        let response_size_class = super::response_size_class(encoded_size_class)
+            .map_err(|_| OnionReplySessionRestartError::InvalidSession)?;
+        let proof_mode = OnionReplyProofMode::try_from(bytes[58])
+            .map_err(|_| OnionReplySessionRestartError::InvalidSession)?;
+        let mut request_context_commitment = [0u8; 32];
+        request_context_commitment.copy_from_slice(&bytes[59..91]);
+        let mut secret_bytes = [0u8; 32];
+        secret_bytes.copy_from_slice(&bytes[91..123]);
+        let reply_key = RecoverableOnionReplyKey::from_persistence_secret(secret_bytes);
+        secret_bytes.zeroize();
+        let reply_key = reply_key?;
+
+        Ok(Self {
+            route_id,
+            expected_terminal_node_id,
+            response_size_class,
+            proof_mode,
+            request_context_commitment,
+            reply_key,
+        })
     }
 }

@@ -42,7 +42,9 @@
 //! - Keep this carrier workload-neutral. Blind Vault, mailbox, and Agent RPC
 //!   parsing belongs at the terminal dispatch boundary.
 //!
-//! Last Modified: v1.3.0-SessionModule - Split single-use source session and
+//! Last Modified: v1.4.0-SessionRestartState - Kept the private restart codec
+//! reachable only to identity-sealed workflow composition inside this crate.
+//! v1.3.0-SessionModule - Split single-use source session and
 //! recoverable key ownership from the stable request/response wire codec.
 //! v1.2.0-RequestBoundReply - Bound key derivation, encrypted
 //! response metadata, and terminal signatures to the exact request payload.
@@ -62,6 +64,7 @@ use crate::crypto::keys::{E2eSession, EphemeralKeyPair, IdentityKeyPair, Identit
 mod session;
 
 pub use session::OnionReplySession;
+pub(crate) use session::{OnionReplySessionRestartError, OnionReplySessionRestartState};
 
 const REQUEST_MAGIC: [u8; 4] = *b"ANRQ";
 const RESPONSE_MAGIC: [u8; 4] = *b"ANRS";

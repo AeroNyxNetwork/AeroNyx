@@ -36,7 +36,9 @@
 //! - Never log, clone unnecessarily, or expose the private continuation bytes.
 //! - Delete a journal only after accepted evidence or explicit safe resolution.
 //!
-//! Last Modified: v1.1.0-PreparedAttempt - Added a typed
+//! Last Modified: v1.2.0-TypedContinuation - Added errors shared by the
+//! recoverable onion reply continuation codec.
+//! v1.1.0-PreparedAttempt - Added a typed
 //! persist-before-dispatch handle.
 //! v1.0.0-PrivateAttemptJournal - Initial fail-closed format.
 //! ============================================
@@ -295,6 +297,18 @@ pub enum BlindVaultReplicaAttemptJournalError {
     /// Journal binding did not match the authenticated restored execution.
     #[error("blind vault replica attempt journal does not match restored state")]
     StateMismatch,
+    /// Typed continuation bytes were truncated or internally inconsistent.
+    #[error("blind vault replica attempt continuation is malformed")]
+    ContinuationMalformed,
+    /// Typed continuation bytes use an unsupported local format version.
+    #[error("blind vault replica attempt continuation version is unsupported")]
+    ContinuationVersionUnsupported,
+    /// Typed continuation recovery requires at least one reply session.
+    #[error("blind vault replica attempt continuation requires a reply session")]
+    ReplySessionsRequired,
+    /// Typed continuation exceeded the fixed single-use reply-session count.
+    #[error("blind vault replica attempt continuation has too many reply sessions")]
+    TooManyReplySessions,
 }
 
 impl BlindVaultReplicaExecution {
