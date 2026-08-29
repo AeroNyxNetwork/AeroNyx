@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.33.0-DistilledAdmissionEvidence - Added a credential-free
+//! Last Modified: v1.34.0-ReplacementReplyPolicy - Composed request-bound
+//! replies into one fail-closed replacement lifecycle state machine.
+//! v1.33.0-DistilledAdmissionEvidence - Added a credential-free
 //! verified admission stage for sequential replacement/provision workflows.
 //! v1.32.0-RetirementTransportPermit - Enforced replacement
 //! retirement permits through ordered send and verified route selection.
@@ -171,14 +173,17 @@ pub use bound_dispatch::{
     BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaOnionDispatchPlan,
     BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
     BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
-    BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaRequestBoundReply,
+    BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaReplacementAuthorizationError,
+    BlindVaultReplicaReplacementReplyOutcome, BlindVaultReplicaReplacementReplyPolicy,
+    BlindVaultReplicaReplacementReplyPolicyBuildError,
+    BlindVaultReplicaReplacementReplyPolicyError, BlindVaultReplicaRequestBoundReply,
     BlindVaultReplicaRequestBoundReplyError, BlindVaultReplicaRequestBoundReplyVerifier,
     BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalAttemptRuntime,
     BlindVaultReplicaTerminalAttemptRuntimeBuildError, BlindVaultReplicaTerminalAttemptState,
     BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalReplyVerifier,
     BlindVaultReplicaTerminalSendContext, BlindVaultReplicaTerminalSendError,
-    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaVerifiedOnionTransport,
-    BlindVaultReplicaVerifiedOnionTransportError,
+    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaVerificationClock,
+    BlindVaultReplicaVerifiedOnionTransport, BlindVaultReplicaVerifiedOnionTransportError,
 };
 pub use durable_dispatch::{
     BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,

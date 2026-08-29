@@ -14,6 +14,7 @@
 //! - Preserves the binding through prepared and committed store operations.
 //! - Produces an ordered send sequence only after both records are durable.
 //! - Gates old-lease retirement with workflow and terminal authorization.
+//! - Composes replacement replies into one source-private lifecycle policy.
 //! - Redacts and zeroizes the binding commitment.
 //!
 //! ## Dependencies
@@ -34,7 +35,9 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.2.0-RetirementPermitGate - Required workflow and route
+//! Last Modified: v1.3.0-ReplacementReplyPolicy - Added a reusable typed
+//! admission/write/inventory/retirement reply state machine.
+//! v1.2.0-RetirementPermitGate - Required workflow and route
 //! terminal authorization before old-lease retirement can reach transport.
 //! v1.1.0-OwnedTerminalRuntime - Added one-step ownership
 //! transfer from a durable bound attempt into a self-contained runtime.
@@ -58,6 +61,7 @@ use crate::crypto::keys::IdentityKeyPair;
 
 mod attempt_runtime;
 mod onion_transport;
+mod replacement_reply_policy;
 mod request_bound_verifier;
 mod send_sequence;
 
@@ -70,6 +74,11 @@ pub use onion_transport::{
     BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
     BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaVerifiedOnionTransport,
     BlindVaultReplicaVerifiedOnionTransportError,
+};
+pub use replacement_reply_policy::{
+    BlindVaultReplicaReplacementAuthorizationError, BlindVaultReplicaReplacementReplyOutcome,
+    BlindVaultReplicaReplacementReplyPolicy, BlindVaultReplicaReplacementReplyPolicyBuildError,
+    BlindVaultReplicaReplacementReplyPolicyError, BlindVaultReplicaVerificationClock,
 };
 pub use request_bound_verifier::{
     BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaRequestBoundReply,
