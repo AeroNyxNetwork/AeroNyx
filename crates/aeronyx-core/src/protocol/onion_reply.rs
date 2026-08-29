@@ -23,6 +23,7 @@
 //! - `crypto::keys`: audited X25519, Ed25519, and XChaCha20-Poly1305 wrappers.
 //! - `protocol::onion`: callers carry the encoded request as the final onion
 //!   payload and propagate the encoded response without parsing it.
+//! - `protocol::onion_reply/session.rs`: single-use source session ownership.
 //!
 //! ## Main Logical Flow
 //! 1. The source creates an ephemeral X25519 key and encodes a bounded request.
@@ -41,7 +42,9 @@
 //! - Keep this carrier workload-neutral. Blind Vault, mailbox, and Agent RPC
 //!   parsing belongs at the terminal dispatch boundary.
 //!
-//! Last Modified: v1.2.0-RequestBoundReply - Bound key derivation, encrypted
+//! Last Modified: v1.3.0-SessionModule - Split single-use source session and
+//! recoverable key ownership from the stable request/response wire codec.
+//! v1.2.0-RequestBoundReply - Bound key derivation, encrypted
 //! response metadata, and terminal signatures to the exact request payload.
 //! v1.1.0-OnionReplySession - Added single-use source request
 //! preparation and response verification.
@@ -55,6 +58,10 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use crate::crypto::keys::{E2eSession, EphemeralKeyPair, IdentityKeyPair, IdentityPublicKey};
+
+mod session;
+
+pub use session::OnionReplySession;
 
 const REQUEST_MAGIC: [u8; 4] = *b"ANRQ";
 const RESPONSE_MAGIC: [u8; 4] = *b"ANRS";
@@ -262,99 +269,6 @@ pub struct OnionReplyPayload {
     pub payload: Vec<u8>,
 }
 
-/// Source-owned single-use state for one encrypted terminal response.
-///
-/// [ONION-REPLY-SESSION 2026-08-28 by Codex] The ephemeral private key never
-/// enters the request or a node API. Consuming `self` on open makes key reuse
-/// and accepting two responses for one logical route impossible by type.
-pub struct OnionReplySession {
-    route_id: [u8; 16],
-    expected_terminal_node_id: [u8; 32],
-    response_size_class: usize,
-    request_context_commitment: [u8; 32],
-    reply_key: EphemeralKeyPair,
-}
-
-impl OnionReplySession {
-    /// Creates one request and retains the corresponding private reply state.
-    pub fn prepare(
-        route_id: [u8; 16],
-        expected_terminal_node_id: [u8; 32],
-        response_size_class: usize,
-        payload: Vec<u8>,
-    ) -> Result<(OnionReplyRequest, Self), OnionReplyError> {
-        Self::prepare_with_mode(
-            route_id,
-            expected_terminal_node_id,
-            response_size_class,
-            payload,
-            OnionReplyProofMode::RelayVisibleTerminalReceipt,
-        )
-    }
-
-    /// Creates one v2 request that keeps final proof private to the source.
-    pub fn prepare_source_sealed(
-        route_id: [u8; 16],
-        expected_terminal_node_id: [u8; 32],
-        response_size_class: usize,
-        payload: Vec<u8>,
-    ) -> Result<(OnionReplyRequest, Self), OnionReplyError> {
-        Self::prepare_with_mode(
-            route_id,
-            expected_terminal_node_id,
-            response_size_class,
-            payload,
-            OnionReplyProofMode::SourceSealedTerminalProof,
-        )
-    }
-
-    fn prepare_with_mode(
-        route_id: [u8; 16],
-        expected_terminal_node_id: [u8; 32],
-        response_size_class: usize,
-        payload: Vec<u8>,
-        proof_mode: OnionReplyProofMode,
-    ) -> Result<(OnionReplyRequest, Self), OnionReplyError> {
-        IdentityPublicKey::from_bytes(&expected_terminal_node_id)
-            .map_err(|_| OnionReplyError::InvalidTerminalIdentity)?;
-        let reply_key = EphemeralKeyPair::generate();
-        let request = match proof_mode {
-            OnionReplyProofMode::RelayVisibleTerminalReceipt => {
-                OnionReplyRequest::new(reply_key.public_key_bytes(), response_size_class, payload)?
-            }
-            OnionReplyProofMode::SourceSealedTerminalProof => OnionReplyRequest::new_source_sealed(
-                reply_key.public_key_bytes(),
-                response_size_class,
-                payload,
-            )?,
-        };
-        let request_context_commitment = request_context_commitment(&request);
-        Ok((
-            request,
-            Self {
-                route_id,
-                expected_terminal_node_id,
-                response_size_class,
-                request_context_commitment,
-                reply_key,
-            },
-        ))
-    }
-
-    /// Decodes, decrypts, and verifies the one response bound to this session.
-    pub fn open(self, encoded_response: &[u8]) -> Result<OnionReplyPayload, OnionReplyError> {
-        let response = decode_onion_sealed_response(encoded_response)?;
-        open_onion_reply_with_context(
-            self.route_id,
-            &response,
-            self.reply_key,
-            self.expected_terminal_node_id,
-            self.response_size_class,
-            self.request_context_commitment,
-        )
-    }
-}
-
 /// Encodes one request with an explicit stable byte layout.
 pub fn encode_onion_reply_request(request: &OnionReplyRequest) -> Result<Vec<u8>, OnionReplyError> {
     request.validate()?;
@@ -521,10 +435,29 @@ pub fn open_onion_reply(
     )
 }
 
-fn open_onion_reply_with_context(
+trait ReplyKeyAgreement {
+    fn public_key_bytes(&self) -> [u8; 32];
+
+    fn exchange(self, peer_public: &[u8; 32]) -> Result<[u8; 32], OnionReplyError>;
+}
+
+impl ReplyKeyAgreement for EphemeralKeyPair {
+    fn public_key_bytes(&self) -> [u8; 32] {
+        EphemeralKeyPair::public_key_bytes(self)
+    }
+
+    fn exchange(self, peer_public: &[u8; 32]) -> Result<[u8; 32], OnionReplyError> {
+        if self.is_consumed() {
+            return Err(OnionReplyError::InvalidReplyKey);
+        }
+        Ok(EphemeralKeyPair::exchange(self, peer_public))
+    }
+}
+
+fn open_onion_reply_with_context<K: ReplyKeyAgreement>(
     route_id: [u8; 16],
     response: &OnionSealedResponse,
-    reply_key: EphemeralKeyPair,
+    reply_key: K,
     expected_terminal_node_id: [u8; 32],
     expected_size_class: usize,
     expected_request_context_commitment: [u8; 32],
@@ -533,7 +466,7 @@ fn open_onion_reply_with_context(
         return Err(OnionReplyError::InvalidSizeClass);
     }
     let reply_public_key = reply_key.public_key_bytes();
-    let mut shared_secret = reply_key.exchange(&response.ephemeral_public_key);
+    let mut shared_secret = reply_key.exchange(&response.ephemeral_public_key)?;
     if let Err(error) = reject_low_order_shared_secret(&shared_secret) {
         shared_secret.zeroize();
         return Err(error);
