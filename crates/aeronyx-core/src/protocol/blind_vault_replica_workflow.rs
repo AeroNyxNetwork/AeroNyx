@@ -38,7 +38,9 @@
 //! - Never retire an old replica from contract order alone; obtain
 //!   `BlindVaultReplacementRetirementPermit` from the active execution.
 //!
-//! Last Modified: v1.9.0-ReplacementRetirementPermit - Added an evidence-backed
+//! Last Modified: v1.10.0-SourcePlanSummary - Retained the complete bounded
+//! planner summary required for fail-closed restart validation.
+//! v1.9.0-ReplacementRetirementPermit - Added an evidence-backed
 //! permit that gates old-lease retirement behind a verified new replica.
 //! v1.8.0-ReplicaDispatchContract - Made each action's required
 //! onion terminal purposes and compound-stage order explicit for adapters.
@@ -600,6 +602,9 @@ pub struct BlindVaultReplicaExecution {
     pub(super) workflow_id: [u8; 16],
     pub(super) created_at_ms: u64,
     pub(super) source_plan_health: BlindVaultReplicaPlanHealth,
+    pub(super) source_configured_replicas: u8,
+    pub(super) source_live_verified_replicas: u8,
+    pub(super) source_live_matching_replicas: u8,
     pub(super) policy: BlindVaultReplicaExecutionPolicy,
     pub(super) maximum_in_flight: u8,
     pub(super) items: Vec<BlindVaultReplicaWorkItem>,

@@ -87,6 +87,12 @@ impl BlindVaultReplicaExecution {
             workflow_id,
             created_at_ms,
             source_plan_health: plan.health,
+            // [BLIND-VAULT-RESTART-PLAN-SUMMARY 2026-08-29 by Codex] Preserve
+            // the complete bounded planner summary so a future restored state
+            // can reconstruct and re-run `BlindVaultReplicaPlan::validate_shape`.
+            source_configured_replicas: plan.configured_replicas,
+            source_live_verified_replicas: plan.live_verified_replicas,
+            source_live_matching_replicas: plan.live_matching_replicas,
             policy,
             maximum_in_flight,
             items,
@@ -109,6 +115,24 @@ impl BlindVaultReplicaExecution {
     #[must_use]
     pub const fn source_plan_health(&self) -> BlindVaultReplicaPlanHealth {
         self.source_plan_health
+    }
+
+    /// Intended replica membership represented by the source plan.
+    #[must_use]
+    pub const fn source_configured_replicas(&self) -> u8 {
+        self.source_configured_replicas
+    }
+
+    /// Live terminal-signed observations represented by the source plan.
+    #[must_use]
+    pub const fn source_live_verified_replicas(&self) -> u8 {
+        self.source_live_verified_replicas
+    }
+
+    /// Live observations matching their private source manifests.
+    #[must_use]
+    pub const fn source_live_matching_replicas(&self) -> u8 {
+        self.source_live_matching_replicas
     }
 
     /// Maximum unrelated actions permitted to await evidence concurrently.
