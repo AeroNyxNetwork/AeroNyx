@@ -20,6 +20,7 @@
 //! - Accepts typed inventory-reconciliation completion capabilities.
 //! - Unifies all policy-issued capabilities under one closed action enum.
 //! - Unifies verified completion and bounded failure under one resolution enum.
+//! - Distills detailed terminal runtime errors into bounded attempt failures.
 //! - Records bounded failure and retry disposition through the same boundary.
 //! - Resolves the exact journal and snapshot in one recovery-store operation.
 //! - Restores the prior in-memory state after sealing or persistence failure.
@@ -48,7 +49,9 @@
 //!   exact idempotent retry is required and is supported by the store contract.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.10.0-UnifiedAttemptResolution - Added one closed adapter
+//! Last Modified: v1.11.0-TerminalFailureDistillation - Added the standard
+//! detailed-runtime-error to bounded-attempt-failure conversion.
+//! v1.10.0-UnifiedAttemptResolution - Added one closed adapter
 //! outcome spanning verified completion and bounded failure.
 //! v1.9.0-ReplyOutcomeConversion - Added idiomatic terminal
 //! extraction from every action-specific reply outcome.
@@ -86,8 +89,9 @@ use super::{
     BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaProvisioningReplyOutcome,
     BlindVaultReplicaReconcileReplyOutcome, BlindVaultReplicaRecoveryStore,
     BlindVaultReplicaRenewalReplyOutcome, BlindVaultReplicaReplacementReplyOutcome,
-    BlindVaultReplicaSnapshotRecord, BlindVaultReplicaWorkId, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError,
+    BlindVaultReplicaSnapshotRecord, BlindVaultReplicaTerminalAttemptError,
+    BlindVaultReplicaTerminalVerificationFailure, BlindVaultReplicaWorkId,
+    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
 };
 use crate::crypto::keys::IdentityKeyPair;
 
@@ -178,6 +182,24 @@ impl BlindVaultReplicaAttemptFailure {
             retry_not_before_ms,
             failure,
         }
+    }
+
+    /// Distills one detailed runtime error into durable privacy-safe state.
+    ///
+    /// [BLIND-VAULT-TERMINAL-FAILURE-DISTILLATION 2026-08-30 by Codex]
+    /// Transport and verifier details remain source-local. The workflow still
+    /// validates event ordering, retry backoff, and attempt exhaustion when
+    /// this value crosses the atomic durable-resolution boundary.
+    #[must_use]
+    pub fn from_terminal_error<TransportError, VerificationError>(
+        failed_at_ms: u64,
+        retry_not_before_ms: u64,
+        error: &BlindVaultReplicaTerminalAttemptError<TransportError, VerificationError>,
+    ) -> Self
+    where
+        VerificationError: BlindVaultReplicaTerminalVerificationFailure,
+    {
+        Self::new(failed_at_ms, retry_not_before_ms, error.dispatch_failure())
     }
 
     /// Source time at which the attempt stopped awaiting evidence.

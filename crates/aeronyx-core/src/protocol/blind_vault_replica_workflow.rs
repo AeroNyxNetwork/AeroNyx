@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.56.0-TerminalFailureClassification - Standardized coarse,
+//! Last Modified: v1.57.0-TerminalFailureDistillation - Connected detailed
+//! runtime failures to bounded durable attempt outcomes.
+//! v1.56.0-TerminalFailureClassification - Standardized coarse,
 //! privacy-safe failure mapping across terminal runtime adapters.
 //! v1.55.0-UnifiedAttemptResolution - Added one closed durable
 //! adapter outcome for verified completion and bounded failure.
