@@ -134,6 +134,9 @@
 //! - [AUTHENTICATED-ONWARD-DOMAIN 2026-08-30 by Codex] Preserves the private
 //!   authenticated request boundary through legacy forwarding so onion-middle
 //!   metadata is not redundantly signature-verified on a Tokio I/O worker
+//! - [BLIND-RESPONSE-CRYPTO-COMPLETION 2026-08-30 by Codex] Evaluates bounded
+//!   downstream ACKs and verifies their hop-local receipts outside Tokio I/O,
+//!   with fair completion admission after an outbound route effect is armed
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -338,6 +341,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.76.0-ResponseCryptoCompletion - Move downstream response policy and
+//! receipt verification into bounded fair crypto completion workers
 //! v0.75.0-EnvelopeSizePreflight - Validate canonical blind-envelope bounds
 //! without allocating another ciphertext-sized encoding buffer
 //! v0.74.0-StreamingRequestCommitment - Preserve canonical replay commitments
@@ -2320,6 +2325,34 @@ where
     let permit = blind_relay_crypto_admission()
         .try_acquire_owned()
         .map_err(|_| BlindRelayError::Backpressure)?;
+    execute_blind_relay_crypto(permit, work).await
+}
+
+/// Completes pure cryptographic work after an external route effect is armed.
+///
+/// Unlike preflight admission, this waits fairly for bounded CPU capacity so a
+/// successfully returned ACK is not discarded merely because new ingress
+/// verification arrived first. The outer HTTP in-flight gate bounds waiters.
+async fn complete_blind_relay_crypto<T, F>(work: F) -> Result<T, BlindRelayError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, BlindRelayError> + Send + 'static,
+{
+    let permit = blind_relay_crypto_admission()
+        .acquire_owned()
+        .await
+        .map_err(|_| BlindRelayError::Backpressure)?;
+    execute_blind_relay_crypto(permit, work).await
+}
+
+async fn execute_blind_relay_crypto<T, F>(
+    permit: OwnedSemaphorePermit,
+    work: F,
+) -> Result<T, BlindRelayError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, BlindRelayError> + Send + 'static,
+{
     match tokio::task::spawn_blocking(move || {
         // [BLIND-RELAY-CRYPTO-DOMAIN 2026-08-30 by Codex] Keep the owned
         // permit in the worker after request cancellation. This helper must
@@ -3735,8 +3768,8 @@ fn blind_relay_response_observed_at(started_at: u64, started: &Instant) -> u64 {
 
 /// Replaceable capabilities composed for one forwarding operation.
 struct BlindRelayForwardComponents<'a> {
-    retry_policy: &'a dyn BlindRelayRetryPolicy,
-    response_policy: &'a dyn BlindRelayResponsePolicy,
+    retry_policy: Arc<dyn BlindRelayRetryPolicy>,
+    response_policy: Arc<dyn BlindRelayResponsePolicy>,
     transport: &'a dyn BlindRelayTransport,
     observer: &'a dyn BlindRelayForwardObserver,
 }
@@ -3748,8 +3781,6 @@ async fn forward_blind_relay_with_retry(
     request: PeerBlindRelayRequest,
     now: u64,
 ) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
-    let retry_policy = BlindRelayRetryDomain::default();
-    let response_policy = BlindRelayResponseDomain;
     let transport = ReqwestBlindRelayTransport::new(Arc::clone(&state.http_client));
     let observer = PeerStoreBlindRelayForwardObserver::new(state.peer_store.as_ref());
     forward_blind_relay_with_components(
@@ -3758,8 +3789,8 @@ async fn forward_blind_relay_with_retry(
         request,
         now,
         BlindRelayForwardComponents {
-            retry_policy: &retry_policy,
-            response_policy: &response_policy,
+            retry_policy: Arc::new(BlindRelayRetryDomain::default()),
+            response_policy: Arc::new(BlindRelayResponseDomain),
             transport: &transport,
             observer: &observer,
         },
@@ -3777,6 +3808,7 @@ async fn forward_blind_relay_with_components(
     now: u64,
     components: BlindRelayForwardComponents<'_>,
 ) -> Result<BlindRelayForwardOutcome, BlindRelayError> {
+    let request = Arc::new(request);
     let next_hop = descriptor.node_id();
     let failure_receipt_required = blind_relay_failure_receipt_required(descriptor);
     let success_receipt_required = blind_relay_success_receipt_required(descriptor);
@@ -3785,23 +3817,33 @@ async fn forward_blind_relay_with_components(
     let large_pull_response_allowed = onion_large_pull_response_allowed(descriptor);
     let request_started_at = Instant::now();
     for attempt in 1..=components.retry_policy.max_attempts().get() {
-        let retry_context = blind_relay_retry_context(&request, next_hop, attempt)?;
-        let transport_outcome = components.transport.send(url, &request).await;
+        let retry_context = blind_relay_retry_context(request.as_ref(), next_hop, attempt)?;
+        let transport_outcome = components.transport.send(url, request.as_ref()).await;
         let observed_at = blind_relay_response_observed_at(now, &request_started_at);
-        let decision = components.response_policy.evaluate(
-            transport_outcome,
-            BlindRelayResponseContext {
-                request: &request,
-                next_hop,
-                observed_at,
-                failure_receipt_required,
-                success_receipt_required,
-                source_sealed_terminal_proof_allowed,
-                large_pull_response_allowed,
-                retry_context,
-                retry_policy: components.retry_policy,
-            },
-        );
+        let request_for_validation = Arc::clone(&request);
+        let response_policy = Arc::clone(&components.response_policy);
+        let retry_policy = Arc::clone(&components.retry_policy);
+        let decision = complete_blind_relay_crypto(move || {
+            // [BLIND-RESPONSE-CRYPTO-COMPLETION 2026-08-30 by Codex] Response
+            // decoding is already byte-bounded by the transport. Keep policy
+            // evaluation pure while moving receipt verification and payload
+            // commitment hashing away from the asynchronous I/O runtime.
+            Ok(response_policy.evaluate(
+                transport_outcome,
+                BlindRelayResponseContext {
+                    request: request_for_validation.as_ref(),
+                    next_hop,
+                    observed_at,
+                    failure_receipt_required,
+                    success_receipt_required,
+                    source_sealed_terminal_proof_allowed,
+                    large_pull_response_allowed,
+                    retry_context,
+                    retry_policy: retry_policy.as_ref(),
+                },
+            ))
+        })
+        .await?;
         match decision {
             BlindRelayResponseDecision::Accepted(response) => {
                 return Ok(complete_blind_relay_forward(
