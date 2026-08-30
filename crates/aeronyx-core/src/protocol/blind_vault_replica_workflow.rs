@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.70.0-PrivacySafeFailureDiagnostics - Redacted exact
+//! Last Modified: v1.71.0-TotalRuntimeStateGate - Removed the terminal runtime
+//! panic branch in favor of exhaustive typed state handling.
+//! v1.70.0-PrivacySafeFailureDiagnostics - Redacted exact
 //! durable failure and retry timing from standard diagnostics.
 //! v1.69.0-PrivacySafeStateDiagnostics - Redacted absolute
 //! source timing from work-state and dispatch-readiness diagnostics.

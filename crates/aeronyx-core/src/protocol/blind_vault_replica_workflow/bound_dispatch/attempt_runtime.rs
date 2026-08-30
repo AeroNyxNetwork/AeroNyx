@@ -40,7 +40,9 @@
 //! - Verifiers must validate workload frame, request identity, and signed result.
 //! - Do not expose adapter state, reply keys, payloads, or work ids in telemetry.
 //!
-//! Last Modified: v1.4.0-PrivacySafeRuntimeDiagnostics - Replaced generic
+//! Last Modified: v1.5.0-TotalRuntimeStateGate - Replaced the guarded panic
+//! branch with one exhaustive fail-closed runtime-state match.
+//! v1.4.0-PrivacySafeRuntimeDiagnostics - Replaced generic
 //! transport/verifier Debug and Display output with stable classifications.
 //! v1.3.0-TerminalFailureClassification - Added one extensible,
 //! privacy-safe runtime error classification boundary.
@@ -211,16 +213,17 @@ impl<'effects> BlindVaultReplicaTerminalAttemptRuntime<'effects> {
         Transport::Response: AsRef<[u8]>,
         Verifier: BlindVaultReplicaTerminalReplyVerifier,
     {
-        if self.state != BlindVaultReplicaTerminalAttemptState::Ready {
-            return Err(match self.state {
-                BlindVaultReplicaTerminalAttemptState::Complete => {
-                    BlindVaultReplicaTerminalAttemptError::SequenceComplete
-                }
-                BlindVaultReplicaTerminalAttemptState::Poisoned => {
-                    BlindVaultReplicaTerminalAttemptError::RuntimePoisoned
-                }
-                BlindVaultReplicaTerminalAttemptState::Ready => unreachable!(),
-            });
+        // [BLIND-VAULT-TOTAL-RUNTIME-STATE-GATE 2026-08-30 by Codex] Keep the
+        // gate exhaustive so future state variants require an explicit
+        // fail-closed decision instead of inheriting a process panic.
+        match self.state {
+            BlindVaultReplicaTerminalAttemptState::Ready => {}
+            BlindVaultReplicaTerminalAttemptState::Complete => {
+                return Err(BlindVaultReplicaTerminalAttemptError::SequenceComplete);
+            }
+            BlindVaultReplicaTerminalAttemptState::Poisoned => {
+                return Err(BlindVaultReplicaTerminalAttemptError::RuntimePoisoned);
+            }
         }
         if !self.send_sequence.matches_next_payload(purpose, payload) {
             return Err(BlindVaultReplicaTerminalAttemptError::PayloadMismatch);
