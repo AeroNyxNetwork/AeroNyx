@@ -146,6 +146,9 @@
 //! - [BLIND-FAILURE-SIGNING-COMPLETION 2026-08-30 by Codex] Signs only
 //!   authenticated failure receipts outside Tokio and degrades worker faults
 //!   to retryable unsigned backpressure rather than false downgrade evidence
+//! - [DIRECT-RECEIPT-SIGNING-COMPLETION 2026-08-31 by Codex] Signs direct
+//!   custody receipts in the bounded direct-crypto domain after durable
+//!   acceptance, with fair completion admission and retryable failure
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -1146,6 +1149,17 @@ enum DirectPeerAuthenticationFailure {
     Unavailable,
 }
 
+/// Internal failure of the bounded direct-relay cryptographic worker.
+///
+/// [DIRECT-RECEIPT-SIGNING-COMPLETION 2026-08-31 by Codex] Keep worker
+/// availability separate from protocol authentication. A worker failure after
+/// durable custody must produce a retryable transport failure, never an
+/// unsigned success or an authentication judgement about the previous hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectRelayCryptoFailure {
+    Unavailable,
+}
+
 impl DirectPeerAuthenticationFailure {
     const fn status_code(self) -> StatusCode {
         match self {
@@ -2017,11 +2031,25 @@ async fn authenticated_peer_relay_response(
             // [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Sign only after
             // `process_peer_relay` has established durable custody. The
             // commitment was computed from the already authenticated request.
-            let receipt = PeerChatRelayReceiptV2::accepted(
-                request_commitment,
-                now_secs(),
-                node_identity.as_ref(),
-            );
+            let accepted_at = now_secs();
+            let receipt = match complete_direct_relay_crypto(move || {
+                PeerChatRelayReceiptV2::accepted(
+                    request_commitment,
+                    accepted_at,
+                    node_identity.as_ref(),
+                )
+            })
+            .await
+            {
+                Ok(receipt) => receipt,
+                Err(DirectRelayCryptoFailure::Unavailable) => {
+                    // Durable custody is already idempotent. Leave the replay
+                    // lease incomplete and ask the sender to retry; the next
+                    // attempt can recover the exact custody ACK without
+                    // claiming that an unsigned response is authoritative.
+                    return rejected_direct_peer_relay_v2_response(StatusCode::SERVICE_UNAVAILABLE);
+                }
+            };
             let response = PeerChatRelayResponseV2 {
                 relay,
                 receipt: Some(receipt),
@@ -2043,6 +2071,22 @@ async fn authenticated_peer_relay_response(
         )
             .into_response(),
     }
+}
+
+fn rejected_direct_peer_relay_v2_response(status: StatusCode) -> Response {
+    (
+        status,
+        Json(PeerChatRelayResponseV2 {
+            relay: PeerChatRelayResponse {
+                accepted: false,
+                duplicate: false,
+                delivered_online: 0,
+                stored_pending: false,
+            },
+            receipt: None,
+        }),
+    )
+        .into_response()
 }
 
 async fn peer_relay_response(state: ChatPeerState, envelope: ChatEnvelope) -> Response {
@@ -2192,18 +2236,14 @@ async fn validate_peer_envelope_for_relay(
             return Err(error);
         }
     };
-    let worker = tokio::task::spawn_blocking(move || {
-        // Keep the permit alive until CPU work really stops, even when the
-        // parent request future is cancelled while awaiting this worker.
-        let _permit = permit;
+    let worker = execute_direct_relay_crypto(permit, move || {
         let result = validate_peer_envelope(&envelope, now);
         (envelope, result)
     })
     .await;
     let (envelope, result) = match worker {
         Ok(result) => result,
-        Err(_) => {
-            warn!("[CHAT_PEER] Sender envelope verification worker failed closed");
+        Err(DirectRelayCryptoFailure::Unavailable) => {
             let error = ChatPeerRelayError::VerificationUnavailable;
             record_peer_envelope_rejection(state, now, &error);
             return Err(error);
@@ -2446,11 +2486,11 @@ async fn authenticate_direct_peer_relay_request(
     let permit = direct_relay_signature_admission()
         .try_acquire_owned()
         .map_err(|_| DirectPeerAuthenticationFailure::Backpressure)?;
-    match tokio::task::spawn_blocking(move || {
+    execute_direct_relay_crypto(permit, move || {
         // [DIRECT-RELAY-VERIFY-ADMISSION 2026-08-30 by Codex] The owned permit
-        // remains in the worker after HTTP cancellation. Excess work never
-        // queues, and no inner envelope or node identity reaches telemetry.
-        let _permit = permit;
+        // remains in the shared worker after HTTP cancellation. Excess work
+        // never queues, and no inner envelope or node identity reaches
+        // telemetry.
         match request {
             DirectPeerAuthenticationRequest::V2(request) => {
                 let request_commitment = request
@@ -2478,13 +2518,48 @@ async fn authenticate_direct_peer_relay_request(
         }
     })
     .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            warn!("[CHAT_PEER] Direct relay verification worker failed closed");
-            Err(DirectPeerAuthenticationFailure::Unavailable)
-        }
-    }
+    .map_err(|DirectRelayCryptoFailure::Unavailable| DirectPeerAuthenticationFailure::Unavailable)?
+}
+
+/// Waits fairly for direct-relay crypto capacity after durable custody.
+///
+/// Preflight verification intentionally uses `try_acquire_owned` so hostile
+/// ingress cannot build a blocking-task queue. Completion is different: the
+/// node already owns the ciphertext, and the parser-front in-flight gate
+/// bounds these waiters, so fairness prevents fresh verification work from
+/// starving authoritative receipt signing.
+async fn complete_direct_relay_crypto<T, F>(work: F) -> Result<T, DirectRelayCryptoFailure>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = direct_relay_signature_admission()
+        .acquire_owned()
+        .await
+        .map_err(|_| DirectRelayCryptoFailure::Unavailable)?;
+    execute_direct_relay_crypto(permit, work).await
+}
+
+async fn execute_direct_relay_crypto<T, F>(
+    permit: OwnedSemaphorePermit,
+    work: F,
+) -> Result<T, DirectRelayCryptoFailure>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        // [DIRECT-RECEIPT-SIGNING-COMPLETION 2026-08-31 by Codex] Keep the
+        // permit in the worker after request cancellation. This domain owns
+        // CPU-only cryptographic work and must never perform I/O or effects.
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| {
+        warn!("[CHAT_PEER] Direct relay crypto worker failed closed");
+        DirectRelayCryptoFailure::Unavailable
+    })
 }
 
 async fn authenticate_peer_blind_relay_request(
