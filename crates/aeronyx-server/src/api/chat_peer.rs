@@ -122,6 +122,9 @@
 //! - [PREPARED-TERMINAL-EFFECT 2026-08-30 by Codex] Decodes and authenticates
 //!   terminal payloads before arming durable effect recovery; read-only Blind
 //!   Vault replies never consume mutation-recovery capacity
+//! - [DIRECT-RELAY-VERIFY-ADMISSION 2026-08-30 by Codex] Runs direct previous-
+//!   hop and sender signature verification behind bounded blocking admission
+//!   so hostile cryptographic work cannot stall asynchronous relay I/O
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -326,6 +329,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.70.0-DirectRelayVerifyAdmission - Bound all direct-relay signature work
+//! outside Tokio workers with immediate backpressure and coarse diagnostics
 //! v0.69.0-PreparedTerminalEffect - Separate terminal parsing, authentication,
 //! effect arming, and execution so malformed work remains safely releasable
 //! v0.68.0-OnionDeleteReply - Dispatch signed Blind Vault deletion requests
@@ -603,6 +608,17 @@ const MAX_BLIND_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT: usize = 8;
 
 /// Process-wide admission for CPU-bound blind-relay authentication.
 static BLIND_RELAY_SIGNATURE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Hard ceiling for concurrent direct-relay signature verification workers.
+///
+/// [DIRECT-RELAY-VERIFY-ADMISSION 2026-08-30 by Codex] Direct and blind relay
+/// have separate half-CPU partitions so one public surface cannot starve the
+/// other. Together they approximate host parallelism; one-core nodes retain
+/// one worker per surface so either protocol can still make progress.
+const MAX_DIRECT_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT: usize = 8;
+
+/// Process-wide admission for CPU-bound direct-relay authentication.
+static DIRECT_RELAY_SIGNATURE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Domain for the complete authenticated blind request, including onward data.
 const BLIND_RELAY_AUTHENTICATED_REQUEST_COMMITMENT_DOMAIN: &[u8] =
@@ -1047,6 +1063,51 @@ impl PeerChatRelayRequestV3 {
     }
 }
 
+/// Versioned direct-relay request awaiting previous-hop authentication.
+///
+/// This enum intentionally does not implement `Debug` because it contains an
+/// end-to-end encrypted user envelope and routing metadata.
+enum DirectPeerAuthenticationRequest {
+    V2(PeerChatRelayRequestV2),
+    V3 {
+        request: PeerChatRelayRequestV3,
+        expected_target_node_id: [u8; 32],
+    },
+}
+
+/// Direct relay request after bounded previous-hop signature verification.
+struct AuthenticatedDirectPeerRelayRequest {
+    envelope: ChatEnvelope,
+    previous_hop_node_id: [u8; 32],
+    request_commitment: [u8; 32],
+}
+
+/// Coarse pre-custody authentication failure safe for public responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPeerAuthenticationFailure {
+    Invalid,
+    Backpressure,
+    Unavailable,
+}
+
+impl DirectPeerAuthenticationFailure {
+    const fn status_code(self) -> StatusCode {
+        match self {
+            Self::Invalid => StatusCode::UNAUTHORIZED,
+            Self::Backpressure => StatusCode::TOO_MANY_REQUESTS,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    const fn reason_bucket(self) -> &'static str {
+        match self {
+            Self::Invalid => "peer_auth_invalid",
+            Self::Backpressure => "peer_auth_backpressure",
+            Self::Unavailable => "peer_auth_unavailable",
+        }
+    }
+}
+
 fn peer_chat_relay_auth_v3_signing_data(
     previous_hop_node_id: &[u8; 32],
     target_node_id: &[u8; 32],
@@ -1326,6 +1387,12 @@ enum ChatPeerRelayError {
     #[error("chat relay disabled")]
     RelayUnavailable,
 
+    #[error("direct relay signature verification capacity exhausted")]
+    VerificationBackpressure,
+
+    #[error("direct relay signature verification unavailable")]
+    VerificationUnavailable,
+
     #[error("invalid envelope signature")]
     InvalidSignature,
 
@@ -1493,7 +1560,10 @@ impl BlindRelayError {
 impl ChatPeerRelayError {
     fn status_code(&self) -> StatusCode {
         match self {
-            Self::RelayUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RelayUnavailable | Self::VerificationUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::VerificationBackpressure => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidSignature
             | Self::EnvelopeTooLarge { .. }
             | Self::Serialization
@@ -1507,6 +1577,8 @@ impl ChatPeerRelayError {
     fn reason_bucket(&self) -> &'static str {
         match self {
             Self::RelayUnavailable => "relay_unavailable",
+            Self::VerificationBackpressure => "signature_backpressure",
+            Self::VerificationUnavailable => "signature_verification_unavailable",
             Self::InvalidSignature => "invalid_signature",
             Self::EnvelopeTooLarge { .. } => "envelope_too_large",
             Self::Serialization => "envelope_serialization_failed",
@@ -1744,22 +1816,20 @@ async fn peer_relay_v2_handler(
     // [DIRECT-RELAY-AUTH-V2 2026-08-15 by Codex] Authenticate the immediate
     // node before the inner envelope reaches durable storage. Invalid claims
     // affect only aggregate health and cannot poison another node's identity.
-    let Some(request_commitment) = request.verified_request_commitment() else {
-        if let Some(relay) = state.chat_relay.as_ref() {
-            relay.record_peer_relay_inbound_rejected_typed(
-                now_secs(),
-                ChatRelayInboundFailureReason::from_bucket("peer_auth_invalid"),
-            );
-        }
-        return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
-    };
+    let authenticated =
+        match authenticate_direct_peer_relay_request(DirectPeerAuthenticationRequest::V2(request))
+            .await
+        {
+            Ok(authenticated) => authenticated,
+            Err(failure) => return reject_direct_peer_authentication(&state, failure),
+        };
 
     authenticated_peer_relay_response(
         state,
         gate,
-        request.envelope,
-        request.previous_hop_node_id,
-        request_commitment,
+        authenticated.envelope,
+        authenticated.previous_hop_node_id,
+        authenticated.request_commitment,
     )
     .await
 }
@@ -1783,25 +1853,38 @@ async fn peer_relay_v3_handler(
         }
         return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
     }
-    let Some(request_commitment) = request.verified_request_commitment_for_target(&local_node_id)
-    else {
-        if let Some(relay) = state.chat_relay.as_ref() {
-            relay.record_peer_relay_inbound_rejected_typed(
-                now_secs(),
-                ChatRelayInboundFailureReason::from_bucket("peer_auth_invalid"),
-            );
-        }
-        return rejected_peer_relay_response(StatusCode::UNAUTHORIZED);
-    };
+    let authenticated =
+        match authenticate_direct_peer_relay_request(DirectPeerAuthenticationRequest::V3 {
+            request,
+            expected_target_node_id: local_node_id,
+        })
+        .await
+        {
+            Ok(authenticated) => authenticated,
+            Err(failure) => return reject_direct_peer_authentication(&state, failure),
+        };
 
     authenticated_peer_relay_response(
         state,
         gate,
-        request.envelope,
-        request.previous_hop_node_id,
-        request_commitment,
+        authenticated.envelope,
+        authenticated.previous_hop_node_id,
+        authenticated.request_commitment,
     )
     .await
+}
+
+fn reject_direct_peer_authentication(
+    state: &ChatPeerState,
+    failure: DirectPeerAuthenticationFailure,
+) -> Response {
+    if let Some(relay) = state.chat_relay.as_ref() {
+        relay.record_peer_relay_inbound_rejected_typed(
+            now_secs(),
+            ChatRelayInboundFailureReason::from_bucket(failure.reason_bucket()),
+        );
+    }
+    rejected_peer_relay_response(failure.status_code())
 }
 
 /// Applies post-authentication fairness and emits one common custody response.
@@ -1976,7 +2059,7 @@ async fn process_peer_relay(
     envelope: ChatEnvelope,
 ) -> Result<PeerChatRelayResponse, ChatPeerRelayError> {
     let now = now_secs();
-    validate_peer_envelope_for_relay(&state, &envelope, now)?;
+    let envelope = validate_peer_envelope_for_relay(&state, envelope, now).await?;
     process_authenticated_peer_relay(state, envelope, now).await
 }
 
@@ -1986,21 +2069,50 @@ async fn process_peer_relay(
 /// this same boundary before arming durable route recovery. That prevents an
 /// invalid sender signature or replay timestamp from pinning an ambiguous
 /// effect claim while keeping direct and onion telemetry semantics aligned.
-fn validate_peer_envelope_for_relay(
+async fn validate_peer_envelope_for_relay(
     state: &ChatPeerState,
-    envelope: &ChatEnvelope,
+    envelope: ChatEnvelope,
     now: u64,
-) -> Result<(), ChatPeerRelayError> {
-    if let Err(error) = validate_peer_envelope(envelope, now) {
-        if let Some(relay) = state.chat_relay.as_ref() {
-            relay.record_peer_relay_inbound_rejected_typed(
-                now,
-                ChatRelayInboundFailureReason::from_bucket(error.reason_bucket()),
-            );
+) -> Result<ChatEnvelope, ChatPeerRelayError> {
+    let permit = match direct_relay_signature_admission().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let error = ChatPeerRelayError::VerificationBackpressure;
+            record_peer_envelope_rejection(state, now, &error);
+            return Err(error);
         }
+    };
+    let worker = tokio::task::spawn_blocking(move || {
+        // Keep the permit alive until CPU work really stops, even when the
+        // parent request future is cancelled while awaiting this worker.
+        let _permit = permit;
+        let result = validate_peer_envelope(&envelope, now);
+        (envelope, result)
+    })
+    .await;
+    let (envelope, result) = match worker {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("[CHAT_PEER] Sender envelope verification worker failed closed");
+            let error = ChatPeerRelayError::VerificationUnavailable;
+            record_peer_envelope_rejection(state, now, &error);
+            return Err(error);
+        }
+    };
+    if let Err(error) = result {
+        record_peer_envelope_rejection(state, now, &error);
         return Err(error);
     }
-    Ok(())
+    Ok(envelope)
+}
+
+fn record_peer_envelope_rejection(state: &ChatPeerState, now: u64, error: &ChatPeerRelayError) {
+    if let Some(relay) = state.chat_relay.as_ref() {
+        relay.record_peer_relay_inbound_rejected_typed(
+            now,
+            ChatRelayInboundFailureReason::from_bucket(error.reason_bucket()),
+        );
+    }
 }
 
 /// Establishes durable custody for an already authenticated sender envelope.
@@ -2073,20 +2185,81 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn signature_verification_capacity(hard_cap: usize) -> usize {
+    // Reserve roughly half the reported hardware parallelism for the rest of
+    // the node. A one-core process still receives one verification worker.
+    let hardware_threads = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    (hardware_threads.saturating_add(1) / 2)
+        .max(1)
+        .min(hard_cap)
+}
+
 fn blind_relay_signature_admission() -> Arc<Semaphore> {
     Arc::clone(BLIND_RELAY_SIGNATURE_ADMISSION.get_or_init(|| {
         // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Reserve roughly
-        // half the reported hardware parallelism for the rest of the node.
-        // The hard cap keeps large hosts from accepting an excessive blocking
-        // burst, while a one-core node still retains one verification worker.
-        let hardware_threads = std::thread::available_parallelism()
-            .map(|parallelism| parallelism.get())
-            .unwrap_or(1);
-        let capacity = (hardware_threads.saturating_add(1) / 2)
-            .max(1)
-            .min(MAX_BLIND_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT);
-        Arc::new(Semaphore::new(capacity))
+        // half the host for the rest of the node and reject excess work before
+        // it enters Tokio's blocking queue.
+        Arc::new(Semaphore::new(signature_verification_capacity(
+            MAX_BLIND_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT,
+        )))
     }))
+}
+
+fn direct_relay_signature_admission() -> Arc<Semaphore> {
+    Arc::clone(DIRECT_RELAY_SIGNATURE_ADMISSION.get_or_init(|| {
+        Arc::new(Semaphore::new(signature_verification_capacity(
+            MAX_DIRECT_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT,
+        )))
+    }))
+}
+
+async fn authenticate_direct_peer_relay_request(
+    request: DirectPeerAuthenticationRequest,
+) -> Result<AuthenticatedDirectPeerRelayRequest, DirectPeerAuthenticationFailure> {
+    let permit = direct_relay_signature_admission()
+        .try_acquire_owned()
+        .map_err(|_| DirectPeerAuthenticationFailure::Backpressure)?;
+    match tokio::task::spawn_blocking(move || {
+        // [DIRECT-RELAY-VERIFY-ADMISSION 2026-08-30 by Codex] The owned permit
+        // remains in the worker after HTTP cancellation. Excess work never
+        // queues, and no inner envelope or node identity reaches telemetry.
+        let _permit = permit;
+        match request {
+            DirectPeerAuthenticationRequest::V2(request) => {
+                let request_commitment = request
+                    .verified_request_commitment()
+                    .ok_or(DirectPeerAuthenticationFailure::Invalid)?;
+                Ok(AuthenticatedDirectPeerRelayRequest {
+                    envelope: request.envelope,
+                    previous_hop_node_id: request.previous_hop_node_id,
+                    request_commitment,
+                })
+            }
+            DirectPeerAuthenticationRequest::V3 {
+                request,
+                expected_target_node_id,
+            } => {
+                let request_commitment = request
+                    .verified_request_commitment_for_target(&expected_target_node_id)
+                    .ok_or(DirectPeerAuthenticationFailure::Invalid)?;
+                Ok(AuthenticatedDirectPeerRelayRequest {
+                    envelope: request.envelope,
+                    previous_hop_node_id: request.previous_hop_node_id,
+                    request_commitment,
+                })
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("[CHAT_PEER] Direct relay verification worker failed closed");
+            Err(DirectPeerAuthenticationFailure::Unavailable)
+        }
+    }
 }
 
 async fn authenticate_peer_blind_relay_request(
@@ -2514,7 +2687,7 @@ async fn process_onion_blind_relay(
             // negotiation, and chat sender authentication must finish before
             // mutation recovery is armed. Read-only vault observations stay
             // unarmed, so cancellation can release and safely retry the route.
-            let prepared = prepare_onion_terminal_payload(&state, &peel.inner, now)?;
+            let prepared = prepare_onion_terminal_payload(&state, &peel.inner, now).await?;
             if prepared.requires_durable_guard() {
                 route_lease
                     .arm_effect(now)
@@ -2756,7 +2929,7 @@ impl PreparedOnionTerminalPayload {
 
 /// Performs terminal wire parsing and sender authentication without touching
 /// Blind Vault or pending-message storage.
-fn prepare_onion_terminal_payload(
+async fn prepare_onion_terminal_payload(
     state: &ChatPeerState,
     payload: &[u8],
     now_secs: u64,
@@ -2788,7 +2961,8 @@ fn prepare_onion_terminal_payload(
 
     let envelope =
         decode_envelope(payload).map_err(|_| BlindRelayError::OnionTerminalPayloadRejected)?;
-    validate_peer_envelope_for_relay(state, &envelope, now_secs)
+    let envelope = validate_peer_envelope_for_relay(state, envelope, now_secs)
+        .await
         .map_err(|_| BlindRelayError::ForwardFailed)?;
     Ok(PreparedOnionTerminalPayload::Message(envelope))
 }
@@ -6060,7 +6234,7 @@ mod tests {
         );
 
         assert!(matches!(
-            prepare_onion_terminal_payload(&state, b"ANBV", now),
+            prepare_onion_terminal_payload(&state, b"ANBV", now).await,
             Err(BlindRelayError::OnionTerminalPayloadRejected)
         ));
     }
