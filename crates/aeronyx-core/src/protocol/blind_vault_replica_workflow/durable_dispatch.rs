@@ -36,7 +36,9 @@
 //! - Keep the low-level legacy methods for compatibility, but new adapters
 //!   should use this path before every private mutating network attempt.
 //!
-//! Last Modified: v1.2.0-RecoverablePublication - Added a consuming publication
+//! Last Modified: v1.3.0-OwnedResolutionBinding - Preserved the private journal
+//! commitment needed to resolve an owned durable send permit after evidence.
+//! v1.2.0-RecoverablePublication - Added a consuming publication
 //! path whose error retains the complete retryable committed capability.
 //! v1.1.0-DurableResolutionBinding - Shared the exact prepared
 //! journal with the sibling resolution domain without widening public access.
@@ -50,11 +52,11 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use super::{
-    BlindVaultReplicaAttemptJournalError, BlindVaultReplicaCommittedAttemptRecord,
-    BlindVaultReplicaExecution, BlindVaultReplicaPreparedAttemptJournal,
-    BlindVaultReplicaPreparedAttemptRecord, BlindVaultReplicaRecoveryStore,
-    BlindVaultReplicaSnapshotRecord, BlindVaultReplicaWorkId, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError,
+    persistence::sealed_record_commitment, BlindVaultReplicaAttemptJournalError,
+    BlindVaultReplicaCommittedAttemptRecord, BlindVaultReplicaExecution,
+    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedAttemptRecord,
+    BlindVaultReplicaRecoveryStore, BlindVaultReplicaSnapshotRecord, BlindVaultReplicaWorkId,
+    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
 };
 use crate::crypto::keys::IdentityKeyPair;
 
@@ -91,6 +93,7 @@ pub struct BlindVaultReplicaOwnedDurableAttemptDispatch {
     attempt: u8,
     snapshot_sequence: u64,
     journal_sequence: u64,
+    journal_commitment: [u8; 32],
 }
 
 /// Recoverable failure to publish one committed dispatch generation.
@@ -249,6 +252,7 @@ impl<'a> BlindVaultReplicaCommittedAttemptDispatch<'a> {
             attempt: self.attempt(),
             snapshot_sequence: self.snapshot_sequence(),
             journal_sequence: self.prepared.journal_sequence(),
+            journal_commitment: sealed_record_commitment(self.prepared.sealed_journal()),
         })
     }
 }
@@ -309,6 +313,16 @@ impl BlindVaultReplicaOwnedDurableAttemptDispatch {
     pub const fn journal_sequence(&self) -> u64 {
         self.journal_sequence
     }
+
+    pub(super) const fn journal_commitment(&self) -> [u8; 32] {
+        self.journal_commitment
+    }
+}
+
+impl Drop for BlindVaultReplicaOwnedDurableAttemptDispatch {
+    fn drop(&mut self) {
+        self.journal_commitment.zeroize();
+    }
 }
 
 impl<'a, StoreError> BlindVaultReplicaCommitPublicationError<'a, StoreError> {
@@ -345,6 +359,7 @@ impl fmt::Debug for BlindVaultReplicaOwnedDurableAttemptDispatch {
             .field("snapshot_sequence", &self.snapshot_sequence)
             .field("journal_sequence", &self.journal_sequence)
             .field("work_id", &"<redacted>")
+            .field("journal_commitment", &"<redacted>")
             .finish_non_exhaustive()
     }
 }

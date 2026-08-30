@@ -50,7 +50,9 @@
 //!   exact idempotent retry is required and is supported by the store contract.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.12.0-RetryBoundaryDerivation - Added checked retry-delay
+//! Last Modified: v1.13.0-OwnedResolutionBinding - Allowed owned durable send
+//! permits to retain and derive the exact committed journal binding.
+//! v1.12.0-RetryBoundaryDerivation - Added checked retry-delay
 //! derivation that leaves permanent outcomes without invented schedules.
 //! v1.11.0-TerminalFailureDistillation - Added the standard
 //! detailed-runtime-error to bounded-attempt-failure conversion.
@@ -89,12 +91,12 @@ use super::{
     BlindVaultReplicaCompletedRenewal, BlindVaultReplicaCompletedReplacement,
     BlindVaultReplicaDispatchFailure, BlindVaultReplicaDurableAttemptDispatch,
     BlindVaultReplicaExecution, BlindVaultReplicaObservationReplyOutcome,
-    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaProvisioningReplyOutcome,
-    BlindVaultReplicaReconcileReplyOutcome, BlindVaultReplicaRecoveryStore,
-    BlindVaultReplicaRenewalReplyOutcome, BlindVaultReplicaReplacementReplyOutcome,
-    BlindVaultReplicaSnapshotRecord, BlindVaultReplicaTerminalAttemptError,
-    BlindVaultReplicaTerminalVerificationFailure, BlindVaultReplicaWorkId,
-    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultReplicaOwnedDurableAttemptDispatch, BlindVaultReplicaPreparedAttemptJournal,
+    BlindVaultReplicaProvisioningReplyOutcome, BlindVaultReplicaReconcileReplyOutcome,
+    BlindVaultReplicaRecoveryStore, BlindVaultReplicaRenewalReplyOutcome,
+    BlindVaultReplicaReplacementReplyOutcome, BlindVaultReplicaSnapshotRecord,
+    BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalVerificationFailure,
+    BlindVaultReplicaWorkId, BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
 };
 use crate::crypto::keys::IdentityKeyPair;
 
@@ -520,6 +522,19 @@ impl BlindVaultReplicaDurableAttemptDispatch<'_, '_> {
     #[must_use]
     pub fn committed_attempt_binding(&self) -> BlindVaultReplicaCommittedAttemptBinding {
         BlindVaultReplicaCommittedAttemptBinding::from_prepared(self.committed.prepared)
+    }
+}
+
+impl BlindVaultReplicaOwnedDurableAttemptDispatch {
+    /// Captures the exact journal binding from owned durable send admission.
+    #[must_use]
+    pub fn committed_attempt_binding(&self) -> BlindVaultReplicaCommittedAttemptBinding {
+        BlindVaultReplicaCommittedAttemptBinding {
+            work_id: self.work_id(),
+            attempt: self.attempt(),
+            journal_sequence: self.journal_sequence(),
+            journal_commitment: self.journal_commitment(),
+        }
     }
 }
 

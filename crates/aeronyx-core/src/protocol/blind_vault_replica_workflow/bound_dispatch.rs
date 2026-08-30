@@ -37,7 +37,9 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.9.0-RecoverablePublication - Added consuming publication
+//! Last Modified: v1.10.0-OwnedResolutionBinding - Exposed the exact opaque
+//! committed binding needed to resolve an owned bound attempt after evidence.
+//! v1.9.0-RecoverablePublication - Added consuming publication
 //! permits whose errors retain the exact committed state for idempotent retry.
 //! v1.8.0-TerminalFailureClassification - Exported the shared
 //! bounded runtime failure classification boundary.
@@ -65,11 +67,12 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use super::{
-    BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaCommittedAttemptDispatch,
-    BlindVaultReplicaDurableAttemptDispatch, BlindVaultReplicaDurableDispatchError,
-    BlindVaultReplicaExecution, BlindVaultReplicaOwnedDurableAttemptDispatch,
-    BlindVaultReplicaPersistedAttemptJournal, BlindVaultReplicaPreparedAttemptJournal,
-    BlindVaultReplicaPreparedEffectSet, BlindVaultReplicaRecoveryStore, BlindVaultReplicaWorkId,
+    BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaCommittedAttemptBinding,
+    BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,
+    BlindVaultReplicaDurableDispatchError, BlindVaultReplicaExecution,
+    BlindVaultReplicaOwnedDurableAttemptDispatch, BlindVaultReplicaPersistedAttemptJournal,
+    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedEffectSet,
+    BlindVaultReplicaRecoveryStore, BlindVaultReplicaWorkId,
 };
 use crate::crypto::keys::IdentityKeyPair;
 
@@ -428,6 +431,12 @@ impl BlindVaultReplicaOwnedDurableBoundAttemptDispatch {
     #[must_use]
     pub const fn journal_sequence(&self) -> u64 {
         self.durable.journal_sequence()
+    }
+
+    /// Exact opaque journal binding required for durable terminal resolution.
+    #[must_use]
+    pub fn committed_attempt_binding(&self) -> BlindVaultReplicaCommittedAttemptBinding {
+        self.durable.committed_attempt_binding()
     }
 
     /// Consumes owned durability authority into one ordered send capability.
