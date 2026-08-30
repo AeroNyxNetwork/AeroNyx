@@ -120,6 +120,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.33.0-BlindVaultDurableRenewal - Added typed atomic resolution for
+//! completed exact-generation renewal policies
+//! [BLIND-VAULT-DURABLE-RENEWAL-COMPLETION 2026-08-30 by Codex]
 //! v1.32.0-BlindVaultRenewalReplyPolicy - Added exact lease-generation
 //! compare-and-swap verification for renewal attempts
 //! [BLIND-VAULT-RENEWAL-REPLY-POLICY 2026-08-30 by Codex]
