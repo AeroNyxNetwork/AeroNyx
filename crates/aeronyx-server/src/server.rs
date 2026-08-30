@@ -13592,6 +13592,10 @@ impl Server {
             NodeProtocolFeature::DirectPeerRelayTargetBindingV3,
             NodeProtocolFeature::OnionReplyV1,
             NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+            // [BLIND-VAULT-LARGE-PULL-NEGOTIATION 2026-08-30 by Codex]
+            // Every upgraded hop can carry the protocol-bounded maximum
+            // anonymous recovery response through its bounded ACK decoder.
+            NodeProtocolFeature::OnionBlindVaultLargePullV1,
             NodeProtocolFeature::OnionBlindLeaseAdmissionV1,
             NodeProtocolFeature::OnionBlindVaultPutReceiptV1,
             NodeProtocolFeature::OnionBlindVaultLeaseRetireV1,

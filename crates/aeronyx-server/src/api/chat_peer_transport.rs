@@ -44,7 +44,7 @@ use reqwest::{Client, StatusCode};
 use super::chat_peer::{PeerBlindRelayRequest, PeerBlindRelayResponse};
 use super::chat_peer_retry::BlindRelayTransportFailureKind;
 use crate::api::{
-    decode_bounded_json_response, BoundedHttpResponseError, PEER_ACK_RESPONSE_MAX_BYTES,
+    decode_bounded_json_response, BoundedHttpResponseError, BLIND_RELAY_ACK_RESPONSE_MAX_BYTES,
 };
 
 /// Result of one outbound blind-relay HTTP exchange.
@@ -172,7 +172,7 @@ impl BlindRelayTransport for ReqwestBlindRelayTransport {
         let status = response.status();
         let decoded = decode_bounded_json_response::<PeerBlindRelayResponse>(
             response,
-            PEER_ACK_RESPONSE_MAX_BYTES,
+            BLIND_RELAY_ACK_RESPONSE_MAX_BYTES,
         )
         .await;
         if status.is_success() {

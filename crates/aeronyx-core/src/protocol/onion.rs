@@ -153,12 +153,30 @@ const SOURCE_SEALED_REPLY_PATH_FEATURES: [NodeProtocolFeature; 2] = [
     NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
 ];
 
+/// [BLIND-VAULT-LARGE-PULL-NEGOTIATION 2026-08-30 by Codex]
+/// Path contract for the maximum fixed-size anonymous recovery response.
+const BLIND_VAULT_LARGE_PULL_PATH_FEATURES: [NodeProtocolFeature; 3] = [
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+    NodeProtocolFeature::OnionBlindVaultLargePullV1,
+];
+
 /// Generic reply support plus encrypted workload failures and sealed proof.
-const BLIND_VAULT_REPLY_FEATURES: [NodeProtocolFeature; 4] = [
+const BLIND_VAULT_DELETE_FEATURES: [NodeProtocolFeature; 4] = [
     NodeProtocolFeature::OnionReplyV1,
     NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
     NodeProtocolFeature::BlindRelaySuccessReceiptV1,
     NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+];
+
+/// [BLIND-VAULT-LARGE-PULL-NEGOTIATION 2026-08-30 by Codex]
+/// Generic reply support plus the path-wide large recovery carrier.
+const BLIND_VAULT_PULL_FEATURES: [NodeProtocolFeature; 5] = [
+    NodeProtocolFeature::OnionReplyV1,
+    NodeProtocolFeature::OnionBlindVaultEncryptedFailureV1,
+    NodeProtocolFeature::BlindRelaySuccessReceiptV1,
+    NodeProtocolFeature::OnionSourceSealedTerminalProofV1,
+    NodeProtocolFeature::OnionBlindVaultLargePullV1,
 ];
 
 /// Reply contract for blind-issued lease admission.
@@ -356,7 +374,8 @@ impl OnionRoutePurpose {
     pub const fn required_terminal_protocol_features(self) -> &'static [NodeProtocolFeature] {
         match self {
             Self::MessageRelay | Self::BlindVaultPut => &[],
-            Self::BlindVaultPull | Self::BlindVaultDelete => &BLIND_VAULT_REPLY_FEATURES,
+            Self::BlindVaultPull => &BLIND_VAULT_PULL_FEATURES,
+            Self::BlindVaultDelete => &BLIND_VAULT_DELETE_FEATURES,
             Self::BlindVaultLeaseAdmission => &BLIND_VAULT_LEASE_ADMISSION_FEATURES,
             Self::BlindVaultPutReceipt => &BLIND_VAULT_PUT_RECEIPT_FEATURES,
             Self::BlindVaultLeaseRetire => &BLIND_VAULT_LEASE_RETIRE_FEATURES,
@@ -377,8 +396,8 @@ impl OnionRoutePurpose {
     pub const fn required_path_protocol_features(self) -> &'static [NodeProtocolFeature] {
         match self {
             Self::MessageRelay | Self::BlindVaultPut => &[],
-            Self::BlindVaultPull
-            | Self::BlindVaultDelete
+            Self::BlindVaultPull => &BLIND_VAULT_LARGE_PULL_PATH_FEATURES,
+            Self::BlindVaultDelete
             | Self::BlindVaultLeaseAdmission
             | Self::BlindVaultPutReceipt
             | Self::BlindVaultLeaseRetire

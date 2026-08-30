@@ -2390,6 +2390,10 @@ pub fn discovery_summary_response(
             // ACK travels upstream, keeping terminal topology private.
             "blind_relay_success_receipt_v1": true,
             "source_sealed_terminal_proof_v1": true,
+            // [BLIND-VAULT-LARGE-PULL-NEGOTIATION 2026-08-30 by Codex]
+            // Unsigned visibility hint only. Route authority comes from the
+            // matching feature token in every hop's signed descriptor.
+            "blind_vault_large_pull_v1": true,
             // [ONION-ROUTE-PURPOSE 2026-08-10 by Codex] Canonical values come
             // from aeronyx-core so all implementations negotiate one contract.
             "onion_route_purpose_v1": true,

@@ -9,7 +9,7 @@
 //!
 //! ## Main Functionality
 //! - Accepts one decoded onion reply carrier at a terminal node.
-//! - Restricts inline v1 recovery to one 4 KiB-class Blind Vault object page.
+//! - Restricts inline v1 recovery to one maximum-class Blind Vault object page.
 //! - Executes immutable writes, capability-authenticated recovery, signed
 //!   object deletion or complete lease retirement, and blind-issued admission
 //!   without exposing any request to middle relays.
@@ -24,7 +24,7 @@
 //!
 //! ## Main Logical Flow
 //! 1. Decode and validate the reply carrier and its inner Blind Vault frame.
-//! 2. Require `PullRequest(limit=1)` and the inline 8 KiB response class.
+//! 2. Require `PullRequest(limit=1)` and its negotiated fixed response class.
 //! 3. Read one stable snapshot page using the bearer read capability.
 //! 4. Sign the exact ciphertext page with the terminal descriptor identity.
 //! 5. Seal and base64-encode the fixed-size response for unchanged propagation.
@@ -32,12 +32,14 @@
 //! ## Important Note For The Next Developer
 //! - Never log or return lease ids, capabilities, object ids, cursors, payloads,
 //!   ciphertext commitments, node paths, or storage error strings.
-//! - Do not raise the inline size class without also raising and auditing the
-//!   peer ACK response ceiling. Larger replies require a separate binary path.
+//! - Keep the pull response class and peer ACK ceiling derived from core wire
+//!   bounds. Every path hop must advertise the large-pull feature.
 //! - Keep node fan-out out of this module; clients choose unrelated replicas
 //!   and routes so one node cannot reconstruct a logical replica set.
 //!
-//! Last Modified: v1.8.0-BlindVaultEncryptedFailure - Moved valid-request
+//! Last Modified: v1.9.0-BlindVaultLargePull - Carried every v1 ciphertext
+//! class through one negotiated maximum fixed-size response.
+//! v1.8.0-BlindVaultEncryptedFailure - Moved valid-request
 //! workload failures inside source-only authenticated onion replies.
 //! v1.7.0-BlindVaultLeaseInventory - Added private streaming
 //! inventory commitments with encrypted terminal-signed receipts.
@@ -62,7 +64,8 @@ use aeronyx_core::protocol::{
     encode_onion_sealed_response, seal_onion_reply, BlindVaultBlindLeaseAcceptedReceipt,
     BlindVaultFrame, BlindVaultPullResponse, BlindVaultRecoveredObject, BlindVaultTerminalFailure,
     BlindVaultTerminalFailureCode, BlindVaultTerminalOperation, OnionReplyProofMode,
-    OnionRoutePurpose, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, ONION_REPLY_RESPONSE_SIZE_CLASSES,
+    OnionRoutePurpose, BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES,
+    BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS, ONION_REPLY_RESPONSE_SIZE_CLASSES,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
@@ -120,14 +123,25 @@ pub(super) fn execute_blind_vault_inline_reply(
 ) -> Result<TerminalReply, TerminalReplyFailure> {
     let reply_request =
         decode_onion_reply_request(encoded_request).map_err(|_| TerminalReplyFailure::Rejected)?;
-    if usize::try_from(reply_request.response_size_class).ok()
-        != Some(ONION_REPLY_RESPONSE_SIZE_CLASSES[0])
-    {
-        return Err(TerminalReplyFailure::Rejected);
-    }
+    let response_size_class = usize::try_from(reply_request.response_size_class)
+        .map_err(|_| TerminalReplyFailure::Rejected)?;
 
     let frame = decode_blind_vault_frame(&reply_request.payload)
         .map_err(|_| TerminalReplyFailure::Rejected)?;
+    let is_pull = matches!(&frame, BlindVaultFrame::PullRequest(_));
+    let current_size_class = if is_pull {
+        BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS
+    } else {
+        ONION_REPLY_RESPONSE_SIZE_CLASSES[0]
+    };
+    // [BLIND-VAULT-ONION-PULL-SIZE 2026-08-30 by Codex] Only Pull may reserve
+    // the larger carrier. Retaining the old 8 KiB Pull class lets an upgraded
+    // terminal serve legacy 4 KiB-only clients during a rolling deployment;
+    // every other operation remains non-amplifying.
+    let legacy_pull_size = is_pull && response_size_class == ONION_REPLY_RESPONSE_SIZE_CLASSES[0];
+    if response_size_class != current_size_class && !legacy_pull_size {
+        return Err(TerminalReplyFailure::Rejected);
+    }
     let (purpose, operation, response) = match frame {
         BlindVaultFrame::Put(put_request) => {
             let response = (|| {

@@ -37,13 +37,18 @@
 //!   explicitly changes the wire contract.
 //!
 //! ## Last Modified
+//! v2.8.39-LargePullValidation - Accept the maximum recovery carrier only
+//! after signed next-hop feature negotiation.
 //! v2.8.38-OnionReplyValidation - Validate fixed-size opaque reply envelopes.
 //! v2.8.37-ChatPeerResponseDomain - Initial trait-based response policy.
 //! ============================================================================
 
 use std::time::Duration;
 
-use aeronyx_core::protocol::{decode_onion_sealed_response, ONION_REPLY_RESPONSE_SIZE_CLASSES};
+use aeronyx_core::protocol::{
+    decode_onion_sealed_response, BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS,
+    ONION_REPLY_RESPONSE_SIZE_CLASSES,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::StatusCode;
 
@@ -116,6 +121,7 @@ pub(super) struct BlindRelayResponseContext<'a> {
     pub(super) failure_receipt_required: bool,
     pub(super) success_receipt_required: bool,
     pub(super) source_sealed_terminal_proof_allowed: bool,
+    pub(super) large_pull_response_allowed: bool,
     pub(super) retry_context: BlindRelayRetryContext,
     pub(super) retry_policy: &'a dyn BlindRelayRetryPolicy,
 }
@@ -194,6 +200,7 @@ fn evaluate_success_status(
             if let Err(diagnostic) = validate_opaque_terminal_response(
                 &response,
                 context.source_sealed_terminal_proof_allowed,
+                context.large_pull_response_allowed,
             ) {
                 return BlindRelayResponseDecision::InvalidResponse {
                     kind: BlindRelayInvalidResponseKind::OpaqueTerminalResponse,
@@ -227,6 +234,7 @@ fn evaluate_success_status(
 fn validate_opaque_terminal_response(
     ack: &PeerBlindRelayResponse,
     source_sealed_terminal_proof_allowed: bool,
+    large_pull_response_allowed: bool,
 ) -> Result<(), &'static str> {
     let Some(encoded) = ack.opaque_terminal_response_b64.as_deref() else {
         return Ok(());
@@ -239,11 +247,17 @@ fn validate_opaque_terminal_response(
         .map_err(|_| "opaque_response_base64_invalid")?;
     let response =
         decode_onion_sealed_response(&bytes).map_err(|_| "opaque_response_envelope_invalid")?;
-    if response
+    let response_size_class = response
         .validate()
-        .map_err(|_| "opaque_response_envelope_invalid")?
-        != ONION_REPLY_RESPONSE_SIZE_CLASSES[0]
-    {
+        .map_err(|_| "opaque_response_envelope_invalid")?;
+    let standard_response = response_size_class == ONION_REPLY_RESPONSE_SIZE_CLASSES[0];
+    let negotiated_large_pull = large_pull_response_allowed
+        && response_size_class == BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS;
+    // [BLIND-VAULT-LARGE-PULL-VALIDATION 2026-08-30 by Codex] Do not infer
+    // workload purpose from opaque bytes. The signed immediate-hop descriptor
+    // authorizes exactly the one additional bounded class needed by recovery;
+    // every unadvertised or intermediate class remains invalid.
+    if !standard_response && !negotiated_large_pull {
         return Err("opaque_response_size_class_invalid");
     }
     Ok(())

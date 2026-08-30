@@ -67,7 +67,9 @@
 //! - Media blobs use a separate bounded blob protocol; this object protocol is
 //!   for padded metadata/message-event segments only.
 //!
-//! Last Modified: v1.20.0-PrivacySafeTypedDebug - Redacted direct formatting
+//! Last Modified: v1.21.0-OnionPullSizeContract - Bound anonymous recovery to
+//! the negotiated maximum fixed-size response class.
+//! v1.20.0-PrivacySafeTypedDebug - Redacted direct formatting
 //! for capability-, topology-, and commitment-bearing protocol values.
 //! v1.19.0-PrivacySafeFrameDebug - Redacted top-level frames,
 //! encrypted objects, bearer recovery requests, and storage receipts.
@@ -247,6 +249,17 @@ pub const MAX_BLIND_VAULT_FRAME_BYTES: u64 = MAX_BLIND_VAULT_PULL_RESPONSE_FRAME
 /// classes. Attachments and media must use the encrypted blob channel.
 pub const BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES: [usize; 4] =
     [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024];
+
+/// Fixed response class used by anonymous single-object recovery.
+///
+/// [BLIND-VAULT-ONION-PULL-SIZE 2026-08-30 by Codex] A lease may contain any
+/// valid ciphertext class, including objects written through the bounded
+/// direct API. Always reserving the largest response class keeps the object's
+/// size hidden from relay hops and guarantees that one valid object plus its
+/// signed metadata can be sealed. Route construction must require the matching
+/// path-wide feature before using this class.
+pub const BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS: usize =
+    ONION_REPLY_RESPONSE_SIZE_CLASSES[ONION_REPLY_RESPONSE_SIZE_CLASSES.len() - 1];
 
 // [BLIND-VAULT-PRIVACY-SAFE-TYPED-DEBUG 2026-08-30 by Codex] Typed handlers
 // frequently format a decoded request directly rather than its outer frame.
@@ -1622,7 +1635,7 @@ impl BlindVaultOnionPullSession {
         let (reply_request, reply_session) = OnionReplySession::prepare_source_sealed(
             route_id,
             expected_terminal_node_id,
-            ONION_REPLY_RESPONSE_SIZE_CLASSES[0],
+            BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS,
             encoded_pull,
         )?;
         let encoded_request = encode_onion_reply_request(&reply_request)?;

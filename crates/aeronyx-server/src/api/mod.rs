@@ -328,8 +328,23 @@ impl std::fmt::Display for BoundedHttpResponseError {
     }
 }
 
-/// Relay acknowledgements contain only booleans, counters, and reason codes.
+/// Relay acknowledgements without opaque terminal data remain compact.
 pub(crate) const PEER_ACK_RESPONSE_MAX_BYTES: usize = 16 * 1024;
+
+/// Headroom for bounded Blind Relay JSON fields and signed hop-local receipts.
+const BLIND_RELAY_ACK_METADATA_MAX_BYTES: usize = PEER_ACK_RESPONSE_MAX_BYTES;
+
+/// Maximum base64 length of the protocol-bounded opaque terminal response.
+const BLIND_RELAY_ACK_OPAQUE_RESPONSE_MAX_BYTES: usize =
+    ((aeronyx_core::protocol::MAX_ONION_SEALED_RESPONSE_BYTES + 2) / 3) * 4;
+
+/// Maximum Blind Relay acknowledgement accepted by its bounded decoder.
+///
+/// [BLIND-VAULT-LARGE-PULL-TRANSPORT 2026-08-30 by Codex] Derive this ceiling
+/// from the core wire bound without widening unrelated peer control responses.
+/// The stream reader enforces the resulting cap before JSON decoding.
+pub(crate) const BLIND_RELAY_ACK_RESPONSE_MAX_BYTES: usize =
+    BLIND_RELAY_ACK_OPAQUE_RESPONSE_MAX_BYTES + BLIND_RELAY_ACK_METADATA_MAX_BYTES;
 
 /// Reads an untrusted HTTP response without allowing a peer to grow the
 /// process heap without bound.

@@ -459,6 +459,14 @@ pub enum NodeProtocolFeature {
     /// path-wide: every selected hop must also support immediate-hop success
     /// receipts before a source opts into the topology-hiding response mode.
     OnionSourceSealedTerminalProofV1,
+    /// The node can propagate the largest fixed-size Blind Vault recovery
+    /// response without truncating or rejecting the peer acknowledgement.
+    ///
+    /// [BLIND-VAULT-LARGE-PULL-NEGOTIATION 2026-08-30 by Codex] This is a
+    /// path-wide transport claim, not merely a terminal workload claim. A
+    /// source must require it from every selected hop before reserving the
+    /// maximum anonymous pull response class.
+    OnionBlindVaultLargePullV1,
     /// The node accepts RFC 9474 blind-issued lease admission inside the final
     /// onion layer and returns a request-bound terminal-signed receipt.
     ///
@@ -500,7 +508,7 @@ pub enum NodeProtocolFeature {
 
 impl NodeProtocolFeature {
     /// Features understood by this binary, in stable negotiation order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::BlindRelayFailureReceiptV1,
         Self::BlindRelaySuccessReceiptV1,
         Self::PurposeBoundDeliveryReceiptV2,
@@ -509,6 +517,7 @@ impl NodeProtocolFeature {
         Self::DirectPeerRelayTargetBindingV3,
         Self::OnionReplyV1,
         Self::OnionSourceSealedTerminalProofV1,
+        Self::OnionBlindVaultLargePullV1,
         Self::OnionBlindLeaseAdmissionV1,
         Self::OnionBlindVaultPutReceiptV1,
         Self::OnionBlindVaultLeaseRetireV1,
@@ -530,6 +539,7 @@ impl NodeProtocolFeature {
             Self::DirectPeerRelayTargetBindingV3 => "anpf1-dprtb3",
             Self::OnionReplyV1 => "anpf1-or1",
             Self::OnionSourceSealedTerminalProofV1 => "anpf1-osstp1",
+            Self::OnionBlindVaultLargePullV1 => "anpf1-oblp1",
             Self::OnionBlindLeaseAdmissionV1 => "anpf1-obla1",
             Self::OnionBlindVaultPutReceiptV1 => "anpf1-obpr1",
             Self::OnionBlindVaultLeaseRetireV1 => "anpf1-oblr1",

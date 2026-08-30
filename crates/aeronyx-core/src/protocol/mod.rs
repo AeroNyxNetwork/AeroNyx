@@ -278,7 +278,8 @@ pub use blind_vault::{
     BlindVaultReplicaPlanHealth, BlindVaultReplicaPlanner, BlindVaultReplicaPolicy,
     BlindVaultReplicaTarget, BlindVaultStoredReceipt, BlindVaultTerminalFailure,
     BlindVaultTerminalFailureCode, BlindVaultTerminalOperation, BlindVaultVerifiedReplicaInventory,
-    BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_PROTOCOL_VERSION, MAX_BLIND_VAULT_FRAME_BYTES,
+    BLIND_VAULT_CIPHERTEXT_SIZE_CLASSES, BLIND_VAULT_ONION_PULL_RESPONSE_SIZE_CLASS,
+    BLIND_VAULT_PROTOCOL_VERSION, MAX_BLIND_VAULT_FRAME_BYTES,
     MAX_BLIND_VAULT_REPLICA_PLAN_ACTIONS, MAX_BLIND_VAULT_REPLICA_PLAN_MEMBERS,
 };
 pub use blind_vault_replica_workflow::{

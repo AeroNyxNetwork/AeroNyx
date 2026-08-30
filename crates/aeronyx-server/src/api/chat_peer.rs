@@ -3236,6 +3236,7 @@ async fn forward_blind_relay_with_components(
     let success_receipt_required = blind_relay_success_receipt_required(descriptor);
     let source_sealed_terminal_proof_allowed =
         onion_source_sealed_terminal_proof_allowed(descriptor);
+    let large_pull_response_allowed = onion_large_pull_response_allowed(descriptor);
     let request_started_at = Instant::now();
     for attempt in 1..=components.retry_policy.max_attempts().get() {
         let retry_context = blind_relay_retry_context(&request, next_hop, attempt)?;
@@ -3250,6 +3251,7 @@ async fn forward_blind_relay_with_components(
                 failure_receipt_required,
                 success_receipt_required,
                 source_sealed_terminal_proof_allowed,
+                large_pull_response_allowed,
                 retry_context,
                 retry_policy: components.retry_policy,
             },
@@ -3366,6 +3368,15 @@ fn onion_source_sealed_terminal_proof_allowed(descriptor: &SignedNodeDescriptor)
         && descriptor
             .descriptor
             .advertises_protocol_feature(NodeProtocolFeature::OnionSourceSealedTerminalProofV1)
+}
+
+fn onion_large_pull_response_allowed(descriptor: &SignedNodeDescriptor) -> bool {
+    // [BLIND-VAULT-LARGE-PULL-VALIDATION 2026-08-30 by Codex] A bounded large
+    // ACK is accepted only from the exact signed descriptor selected for this
+    // hop. The response remains opaque, so no relay learns the workload type.
+    descriptor
+        .descriptor
+        .advertises_protocol_feature(NodeProtocolFeature::OnionBlindVaultLargePullV1)
 }
 
 fn complete_blind_relay_forward(
