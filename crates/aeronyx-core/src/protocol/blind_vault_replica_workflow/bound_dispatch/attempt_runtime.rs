@@ -16,6 +16,7 @@
 //! - Requires workflow authority before an old lease can be retired.
 //! - Opens and semantically verifies each response before allowing the next.
 //! - Poisons the complete runtime after any authenticated-reply failure.
+//! - Classifies terminal errors into bounded privacy-safe workflow failures.
 //!
 //! ## Dependencies
 //! - `send_sequence.rs`: payload-bound ordered network authority.
@@ -38,7 +39,9 @@
 //! - Verifiers must validate workload frame, request identity, and signed result.
 //! - Do not expose adapter state, reply keys, payloads, or work ids in telemetry.
 //!
-//! Last Modified: v1.2.0-RetirementPermitGate - Blocked old-lease retirement
+//! Last Modified: v1.3.0-TerminalFailureClassification - Added one extensible,
+//! privacy-safe runtime error classification boundary.
+//! v1.2.0-RetirementPermitGate - Blocked old-lease retirement
 //! before I/O unless the active workflow issued an exact permit.
 //! v1.1.0-RequestAwareVerification - Supplied the exact bound
 //! request to private workload verification without retaining another copy.
@@ -57,6 +60,7 @@ use super::send_sequence::{
 };
 use crate::protocol::blind_vault_replica_workflow::{
     BlindVaultReplacementRetirementPermit, BlindVaultReplicaAttemptContinuation,
+    BlindVaultReplicaDispatchFailure,
 };
 use crate::protocol::onion::OnionRoutePurpose;
 use crate::protocol::onion_reply::{OnionReplyError, OnionReplyPayload, OnionReplySession};
@@ -90,6 +94,16 @@ pub trait BlindVaultReplicaTerminalReplyVerifier {
         adapter_state: &[u8],
         reply: OnionReplyPayload,
     ) -> Result<Self::Output, Self::Error>;
+}
+
+/// Converts source-private verifier errors into bounded durable failure state.
+///
+/// [BLIND-VAULT-TERMINAL-FAILURE-CLASSIFICATION 2026-08-30 by Codex] Detailed
+/// request, receipt, terminal, and policy errors stay at the source. Workflow
+/// snapshots retain only the stable coarse class required for retry decisions.
+pub trait BlindVaultReplicaTerminalVerificationFailure {
+    /// Returns the privacy-safe workflow failure for this verifier error.
+    fn dispatch_failure(&self) -> BlindVaultReplicaDispatchFailure;
 }
 
 /// Runtime owning aligned effect, reply-session, and adapter-state cursors.
@@ -359,6 +373,37 @@ pub enum BlindVaultReplicaTerminalAttemptError<TransportError, VerificationError
     Reply(OnionReplyError),
     /// The opened workload response failed exact semantic verification.
     Verification(VerificationError),
+}
+
+impl<TransportError, VerificationError>
+    BlindVaultReplicaTerminalAttemptError<TransportError, VerificationError>
+where
+    VerificationError: BlindVaultReplicaTerminalVerificationFailure,
+{
+    /// Classifies this detailed runtime error for durable workflow state.
+    ///
+    /// Transport failures remain retryable. Authenticated malformed replies
+    /// are terminal rejections. Missing local authority and invalid local
+    /// state fail closed without exposing detailed error strings.
+    #[must_use]
+    pub fn dispatch_failure(&self) -> BlindVaultReplicaDispatchFailure {
+        match self {
+            Self::Transport(_) => BlindVaultReplicaDispatchFailure::TransportUnavailable,
+            Self::Reply(_) => BlindVaultReplicaDispatchFailure::TerminalRejected,
+            Self::Verification(error) => error.dispatch_failure(),
+            Self::RetirementPermitRequired | Self::RetirementPermitMismatch => {
+                BlindVaultReplicaDispatchFailure::PolicyRejected
+            }
+            Self::SequenceComplete
+            | Self::RuntimePoisoned
+            | Self::PayloadMismatch
+            | Self::StateMismatch
+            | Self::SessionRequestMismatch
+            | Self::RetirementRequestInvalid => {
+                BlindVaultReplicaDispatchFailure::LocalConstructionFailed
+            }
+        }
+    }
 }
 
 impl<TransportError: fmt::Display, VerificationError: fmt::Display> fmt::Display

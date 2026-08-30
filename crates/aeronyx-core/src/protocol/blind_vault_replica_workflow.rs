@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.55.0-UnifiedAttemptResolution - Added one closed durable
+//! Last Modified: v1.56.0-TerminalFailureClassification - Standardized coarse,
+//! privacy-safe failure mapping across terminal runtime adapters.
+//! v1.55.0-UnifiedAttemptResolution - Added one closed durable
 //! adapter outcome for verified completion and bounded failure.
 //! v1.54.0-ReplyOutcomeConversion - Added standard typed
 //! conversion from action reply outcomes into unified completion.
@@ -236,8 +238,9 @@ pub use bound_dispatch::{
     BlindVaultReplicaTerminalAttemptRuntimeBuildError, BlindVaultReplicaTerminalAttemptState,
     BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalReplyVerifier,
     BlindVaultReplicaTerminalSendContext, BlindVaultReplicaTerminalSendError,
-    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaVerificationClock,
-    BlindVaultReplicaVerifiedOnionTransport, BlindVaultReplicaVerifiedOnionTransportError,
+    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaTerminalVerificationFailure,
+    BlindVaultReplicaVerificationClock, BlindVaultReplicaVerifiedOnionTransport,
+    BlindVaultReplicaVerifiedOnionTransportError,
 };
 pub use durable_dispatch::{
     BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,

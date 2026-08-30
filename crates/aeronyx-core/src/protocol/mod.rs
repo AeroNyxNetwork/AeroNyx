@@ -85,6 +85,8 @@
 //!   replacement write receipt to its signed admission lease window.
 //! - [BLIND-VAULT-ATTEMPT-RESOLUTION 2026-08-30 by Codex] Re-exported one
 //!   closed durable adapter outcome for verified completion or bounded failure.
+//! - [BLIND-VAULT-TERMINAL-FAILURE-CLASSIFICATION 2026-08-30 by Codex]
+//!   Standardized privacy-safe failure mapping across terminal adapters.
 //!
 //! ## Main Functionality
 //!
@@ -122,6 +124,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.41.0-BlindVaultTerminalFailureClassification - Added one extensible,
+//! bounded runtime error classification boundary
+//! [BLIND-VAULT-TERMINAL-FAILURE-CLASSIFICATION 2026-08-30 by Codex]
 //! v1.40.0-BlindVaultAttemptResolution - Added one closed durable adapter
 //! outcome spanning verified completion and bounded failure
 //! [BLIND-VAULT-ATTEMPT-RESOLUTION 2026-08-30 by Codex]
@@ -315,11 +320,12 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaTerminalAttemptState, BlindVaultReplicaTerminalEffect,
     BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalReplyVerifier,
     BlindVaultReplicaTerminalSendContext, BlindVaultReplicaTerminalSendError,
-    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaVerificationClock,
-    BlindVaultReplicaVerifiedOnionTransport, BlindVaultReplicaVerifiedOnionTransportError,
-    BlindVaultReplicaWorkId, BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
-    BlindVaultVerifiedRetiredReplica, DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
+    BlindVaultReplicaTerminalSendSequence, BlindVaultReplicaTerminalVerificationFailure,
+    BlindVaultReplicaVerificationClock, BlindVaultReplicaVerifiedOnionTransport,
+    BlindVaultReplicaVerifiedOnionTransportError, BlindVaultReplicaWorkId,
+    BlindVaultReplicaWorkItem, BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedRetiredReplica,
+    DEFAULT_BLIND_VAULT_REPLICA_MAXIMUM_IN_FLIGHT,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_ADAPTER_STATE_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_BYTES,
     MAX_BLIND_VAULT_REPLICA_ATTEMPT_JOURNAL_RETENTION_MS,

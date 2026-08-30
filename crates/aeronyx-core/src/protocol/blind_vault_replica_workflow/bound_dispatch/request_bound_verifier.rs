@@ -40,7 +40,9 @@
 //! - Never implement a permissive default private policy.
 //! - Debug output must remain redacted because requests can contain ciphertext.
 //!
-//! Last Modified: v1.3.0-SingleEffectContext - Centralized exact work,
+//! Last Modified: v1.4.0-TerminalFailureClassification - Implemented the
+//! shared bounded runtime failure classifier for request-bound errors.
+//! v1.3.0-SingleEffectContext - Centralized exact work,
 //! attempt, sequence, and terminal-authorization checks for single replies.
 //! v1.2.0-SharedVerificationClock - Moved the replaceable
 //! source-time boundary beside the common private reply-policy contract.
@@ -55,7 +57,9 @@ use std::fmt;
 use thiserror::Error;
 
 use super::super::{BlindVaultReplicaDispatchFailure, BlindVaultReplicaWorkId};
-use super::attempt_runtime::BlindVaultReplicaTerminalReplyVerifier;
+use super::attempt_runtime::{
+    BlindVaultReplicaTerminalReplyVerifier, BlindVaultReplicaTerminalVerificationFailure,
+};
 use super::send_sequence::BlindVaultReplicaTerminalSendContext;
 use crate::crypto::keys::IdentityPublicKey;
 use crate::protocol::blind_vault::{
@@ -493,5 +497,13 @@ impl<PolicyError> BlindVaultReplicaRequestBoundReplyError<PolicyError> {
             | Self::ResponseFrameMismatch
             | Self::RequestMismatch => BlindVaultReplicaDispatchFailure::TerminalRejected,
         }
+    }
+}
+
+impl<PolicyError> BlindVaultReplicaTerminalVerificationFailure
+    for BlindVaultReplicaRequestBoundReplyError<PolicyError>
+{
+    fn dispatch_failure(&self) -> BlindVaultReplicaDispatchFailure {
+        BlindVaultReplicaRequestBoundReplyError::dispatch_failure(self)
     }
 }

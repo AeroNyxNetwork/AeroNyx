@@ -15,6 +15,7 @@
 //! - Produces an ordered send sequence only after both records are durable.
 //! - Gates old-lease retirement with workflow and terminal authorization.
 //! - Composes replacement replies into one source-private lifecycle policy.
+//! - Exposes one extensible, privacy-safe terminal failure classifier.
 //! - Redacts and zeroizes the binding commitment.
 //!
 //! ## Dependencies
@@ -35,7 +36,9 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.7.0-RenewalReplyPolicy - Added exact lease-generation
+//! Last Modified: v1.8.0-TerminalFailureClassification - Exported the shared
+//! bounded runtime failure classification boundary.
+//! v1.7.0-RenewalReplyPolicy - Added exact lease-generation
 //! compare-and-swap verification for single-effect renewal attempts.
 //! v1.6.0-ObservationReplyPolicy - Added exact single-effect
 //! fresh inventory verification for observation-retry attempts.
@@ -80,7 +83,7 @@ mod send_sequence;
 pub use attempt_runtime::{
     BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalAttemptRuntime,
     BlindVaultReplicaTerminalAttemptRuntimeBuildError, BlindVaultReplicaTerminalAttemptState,
-    BlindVaultReplicaTerminalReplyVerifier,
+    BlindVaultReplicaTerminalReplyVerifier, BlindVaultReplicaTerminalVerificationFailure,
 };
 pub use observation_reply_policy::{
     BlindVaultReplicaCompletedObservation, BlindVaultReplicaObservationReplyOutcome,
