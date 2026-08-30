@@ -36,7 +36,9 @@
 //! - This policy is source-private and intentionally not serializable.
 //! - Never expose object identifiers or private manifest values in telemetry.
 //!
-//! Last Modified: v1.0.0-ReconcileReplyPolicy - Initial attempt-bound,
+//! Last Modified: v1.1.0-AttemptBoundCompletion - Preserved exact policy
+//! attempt binding inside the emitted durable completion capability.
+//! v1.0.0-ReconcileReplyPolicy - Initial attempt-bound,
 //! monotonic mutation and post-mutation inventory state machine.
 //! ============================================
 
@@ -94,6 +96,8 @@ impl fmt::Debug for BlindVaultReplicaReconcileReplyOutcome {
 #[derive(Clone, PartialEq, Eq)]
 pub struct BlindVaultReplicaCompletedReconciliation {
     evidence: BlindVaultReplicaActionEvidence,
+    work_id: BlindVaultReplicaWorkId,
+    attempt: u8,
 }
 
 impl BlindVaultReplicaCompletedReconciliation {
@@ -101,6 +105,14 @@ impl BlindVaultReplicaCompletedReconciliation {
         &self,
     ) -> &BlindVaultReplicaActionEvidence {
         &self.evidence
+    }
+
+    pub(in crate::protocol::blind_vault_replica_workflow) const fn matches_attempt(
+        &self,
+        work_id: BlindVaultReplicaWorkId,
+        attempt: u8,
+    ) -> bool {
+        self.work_id == work_id && self.attempt == attempt
     }
 }
 
@@ -403,7 +415,7 @@ where
         BlindVaultReplicaReconcileReplyPolicyError<Clock::Error>,
     > {
         require_unrestricted_terminal(context)?;
-        let _binding = require_or_create_binding(self.expected_work_id, binding, context)?;
+        let binding = require_or_create_binding(self.expected_work_id, binding, context)?;
         let now_ms = self
             .clock
             .now_ms()
@@ -425,7 +437,11 @@ where
         self.state = BlindVaultReplicaReconcileReplyState::Complete;
         Ok(
             BlindVaultReplicaReconcileReplyOutcome::ReconciliationCompleted(
-                BlindVaultReplicaCompletedReconciliation { evidence },
+                BlindVaultReplicaCompletedReconciliation {
+                    evidence,
+                    work_id: binding.work_id,
+                    attempt: binding.attempt,
+                },
             ),
         )
     }

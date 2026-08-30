@@ -36,7 +36,9 @@
 //! - This policy is source-private and intentionally not serializable.
 //! - Never expose private expectations or inventory values in telemetry.
 //!
-//! Last Modified: v1.0.0-ObservationReplyPolicy - Initial exact-action,
+//! Last Modified: v1.1.0-AttemptBoundCompletion - Bound completion capability
+//! to the exact work id and runtime attempt that produced its evidence.
+//! v1.0.0-ObservationReplyPolicy - Initial exact-action,
 //! single-effect, freshness-bounded observation recovery policy.
 //! ============================================
 
@@ -82,6 +84,8 @@ impl fmt::Debug for BlindVaultReplicaObservationReplyOutcome {
 #[derive(Clone, PartialEq, Eq)]
 pub struct BlindVaultReplicaCompletedObservation {
     evidence: BlindVaultReplicaActionEvidence,
+    work_id: BlindVaultReplicaWorkId,
+    attempt: u8,
 }
 
 impl BlindVaultReplicaCompletedObservation {
@@ -89,6 +93,14 @@ impl BlindVaultReplicaCompletedObservation {
         &self,
     ) -> &BlindVaultReplicaActionEvidence {
         &self.evidence
+    }
+
+    pub(in crate::protocol::blind_vault_replica_workflow) const fn matches_attempt(
+        &self,
+        work_id: BlindVaultReplicaWorkId,
+        attempt: u8,
+    ) -> bool {
+        self.work_id == work_id && self.attempt == attempt
     }
 }
 
@@ -220,7 +232,11 @@ where
         self.state = BlindVaultReplicaObservationReplyState::Complete;
         Ok(
             BlindVaultReplicaObservationReplyOutcome::ObservationCompleted(
-                BlindVaultReplicaCompletedObservation { evidence },
+                BlindVaultReplicaCompletedObservation {
+                    evidence,
+                    work_id: context.work_id(),
+                    attempt: context.attempt(),
+                },
             ),
         )
     }

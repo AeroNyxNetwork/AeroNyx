@@ -120,6 +120,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.37.0-BlindVaultAttemptBoundCompletion - Bound every typed completion
+//! capability to its exact work id and runtime attempt
+//! [BLIND-VAULT-ATTEMPT-BOUND-COMPLETION 2026-08-30 by Codex]
 //! v1.36.0-BlindVaultCompletedAction - Added one closed typed capability enum
 //! and generic durable completion boundary
 //! [BLIND-VAULT-COMPLETED-ACTION 2026-08-30 by Codex]

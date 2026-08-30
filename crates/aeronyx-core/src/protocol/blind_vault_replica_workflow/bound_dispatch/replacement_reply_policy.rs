@@ -38,7 +38,9 @@
 //! - Never add a transition that accepts retirement before verified inventory.
 //! - Never expose request, receipt, manifest, node, or lease values in Debug.
 //!
-//! Last Modified: v1.5.0-WriteLeaseLifetime - Bound replacement write receipts
+//! Last Modified: v1.6.0-AttemptBoundCompletion - Preserved exact replacement
+//! attempt binding inside the emitted durable completion capability.
+//! v1.5.0-WriteLeaseLifetime - Bound replacement write receipts
 //! to the current admission time and signed lease expiry.
 //! v1.4.0-AuthorizedRetirementDispatch - Composed workflow
 //! authority and the permit-gated runtime send behind one typed operation.
@@ -110,6 +112,8 @@ impl fmt::Debug for BlindVaultReplicaReplacementReplyOutcome {
 #[derive(Clone, PartialEq, Eq)]
 pub struct BlindVaultReplicaCompletedReplacement {
     evidence: BlindVaultReplicaActionEvidence,
+    work_id: BlindVaultReplicaWorkId,
+    attempt: u8,
 }
 
 impl BlindVaultReplicaCompletedReplacement {
@@ -117,6 +121,14 @@ impl BlindVaultReplicaCompletedReplacement {
         &self,
     ) -> &BlindVaultReplicaActionEvidence {
         &self.evidence
+    }
+
+    pub(in crate::protocol::blind_vault_replica_workflow) const fn matches_attempt(
+        &self,
+        work_id: BlindVaultReplicaWorkId,
+        attempt: u8,
+    ) -> bool {
+        self.work_id == work_id && self.attempt == attempt
     }
 }
 
@@ -463,7 +475,11 @@ where
                 self.state = BlindVaultReplicaReplacementReplyState::Complete;
                 Ok(
                     BlindVaultReplicaReplacementReplyOutcome::ReplacementCompleted(
-                        BlindVaultReplicaCompletedReplacement { evidence },
+                        BlindVaultReplicaCompletedReplacement {
+                            evidence,
+                            work_id: binding.work_id,
+                            attempt: binding.attempt,
+                        },
                     ),
                 )
             }

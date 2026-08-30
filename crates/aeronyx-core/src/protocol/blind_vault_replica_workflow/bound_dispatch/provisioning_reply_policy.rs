@@ -36,7 +36,9 @@
 //! - Never permit interleaved replica groups or caller-selected group indexes.
 //! - Never expose private expectations or replica topology in telemetry.
 //!
-//! Last Modified: v1.0.0-ProvisioningReplyPolicy - Initial bounded aggregate
+//! Last Modified: v1.1.0-AttemptBoundCompletion - Preserved exact aggregate
+//! attempt binding inside the emitted durable completion capability.
+//! v1.0.0-ProvisioningReplyPolicy - Initial bounded aggregate
 //! provisioning reply state machine and completion capability.
 //! ============================================
 
@@ -101,6 +103,8 @@ impl fmt::Debug for BlindVaultReplicaProvisioningReplyOutcome {
 #[derive(Clone, PartialEq, Eq)]
 pub struct BlindVaultReplicaCompletedProvisioning {
     evidence: BlindVaultReplicaActionEvidence,
+    work_id: BlindVaultReplicaWorkId,
+    attempt: u8,
 }
 
 impl BlindVaultReplicaCompletedProvisioning {
@@ -108,6 +112,14 @@ impl BlindVaultReplicaCompletedProvisioning {
         &self,
     ) -> &BlindVaultReplicaActionEvidence {
         &self.evidence
+    }
+
+    pub(in crate::protocol::blind_vault_replica_workflow) const fn matches_attempt(
+        &self,
+        work_id: BlindVaultReplicaWorkId,
+        attempt: u8,
+    ) -> bool {
+        self.work_id == work_id && self.attempt == attempt
     }
 }
 
@@ -409,7 +421,11 @@ where
                     self.state = BlindVaultReplicaProvisioningReplyState::Complete;
                     Ok(
                         BlindVaultReplicaProvisioningReplyOutcome::ProvisioningCompleted(
-                            BlindVaultReplicaCompletedProvisioning { evidence },
+                            BlindVaultReplicaCompletedProvisioning {
+                                evidence,
+                                work_id: binding.work_id,
+                                attempt: binding.attempt,
+                            },
                         ),
                     )
                 } else {

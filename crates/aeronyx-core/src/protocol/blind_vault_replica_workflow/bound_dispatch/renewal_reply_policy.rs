@@ -36,7 +36,9 @@
 //! - This policy is source-private and intentionally not serializable.
 //! - Never expose lease timestamps, identifiers, or evidence in Debug output.
 //!
-//! Last Modified: v1.0.0-RenewalReplyPolicy - Initial exact-generation,
+//! Last Modified: v1.1.0-AttemptBoundCompletion - Bound completion capability
+//! to the exact work id and runtime attempt that produced its evidence.
+//! v1.0.0-RenewalReplyPolicy - Initial exact-generation,
 //! single-effect, live-lease renewal reply policy.
 //! ============================================
 
@@ -77,6 +79,8 @@ impl fmt::Debug for BlindVaultReplicaRenewalReplyOutcome {
 #[derive(Clone, PartialEq, Eq)]
 pub struct BlindVaultReplicaCompletedRenewal {
     evidence: BlindVaultReplicaActionEvidence,
+    work_id: BlindVaultReplicaWorkId,
+    attempt: u8,
 }
 
 impl BlindVaultReplicaCompletedRenewal {
@@ -84,6 +88,14 @@ impl BlindVaultReplicaCompletedRenewal {
         &self,
     ) -> &BlindVaultReplicaActionEvidence {
         &self.evidence
+    }
+
+    pub(in crate::protocol::blind_vault_replica_workflow) const fn matches_attempt(
+        &self,
+        work_id: BlindVaultReplicaWorkId,
+        attempt: u8,
+    ) -> bool {
+        self.work_id == work_id && self.attempt == attempt
     }
 }
 
@@ -215,7 +227,11 @@ where
         .map_err(BlindVaultReplicaRenewalReplyPolicyError::Workflow)?;
         self.state = BlindVaultReplicaRenewalReplyState::Complete;
         Ok(BlindVaultReplicaRenewalReplyOutcome::RenewalCompleted(
-            BlindVaultReplicaCompletedRenewal { evidence },
+            BlindVaultReplicaCompletedRenewal {
+                evidence,
+                work_id: context.work_id(),
+                attempt: context.attempt(),
+            },
         ))
     }
 }
