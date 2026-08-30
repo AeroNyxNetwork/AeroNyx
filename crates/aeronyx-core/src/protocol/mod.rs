@@ -89,6 +89,8 @@
 //!   Standardized privacy-safe failure mapping across terminal adapters.
 //! - [BLIND-VAULT-TERMINAL-FAILURE-DISTILLATION 2026-08-30 by Codex] Connected
 //!   detailed runtime errors to bounded source-private attempt outcomes.
+//! - [BLIND-VAULT-RETRY-BOUNDARY-DERIVATION 2026-08-30 by Codex] Added checked
+//!   retry-delay derivation without schedules for permanent outcomes.
 //!
 //! ## Main Functionality
 //!
@@ -126,6 +128,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.43.0-BlindVaultRetryBoundaryDerivation - Added overflow-safe retry-delay
+//! derivation for terminal runtime failure outcomes
+//! [BLIND-VAULT-RETRY-BOUNDARY-DERIVATION 2026-08-30 by Codex]
 //! v1.42.0-BlindVaultTerminalFailureDistillation - Added the standard detailed
 //! terminal-error to bounded-attempt-failure conversion
 //! [BLIND-VAULT-TERMINAL-FAILURE-DISTILLATION 2026-08-30 by Codex]

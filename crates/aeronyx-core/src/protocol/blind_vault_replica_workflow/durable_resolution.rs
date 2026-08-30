@@ -21,6 +21,7 @@
 //! - Unifies all policy-issued capabilities under one closed action enum.
 //! - Unifies verified completion and bounded failure under one resolution enum.
 //! - Distills detailed terminal runtime errors into bounded attempt failures.
+//! - Derives overflow-safe retry boundaries only for retryable failures.
 //! - Records bounded failure and retry disposition through the same boundary.
 //! - Resolves the exact journal and snapshot in one recovery-store operation.
 //! - Restores the prior in-memory state after sealing or persistence failure.
@@ -49,7 +50,9 @@
 //!   exact idempotent retry is required and is supported by the store contract.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.11.0-TerminalFailureDistillation - Added the standard
+//! Last Modified: v1.12.0-RetryBoundaryDerivation - Added checked retry-delay
+//! derivation that leaves permanent outcomes without invented schedules.
+//! v1.11.0-TerminalFailureDistillation - Added the standard
 //! detailed-runtime-error to bounded-attempt-failure conversion.
 //! v1.10.0-UnifiedAttemptResolution - Added one closed adapter
 //! outcome spanning verified completion and bounded failure.
@@ -200,6 +203,30 @@ impl BlindVaultReplicaAttemptFailure {
         VerificationError: BlindVaultReplicaTerminalVerificationFailure,
     {
         Self::new(failed_at_ms, retry_not_before_ms, error.dispatch_failure())
+    }
+
+    /// Distills one runtime error and safely derives its retry boundary.
+    ///
+    /// Retryable failures use checked source-time addition. Permanent failures
+    /// ignore the supplied delay and retain `failed_at_ms`, matching workflow
+    /// semantics without requiring adapters to invent an unused schedule.
+    pub fn from_terminal_error_with_retry_delay<TransportError, VerificationError>(
+        failed_at_ms: u64,
+        retry_delay_ms: u64,
+        error: &BlindVaultReplicaTerminalAttemptError<TransportError, VerificationError>,
+    ) -> Result<Self, BlindVaultReplicaWorkflowError>
+    where
+        VerificationError: BlindVaultReplicaTerminalVerificationFailure,
+    {
+        let failure = error.dispatch_failure();
+        let retry_not_before_ms = if failure.is_retryable() {
+            failed_at_ms
+                .checked_add(retry_delay_ms)
+                .ok_or(BlindVaultReplicaWorkflowError::TimestampOutOfRange)?
+        } else {
+            failed_at_ms
+        };
+        Ok(Self::new(failed_at_ms, retry_not_before_ms, failure))
     }
 
     /// Source time at which the attempt stopped awaiting evidence.
@@ -401,6 +428,25 @@ pub enum BlindVaultReplicaAttemptResolution {
     Completed(BlindVaultReplicaCompletedAction),
     /// Attempt ended with one bounded privacy-safe failure disposition.
     Failed(BlindVaultReplicaAttemptFailure),
+}
+
+impl BlindVaultReplicaAttemptResolution {
+    /// Creates a bounded failed resolution from one detailed runtime error.
+    pub fn failed_from_terminal_error<TransportError, VerificationError>(
+        failed_at_ms: u64,
+        retry_delay_ms: u64,
+        error: &BlindVaultReplicaTerminalAttemptError<TransportError, VerificationError>,
+    ) -> Result<Self, BlindVaultReplicaWorkflowError>
+    where
+        VerificationError: BlindVaultReplicaTerminalVerificationFailure,
+    {
+        BlindVaultReplicaAttemptFailure::from_terminal_error_with_retry_delay(
+            failed_at_ms,
+            retry_delay_ms,
+            error,
+        )
+        .map(Self::Failed)
+    }
 }
 
 impl fmt::Debug for BlindVaultReplicaAttemptResolution {

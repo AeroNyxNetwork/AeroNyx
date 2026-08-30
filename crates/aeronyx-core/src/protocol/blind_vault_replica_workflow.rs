@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.57.0-TerminalFailureDistillation - Connected detailed
+//! Last Modified: v1.58.0-RetryBoundaryDerivation - Added overflow-safe retry
+//! scheduling for detailed terminal runtime failures.
+//! v1.57.0-TerminalFailureDistillation - Connected detailed
 //! runtime failures to bounded durable attempt outcomes.
 //! v1.56.0-TerminalFailureClassification - Standardized coarse,
 //! privacy-safe failure mapping across terminal runtime adapters.
