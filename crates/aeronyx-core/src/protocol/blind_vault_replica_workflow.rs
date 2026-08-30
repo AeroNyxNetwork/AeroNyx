@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.61.0-OwnedResolutionBinding - Preserved exact opaque
+//! Last Modified: v1.62.0-ResolutionReconciliation - Added exact idempotent
+//! durability confirmation for ambiguous atomic attempt-resolution outcomes.
+//! v1.61.0-OwnedResolutionBinding - Preserved exact opaque
 //! journal resolution authority across the owned durable send path.
 //! v1.60.0-RecoverablePublication - Added owned durable send
 //! permits whose publication failures retain exact committed retry state.

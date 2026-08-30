@@ -24,6 +24,7 @@
 //! - Derives overflow-safe retry boundaries only for retryable failures.
 //! - Records bounded failure and retry disposition through the same boundary.
 //! - Resolves the exact journal and snapshot in one recovery-store operation.
+//! - Reconciles ambiguous store errors through exact idempotent confirmation.
 //! - Restores the prior in-memory state after sealing or persistence failure.
 //!
 //! ## Dependencies
@@ -46,11 +47,13 @@
 //! - New adapters must prefer attempt-bound typed completion entry points.
 //! - Never expose journal commitments, work identity, or targets in telemetry.
 //! - Store success is the only point at which attempt resolution is durable.
-//! - A failed store call may have an ambiguous host outcome; rollback plus an
-//!   exact idempotent retry is required and is supported by the store contract.
+//! - A failed store call retries the same exact local transition once; stores
+//!   must re-confirm file/database durability before idempotent success.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.13.0-OwnedResolutionBinding - Allowed owned durable send
+//! Last Modified: v1.14.0-AmbiguousResolutionReconciliation - Replayed the
+//! exact local transition once to confirm durability after ambiguous errors.
+//! v1.13.0-OwnedResolutionBinding - Allowed owned durable send
 //! permits to retain and derive the exact committed journal binding.
 //! v1.12.0-RetryBoundaryDerivation - Added checked retry-delay
 //! derivation that leaves permanent outcomes without invented schedules.
@@ -475,12 +478,16 @@ impl From<BlindVaultReplicaAttemptFailure> for BlindVaultReplicaAttemptResolutio
 }
 
 /// Fail-closed errors before one attempt resolution becomes durable.
-#[derive(Debug)]
 pub enum BlindVaultReplicaDurableResolutionError<StoreError> {
     /// Outcome transition or snapshot sealing violated workflow semantics.
     Workflow(BlindVaultReplicaWorkflowError),
     /// Durable store did not confirm exact atomic resolution.
     Store(StoreError),
+    /// Both resolution and its exact idempotent confirmation failed.
+    StoreOutcomeUnknown {
+        resolution: StoreError,
+        confirmation: StoreError,
+    },
     /// Binding and current in-memory attempt did not match exactly.
     StateMismatch,
     /// Typed completion was produced by another work item or attempt.
@@ -493,6 +500,9 @@ impl<StoreError> fmt::Display for BlindVaultReplicaDurableResolutionError<StoreE
             Self::Workflow(error) => fmt::Display::fmt(error, formatter),
             Self::Store(_) => {
                 formatter.write_str("blind vault replica durable resolution store failed")
+            }
+            Self::StoreOutcomeUnknown { .. } => {
+                formatter.write_str("blind vault replica durable resolution outcome is unknown")
             }
             Self::StateMismatch => {
                 formatter.write_str("blind vault replica resolution state does not match")
@@ -512,7 +522,22 @@ where
         match self {
             Self::Workflow(error) => Some(error),
             Self::Store(error) => Some(error),
+            Self::StoreOutcomeUnknown { resolution, .. } => Some(resolution),
             Self::StateMismatch | Self::CompletionBindingMismatch => None,
+        }
+    }
+}
+
+impl<StoreError> fmt::Debug for BlindVaultReplicaDurableResolutionError<StoreError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workflow(_) => formatter.write_str("Workflow(<redacted>)"),
+            Self::Store(_) => formatter.write_str("Store(<redacted>)"),
+            Self::StoreOutcomeUnknown { .. } => {
+                formatter.write_str("StoreOutcomeUnknown(<redacted>)")
+            }
+            Self::StateMismatch => formatter.write_str("StateMismatch"),
+            Self::CompletionBindingMismatch => formatter.write_str("CompletionBindingMismatch"),
         }
     }
 }
@@ -894,13 +919,29 @@ impl BlindVaultReplicaExecution {
             snapshot_sequence,
             sealed_snapshot.as_slice(),
         );
-        if let Err(error) = store.resolve_attempt(
+        if let Err(resolution_error) = store.resolve_attempt(
             &snapshot,
             binding.journal_sequence,
             binding.journal_commitment,
         ) {
-            restore_work_state(self, binding.work_id, previous_state)?;
-            return Err(BlindVaultReplicaDurableResolutionError::Store(error));
+            // [BLIND-VAULT-RESOLUTION-RECONCILIATION 2026-08-30 by Codex]
+            // Atomic replacement may have succeeded before a later directory
+            // synchronization error surfaced. Replaying the exact transition
+            // lets a compliant store either finish it or re-confirm durable
+            // file/database state before returning success.
+            if let Err(confirmation_error) = store.resolve_attempt(
+                &snapshot,
+                binding.journal_sequence,
+                binding.journal_commitment,
+            ) {
+                restore_work_state(self, binding.work_id, previous_state)?;
+                return Err(
+                    BlindVaultReplicaDurableResolutionError::StoreOutcomeUnknown {
+                        resolution: resolution_error,
+                        confirmation: confirmation_error,
+                    },
+                );
+            }
         }
 
         Ok(BlindVaultReplicaDurableResolution {

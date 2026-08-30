@@ -14,6 +14,7 @@
 //! - Commits snapshot and journal relation through explicit phase transitions.
 //! - Detects sequence rollback, workflow drift, and journal substitution.
 //! - Verifies checksums and sealed-record commitments before returning state.
+//! - Re-confirms durability before accepting an exact idempotent retry.
 //!
 //! ## Dependencies
 //! - `blind_vault_replica_recovery_io.rs`: restrictive atomic private I/O.
@@ -35,7 +36,9 @@
 //! - Never permit normal snapshots to cross unresolved attempt phases.
 //! - Never weaken exact work/attempt/sequence/commitment comparisons.
 //!
-//! Last Modified: v1.2.0-PreparedAbort - Added idempotent exact cleanup for a
+//! Last Modified: v1.3.0-IdempotentDurabilityConfirmation - Re-synchronized
+//! the current file and directory before exact retry success.
+//! v1.2.0-PreparedAbort - Added idempotent exact cleanup for a
 //! journal proven not to have reached committed dispatch state.
 //! v1.1.0-ExactCrashRetry - Made every durable transition
 //! idempotent only for the exact same sequence and sealed commitment.
@@ -190,6 +193,7 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
                     return Err(BlindVaultReplicaRecoveryStoreError::InvalidTransition);
                 }
                 if current.snapshot_matches(snapshot) {
+                    self.file.confirm_current_durable()?;
                     return Ok(());
                 }
                 current.require_new_snapshot_sequence(snapshot.snapshot_sequence())?;
@@ -214,6 +218,7 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
         if current.phase == StoredAttemptPhaseV1::Prepared
             && current.attempt_matches_prepared(prepared)
         {
+            self.file.confirm_current_durable()?;
             return Ok(());
         }
         if current.phase != StoredAttemptPhaseV1::Resolved || current.attempt.is_some() {
@@ -248,6 +253,7 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
             && current.attempt_matches_committed(committed)
             && current.snapshot_matches(committed.snapshot())
         {
+            self.file.confirm_current_durable()?;
             return Ok(());
         }
         current.require_new_snapshot_sequence(committed.snapshot().snapshot_sequence())?;
@@ -286,6 +292,7 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
                     journal_commitment,
                 })
         {
+            self.file.confirm_current_durable()?;
             return Ok(());
         }
         let attempt = current
@@ -329,6 +336,7 @@ impl BlindVaultReplicaRecoveryStore for FileBlindVaultReplicaRecoveryStore {
                 })
             && current.snapshot_matches(snapshot)
         {
+            self.file.confirm_current_durable()?;
             return Ok(());
         }
         current.require_new_snapshot_sequence(snapshot.snapshot_sequence())?;

@@ -30,13 +30,17 @@
 //!
 //! ## Important Note For The Next Developer
 //! - Implementations must never return success before durable synchronization.
+//! - Exact idempotent retries must re-confirm underlying durability; observing
+//!   matching bytes alone is insufficient after a prior synchronization error.
 //! - A filesystem adapter must fsync file and parent directory after rename.
 //! - A database adapter must use one durable transaction for every method.
 //! - High-water state needs stronger rollback protection than mutable records.
 //! - Never log sealed bytes, workflow identity, target identity, or work ids.
 //! - Partial, corrupt, reordered, or unsupported state must fail closed.
 //!
-//! Last Modified: v1.1.0-PreparedAbort - Added exact safe cleanup for journals
+//! Last Modified: v1.2.0-IdempotentDurabilityConfirmation - Required exact
+//! retries to re-confirm host durability before returning success.
+//! v1.1.0-PreparedAbort - Added exact safe cleanup for journals
 //! proven to have stopped before the post-dispatch snapshot commit.
 //! v1.0.0-RecoveryStoreContract - Initial storage-neutral
 //! atomic persistence contract for restart-safe replica execution.

@@ -15,6 +15,7 @@
 //! - Requires directory and private files to belong to the effective user.
 //! - Reads only bounded regular `0600` files without following symlinks.
 //! - Publishes a temp file through file fsync, rename, and directory fsync.
+//! - Re-confirms current file and directory durability after ambiguous errors.
 //! - Removes only adapter-owned unfinished temp files after acquiring the lock.
 //!
 //! ## Dependencies
@@ -37,7 +38,9 @@
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.3.0-ComponentWalk - Rejected symlinks in every configured
+//! Last Modified: v1.4.0-DurabilityConfirmation - Added descriptor-pinned file
+//! and directory synchronization for exact idempotent transition retries.
+//! v1.3.0-ComponentWalk - Rejected symlinks in every configured
 //! path component through descriptor-relative creation and traversal.
 //! v1.2.0-OwnerFence - Rejected recovery directories and files
 //! not owned by the process effective user.
@@ -193,6 +196,20 @@ impl PrivateAtomicRecoveryFile {
             );
         }
         result
+    }
+
+    /// Re-confirms the visible generation across an ambiguous prior result.
+    ///
+    /// [BLIND-VAULT-RECOVERY-DURABILITY-CONFIRMATION 2026-08-30 by Codex]
+    /// A matching file after `renameat` does not prove its directory entry
+    /// survived power loss. Exact idempotent retries synchronize both the
+    /// validated state file and the already pinned containing directory.
+    pub(crate) fn confirm_current_durable(&self) -> Result<(), PrivateRecoveryIoError> {
+        let state =
+            open_private_regular_file_at(&self.directory, STATE_FILE_NAME, false, false, false)?;
+        state.sync_all()?;
+        self.directory.sync_all()?;
+        Ok(())
     }
 
     fn unique_temp_name(&self) -> String {
