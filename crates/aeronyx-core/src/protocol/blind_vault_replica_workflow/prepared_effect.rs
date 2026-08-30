@@ -14,7 +14,8 @@
 //! - Validates compound effects against the immutable action contract.
 //! - Binds the ordered set to workflow, work item, attempt, and evidence window.
 //! - Matches send-time bytes without retaining plaintext or ciphertext payloads.
-//! - Redacts commitments from Debug output and zeroizes them on drop.
+//! - Redacts commitments and source timing from Debug output.
+//! - Zeroizes payload commitments on drop.
 //!
 //! ## Dependencies
 //! - `execution.rs`: side-effect-free attempt readiness.
@@ -37,7 +38,9 @@
 //! - A network adapter must match each payload immediately before sending it.
 //! - Do not weaken ordered contract validation into an unordered purpose set.
 //!
-//! Last Modified: v1.0.0-PreparedTerminalEffects - Initial exact payload-blind
+//! Last Modified: v1.1.0-PrivacySafeEffectDiagnostics - Redacted exact source
+//! dispatch and evidence-window timing from standard diagnostics.
+//! v1.0.0-PreparedTerminalEffects - Initial exact payload-blind
 //! binding and compound-action stage validation.
 //! ============================================
 
@@ -202,11 +205,13 @@ impl BlindVaultReplicaPreparedEffectSet {
 
 impl fmt::Debug for BlindVaultReplicaPreparedEffectSet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // [BLIND-VAULT-EFFECT-DIAGNOSTICS 2026-08-30 by Codex] Exact source
+        // timing is authority for state transitions, not telemetry metadata.
         formatter
             .debug_struct("BlindVaultReplicaPreparedEffectSet")
             .field("attempt", &self.attempt)
-            .field("planned_dispatch_at_ms", &self.planned_dispatch_at_ms)
-            .field("evidence_deadline_ms", &self.evidence_deadline_ms)
+            .field("planned_dispatch_at_ms", &"<redacted>")
+            .field("evidence_deadline_ms", &"<redacted>")
             .field("effect_count", &self.effects.len())
             .field("commitment", &"[REDACTED]")
             .finish_non_exhaustive()

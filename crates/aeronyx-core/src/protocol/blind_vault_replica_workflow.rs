@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.68.0-PrivacySafeRecoveryDiagnostics - Redacted recovery
+//! Last Modified: v1.69.0-PrivacySafeStateDiagnostics - Redacted absolute
+//! source timing from work-state and dispatch-readiness diagnostics.
+//! v1.68.0-PrivacySafeRecoveryDiagnostics - Redacted recovery
 //! task and durable-resolution identities from standard diagnostics.
 //! v1.67.0-PrivacySafeActionDiagnostics - Standardized redacted
 //! clock and private policy diagnostics across replica action state machines.
@@ -460,7 +462,7 @@ impl From<BlindVaultTerminalFailureCode> for BlindVaultReplicaDispatchFailure {
 }
 
 /// Monotonic state of one immutable planner action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BlindVaultReplicaWorkState {
     /// No network work is permitted until the source explicitly authorizes it.
     AwaitingAuthorization,
@@ -495,6 +497,59 @@ pub enum BlindVaultReplicaWorkState {
     },
     /// The source explicitly cancelled the immutable action.
     Cancelled { cancelled_at_ms: u64 },
+}
+
+// [BLIND-VAULT-WORK-STATE-DIAGNOSTICS 2026-08-30 by Codex] Absolute source
+// times can correlate an otherwise blind operation across process and host
+// logs. Diagnostics retain the transition, attempt, and coarse failure only.
+impl fmt::Debug for BlindVaultReplicaWorkState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AwaitingAuthorization => formatter.write_str("AwaitingAuthorization"),
+            Self::Authorized { .. } => formatter
+                .debug_struct("Authorized")
+                .field("authorized_at_ms", &"<redacted>")
+                .finish(),
+            Self::AwaitingEvidence { attempt, .. } => formatter
+                .debug_struct("AwaitingEvidence")
+                .field("attempt", attempt)
+                .field("source_timing", &"<redacted>")
+                .finish(),
+            Self::EvidenceAccepted { attempt, .. } => formatter
+                .debug_struct("EvidenceAccepted")
+                .field("attempt", attempt)
+                .field("verified_at_ms", &"<redacted>")
+                .finish(),
+            Self::RetryableFailure {
+                attempt, failure, ..
+            } => formatter
+                .debug_struct("RetryableFailure")
+                .field("attempt", attempt)
+                .field("source_timing", &"<redacted>")
+                .field("failure", failure)
+                .finish(),
+            Self::PermanentFailure {
+                attempt, failure, ..
+            } => formatter
+                .debug_struct("PermanentFailure")
+                .field("attempt", attempt)
+                .field("failed_at_ms", &"<redacted>")
+                .field("failure", failure)
+                .finish(),
+            Self::Exhausted {
+                attempt, failure, ..
+            } => formatter
+                .debug_struct("Exhausted")
+                .field("attempt", attempt)
+                .field("failed_at_ms", &"<redacted>")
+                .field("failure", failure)
+                .finish(),
+            Self::Cancelled { .. } => formatter
+                .debug_struct("Cancelled")
+                .field("cancelled_at_ms", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 fn work_state_name(state: BlindVaultReplicaWorkState) -> &'static str {
@@ -583,7 +638,7 @@ pub enum BlindVaultReplicaExecutionPhase {
 /// [BLIND-VAULT-DISPATCH-READINESS 2026-08-29 by Codex] Product and agent
 /// adapters can render or schedule work without invoking a mutating transition
 /// merely to discover backoff, dependency, target, or capacity state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BlindVaultReplicaDispatchReadiness {
     /// The exact immutable action may be dispatched now.
     Ready {
@@ -604,6 +659,37 @@ pub enum BlindVaultReplicaDispatchReadiness {
     CapacityReached { in_flight: u8, maximum: u8 },
     /// This work item is complete, cancelled, or permanently blocked.
     TerminalState,
+}
+
+// [BLIND-VAULT-DISPATCH-READINESS-DIAGNOSTICS 2026-08-30 by Codex] Preserve
+// scheduling disposition without publishing exact deadline or backoff times.
+impl fmt::Debug for BlindVaultReplicaDispatchReadiness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ready { attempt, .. } => formatter
+                .debug_struct("Ready")
+                .field("attempt", attempt)
+                .field("evidence_deadline_ms", &"<redacted>")
+                .finish(),
+            Self::AwaitingAuthorization => formatter.write_str("AwaitingAuthorization"),
+            Self::RetryBackoff { .. } => formatter
+                .debug_struct("RetryBackoff")
+                .field("retry_not_before_ms", &"<redacted>")
+                .finish(),
+            Self::AlreadyInFlight { .. } => formatter
+                .debug_struct("AlreadyInFlight")
+                .field("evidence_deadline_ms", &"<redacted>")
+                .finish(),
+            Self::TargetInFlight => formatter.write_str("TargetInFlight"),
+            Self::TargetDependencyPending => formatter.write_str("TargetDependencyPending"),
+            Self::CapacityReached { in_flight, maximum } => formatter
+                .debug_struct("CapacityReached")
+                .field("in_flight", in_flight)
+                .field("maximum", maximum)
+                .finish(),
+            Self::TerminalState => formatter.write_str("TerminalState"),
+        }
+    }
 }
 
 /// Purpose-level network work required by one source-owned replica action.
@@ -718,13 +804,16 @@ pub struct BlindVaultVerifiedProvisionedReplica {
     pub(super) observed_at_ms: u64,
 }
 
+// [BLIND-VAULT-EVIDENCE-DIAGNOSTICS 2026-08-30 by Codex] Verified lifecycle
+// timestamps stay available through typed policy logic, but standard Debug
+// must not turn them into correlation handles alongside terminal logs.
 impl std::fmt::Debug for BlindVaultVerifiedProvisionedReplica {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BlindVaultVerifiedProvisionedReplica")
-            .field("lease_expires_at_ms", &self.lease_expires_at_ms)
-            .field("accepted_at_ms", &self.accepted_at_ms)
-            .field("observed_at_ms", &self.observed_at_ms)
+            .field("lease_expires_at_ms", &"<redacted>")
+            .field("accepted_at_ms", &"<redacted>")
+            .field("observed_at_ms", &"<redacted>")
             .field("node_id", &"[REDACTED]")
             .field("lease_id", &"[REDACTED]")
             .finish()
@@ -749,8 +838,8 @@ impl std::fmt::Debug for BlindVaultVerifiedReplicaAdmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BlindVaultVerifiedReplicaAdmission")
-            .field("lease_expires_at_ms", &self.lease_expires_at_ms)
-            .field("accepted_at_ms", &self.accepted_at_ms)
+            .field("lease_expires_at_ms", &"<redacted>")
+            .field("accepted_at_ms", &"<redacted>")
             .field("node_id", &"[REDACTED]")
             .field("lease_id", &"[REDACTED]")
             .finish()
@@ -799,7 +888,7 @@ impl std::fmt::Debug for BlindVaultVerifiedRetiredReplica {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BlindVaultVerifiedRetiredReplica")
-            .field("retired_at_ms", &self.retired_at_ms)
+            .field("retired_at_ms", &"<redacted>")
             .field("node_id", &"[REDACTED]")
             .field("lease_id", &"[REDACTED]")
             .finish()
@@ -833,8 +922,8 @@ impl std::fmt::Debug for BlindVaultReplacementRetirementPermit {
         formatter
             .debug_struct("BlindVaultReplacementRetirementPermit")
             .field("attempt", &self.attempt)
-            .field("replacement_expires_at_ms", &self.replacement_expires_at_ms)
-            .field("authorized_at_ms", &self.authorized_at_ms)
+            .field("replacement_expires_at_ms", &"<redacted>")
+            .field("authorized_at_ms", &"<redacted>")
             .field("work_id", &"[REDACTED]")
             .field("replaced_node_id", &"[REDACTED]")
             .field("replaced_lease_id", &"[REDACTED]")
