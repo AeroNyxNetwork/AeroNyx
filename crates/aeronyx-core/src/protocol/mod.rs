@@ -120,6 +120,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.39.0-BlindVaultReplyOutcomeConversion - Added standard conversion from
+//! action reply outcomes into unified typed completion
+//! [BLIND-VAULT-REPLY-OUTCOME-CONVERSION 2026-08-30 by Codex]
 //! v1.38.0-BlindVaultCompletionBindingGate - Rejected typed capabilities from
 //! any other work id or attempt at the durable boundary
 //! [BLIND-VAULT-COMPLETION-BINDING-GATE 2026-08-30 by Codex]

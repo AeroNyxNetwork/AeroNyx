@@ -47,7 +47,9 @@
 //!   exact idempotent retry is required and is supported by the store contract.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.8.0-CompletionBindingGate - Required every typed
+//! Last Modified: v1.9.0-ReplyOutcomeConversion - Added idiomatic terminal
+//! extraction from every action-specific reply outcome.
+//! v1.8.0-CompletionBindingGate - Required every typed
 //! completion to match the exact committed work id and attempt before mutation.
 //! v1.7.0-UnifiedCompletedAction - Added one closed capability
 //! enum and durable entry point spanning every planner action.
@@ -77,9 +79,12 @@ use super::{
     BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaCompletedReconciliation,
     BlindVaultReplicaCompletedRenewal, BlindVaultReplicaCompletedReplacement,
     BlindVaultReplicaDispatchFailure, BlindVaultReplicaDurableAttemptDispatch,
-    BlindVaultReplicaExecution, BlindVaultReplicaPreparedAttemptJournal,
-    BlindVaultReplicaRecoveryStore, BlindVaultReplicaSnapshotRecord, BlindVaultReplicaWorkId,
-    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
+    BlindVaultReplicaExecution, BlindVaultReplicaObservationReplyOutcome,
+    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaProvisioningReplyOutcome,
+    BlindVaultReplicaReconcileReplyOutcome, BlindVaultReplicaRecoveryStore,
+    BlindVaultReplicaRenewalReplyOutcome, BlindVaultReplicaReplacementReplyOutcome,
+    BlindVaultReplicaSnapshotRecord, BlindVaultReplicaWorkId, BlindVaultReplicaWorkState,
+    BlindVaultReplicaWorkflowError,
 };
 use crate::crypto::keys::IdentityKeyPair;
 
@@ -303,6 +308,59 @@ impl From<BlindVaultReplicaCompletedReplacement> for BlindVaultReplicaCompletedA
 impl From<BlindVaultReplicaCompletedProvisioning> for BlindVaultReplicaCompletedAction {
     fn from(completed: BlindVaultReplicaCompletedProvisioning) -> Self {
         Self::Provisioning(completed)
+    }
+}
+
+impl From<BlindVaultReplicaRenewalReplyOutcome> for BlindVaultReplicaCompletedAction {
+    fn from(outcome: BlindVaultReplicaRenewalReplyOutcome) -> Self {
+        let BlindVaultReplicaRenewalReplyOutcome::RenewalCompleted(completed) = outcome;
+        Self::Renewal(completed)
+    }
+}
+
+impl From<BlindVaultReplicaObservationReplyOutcome> for BlindVaultReplicaCompletedAction {
+    fn from(outcome: BlindVaultReplicaObservationReplyOutcome) -> Self {
+        let BlindVaultReplicaObservationReplyOutcome::ObservationCompleted(completed) = outcome;
+        Self::Observation(completed)
+    }
+}
+
+impl TryFrom<BlindVaultReplicaReconcileReplyOutcome> for BlindVaultReplicaCompletedAction {
+    type Error = BlindVaultReplicaReconcileReplyOutcome;
+
+    fn try_from(outcome: BlindVaultReplicaReconcileReplyOutcome) -> Result<Self, Self::Error> {
+        match outcome {
+            BlindVaultReplicaReconcileReplyOutcome::ReconciliationCompleted(completed) => {
+                Ok(Self::Reconciliation(completed))
+            }
+            incomplete => Err(incomplete),
+        }
+    }
+}
+
+impl TryFrom<BlindVaultReplicaReplacementReplyOutcome> for BlindVaultReplicaCompletedAction {
+    type Error = BlindVaultReplicaReplacementReplyOutcome;
+
+    fn try_from(outcome: BlindVaultReplicaReplacementReplyOutcome) -> Result<Self, Self::Error> {
+        match outcome {
+            BlindVaultReplicaReplacementReplyOutcome::ReplacementCompleted(completed) => {
+                Ok(Self::Replacement(completed))
+            }
+            incomplete => Err(incomplete),
+        }
+    }
+}
+
+impl TryFrom<BlindVaultReplicaProvisioningReplyOutcome> for BlindVaultReplicaCompletedAction {
+    type Error = BlindVaultReplicaProvisioningReplyOutcome;
+
+    fn try_from(outcome: BlindVaultReplicaProvisioningReplyOutcome) -> Result<Self, Self::Error> {
+        match outcome {
+            BlindVaultReplicaProvisioningReplyOutcome::ProvisioningCompleted(completed) => {
+                Ok(Self::Provisioning(completed))
+            }
+            incomplete => Err(incomplete),
+        }
     }
 }
 
