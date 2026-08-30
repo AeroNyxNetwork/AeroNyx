@@ -67,6 +67,8 @@
 //!   request-bound replies into a fail-closed replacement lifecycle policy.
 //! - [BLIND-VAULT-DURABLE-REPLACEMENT 2026-08-29 by Codex] Added a typed
 //!   durable path for complete policy-issued replacement capabilities.
+//! - [BLIND-VAULT-REPLACEMENT-PERMIT-COMPOSITION 2026-08-30 by Codex] Bound
+//!   policy authorization and runtime retirement to one workflow permit.
 //!
 //! ## Main Functionality
 //!
@@ -104,6 +106,8 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.27.0-BlindVaultReplacementPermitComposition - Issued and installed one
+//! exact active-workflow permit for policy and runtime consumption
 //! v1.26.0-BlindVaultDurableReplacement - Added a typed atomic resolution API
 //! for completed replacement-policy evidence
 //! v1.25.0-BlindVaultReplacementReplyPolicy - Added a reusable source-private

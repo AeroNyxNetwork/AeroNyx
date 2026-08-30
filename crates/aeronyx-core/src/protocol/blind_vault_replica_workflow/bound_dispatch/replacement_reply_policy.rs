@@ -32,11 +32,14 @@
 //!
 //! ## Important Note For The Next Developer
 //! - This state machine is source-private and intentionally not serializable.
-//! - Durable replay authority remains in the bound attempt continuation.
+//! - Durable recovery replays the complete idempotent effect sequence from
+//!   stage zero; recreate this policy instead of checkpointing partial state.
 //! - Never add a transition that accepts retirement before verified inventory.
 //! - Never expose request, receipt, manifest, node, or lease values in Debug.
 //!
-//! Last Modified: v1.1.0-CompletedReplacementCapability - Restricted durable
+//! Last Modified: v1.2.0-WorkflowPermitComposition - Issued and installed one
+//! exact active-execution permit for both policy and runtime use.
+//! v1.1.0-CompletedReplacementCapability - Restricted durable
 //! replacement completion to evidence emitted by the full policy state machine.
 //! v1.0.0-ReplacementReplyPolicy - Initial typed replacement
 //! reply state machine and workflow-permit composition.
@@ -46,8 +49,9 @@ use std::{error::Error, fmt};
 
 use super::super::{
     BlindVaultReplacementRetirementPermit, BlindVaultReplicaActionEvidence,
-    BlindVaultReplicaWorkId, BlindVaultReplicaWorkflowError, BlindVaultVerifiedProvisionedReplica,
-    BlindVaultVerifiedReplicaAdmission, BlindVaultVerifiedRetiredReplica,
+    BlindVaultReplicaExecution, BlindVaultReplicaWorkId, BlindVaultReplicaWorkflowError,
+    BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedReplicaAdmission,
+    BlindVaultVerifiedRetiredReplica,
 };
 use super::request_bound_verifier::{
     BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaRequestBoundReply,
@@ -246,6 +250,35 @@ impl<Clock> BlindVaultReplicaReplacementReplyPolicy<Clock> {
         self.state =
             BlindVaultReplicaReplacementReplyState::RetirementAuthorized { binding, permit };
         Ok(())
+    }
+
+    /// Issues and installs one exact active-workflow retirement permit.
+    ///
+    /// [BLIND-VAULT-REPLACEMENT-PERMIT-COMPOSITION 2026-08-30 by Codex]
+    /// The returned copy is the same capability retained by this policy and
+    /// must be passed to the runtime's permit-gated retirement send. Callers
+    /// no longer independently select work or replacement identity.
+    pub fn authorize_retirement_from_execution(
+        &mut self,
+        execution: &BlindVaultReplicaExecution,
+        authorized_at_ms: u64,
+    ) -> Result<BlindVaultReplacementRetirementPermit, BlindVaultReplicaReplacementPermitIssueError>
+    {
+        let BlindVaultReplicaReplacementReplyState::ReplacementVerified {
+            binding,
+            replacement,
+        } = self.state
+        else {
+            return Err(BlindVaultReplicaReplacementPermitIssueError::Authorization(
+                BlindVaultReplicaReplacementAuthorizationError::StageMismatch,
+            ));
+        };
+        let permit = execution
+            .replacement_retirement_permit(binding.work_id, &replacement, authorized_at_ms)
+            .map_err(BlindVaultReplicaReplacementPermitIssueError::Workflow)?;
+        self.authorize_retirement(permit)
+            .map_err(BlindVaultReplicaReplacementPermitIssueError::Authorization)?;
+        Ok(permit)
     }
 
     /// Whether verified replacement and retirement evidence are complete.
@@ -460,6 +493,33 @@ impl fmt::Display for BlindVaultReplicaReplacementAuthorizationError {
 }
 
 impl Error for BlindVaultReplicaReplacementAuthorizationError {}
+
+/// Active-workflow permit issuance or local policy installation failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlindVaultReplicaReplacementPermitIssueError {
+    /// Active workflow rejected permit issuance or event time.
+    Workflow(BlindVaultReplicaWorkflowError),
+    /// Verified policy state rejected the issued capability.
+    Authorization(BlindVaultReplicaReplacementAuthorizationError),
+}
+
+impl fmt::Display for BlindVaultReplicaReplacementPermitIssueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workflow(error) => fmt::Display::fmt(error, formatter),
+            Self::Authorization(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl Error for BlindVaultReplicaReplacementPermitIssueError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Workflow(error) => Some(error),
+            Self::Authorization(error) => Some(error),
+        }
+    }
+}
 
 /// Fail-closed private replacement reply or lifecycle transition failure.
 #[derive(Debug)]

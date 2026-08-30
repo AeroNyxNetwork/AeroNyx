@@ -77,8 +77,8 @@ pub use onion_transport::{
 };
 pub use replacement_reply_policy::{
     BlindVaultReplicaCompletedReplacement, BlindVaultReplicaReplacementAuthorizationError,
-    BlindVaultReplicaReplacementReplyOutcome, BlindVaultReplicaReplacementReplyPolicy,
-    BlindVaultReplicaReplacementReplyPolicyBuildError,
+    BlindVaultReplicaReplacementPermitIssueError, BlindVaultReplicaReplacementReplyOutcome,
+    BlindVaultReplicaReplacementReplyPolicy, BlindVaultReplicaReplacementReplyPolicyBuildError,
     BlindVaultReplicaReplacementReplyPolicyError, BlindVaultReplicaVerificationClock,
 };
 pub use request_bound_verifier::{

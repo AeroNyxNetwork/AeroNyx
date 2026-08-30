@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.35.0-DurableReplacementCompletion - Added a typed durable
+//! Last Modified: v1.36.0-ReplacementPermitComposition - Bound policy and
+//! runtime retirement to one active-execution-issued permit capability.
+//! v1.35.0-DurableReplacementCompletion - Added a typed durable
 //! path accepting only an unforgeable completed-policy capability.
 //! v1.34.0-ReplacementReplyPolicy - Composed request-bound
 //! replies into one fail-closed replacement lifecycle state machine.
@@ -176,8 +178,9 @@ pub use bound_dispatch::{
     BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
     BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaPersistedBoundAttemptJournal,
     BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaPrivateReplyPolicy,
-    BlindVaultReplicaReplacementAuthorizationError, BlindVaultReplicaReplacementReplyOutcome,
-    BlindVaultReplicaReplacementReplyPolicy, BlindVaultReplicaReplacementReplyPolicyBuildError,
+    BlindVaultReplicaReplacementAuthorizationError, BlindVaultReplicaReplacementPermitIssueError,
+    BlindVaultReplicaReplacementReplyOutcome, BlindVaultReplicaReplacementReplyPolicy,
+    BlindVaultReplicaReplacementReplyPolicyBuildError,
     BlindVaultReplicaReplacementReplyPolicyError, BlindVaultReplicaRequestBoundReply,
     BlindVaultReplicaRequestBoundReplyError, BlindVaultReplicaRequestBoundReplyVerifier,
     BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalAttemptRuntime,
