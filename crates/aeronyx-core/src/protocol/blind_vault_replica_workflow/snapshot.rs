@@ -21,7 +21,9 @@
 //! - Keep the accepted sequence high-water mark in separately protected state.
 //! - Authentication failure and malformed state must remain fail-closed.
 //!
-//! Last Modified: v1.2.0-SharedLocalSealing - Reused the identity-bound local
+//! Last Modified: v1.3.0-NonDiagnosticPlaintext - Removed diagnostic formatting
+//! from every plaintext snapshot codec body.
+//! v1.2.0-SharedLocalSealing - Reused the identity-bound local
 //! AEAD primitive without changing the V1 snapshot bytes or error contract.
 //! v1.1.0-RollbackGuard - Added authenticated monotonic restore
 //! sequencing and explicit sensitive-buffer cleanup on every handled path.
@@ -49,7 +51,10 @@ const RESTART_SNAPSHOT_VERSION_V1: u16 = 1;
 const RESTART_SNAPSHOT_KEY_SALT: &[u8] = b"AeroNyx-BlindVault-Replica-Restart-Key-v1";
 const RESTART_SNAPSHOT_KEY_INFO: &[u8] = b"AeroNyx-BlindVault-Replica-Restart-State-v1";
 
-#[derive(Debug, Serialize, Deserialize)]
+// [BLIND-VAULT-SNAPSHOT-NONDIAGNOSTIC-PLAINTEXT 2026-08-30 by Codex] These
+// codec-only values exist only between authenticated memory and local AEAD.
+// They must not acquire a formatting path into logs or error context.
+#[derive(Serialize, Deserialize)]
 struct RestartSnapshotBodyV1 {
     snapshot_sequence: u64,
     workflow_id: [u8; 16],
@@ -65,7 +70,7 @@ struct RestartSnapshotBodyV1 {
     items: Vec<WorkItemV1>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct WorkItemV1 {
     sequence: u16,
     #[serde(with = "ActionV1")]
@@ -74,7 +79,7 @@ struct WorkItemV1 {
     state: BlindVaultReplicaWorkState,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(remote = "BlindVaultReplicaPlanHealth")]
 enum PlanHealthV1 {
     Healthy,
@@ -83,7 +88,7 @@ enum PlanHealthV1 {
     QuorumUnavailable,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(remote = "BlindVaultReplicaAction")]
 enum ActionV1 {
     RenewLease {
@@ -114,7 +119,7 @@ enum ActionV1 {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(remote = "BlindVaultReplicaDispatchFailure")]
 enum DispatchFailureV1 {
     TransportUnavailable,
@@ -128,7 +133,7 @@ enum DispatchFailureV1 {
     InlineResponseUnsupported,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(remote = "BlindVaultReplicaWorkState")]
 enum WorkStateV1 {
     AwaitingAuthorization,
