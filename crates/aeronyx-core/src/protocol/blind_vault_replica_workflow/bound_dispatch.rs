@@ -12,6 +12,7 @@
 //! ## Main Functionality
 //! - Wraps the generic prepared journal with exact effect identity.
 //! - Preserves the binding through prepared and committed store operations.
+//! - Retains committed state across ambiguous store publication failures.
 //! - Produces an ordered send sequence only after both records are durable.
 //! - Gates old-lease retirement with workflow and terminal authorization.
 //! - Composes replacement replies into one source-private lifecycle policy.
@@ -36,7 +37,9 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.8.0-TerminalFailureClassification - Exported the shared
+//! Last Modified: v1.9.0-RecoverablePublication - Added consuming publication
+//! permits whose errors retain the exact committed state for idempotent retry.
+//! v1.8.0-TerminalFailureClassification - Exported the shared
 //! bounded runtime failure classification boundary.
 //! v1.7.0-RenewalReplyPolicy - Added exact lease-generation
 //! compare-and-swap verification for single-effect renewal attempts.
@@ -64,9 +67,9 @@ use zeroize::Zeroize;
 use super::{
     BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaCommittedAttemptDispatch,
     BlindVaultReplicaDurableAttemptDispatch, BlindVaultReplicaDurableDispatchError,
-    BlindVaultReplicaExecution, BlindVaultReplicaPersistedAttemptJournal,
-    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaPreparedEffectSet,
-    BlindVaultReplicaRecoveryStore, BlindVaultReplicaWorkId,
+    BlindVaultReplicaExecution, BlindVaultReplicaOwnedDurableAttemptDispatch,
+    BlindVaultReplicaPersistedAttemptJournal, BlindVaultReplicaPreparedAttemptJournal,
+    BlindVaultReplicaPreparedEffectSet, BlindVaultReplicaRecoveryStore, BlindVaultReplicaWorkId,
 };
 use crate::crypto::keys::IdentityKeyPair;
 
@@ -140,6 +143,7 @@ pub struct BlindVaultReplicaPersistedBoundAttemptJournal<'a> {
 }
 
 /// Bound post-dispatch workflow state plus sealed restart snapshot.
+#[must_use = "committed bound dispatch must remain owned until publication succeeds"]
 pub struct BlindVaultReplicaCommittedBoundAttemptDispatch<'a> {
     committed: BlindVaultReplicaCommittedAttemptDispatch<'a>,
     prepared: &'a BlindVaultReplicaPreparedBoundAttemptJournal,
@@ -149,6 +153,31 @@ pub struct BlindVaultReplicaCommittedBoundAttemptDispatch<'a> {
 pub struct BlindVaultReplicaDurableBoundAttemptDispatch<'a, 'b> {
     durable: BlindVaultReplicaDurableAttemptDispatch<'a, 'b>,
     prepared: &'a BlindVaultReplicaPreparedBoundAttemptJournal,
+}
+
+/// Owned final durability marker for one exact bound terminal effect set.
+///
+/// [BLIND-VAULT-BOUND-RECOVERABLE-PUBLICATION 2026-08-30 by Codex] This
+/// marker carries only source-private correlation and a commitment after the
+/// sealed snapshot has been accepted. It can safely outlive the publication
+/// call without borrowing the committed recovery payload.
+#[must_use = "durable bound dispatch authority must reach an exact send path"]
+pub struct BlindVaultReplicaOwnedDurableBoundAttemptDispatch {
+    durable: BlindVaultReplicaOwnedDurableAttemptDispatch,
+    planned_dispatch_at_ms: u64,
+    evidence_deadline_ms: u64,
+    effect_set_commitment: [u8; 32],
+}
+
+/// Recoverable failure to publish one committed bound dispatch generation.
+///
+/// The error owns the complete marker needed to retry the same journal-bound
+/// snapshot. Callers may inspect the adapter error without gaining access to
+/// private continuation state or sealed recovery bytes.
+#[must_use = "publication failure retains committed state and must be retried or recovered"]
+pub struct BlindVaultReplicaBoundCommitPublicationError<'a, StoreError> {
+    committed: BlindVaultReplicaCommittedBoundAttemptDispatch<'a>,
+    source: StoreError,
 }
 
 impl BlindVaultReplicaPreparedBoundAttemptJournal {
@@ -290,6 +319,44 @@ impl<'a> BlindVaultReplicaCommittedBoundAttemptDispatch<'a> {
             prepared: self.prepared,
         })
     }
+
+    /// Consumes this bound marker into owned authority or a retryable error.
+    ///
+    /// New orchestration should use this path so an ambiguous store error
+    /// cannot discard the only in-process copy of the committed snapshot.
+    pub fn publish_for_network_send<Store>(
+        self,
+        store: &mut Store,
+    ) -> Result<
+        BlindVaultReplicaOwnedDurableBoundAttemptDispatch,
+        BlindVaultReplicaBoundCommitPublicationError<'a, Store::Error>,
+    >
+    where
+        Store: BlindVaultReplicaRecoveryStore,
+    {
+        let Self {
+            committed,
+            prepared,
+        } = self;
+        match committed.publish_for_network_send(store) {
+            Ok(durable) => Ok(BlindVaultReplicaOwnedDurableBoundAttemptDispatch {
+                durable,
+                planned_dispatch_at_ms: prepared.planned_dispatch_at_ms(),
+                evidence_deadline_ms: prepared.evidence_deadline_ms(),
+                effect_set_commitment: prepared.effect_set_commitment,
+            }),
+            Err(error) => {
+                let (committed, source) = error.into_parts();
+                Err(BlindVaultReplicaBoundCommitPublicationError {
+                    committed: Self {
+                        committed,
+                        prepared,
+                    },
+                    source,
+                })
+            }
+        }
+    }
 }
 
 impl BlindVaultReplicaDurableBoundAttemptDispatch<'_, '_> {
@@ -335,6 +402,108 @@ impl BlindVaultReplicaDurableBoundAttemptDispatch<'_, '_> {
             );
         BlindVaultReplicaTerminalAttemptRuntime::new(send_sequence, continuation)
             .map_err(BlindVaultReplicaBoundRuntimeError::from)
+    }
+}
+
+impl BlindVaultReplicaOwnedDurableBoundAttemptDispatch {
+    /// Exact source-local work item now permitted to reach transport.
+    #[must_use]
+    pub const fn work_id(&self) -> BlindVaultReplicaWorkId {
+        self.durable.work_id()
+    }
+
+    /// Exact bounded attempt represented by durable local state.
+    #[must_use]
+    pub const fn attempt(&self) -> u8 {
+        self.durable.attempt()
+    }
+
+    /// Accepted post-dispatch snapshot sequence.
+    #[must_use]
+    pub const fn snapshot_sequence(&self) -> u64 {
+        self.durable.snapshot_sequence()
+    }
+
+    /// Accepted private-journal sequence.
+    #[must_use]
+    pub const fn journal_sequence(&self) -> u64 {
+        self.durable.journal_sequence()
+    }
+
+    /// Consumes owned durability authority into one ordered send capability.
+    pub fn into_terminal_send_sequence<'effects>(
+        self,
+        effect_set: &'effects BlindVaultReplicaPreparedEffectSet,
+    ) -> Result<
+        BlindVaultReplicaTerminalSendSequence<'effects>,
+        BlindVaultReplicaDurableDispatchError,
+    > {
+        if !self.matches_effect_set(effect_set) {
+            return Err(BlindVaultReplicaDurableDispatchError::StateMismatch);
+        }
+        Ok(BlindVaultReplicaTerminalSendSequence::from_durable_parts(
+            effect_set,
+            self.snapshot_sequence(),
+            self.journal_sequence(),
+        ))
+    }
+
+    /// Consumes owned durability authority and private state into one runtime.
+    pub fn into_terminal_attempt_runtime(
+        self,
+        bound: BlindVaultReplicaBoundAttemptContinuation,
+    ) -> Result<BlindVaultReplicaTerminalAttemptRuntime<'static>, BlindVaultReplicaBoundRuntimeError>
+    {
+        if !self.matches_effect_set(bound.effect_set()) {
+            return Err(BlindVaultReplicaDurableDispatchError::StateMismatch.into());
+        }
+        let snapshot_sequence = self.snapshot_sequence();
+        let journal_sequence = self.journal_sequence();
+        let (effect_set, continuation) = bound.into_parts();
+        let send_sequence =
+            BlindVaultReplicaTerminalSendSequence::<'static>::from_owned_durable_parts(
+                effect_set,
+                snapshot_sequence,
+                journal_sequence,
+            );
+        BlindVaultReplicaTerminalAttemptRuntime::new(send_sequence, continuation)
+            .map_err(BlindVaultReplicaBoundRuntimeError::from)
+    }
+
+    fn matches_effect_set(&self, effect_set: &BlindVaultReplicaPreparedEffectSet) -> bool {
+        self.work_id() == effect_set.work_id()
+            && self.attempt() == effect_set.attempt()
+            && self.planned_dispatch_at_ms == effect_set.planned_dispatch_at_ms()
+            && self.evidence_deadline_ms == effect_set.evidence_deadline_ms()
+            && self.effect_set_commitment == effect_set.commitment()
+    }
+}
+
+impl Drop for BlindVaultReplicaOwnedDurableBoundAttemptDispatch {
+    fn drop(&mut self) {
+        self.effect_set_commitment.zeroize();
+    }
+}
+
+impl<'a, StoreError> BlindVaultReplicaBoundCommitPublicationError<'a, StoreError> {
+    /// Coarse adapter error without exposing committed private state.
+    #[must_use]
+    pub const fn store_error(&self) -> &StoreError {
+        &self.source
+    }
+
+    /// Retries the exact same committed bound generation idempotently.
+    pub fn retry<Store>(
+        self,
+        store: &mut Store,
+    ) -> Result<
+        BlindVaultReplicaOwnedDurableBoundAttemptDispatch,
+        BlindVaultReplicaBoundCommitPublicationError<'a, StoreError>,
+    >
+    where
+        Store: BlindVaultReplicaRecoveryStore<Error = StoreError>,
+    {
+        self.committed.publish_for_network_send(store)
     }
 }
 
@@ -386,5 +555,44 @@ impl fmt::Debug for BlindVaultReplicaDurableBoundAttemptDispatch<'_, '_> {
             .field("snapshot_sequence", &self.durable.snapshot_sequence())
             .field("journal_sequence", &self.durable.journal_sequence())
             .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for BlindVaultReplicaOwnedDurableBoundAttemptDispatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaOwnedDurableBoundAttemptDispatch")
+            .field("attempt", &self.attempt())
+            .field("snapshot_sequence", &self.snapshot_sequence())
+            .field("journal_sequence", &self.journal_sequence())
+            .field("work_id", &"<redacted>")
+            .field("effect_set_commitment", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<StoreError> fmt::Debug for BlindVaultReplicaBoundCommitPublicationError<'_, StoreError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaBoundCommitPublicationError")
+            .field("attempt", &self.committed.attempt())
+            .field("committed_state", &"<retained>")
+            .field("store_error", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<StoreError> fmt::Display for BlindVaultReplicaBoundCommitPublicationError<'_, StoreError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("blind vault replica committed bound publication failed")
+    }
+}
+
+impl<StoreError> std::error::Error for BlindVaultReplicaBoundCommitPublicationError<'_, StoreError>
+where
+    StoreError: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }

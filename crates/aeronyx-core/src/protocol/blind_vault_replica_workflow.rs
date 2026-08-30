@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.59.0-PrivacySafeDomainDebug - Replaced topology-bearing
+//! Last Modified: v1.60.0-RecoverablePublication - Added owned durable send
+//! permits whose publication failures retain exact committed retry state.
+//! v1.59.0-PrivacySafeDomainDebug - Replaced topology-bearing
 //! derived diagnostics with bounded redacted workflow summaries.
 //! v1.58.0-RetryBoundaryDerivation - Added overflow-safe retry
 //! scheduling for detailed terminal runtime failures.
@@ -219,14 +221,15 @@ pub use bound_continuation::{
     BlindVaultReplicaBoundAttemptContinuation, BlindVaultReplicaBoundContinuationError,
 };
 pub use bound_dispatch::{
-    BlindVaultReplicaBoundRuntimeError, BlindVaultReplicaCommittedBoundAttemptDispatch,
-    BlindVaultReplicaCompletedObservation, BlindVaultReplicaCompletedProvisioning,
-    BlindVaultReplicaCompletedReconciliation, BlindVaultReplicaCompletedRenewal,
-    BlindVaultReplicaCompletedReplacement, BlindVaultReplicaDurableBoundAttemptDispatch,
-    BlindVaultReplicaObservationReplyOutcome, BlindVaultReplicaObservationReplyPolicy,
-    BlindVaultReplicaObservationReplyPolicyBuildError,
+    BlindVaultReplicaBoundCommitPublicationError, BlindVaultReplicaBoundRuntimeError,
+    BlindVaultReplicaCommittedBoundAttemptDispatch, BlindVaultReplicaCompletedObservation,
+    BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaCompletedReconciliation,
+    BlindVaultReplicaCompletedRenewal, BlindVaultReplicaCompletedReplacement,
+    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaObservationReplyOutcome,
+    BlindVaultReplicaObservationReplyPolicy, BlindVaultReplicaObservationReplyPolicyBuildError,
     BlindVaultReplicaObservationReplyPolicyError, BlindVaultReplicaOnionDispatchPlan,
     BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
+    BlindVaultReplicaOwnedDurableBoundAttemptDispatch,
     BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
     BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaProvisioningReplyOutcome,
     BlindVaultReplicaProvisioningReplyPolicy, BlindVaultReplicaProvisioningReplyPolicyBuildError,
@@ -249,8 +252,9 @@ pub use bound_dispatch::{
     BlindVaultReplicaVerifiedOnionTransportError,
 };
 pub use durable_dispatch::{
-    BlindVaultReplicaCommittedAttemptDispatch, BlindVaultReplicaDurableAttemptDispatch,
-    BlindVaultReplicaDurableDispatchError, BlindVaultReplicaPersistedAttemptJournal,
+    BlindVaultReplicaCommitPublicationError, BlindVaultReplicaCommittedAttemptDispatch,
+    BlindVaultReplicaDurableAttemptDispatch, BlindVaultReplicaDurableDispatchError,
+    BlindVaultReplicaOwnedDurableAttemptDispatch, BlindVaultReplicaPersistedAttemptJournal,
 };
 pub use durable_resolution::{
     BlindVaultReplicaAttemptFailure, BlindVaultReplicaAttemptResolution,
