@@ -79,7 +79,10 @@
 //!   then remain monotonic, continuity-safe, and atomic across both SQLite
 //!   persistence and in-process readers.
 //!
-//! Last Modified: v1.19.0-BlindVaultAdmissionReadiness - Added one aggregate,
+//! Last Modified: v1.20.0-PrivacySafeServiceDiagnostics - Redacted opaque pull
+//! values and nested host errors, disabled private-row Debug, and removed the
+//! remaining production HMAC panic path.
+//! v1.19.0-BlindVaultAdmissionReadiness - Added one aggregate,
 //! fail-closed admission-readiness state for discovery and operations.
 //! v1.18.0-BlindVaultDiskReserve - Added replaceable physical
 //! capacity observation and fail-closed write watermarks.
@@ -123,6 +126,7 @@
 //! ============================================
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -290,7 +294,7 @@ pub struct BlindVaultIssuerRuntimeStatus {
 }
 
 /// One opaque object returned to an authorised client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BlindVaultStoredObject {
     /// Replica-local object identifier.
     pub object_id: [u8; 32],
@@ -302,13 +306,38 @@ pub struct BlindVaultStoredObject {
     pub expires_at_ms: u64,
 }
 
+// [BLIND-VAULT-OPAQUE-OBJECT-DIAGNOSTICS 2026-08-30 by Codex] Public Debug
+// remains available for compatibility, but must never expose ciphertext or
+// per-object correlation metadata from the node-blind storage boundary.
+impl fmt::Debug for BlindVaultStoredObject {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultStoredObject")
+            .field("object_id", &"<redacted>")
+            .field("ciphertext", &"<redacted>")
+            .field("ciphertext_commitment", &"<redacted>")
+            .field("expires_at_ms", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Bounded internal recovery page.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BlindVaultPullPage {
     /// Still-live opaque objects in insertion order.
     pub objects: Vec<BlindVaultStoredObject>,
     /// Lease-bound encrypted cursor for the same stable recovery snapshot.
     pub continuation_cursor: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for BlindVaultPullPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultPullPage")
+            .field("objects", &"<redacted>")
+            .field("continuation_cursor", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Aggregate-only bounded maintenance result.
@@ -402,7 +431,7 @@ impl BlindVaultAdmissionReadiness {
 
 /// Fail-closed service errors. API handlers should map these to coarse public
 /// buckets instead of returning database or capability details.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum BlindVaultServiceError {
     /// Service was not explicitly enabled.
     #[error("blind vault service is disabled")]
@@ -497,6 +526,15 @@ pub enum BlindVaultServiceError {
     /// Timestamp could not be represented safely by SQLite.
     #[error("blind vault timestamp is outside the supported range")]
     TimestampOutOfRange,
+}
+
+// [BLIND-VAULT-SERVICE-ERROR-DIAGNOSTICS 2026-08-30 by Codex] Keep standard
+// formatting at the coarse service boundary. `Error::source` still lets a
+// trusted local adapter inspect nested SQLite or protocol errors explicitly.
+impl fmt::Debug for BlindVaultServiceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
 
 /// Privacy-safe retry class for an anonymous ciphertext Put failure.
@@ -1368,7 +1406,7 @@ impl BlindVaultService {
         let now = sqlite_i64(now_ms)?;
         let lease_expires_at = sqlite_i64(lease.expires_at_ms)?;
         let spend_expires_at = sqlite_i64(spend_expires_at_ms)?;
-        let read_tag = self.read_capability_tag(&lease.lease_id, &lease.read_capability_hash);
+        let read_tag = self.read_capability_tag(&lease.lease_id, &lease.read_capability_hash)?;
 
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2396,13 +2434,20 @@ impl BlindVaultService {
         Ok(receipt)
     }
 
-    fn read_capability_tag(&self, lease_id: &[u8; 32], capability_hash: &[u8; 32]) -> [u8; 32] {
+    fn read_capability_tag(
+        &self,
+        lease_id: &[u8; 32],
+        capability_hash: &[u8; 32],
+    ) -> Result<[u8; 32], BlindVaultServiceError> {
+        // [BLIND-VAULT-PANIC-FREE-READ-TAG 2026-08-30 by Codex] A fixed-size
+        // HMAC key should always be accepted, but crypto-provider failure is a
+        // typed fail-closed service error rather than a node process panic.
         let mut mac = HmacSha256::new_from_slice(self.read_auth_key.as_ref())
-            .expect("HMAC accepts a 32-byte key");
+            .map_err(|_| BlindVaultServiceError::CorruptState)?;
         mac.update(READ_AUTH_TAG_DOMAIN);
         mac.update(lease_id);
         mac.update(capability_hash);
-        mac.finalize().into_bytes().into()
+        Ok(mac.finalize().into_bytes().into())
     }
 
     fn verify_read_capability(
@@ -2725,7 +2770,10 @@ fn derive_node_key(
     Ok(Zeroizing::new(key_deriver.finalize().into_bytes().into()))
 }
 
-#[derive(Debug)]
+// [BLIND-VAULT-PRIVATE-ROW-DIAGNOSTICS 2026-08-30 by Codex] These private
+// persistence rows intentionally do not implement Debug. They contain
+// capability tags, correlation identifiers, commitments, keys, or per-lease
+// usage that the service privacy invariant forbids in logs.
 struct LeaseProvisioningRow {
     request_id: [u8; 16],
     write_verifying_key: [u8; 32],
@@ -2734,7 +2782,7 @@ struct LeaseProvisioningRow {
     expires_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct LeaseRuntimeRow {
     write_verifying_key: [u8; 32],
     admin_verifying_key: [u8; 32],
@@ -2744,7 +2792,7 @@ struct LeaseRuntimeRow {
 }
 
 /// One coherent live-usage observation returned by a single SQLite statement.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct LeaseStatusObservation {
     admin_verifying_key: [u8; 32],
     expires_at_ms: u64,
@@ -2752,13 +2800,12 @@ struct LeaseStatusObservation {
     live_ciphertext_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct LeaseObjectUsage {
     object_count: u64,
     ciphertext_bytes: u64,
 }
 
-#[derive(Debug)]
 struct ExistingObjectRow {
     request_id: [u8; 16],
     ciphertext_commitment: [u8; 32],
@@ -2766,7 +2813,6 @@ struct ExistingObjectRow {
     expires_at_ms: u64,
 }
 
-#[derive(Debug)]
 struct ExpiredObjectRow {
     sequence: i64,
     lease_id: Vec<u8>,
@@ -2776,7 +2822,6 @@ struct ExpiredObjectRow {
 }
 
 /// Bounded durable state retained only for exact retirement retries.
-#[derive(Debug)]
 struct LeaseRetirementRow {
     request_id: [u8; 16],
     admin_verifying_key: [u8; 32],
@@ -2787,7 +2832,7 @@ struct LeaseRetirementRow {
 }
 
 /// Bounded durable state retained only for exact lease-renewal retries.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct LeaseRenewalRow {
     admission_spend_id: [u8; 32],
     request_commitment: [u8; 32],
