@@ -16,6 +16,7 @@
 //! - Verifies terminal signatures and exact request/receipt relationships.
 //! - Maps authenticated terminal failures without exposing storage details.
 //! - Delegates manifest, freshness, and lifecycle policy to a source adapter.
+//! - Centralizes anonymous single-effect attempt-context verification.
 //! - Exposes a source-only mutable policy boundary between verified stages.
 //!
 //! ## Dependencies
@@ -39,7 +40,9 @@
 //! - Never implement a permissive default private policy.
 //! - Debug output must remain redacted because requests can contain ciphertext.
 //!
-//! Last Modified: v1.2.0-SharedVerificationClock - Moved the replaceable
+//! Last Modified: v1.3.0-SingleEffectContext - Centralized exact work,
+//! attempt, sequence, and terminal-authorization checks for single replies.
+//! v1.2.0-SharedVerificationClock - Moved the replaceable
 //! source-time boundary beside the common private reply-policy contract.
 //! v1.1.0-StagedPolicyMutation - Allowed source adapters to
 //! install workflow authority between verified replacement stages.
@@ -51,7 +54,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use super::super::BlindVaultReplicaDispatchFailure;
+use super::super::{BlindVaultReplicaDispatchFailure, BlindVaultReplicaWorkId};
 use super::attempt_runtime::BlindVaultReplicaTerminalReplyVerifier;
 use super::send_sequence::BlindVaultReplicaTerminalSendContext;
 use crate::crypto::keys::IdentityPublicKey;
@@ -89,6 +92,38 @@ where
     fn now_ms(&mut self) -> Result<u64, Self::Error> {
         self()
     }
+}
+
+/// Private classification for one invalid single-effect reply context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BlindVaultReplicaSingleEffectContextError {
+    /// Work identity was wrong or the runtime attempt was invalid.
+    AttemptMismatch,
+    /// Context did not describe the sole effect at index zero.
+    SequenceMismatch,
+    /// Anonymous single-effect work unexpectedly carried lifecycle authority.
+    TerminalAuthorizationMismatch,
+}
+
+/// Verifies context shared by source-private single-terminal reply policies.
+///
+/// [BLIND-VAULT-SINGLE-EFFECT-REPLY-CONTEXT 2026-08-30 by Codex] Context is
+/// created by the ordered runtime, but policies still fail closed so future
+/// adapters cannot weaken work, attempt, sequence, or lifecycle boundaries.
+pub(super) fn verify_single_effect_reply_context(
+    expected_work_id: BlindVaultReplicaWorkId,
+    context: BlindVaultReplicaTerminalSendContext,
+) -> Result<(), BlindVaultReplicaSingleEffectContextError> {
+    if context.work_id() != expected_work_id || context.attempt() == 0 {
+        return Err(BlindVaultReplicaSingleEffectContextError::AttemptMismatch);
+    }
+    if context.effect_index() != 0 || context.effect_count() != 1 {
+        return Err(BlindVaultReplicaSingleEffectContextError::SequenceMismatch);
+    }
+    if context.authorized_terminal_node_id().is_some() {
+        return Err(BlindVaultReplicaSingleEffectContextError::TerminalAuthorizationMismatch);
+    }
+    Ok(())
 }
 
 /// Exact signed request/receipt pair authenticated at the common protocol layer.

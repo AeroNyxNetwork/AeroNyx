@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.48.0-DurableRenewalCompletion - Added typed atomic
+//! Last Modified: v1.49.0-SingleEffectReplyContext - Centralized fail-closed
+//! work, attempt, sequence, and authorization checks for single replies.
+//! v1.48.0-DurableRenewalCompletion - Added typed atomic
 //! resolution for policy-issued exact-generation renewal completion.
 //! v1.47.0-RenewalReplyPolicy - Added exact lease-generation,
 //! single-effect renewal reply verification.

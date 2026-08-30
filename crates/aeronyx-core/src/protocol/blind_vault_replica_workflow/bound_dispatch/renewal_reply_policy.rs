@@ -47,7 +47,8 @@ use super::super::{
     BlindVaultReplicaWorkflowError,
 };
 use super::request_bound_verifier::{
-    BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaRequestBoundReply,
+    verify_single_effect_reply_context, BlindVaultReplicaPrivateReplyPolicy,
+    BlindVaultReplicaRequestBoundReply, BlindVaultReplicaSingleEffectContextError,
     BlindVaultReplicaVerificationClock,
 };
 use super::send_sequence::BlindVaultReplicaTerminalSendContext;
@@ -193,7 +194,8 @@ where
         let BlindVaultReplicaRequestBoundReply::LeaseRenewed { request, receipt } = reply else {
             return Err(BlindVaultReplicaRenewalReplyPolicyError::StageMismatch);
         };
-        require_single_effect_attempt(self.expected_work_id, context)?;
+        verify_single_effect_reply_context(self.expected_work_id, context)
+            .map_err(map_single_effect_context_error)?;
         if receipt.node_id != self.expected_node_id
             || receipt.lease_id != self.expected_lease_id
             || receipt.previous_expires_at_ms != self.expected_expires_at_ms
@@ -218,20 +220,20 @@ where
     }
 }
 
-fn require_single_effect_attempt<ClockError>(
-    expected_work_id: BlindVaultReplicaWorkId,
-    context: BlindVaultReplicaTerminalSendContext,
-) -> Result<(), BlindVaultReplicaRenewalReplyPolicyError<ClockError>> {
-    if context.work_id() != expected_work_id || context.attempt() == 0 {
-        return Err(BlindVaultReplicaRenewalReplyPolicyError::AttemptMismatch);
+fn map_single_effect_context_error<ClockError>(
+    error: BlindVaultReplicaSingleEffectContextError,
+) -> BlindVaultReplicaRenewalReplyPolicyError<ClockError> {
+    match error {
+        BlindVaultReplicaSingleEffectContextError::AttemptMismatch => {
+            BlindVaultReplicaRenewalReplyPolicyError::AttemptMismatch
+        }
+        BlindVaultReplicaSingleEffectContextError::SequenceMismatch => {
+            BlindVaultReplicaRenewalReplyPolicyError::SequenceMismatch
+        }
+        BlindVaultReplicaSingleEffectContextError::TerminalAuthorizationMismatch => {
+            BlindVaultReplicaRenewalReplyPolicyError::TerminalAuthorizationMismatch
+        }
     }
-    if context.effect_index() != 0 || context.effect_count() != 1 {
-        return Err(BlindVaultReplicaRenewalReplyPolicyError::SequenceMismatch);
-    }
-    if context.authorized_terminal_node_id().is_some() {
-        return Err(BlindVaultReplicaRenewalReplyPolicyError::TerminalAuthorizationMismatch);
-    }
-    Ok(())
 }
 
 /// Renewal policy construction failure before any reply is accepted.
