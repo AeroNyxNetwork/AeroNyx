@@ -12,6 +12,7 @@
 //! - Creates/verifies a private `0700` recovery directory.
 //! - Pins the opened directory inode for every subsequent filesystem action.
 //! - Holds one non-blocking exclusive process fence for the store lifetime.
+//! - Requires directory and private files to belong to the effective user.
 //! - Reads only bounded regular `0600` files without following symlinks.
 //! - Publishes a temp file through file fsync, rename, and directory fsync.
 //! - Removes only adapter-owned unfinished temp files after acquiring the lock.
@@ -36,7 +37,9 @@
 //! - The process fence prevents concurrent writers, not privileged rollback.
 //! - Never return to path-based state I/O after the directory FD is pinned.
 //!
-//! Last Modified: v1.1.0-DirectoryFdFence - Bound lock, reads, temporary files,
+//! Last Modified: v1.2.0-OwnerFence - Rejected recovery directories and files
+//! not owned by the process effective user.
+//! v1.1.0-DirectoryFdFence - Bound lock, reads, temporary files,
 //! cleanup, replacement, and fsync to one opened private directory inode.
 //! v1.0.0-PrivateAtomicRecoveryIo - Initial restrictive atomic
 //! generation file and process-fence implementation.
@@ -231,7 +234,13 @@ fn open_private_directory(path: &Path) -> Result<File, PrivateRecoveryIoError> {
         .open(path)?;
     directory.set_permissions(fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
     let metadata = directory.metadata()?;
-    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+    // [BLIND-VAULT-RECOVERY-OWNER-FENCE 2026-08-30 by Codex] Private mode bits
+    // are insufficient when a privileged process opens an attacker-owned
+    // directory. Ownership is checked on the pinned inode and every child.
+    if !metadata.is_dir()
+        || metadata.uid() != effective_user_id()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
         return Err(PrivateRecoveryIoError::UnsafePath);
     }
     Ok(directory)
@@ -282,7 +291,11 @@ fn open_private_regular_file_at(
 fn validate_private_regular_metadata(
     metadata: &fs::Metadata,
 ) -> Result<(), PrivateRecoveryIoError> {
-    if !metadata.is_file() || metadata.nlink() != 1 || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.is_file()
+        || metadata.uid() != effective_user_id()
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o077 != 0
+    {
         return Err(PrivateRecoveryIoError::UnsafePath);
     }
     Ok(())
@@ -341,4 +354,9 @@ fn cleanup_owned_temp_files(directory: &File) -> Result<(), PrivateRecoveryIoErr
 
 fn nix_filesystem_error(error: nix::errno::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error as i32)
+}
+
+fn effective_user_id() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and does not dereference memory.
+    unsafe { nix::libc::geteuid() }
 }
