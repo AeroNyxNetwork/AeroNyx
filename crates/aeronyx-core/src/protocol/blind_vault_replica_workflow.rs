@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.69.0-PrivacySafeStateDiagnostics - Redacted absolute
+//! Last Modified: v1.70.0-PrivacySafeFailureDiagnostics - Redacted exact
+//! durable failure and retry timing from standard diagnostics.
+//! v1.69.0-PrivacySafeStateDiagnostics - Redacted absolute
 //! source timing from work-state and dispatch-readiness diagnostics.
 //! v1.68.0-PrivacySafeRecoveryDiagnostics - Redacted recovery
 //! task and durable-resolution identities from standard diagnostics.

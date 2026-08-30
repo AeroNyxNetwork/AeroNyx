@@ -51,7 +51,9 @@
 //!   must re-confirm file/database durability before idempotent success.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.15.0-PrivacySafeResolutionDebug - Redacted source-local
+//! Last Modified: v1.16.0-PrivacySafeFailureDebug - Redacted exact failure and
+//! retry timing from standard durable-attempt diagnostics.
+//! v1.15.0-PrivacySafeResolutionDebug - Redacted source-local
 //! work identity from standard durable-resolution diagnostics.
 //! v1.14.0-AmbiguousResolutionReconciliation - Replayed the
 //! exact local transition once to confirm durability after ambiguous errors.
@@ -172,11 +174,25 @@ impl fmt::Debug for BlindVaultReplicaCommittedAttemptBinding {
 /// related inputs together across the durability boundary.
 ///
 /// [BLIND-VAULT-ATTEMPT-FAILURE 2026-08-29 by Codex]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultReplicaAttemptFailure {
     failed_at_ms: u64,
     retry_not_before_ms: u64,
     failure: BlindVaultReplicaDispatchFailure,
+}
+
+// [BLIND-VAULT-ATTEMPT-FAILURE-DIAGNOSTICS 2026-08-30 by Codex] Keep the
+// bounded recovery disposition observable without publishing exact source
+// failure or retry timestamps across the durable boundary.
+impl fmt::Debug for BlindVaultReplicaAttemptFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaAttemptFailure")
+            .field("failed_at_ms", &"<redacted>")
+            .field("retry_not_before_ms", &"<redacted>")
+            .field("failure", &self.failure)
+            .finish()
+    }
 }
 
 impl BlindVaultReplicaAttemptFailure {
