@@ -338,6 +338,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.74.0-StreamingRequestCommitment - Preserve canonical replay commitments
+//! while hashing large authenticated requests without a second payload buffer
 //! v0.73.0-AuthenticatedOnwardDomain - Remove duplicate onion-middle signature
 //! verification and bound every legacy next-hop re-signing operation
 //! v0.72.0-BlindRelayCryptoDomain - Bound onion peel and deterministic onward
@@ -460,6 +462,7 @@
 // ============================================================================
 
 use std::{
+    io::{self, Write},
     sync::{atomic::AtomicUsize, Arc, OnceLock},
     time::Instant,
 };
@@ -1345,6 +1348,20 @@ struct AuthenticatedPeerBlindRelayRequest {
     request_commitment: [u8; 32],
 }
 
+/// Streaming adapter for canonical bincode commitment bytes.
+struct Sha256CommitmentWriter<'a>(&'a mut Sha256);
+
+impl Write for Sha256CommitmentWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn blind_relay_authenticated_request_commitment(
     request: &PeerBlindRelayRequest,
 ) -> Result<[u8; 32], bincode::Error> {
@@ -1352,11 +1369,15 @@ fn blind_relay_authenticated_request_commitment(
     // canonical internal encoding used by this protocol crate. Hashing the
     // complete request prevents route-id reuse from swapping optional onward
     // routing material while keeping all durable keys node-secret HMACs.
-    let encoded = bincode::serialize(request)?;
+    // [STREAMING-REPLAY-COMMITMENT 2026-08-30 by Codex] `serialized_size`
+    // and `serialize_into` use the same bincode 1.x canonical options as
+    // `serialize`. Hashing through `Write` preserves the existing commitment
+    // exactly without allocating a second request-sized byte vector.
+    let encoded_len = bincode::serialized_size(request)?;
     let mut hasher = Sha256::new();
     hasher.update(BLIND_RELAY_AUTHENTICATED_REQUEST_COMMITMENT_DOMAIN);
-    hasher.update((encoded.len() as u64).to_be_bytes());
-    hasher.update(encoded);
+    hasher.update(encoded_len.to_be_bytes());
+    bincode::serialize_into(Sha256CommitmentWriter(&mut hasher), request)?;
     Ok(hasher.finalize().into())
 }
 
