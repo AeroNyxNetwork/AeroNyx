@@ -131,6 +131,9 @@
 //! - [BLIND-RELAY-CRYPTO-DOMAIN 2026-08-30 by Codex] Composes previous-hop
 //!   verification, onion peeling, and deterministic onward signing behind one
 //!   bounded CPU domain outside the asynchronous I/O runtime
+//! - [AUTHENTICATED-ONWARD-DOMAIN 2026-08-30 by Codex] Preserves the private
+//!   authenticated request boundary through legacy forwarding so onion-middle
+//!   metadata is not redundantly signature-verified on a Tokio I/O worker
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -335,6 +338,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.73.0-AuthenticatedOnwardDomain - Remove duplicate onion-middle signature
+//! verification and bound every legacy next-hop re-signing operation
 //! v0.72.0-BlindRelayCryptoDomain - Bound onion peel and deterministic onward
 //! signing with the same fail-fast CPU admission as blind authentication
 //! v0.71.0-RelayStorageAdmission - Move synchronous terminal SQLite work out
@@ -2435,6 +2440,12 @@ struct BlindRelayForwardSeed {
     timestamp: u64,
 }
 
+/// Fully re-signed legacy forwarding unit prepared before route effects arm.
+struct PreparedLegacyBlindRelayForward {
+    envelope: BlindRelayEnvelope,
+    onward_envelope: Option<BlindRelayEnvelope>,
+}
+
 impl From<&BlindRelayEnvelope> for BlindRelayForwardSeed {
     fn from(envelope: &BlindRelayEnvelope) -> Self {
         Self {
@@ -2713,15 +2724,28 @@ async fn process_authenticated_peer_blind_relay(
         }
     };
 
-    let forwarded_envelope = envelope
-        .decremented_ttl()
-        .ok_or(BlindRelayError::TtlExhausted)?
-        .sign_with(state.node_identity.as_ref());
-    let forwarded_onward_envelope = request
-        .onward_envelope
-        .map(|envelope| envelope.sign_with(state.node_identity.as_ref()));
+    let original_envelope = Arc::new(envelope);
+    let envelope_for_forwarding = Arc::clone(&original_envelope);
+    let onward_envelope_for_forwarding = request.onward_envelope;
+    let forwarding_identity = Arc::clone(&state.node_identity);
+    let prepared_forward = run_blind_relay_crypto(move || {
+        // [AUTHENTICATED-ONWARD-DOMAIN 2026-08-30 by Codex] Re-sign the
+        // complete legacy forwarding unit in one bounded worker. The
+        // original outer envelope stays immutable for its success receipt.
+        let envelope = envelope_for_forwarding
+            .decremented_ttl()
+            .ok_or(BlindRelayError::TtlExhausted)?
+            .sign_with(forwarding_identity.as_ref());
+        let onward_envelope = onward_envelope_for_forwarding
+            .map(|envelope| envelope.sign_with(forwarding_identity.as_ref()));
+        Ok(PreparedLegacyBlindRelayForward {
+            envelope,
+            onward_envelope,
+        })
+    })
+    .await?;
     let forwarded_onward_descriptor_hint = onward_descriptor_hint;
-    let ttl_remaining = forwarded_envelope.ttl;
+    let ttl_remaining = prepared_forward.envelope.ttl;
 
     let forward_started_at = blind_relay_response_observed_at(now, &route_started_at);
     route_lease
@@ -2732,9 +2756,9 @@ async fn process_authenticated_peer_blind_relay(
         &url,
         &descriptor,
         PeerBlindRelayRequest {
-            envelope: forwarded_envelope,
+            envelope: prepared_forward.envelope,
             previous_hop_node_id: self_node_id,
-            onward_envelope: forwarded_onward_envelope,
+            onward_envelope: prepared_forward.onward_envelope,
             onward_descriptor_hint: forwarded_onward_descriptor_hint,
         },
         forward_started_at,
@@ -2746,7 +2770,7 @@ async fn process_authenticated_peer_blind_relay(
     };
 
     let response = attach_blind_relay_success_receipt(
-        &envelope,
+        original_envelope.as_ref(),
         PeerBlindRelayResponse {
             accepted: true,
             terminal: false,
@@ -3271,17 +3295,14 @@ async fn process_onion_middle_blind_relay(
     now: u64,
     route_started_at: &Instant,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
-    validate_blind_relay_envelope(&onward_envelope, &previous_hop_node_id, now).map_err(
-        |error| {
-            reject_blind_relay_previous_hop(
-                &state,
-                previous_hop_node_id,
-                now,
-                error.reason_bucket(),
-            );
-            error
-        },
-    )?;
+    // [AUTHENTICATED-ONWARD-DOMAIN 2026-08-30 by Codex] The private
+    // `AuthenticatedPeerBlindRelayRequest` constructor already verified the
+    // onward signature inside bounded blocking admission. Repeating that work
+    // here would let valid requests consume Ed25519 verification on Tokio.
+    validate_blind_relay_metadata(&onward_envelope, now).map_err(|error| {
+        reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, error.reason_bucket());
+        error
+    })?;
 
     let self_node_id = state.node_identity.public_key_bytes();
     if onward_envelope.next_hop == self_node_id || onward_envelope.next_hop == previous_hop_node_id
@@ -3350,10 +3371,14 @@ async fn process_onion_middle_blind_relay(
         }
     };
 
-    let forwarded_envelope = onward_envelope
-        .decremented_ttl()
-        .ok_or(BlindRelayError::TtlExhausted)?
-        .sign_with(state.node_identity.as_ref());
+    let forwarding_identity = Arc::clone(&state.node_identity);
+    let forwarded_envelope = run_blind_relay_crypto(move || {
+        onward_envelope
+            .decremented_ttl()
+            .ok_or(BlindRelayError::TtlExhausted)
+            .map(|envelope| envelope.sign_with(forwarding_identity.as_ref()))
+    })
+    .await?;
     let ttl_remaining = forwarded_envelope.ttl;
 
     let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
@@ -3952,6 +3977,7 @@ fn log_invalid_blind_relay_response(
     }
 }
 
+#[cfg(test)]
 fn validate_blind_relay_envelope(
     envelope: &BlindRelayEnvelope,
     previous_hop_node_id: &[u8; 32],
