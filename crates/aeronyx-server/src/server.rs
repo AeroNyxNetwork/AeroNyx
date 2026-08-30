@@ -985,7 +985,8 @@ use crate::api::auth::ensure_jwt_secret;
 use crate::api::blind_vault::build_blind_vault_router;
 use crate::api::chat_handlers::build_chat_router;
 use crate::api::chat_peer::{
-    build_chat_peer_router, prepare_peer_chat_relay_request_v1,
+    build_chat_peer_router, prepare_peer_blind_relay_http_request,
+    prepare_peer_chat_relay_request_v1,
     prepare_peer_chat_relay_request_v2,
     prepare_peer_chat_relay_request_v3, verify_peer_chat_relay_receipt,
     DirectRelayReceiptVerificationFailure, PeerBlindRelayRequest, PeerBlindRelayResponse,
@@ -11216,8 +11217,28 @@ impl Server {
             onward_envelope: None,
             onward_descriptor_hint: None,
         };
+        let request = match prepare_peer_blind_relay_http_request(request).await {
+            Ok(request) => request,
+            Err(error) => {
+                // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex]
+                // No peer observed this request. Keep local saturation visible
+                // to aggregate readiness without poisoning route reputation.
+                peer_store.record_blind_relay_probe_result(
+                    now,
+                    false,
+                    error.reason_bucket(),
+                );
+                return;
+            }
+        };
 
-        match client.post(url).json(&request).send().await {
+        match client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request.body())
+            .send()
+            .await
+        {
             Ok(response) if response.status().is_success() => match decode_bounded_json_response::<
                 PeerBlindRelayResponse,
             >(
@@ -11396,8 +11417,31 @@ impl Server {
                     .flatten()
                 {
                     request_count = request_count.saturating_add(1);
+                    let request = match prepare_peer_blind_relay_http_request(request).await {
+                        Ok(request) => request,
+                        Err(error) => {
+                            peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                                now,
+                                false,
+                                error.reason_bucket(),
+                                middle_candidate_count,
+                                terminal_candidate_count,
+                                2,
+                                1,
+                            );
+                            // Request preparation is local and pre-network;
+                            // continue searching without penalizing this middle.
+                            continue 'terminal_candidates;
+                        }
+                    };
                     let request_started_at = Instant::now();
-                    match client.post(&url).json(&request).send().await {
+                    match client
+                        .post(&url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(request.body())
+                        .send()
+                        .await
+                    {
                         Ok(response) if response.status().is_success() => {
                             // [MULTIHOP-PROOF-RESPONSE-TIME 2026-08-11 by Codex]
                             // Bind verification to response observation rather
@@ -11416,7 +11460,7 @@ impl Server {
                                         && ack.forwarded
                                         && Self::verified_delivery_receipt(
                                             ack.delivery_receipt.as_ref(),
-                                            &request.envelope.route_id,
+                                            request.route_id(),
                                             &payload_commitment,
                                             &terminal_node_id,
                                             observed_at,
@@ -11605,9 +11649,30 @@ impl Server {
                     onward_envelope: Some(onward_envelope),
                     onward_descriptor_hint: Some(terminal.clone()),
                 };
+                let request = match prepare_peer_blind_relay_http_request(request).await {
+                    Ok(request) => request,
+                    Err(error) => {
+                        peer_store.record_blind_relay_two_hop_probe_result_with_context(
+                            now,
+                            false,
+                            error.reason_bucket(),
+                            middle_candidate_count,
+                            terminal_candidate_count,
+                            2,
+                            1,
+                        );
+                        continue 'terminal_candidates;
+                    }
+                };
 
                 let request_started_at = Instant::now();
-                match client.post(&url).json(&request).send().await {
+                match client
+                    .post(&url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(request.body())
+                    .send()
+                    .await
+                {
                     Ok(response) if response.status().is_success() => {
                         let observed_at =
                             now.saturating_add(request_started_at.elapsed().as_secs());
@@ -11903,9 +11968,30 @@ impl Server {
                         continue;
                     };
                     request_count = request_count.saturating_add(1);
+                    let request = match prepare_peer_blind_relay_http_request(request).await {
+                        Ok(request) => request,
+                        Err(error) => {
+                            peer_store.record_blind_relay_three_hop_probe_result_with_context(
+                                now,
+                                false,
+                                error.reason_bucket(),
+                                effective_middle_candidate_count,
+                                terminal_candidate_count,
+                                3,
+                                2,
+                            );
+                            continue;
+                        }
+                    };
 
                     let request_started_at = Instant::now();
-                    match client.post(&url).json(&request).send().await {
+                    match client
+                        .post(&url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(request.body())
+                        .send()
+                        .await
+                    {
                         Ok(response) if response.status().is_success() => {
                             let observed_at =
                                 now.saturating_add(request_started_at.elapsed().as_secs());
@@ -11920,7 +12006,7 @@ impl Server {
                                         && ack.forwarded
                                         && Self::verified_delivery_receipt(
                                             ack.delivery_receipt.as_ref(),
-                                            &request.envelope.route_id,
+                                            request.route_id(),
                                             &payload_commitment,
                                             &terminal_node_id,
                                             observed_at,
@@ -12679,6 +12765,16 @@ impl Server {
                     continue;
                 }
             };
+            let request = match prepare_peer_blind_relay_http_request(request).await {
+                Ok(request) => request,
+                Err(error) => {
+                    // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex]
+                    // A locally rejected carrier was never observed by either
+                    // hop, so it remains eligible for another safe route.
+                    last_failure_reason = Some(error.reason_bucket().to_string());
+                    continue;
+                }
+            };
 
             // Once sent, both hops are considered exposed for this envelope
             // even if the ACK is lost. Reusing either node or endpoint network
@@ -12688,7 +12784,13 @@ impl Server {
             used_hops.push(middle.clone());
             used_hops.push(terminal.clone());
             attempted = attempted.saturating_add(1);
-            match client.post(&url).json(&request).send().await {
+            match client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(request.body())
+                .send()
+                .await
+            {
                 Ok(response) if response.status().is_success() => {
                     match decode_bounded_json_response::<PeerBlindRelayResponse>(
                         response,

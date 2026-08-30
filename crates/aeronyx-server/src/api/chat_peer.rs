@@ -158,6 +158,9 @@
 //! - [OUTBOUND-DIRECT-RECEIPT-VERIFICATION 2026-08-31 by Codex] Verifies
 //!   bounded custody receipts outside Tokio while preserving local worker
 //!   failures as non-peer-attributable typed outcomes
+//! - [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex] Serializes each
+//!   opaque blind-relay request once behind bounded CPU admission and carries
+//!   immutable HTTP bytes without retaining a second large request graph
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -1263,6 +1266,34 @@ pub(crate) enum DirectRelayReceiptVerificationFailure {
     Unavailable,
 }
 
+/// Privacy-safe local failure while preparing an outbound blind request.
+///
+/// This is deliberately distinct from a next-hop failure: no HTTP request has
+/// been attempted when one of these variants is returned, so callers must not
+/// penalize a selected peer or mark the route surface as exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlindRelayRequestPreparationFailure {
+    Encoding,
+    BodyTooLarge,
+    Backpressure,
+    Unavailable,
+}
+
+impl BlindRelayRequestPreparationFailure {
+    /// Closed aggregate label safe for relay-health telemetry.
+    #[must_use]
+    pub(crate) const fn reason_bucket(self) -> &'static str {
+        // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex] Preserve
+        // one coarse local bucket across encoding, policy, and worker faults;
+        // the public health surface must not expose request-size distinctions.
+        match self {
+            Self::Encoding | Self::BodyTooLarge | Self::Backpressure | Self::Unavailable => {
+                "onion_request_build_failed"
+            }
+        }
+    }
+}
+
 impl DirectRelayRequestPreparationFailure {
     /// Closed aggregate label safe for route-health telemetry.
     #[must_use]
@@ -1307,6 +1338,30 @@ impl PreparedPeerChatRelayHttpRequest {
 pub(crate) struct PreparedAuthenticatedPeerChatRelayHttpRequest {
     request: PreparedPeerChatRelayHttpRequest,
     request_commitment: [u8; 32],
+}
+
+/// Opaque blind-relay HTTP carrier prepared outside the async I/O runtime.
+///
+/// The full request is dropped after serialization. Retaining only the exact
+/// route id needed for receipt verification avoids holding both a potentially
+/// large onion object graph and its JSON representation during network I/O.
+/// This type intentionally omits `Debug` because its body is encrypted user
+/// data even though the node cannot decrypt it.
+pub(crate) struct PreparedPeerBlindRelayHttpRequest {
+    body: Bytes,
+    route_id: [u8; 16],
+}
+
+impl PreparedPeerBlindRelayHttpRequest {
+    #[must_use]
+    pub(crate) fn body(&self) -> Bytes {
+        self.body.clone()
+    }
+
+    #[must_use]
+    pub(crate) const fn route_id(&self) -> &[u8; 16] {
+        &self.route_id
+    }
 }
 
 impl PreparedAuthenticatedPeerChatRelayHttpRequest {
@@ -2769,6 +2824,36 @@ pub(crate) async fn prepare_peer_chat_relay_request_v3(
         encode_prepared_authenticated_peer_chat_relay_request(&request, request_commitment)
     })
     .await
+}
+
+/// Prepares one blind-relay request outside the asynchronous I/O runtime.
+pub(crate) async fn prepare_peer_blind_relay_http_request(
+    request: PeerBlindRelayRequest,
+) -> Result<PreparedPeerBlindRelayHttpRequest, BlindRelayRequestPreparationFailure> {
+    let permit = blind_relay_crypto_admission()
+        .try_acquire_owned()
+        .map_err(|_| BlindRelayRequestPreparationFailure::Backpressure)?;
+    tokio::task::spawn_blocking(move || {
+        // [OUTBOUND-BLIND-REQUEST-PREPARATION 2026-08-31 by Codex] Keep the
+        // permit in the worker after caller cancellation. Serialization has no
+        // I/O or effects, so abandoning the result is always retry-safe.
+        let _permit = permit;
+        let route_id = request.envelope.route_id;
+        let body = serde_json::to_vec(&request)
+            .map_err(|_| BlindRelayRequestPreparationFailure::Encoding)?;
+        if body.len() > PEER_BLIND_RELAY_REQUEST_BODY_MAX_BYTES {
+            return Err(BlindRelayRequestPreparationFailure::BodyTooLarge);
+        }
+        Ok(PreparedPeerBlindRelayHttpRequest {
+            body: Bytes::from(body),
+            route_id,
+        })
+    })
+    .await
+    .map_err(|_| {
+        warn!("[CHAT_PEER] Outbound blind relay preparation worker failed closed");
+        BlindRelayRequestPreparationFailure::Unavailable
+    })?
 }
 
 fn encode_prepared_peer_chat_relay_request<T: Serialize>(
