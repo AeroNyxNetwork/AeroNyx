@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.42.0-ReplacementWriteLifetime - Bound replacement write
+//! Last Modified: v1.43.0-ReconcileReplyPolicy - Added an exact-action,
+//! attempt-bound write/delete/inventory reconciliation reply state machine.
+//! v1.42.0-ReplacementWriteLifetime - Bound replacement write
 //! receipts to their exact signed admission lifecycle.
 //! v1.41.0-DurableProvisioningCompletion - Added a typed atomic
 //! resolution path for policy-issued aggregate provisioning completion.
@@ -186,13 +188,16 @@ pub use bound_continuation::{
 };
 pub use bound_dispatch::{
     BlindVaultReplicaBoundRuntimeError, BlindVaultReplicaCommittedBoundAttemptDispatch,
-    BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaCompletedReplacement,
-    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaOnionDispatchPlan,
-    BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
-    BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
-    BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaProvisioningReplyOutcome,
-    BlindVaultReplicaProvisioningReplyPolicy, BlindVaultReplicaProvisioningReplyPolicyBuildError,
-    BlindVaultReplicaProvisioningReplyPolicyError, BlindVaultReplicaReplacementAuthorizationError,
+    BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaCompletedReconciliation,
+    BlindVaultReplicaCompletedReplacement, BlindVaultReplicaDurableBoundAttemptDispatch,
+    BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
+    BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaPersistedBoundAttemptJournal,
+    BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaPrivateReplyPolicy,
+    BlindVaultReplicaProvisioningReplyOutcome, BlindVaultReplicaProvisioningReplyPolicy,
+    BlindVaultReplicaProvisioningReplyPolicyBuildError,
+    BlindVaultReplicaProvisioningReplyPolicyError, BlindVaultReplicaReconcileReplyOutcome,
+    BlindVaultReplicaReconcileReplyPolicy, BlindVaultReplicaReconcileReplyPolicyBuildError,
+    BlindVaultReplicaReconcileReplyPolicyError, BlindVaultReplicaReplacementAuthorizationError,
     BlindVaultReplicaReplacementPermitIssueError, BlindVaultReplicaReplacementReplyOutcome,
     BlindVaultReplicaReplacementReplyPolicy, BlindVaultReplicaReplacementReplyPolicyBuildError,
     BlindVaultReplicaReplacementReplyPolicyError,

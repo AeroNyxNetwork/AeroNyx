@@ -35,7 +35,11 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.3.0-ReplacementReplyPolicy - Added a reusable typed
+//! Last Modified: v1.5.0-ReconcileReplyPolicy - Added ordered write/delete and
+//! post-mutation inventory verification for exact reconciliation attempts.
+//! v1.4.0-ProvisioningReplyPolicy - Added bounded aggregate
+//! admission/write/inventory verification for exact provisioning attempts.
+//! v1.3.0-ReplacementReplyPolicy - Added a reusable typed
 //! admission/write/inventory/retirement reply state machine.
 //! v1.2.0-RetirementPermitGate - Required workflow and route
 //! terminal authorization before old-lease retirement can reach transport.
@@ -62,6 +66,7 @@ use crate::crypto::keys::IdentityKeyPair;
 mod attempt_runtime;
 mod onion_transport;
 mod provisioning_reply_policy;
+mod reconcile_reply_policy;
 mod replacement_reply_policy;
 mod request_bound_verifier;
 mod send_sequence;
@@ -80,6 +85,11 @@ pub use provisioning_reply_policy::{
     BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaProvisioningReplyOutcome,
     BlindVaultReplicaProvisioningReplyPolicy, BlindVaultReplicaProvisioningReplyPolicyBuildError,
     BlindVaultReplicaProvisioningReplyPolicyError,
+};
+pub use reconcile_reply_policy::{
+    BlindVaultReplicaCompletedReconciliation, BlindVaultReplicaReconcileReplyOutcome,
+    BlindVaultReplicaReconcileReplyPolicy, BlindVaultReplicaReconcileReplyPolicyBuildError,
+    BlindVaultReplicaReconcileReplyPolicyError,
 };
 pub use replacement_reply_policy::{
     BlindVaultReplicaCompletedReplacement, BlindVaultReplicaReplacementAuthorizationError,

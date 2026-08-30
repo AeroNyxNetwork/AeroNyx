@@ -120,6 +120,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.28.0-BlindVaultReconcileReplyPolicy - Added exact ordered mutation and
+//! post-mutation inventory verification for reconciliation attempts
+//! [BLIND-VAULT-RECONCILE-REPLY-POLICY 2026-08-30 by Codex]
 //! v1.27.0-BlindVaultReplacementPermitComposition - Issued and installed one
 //! exact active-workflow permit for policy and runtime consumption
 //! v1.26.0-BlindVaultDurableReplacement - Added a typed atomic resolution API
