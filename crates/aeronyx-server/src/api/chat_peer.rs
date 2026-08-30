@@ -1274,12 +1274,18 @@ fn peer_chat_relay_auth_v3_signing_data(
 
 /// Serde helper preserving a fixed 64-byte Ed25519 signature representation.
 mod peer_relay_signature_serde {
+    use serde::ser::Error as _;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(value: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error> {
-        let lower: [u8; 32] = value[..32].try_into().expect("fixed signature half");
-        let upper: [u8; 32] = value[32..].try_into().expect("fixed signature half");
-        (lower, upper).serialize(serializer)
+        // [PANIC-FREE-SIGNATURE-SERDE 2026-08-31 by Codex] Preserve the fixed
+        // wire representation while keeping serialization total. Even an
+        // internal shape invariant must become a typed Serde error rather
+        // than an availability-impacting process panic.
+        let (lower, upper) = value.split_at(32);
+        let lower: &[u8; 32] = lower.try_into().map_err(S::Error::custom)?;
+        let upper: &[u8; 32] = upper.try_into().map_err(S::Error::custom)?;
+        (*lower, *upper).serialize(serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 64], D::Error> {
