@@ -8,7 +8,9 @@
 //! exact request binding, live lease state, and source-owned manifests without
 //! retaining credentials, ciphertext, object identifiers, or social metadata.
 //!
-//! Last Modified: v1.1.0-DistilledAdmissionEvidence - Split admission and
+//! Last Modified: v1.2.0-ReplacementLeaseLifetime - Carried the verified
+//! replacement lease window into retirement authorization and evidence.
+//! v1.1.0-DistilledAdmissionEvidence - Split admission and
 //! inventory verification so one-time credentials can be discarded early.
 
 use std::collections::BTreeSet;
@@ -115,6 +117,7 @@ impl BlindVaultVerifiedProvisionedReplica {
         Ok(Self {
             node_id: admission.node_id,
             lease_id: admission.lease_id,
+            lease_expires_at_ms: admission.lease_expires_at_ms,
             accepted_at_ms: admission.accepted_at_ms,
             observed_at_ms: inventory.observed_at_ms(),
         })
@@ -259,6 +262,7 @@ impl BlindVaultReplicaActionEvidence {
             // Preserve the source-compatible constructor but fail closed when
             // the old lease was retired before the replacement became live.
             || replacement.observed_at_ms > retirement.retired_at_ms
+            || replacement.lease_expires_at_ms <= retirement.retired_at_ms
             || retirement.retired_at_ms > now_ms
         {
             return Err(BlindVaultReplicaWorkflowError::EvidenceActionMismatch);
@@ -287,6 +291,7 @@ impl BlindVaultReplicaActionEvidence {
         if retirement.node_id != permit.replaced_node_id
             || retirement.lease_id != permit.replaced_lease_id
             || retirement.retired_at_ms < permit.authorized_at_ms
+            || permit.replacement_expires_at_ms <= retirement.retired_at_ms
             || retirement.retired_at_ms > now_ms
         {
             return Err(BlindVaultReplicaWorkflowError::EvidenceActionMismatch);

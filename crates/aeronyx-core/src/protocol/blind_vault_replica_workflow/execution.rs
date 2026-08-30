@@ -7,7 +7,9 @@
 //! intentionally not a terminal state. Every action must accept cryptographic
 //! evidence, then a fresh planner pass must confirm whole-set convergence.
 //!
-//! Last Modified: v1.1.0-CommittedLateEvidence - Centralized evidence
+//! Last Modified: v1.2.0-ReplacementPermitLifetime - Required the verified
+//! replacement lease to remain live for authorization and transport retry.
+//! v1.1.0-CommittedLateEvidence - Centralized evidence
 //! admission while permitting exact committed attempts to accept late,
 //! cryptographically verified terminal evidence during durable recovery.
 
@@ -403,6 +405,7 @@ impl BlindVaultReplicaExecution {
             || replacement.observed_at_ms < dispatched_at_ms
             || replacement.observed_at_ms > authorized_at_ms
             || replacement.accepted_at_ms > replacement.observed_at_ms
+            || replacement.lease_expires_at_ms <= authorized_at_ms
             || replacement.node_id == replaced_node_id
             || replacement.lease_id == replaced_lease_id
         {
@@ -416,8 +419,52 @@ impl BlindVaultReplicaExecution {
             replaced_lease_id,
             replacement_node_id: replacement.node_id,
             replacement_lease_id: replacement.lease_id,
+            replacement_expires_at_ms: replacement.lease_expires_at_ms,
             authorized_at_ms,
         })
+    }
+
+    /// Revalidates one previously issued permit before retryable transport.
+    ///
+    /// [BLIND-VAULT-REPLACEMENT-PERMIT-RETRY 2026-08-30 by Codex] A transport
+    /// failure does not mint fresh authority. The original capability remains
+    /// usable only while its exact attempt is active, its evidence deadline is
+    /// open, and the verified replacement lease is still live.
+    pub fn validate_replacement_retirement_permit(
+        &self,
+        permit: &BlindVaultReplacementRetirementPermit,
+        now_ms: u64,
+    ) -> Result<(), BlindVaultReplicaWorkflowError> {
+        self.validate_event_time(now_ms)?;
+        let item = self.items[self.item_index(permit.work_id)?];
+        let (attempt, dispatched_at_ms, evidence_deadline_ms) = match item.state {
+            BlindVaultReplicaWorkState::AwaitingEvidence {
+                attempt,
+                dispatched_at_ms,
+                evidence_deadline_ms,
+            } => (attempt, dispatched_at_ms, evidence_deadline_ms),
+            _ => return Err(BlindVaultReplicaWorkflowError::InvalidTransition),
+        };
+        let BlindVaultReplicaAction::ReplaceReplica {
+            node_id: replaced_node_id,
+            lease_id: replaced_lease_id,
+        } = item.action
+        else {
+            return Err(BlindVaultReplicaWorkflowError::InvalidTransition);
+        };
+        if attempt != permit.attempt
+            || replaced_node_id != permit.replaced_node_id
+            || replaced_lease_id != permit.replaced_lease_id
+            || permit.authorized_at_ms < dispatched_at_ms
+            || permit.authorized_at_ms > now_ms
+            || now_ms > evidence_deadline_ms
+            || permit.replacement_expires_at_ms <= now_ms
+            || permit.replacement_node_id == replaced_node_id
+            || permit.replacement_lease_id == replaced_lease_id
+        {
+            return Err(BlindVaultReplicaWorkflowError::ReplacementRetirementNotReady);
+        }
+        Ok(())
     }
 
     /// Accepts only verified evidence matching both the action kind and target.

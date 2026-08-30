@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.36.0-ReplacementPermitComposition - Bound policy and
+//! Last Modified: v1.37.0-ReplacementLeaseLifetime - Preserved and enforced
+//! the verified replacement lease window through retirement completion.
+//! v1.36.0-ReplacementPermitComposition - Bound policy and
 //! runtime retirement to one active-execution-issued permit capability.
 //! v1.35.0-DurableReplacementCompletion - Added a typed durable
 //! path accepting only an unforgeable completed-policy capability.
@@ -586,12 +588,30 @@ pub enum BlindVaultReplicaConvergence {
 
 /// Verified admission plus matching live inventory for one newly provisioned
 /// replica. Private fields prevent callers from manufacturing this evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// [BLIND-VAULT-REPLACEMENT-LEASE-LIFETIME 2026-08-30 by Codex] The distilled
+/// proof retains the signed expiry needed to prevent unsafe delayed retirement,
+/// while Debug keeps replica topology identifiers redacted.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultVerifiedProvisionedReplica {
     pub(super) node_id: [u8; 32],
     pub(super) lease_id: [u8; 32],
+    pub(super) lease_expires_at_ms: u64,
     pub(super) accepted_at_ms: u64,
     pub(super) observed_at_ms: u64,
+}
+
+impl std::fmt::Debug for BlindVaultVerifiedProvisionedReplica {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultVerifiedProvisionedReplica")
+            .field("lease_expires_at_ms", &self.lease_expires_at_ms)
+            .field("accepted_at_ms", &self.accepted_at_ms)
+            .field("observed_at_ms", &self.observed_at_ms)
+            .field("node_id", &"[REDACTED]")
+            .field("lease_id", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Credential-free proof that one anonymous replica admission was accepted.
@@ -651,11 +671,22 @@ impl BlindVaultVerifiedReplicaAdmission {
 /// Private fields prevent a caller from marking replacement complete using a
 /// locally invented node or lease identifier. Construction is available only
 /// through the receipt-verifying implementation in `evidence.rs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultVerifiedRetiredReplica {
     pub(super) node_id: [u8; 32],
     pub(super) lease_id: [u8; 32],
     pub(super) retired_at_ms: u64,
+}
+
+impl std::fmt::Debug for BlindVaultVerifiedRetiredReplica {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultVerifiedRetiredReplica")
+            .field("retired_at_ms", &self.retired_at_ms)
+            .field("node_id", &"[REDACTED]")
+            .field("lease_id", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Evidence-backed permission to retire one replaced replica.
@@ -664,7 +695,11 @@ pub struct BlindVaultVerifiedRetiredReplica {
 /// can only be issued by an active workflow attempt after a distinct new
 /// replica has produced a matching live inventory. It carries no ciphertext,
 /// object identifier, manifest, credential, route, endpoint, or user identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// [BLIND-VAULT-REPLACEMENT-LEASE-LIFETIME 2026-08-30 by Codex] The permit
+/// carries the replacement expiry needed for fail-closed retries and redacts
+/// all topology identifiers from Debug output.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultReplacementRetirementPermit {
     pub(super) work_id: BlindVaultReplicaWorkId,
     pub(super) attempt: u8,
@@ -672,7 +707,24 @@ pub struct BlindVaultReplacementRetirementPermit {
     pub(super) replaced_lease_id: [u8; 32],
     pub(super) replacement_node_id: [u8; 32],
     pub(super) replacement_lease_id: [u8; 32],
+    pub(super) replacement_expires_at_ms: u64,
     pub(super) authorized_at_ms: u64,
+}
+
+impl std::fmt::Debug for BlindVaultReplacementRetirementPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplacementRetirementPermit")
+            .field("attempt", &self.attempt)
+            .field("replacement_expires_at_ms", &self.replacement_expires_at_ms)
+            .field("authorized_at_ms", &self.authorized_at_ms)
+            .field("work_id", &"[REDACTED]")
+            .field("replaced_node_id", &"[REDACTED]")
+            .field("replaced_lease_id", &"[REDACTED]")
+            .field("replacement_node_id", &"[REDACTED]")
+            .field("replacement_lease_id", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl BlindVaultReplacementRetirementPermit {
@@ -710,6 +762,12 @@ impl BlindVaultReplacementRetirementPermit {
     #[must_use]
     pub const fn replacement_lease_id(&self) -> [u8; 32] {
         self.replacement_lease_id
+    }
+
+    /// Terminal-signed expiry bounding safe retirement and transport retry.
+    #[must_use]
+    pub const fn replacement_expires_at_ms(&self) -> u64 {
+        self.replacement_expires_at_ms
     }
 
     /// Source time at which the active attempt authorized retirement.
@@ -750,6 +808,12 @@ impl BlindVaultVerifiedProvisionedReplica {
     #[must_use]
     pub const fn lease_id(&self) -> [u8; 32] {
         self.lease_id
+    }
+
+    /// Terminal-signed lease expiry proven by matching live inventory.
+    #[must_use]
+    pub const fn lease_expires_at_ms(&self) -> u64 {
+        self.lease_expires_at_ms
     }
 
     /// Terminal-signed admission time.

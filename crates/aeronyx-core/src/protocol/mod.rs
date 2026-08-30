@@ -69,6 +69,8 @@
 //!   durable path for complete policy-issued replacement capabilities.
 //! - [BLIND-VAULT-REPLACEMENT-PERMIT-COMPOSITION 2026-08-30 by Codex] Bound
 //!   policy authorization and runtime retirement to one workflow permit.
+//! - [BLIND-VAULT-REPLACEMENT-LEASE-LIFETIME 2026-08-30 by Codex] Prevented
+//!   authorization, retry, or completion after replacement lease expiry.
 //!
 //! ## Main Functionality
 //!

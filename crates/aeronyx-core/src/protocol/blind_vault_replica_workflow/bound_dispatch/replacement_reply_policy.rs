@@ -37,7 +37,9 @@
 //! - Never add a transition that accepts retirement before verified inventory.
 //! - Never expose request, receipt, manifest, node, or lease values in Debug.
 //!
-//! Last Modified: v1.2.0-WorkflowPermitComposition - Issued and installed one
+//! Last Modified: v1.3.0-RetryablePermitComposition - Revalidated and reused
+//! the same live replacement permit after retryable transport failure.
+//! v1.2.0-WorkflowPermitComposition - Issued and installed one
 //! exact active-execution permit for both policy and runtime use.
 //! v1.1.0-CompletedReplacementCapability - Restricted durable
 //! replacement completion to evidence emitted by the full policy state machine.
@@ -252,33 +254,41 @@ impl<Clock> BlindVaultReplicaReplacementReplyPolicy<Clock> {
         Ok(())
     }
 
-    /// Issues and installs one exact active-workflow retirement permit.
+    /// Issues or revalidates one exact active-workflow retirement permit.
     ///
     /// [BLIND-VAULT-REPLACEMENT-PERMIT-COMPOSITION 2026-08-30 by Codex]
     /// The returned copy is the same capability retained by this policy and
-    /// must be passed to the runtime's permit-gated retirement send. Callers
-    /// no longer independently select work or replacement identity.
+    /// must be passed to the runtime's permit-gated retirement send. A retry
+    /// reuses that capability after the workflow confirms both its attempt and
+    /// replacement lease remain live; callers never reconstruct authority.
     pub fn authorize_retirement_from_execution(
         &mut self,
         execution: &BlindVaultReplicaExecution,
         authorized_at_ms: u64,
     ) -> Result<BlindVaultReplacementRetirementPermit, BlindVaultReplicaReplacementPermitIssueError>
     {
-        let BlindVaultReplicaReplacementReplyState::ReplacementVerified {
-            binding,
-            replacement,
-        } = self.state
-        else {
-            return Err(BlindVaultReplicaReplacementPermitIssueError::Authorization(
+        match self.state {
+            BlindVaultReplicaReplacementReplyState::ReplacementVerified {
+                binding,
+                replacement,
+            } => {
+                let permit = execution
+                    .replacement_retirement_permit(binding.work_id, &replacement, authorized_at_ms)
+                    .map_err(BlindVaultReplicaReplacementPermitIssueError::Workflow)?;
+                self.authorize_retirement(permit)
+                    .map_err(BlindVaultReplicaReplacementPermitIssueError::Authorization)?;
+                Ok(permit)
+            }
+            BlindVaultReplicaReplacementReplyState::RetirementAuthorized { permit, .. } => {
+                execution
+                    .validate_replacement_retirement_permit(&permit, authorized_at_ms)
+                    .map_err(BlindVaultReplicaReplacementPermitIssueError::Workflow)?;
+                Ok(permit)
+            }
+            _ => Err(BlindVaultReplicaReplacementPermitIssueError::Authorization(
                 BlindVaultReplicaReplacementAuthorizationError::StageMismatch,
-            ));
-        };
-        let permit = execution
-            .replacement_retirement_permit(binding.work_id, &replacement, authorized_at_ms)
-            .map_err(BlindVaultReplicaReplacementPermitIssueError::Workflow)?;
-        self.authorize_retirement(permit)
-            .map_err(BlindVaultReplicaReplacementPermitIssueError::Authorization)?;
-        Ok(permit)
+            )),
+        }
     }
 
     /// Whether verified replacement and retirement evidence are complete.
