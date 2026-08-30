@@ -143,6 +143,9 @@
 //! - [BLIND-TERMINAL-PROOF-COMPLETION 2026-08-30 by Codex] Commits and signs
 //!   terminal delivery evidence together with its hop-local success response
 //!   in one worker after durable terminal acceptance
+//! - [BLIND-FAILURE-SIGNING-COMPLETION 2026-08-30 by Codex] Signs only
+//!   authenticated failure receipts outside Tokio and degrades worker faults
+//!   to retryable unsigned backpressure rather than false downgrade evidence
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -347,6 +350,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.79.0-FailureSigningCompletion - Complete failure response fields and
+//! move authenticated receipt signing into bounded completion workers
 //! v0.78.0-TerminalProofCompletion - Co-locate terminal payload commitment and
 //! both receipt signatures in one bounded completion operation
 //! v0.77.0-SuccessSigningCompletion - Move success receipt hashing and Ed25519
@@ -2071,23 +2076,22 @@ async fn peer_blind_relay_handler(
             state
                 .peer_store
                 .record_blind_relay_rejected(now_secs(), error.reason_bucket());
-            return blind_relay_failure_response(
-                error,
-                failure_route_id,
-                None,
-                node_identity.as_ref(),
-            );
+            return blind_relay_failure_response(error, failure_route_id, None, node_identity)
+                .await;
         }
     };
     let failure_request_commitment = authenticated.failure_request_commitment;
     match process_authenticated_peer_blind_relay(state, authenticated).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(error) => blind_relay_failure_response(
-            error,
-            failure_route_id,
-            Some(failure_request_commitment),
-            node_identity.as_ref(),
-        ),
+        Err(error) => {
+            blind_relay_failure_response(
+                error,
+                failure_route_id,
+                Some(failure_request_commitment),
+                node_identity,
+            )
+            .await
+        }
     }
 }
 
@@ -2096,24 +2100,55 @@ async fn peer_blind_relay_handler(
 ///
 /// [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] `None` is a security
 /// boundary, not legacy absence: pre-authentication failures must stay unsigned.
-fn blind_relay_failure_response(
+async fn blind_relay_failure_response(
     error: BlindRelayError,
     route_id: [u8; 16],
     authenticated_request_commitment: Option<[u8; 32]>,
-    node_identity: &IdentityKeyPair,
+    node_identity: Arc<IdentityKeyPair>,
 ) -> Response {
+    let status = error.status_code();
     let reason = error.reason_bucket();
-    let failure_receipt = authenticated_request_commitment.map(|request_commitment| {
-        BlindRelayFailureReceipt::failed(
+    let Some(request_commitment) = authenticated_request_commitment else {
+        return build_blind_relay_failure_response(status, reason, None);
+    };
+    let failed_at = now_secs();
+    let failure_receipt = match complete_blind_relay_crypto(move || {
+        // [BLIND-FAILURE-SIGNING-COMPLETION 2026-08-30 by Codex] Possession
+        // of the precomputed commitment proves the request crossed the private
+        // authenticated boundary. No envelope or peer-controlled bytes enter
+        // this signing worker.
+        Ok(BlindRelayFailureReceipt::failed(
             route_id,
             request_commitment,
             reason,
-            now_secs(),
-            node_identity,
-        )
-    });
+            failed_at,
+            node_identity.as_ref(),
+        ))
+    })
+    .await
+    {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            // An unsigned declared protocol failure would look like a signed
+            // feature downgrade. A bare retryable 429 carries no blame and
+            // lets the exact durable request recover on its next attempt.
+            return build_blind_relay_failure_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                BlindRelayError::Backpressure.reason_bucket(),
+                None,
+            );
+        }
+    };
+    build_blind_relay_failure_response(status, reason, Some(failure_receipt))
+}
+
+fn build_blind_relay_failure_response(
+    status: StatusCode,
+    reason: &'static str,
+    failure_receipt: Option<BlindRelayFailureReceipt>,
+) -> Response {
     (
-        error.status_code(),
+        status,
         Json(PeerBlindRelayResponse {
             accepted: false,
             terminal: false,
@@ -2121,7 +2156,9 @@ fn blind_relay_failure_response(
             ttl_remaining: 0,
             reason: Some(reason.to_string()),
             delivery_receipt: None,
+            success_receipt: None,
             failure_receipt,
+            opaque_terminal_response_b64: None,
         }),
     )
         .into_response()
