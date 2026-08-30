@@ -128,6 +128,9 @@
 //! - [RELAY-STORAGE-ADMISSION 2026-08-30 by Codex] Reserves bounded ChatRelay
 //!   or Blind Vault execution before arming terminal effects, then keeps each
 //!   permit inside its blocking worker through durable completion
+//! - [BLIND-RELAY-CRYPTO-DOMAIN 2026-08-30 by Codex] Composes previous-hop
+//!   verification, onion peeling, and deterministic onward signing behind one
+//!   bounded CPU domain outside the asynchronous I/O runtime
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -332,6 +335,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.72.0-BlindRelayCryptoDomain - Bound onion peel and deterministic onward
+//! signing with the same fail-fast CPU admission as blind authentication
 //! v0.71.0-RelayStorageAdmission - Move synchronous terminal SQLite work out
 //! of async workers and reserve bounded execution before effect arming
 //! v0.70.0-DirectRelayVerifyAdmission - Bound all direct-relay signature work
@@ -606,16 +611,16 @@ const HTTP_TOO_EARLY_STATUS_CODE: u16 = 425;
 /// jitter at the transport/client layer.
 const MAX_IN_FLIGHT_BLIND_RELAY_REQUESTS: usize = 64;
 
-/// Hard ceiling for concurrent previous-hop signature verification workers.
+/// Hard ceiling for concurrent blind-relay cryptographic workers.
 ///
 /// [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] The runtime derives a
 /// smaller CPU-aware value from this cap. Keeping it below the HTTP in-flight
-/// ceiling prevents large, invalid but syntactically valid envelopes from
+/// ceiling prevents signature, onion peel, or forwarding-signature work from
 /// occupying Tokio workers or creating an unbounded blocking-task backlog.
-const MAX_BLIND_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT: usize = 8;
+const MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT: usize = 8;
 
-/// Process-wide admission for CPU-bound blind-relay authentication.
-static BLIND_RELAY_SIGNATURE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+/// Process-wide admission for CPU-bound blind-relay cryptography.
+static BLIND_RELAY_CRYPTO_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Hard ceiling for concurrent direct-relay signature verification workers.
 ///
@@ -2265,15 +2270,42 @@ fn signature_verification_capacity(hard_cap: usize) -> usize {
         .min(hard_cap)
 }
 
-fn blind_relay_signature_admission() -> Arc<Semaphore> {
-    Arc::clone(BLIND_RELAY_SIGNATURE_ADMISSION.get_or_init(|| {
+fn blind_relay_crypto_admission() -> Arc<Semaphore> {
+    Arc::clone(BLIND_RELAY_CRYPTO_ADMISSION.get_or_init(|| {
         // [BLIND-RELAY-VERIFY-ADMISSION 2026-08-21 by Codex] Reserve roughly
         // half the host for the rest of the node and reject excess work before
         // it enters Tokio's blocking queue.
         Arc::new(Semaphore::new(signature_verification_capacity(
-            MAX_BLIND_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT,
+            MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT,
         )))
     }))
+}
+
+/// Executes one bounded blind-relay cryptographic operation off the async I/O
+/// runtime. Work must remain pure with respect to network and durable storage.
+async fn run_blind_relay_crypto<T, F>(work: F) -> Result<T, BlindRelayError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, BlindRelayError> + Send + 'static,
+{
+    let permit = blind_relay_crypto_admission()
+        .try_acquire_owned()
+        .map_err(|_| BlindRelayError::Backpressure)?;
+    match tokio::task::spawn_blocking(move || {
+        // [BLIND-RELAY-CRYPTO-DOMAIN 2026-08-30 by Codex] Keep the owned
+        // permit in the worker after request cancellation. This helper must
+        // never contain I/O or durable effects, so retries remain safe.
+        let _permit = permit;
+        work()
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("[CHAT_PEER] Blind relay crypto worker failed closed");
+            Err(BlindRelayError::Backpressure)
+        }
+    }
 }
 
 fn direct_relay_signature_admission() -> Arc<Semaphore> {
@@ -2349,7 +2381,7 @@ async fn authenticate_direct_peer_relay_request(
 async fn authenticate_peer_blind_relay_request(
     request: PeerBlindRelayRequest,
 ) -> Result<AuthenticatedPeerBlindRelayRequest, BlindRelayError> {
-    authenticate_peer_blind_relay_request_with_admission(blind_relay_signature_admission(), request)
+    authenticate_peer_blind_relay_request_with_admission(blind_relay_crypto_admission(), request)
         .await
 }
 
@@ -2396,8 +2428,39 @@ async fn authenticate_peer_blind_relay_request_with_admission(
     }
 }
 
+#[derive(Clone, Copy)]
+struct BlindRelayForwardSeed {
+    route_id: [u8; 16],
+    ttl: u8,
+    timestamp: u64,
+}
+
+impl From<&BlindRelayEnvelope> for BlindRelayForwardSeed {
+    fn from(envelope: &BlindRelayEnvelope) -> Self {
+        Self {
+            route_id: envelope.route_id,
+            ttl: envelope.ttl,
+            timestamp: envelope.timestamp,
+        }
+    }
+}
+
 fn build_forwarded_onion_envelope(
     envelope: &BlindRelayEnvelope,
+    next_hop: [u8; 32],
+    inner: Vec<u8>,
+    node_identity: &IdentityKeyPair,
+) -> BlindRelayEnvelope {
+    build_forwarded_onion_envelope_from_seed(
+        BlindRelayForwardSeed::from(envelope),
+        next_hop,
+        inner,
+        node_identity,
+    )
+}
+
+fn build_forwarded_onion_envelope_from_seed(
+    seed: BlindRelayForwardSeed,
     next_hop: [u8; 32],
     inner: Vec<u8>,
     node_identity: &IdentityKeyPair,
@@ -2406,11 +2469,11 @@ fn build_forwarded_onion_envelope(
     // from authenticated ingress state. Ed25519 signing is deterministic, so
     // an exact restart retry generates the same downstream request commitment.
     BlindRelayEnvelope {
-        route_id: envelope.route_id,
+        route_id: seed.route_id,
         next_hop,
-        ttl: envelope.ttl.saturating_sub(1),
+        ttl: seed.ttl.saturating_sub(1),
         encrypted_blob: inner,
-        timestamp: envelope.timestamp,
+        timestamp: seed.timestamp,
         signature: [0u8; 64],
     }
     .sign_with(node_identity)
@@ -2729,6 +2792,7 @@ async fn process_onion_blind_relay(
     route_started_at: &Instant,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
     let self_node_id = state.node_identity.public_key_bytes();
+    let envelope = Arc::new(envelope);
 
     // Per-route replay/dedup, identical to the opaque terminal/forward paths.
     let mut route_lease = match begin_blind_relay_route(
@@ -2754,12 +2818,19 @@ async fn process_onion_blind_relay(
     // window (forward secrecy — see services::onion_keys). A failure yields a
     // coarse bucket only, never a payload leak.
     let onion_secrets = crate::services::onion_keys::peel_secrets(now);
-    let peel = match try_open_onion_layer(&envelope.encrypted_blob, &onion_secrets) {
+    let encrypted_envelope = Arc::clone(&envelope);
+    let peel = match run_blind_relay_crypto(move || {
+        try_open_onion_layer(&encrypted_envelope.encrypted_blob, &onion_secrets)
+            .map_err(|_| BlindRelayError::OnionPeelFailed)
+    })
+    .await
+    {
         Ok(peel) => peel,
-        Err(_) => {
+        Err(BlindRelayError::OnionPeelFailed) => {
             reject_blind_relay_previous_hop(&state, previous_hop_node_id, now, "onion_peel_failed");
             return Err(BlindRelayError::OnionPeelFailed);
         }
+        Err(error) => return Err(error),
     };
 
     match peel.next_hop {
@@ -2920,12 +2991,17 @@ async fn process_onion_blind_relay(
             // hop. A restart retry must produce byte-identical signed onward
             // input so the downstream node can replay its durable ACK without
             // repeating terminal storage or another network effect.
-            let forwarded_envelope = build_forwarded_onion_envelope(
-                &envelope,
-                next_hop,
-                peel.inner,
-                state.node_identity.as_ref(),
-            );
+            let forward_seed = BlindRelayForwardSeed::from(envelope.as_ref());
+            let forwarding_identity = Arc::clone(&state.node_identity);
+            let forwarded_envelope = run_blind_relay_crypto(move || {
+                Ok(build_forwarded_onion_envelope_from_seed(
+                    forward_seed,
+                    next_hop,
+                    peel.inner,
+                    forwarding_identity.as_ref(),
+                ))
+            })
+            .await?;
             let ttl_remaining = forwarded_envelope.ttl;
 
             let forward_started_at = blind_relay_response_observed_at(now, route_started_at);
