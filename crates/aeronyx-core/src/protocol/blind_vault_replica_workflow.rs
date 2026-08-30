@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.39.0-ProvisioningLeaseLifetime - Required every newly
+//! Last Modified: v1.40.0-ProvisioningReplyPolicy - Added an exact-count,
+//! attempt-bound aggregate admission/write/inventory reply state machine.
+//! v1.39.0-ProvisioningLeaseLifetime - Required every newly
 //! provisioned replica lease to remain live at aggregate evidence creation.
 //! v1.38.0-AuthorizedRetirementDispatch - Joined active
 //! workflow authority, permit-gated transport, and exact reply verification.
@@ -180,13 +182,15 @@ pub use bound_continuation::{
 };
 pub use bound_dispatch::{
     BlindVaultReplicaBoundRuntimeError, BlindVaultReplicaCommittedBoundAttemptDispatch,
-    BlindVaultReplicaCompletedReplacement, BlindVaultReplicaDurableBoundAttemptDispatch,
-    BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
-    BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaPersistedBoundAttemptJournal,
-    BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaPrivateReplyPolicy,
-    BlindVaultReplicaReplacementAuthorizationError, BlindVaultReplicaReplacementPermitIssueError,
-    BlindVaultReplicaReplacementReplyOutcome, BlindVaultReplicaReplacementReplyPolicy,
-    BlindVaultReplicaReplacementReplyPolicyBuildError,
+    BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaCompletedReplacement,
+    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaOnionDispatchPlan,
+    BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
+    BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
+    BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaProvisioningReplyOutcome,
+    BlindVaultReplicaProvisioningReplyPolicy, BlindVaultReplicaProvisioningReplyPolicyBuildError,
+    BlindVaultReplicaProvisioningReplyPolicyError, BlindVaultReplicaReplacementAuthorizationError,
+    BlindVaultReplicaReplacementPermitIssueError, BlindVaultReplicaReplacementReplyOutcome,
+    BlindVaultReplicaReplacementReplyPolicy, BlindVaultReplicaReplacementReplyPolicyBuildError,
     BlindVaultReplicaReplacementReplyPolicyError,
     BlindVaultReplicaReplacementRetirementDispatchError, BlindVaultReplicaRequestBoundReply,
     BlindVaultReplicaRequestBoundReplyError, BlindVaultReplicaRequestBoundReplyVerifier,

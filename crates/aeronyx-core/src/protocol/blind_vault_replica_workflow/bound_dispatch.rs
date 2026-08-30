@@ -61,6 +61,7 @@ use crate::crypto::keys::IdentityKeyPair;
 
 mod attempt_runtime;
 mod onion_transport;
+mod provisioning_reply_policy;
 mod replacement_reply_policy;
 mod request_bound_verifier;
 mod send_sequence;
@@ -74,6 +75,11 @@ pub use onion_transport::{
     BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
     BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaVerifiedOnionTransport,
     BlindVaultReplicaVerifiedOnionTransportError,
+};
+pub use provisioning_reply_policy::{
+    BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaProvisioningReplyOutcome,
+    BlindVaultReplicaProvisioningReplyPolicy, BlindVaultReplicaProvisioningReplyPolicyBuildError,
+    BlindVaultReplicaProvisioningReplyPolicyError,
 };
 pub use replacement_reply_policy::{
     BlindVaultReplicaCompletedReplacement, BlindVaultReplicaReplacementAuthorizationError,
