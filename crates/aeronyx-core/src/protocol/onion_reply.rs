@@ -100,6 +100,15 @@ pub const MAX_ONION_SEALED_RESPONSE_BYTES: usize = RESPONSE_HEADER_BYTES
     + ONION_REPLY_RESPONSE_SIZE_CLASSES[ONION_REPLY_RESPONSE_SIZE_CLASSES.len() - 1]
     + AEAD_TAG_BYTES;
 
+/// Exact upper bound after standard padded base64 encoding.
+///
+/// [ONION-REPLY-BASE64-BOUND 2026-08-30 by Codex] Peer JSON transport and
+/// restart-durable ACK storage both carry this encoding. Keeping the expansion
+/// formula in the core wire domain prevents those independent boundaries from
+/// drifting when response classes change.
+pub const MAX_ONION_SEALED_RESPONSE_BASE64_BYTES: usize =
+    ((MAX_ONION_SEALED_RESPONSE_BYTES + 2) / 3) * 4;
+
 /// Relay-visible terminal-proof behavior requested by the source.
 ///
 /// [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] Version 1 preserves the

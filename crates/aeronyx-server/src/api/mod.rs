@@ -336,7 +336,7 @@ const BLIND_RELAY_ACK_METADATA_MAX_BYTES: usize = PEER_ACK_RESPONSE_MAX_BYTES;
 
 /// Maximum base64 length of the protocol-bounded opaque terminal response.
 const BLIND_RELAY_ACK_OPAQUE_RESPONSE_MAX_BYTES: usize =
-    ((aeronyx_core::protocol::MAX_ONION_SEALED_RESPONSE_BYTES + 2) / 3) * 4;
+    aeronyx_core::protocol::MAX_ONION_SEALED_RESPONSE_BASE64_BYTES;
 
 /// Maximum Blind Relay acknowledgement accepted by its bounded decoder.
 ///

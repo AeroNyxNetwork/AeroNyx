@@ -370,7 +370,8 @@ pub use onion_reply::{
     decode_onion_reply_request, decode_onion_sealed_response, encode_onion_reply_request,
     encode_onion_sealed_response, is_onion_reply_request, open_onion_reply, seal_onion_reply,
     OnionReplyError, OnionReplyPayload, OnionReplyProofMode, OnionReplyRequest, OnionReplySession,
-    OnionSealedResponse, MAX_ONION_REPLY_REQUEST_PAYLOAD_BYTES, MAX_ONION_SEALED_RESPONSE_BYTES,
+    OnionSealedResponse, MAX_ONION_REPLY_REQUEST_PAYLOAD_BYTES,
+    MAX_ONION_SEALED_RESPONSE_BASE64_BYTES, MAX_ONION_SEALED_RESPONSE_BYTES,
     ONION_REPLY_RESPONSE_SIZE_CLASSES,
 };
 pub use version::{ProtocolVersion, CURRENT_PROTOCOL_VERSION};
