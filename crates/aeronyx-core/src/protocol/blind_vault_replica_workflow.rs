@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.43.0-ReconcileReplyPolicy - Added an exact-action,
+//! Last Modified: v1.44.0-DurableReconciliationCompletion - Added typed atomic
+//! resolution for policy-issued inventory reconciliation completion.
+//! v1.43.0-ReconcileReplyPolicy - Added an exact-action,
 //! attempt-bound write/delete/inventory reconciliation reply state machine.
 //! v1.42.0-ReplacementWriteLifetime - Bound replacement write
 //! receipts to their exact signed admission lifecycle.

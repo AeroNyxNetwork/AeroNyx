@@ -15,6 +15,7 @@
 //! - Accepts verified evidence and seals the resulting workflow snapshot.
 //! - Accepts typed completed-replacement capabilities without reopening proof.
 //! - Accepts typed aggregate-provisioning completion capabilities.
+//! - Accepts typed inventory-reconciliation completion capabilities.
 //! - Records bounded failure and retry disposition through the same boundary.
 //! - Resolves the exact journal and snapshot in one recovery-store operation.
 //! - Restores the prior in-memory state after sealing or persistence failure.
@@ -42,7 +43,9 @@
 //!   exact idempotent retry is required and is supported by the store contract.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.3.0-DurableProvisioningCompletion - Added a typed durable
+//! Last Modified: v1.4.0-DurableReconciliationCompletion - Added a typed
+//! durable boundary for completed write/delete/inventory reconciliation.
+//! v1.3.0-DurableProvisioningCompletion - Added a typed durable
 //! boundary for complete aggregate provisioning reply policies.
 //! v1.2.0-DurableReplacementCompletion - Added a typed durable
 //! boundary for evidence emitted by the complete replacement reply policy.
@@ -59,11 +62,11 @@ use zeroize::{Zeroize, Zeroizing};
 use super::{
     persistence::sealed_record_commitment, BlindVaultReplicaActionEvidence,
     BlindVaultReplicaAttemptJournal, BlindVaultReplicaCompletedProvisioning,
-    BlindVaultReplicaCompletedReplacement, BlindVaultReplicaDispatchFailure,
-    BlindVaultReplicaDurableAttemptDispatch, BlindVaultReplicaExecution,
-    BlindVaultReplicaPreparedAttemptJournal, BlindVaultReplicaRecoveryStore,
-    BlindVaultReplicaSnapshotRecord, BlindVaultReplicaWorkId, BlindVaultReplicaWorkState,
-    BlindVaultReplicaWorkflowError,
+    BlindVaultReplicaCompletedReconciliation, BlindVaultReplicaCompletedReplacement,
+    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDurableAttemptDispatch,
+    BlindVaultReplicaExecution, BlindVaultReplicaPreparedAttemptJournal,
+    BlindVaultReplicaRecoveryStore, BlindVaultReplicaSnapshotRecord, BlindVaultReplicaWorkId,
+    BlindVaultReplicaWorkState, BlindVaultReplicaWorkflowError,
 };
 use crate::crypto::keys::IdentityKeyPair;
 
@@ -261,6 +264,35 @@ impl BlindVaultReplicaAttemptJournal {
 }
 
 impl BlindVaultReplicaExecution {
+    /// Atomically resolves one fully verified inventory reconciliation attempt.
+    ///
+    /// [BLIND-VAULT-DURABLE-RECONCILIATION-COMPLETION 2026-08-30 by Codex]
+    /// The capability is constructible only after ordered writes and deletes
+    /// complete and one fresh terminal inventory matches the exact private
+    /// manifest without predating any accepted mutation.
+    pub fn accept_completed_reconciliation_durably<Store>(
+        &mut self,
+        identity: &IdentityKeyPair,
+        store: &mut Store,
+        binding: &BlindVaultReplicaCommittedAttemptBinding,
+        completed: &BlindVaultReplicaCompletedReconciliation,
+        snapshot_sequence: u64,
+    ) -> Result<
+        BlindVaultReplicaDurableResolution,
+        BlindVaultReplicaDurableResolutionError<Store::Error>,
+    >
+    where
+        Store: BlindVaultReplicaRecoveryStore,
+    {
+        self.accept_evidence_durably(
+            identity,
+            store,
+            binding,
+            completed.evidence(),
+            snapshot_sequence,
+        )
+    }
+
     /// Atomically resolves one fully verified aggregate provisioning attempt.
     ///
     /// [BLIND-VAULT-DURABLE-PROVISIONING-COMPLETION 2026-08-30 by Codex] The

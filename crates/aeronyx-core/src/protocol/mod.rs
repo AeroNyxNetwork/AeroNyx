@@ -120,6 +120,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.29.0-BlindVaultDurableReconciliation - Added typed atomic resolution for
+//! completed reconciliation reply policies
+//! [BLIND-VAULT-DURABLE-RECONCILIATION-COMPLETION 2026-08-30 by Codex]
 //! v1.28.0-BlindVaultReconcileReplyPolicy - Added exact ordered mutation and
 //! post-mutation inventory verification for reconciliation attempts
 //! [BLIND-VAULT-RECONCILE-REPLY-POLICY 2026-08-30 by Codex]
