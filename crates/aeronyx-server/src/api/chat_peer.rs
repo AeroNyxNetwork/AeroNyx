@@ -155,6 +155,9 @@
 //! - [OUTBOUND-DIRECT-REQUEST-PREPARATION 2026-08-31 by Codex] Prepares
 //!   authenticated v2/v3 outbound requests behind fail-fast bounded crypto
 //!   admission, leaving peer selection and HTTP I/O in the server runtime
+//! - [OUTBOUND-DIRECT-RECEIPT-VERIFICATION 2026-08-31 by Codex] Verifies
+//!   bounded custody receipts outside Tokio while preserving local worker
+//!   failures as non-peer-attributable typed outcomes
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -1245,6 +1248,15 @@ enum DirectRelayCryptoFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectRelayRequestPreparationFailure {
     Encoding,
+    Backpressure,
+    Unavailable,
+}
+
+/// Local bounded-worker failure or remote cryptographic rejection for one
+/// direct custody receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectRelayReceiptVerificationFailure {
+    Invalid(&'static str),
     Backpressure,
     Unavailable,
 }
@@ -2697,6 +2709,34 @@ pub(crate) async fn prepare_peer_chat_relay_request_v3(
         )
     })
     .await
+}
+
+/// Verifies a signed direct-custody receipt outside the async I/O runtime.
+pub(crate) async fn verify_peer_chat_relay_receipt(
+    receipt: PeerChatRelayReceiptV2,
+    expected_request_commitment: [u8; 32],
+    expected_node_id: [u8; 32],
+    observed_at: u64,
+) -> Result<(), DirectRelayReceiptVerificationFailure> {
+    // [OUTBOUND-DIRECT-RECEIPT-VERIFICATION 2026-08-31 by Codex] A response
+    // body has already been bounded before this call. Fail fast when the local
+    // CPU partition is full; the caller may repeat the exact v3 request, but
+    // must not attribute local saturation to the selected peer.
+    let permit = direct_relay_signature_admission()
+        .try_acquire_owned()
+        .map_err(|_| DirectRelayReceiptVerificationFailure::Backpressure)?;
+    execute_direct_relay_crypto(permit, move || {
+        receipt.verify_expected_commitment(
+            &expected_request_commitment,
+            &expected_node_id,
+            observed_at,
+        )
+    })
+    .await
+    .map_err(|DirectRelayCryptoFailure::Unavailable| {
+        DirectRelayReceiptVerificationFailure::Unavailable
+    })?
+    .map_err(DirectRelayReceiptVerificationFailure::Invalid)
 }
 
 async fn prepare_direct_peer_relay_request<T, F>(

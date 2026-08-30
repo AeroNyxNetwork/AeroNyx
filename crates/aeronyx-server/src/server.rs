@@ -986,9 +986,10 @@ use crate::api::blind_vault::build_blind_vault_router;
 use crate::api::chat_handlers::build_chat_router;
 use crate::api::chat_peer::{
     build_chat_peer_router, prepare_peer_chat_relay_request_v2,
-    prepare_peer_chat_relay_request_v3, PeerBlindRelayRequest, PeerBlindRelayResponse,
-    PeerChatRelayRequest, PeerChatRelayRequestV2, PeerChatRelayRequestV3, PeerChatRelayResponse,
-    PeerChatRelayResponseV2,
+    prepare_peer_chat_relay_request_v3, verify_peer_chat_relay_receipt,
+    DirectRelayReceiptVerificationFailure, PeerBlindRelayRequest, PeerBlindRelayResponse,
+    PeerChatRelayRequest, PeerChatRelayRequestV2, PeerChatRelayRequestV3,
+    PeerChatRelayResponse, PeerChatRelayResponseV2,
 };
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
@@ -1120,8 +1121,9 @@ const HTTP_TOO_EARLY_STATUS_CODE: u16 = 425;
 ///
 /// [DIRECT-RELAY-ACK-LOSS 2026-08-15 by Codex] Keep this typed until the route
 /// health boundary so retry policy cannot depend on strings or peer-controlled
-/// response content. Only body-read and JSON truncation are ambiguous: size,
-/// rejection, and cryptographic failures are deterministic protocol failures.
+/// response content. Body-read/JSON truncation and local verifier availability
+/// are retryable; remote rejection and invalid cryptographic evidence are
+/// deterministic protocol failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectPeerRelayAckFailure {
     Bounded(BoundedHttpResponseError),
@@ -1129,6 +1131,8 @@ enum DirectPeerRelayAckFailure {
     ReceiptRequestMissing,
     ReceiptMissing,
     ReceiptInvalid(&'static str),
+    VerificationBackpressure,
+    VerificationUnavailable,
 }
 
 impl DirectPeerRelayAckFailure {
@@ -1137,7 +1141,15 @@ impl DirectPeerRelayAckFailure {
             self,
             Self::Bounded(
                 BoundedHttpResponseError::BodyRead | BoundedHttpResponseError::JsonDecode
-            )
+            ) | Self::VerificationBackpressure
+                | Self::VerificationUnavailable
+        )
+    }
+
+    const fn is_local_runtime_failure(self) -> bool {
+        matches!(
+            self,
+            Self::VerificationBackpressure | Self::VerificationUnavailable
         )
     }
 
@@ -1148,7 +1160,57 @@ impl DirectPeerRelayAckFailure {
             Self::ReceiptRequestMissing => "peer_relay_receipt_request_missing".to_string(),
             Self::ReceiptMissing => "peer_relay_receipt_missing".to_string(),
             Self::ReceiptInvalid(reason) => format!("peer_relay_{reason}"),
+            // Preserve the existing closed aggregate vocabulary. Attribution
+            // remains typed, so these local faults never affect peer health.
+            Self::VerificationBackpressure | Self::VerificationUnavailable => {
+                "peer_relay_request_unknown".to_string()
+            }
         }
+    }
+}
+
+/// Whether a direct delivery failure is evidence about the selected peer.
+///
+/// [DIRECT-RELAY-LOCAL-FAULT-ATTRIBUTION 2026-08-31 by Codex] Keep this typed
+/// until both route reputation and circuit state have consumed it. Strings
+/// cannot safely distinguish local scheduler pressure from remote failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPeerRelayFailureAttribution {
+    LocalRuntime,
+    SelectedPeer,
+}
+
+#[derive(Debug)]
+struct DirectPeerRelayDeliveryFailure {
+    reason: String,
+    attribution: DirectPeerRelayFailureAttribution,
+}
+
+impl DirectPeerRelayDeliveryFailure {
+    fn selected_peer(reason: String) -> Self {
+        Self {
+            reason,
+            attribution: DirectPeerRelayFailureAttribution::SelectedPeer,
+        }
+    }
+
+    fn from_ack(error: DirectPeerRelayAckFailure) -> Self {
+        let attribution = if error.is_local_runtime_failure() {
+            DirectPeerRelayFailureAttribution::LocalRuntime
+        } else {
+            DirectPeerRelayFailureAttribution::SelectedPeer
+        };
+        Self {
+            reason: error.privacy_safe_reason(),
+            attribution,
+        }
+    }
+
+    const fn affects_peer_reputation(&self) -> bool {
+        matches!(
+            self.attribution,
+            DirectPeerRelayFailureAttribution::SelectedPeer
+        )
     }
 }
 
@@ -1167,6 +1229,10 @@ impl TargetBoundPeerRelayFailure {
             Self::Http(status) => status.as_u16() == HTTP_TOO_EARLY_STATUS_CODE,
             Self::Ack(error) => error.retryable_after_ambiguous_delivery(),
         }
+    }
+
+    fn is_local_runtime_failure(&self) -> bool {
+        matches!(self, Self::Ack(error) if error.is_local_runtime_failure())
     }
 }
 
@@ -1195,6 +1261,13 @@ impl TargetBoundPeerRelayDeliveryOutcome {
             .as_ref()
             .err()
             .is_some_and(|error| !error.retryable_after_ambiguous_delivery())
+    }
+
+    fn local_runtime_failure(&self) -> bool {
+        self.result
+            .as_ref()
+            .err()
+            .is_some_and(TargetBoundPeerRelayFailure::is_local_runtime_failure)
     }
 }
 const ONION_ROUTE_SELECTION_CANDIDATE_LIMIT: usize = 8;
@@ -12752,25 +12825,7 @@ impl Server {
     /// [DIRECT-RELAY-RECEIPT-V2 2026-08-15 by Codex] Signed receipts are
     /// required only when the selected descriptor advertises that contract;
     /// rolling auth-only v2 and legacy v1 peers retain their response shape.
-    async fn validate_direct_peer_relay_ack(
-        response: reqwest::Response,
-        expected_request_commitment: Option<&[u8; 32]>,
-        expected_node_id: &[u8; 32],
-        require_signed_receipt: bool,
-        observed_at: u64,
-    ) -> std::result::Result<(), String> {
-        Self::validate_direct_peer_relay_ack_typed(
-            response,
-            expected_request_commitment,
-            expected_node_id,
-            require_signed_receipt,
-            observed_at,
-        )
-        .await
-        .map_err(DirectPeerRelayAckFailure::privacy_safe_reason)
-    }
-
-    /// Typed form shared by compatibility and retry-aware v3 dispatch.
+    /// The typed result preserves local verifier faults until attribution.
     async fn validate_direct_peer_relay_ack_typed(
         response: reqwest::Response,
         expected_request_commitment: Option<&[u8; 32]>,
@@ -12820,11 +12875,25 @@ impl Server {
         }
         let receipt = response
             .receipt
-            .as_ref()
             .ok_or(DirectPeerRelayAckFailure::ReceiptMissing)?;
-        receipt
-            .verify_expected_commitment(expected_request_commitment, expected_node_id, observed_at)
-            .map_err(DirectPeerRelayAckFailure::ReceiptInvalid)
+        verify_peer_chat_relay_receipt(
+            receipt,
+            *expected_request_commitment,
+            *expected_node_id,
+            observed_at,
+        )
+        .await
+        .map_err(|error| match error {
+            DirectRelayReceiptVerificationFailure::Invalid(reason) => {
+                DirectPeerRelayAckFailure::ReceiptInvalid(reason)
+            }
+            DirectRelayReceiptVerificationFailure::Backpressure => {
+                DirectPeerRelayAckFailure::VerificationBackpressure
+            }
+            DirectRelayReceiptVerificationFailure::Unavailable => {
+                DirectPeerRelayAckFailure::VerificationUnavailable
+            }
+        })
     }
 
     /// Sends and validates one target-bound request with one exact ambiguity retry.
@@ -13092,22 +13161,37 @@ impl Server {
                 )
                 .await;
                 if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
-                    circuit_allows_more = relay.complete_direct_peer_delivery(
-                        unix_now_secs(),
-                        permit,
-                        outcome.retry_triggered(),
-                        outcome.delivery_succeeded(),
-                        outcome.final_failure_deterministic(),
-                    );
+                    if outcome.local_runtime_failure() {
+                        // [DIRECT-RELAY-LOCAL-FAULT-ATTRIBUTION 2026-08-31 by
+                        // Codex] Local verifier capacity says nothing about the
+                        // selected peer. Release half-open ownership without
+                        // advancing outage evidence.
+                        relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
+                    } else {
+                        circuit_allows_more = relay.complete_direct_peer_delivery(
+                            unix_now_secs(),
+                            permit,
+                            outcome.retry_triggered(),
+                            outcome.delivery_succeeded(),
+                            outcome.final_failure_deterministic(),
+                        );
+                    }
                 }
                 outcome.result.map_err(|error| match error {
                     TargetBoundPeerRelayFailure::Transport(error) => {
-                        Self::classify_reqwest_error("peer_relay_request", &error)
+                        DirectPeerRelayDeliveryFailure::selected_peer(
+                            Self::classify_reqwest_error("peer_relay_request", &error),
+                        )
                     }
                     TargetBoundPeerRelayFailure::Http(status) => {
-                        format!("peer_relay_http_{}", status.as_u16())
+                        DirectPeerRelayDeliveryFailure::selected_peer(format!(
+                            "peer_relay_http_{}",
+                            status.as_u16()
+                        ))
                     }
-                    TargetBoundPeerRelayFailure::Ack(error) => error.privacy_safe_reason(),
+                    TargetBoundPeerRelayFailure::Ack(error) => {
+                        DirectPeerRelayDeliveryFailure::from_ack(error)
+                    }
                 })
             } else {
                 let (response, expected_request_commitment) = if use_authenticated_relay {
@@ -13144,7 +13228,7 @@ impl Server {
                 };
                 match response {
                     Ok(response) if response.status().is_success() => {
-                        Self::validate_direct_peer_relay_ack(
+                        Self::validate_direct_peer_relay_ack_typed(
                             response,
                             expected_request_commitment.as_ref(),
                             &peer.node_id(),
@@ -13152,9 +13236,15 @@ impl Server {
                             unix_now_secs(),
                         )
                         .await
+                        .map_err(DirectPeerRelayDeliveryFailure::from_ack)
                     }
-                    Ok(response) => Err(format!("peer_relay_http_{}", response.status().as_u16())),
-                    Err(error) => Err(Self::classify_reqwest_error("peer_relay_request", &error)),
+                    Ok(response) => Err(DirectPeerRelayDeliveryFailure::selected_peer(format!(
+                        "peer_relay_http_{}",
+                        response.status().as_u16()
+                    ))),
+                    Err(error) => Err(DirectPeerRelayDeliveryFailure::selected_peer(
+                        Self::classify_reqwest_error("peer_relay_request", &error),
+                    )),
                 }
             };
 
@@ -13165,14 +13255,19 @@ impl Server {
                     let _ =
                         peer_store.record_route_forward_success_for_descriptor(&peer, observed_at);
                 }
-                Err(reason) => {
-                    let _ = peer_store.record_route_forward_failure_for_descriptor(
-                        &peer,
-                        observed_at,
-                        reason.clone(),
+                Err(failure) => {
+                    if failure.affects_peer_reputation() {
+                        let _ = peer_store.record_route_forward_failure_for_descriptor(
+                            &peer,
+                            observed_at,
+                            failure.reason.clone(),
+                        );
+                    }
+                    last_failure_reason = Some(failure.reason.clone());
+                    debug!(
+                        reason = failure.reason,
+                        "[CHAT_RELAY] Peer relay delivery failed"
                     );
-                    last_failure_reason = Some(reason.clone());
-                    debug!(reason, "[CHAT_RELAY] Peer relay delivery failed");
                 }
             }
             if stop_after_delivery || !circuit_allows_more {
