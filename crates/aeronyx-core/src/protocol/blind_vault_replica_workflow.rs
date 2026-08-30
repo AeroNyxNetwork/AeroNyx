@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.50.0-ReplyPolicyExports - Restored flat protocol exports
+//! Last Modified: v1.51.0-UnifiedCompletedAction - Added one closed typed
+//! capability enum and generic durable entry point for all planner actions.
+//! v1.50.0-ReplyPolicyExports - Restored flat protocol exports
 //! for every typed completion and reply-policy integration type.
 //! v1.49.0-SingleEffectReplyContext - Centralized fail-closed
 //! work, attempt, sequence, and authorization checks for single replies.
@@ -235,7 +237,8 @@ pub use durable_dispatch::{
 };
 pub use durable_resolution::{
     BlindVaultReplicaAttemptFailure, BlindVaultReplicaCommittedAttemptBinding,
-    BlindVaultReplicaDurableResolution, BlindVaultReplicaDurableResolutionError,
+    BlindVaultReplicaCompletedAction, BlindVaultReplicaDurableResolution,
+    BlindVaultReplicaDurableResolutionError,
 };
 pub use durable_snapshot::{
     BlindVaultReplicaDurableSnapshot, BlindVaultReplicaDurableSnapshotError,

@@ -120,6 +120,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.36.0-BlindVaultCompletedAction - Added one closed typed capability enum
+//! and generic durable completion boundary
+//! [BLIND-VAULT-COMPLETED-ACTION 2026-08-30 by Codex]
 //! v1.35.0-BlindVaultReplyPolicyExports - Restored the flat protocol API for
 //! every typed completion and reply policy
 //! [BLIND-VAULT-REPLY-POLICY-EXPORTS 2026-08-30 by Codex]
@@ -258,15 +261,16 @@ pub use blind_vault_replica_workflow::{
     BlindVaultReplicaBoundContinuationError, BlindVaultReplicaBoundRuntimeError,
     BlindVaultReplicaCommittedAttemptBinding, BlindVaultReplicaCommittedAttemptDispatch,
     BlindVaultReplicaCommittedAttemptRecord, BlindVaultReplicaCommittedBoundAttemptDispatch,
-    BlindVaultReplicaCompletedObservation, BlindVaultReplicaCompletedProvisioning,
-    BlindVaultReplicaCompletedReconciliation, BlindVaultReplicaCompletedRenewal,
-    BlindVaultReplicaCompletedReplacement, BlindVaultReplicaConvergence,
-    BlindVaultReplicaDispatchContract, BlindVaultReplicaDispatchFailure,
-    BlindVaultReplicaDispatchReadiness, BlindVaultReplicaDurableAttemptDispatch,
-    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaDurableDispatchError,
-    BlindVaultReplicaDurableResolution, BlindVaultReplicaDurableResolutionError,
-    BlindVaultReplicaDurableSnapshot, BlindVaultReplicaDurableSnapshotError,
-    BlindVaultReplicaExecution, BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
+    BlindVaultReplicaCompletedAction, BlindVaultReplicaCompletedObservation,
+    BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaCompletedReconciliation,
+    BlindVaultReplicaCompletedRenewal, BlindVaultReplicaCompletedReplacement,
+    BlindVaultReplicaConvergence, BlindVaultReplicaDispatchContract,
+    BlindVaultReplicaDispatchFailure, BlindVaultReplicaDispatchReadiness,
+    BlindVaultReplicaDurableAttemptDispatch, BlindVaultReplicaDurableBoundAttemptDispatch,
+    BlindVaultReplicaDurableDispatchError, BlindVaultReplicaDurableResolution,
+    BlindVaultReplicaDurableResolutionError, BlindVaultReplicaDurableSnapshot,
+    BlindVaultReplicaDurableSnapshotError, BlindVaultReplicaExecution,
+    BlindVaultReplicaExecutionPhase, BlindVaultReplicaExecutionPolicy,
     BlindVaultReplicaLoadedRecovery, BlindVaultReplicaObservationReplyOutcome,
     BlindVaultReplicaObservationReplyPolicy, BlindVaultReplicaObservationReplyPolicyBuildError,
     BlindVaultReplicaObservationReplyPolicyError, BlindVaultReplicaOnionDispatchPlan,

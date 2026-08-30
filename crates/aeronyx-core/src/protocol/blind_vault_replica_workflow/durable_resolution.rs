@@ -18,6 +18,7 @@
 //! - Accepts typed exact-generation renewal completion capabilities.
 //! - Accepts typed aggregate-provisioning completion capabilities.
 //! - Accepts typed inventory-reconciliation completion capabilities.
+//! - Unifies all policy-issued capabilities under one closed action enum.
 //! - Records bounded failure and retry disposition through the same boundary.
 //! - Resolves the exact journal and snapshot in one recovery-store operation.
 //! - Restores the prior in-memory state after sealing or persistence failure.
@@ -45,7 +46,9 @@
 //!   exact idempotent retry is required and is supported by the store contract.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.6.0-DurableRenewalCompletion - Added a typed durable
+//! Last Modified: v1.7.0-UnifiedCompletedAction - Added one closed capability
+//! enum and durable entry point spanning every planner action.
+//! v1.6.0-DurableRenewalCompletion - Added a typed durable
 //! boundary for exact-generation live lease renewal completion.
 //! v1.5.0-DurableObservationCompletion - Added a typed durable
 //! boundary for completed live inventory observation retries.
@@ -216,6 +219,80 @@ impl BlindVaultReplicaDurableResolution {
     }
 }
 
+/// Closed set of policy-issued capabilities that may complete planner work.
+///
+/// [BLIND-VAULT-COMPLETED-ACTION 2026-08-30 by Codex] Every variant carries
+/// a capability whose fields are private and whose constructor is owned by its
+/// exact reply policy. Adapters can unify persistence without accepting raw
+/// receipts, caller-selected action labels, or unverified evidence.
+#[derive(Clone, PartialEq, Eq)]
+pub enum BlindVaultReplicaCompletedAction {
+    /// Exact-generation lease renewal completed with a live new lease.
+    Renewal(BlindVaultReplicaCompletedRenewal),
+    /// Fresh live inventory restored observation of one replica.
+    Observation(BlindVaultReplicaCompletedObservation),
+    /// Ordered repair mutations ended in matching live inventory.
+    Reconciliation(BlindVaultReplicaCompletedReconciliation),
+    /// Distinct replacement became live before authorized old-lease retirement.
+    Replacement(BlindVaultReplicaCompletedReplacement),
+    /// Exact planner-authorized replica count became independently live.
+    Provisioning(BlindVaultReplicaCompletedProvisioning),
+}
+
+impl BlindVaultReplicaCompletedAction {
+    fn evidence(&self) -> &BlindVaultReplicaActionEvidence {
+        match self {
+            Self::Renewal(completed) => completed.evidence(),
+            Self::Observation(completed) => completed.evidence(),
+            Self::Reconciliation(completed) => completed.evidence(),
+            Self::Replacement(completed) => completed.evidence(),
+            Self::Provisioning(completed) => completed.evidence(),
+        }
+    }
+}
+
+impl fmt::Debug for BlindVaultReplicaCompletedAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Renewal(_) => "Renewal([REDACTED])",
+            Self::Observation(_) => "Observation([REDACTED])",
+            Self::Reconciliation(_) => "Reconciliation([REDACTED])",
+            Self::Replacement(_) => "Replacement([REDACTED])",
+            Self::Provisioning(_) => "Provisioning([REDACTED])",
+        })
+    }
+}
+
+impl From<BlindVaultReplicaCompletedRenewal> for BlindVaultReplicaCompletedAction {
+    fn from(completed: BlindVaultReplicaCompletedRenewal) -> Self {
+        Self::Renewal(completed)
+    }
+}
+
+impl From<BlindVaultReplicaCompletedObservation> for BlindVaultReplicaCompletedAction {
+    fn from(completed: BlindVaultReplicaCompletedObservation) -> Self {
+        Self::Observation(completed)
+    }
+}
+
+impl From<BlindVaultReplicaCompletedReconciliation> for BlindVaultReplicaCompletedAction {
+    fn from(completed: BlindVaultReplicaCompletedReconciliation) -> Self {
+        Self::Reconciliation(completed)
+    }
+}
+
+impl From<BlindVaultReplicaCompletedReplacement> for BlindVaultReplicaCompletedAction {
+    fn from(completed: BlindVaultReplicaCompletedReplacement) -> Self {
+        Self::Replacement(completed)
+    }
+}
+
+impl From<BlindVaultReplicaCompletedProvisioning> for BlindVaultReplicaCompletedAction {
+    fn from(completed: BlindVaultReplicaCompletedProvisioning) -> Self {
+        Self::Provisioning(completed)
+    }
+}
+
 /// Fail-closed errors before one attempt resolution becomes durable.
 #[derive(Debug)]
 pub enum BlindVaultReplicaDurableResolutionError<StoreError> {
@@ -271,6 +348,33 @@ impl BlindVaultReplicaAttemptJournal {
 }
 
 impl BlindVaultReplicaExecution {
+    /// Atomically resolves any reply-policy-issued completed action.
+    ///
+    /// This is the preferred generic adapter boundary. Action-specific methods
+    /// remain available for source compatibility and narrower integrations.
+    pub fn accept_completed_action_durably<Store>(
+        &mut self,
+        identity: &IdentityKeyPair,
+        store: &mut Store,
+        binding: &BlindVaultReplicaCommittedAttemptBinding,
+        completed: &BlindVaultReplicaCompletedAction,
+        snapshot_sequence: u64,
+    ) -> Result<
+        BlindVaultReplicaDurableResolution,
+        BlindVaultReplicaDurableResolutionError<Store::Error>,
+    >
+    where
+        Store: BlindVaultReplicaRecoveryStore,
+    {
+        self.accept_evidence_durably(
+            identity,
+            store,
+            binding,
+            completed.evidence(),
+            snapshot_sequence,
+        )
+    }
+
     /// Atomically resolves one fully verified lease-renewal attempt.
     ///
     /// [BLIND-VAULT-DURABLE-RENEWAL-COMPLETION 2026-08-30 by Codex] The
