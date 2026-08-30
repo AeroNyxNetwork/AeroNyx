@@ -28,8 +28,12 @@
 //! - A fresh inventory or status observation must still pass normal evidence
 //!   verification before it affects a new planner generation.
 //!
-//! Last Modified: v1.0.0-RestartRecoveryPlan - Initial bounded classification.
+//! Last Modified: v1.1.0-PrivacySafeRecoveryTaskDebug - Redacted source-local
+//! work identity and absolute timing from standard task diagnostics.
+//! v1.0.0-RestartRecoveryPlan - Initial bounded classification.
 //! ============================================
+
+use std::fmt;
 
 use super::{
     require_timestamp, BlindVaultReplicaRestoredExecution, BlindVaultReplicaWorkId,
@@ -80,7 +84,7 @@ pub enum BlindVaultReplicaRestartRecoveryTiming {
 }
 
 /// One bounded source-local recovery task derived from restored workflow state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultReplicaRestartRecoveryTask {
     work_id: BlindVaultReplicaWorkId,
     attempt: u8,
@@ -88,6 +92,21 @@ pub struct BlindVaultReplicaRestartRecoveryTask {
     evidence_deadline_ms: u64,
     timing: BlindVaultReplicaRestartRecoveryTiming,
     kind: BlindVaultReplicaRestartRecoveryKind,
+}
+
+// [BLIND-VAULT-RECOVERY-TASK-DIAGNOSTICS 2026-08-30 by Codex] Recovery
+// identity and absolute source times can correlate private work across logs.
+// Keep only bounded operational state in standard diagnostics.
+impl fmt::Debug for BlindVaultReplicaRestartRecoveryTask {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaRestartRecoveryTask")
+            .field("work_id", &"<redacted>")
+            .field("attempt", &self.attempt)
+            .field("timing", &self.timing)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlindVaultReplicaRestartRecoveryTask {

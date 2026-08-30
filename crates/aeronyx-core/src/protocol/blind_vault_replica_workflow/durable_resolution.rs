@@ -51,7 +51,9 @@
 //!   must re-confirm file/database durability before idempotent success.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.14.0-AmbiguousResolutionReconciliation - Replayed the
+//! Last Modified: v1.15.0-PrivacySafeResolutionDebug - Redacted source-local
+//! work identity from standard durable-resolution diagnostics.
+//! v1.14.0-AmbiguousResolutionReconciliation - Replayed the
 //! exact local transition once to confirm durability after ambiguous errors.
 //! v1.13.0-OwnedResolutionBinding - Allowed owned durable send
 //! permits to retain and derive the exact committed journal binding.
@@ -254,12 +256,27 @@ impl BlindVaultReplicaAttemptFailure {
 }
 
 /// Durable result after an attempt outcome and journal resolution become safe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BlindVaultReplicaDurableResolution {
     work_id: BlindVaultReplicaWorkId,
     attempt: u8,
     snapshot_sequence: u64,
     journal_sequence: u64,
+}
+
+// [BLIND-VAULT-DURABLE-RESOLUTION-DIAGNOSTICS 2026-08-30 by Codex] Sequence
+// progress is operationally useful, but source-local work identity must not
+// become a cross-restart telemetry correlation handle.
+impl fmt::Debug for BlindVaultReplicaDurableResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlindVaultReplicaDurableResolution")
+            .field("work_id", &"<redacted>")
+            .field("attempt", &self.attempt)
+            .field("snapshot_sequence", &self.snapshot_sequence)
+            .field("journal_sequence", &self.journal_sequence)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlindVaultReplicaDurableResolution {
