@@ -38,7 +38,9 @@
 //! - Never add a transition that accepts retirement before verified inventory.
 //! - Never expose request, receipt, manifest, node, or lease values in Debug.
 //!
-//! Last Modified: v1.6.0-AttemptBoundCompletion - Preserved exact replacement
+//! Last Modified: v1.7.0-PrivacySafePolicyDiagnostics - Redacted generic clock,
+//! transport, and source-private policy errors from standard diagnostics.
+//! v1.6.0-AttemptBoundCompletion - Preserved exact replacement
 //! attempt binding inside the emitted durable completion capability.
 //! v1.5.0-WriteLeaseLifetime - Bound replacement write receipts
 //! to the current admission time and signed lease expiry.
@@ -585,7 +587,6 @@ impl Error for BlindVaultReplicaReplacementPermitIssueError {
 }
 
 /// Permit composition, runtime transport, or retirement-reply failure.
-#[derive(Debug)]
 pub enum BlindVaultReplicaReplacementRetirementDispatchError<TransportError, ClockError> {
     /// Active execution could not issue or revalidate exact retirement authority.
     Permit(BlindVaultReplicaReplacementPermitIssueError),
@@ -600,13 +601,24 @@ pub enum BlindVaultReplicaReplacementRetirementDispatchError<TransportError, Clo
     ),
 }
 
-impl<TransportError: fmt::Display, ClockError: fmt::Display> fmt::Display
+impl<TransportError, ClockError> fmt::Display
     for BlindVaultReplicaReplacementRetirementDispatchError<TransportError, ClockError>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Permit(error) => fmt::Display::fmt(error, formatter),
             Self::Attempt(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl<TransportError, ClockError> fmt::Debug
+    for BlindVaultReplicaReplacementRetirementDispatchError<TransportError, ClockError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Permit(_) => formatter.write_str("Permit(<redacted>)"),
+            Self::Attempt(_) => formatter.write_str("Attempt(<redacted>)"),
         }
     }
 }
@@ -626,7 +638,6 @@ where
 }
 
 /// Fail-closed private replacement reply or lifecycle transition failure.
-#[derive(Debug)]
 pub enum BlindVaultReplicaReplacementReplyPolicyError<ClockError> {
     /// Source clock could not provide verification time.
     Clock(ClockError),
@@ -646,12 +657,10 @@ pub enum BlindVaultReplicaReplacementReplyPolicyError<ClockError> {
     Workflow(BlindVaultReplicaWorkflowError),
 }
 
-impl<ClockError: fmt::Display> fmt::Display
-    for BlindVaultReplicaReplacementReplyPolicyError<ClockError>
-{
+impl<ClockError> fmt::Display for BlindVaultReplicaReplacementReplyPolicyError<ClockError> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Clock(error) => write!(formatter, "blind vault source clock failed: {error}"),
+            Self::Clock(_) => formatter.write_str("blind vault source clock failed"),
             Self::StageMismatch => {
                 formatter.write_str("blind vault replacement reply stage mismatched")
             }
@@ -669,6 +678,23 @@ impl<ClockError: fmt::Display> fmt::Display
             }
             Self::Inventory(error) => fmt::Display::fmt(error, formatter),
             Self::Workflow(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl<ClockError> fmt::Debug for BlindVaultReplicaReplacementReplyPolicyError<ClockError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Clock(_) => formatter.write_str("Clock(<redacted>)"),
+            Self::StageMismatch => formatter.write_str("StageMismatch"),
+            Self::AttemptMismatch => formatter.write_str("AttemptMismatch"),
+            Self::ReplacementTargetMismatch => formatter.write_str("ReplacementTargetMismatch"),
+            Self::TerminalAuthorizationMismatch => {
+                formatter.write_str("TerminalAuthorizationMismatch")
+            }
+            Self::ReceiptOutsideWindow => formatter.write_str("ReceiptOutsideWindow"),
+            Self::Inventory(_) => formatter.write_str("Inventory(<redacted>)"),
+            Self::Workflow(_) => formatter.write_str("Workflow(<redacted>)"),
         }
     }
 }

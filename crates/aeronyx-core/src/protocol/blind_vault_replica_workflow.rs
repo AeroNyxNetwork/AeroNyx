@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.66.0-PrivacySafeBoundaryDiagnostics - Redacted generic
+//! Last Modified: v1.67.0-PrivacySafeActionDiagnostics - Standardized redacted
+//! clock and private policy diagnostics across replica action state machines.
+//! v1.66.0-PrivacySafeBoundaryDiagnostics - Redacted generic
 //! source-policy and recovery-store diagnostics.
 //! v1.65.0-PrivacySafeTransportDiagnostics - Redacted generic
 //! route, transport, reply, and verification adapter diagnostics.

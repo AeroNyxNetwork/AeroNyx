@@ -37,7 +37,9 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.12.0-PrivacySafePolicyDiagnostics - Redacted generic
+//! Last Modified: v1.13.0-PrivacySafeActionDiagnostics - Standardized redacted
+//! clock and private policy diagnostics across every action reply state machine.
+//! v1.12.0-PrivacySafePolicyDiagnostics - Redacted generic
 //! source-private policy errors at the request-bound verifier boundary.
 //! v1.11.0-PrivacySafeTransportDiagnostics - Redacted generic
 //! route, sender, transport, reply, and verifier diagnostic details.

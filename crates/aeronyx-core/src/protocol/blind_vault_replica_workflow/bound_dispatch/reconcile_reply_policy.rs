@@ -36,7 +36,9 @@
 //! - This policy is source-private and intentionally not serializable.
 //! - Never expose object identifiers or private manifest values in telemetry.
 //!
-//! Last Modified: v1.1.0-AttemptBoundCompletion - Preserved exact policy
+//! Last Modified: v1.2.0-PrivacySafeClockDiagnostics - Redacted generic clock
+//! and source-private policy errors from standard diagnostics.
+//! v1.1.0-AttemptBoundCompletion - Preserved exact policy
 //! attempt binding inside the emitted durable completion capability.
 //! v1.0.0-ReconcileReplyPolicy - Initial attempt-bound,
 //! monotonic mutation and post-mutation inventory state machine.
@@ -537,7 +539,6 @@ impl fmt::Display for BlindVaultReplicaReconcileReplyPolicyBuildError {
 impl Error for BlindVaultReplicaReconcileReplyPolicyBuildError {}
 
 /// Fail-closed reconciliation reply or lifecycle transition failure.
-#[derive(Debug)]
 pub enum BlindVaultReplicaReconcileReplyPolicyError<ClockError> {
     /// Source clock could not provide verification time.
     Clock(ClockError),
@@ -563,12 +564,10 @@ pub enum BlindVaultReplicaReconcileReplyPolicyError<ClockError> {
     Workflow(BlindVaultReplicaWorkflowError),
 }
 
-impl<ClockError: fmt::Display> fmt::Display
-    for BlindVaultReplicaReconcileReplyPolicyError<ClockError>
-{
+impl<ClockError> fmt::Display for BlindVaultReplicaReconcileReplyPolicyError<ClockError> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Clock(error) => write!(formatter, "blind vault source clock failed: {error}"),
+            Self::Clock(_) => formatter.write_str("blind vault source clock failed"),
             Self::StageMismatch => {
                 formatter.write_str("blind vault reconciliation reply stage mismatched")
             }
@@ -594,6 +593,26 @@ impl<ClockError: fmt::Display> fmt::Display
                 .write_str("blind vault reconciliation inventory predates accepted mutation"),
             Self::Inventory(error) => fmt::Display::fmt(error, formatter),
             Self::Workflow(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl<ClockError> fmt::Debug for BlindVaultReplicaReconcileReplyPolicyError<ClockError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Clock(_) => formatter.write_str("Clock(<redacted>)"),
+            Self::StageMismatch => formatter.write_str("StageMismatch"),
+            Self::AttemptMismatch => formatter.write_str("AttemptMismatch"),
+            Self::TargetMismatch => formatter.write_str("TargetMismatch"),
+            Self::TerminalAuthorizationMismatch => {
+                formatter.write_str("TerminalAuthorizationMismatch")
+            }
+            Self::ReceiptOutsideWindow => formatter.write_str("ReceiptOutsideWindow"),
+            Self::MutationTimeInvalid => formatter.write_str("MutationTimeInvalid"),
+            Self::MutationCountOverflow => formatter.write_str("MutationCountOverflow"),
+            Self::InventoryPredatesMutation => formatter.write_str("InventoryPredatesMutation"),
+            Self::Inventory(_) => formatter.write_str("Inventory(<redacted>)"),
+            Self::Workflow(_) => formatter.write_str("Workflow(<redacted>)"),
         }
     }
 }

@@ -36,7 +36,9 @@
 //! - Never permit interleaved replica groups or caller-selected group indexes.
 //! - Never expose private expectations or replica topology in telemetry.
 //!
-//! Last Modified: v1.1.0-AttemptBoundCompletion - Preserved exact aggregate
+//! Last Modified: v1.2.0-PrivacySafeClockDiagnostics - Redacted generic clock
+//! and source-private policy errors from standard diagnostics.
+//! v1.1.0-AttemptBoundCompletion - Preserved exact aggregate
 //! attempt binding inside the emitted durable completion capability.
 //! v1.0.0-ProvisioningReplyPolicy - Initial bounded aggregate
 //! provisioning reply state machine and completion capability.
@@ -524,7 +526,6 @@ impl fmt::Display for BlindVaultReplicaProvisioningReplyPolicyBuildError {
 impl Error for BlindVaultReplicaProvisioningReplyPolicyBuildError {}
 
 /// Fail-closed aggregate provisioning reply or lifecycle transition failure.
-#[derive(Debug)]
 pub enum BlindVaultReplicaProvisioningReplyPolicyError<ClockError> {
     /// Source clock could not provide verification time.
     Clock(ClockError),
@@ -546,12 +547,10 @@ pub enum BlindVaultReplicaProvisioningReplyPolicyError<ClockError> {
     Workflow(BlindVaultReplicaWorkflowError),
 }
 
-impl<ClockError: fmt::Display> fmt::Display
-    for BlindVaultReplicaProvisioningReplyPolicyError<ClockError>
-{
+impl<ClockError> fmt::Display for BlindVaultReplicaProvisioningReplyPolicyError<ClockError> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Clock(error) => write!(formatter, "blind vault source clock failed: {error}"),
+            Self::Clock(_) => formatter.write_str("blind vault source clock failed"),
             Self::StageMismatch => {
                 formatter.write_str("blind vault provisioning reply stage mismatched")
             }
@@ -572,6 +571,24 @@ impl<ClockError: fmt::Display> fmt::Display
             }
             Self::Inventory(error) => fmt::Display::fmt(error, formatter),
             Self::Workflow(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl<ClockError> fmt::Debug for BlindVaultReplicaProvisioningReplyPolicyError<ClockError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Clock(_) => formatter.write_str("Clock(<redacted>)"),
+            Self::StageMismatch => formatter.write_str("StageMismatch"),
+            Self::AttemptMismatch => formatter.write_str("AttemptMismatch"),
+            Self::ReplicaTargetMismatch => formatter.write_str("ReplicaTargetMismatch"),
+            Self::DuplicateReplica => formatter.write_str("DuplicateReplica"),
+            Self::TerminalAuthorizationMismatch => {
+                formatter.write_str("TerminalAuthorizationMismatch")
+            }
+            Self::ReceiptOutsideWindow => formatter.write_str("ReceiptOutsideWindow"),
+            Self::Inventory(_) => formatter.write_str("Inventory(<redacted>)"),
+            Self::Workflow(_) => formatter.write_str("Workflow(<redacted>)"),
         }
     }
 }

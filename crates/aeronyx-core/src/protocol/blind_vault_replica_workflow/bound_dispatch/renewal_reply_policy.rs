@@ -36,7 +36,9 @@
 //! - This policy is source-private and intentionally not serializable.
 //! - Never expose lease timestamps, identifiers, or evidence in Debug output.
 //!
-//! Last Modified: v1.1.0-AttemptBoundCompletion - Bound completion capability
+//! Last Modified: v1.2.0-PrivacySafeClockDiagnostics - Redacted generic clock
+//! and source-private policy errors from standard diagnostics.
+//! v1.1.0-AttemptBoundCompletion - Bound completion capability
 //! to the exact work id and runtime attempt that produced its evidence.
 //! v1.0.0-RenewalReplyPolicy - Initial exact-generation,
 //! single-effect, live-lease renewal reply policy.
@@ -277,7 +279,6 @@ impl fmt::Display for BlindVaultReplicaRenewalReplyPolicyBuildError {
 impl Error for BlindVaultReplicaRenewalReplyPolicyBuildError {}
 
 /// Fail-closed renewal reply or lifecycle transition failure.
-#[derive(Debug)]
 pub enum BlindVaultReplicaRenewalReplyPolicyError<ClockError> {
     /// Source clock could not provide verification time.
     Clock(ClockError),
@@ -295,12 +296,10 @@ pub enum BlindVaultReplicaRenewalReplyPolicyError<ClockError> {
     Workflow(BlindVaultReplicaWorkflowError),
 }
 
-impl<ClockError: fmt::Display> fmt::Display
-    for BlindVaultReplicaRenewalReplyPolicyError<ClockError>
-{
+impl<ClockError> fmt::Display for BlindVaultReplicaRenewalReplyPolicyError<ClockError> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Clock(error) => write!(formatter, "blind vault source clock failed: {error}"),
+            Self::Clock(_) => formatter.write_str("blind vault source clock failed"),
             Self::StageMismatch => {
                 formatter.write_str("blind vault renewal reply stage mismatched")
             }
@@ -317,6 +316,22 @@ impl<ClockError: fmt::Display> fmt::Display
                 formatter.write_str("blind vault renewal terminal authorization mismatched")
             }
             Self::Workflow(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl<ClockError> fmt::Debug for BlindVaultReplicaRenewalReplyPolicyError<ClockError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Clock(_) => formatter.write_str("Clock(<redacted>)"),
+            Self::StageMismatch => formatter.write_str("StageMismatch"),
+            Self::AttemptMismatch => formatter.write_str("AttemptMismatch"),
+            Self::SequenceMismatch => formatter.write_str("SequenceMismatch"),
+            Self::ActionMismatch => formatter.write_str("ActionMismatch"),
+            Self::TerminalAuthorizationMismatch => {
+                formatter.write_str("TerminalAuthorizationMismatch")
+            }
+            Self::Workflow(_) => formatter.write_str("Workflow(<redacted>)"),
         }
     }
 }
