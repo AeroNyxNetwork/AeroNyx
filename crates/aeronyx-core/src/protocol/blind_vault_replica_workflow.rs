@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.45.0-ObservationReplyPolicy - Added exact single-effect,
+//! Last Modified: v1.46.0-DurableObservationCompletion - Added typed atomic
+//! resolution for policy-issued observation-retry completion.
+//! v1.45.0-ObservationReplyPolicy - Added exact single-effect,
 //! freshness-bounded observation-retry reply verification.
 //! v1.44.0-DurableReconciliationCompletion - Added typed atomic
 //! resolution for policy-issued inventory reconciliation completion.
