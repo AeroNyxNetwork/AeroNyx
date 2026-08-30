@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.44.0-DurableReconciliationCompletion - Added typed atomic
+//! Last Modified: v1.45.0-ObservationReplyPolicy - Added exact single-effect,
+//! freshness-bounded observation-retry reply verification.
+//! v1.44.0-DurableReconciliationCompletion - Added typed atomic
 //! resolution for policy-issued inventory reconciliation completion.
 //! v1.43.0-ReconcileReplyPolicy - Added an exact-action,
 //! attempt-bound write/delete/inventory reconciliation reply state machine.
@@ -190,13 +192,15 @@ pub use bound_continuation::{
 };
 pub use bound_dispatch::{
     BlindVaultReplicaBoundRuntimeError, BlindVaultReplicaCommittedBoundAttemptDispatch,
-    BlindVaultReplicaCompletedProvisioning, BlindVaultReplicaCompletedReconciliation,
-    BlindVaultReplicaCompletedReplacement, BlindVaultReplicaDurableBoundAttemptDispatch,
-    BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,
-    BlindVaultReplicaOnionRouteProvider, BlindVaultReplicaPersistedBoundAttemptJournal,
-    BlindVaultReplicaPreparedBoundAttemptJournal, BlindVaultReplicaPrivateReplyPolicy,
-    BlindVaultReplicaProvisioningReplyOutcome, BlindVaultReplicaProvisioningReplyPolicy,
-    BlindVaultReplicaProvisioningReplyPolicyBuildError,
+    BlindVaultReplicaCompletedObservation, BlindVaultReplicaCompletedProvisioning,
+    BlindVaultReplicaCompletedReconciliation, BlindVaultReplicaCompletedReplacement,
+    BlindVaultReplicaDurableBoundAttemptDispatch, BlindVaultReplicaObservationReplyOutcome,
+    BlindVaultReplicaObservationReplyPolicy, BlindVaultReplicaObservationReplyPolicyBuildError,
+    BlindVaultReplicaObservationReplyPolicyError, BlindVaultReplicaOnionDispatchPlan,
+    BlindVaultReplicaOnionEnvelopeSender, BlindVaultReplicaOnionRouteProvider,
+    BlindVaultReplicaPersistedBoundAttemptJournal, BlindVaultReplicaPreparedBoundAttemptJournal,
+    BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaProvisioningReplyOutcome,
+    BlindVaultReplicaProvisioningReplyPolicy, BlindVaultReplicaProvisioningReplyPolicyBuildError,
     BlindVaultReplicaProvisioningReplyPolicyError, BlindVaultReplicaReconcileReplyOutcome,
     BlindVaultReplicaReconcileReplyPolicy, BlindVaultReplicaReconcileReplyPolicyBuildError,
     BlindVaultReplicaReconcileReplyPolicyError, BlindVaultReplicaReplacementAuthorizationError,

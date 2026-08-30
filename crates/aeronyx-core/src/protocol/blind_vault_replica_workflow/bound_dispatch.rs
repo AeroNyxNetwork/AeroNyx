@@ -35,7 +35,9 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.5.0-ReconcileReplyPolicy - Added ordered write/delete and
+//! Last Modified: v1.6.0-ObservationReplyPolicy - Added exact single-effect
+//! fresh inventory verification for observation-retry attempts.
+//! v1.5.0-ReconcileReplyPolicy - Added ordered write/delete and
 //! post-mutation inventory verification for exact reconciliation attempts.
 //! v1.4.0-ProvisioningReplyPolicy - Added bounded aggregate
 //! admission/write/inventory verification for exact provisioning attempts.
@@ -64,6 +66,7 @@ use super::{
 use crate::crypto::keys::IdentityKeyPair;
 
 mod attempt_runtime;
+mod observation_reply_policy;
 mod onion_transport;
 mod provisioning_reply_policy;
 mod reconcile_reply_policy;
@@ -75,6 +78,11 @@ pub use attempt_runtime::{
     BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalAttemptRuntime,
     BlindVaultReplicaTerminalAttemptRuntimeBuildError, BlindVaultReplicaTerminalAttemptState,
     BlindVaultReplicaTerminalReplyVerifier,
+};
+pub use observation_reply_policy::{
+    BlindVaultReplicaCompletedObservation, BlindVaultReplicaObservationReplyOutcome,
+    BlindVaultReplicaObservationReplyPolicy, BlindVaultReplicaObservationReplyPolicyBuildError,
+    BlindVaultReplicaObservationReplyPolicyError,
 };
 pub use onion_transport::{
     BlindVaultReplicaOnionDispatchPlan, BlindVaultReplicaOnionEnvelopeSender,

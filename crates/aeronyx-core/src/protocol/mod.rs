@@ -120,6 +120,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.30.0-BlindVaultObservationReplyPolicy - Added exact single-effect,
+//! freshness-bounded observation-retry verification
+//! [BLIND-VAULT-OBSERVATION-REPLY-POLICY 2026-08-30 by Codex]
 //! v1.29.0-BlindVaultDurableReconciliation - Added typed atomic resolution for
 //! completed reconciliation reply policies
 //! [BLIND-VAULT-DURABLE-RECONCILIATION-COMPLETION 2026-08-30 by Codex]
