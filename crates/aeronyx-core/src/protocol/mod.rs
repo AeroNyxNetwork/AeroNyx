@@ -120,6 +120,9 @@
 //!   parser for untrusted wire values. Unknown purposes must fail closed.
 //!
 //! ## Last Modified
+//! v1.38.0-BlindVaultCompletionBindingGate - Rejected typed capabilities from
+//! any other work id or attempt at the durable boundary
+//! [BLIND-VAULT-COMPLETION-BINDING-GATE 2026-08-30 by Codex]
 //! v1.37.0-BlindVaultAttemptBoundCompletion - Bound every typed completion
 //! capability to its exact work id and runtime attempt
 //! [BLIND-VAULT-ATTEMPT-BOUND-COMPLETION 2026-08-30 by Codex]

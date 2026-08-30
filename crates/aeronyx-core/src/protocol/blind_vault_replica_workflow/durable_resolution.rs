@@ -40,13 +40,16 @@
 //!
 //! ## Important Note For The Next Developer
 //! - A binding is local durability evidence, not terminal authorization.
+//! - New adapters must prefer attempt-bound typed completion entry points.
 //! - Never expose journal commitments, work identity, or targets in telemetry.
 //! - Store success is the only point at which attempt resolution is durable.
 //! - A failed store call may have an ambiguous host outcome; rollback plus an
 //!   exact idempotent retry is required and is supported by the store contract.
 //! - Do not split evidence acceptance and store resolution in new callers.
 //!
-//! Last Modified: v1.7.0-UnifiedCompletedAction - Added one closed capability
+//! Last Modified: v1.8.0-CompletionBindingGate - Required every typed
+//! completion to match the exact committed work id and attempt before mutation.
+//! v1.7.0-UnifiedCompletedAction - Added one closed capability
 //! enum and durable entry point spanning every planner action.
 //! v1.6.0-DurableRenewalCompletion - Added a typed durable
 //! boundary for exact-generation live lease renewal completion.
@@ -249,6 +252,16 @@ impl BlindVaultReplicaCompletedAction {
             Self::Provisioning(completed) => completed.evidence(),
         }
     }
+
+    fn matches_attempt(&self, work_id: BlindVaultReplicaWorkId, attempt: u8) -> bool {
+        match self {
+            Self::Renewal(completed) => completed.matches_attempt(work_id, attempt),
+            Self::Observation(completed) => completed.matches_attempt(work_id, attempt),
+            Self::Reconciliation(completed) => completed.matches_attempt(work_id, attempt),
+            Self::Replacement(completed) => completed.matches_attempt(work_id, attempt),
+            Self::Provisioning(completed) => completed.matches_attempt(work_id, attempt),
+        }
+    }
 }
 
 impl fmt::Debug for BlindVaultReplicaCompletedAction {
@@ -302,6 +315,8 @@ pub enum BlindVaultReplicaDurableResolutionError<StoreError> {
     Store(StoreError),
     /// Binding and current in-memory attempt did not match exactly.
     StateMismatch,
+    /// Typed completion was produced by another work item or attempt.
+    CompletionBindingMismatch,
 }
 
 impl<StoreError> fmt::Display for BlindVaultReplicaDurableResolutionError<StoreError> {
@@ -313,6 +328,9 @@ impl<StoreError> fmt::Display for BlindVaultReplicaDurableResolutionError<StoreE
             }
             Self::StateMismatch => {
                 formatter.write_str("blind vault replica resolution state does not match")
+            }
+            Self::CompletionBindingMismatch => {
+                formatter.write_str("blind vault replica completion binding does not match attempt")
             }
         }
     }
@@ -326,7 +344,7 @@ where
         match self {
             Self::Workflow(error) => Some(error),
             Self::Store(error) => Some(error),
-            Self::StateMismatch => None,
+            Self::StateMismatch | Self::CompletionBindingMismatch => None,
         }
     }
 }
@@ -366,10 +384,11 @@ impl BlindVaultReplicaExecution {
     where
         Store: BlindVaultReplicaRecoveryStore,
     {
-        self.accept_evidence_durably(
+        self.accept_attempt_bound_evidence_durably(
             identity,
             store,
             binding,
+            completed.matches_attempt(binding.work_id, binding.attempt),
             completed.evidence(),
             snapshot_sequence,
         )
@@ -394,10 +413,11 @@ impl BlindVaultReplicaExecution {
     where
         Store: BlindVaultReplicaRecoveryStore,
     {
-        self.accept_evidence_durably(
+        self.accept_attempt_bound_evidence_durably(
             identity,
             store,
             binding,
+            completed.matches_attempt(binding.work_id, binding.attempt),
             completed.evidence(),
             snapshot_sequence,
         )
@@ -423,10 +443,11 @@ impl BlindVaultReplicaExecution {
     where
         Store: BlindVaultReplicaRecoveryStore,
     {
-        self.accept_evidence_durably(
+        self.accept_attempt_bound_evidence_durably(
             identity,
             store,
             binding,
+            completed.matches_attempt(binding.work_id, binding.attempt),
             completed.evidence(),
             snapshot_sequence,
         )
@@ -452,10 +473,11 @@ impl BlindVaultReplicaExecution {
     where
         Store: BlindVaultReplicaRecoveryStore,
     {
-        self.accept_evidence_durably(
+        self.accept_attempt_bound_evidence_durably(
             identity,
             store,
             binding,
+            completed.matches_attempt(binding.work_id, binding.attempt),
             completed.evidence(),
             snapshot_sequence,
         )
@@ -481,10 +503,11 @@ impl BlindVaultReplicaExecution {
     where
         Store: BlindVaultReplicaRecoveryStore,
     {
-        self.accept_evidence_durably(
+        self.accept_attempt_bound_evidence_durably(
             identity,
             store,
             binding,
+            completed.matches_attempt(binding.work_id, binding.attempt),
             completed.evidence(),
             snapshot_sequence,
         )
@@ -510,16 +533,38 @@ impl BlindVaultReplicaExecution {
     where
         Store: BlindVaultReplicaRecoveryStore,
     {
-        self.accept_evidence_durably(
+        self.accept_attempt_bound_evidence_durably(
             identity,
             store,
             binding,
+            completed.matches_attempt(binding.work_id, binding.attempt),
             completed.evidence(),
             snapshot_sequence,
         )
     }
 
-    /// Accepts evidence and atomically resolves its committed private journal.
+    fn accept_attempt_bound_evidence_durably<Store>(
+        &mut self,
+        identity: &IdentityKeyPair,
+        store: &mut Store,
+        binding: &BlindVaultReplicaCommittedAttemptBinding,
+        completion_matches_binding: bool,
+        evidence: &BlindVaultReplicaActionEvidence,
+        snapshot_sequence: u64,
+    ) -> Result<
+        BlindVaultReplicaDurableResolution,
+        BlindVaultReplicaDurableResolutionError<Store::Error>,
+    >
+    where
+        Store: BlindVaultReplicaRecoveryStore,
+    {
+        if !completion_matches_binding {
+            return Err(BlindVaultReplicaDurableResolutionError::CompletionBindingMismatch);
+        }
+        self.accept_evidence_durably(identity, store, binding, evidence, snapshot_sequence)
+    }
+
+    /// Low-level compatibility path for already verified action evidence.
     ///
     /// [BLIND-VAULT-DURABLE-RESOLUTION 2026-08-29 by Codex] Any failure before
     /// store success restores the exact prior work state. The caller may then

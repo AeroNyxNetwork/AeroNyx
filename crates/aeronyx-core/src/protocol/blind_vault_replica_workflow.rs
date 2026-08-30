@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.52.0-AttemptBoundCompletion - Preserved exact work and
+//! Last Modified: v1.53.0-CompletionBindingGate - Rejected typed completion
+//! capabilities from any other work id or attempt before durable mutation.
+//! v1.52.0-AttemptBoundCompletion - Preserved exact work and
 //! attempt binding inside every policy-issued completion capability.
 //! v1.51.0-UnifiedCompletedAction - Added one closed typed
 //! capability enum and generic durable entry point for all planner actions.
