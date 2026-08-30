@@ -12,6 +12,7 @@
 //! ## Main Functionality
 //! - Seals one source-owned workflow at an explicit monotonic sequence.
 //! - Publishes the bounded snapshot through the recovery-store capability.
+//! - Confirms ambiguous publication with the exact same sealed generation.
 //! - Returns a typed receipt only after the store confirms durable success.
 //! - Zeroizes the temporary sealed container on every return path.
 //! - Preserves store enforcement that unresolved private journals block writes.
@@ -31,11 +32,13 @@
 //! ## Important Note For The Next Developer
 //! - This command cannot resolve `Prepared` or `Committed` journals.
 //! - Use durable resolution for evidence-bound private attempt completion.
-//! - Store errors may represent ambiguous host outcomes; callers should reload
-//!   and compare the exact accepted sequence before choosing a new sequence.
+//! - A double store failure leaves the result unknown; discard live state and
+//!   use authenticated recovery before choosing another snapshot sequence.
 //! - Never log source workflow ids, sealed bytes, paths, or store error detail.
 //!
-//! Last Modified: v1.0.0-DurableWorkflowSnapshot - Initial reusable command
+//! Last Modified: v1.1.0-AmbiguousSnapshotConfirmation - Replayed the exact
+//! sealed generation once before reporting an unknown publication outcome.
+//! v1.0.0-DurableWorkflowSnapshot - Initial reusable command
 //! for restart-safe resolved workflow state.
 //! ============================================
 
@@ -63,12 +66,16 @@ impl BlindVaultReplicaDurableSnapshot {
 }
 
 /// Fail-closed errors before a workflow snapshot becomes durable.
-#[derive(Debug)]
 pub enum BlindVaultReplicaDurableSnapshotError<StoreError> {
     /// Snapshot sealing rejected invalid or oversized workflow state.
     Workflow(BlindVaultReplicaWorkflowError),
     /// Recovery store did not confirm durable publication.
     Store(StoreError),
+    /// Both publication and exact idempotent confirmation failed.
+    StoreOutcomeUnknown {
+        publication: StoreError,
+        confirmation: StoreError,
+    },
 }
 
 impl<StoreError> fmt::Display for BlindVaultReplicaDurableSnapshotError<StoreError> {
@@ -77,6 +84,9 @@ impl<StoreError> fmt::Display for BlindVaultReplicaDurableSnapshotError<StoreErr
             Self::Workflow(error) => fmt::Display::fmt(error, formatter),
             Self::Store(_) => {
                 formatter.write_str("blind vault replica durable snapshot store failed")
+            }
+            Self::StoreOutcomeUnknown { .. } => {
+                formatter.write_str("blind vault replica durable snapshot outcome is unknown")
             }
         }
     }
@@ -90,6 +100,19 @@ where
         match self {
             Self::Workflow(error) => Some(error),
             Self::Store(error) => Some(error),
+            Self::StoreOutcomeUnknown { publication, .. } => Some(publication),
+        }
+    }
+}
+
+impl<StoreError> fmt::Debug for BlindVaultReplicaDurableSnapshotError<StoreError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workflow(_) => formatter.write_str("Workflow(<redacted>)"),
+            Self::Store(_) => formatter.write_str("Store(<redacted>)"),
+            Self::StoreOutcomeUnknown { .. } => {
+                formatter.write_str("StoreOutcomeUnknown(<redacted>)")
+            }
         }
     }
 }
@@ -118,9 +141,18 @@ impl BlindVaultReplicaExecution {
             snapshot_sequence,
             sealed_snapshot.as_slice(),
         );
-        store
-            .persist_snapshot(&snapshot)
-            .map_err(BlindVaultReplicaDurableSnapshotError::Store)?;
+        if let Err(publication_error) = store.persist_snapshot(&snapshot) {
+            // [BLIND-VAULT-SNAPSHOT-CONFIRMATION 2026-08-30 by Codex] Reuse
+            // the same randomized sealed container. Re-sealing at the same
+            // monotonic sequence would create a conflicting generation and
+            // could not prove whether the first atomic replacement survived.
+            if let Err(confirmation_error) = store.persist_snapshot(&snapshot) {
+                return Err(BlindVaultReplicaDurableSnapshotError::StoreOutcomeUnknown {
+                    publication: publication_error,
+                    confirmation: confirmation_error,
+                });
+            }
+        }
         Ok(BlindVaultReplicaDurableSnapshot { snapshot_sequence })
     }
 }
