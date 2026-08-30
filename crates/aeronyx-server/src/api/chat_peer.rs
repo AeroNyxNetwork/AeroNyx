@@ -140,6 +140,9 @@
 //! - [BLIND-SUCCESS-SIGNING-COMPLETION 2026-08-30 by Codex] Signs hop-local
 //!   success receipts in the same fair completion domain without cloning the
 //!   opaque request envelope or response carrier
+//! - [BLIND-TERMINAL-PROOF-COMPLETION 2026-08-30 by Codex] Commits and signs
+//!   terminal delivery evidence together with its hop-local success response
+//!   in one worker after durable terminal acceptance
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -344,6 +347,8 @@
 //!   write-only: persistence must never influence forwarding control flow.
 //!
 //! ## Last Modified
+//! v0.78.0-TerminalProofCompletion - Co-locate terminal payload commitment and
+//! both receipt signatures in one bounded completion operation
 //! v0.77.0-SuccessSigningCompletion - Move success receipt hashing and Ed25519
 //! signing outside Tokio while preserving durable completion ordering
 //! v0.76.0-ResponseCryptoCompletion - Move downstream response policy and
@@ -2560,7 +2565,7 @@ fn build_forwarded_onion_envelope_from_seed(
 /// ensuring a relay never propagates a deeper hop's success signature.
 async fn attach_blind_relay_success_receipt(
     envelope: Arc<BlindRelayEnvelope>,
-    mut response: PeerBlindRelayResponse,
+    response: PeerBlindRelayResponse,
     accepted_at: u64,
     responder: Arc<IdentityKeyPair>,
 ) -> Result<PeerBlindRelayResponse, BlindRelayError> {
@@ -2568,38 +2573,89 @@ async fn attach_blind_relay_success_receipt(
         // [BLIND-SUCCESS-SIGNING-COMPLETION 2026-08-30 by Codex] The request
         // and possibly large opaque response move into the worker by ownership;
         // `Arc` avoids a ciphertext clone while durable completion waits.
-        if !response.accepted || response.failure_receipt.is_some() {
-            return Err(BlindRelayError::ForwardFailed);
-        }
-        let opaque_response = response
-            .opaque_terminal_response_b64
-            .as_deref()
-            .map(str::as_bytes);
-        let receipt = match (response.terminal, response.forwarded) {
-            (true, false) => BlindRelaySuccessReceipt::terminal(
-                envelope.as_ref(),
-                response.ttl_remaining,
-                response.reason.as_deref(),
-                response.delivery_receipt.as_ref(),
-                opaque_response,
-                accepted_at,
-                responder.as_ref(),
-            ),
-            (false, true) => BlindRelaySuccessReceipt::forwarded(
-                envelope.as_ref(),
-                response.ttl_remaining,
-                response.reason.as_deref(),
-                response.delivery_receipt.as_ref(),
-                opaque_response,
-                accepted_at,
-                responder.as_ref(),
-            ),
-            _ => return Err(BlindRelayError::ForwardFailed),
-        };
-        response.success_receipt = Some(receipt);
-        Ok(response)
+        sign_blind_relay_success_receipt(
+            envelope.as_ref(),
+            response,
+            accepted_at,
+            responder.as_ref(),
+        )
     })
     .await
+}
+
+/// Payload ownership required to create terminal evidence without a clone.
+struct TerminalDeliveryProofInput {
+    payload: Vec<u8>,
+    purpose: OnionRoutePurpose,
+}
+
+async fn attach_blind_relay_terminal_success_receipts(
+    envelope: Arc<BlindRelayEnvelope>,
+    mut response: PeerBlindRelayResponse,
+    proof: TerminalDeliveryProofInput,
+    accepted_at: u64,
+    responder: Arc<IdentityKeyPair>,
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    complete_blind_relay_crypto(move || {
+        // [BLIND-TERMINAL-PROOF-COMPLETION 2026-08-30 by Codex] One worker
+        // commits the accepted payload, signs terminal evidence, and binds that
+        // exact evidence into the immediate-hop ACK before durable completion.
+        if response.delivery_receipt.is_some() {
+            return Err(BlindRelayError::ForwardFailed);
+        }
+        response.delivery_receipt = Some(BlindRelayDeliveryReceipt::accepted_for_purpose(
+            envelope.route_id,
+            &proof.payload,
+            proof.purpose,
+            accepted_at,
+            responder.as_ref(),
+        ));
+        sign_blind_relay_success_receipt(
+            envelope.as_ref(),
+            response,
+            accepted_at,
+            responder.as_ref(),
+        )
+    })
+    .await
+}
+
+fn sign_blind_relay_success_receipt(
+    envelope: &BlindRelayEnvelope,
+    mut response: PeerBlindRelayResponse,
+    accepted_at: u64,
+    responder: &IdentityKeyPair,
+) -> Result<PeerBlindRelayResponse, BlindRelayError> {
+    if !response.accepted || response.failure_receipt.is_some() {
+        return Err(BlindRelayError::ForwardFailed);
+    }
+    let opaque_response = response
+        .opaque_terminal_response_b64
+        .as_deref()
+        .map(str::as_bytes);
+    let receipt = match (response.terminal, response.forwarded) {
+        (true, false) => BlindRelaySuccessReceipt::terminal(
+            envelope,
+            response.ttl_remaining,
+            response.reason.as_deref(),
+            response.delivery_receipt.as_ref(),
+            opaque_response,
+            accepted_at,
+            responder,
+        ),
+        (false, true) => BlindRelaySuccessReceipt::forwarded(
+            envelope,
+            response.ttl_remaining,
+            response.reason.as_deref(),
+            response.delivery_receipt.as_ref(),
+            opaque_response,
+            accepted_at,
+            responder,
+        ),
+        _ => return Err(BlindRelayError::ForwardFailed),
+    };
+    response.success_receipt = Some(receipt);
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -2970,47 +3026,51 @@ async fn process_onion_blind_relay(
                     return Err(error);
                 }
             };
-            let route_purpose = terminal_delivery.purpose;
-
             let accepted_at = blind_relay_response_observed_at(now, route_started_at);
             // [PURPOSE-BOUND-RECEIPT 2026-08-10 by Codex] Sign v2 only after
             // the selected terminal workload has crossed its durable acceptance
             // boundary. The purpose is committed with the opaque payload hash,
             // not returned as relay-visible metadata.
-            let delivery_receipt = match terminal_delivery.proof_mode {
+            let response = PeerBlindRelayResponse {
+                accepted: true,
+                terminal: true,
+                forwarded: false,
+                ttl_remaining: envelope.ttl,
+                reason: Some("onion_terminal_delivered".to_string()),
+                delivery_receipt: None,
+                success_receipt: None,
+                failure_receipt: None,
+                opaque_terminal_response_b64: terminal_delivery.opaque_response_b64,
+            };
+            let response = match terminal_delivery.proof_mode {
                 OnionReplyProofMode::RelayVisibleTerminalReceipt => {
-                    Some(BlindRelayDeliveryReceipt::accepted_for_purpose(
-                        envelope.route_id,
-                        &peel.inner,
-                        route_purpose,
+                    attach_blind_relay_terminal_success_receipts(
+                        Arc::clone(&envelope),
+                        response,
+                        TerminalDeliveryProofInput {
+                            payload: peel.inner,
+                            purpose: terminal_delivery.purpose,
+                        },
                         accepted_at,
-                        state.node_identity.as_ref(),
-                    ))
+                        Arc::clone(&state.node_identity),
+                    )
+                    .await?
                 }
                 // [SOURCE-SEALED-TERMINAL-PROOF 2026-08-29 by Codex] The
                 // terminal identity and signed workload result are already
                 // authenticated inside this fixed-size ciphertext. Omitting
                 // the clear terminal receipt prevents every middle hop from
                 // reconstructing the final route endpoint.
-                OnionReplyProofMode::SourceSealedTerminalProof => None,
+                OnionReplyProofMode::SourceSealedTerminalProof => {
+                    attach_blind_relay_success_receipt(
+                        Arc::clone(&envelope),
+                        response,
+                        accepted_at,
+                        Arc::clone(&state.node_identity),
+                    )
+                    .await?
+                }
             };
-            let response = attach_blind_relay_success_receipt(
-                Arc::clone(&envelope),
-                PeerBlindRelayResponse {
-                    accepted: true,
-                    terminal: true,
-                    forwarded: false,
-                    ttl_remaining: envelope.ttl,
-                    reason: Some("onion_terminal_delivered".to_string()),
-                    delivery_receipt,
-                    success_receipt: None,
-                    failure_receipt: None,
-                    opaque_terminal_response_b64: terminal_delivery.opaque_response_b64,
-                },
-                accepted_at,
-                Arc::clone(&state.node_identity),
-            )
-            .await?;
             complete_blind_relay_route(&state, route_lease, accepted_at, response.clone())?;
             record_blind_relay_previous_hop_success(&state, previous_hop_node_id);
             state.peer_store.record_blind_relay_terminal(
