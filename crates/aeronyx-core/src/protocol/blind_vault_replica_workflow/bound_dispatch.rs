@@ -79,7 +79,8 @@ pub use replacement_reply_policy::{
     BlindVaultReplicaCompletedReplacement, BlindVaultReplicaReplacementAuthorizationError,
     BlindVaultReplicaReplacementPermitIssueError, BlindVaultReplicaReplacementReplyOutcome,
     BlindVaultReplicaReplacementReplyPolicy, BlindVaultReplicaReplacementReplyPolicyBuildError,
-    BlindVaultReplicaReplacementReplyPolicyError, BlindVaultReplicaVerificationClock,
+    BlindVaultReplicaReplacementReplyPolicyError,
+    BlindVaultReplicaReplacementRetirementDispatchError, BlindVaultReplicaVerificationClock,
 };
 pub use request_bound_verifier::{
     BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaRequestBoundReply,

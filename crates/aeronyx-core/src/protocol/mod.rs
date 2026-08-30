@@ -71,6 +71,8 @@
 //!   policy authorization and runtime retirement to one workflow permit.
 //! - [BLIND-VAULT-REPLACEMENT-LEASE-LIFETIME 2026-08-30 by Codex] Prevented
 //!   authorization, retry, or completion after replacement lease expiry.
+//! - [BLIND-VAULT-AUTHORIZED-RETIREMENT-DISPATCH 2026-08-30 by Codex] Joined
+//!   active workflow authority to permit-gated transport and reply validation.
 //!
 //! ## Main Functionality
 //!

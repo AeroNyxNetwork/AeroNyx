@@ -15,6 +15,7 @@
 //! - Retains only credential-free verified admission state between replies.
 //! - Verifies replacement inventory against one source-owned manifest.
 //! - Requires a workflow-issued permit before accepting retirement evidence.
+//! - Composes permit issuance, runtime transport, and reply verification.
 //! - Produces typed, non-serializable lifecycle outcomes for the source.
 //! - Seals completed evidence behind an unforgeable replacement-only type.
 //!
@@ -37,7 +38,9 @@
 //! - Never add a transition that accepts retirement before verified inventory.
 //! - Never expose request, receipt, manifest, node, or lease values in Debug.
 //!
-//! Last Modified: v1.3.0-RetryablePermitComposition - Revalidated and reused
+//! Last Modified: v1.4.0-AuthorizedRetirementDispatch - Composed workflow
+//! authority and the permit-gated runtime send behind one typed operation.
+//! v1.3.0-RetryablePermitComposition - Revalidated and reused
 //! the same live replacement permit after retryable transport failure.
 //! v1.2.0-WorkflowPermitComposition - Issued and installed one
 //! exact active-execution permit for both policy and runtime use.
@@ -55,14 +58,21 @@ use super::super::{
     BlindVaultVerifiedProvisionedReplica, BlindVaultVerifiedReplicaAdmission,
     BlindVaultVerifiedRetiredReplica,
 };
+use super::attempt_runtime::{
+    BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalAttemptRuntime,
+};
 use super::request_bound_verifier::{
     BlindVaultReplicaPrivateReplyPolicy, BlindVaultReplicaRequestBoundReply,
+    BlindVaultReplicaRequestBoundReplyError, BlindVaultReplicaRequestBoundReplyVerifier,
 };
-use super::send_sequence::BlindVaultReplicaTerminalSendContext;
+use super::send_sequence::{
+    BlindVaultReplicaTerminalEffectTransport, BlindVaultReplicaTerminalSendContext,
+};
 use crate::protocol::blind_vault::{
     BlindVaultReplicaEvidenceError, BlindVaultReplicaManifestExpectation,
     BlindVaultVerifiedReplicaInventory,
 };
+use crate::protocol::onion::OnionRoutePurpose;
 
 /// Replaceable source clock used for bounded receipt verification.
 pub trait BlindVaultReplicaVerificationClock {
@@ -298,6 +308,44 @@ impl<Clock> BlindVaultReplicaReplacementReplyPolicy<Clock> {
     }
 }
 
+impl<Clock>
+    BlindVaultReplicaRequestBoundReplyVerifier<BlindVaultReplicaReplacementReplyPolicy<Clock>>
+where
+    Clock: BlindVaultReplicaVerificationClock,
+{
+    /// Authorizes, sends, opens, and verifies one old-lease retirement.
+    ///
+    /// [BLIND-VAULT-AUTHORIZED-RETIREMENT-DISPATCH 2026-08-30 by Codex] This
+    /// is the only high-assurance replacement path that joins active workflow
+    /// authority to runtime transport. The exact permit installed in private
+    /// policy state is passed directly into the ordered send; adapters cannot
+    /// substitute another work item, attempt, replacement, or old terminal.
+    pub fn send_authorized_retirement<Transport>(
+        &mut self,
+        execution: &BlindVaultReplicaExecution,
+        runtime: &mut BlindVaultReplicaTerminalAttemptRuntime<'_>,
+        transport: &mut Transport,
+        purpose: OnionRoutePurpose,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<
+        BlindVaultReplicaReplacementReplyOutcome,
+        BlindVaultReplicaReplacementRetirementDispatchError<Transport::Error, Clock::Error>,
+    >
+    where
+        Transport: BlindVaultReplicaTerminalEffectTransport,
+        Transport::Response: AsRef<[u8]>,
+    {
+        let permit = self
+            .policy_mut()
+            .authorize_retirement_from_execution(execution, now_ms)
+            .map_err(BlindVaultReplicaReplacementRetirementDispatchError::Permit)?;
+        runtime
+            .send_next_with_retirement_permit(transport, self, purpose, payload, &permit)
+            .map_err(BlindVaultReplicaReplacementRetirementDispatchError::Attempt)
+    }
+}
+
 impl<Clock> fmt::Debug for BlindVaultReplicaReplacementReplyPolicy<Clock> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -527,6 +575,47 @@ impl Error for BlindVaultReplicaReplacementPermitIssueError {
         match self {
             Self::Workflow(error) => Some(error),
             Self::Authorization(error) => Some(error),
+        }
+    }
+}
+
+/// Permit composition, runtime transport, or retirement-reply failure.
+#[derive(Debug)]
+pub enum BlindVaultReplicaReplacementRetirementDispatchError<TransportError, ClockError> {
+    /// Active execution could not issue or revalidate exact retirement authority.
+    Permit(BlindVaultReplicaReplacementPermitIssueError),
+    /// Ordered transport or exact terminal reply processing failed.
+    Attempt(
+        BlindVaultReplicaTerminalAttemptError<
+            TransportError,
+            BlindVaultReplicaRequestBoundReplyError<
+                BlindVaultReplicaReplacementReplyPolicyError<ClockError>,
+            >,
+        >,
+    ),
+}
+
+impl<TransportError: fmt::Display, ClockError: fmt::Display> fmt::Display
+    for BlindVaultReplicaReplacementRetirementDispatchError<TransportError, ClockError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Permit(error) => fmt::Display::fmt(error, formatter),
+            Self::Attempt(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl<TransportError, ClockError> Error
+    for BlindVaultReplicaReplacementRetirementDispatchError<TransportError, ClockError>
+where
+    TransportError: Error + 'static,
+    ClockError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Permit(error) => Some(error),
+            Self::Attempt(error) => Some(error),
         }
     }
 }

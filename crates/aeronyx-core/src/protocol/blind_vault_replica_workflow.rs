@@ -65,7 +65,9 @@
 //! - Distill accepted admission replies before waiting for inventory; do not
 //!   retain one-time blind credentials across terminal stages.
 //!
-//! Last Modified: v1.37.0-ReplacementLeaseLifetime - Preserved and enforced
+//! Last Modified: v1.38.0-AuthorizedRetirementDispatch - Joined active
+//! workflow authority, permit-gated transport, and exact reply verification.
+//! v1.37.0-ReplacementLeaseLifetime - Preserved and enforced
 //! the verified replacement lease window through retirement completion.
 //! v1.36.0-ReplacementPermitComposition - Bound policy and
 //! runtime retirement to one active-execution-issued permit capability.
@@ -183,7 +185,8 @@ pub use bound_dispatch::{
     BlindVaultReplicaReplacementAuthorizationError, BlindVaultReplicaReplacementPermitIssueError,
     BlindVaultReplicaReplacementReplyOutcome, BlindVaultReplicaReplacementReplyPolicy,
     BlindVaultReplicaReplacementReplyPolicyBuildError,
-    BlindVaultReplicaReplacementReplyPolicyError, BlindVaultReplicaRequestBoundReply,
+    BlindVaultReplicaReplacementReplyPolicyError,
+    BlindVaultReplicaReplacementRetirementDispatchError, BlindVaultReplicaRequestBoundReply,
     BlindVaultReplicaRequestBoundReplyError, BlindVaultReplicaRequestBoundReplyVerifier,
     BlindVaultReplicaTerminalAttemptError, BlindVaultReplicaTerminalAttemptRuntime,
     BlindVaultReplicaTerminalAttemptRuntimeBuildError, BlindVaultReplicaTerminalAttemptState,
