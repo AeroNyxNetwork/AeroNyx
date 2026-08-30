@@ -149,6 +149,9 @@
 //! - [DIRECT-RECEIPT-SIGNING-COMPLETION 2026-08-31 by Codex] Signs direct
 //!   custody receipts in the bounded direct-crypto domain after durable
 //!   acceptance, with fair completion admission and retryable failure
+//! - [SINGLE-PASS-DIRECT-REQUEST-COMMITMENT 2026-08-31 by Codex] Derives
+//!   direct request signatures and replay commitments from one canonical
+//!   envelope encoding instead of serializing large ciphertext twice
 //!
 //! ## Dependencies
 //! - aeronyx-core/src/protocol/chat.rs: `ChatEnvelope`, `BlindRelayEnvelope`,
@@ -970,14 +973,34 @@ impl PeerChatRelayRequestV2 {
         envelope: ChatEnvelope,
         node_identity: &IdentityKeyPair,
     ) -> Result<Self, bincode::Error> {
+        Self::sign_with_commitment(envelope, node_identity).map(|(request, _)| request)
+    }
+
+    /// Builds the authenticated request and its replay commitment together.
+    ///
+    /// The signature and commitment intentionally consume the same canonical
+    /// bytes. Outbound callers should use this method when they need both so a
+    /// large opaque envelope is encoded exactly once.
+    pub fn sign_with_commitment(
+        envelope: ChatEnvelope,
+        node_identity: &IdentityKeyPair,
+    ) -> Result<(Self, [u8; 32]), bincode::Error> {
         let previous_hop_node_id = node_identity.public_key_bytes();
         let signing_data = peer_chat_relay_auth_v2_signing_data(&previous_hop_node_id, &envelope)?;
         let previous_hop_signature = node_identity.sign(&signing_data);
-        Ok(Self {
-            envelope,
-            previous_hop_node_id,
-            previous_hop_signature,
-        })
+        let request_commitment = peer_chat_relay_request_commitment(
+            PEER_CHAT_RELAY_REQUEST_COMMITMENT_V2_DOMAIN,
+            &signing_data,
+            &previous_hop_signature,
+        );
+        Ok((
+            Self {
+                envelope,
+                previous_hop_node_id,
+                previous_hop_signature,
+            },
+            request_commitment,
+        ))
     }
 
     /// Verifies node-key possession and exact encrypted-envelope binding.
@@ -1000,21 +1023,28 @@ impl PeerChatRelayRequestV2 {
     pub fn request_commitment(&self) -> Result<[u8; 32], bincode::Error> {
         let signing_data =
             peer_chat_relay_auth_v2_signing_data(&self.previous_hop_node_id, &self.envelope)?;
-        let mut hasher = Sha256::new();
-        hasher.update(PEER_CHAT_RELAY_REQUEST_COMMITMENT_V2_DOMAIN);
-        hasher.update((signing_data.len() as u64).to_be_bytes());
-        hasher.update(signing_data);
-        hasher.update(self.previous_hop_signature);
-        Ok(hasher.finalize().into())
+        Ok(peer_chat_relay_request_commitment(
+            PEER_CHAT_RELAY_REQUEST_COMMITMENT_V2_DOMAIN,
+            &signing_data,
+            &self.previous_hop_signature,
+        ))
     }
 
     /// Authenticates the previous hop and returns the exact request commitment.
     #[must_use]
     pub fn verified_request_commitment(&self) -> Option<[u8; 32]> {
-        if !self.verify_previous_hop() {
-            return None;
-        }
-        self.request_commitment().ok()
+        let public_key = IdentityPublicKey::from_bytes(&self.previous_hop_node_id).ok()?;
+        let signing_data =
+            peer_chat_relay_auth_v2_signing_data(&self.previous_hop_node_id, &self.envelope)
+                .ok()?;
+        public_key
+            .verify(&signing_data, &self.previous_hop_signature)
+            .ok()?;
+        Some(peer_chat_relay_request_commitment(
+            PEER_CHAT_RELAY_REQUEST_COMMITMENT_V2_DOMAIN,
+            &signing_data,
+            &self.previous_hop_signature,
+        ))
     }
 }
 
@@ -1058,6 +1088,16 @@ impl PeerChatRelayRequestV3 {
         target_node_id: [u8; 32],
         node_identity: &IdentityKeyPair,
     ) -> Result<Self, bincode::Error> {
+        Self::sign_with_commitment(envelope, target_node_id, node_identity)
+            .map(|(request, _)| request)
+    }
+
+    /// Builds one target-bound request and its exact replay commitment.
+    pub fn sign_with_commitment(
+        envelope: ChatEnvelope,
+        target_node_id: [u8; 32],
+        node_identity: &IdentityKeyPair,
+    ) -> Result<(Self, [u8; 32]), bincode::Error> {
         let previous_hop_node_id = node_identity.public_key_bytes();
         let signing_data = peer_chat_relay_auth_v3_signing_data(
             &previous_hop_node_id,
@@ -1065,12 +1105,20 @@ impl PeerChatRelayRequestV3 {
             &envelope,
         )?;
         let previous_hop_signature = node_identity.sign(&signing_data);
-        Ok(Self {
-            envelope,
-            previous_hop_node_id,
-            target_node_id,
-            previous_hop_signature,
-        })
+        let request_commitment = peer_chat_relay_request_commitment(
+            PEER_CHAT_RELAY_REQUEST_COMMITMENT_V3_DOMAIN,
+            &signing_data,
+            &previous_hop_signature,
+        );
+        Ok((
+            Self {
+                envelope,
+                previous_hop_node_id,
+                target_node_id,
+                previous_hop_signature,
+            },
+            request_commitment,
+        ))
     }
 
     /// Verifies previous-hop possession and binding to the local target.
@@ -1101,12 +1149,11 @@ impl PeerChatRelayRequestV3 {
             &self.target_node_id,
             &self.envelope,
         )?;
-        let mut hasher = Sha256::new();
-        hasher.update(PEER_CHAT_RELAY_REQUEST_COMMITMENT_V3_DOMAIN);
-        hasher.update((signing_data.len() as u64).to_be_bytes());
-        hasher.update(signing_data);
-        hasher.update(self.previous_hop_signature);
-        Ok(hasher.finalize().into())
+        Ok(peer_chat_relay_request_commitment(
+            PEER_CHAT_RELAY_REQUEST_COMMITMENT_V3_DOMAIN,
+            &signing_data,
+            &self.previous_hop_signature,
+        ))
     }
 
     /// Authenticates this exact target and returns the request commitment.
@@ -1115,11 +1162,42 @@ impl PeerChatRelayRequestV3 {
         &self,
         expected_target_node_id: &[u8; 32],
     ) -> Option<[u8; 32]> {
-        if !self.verify_for_target(expected_target_node_id) {
+        if &self.target_node_id != expected_target_node_id {
             return None;
         }
-        self.request_commitment().ok()
+        let public_key = IdentityPublicKey::from_bytes(&self.previous_hop_node_id).ok()?;
+        let signing_data = peer_chat_relay_auth_v3_signing_data(
+            &self.previous_hop_node_id,
+            &self.target_node_id,
+            &self.envelope,
+        )
+        .ok()?;
+        public_key
+            .verify(&signing_data, &self.previous_hop_signature)
+            .ok()?;
+        Some(peer_chat_relay_request_commitment(
+            PEER_CHAT_RELAY_REQUEST_COMMITMENT_V3_DOMAIN,
+            &signing_data,
+            &self.previous_hop_signature,
+        ))
     }
+}
+
+fn peer_chat_relay_request_commitment(
+    domain: &[u8],
+    signing_data: &[u8],
+    previous_hop_signature: &[u8; 64],
+) -> [u8; 32] {
+    // [SINGLE-PASS-DIRECT-REQUEST-COMMITMENT 2026-08-31 by Codex] This pure
+    // helper is the one commitment contract for v2 and v3. Version separation
+    // remains explicit in `domain`; callers cannot accidentally hash a second
+    // serialization that differs from the bytes already signed.
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update((signing_data.len() as u64).to_be_bytes());
+    hasher.update(signing_data);
+    hasher.update(previous_hop_signature);
+    hasher.finalize().into()
 }
 
 /// Versioned direct-relay request awaiting previous-hop authentication.

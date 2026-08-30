@@ -12904,8 +12904,12 @@ impl Server {
         let mut last_failure_reason: Option<String> = None;
 
         let excluded_node_ids = [node_identity.public_key_bytes()];
+        // [SINGLE-PASS-DIRECT-REQUEST-COMMITMENT 2026-08-31 by Codex] Retain
+        // the commitment produced from the exact bytes signed for v2. Reusing
+        // it across compatibility candidates avoids re-encoding the same
+        // opaque envelope after every network response.
         let authenticated_request =
-            PeerChatRelayRequestV2::sign(envelope.clone(), node_identity).ok();
+            PeerChatRelayRequestV2::sign_with_commitment(envelope.clone(), node_identity).ok();
         let mut candidates = peer_store
             .route_candidates_with_capability_excluding(
                 NodeCapability::ChatRelay,
@@ -13028,42 +13032,27 @@ impl Server {
                 // inside the peer loop because the signed target differs for
                 // every candidate. Reusing one request would recreate the v2
                 // cross-node replay boundary this contract closes.
-                let request = match PeerChatRelayRequestV3::sign(
-                    envelope.clone(),
-                    peer.node_id(),
-                    node_identity,
-                ) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
-                            relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
+                let (request, request_commitment) =
+                    match PeerChatRelayRequestV3::sign_with_commitment(
+                        envelope.clone(),
+                        peer.node_id(),
+                        node_identity,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(_) => {
+                            if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
+                                relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
+                            }
+                            let reason = "peer_relay_target_auth_encode_failed".to_string();
+                            let _ = peer_store.record_route_forward_failure_for_descriptor(
+                                &peer,
+                                now,
+                                reason.clone(),
+                            );
+                            last_failure_reason = Some(reason);
+                            break;
                         }
-                        let reason = "peer_relay_target_auth_encode_failed".to_string();
-                        let _ = peer_store.record_route_forward_failure_for_descriptor(
-                            &peer,
-                            now,
-                            reason.clone(),
-                        );
-                        last_failure_reason = Some(reason);
-                        break;
-                    }
-                };
-                let request_commitment = match request.request_commitment() {
-                    Ok(commitment) => commitment,
-                    Err(_) => {
-                        if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
-                            relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
-                        }
-                        let reason = "peer_relay_target_auth_encode_failed".to_string();
-                        let _ = peer_store.record_route_forward_failure_for_descriptor(
-                            &peer,
-                            now,
-                            reason.clone(),
-                        );
-                        last_failure_reason = Some(reason);
-                        break;
-                    }
-                };
+                    };
                 let outcome = Self::send_and_validate_target_bound_peer_relay(
                     client,
                     &url,
@@ -13093,7 +13082,7 @@ impl Server {
                 })
             } else {
                 let (response, expected_request_commitment) = if use_authenticated_relay {
-                    let Some(request) = authenticated_request.as_ref() else {
+                    let Some((request, request_commitment)) = authenticated_request.as_ref() else {
                         let reason = "peer_relay_auth_encode_failed".to_string();
                         let _ = peer_store.record_route_forward_failure_for_descriptor(
                             &peer,
@@ -13105,7 +13094,7 @@ impl Server {
                     };
                     (
                         client.post(&url).json(request).send().await,
-                        request.request_commitment().ok(),
+                        Some(*request_commitment),
                     )
                 } else {
                     (
