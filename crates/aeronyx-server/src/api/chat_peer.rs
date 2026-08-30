@@ -153,8 +153,8 @@
 //!   direct request signatures and replay commitments from one canonical
 //!   envelope encoding instead of serializing large ciphertext twice
 //! - [OUTBOUND-DIRECT-REQUEST-PREPARATION 2026-08-31 by Codex] Prepares
-//!   authenticated v2/v3 outbound requests behind fail-fast bounded crypto
-//!   admission, leaving peer selection and HTTP I/O in the server runtime
+//!   bounded v1/v2/v3 JSON bodies and authenticated commitments behind
+//!   fail-fast CPU admission, leaving only peer selection and I/O in Server
 //! - [OUTBOUND-DIRECT-RECEIPT-VERIFICATION 2026-08-31 by Codex] Verifies
 //!   bounded custody receipts outside Tokio while preserving local worker
 //!   failures as non-peer-attributable typed outcomes
@@ -532,6 +532,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -665,16 +666,16 @@ const MAX_BLIND_RELAY_CRYPTO_OPERATIONS_IN_FLIGHT: usize = 8;
 /// Process-wide admission for CPU-bound blind-relay cryptography.
 static BLIND_RELAY_CRYPTO_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-/// Hard ceiling for concurrent direct-relay signature verification workers.
+/// Hard ceiling for concurrent direct-relay CPU workers.
 ///
 /// [DIRECT-RELAY-VERIFY-ADMISSION 2026-08-30 by Codex] Direct and blind relay
 /// have separate half-CPU partitions so one public surface cannot starve the
 /// other. Together they approximate host parallelism; one-core nodes retain
 /// one worker per surface so either protocol can still make progress.
-const MAX_DIRECT_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT: usize = 8;
+const MAX_DIRECT_RELAY_CPU_OPERATIONS_IN_FLIGHT: usize = 8;
 
-/// Process-wide admission for CPU-bound direct-relay authentication.
-static DIRECT_RELAY_SIGNATURE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+/// Process-wide admission for direct authentication, signing, and encoding.
+static DIRECT_RELAY_CPU_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Maximum concurrent blocking ChatRelay custody operations.
 const MAX_CHAT_RELAY_STORAGE_OPERATIONS_IN_FLIGHT: usize = 8;
@@ -1248,6 +1249,7 @@ enum DirectRelayCryptoFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectRelayRequestPreparationFailure {
     Encoding,
+    BodyTooLarge,
     Backpressure,
     Unavailable,
 }
@@ -1266,13 +1268,39 @@ impl DirectRelayRequestPreparationFailure {
     #[must_use]
     pub(crate) const fn reason_bucket(self) -> &'static str {
         match self {
-            Self::Encoding => "peer_relay_auth_encode_failed",
+            Self::Encoding | Self::BodyTooLarge => "peer_relay_auth_encode_failed",
             // Keep the established closed telemetry vocabulary during rolling
             // upgrades. The typed variant still controls local recovery, while
             // aggregate route evidence avoids inventing a label older nodes
             // would sanitize to `unknown`.
             Self::Backpressure | Self::Unavailable => "peer_relay_auth_encode_failed",
         }
+    }
+}
+
+/// Opaque, bounded HTTP carrier prepared outside the async I/O runtime.
+///
+/// [OUTBOUND-DIRECT-HTTP-BODY-PREPARATION 2026-08-31 by Codex] Serialize once
+/// under bounded CPU admission, then reuse the exact immutable bytes for v2
+/// fanout or v3 retry without blocking a Tokio I/O worker.
+///
+/// This type intentionally omits `Debug`: its body contains an end-to-end
+/// encrypted user envelope. `Bytes` keeps exact retry and fanout clones O(1).
+#[derive(Clone)]
+pub(crate) struct PreparedPeerChatRelayHttpRequest {
+    body: Bytes,
+    request_commitment: Option<[u8; 32]>,
+}
+
+impl PreparedPeerChatRelayHttpRequest {
+    #[must_use]
+    pub(crate) fn body(&self) -> Bytes {
+        self.body.clone()
+    }
+
+    #[must_use]
+    pub(crate) const fn request_commitment(&self) -> Option<[u8; 32]> {
+        self.request_commitment
     }
 }
 
@@ -2350,7 +2378,7 @@ async fn validate_peer_envelope_for_relay(
     envelope: ChatEnvelope,
     now: u64,
 ) -> Result<ChatEnvelope, ChatPeerRelayError> {
-    let permit = match direct_relay_signature_admission().try_acquire_owned() {
+    let permit = match direct_relay_cpu_admission().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             let error = ChatPeerRelayError::VerificationBackpressure;
@@ -2579,10 +2607,10 @@ where
     }
 }
 
-fn direct_relay_signature_admission() -> Arc<Semaphore> {
-    Arc::clone(DIRECT_RELAY_SIGNATURE_ADMISSION.get_or_init(|| {
+fn direct_relay_cpu_admission() -> Arc<Semaphore> {
+    Arc::clone(DIRECT_RELAY_CPU_ADMISSION.get_or_init(|| {
         Arc::new(Semaphore::new(signature_verification_capacity(
-            MAX_DIRECT_RELAY_SIGNATURE_VERIFICATIONS_IN_FLIGHT,
+            MAX_DIRECT_RELAY_CPU_OPERATIONS_IN_FLIGHT,
         )))
     }))
 }
@@ -2605,7 +2633,7 @@ fn blind_vault_terminal_admission() -> Arc<Semaphore> {
 async fn authenticate_direct_peer_relay_request(
     request: DirectPeerAuthenticationRequest,
 ) -> Result<AuthenticatedDirectPeerRelayRequest, DirectPeerAuthenticationFailure> {
-    let permit = direct_relay_signature_admission()
+    let permit = direct_relay_cpu_admission()
         .try_acquire_owned()
         .map_err(|_| DirectPeerAuthenticationFailure::Backpressure)?;
     execute_direct_relay_crypto(permit, move || {
@@ -2655,7 +2683,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let permit = direct_relay_signature_admission()
+    let permit = direct_relay_cpu_admission()
         .acquire_owned()
         .await
         .map_err(|_| DirectRelayCryptoFailure::Unavailable)?;
@@ -2684,13 +2712,26 @@ where
     })
 }
 
+/// Prepares one legacy direct request outside the asynchronous I/O runtime.
+pub(crate) async fn prepare_peer_chat_relay_request_v1(
+    envelope: ChatEnvelope,
+) -> Result<PreparedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
+    prepare_direct_peer_relay_request(move || {
+        encode_prepared_peer_chat_relay_request(&PeerChatRelayRequest { envelope }, None)
+    })
+    .await
+}
+
 /// Prepares one authenticated v2 request outside the asynchronous I/O runtime.
 pub(crate) async fn prepare_peer_chat_relay_request_v2(
     envelope: ChatEnvelope,
     node_identity: Arc<IdentityKeyPair>,
-) -> Result<(PeerChatRelayRequestV2, [u8; 32]), DirectRelayRequestPreparationFailure> {
+) -> Result<PreparedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
     prepare_direct_peer_relay_request(move || {
-        PeerChatRelayRequestV2::sign_with_commitment(envelope, node_identity.as_ref())
+        let (request, request_commitment) =
+            PeerChatRelayRequestV2::sign_with_commitment(envelope, node_identity.as_ref())
+                .map_err(|_| DirectRelayRequestPreparationFailure::Encoding)?;
+        encode_prepared_peer_chat_relay_request(&request, Some(request_commitment))
     })
     .await
 }
@@ -2700,15 +2741,32 @@ pub(crate) async fn prepare_peer_chat_relay_request_v3(
     envelope: ChatEnvelope,
     target_node_id: [u8; 32],
     node_identity: Arc<IdentityKeyPair>,
-) -> Result<(PeerChatRelayRequestV3, [u8; 32]), DirectRelayRequestPreparationFailure> {
+) -> Result<PreparedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
     prepare_direct_peer_relay_request(move || {
-        PeerChatRelayRequestV3::sign_with_commitment(
+        let (request, request_commitment) = PeerChatRelayRequestV3::sign_with_commitment(
             envelope,
             target_node_id,
             node_identity.as_ref(),
         )
+        .map_err(|_| DirectRelayRequestPreparationFailure::Encoding)?;
+        encode_prepared_peer_chat_relay_request(&request, Some(request_commitment))
     })
     .await
+}
+
+fn encode_prepared_peer_chat_relay_request<T: Serialize>(
+    request: &T,
+    request_commitment: Option<[u8; 32]>,
+) -> Result<PreparedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
+    let body =
+        serde_json::to_vec(request).map_err(|_| DirectRelayRequestPreparationFailure::Encoding)?;
+    if body.len() > PEER_CHAT_REQUEST_BODY_MAX_BYTES {
+        return Err(DirectRelayRequestPreparationFailure::BodyTooLarge);
+    }
+    Ok(PreparedPeerChatRelayHttpRequest {
+        body: Bytes::from(body),
+        request_commitment,
+    })
 }
 
 /// Verifies a signed direct-custody receipt outside the async I/O runtime.
@@ -2722,7 +2780,7 @@ pub(crate) async fn verify_peer_chat_relay_receipt(
     // body has already been bounded before this call. Fail fast when the local
     // CPU partition is full; the caller may repeat the exact v3 request, but
     // must not attribute local saturation to the selected peer.
-    let permit = direct_relay_signature_admission()
+    let permit = direct_relay_cpu_admission()
         .try_acquire_owned()
         .map_err(|_| DirectRelayReceiptVerificationFailure::Backpressure)?;
     execute_direct_relay_crypto(permit, move || {
@@ -2744,20 +2802,17 @@ async fn prepare_direct_peer_relay_request<T, F>(
 ) -> Result<T, DirectRelayRequestPreparationFailure>
 where
     T: Send + 'static,
-    F: FnOnce() -> Result<T, bincode::Error> + Send + 'static,
+    F: FnOnce() -> Result<T, DirectRelayRequestPreparationFailure> + Send + 'static,
 {
     // [OUTBOUND-DIRECT-REQUEST-PREPARATION 2026-08-31 by Codex] Outbound
     // fallback is optional and always has local durable custody behind it.
     // Fail fast instead of queueing unbounded signature work under fanout.
-    let permit = direct_relay_signature_admission()
+    let permit = direct_relay_cpu_admission()
         .try_acquire_owned()
         .map_err(|_| DirectRelayRequestPreparationFailure::Backpressure)?;
-    execute_direct_relay_crypto(permit, work)
-        .await
-        .map_err(|DirectRelayCryptoFailure::Unavailable| {
-            DirectRelayRequestPreparationFailure::Unavailable
-        })?
-        .map_err(|_| DirectRelayRequestPreparationFailure::Encoding)
+    execute_direct_relay_crypto(permit, work).await.map_err(
+        |DirectRelayCryptoFailure::Unavailable| DirectRelayRequestPreparationFailure::Unavailable,
+    )?
 }
 
 async fn authenticate_peer_blind_relay_request(

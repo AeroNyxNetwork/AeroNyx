@@ -985,11 +985,11 @@ use crate::api::auth::ensure_jwt_secret;
 use crate::api::blind_vault::build_blind_vault_router;
 use crate::api::chat_handlers::build_chat_router;
 use crate::api::chat_peer::{
-    build_chat_peer_router, prepare_peer_chat_relay_request_v2,
+    build_chat_peer_router, prepare_peer_chat_relay_request_v1,
+    prepare_peer_chat_relay_request_v2,
     prepare_peer_chat_relay_request_v3, verify_peer_chat_relay_receipt,
     DirectRelayReceiptVerificationFailure, PeerBlindRelayRequest, PeerBlindRelayResponse,
-    PeerChatRelayRequest, PeerChatRelayRequestV2, PeerChatRelayRequestV3,
-    PeerChatRelayResponse, PeerChatRelayResponseV2,
+    PeerChatRelayResponse, PeerChatRelayResponseV2, PreparedPeerChatRelayHttpRequest,
 };
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
@@ -12902,19 +12902,25 @@ impl Server {
     /// to one target and retains its signed ACK by opaque commitment. One
     /// attempt therefore spans send, status, bounded body read, and receipt
     /// verification. Retry remains limited to transport ambiguity, HTTP 425,
-    /// or an incomplete/undecodable bounded ACK body; deterministic protocol
-    /// and cryptographic failures terminate immediately.
+    /// an incomplete/undecodable bounded ACK body, or local verifier pressure;
+    /// deterministic remote protocol and cryptographic failures stop at once.
     async fn send_and_validate_target_bound_peer_relay(
         client: &reqwest::Client,
         url: &str,
-        request: &PeerChatRelayRequestV3,
+        request: &PreparedPeerChatRelayHttpRequest,
         expected_request_commitment: &[u8; 32],
         expected_node_id: &[u8; 32],
         require_signed_receipt: bool,
     ) -> TargetBoundPeerRelayDeliveryOutcome {
         let mut attempt = 1usize;
         loop {
-            let outcome = match client.post(url).json(request).send().await {
+            let outcome = match client
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(request.body())
+                .send()
+                .await
+            {
                 Err(error) => Err(TargetBoundPeerRelayFailure::Transport(error)),
                 Ok(response) if !response.status().is_success() => {
                     Err(TargetBoundPeerRelayFailure::Http(response.status()))
@@ -12997,6 +13003,14 @@ impl Server {
                     .descriptor
                     .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayAuthV2)
         });
+        let has_legacy_candidate = candidates.iter().any(|peer| {
+            !peer
+                .descriptor
+                .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayTargetBindingV3)
+                && !peer
+                    .descriptor
+                    .advertises_protocol_feature(NodeProtocolFeature::DirectPeerRelayAuthV2)
+        });
         // [OUTBOUND-DIRECT-REQUEST-PREPARATION 2026-08-31 by Codex] Clone the
         // process identity once for the bounded blocking domain, and skip all
         // signing work when the selected candidates support only legacy v1.
@@ -13014,6 +13028,11 @@ impl Server {
                 .await,
             ),
             _ => None,
+        };
+        let legacy_request = if has_legacy_candidate {
+            Some(prepare_peer_chat_relay_request_v1(envelope.clone()).await)
+        } else {
+            None
         };
         let mut first_target_bound_permit = None;
         if has_target_bound_candidate {
@@ -13135,7 +13154,7 @@ impl Server {
                     Arc::clone(signing_identity),
                 )
                 .await;
-                let (request, request_commitment) = match prepared_request {
+                let request = match prepared_request {
                     Ok(prepared) => prepared,
                     Err(error) => {
                         if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
@@ -13145,6 +13164,13 @@ impl Server {
                         last_failure_reason = Some(reason);
                         break;
                     }
+                };
+                let Some(request_commitment) = request.request_commitment() else {
+                    if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
+                        relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
+                    }
+                    last_failure_reason = Some("peer_relay_auth_encode_failed".to_string());
+                    break;
                 };
                 // [DIRECT-RELAY-ATTEMPT-BOUNDARY 2026-08-31 by Codex] Local
                 // request preparation cannot affect peer reputation. Count an
@@ -13200,7 +13226,7 @@ impl Server {
                         last_failure_reason = Some(reason);
                         continue;
                     };
-                    let (request, request_commitment) = match prepared {
+                    let request = match prepared {
                         Ok(prepared) => prepared,
                         Err(error) => {
                             let reason = error.reason_bucket().to_string();
@@ -13208,19 +13234,38 @@ impl Server {
                             continue;
                         }
                     };
-                    attempted += 1;
-                    (
-                        client.post(&url).json(request).send().await,
-                        Some(*request_commitment),
-                    )
-                } else {
+                    let Some(request_commitment) = request.request_commitment() else {
+                        last_failure_reason = Some("peer_relay_auth_encode_failed".to_string());
+                        continue;
+                    };
                     attempted += 1;
                     (
                         client
                             .post(&url)
-                            .json(&PeerChatRelayRequest {
-                                envelope: envelope.clone(),
-                            })
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .body(request.body())
+                            .send()
+                            .await,
+                        Some(request_commitment),
+                    )
+                } else {
+                    let Some(prepared) = legacy_request.as_ref() else {
+                        last_failure_reason = Some("peer_relay_auth_encode_failed".to_string());
+                        continue;
+                    };
+                    let request = match prepared {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            last_failure_reason = Some(error.reason_bucket().to_string());
+                            continue;
+                        }
+                    };
+                    attempted += 1;
+                    (
+                        client
+                            .post(&url)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .body(request.body())
                             .send()
                             .await,
                         None,
