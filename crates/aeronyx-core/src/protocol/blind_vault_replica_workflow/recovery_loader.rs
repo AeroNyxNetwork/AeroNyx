@@ -15,6 +15,7 @@
 //! - Authenticates prepared journals without exposing continuation plaintext.
 //! - Opens committed journals only for the exact ambiguous in-flight attempt.
 //! - Rejects unsupported concurrent private attempts and every phase mismatch.
+//! - Redacts host and cryptographic errors from standard diagnostics.
 //!
 //! ## Dependencies
 //! - `persistence.rs`: atomic generation phases and recovery-store contract.
@@ -38,7 +39,9 @@
 //! - A single durable generation supports at most one private attempt journal.
 //! - Loading, classification, and journal opening must remain side-effect free.
 //!
-//! Last Modified: v1.0.0-AuthenticatedRecoveryLoad - Initial phase-aware,
+//! Last Modified: v1.1.0-PrivacySafeRecoveryDiagnostics - Replaced generic
+//! store Debug output with stable redacted recovery classifications.
+//! v1.0.0-AuthenticatedRecoveryLoad - Initial phase-aware,
 //! exact-high-water workflow recovery loader.
 //! ============================================
 
@@ -139,7 +142,6 @@ impl fmt::Debug for BlindVaultReplicaLoadedRecovery {
 }
 
 /// Fail-closed boundary errors while interpreting durable recovery state.
-#[derive(Debug)]
 pub enum BlindVaultReplicaRecoveryLoadError<StoreError> {
     /// Host adapter could not load a complete durable generation.
     Store(StoreError),
@@ -149,6 +151,17 @@ pub enum BlindVaultReplicaRecoveryLoadError<StoreError> {
     AttemptJournal(BlindVaultReplicaAttemptJournalError),
     /// Durable phase, high-water, or private-attempt cardinality conflicted.
     StateMismatch,
+}
+
+impl<StoreError> fmt::Debug for BlindVaultReplicaRecoveryLoadError<StoreError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(_) => formatter.write_str("Store(<redacted>)"),
+            Self::Workflow(_) => formatter.write_str("Workflow(<redacted>)"),
+            Self::AttemptJournal(_) => formatter.write_str("AttemptJournal(<redacted>)"),
+            Self::StateMismatch => formatter.write_str("StateMismatch"),
+        }
+    }
 }
 
 impl<StoreError> fmt::Display for BlindVaultReplicaRecoveryLoadError<StoreError> {

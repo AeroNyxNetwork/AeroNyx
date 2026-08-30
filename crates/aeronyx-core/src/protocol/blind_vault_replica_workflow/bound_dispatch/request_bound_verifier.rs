@@ -18,6 +18,7 @@
 //! - Delegates manifest, freshness, and lifecycle policy to a source adapter.
 //! - Centralizes anonymous single-effect attempt-context verification.
 //! - Exposes a source-only mutable policy boundary between verified stages.
+//! - Redacts source-private policy errors from standard diagnostics.
 //!
 //! ## Dependencies
 //! - `attempt_runtime.rs`: semantic reply-verifier trait and private state.
@@ -40,7 +41,9 @@
 //! - Never implement a permissive default private policy.
 //! - Debug output must remain redacted because requests can contain ciphertext.
 //!
-//! Last Modified: v1.4.0-TerminalFailureClassification - Implemented the
+//! Last Modified: v1.5.0-PrivacySafePolicyDiagnostics - Replaced generic
+//! policy Debug output with stable redacted classifications.
+//! v1.4.0-TerminalFailureClassification - Implemented the
 //! shared bounded runtime failure classifier for request-bound errors.
 //! v1.3.0-SingleEffectContext - Centralized exact work,
 //! attempt, sequence, and terminal-authorization checks for single replies.
@@ -440,7 +443,7 @@ fn require_match<PolicyError>(
 }
 
 /// Common protocol failure or source-private policy rejection.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum BlindVaultReplicaRequestBoundReplyError<PolicyError> {
     /// Encoded onion request was malformed or unsupported.
     #[error(transparent)]
@@ -475,6 +478,24 @@ pub enum BlindVaultReplicaRequestBoundReplyError<PolicyError> {
     /// Source-private manifest or lifecycle policy rejected the signed pair.
     #[error("blind vault private reply policy rejected terminal outcome")]
     Policy(PolicyError),
+}
+
+impl<PolicyError> fmt::Debug for BlindVaultReplicaRequestBoundReplyError<PolicyError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OnionReply(_) => formatter.write_str("OnionReply(<redacted>)"),
+            Self::RequestFrame(_) => formatter.write_str("RequestFrame(<redacted>)"),
+            Self::ResponseFrame(_) => formatter.write_str("ResponseFrame(<redacted>)"),
+            Self::InvalidTerminalIdentity => formatter.write_str("InvalidTerminalIdentity"),
+            Self::UnsupportedPurpose => formatter.write_str("UnsupportedPurpose"),
+            Self::TerminalOperationMismatch => formatter.write_str("TerminalOperationMismatch"),
+            Self::TerminalFailure(_) => formatter.write_str("TerminalFailure(<redacted>)"),
+            Self::RequestFrameMismatch => formatter.write_str("RequestFrameMismatch"),
+            Self::ResponseFrameMismatch => formatter.write_str("ResponseFrameMismatch"),
+            Self::RequestMismatch => formatter.write_str("RequestMismatch"),
+            Self::Policy(_) => formatter.write_str("Policy(<redacted>)"),
+        }
+    }
 }
 
 impl<PolicyError> BlindVaultReplicaRequestBoundReplyError<PolicyError> {

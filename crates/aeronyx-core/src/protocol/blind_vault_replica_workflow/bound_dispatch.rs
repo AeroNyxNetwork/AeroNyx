@@ -37,7 +37,9 @@
 //! - Keep the generic path for compatibility; new compound adapters use this.
 //! - Network send remains forbidden until `into_terminal_send_sequence`.
 //!
-//! Last Modified: v1.11.0-PrivacySafeTransportDiagnostics - Redacted generic
+//! Last Modified: v1.12.0-PrivacySafePolicyDiagnostics - Redacted generic
+//! source-private policy errors at the request-bound verifier boundary.
+//! v1.11.0-PrivacySafeTransportDiagnostics - Redacted generic
 //! route, sender, transport, reply, and verifier diagnostic details.
 //! v1.10.0-OwnedResolutionBinding - Exposed the exact opaque
 //! committed binding needed to resolve an owned bound attempt after evidence.
