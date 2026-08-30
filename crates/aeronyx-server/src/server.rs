@@ -989,7 +989,8 @@ use crate::api::chat_peer::{
     prepare_peer_chat_relay_request_v2,
     prepare_peer_chat_relay_request_v3, verify_peer_chat_relay_receipt,
     DirectRelayReceiptVerificationFailure, PeerBlindRelayRequest, PeerBlindRelayResponse,
-    PeerChatRelayResponse, PeerChatRelayResponseV2, PreparedPeerChatRelayHttpRequest,
+    PeerChatRelayResponse, PeerChatRelayResponseV2,
+    PreparedAuthenticatedPeerChatRelayHttpRequest, PreparedPeerChatRelayHttpRequest,
 };
 use crate::api::directory_chain_peer::build_directory_chain_peer_router_with_replica_and_runtime;
 use crate::api::directory_replica_status::{
@@ -12907,7 +12908,7 @@ impl Server {
     async fn send_and_validate_target_bound_peer_relay(
         client: &reqwest::Client,
         url: &str,
-        request: &PreparedPeerChatRelayHttpRequest,
+        request: &PreparedAuthenticatedPeerChatRelayHttpRequest,
         expected_request_commitment: &[u8; 32],
         expected_node_id: &[u8; 32],
         require_signed_receipt: bool,
@@ -13165,13 +13166,7 @@ impl Server {
                         break;
                     }
                 };
-                let Some(request_commitment) = request.request_commitment() else {
-                    if let (Some(relay), Some(permit)) = (relay, delivery_permit) {
-                        relay.cancel_direct_peer_delivery(unix_now_secs(), permit);
-                    }
-                    last_failure_reason = Some("peer_relay_auth_encode_failed".to_string());
-                    break;
-                };
+                let request_commitment = request.request_commitment();
                 // [DIRECT-RELAY-ATTEMPT-BOUNDARY 2026-08-31 by Codex] Local
                 // request preparation cannot affect peer reputation. Count an
                 // attempt only after the exact signed request is ready and the
@@ -13234,10 +13229,7 @@ impl Server {
                             continue;
                         }
                     };
-                    let Some(request_commitment) = request.request_commitment() else {
-                        last_failure_reason = Some("peer_relay_auth_encode_failed".to_string());
-                        continue;
-                    };
+                    let request_commitment = request.request_commitment();
                     attempted += 1;
                     (
                         client

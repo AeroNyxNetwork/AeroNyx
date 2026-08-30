@@ -1289,7 +1289,6 @@ impl DirectRelayRequestPreparationFailure {
 #[derive(Clone)]
 pub(crate) struct PreparedPeerChatRelayHttpRequest {
     body: Bytes,
-    request_commitment: Option<[u8; 32]>,
 }
 
 impl PreparedPeerChatRelayHttpRequest {
@@ -1297,9 +1296,27 @@ impl PreparedPeerChatRelayHttpRequest {
     pub(crate) fn body(&self) -> Bytes {
         self.body.clone()
     }
+}
+
+/// Prepared v2/v3 carrier whose commitment is mandatory by construction.
+///
+/// [AUTHENTICATED-DIRECT-CARRIER-TYPE 2026-08-31 by Codex] A signed request
+/// without its exact commitment is not representable. This removes repeated
+/// runtime `Option` checks from receipt verification and retry orchestration.
+#[derive(Clone)]
+pub(crate) struct PreparedAuthenticatedPeerChatRelayHttpRequest {
+    request: PreparedPeerChatRelayHttpRequest,
+    request_commitment: [u8; 32],
+}
+
+impl PreparedAuthenticatedPeerChatRelayHttpRequest {
+    #[must_use]
+    pub(crate) fn body(&self) -> Bytes {
+        self.request.body()
+    }
 
     #[must_use]
-    pub(crate) const fn request_commitment(&self) -> Option<[u8; 32]> {
+    pub(crate) const fn request_commitment(&self) -> [u8; 32] {
         self.request_commitment
     }
 }
@@ -2717,7 +2734,7 @@ pub(crate) async fn prepare_peer_chat_relay_request_v1(
     envelope: ChatEnvelope,
 ) -> Result<PreparedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
     prepare_direct_peer_relay_request(move || {
-        encode_prepared_peer_chat_relay_request(&PeerChatRelayRequest { envelope }, None)
+        encode_prepared_peer_chat_relay_request(&PeerChatRelayRequest { envelope })
     })
     .await
 }
@@ -2726,12 +2743,12 @@ pub(crate) async fn prepare_peer_chat_relay_request_v1(
 pub(crate) async fn prepare_peer_chat_relay_request_v2(
     envelope: ChatEnvelope,
     node_identity: Arc<IdentityKeyPair>,
-) -> Result<PreparedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
+) -> Result<PreparedAuthenticatedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
     prepare_direct_peer_relay_request(move || {
         let (request, request_commitment) =
             PeerChatRelayRequestV2::sign_with_commitment(envelope, node_identity.as_ref())
                 .map_err(|_| DirectRelayRequestPreparationFailure::Encoding)?;
-        encode_prepared_peer_chat_relay_request(&request, Some(request_commitment))
+        encode_prepared_authenticated_peer_chat_relay_request(&request, request_commitment)
     })
     .await
 }
@@ -2741,7 +2758,7 @@ pub(crate) async fn prepare_peer_chat_relay_request_v3(
     envelope: ChatEnvelope,
     target_node_id: [u8; 32],
     node_identity: Arc<IdentityKeyPair>,
-) -> Result<PreparedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
+) -> Result<PreparedAuthenticatedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
     prepare_direct_peer_relay_request(move || {
         let (request, request_commitment) = PeerChatRelayRequestV3::sign_with_commitment(
             envelope,
@@ -2749,14 +2766,13 @@ pub(crate) async fn prepare_peer_chat_relay_request_v3(
             node_identity.as_ref(),
         )
         .map_err(|_| DirectRelayRequestPreparationFailure::Encoding)?;
-        encode_prepared_peer_chat_relay_request(&request, Some(request_commitment))
+        encode_prepared_authenticated_peer_chat_relay_request(&request, request_commitment)
     })
     .await
 }
 
 fn encode_prepared_peer_chat_relay_request<T: Serialize>(
     request: &T,
-    request_commitment: Option<[u8; 32]>,
 ) -> Result<PreparedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
     let body =
         serde_json::to_vec(request).map_err(|_| DirectRelayRequestPreparationFailure::Encoding)?;
@@ -2765,6 +2781,15 @@ fn encode_prepared_peer_chat_relay_request<T: Serialize>(
     }
     Ok(PreparedPeerChatRelayHttpRequest {
         body: Bytes::from(body),
+    })
+}
+
+fn encode_prepared_authenticated_peer_chat_relay_request<T: Serialize>(
+    request: &T,
+    request_commitment: [u8; 32],
+) -> Result<PreparedAuthenticatedPeerChatRelayHttpRequest, DirectRelayRequestPreparationFailure> {
+    Ok(PreparedAuthenticatedPeerChatRelayHttpRequest {
+        request: encode_prepared_peer_chat_relay_request(request)?,
         request_commitment,
     })
 }
